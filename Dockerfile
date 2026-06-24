@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,25 +18,35 @@ FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
 FROM --platform=$BUILDPLATFORM rust:1.88-alpine AS builder
 COPY --from=xx / /
 RUN apk add clang cmake lld
-RUN rustup target add $(xx-cargo --print-target-triple)
-
-WORKDIR /usr/src
-ADD / /usr/src/
 
 ARG TARGETPLATFORM
 RUN xx-apk add --no-cache musl-dev zlib-dev zlib-static gcc
-RUN xx-cargo build --bin nisshi --all-features --release --target-dir ./build
-RUN xx-verify --static ./build/$(xx-cargo --print-target-triple)/release/nisshi
 
-RUN <<EOF
-mkdir -p /image/schema /image/data /image/tmp /image/etc/ssl
-cp -v build/$(xx-cargo --print-target-triple)/release/nisshi /image
-cp -v LICENSE /image
-cp -rv /etc/ssl /image/etc
+WORKDIR /usr/src
+
+COPY rust-toolchain.toml .
+RUN rustup show && rustup target add $(xx-cargo --print-target-triple)
+
+ADD / /usr/src/
+
+ARG CARGO_BUILD_JOBS=default
+ENV CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/build <<EOF
+xx-cargo build --bin nisshi --no-default-features --features dynostore --release --target-dir ./build
+xx-verify --static ./build/$(xx-cargo --print-target-triple)/release/nisshi
+install ./build/$(xx-cargo --print-target-triple)/release/nisshi /usr/bin
 EOF
 
+FROM scratch AS out
+
+COPY --from=builder --parents /etc/ssl /
+COPY --from=builder /usr/src/LICENSE /usr/bin/nisshi /
+
 FROM scratch
-COPY --from=builder /image /
+COPY --from=out / /
 ENV TMP=/tmp
 ENTRYPOINT ["/nisshi"]
 CMD ["broker"]
