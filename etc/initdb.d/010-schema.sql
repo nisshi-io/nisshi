@@ -132,6 +132,15 @@ partition by
 
 create table if not exists record_default partition of record default;
 
+-- supports looking up a producer/epoch's previous control-batch marker (commit or abort) on a
+-- partition, used to compute the first offset of an aborted transaction for the Fetch
+-- response's aborted_transactions field. Partial: only control-batch rows (attributes bit 32,
+-- BatchAttribute::CONTROL_BITMASK) match, one row per transaction ending rather than one per
+-- message, so this stays small even on a partition with millions of records.
+create index if not exists record_control_marker_producer_epoch_idx
+    on record (topition, producer_id, producer_epoch, offset_id)
+    where (attributes & 32) = 32;
+
 create
 or replace view v_record as
 select
