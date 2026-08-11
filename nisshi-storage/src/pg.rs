@@ -7238,4 +7238,141 @@ mod tests {
 
         Ok(())
     }
+
+    /// Kafka permits TxnOffsetCommit to be sent repeatedly within one transaction -- a
+    /// retry after a lost response, or a later sendOffsetsToTransaction for the same
+    /// partition -- and the latest committed_offset must win. The staging inserts have no
+    /// conflict handling, so the second commit for the same (transaction, consumer group)
+    /// violates txn_offset_commit's unique constraint and fails the whole request.
+    #[tokio::test]
+    async fn txn_offset_commit_second_stage_overwrites_first() -> Result<()> {
+        use nisshi_sans_io::txn_offset_commit_request::{
+            TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+        };
+
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_offset_commit_second_stage_overwrites_first: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let group_id = alphanumeric_string(10);
+
+        let stage = |committed_offset: i64| TxnOffsetCommitRequest {
+            transaction_id: transaction_id.clone(),
+            group_id: group_id.clone(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            generation_id: Some(-1),
+            member_id: Some("".into()),
+            group_instance_id: None,
+            topics: vec![
+                TxnOffsetCommitRequestTopic::default()
+                    .name(topic_name.clone())
+                    .partitions(Some(vec![
+                        TxnOffsetCommitRequestPartition::default()
+                            .partition_index(0)
+                            .committed_offset(committed_offset)
+                            .committed_leader_epoch(Some(-1))
+                            .committed_metadata(None),
+                    ])),
+            ],
+        };
+
+        let per_partition_error = |topics: &[TxnOffsetCommitResponseTopic]| {
+            topics
+                .iter()
+                .flat_map(|topic| topic.partitions.iter().flatten())
+                .map(|partition| partition.error_code)
+                .collect::<Vec<_>>()
+        };
+
+        let first = storage.txn_offset_commit(stage(5)).await?;
+        assert_eq!(
+            vec![i16::from(ErrorCode::None)],
+            per_partition_error(&first),
+        );
+
+        let second = storage.txn_offset_commit(stage(9)).await?;
+        assert_eq!(
+            vec![i16::from(ErrorCode::None)],
+            per_partition_error(&second),
+            "a repeated TxnOffsetCommit must overwrite the staged offset, not error",
+        );
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&transaction_id, producer.id, producer.epoch, true)
+                .await?
+        );
+
+        let c = storage.connection().await?;
+        let committed: i64 = c
+            .query_one(
+                "select co.committed_offset from cluster c \
+                 join consumer_group cg on cg.cluster = c.id \
+                 join topic t on t.cluster = c.id \
+                 join topition tp on tp.topic = t.id \
+                 join consumer_offset co on co.consumer_group = cg.id and co.topition = tp.id \
+                 where c.name = $1 and cg.name = $2 and t.name = $3 and tp.partition = $4",
+                &[&cluster, &group_id, &topic_name, &0i32],
+            )
+            .await?
+            .try_get(0)?;
+
+        assert_eq!(
+            9, committed,
+            "the transaction's commit must apply the LATEST staged offset",
+        );
+
+        Ok(())
+    }
 }
