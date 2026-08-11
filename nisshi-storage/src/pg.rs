@@ -3667,6 +3667,30 @@ impl Storage for Postgres {
             transaction_id, producer_id, producer_epoch, group_id
         );
 
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        // An offsets-only transaction announces itself here rather than in
+        // AddPartitionsToTxn, so this must perform the same lifecycle reset: flip a
+        // resolved (or never-used) txn_detail row back to BEGIN and start the timeout
+        // timer. Without it the row keeps the previous transaction's terminal status and
+        // EndTxn's finalization guard no-ops, silently dropping the staged offsets. The
+        // reset deliberately leaves an in-flight BEGIN row untouched (AddOffsetsToTxn
+        // after AddPartitionsToTxn in the same transaction is the normal
+        // consume-transform-produce order), so a zero-row update is not an error.
+        _ = self
+            .prepare_execute(
+                &c,
+                "txn_detail_update_started_at.sql",
+                &[
+                    &self.cluster,
+                    &transaction_id,
+                    &producer_id,
+                    &producer_epoch,
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
         Ok(ErrorCode::None)
     }
 
@@ -7371,6 +7395,188 @@ mod tests {
         assert_eq!(
             9, committed,
             "the transaction's commit must apply the LATEST staged offset",
+        );
+
+        Ok(())
+    }
+
+    /// An offsets-only transaction (sendOffsetsToTransaction with nothing produced --
+    /// e.g. a Kafka Streams commit interval where every record was filtered) following a
+    /// committed transaction on the same producer epoch: txn_detail still holds the
+    /// previous COMMITTED status, so EndTxn's finalization guard no-ops and the staged
+    /// offsets are silently dropped. AddOffsetsToTxn must reset the transaction to BEGIN
+    /// exactly like AddPartitionsToTxn does.
+    #[tokio::test]
+    async fn offsets_only_transaction_commits_staged_offsets() -> Result<()> {
+        use nisshi_sans_io::txn_offset_commit_request::{
+            TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+        };
+
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping offsets_only_transaction_commits_staged_offsets: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        // transaction A: a normal producing transaction, committed -- leaves txn_detail
+        // at COMMITTED for this (transaction, epoch)
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"a").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&transaction_id, producer.id, producer.epoch, true)
+                .await?
+        );
+
+        // transaction B: offsets-only -- AddOffsetsToTxn, stage, commit
+        let group_id = alphanumeric_string(10);
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_add_offsets(&transaction_id, producer.id, producer.epoch, &group_id)
+                .await?
+        );
+
+        let staged = storage
+            .txn_offset_commit(TxnOffsetCommitRequest {
+                transaction_id: transaction_id.clone(),
+                group_id: group_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                generation_id: Some(-1),
+                member_id: Some("".into()),
+                group_instance_id: None,
+                topics: vec![
+                    TxnOffsetCommitRequestTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![
+                            TxnOffsetCommitRequestPartition::default()
+                                .partition_index(0)
+                                .committed_offset(42)
+                                .committed_leader_epoch(Some(-1))
+                                .committed_metadata(None),
+                        ])),
+                ],
+            })
+            .await?;
+
+        assert_eq!(
+            vec![i16::from(ErrorCode::None)],
+            staged
+                .iter()
+                .flat_map(|topic| topic.partitions.iter().flatten())
+                .map(|partition| partition.error_code)
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&transaction_id, producer.id, producer.epoch, true)
+                .await?
+        );
+
+        let c = storage.connection().await?;
+
+        let committed = c
+            .query_opt(
+                "select co.committed_offset from cluster c \
+                 join consumer_group cg on cg.cluster = c.id \
+                 join topic t on t.cluster = c.id \
+                 join topition tp on tp.topic = t.id \
+                 join consumer_offset co on co.consumer_group = cg.id and co.topition = tp.id \
+                 where c.name = $1 and cg.name = $2 and t.name = $3 and tp.partition = $4",
+                &[&cluster, &group_id, &topic_name, &0i32],
+            )
+            .await?
+            .map(|row| row.try_get::<_, i64>(0))
+            .transpose()?;
+
+        assert_eq!(
+            Some(42),
+            committed,
+            "the offsets-only transaction's commit must apply its staged offsets",
+        );
+
+        // and its staging rows must be consumed by ITS OWN finalization, not leak into
+        // the producer's next transaction
+        let leftover: i64 = c
+            .query_one(
+                "select count(*) from cluster c \
+                 join producer p on p.cluster = c.id \
+                 join txn on txn.cluster = c.id and txn.producer = p.id \
+                 join txn_detail txn_d on txn_d.\"transaction\" = txn.id \
+                 join txn_offset_commit oc on oc.txn_detail = txn_d.id \
+                 where c.name = $1 and txn.name = $2",
+                &[&cluster, &transaction_id],
+            )
+            .await?
+            .try_get(0)?;
+
+        assert_eq!(
+            0, leftover,
+            "staged offset rows must not survive the transaction's finalization",
         );
 
         Ok(())
