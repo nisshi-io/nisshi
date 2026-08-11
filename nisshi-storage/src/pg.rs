@@ -3800,29 +3800,100 @@ impl Storage for Postgres {
         let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
-        let (producer_id, producer_epoch) = if let Some(row) = self
+        // Validate before writing anything, so a rejected request leaves no staging rows
+        // behind. Identity first, against the producer's full epoch history -- the sweep's
+        // fence inserts a bare producer_epoch row with no txn_detail, so the per-txn query
+        // below would miss it and let a fenced zombie stage offsets.
+        let identity_error = match self
             .tx_prepare_query_opt(
                 &tx,
-                "producer_epoch_for_current_txn.sql",
-                &[&self.cluster, &offsets.transaction_id],
+                "producer_epoch_current_for_producer.sql",
+                &[&self.cluster, &offsets.producer_id],
             )
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let producer_id = row
-                .try_get::<_, i64>(0)
-                .map(Some)
-                .inspect_err(|err| error!(?err))?;
+            None => Some(ErrorCode::UnknownProducerId),
+            Some(row) => {
+                let current_epoch = row.try_get::<_, i16>(0).inspect_err(|err| error!(?err))?;
 
-            let epoch = row
-                .try_get::<_, i16>(1)
-                .map(Some)
-                .inspect_err(|err| error!(?err))?;
-
-            (producer_id, epoch)
-        } else {
-            (None, None)
+                match offsets.producer_epoch.cmp(&current_epoch) {
+                    Ordering::Less => Some(ErrorCode::ProducerFenced),
+                    Ordering::Greater => Some(ErrorCode::InvalidProducerEpoch),
+                    Ordering::Equal => None,
+                }
+            }
         };
+
+        // Then transaction state: staging is only legal while this (transaction, epoch)
+        // is in BEGIN. A delayed or duplicate TxnOffsetCommit arriving after EndTxn
+        // finalized the transaction would otherwise stage rows that the producer's NEXT
+        // transaction applies or discards as its own.
+        let state_error = match identity_error {
+            Some(_) => None,
+            None => match self
+                .tx_prepare_query_opt(
+                    &tx,
+                    "producer_epoch_for_current_txn.sql",
+                    &[&self.cluster, &offsets.transaction_id],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                None => Some(ErrorCode::UnknownProducerId),
+                Some(row) => {
+                    let producer_id = row.try_get::<_, i64>(0).inspect_err(|err| error!(?err))?;
+                    let producer_epoch =
+                        row.try_get::<_, i16>(1).inspect_err(|err| error!(?err))?;
+                    let status = row
+                        .try_get::<_, Option<String>>(2)
+                        .inspect_err(|err| error!(?err))?
+                        .map(TxnState::try_from)
+                        .transpose()?;
+
+                    if producer_id != offsets.producer_id {
+                        Some(ErrorCode::UnknownProducerId)
+                    } else if producer_epoch != offsets.producer_epoch
+                        || status != Some(TxnState::Begin)
+                    {
+                        Some(ErrorCode::InvalidTxnState)
+                    } else {
+                        None
+                    }
+                }
+            },
+        };
+
+        if let Some(error_code) = identity_error.or(state_error) {
+            debug!(
+                cluster = self.cluster,
+                offsets.transaction_id,
+                offsets.producer_id,
+                offsets.producer_epoch,
+                ?error_code
+            );
+
+            return Ok(offsets
+                .topics
+                .into_iter()
+                .map(|topic| {
+                    let partitions = topic
+                        .partitions
+                        .unwrap_or(vec![])
+                        .into_iter()
+                        .map(|partition| {
+                            TxnOffsetCommitResponsePartition::default()
+                                .partition_index(partition.partition_index)
+                                .error_code(i16::from(error_code))
+                        })
+                        .collect();
+
+                    TxnOffsetCommitResponseTopic::default()
+                        .name(topic.name)
+                        .partitions(Some(partitions))
+                })
+                .collect());
+        }
 
         _ = self
             .tx_prepare_execute(
@@ -3831,8 +3902,6 @@ impl Storage for Postgres {
                 &[&self.cluster, &offsets.group_id],
             )
             .await?;
-
-        debug!(?producer_id, ?producer_epoch);
 
         _ = self
             .tx_prepare_execute(
@@ -3857,49 +3926,37 @@ impl Storage for Postgres {
             let mut partitions = vec![];
 
             for partition in topic.partitions.unwrap_or(vec![]) {
-                if producer_id.is_some_and(|producer_id| producer_id == offsets.producer_id) {
-                    if producer_epoch
-                        .is_some_and(|producer_epoch| producer_epoch == offsets.producer_epoch)
-                    {
-                        _ = self
-                            .tx_prepare_execute(
-                                &tx,
-                                "txn_offset_commit_tp_insert.sql",
-                                &[
-                                    &self.cluster,
-                                    &offsets.transaction_id,
-                                    &offsets.group_id,
-                                    &offsets.producer_id,
-                                    &offsets.producer_epoch,
-                                    &topic.name,
-                                    &partition.partition_index,
-                                    &partition.committed_offset,
-                                    &partition.committed_leader_epoch,
-                                    &partition.committed_metadata,
-                                ],
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))?;
+                // the insert joins topic/topition: zero rows means the staged
+                // topic/partition does not exist, which must not be acked as success
+                let rows = self
+                    .tx_prepare_execute(
+                        &tx,
+                        "txn_offset_commit_tp_insert.sql",
+                        &[
+                            &self.cluster,
+                            &offsets.transaction_id,
+                            &offsets.group_id,
+                            &offsets.producer_id,
+                            &offsets.producer_epoch,
+                            &topic.name,
+                            &partition.partition_index,
+                            &partition.committed_offset,
+                            &partition.committed_leader_epoch,
+                            &partition.committed_metadata,
+                        ],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err))?;
 
-                        partitions.push(
-                            TxnOffsetCommitResponsePartition::default()
-                                .partition_index(partition.partition_index)
-                                .error_code(i16::from(ErrorCode::None)),
-                        );
-                    } else {
-                        partitions.push(
-                            TxnOffsetCommitResponsePartition::default()
-                                .partition_index(partition.partition_index)
-                                .error_code(i16::from(ErrorCode::InvalidProducerEpoch)),
-                        );
-                    }
-                } else {
-                    partitions.push(
-                        TxnOffsetCommitResponsePartition::default()
-                            .partition_index(partition.partition_index)
-                            .error_code(i16::from(ErrorCode::UnknownProducerId)),
-                    );
-                }
+                partitions.push(
+                    TxnOffsetCommitResponsePartition::default()
+                        .partition_index(partition.partition_index)
+                        .error_code(i16::from(if rows == 1 {
+                            ErrorCode::None
+                        } else {
+                            ErrorCode::UnknownTopicOrPartition
+                        })),
+                );
             }
 
             topics.push(
@@ -7577,6 +7634,360 @@ mod tests {
         assert_eq!(
             0, leftover,
             "staged offset rows must not survive the transaction's finalization",
+        );
+
+        Ok(())
+    }
+
+    async fn staging_row_count(
+        storage: &Postgres,
+        cluster: &str,
+        transaction_id: &str,
+    ) -> Result<i64> {
+        let c = storage.connection().await?;
+
+        c.query_one(
+            "select count(*) from cluster c \
+             join producer p on p.cluster = c.id \
+             join txn on txn.cluster = c.id and txn.producer = p.id \
+             join txn_detail txn_d on txn_d.\"transaction\" = txn.id \
+             join txn_offset_commit oc on oc.txn_detail = txn_d.id \
+             where c.name = $1 and txn.name = $2",
+            &[&cluster.to_owned(), &transaction_id.to_owned()],
+        )
+        .await?
+        .try_get(0)
+        .map_err(Into::into)
+    }
+
+    fn offsets_for(
+        transaction_id: &str,
+        group_id: &str,
+        producer: &ProducerIdResponse,
+        topic_name: &str,
+        committed_offset: i64,
+    ) -> TxnOffsetCommitRequest {
+        use nisshi_sans_io::txn_offset_commit_request::{
+            TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+        };
+
+        TxnOffsetCommitRequest {
+            transaction_id: transaction_id.to_owned(),
+            group_id: group_id.to_owned(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            generation_id: Some(-1),
+            member_id: Some("".into()),
+            group_instance_id: None,
+            topics: vec![
+                TxnOffsetCommitRequestTopic::default()
+                    .name(topic_name.to_owned())
+                    .partitions(Some(vec![
+                        TxnOffsetCommitRequestPartition::default()
+                            .partition_index(0)
+                            .committed_offset(committed_offset)
+                            .committed_leader_epoch(Some(-1))
+                            .committed_metadata(None),
+                    ])),
+            ],
+        }
+    }
+
+    fn partition_errors(topics: &[TxnOffsetCommitResponseTopic]) -> Vec<i16> {
+        topics
+            .iter()
+            .flat_map(|topic| topic.partitions.iter().flatten())
+            .map(|partition| partition.error_code)
+            .collect()
+    }
+
+    /// A producer fenced by the timeout sweep must have its TxnOffsetCommit rejected with
+    /// ProducerFenced. The identity check compared against the newest epoch that HAS a
+    /// txn_detail row, but the sweep's fence inserts a bare producer_epoch row -- so the
+    /// zombie's stale epoch passed and its rows were staged (and orphaned forever, since
+    /// no finalization ever runs at that epoch).
+    #[tokio::test]
+    async fn txn_offset_commit_from_sweep_fenced_producer_is_fenced() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_offset_commit_from_sweep_fenced_producer_is_fenced: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"v").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // the sweep declares the producer dead: aborts the transaction and fences the epoch
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .abort_timed_out(&transaction_id, producer.id, producer.epoch)
+                .await?
+        );
+
+        // the still-alive zombie tries to commit its consumer offsets at the old epoch
+        let group_id = alphanumeric_string(10);
+        let response = storage
+            .txn_offset_commit(offsets_for(
+                &transaction_id,
+                &group_id,
+                &producer,
+                &topic_name,
+                7,
+            ))
+            .await?;
+
+        assert_eq!(
+            vec![i16::from(ErrorCode::ProducerFenced)],
+            partition_errors(&response),
+            "a sweep-fenced producer's TxnOffsetCommit must be rejected as ProducerFenced",
+        );
+
+        assert_eq!(
+            0,
+            staging_row_count(&storage, &cluster, &transaction_id).await?,
+            "a rejected TxnOffsetCommit must not leave staging rows behind",
+        );
+
+        Ok(())
+    }
+
+    /// Staging offsets into a transaction that is not in BEGIN -- e.g. a delayed duplicate
+    /// TxnOffsetCommit arriving after EndTxn already finalized it -- must be rejected with
+    /// InvalidTxnState. It was accepted, and the leftover staging rows were then applied
+    /// as part of the producer's NEXT transaction.
+    #[tokio::test]
+    async fn txn_offset_commit_into_finalized_transaction_is_invalid() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_offset_commit_into_finalized_transaction_is_invalid: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"v").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&transaction_id, producer.id, producer.epoch, true)
+                .await?
+        );
+
+        // delayed duplicate arrives after the transaction already committed
+        let group_id = alphanumeric_string(10);
+        let response = storage
+            .txn_offset_commit(offsets_for(
+                &transaction_id,
+                &group_id,
+                &producer,
+                &topic_name,
+                7,
+            ))
+            .await?;
+
+        assert_eq!(
+            vec![i16::from(ErrorCode::InvalidTxnState)],
+            partition_errors(&response),
+            "staging into a finalized transaction must be rejected as InvalidTxnState",
+        );
+
+        assert_eq!(
+            0,
+            staging_row_count(&storage, &cluster, &transaction_id).await?,
+            "a rejected TxnOffsetCommit must not leave staging rows to contaminate the \
+             producer's next transaction",
+        );
+
+        Ok(())
+    }
+
+    /// Committing an offset for a topic or partition that does not exist staged nothing
+    /// but still answered per-partition success -- silent offset loss. It must report
+    /// UnknownTopicOrPartition.
+    #[tokio::test]
+    async fn txn_offset_commit_unknown_topition_is_reported() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_offset_commit_unknown_topition_is_reported: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        let group_id = alphanumeric_string(10);
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_add_offsets(&transaction_id, producer.id, producer.epoch, &group_id)
+                .await?
+        );
+
+        // the staged topic was never created
+        let missing_topic = alphanumeric_string(15);
+        let response = storage
+            .txn_offset_commit(offsets_for(
+                &transaction_id,
+                &group_id,
+                &producer,
+                &missing_topic,
+                7,
+            ))
+            .await?;
+
+        assert_eq!(
+            vec![i16::from(ErrorCode::UnknownTopicOrPartition)],
+            partition_errors(&response),
+            "an offset staged for a nonexistent topic/partition must not be acked as success",
         );
 
         Ok(())
