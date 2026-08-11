@@ -14,8 +14,8 @@
 -- limitations under the License.
 
 delete from topic
-where topic.cluster in (
-    select c.id
+where topic.id in (
+    select t.id
     from cluster c
     join topic t on t.cluster = c.id
     where c.name = $1
