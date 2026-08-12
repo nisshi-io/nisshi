@@ -6013,4 +6013,108 @@ mod tests {
 
         Ok(())
     }
+
+    /// Deleting one topic must leave every other topic in the cluster untouched.
+    /// `topic_delete_by.sql` narrowed the delete on `topic.cluster` instead of
+    /// `topic.id`, so the subquery only established that the named topic existed
+    /// and the delete then matched every topic in the cluster -- taking their
+    /// topitions, records and headers with it through `on delete cascade`.
+    #[tokio::test]
+    async fn delete_topic_leaves_the_other_topics_in_the_cluster_intact() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping delete_topic_leaves_the_other_topics_in_the_cluster_intact: {err:?}"
+            );
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let doomed = alphanumeric_string(15);
+        let survivor = alphanumeric_string(15);
+
+        for name in [doomed.clone(), survivor.clone()] {
+            _ = storage
+                .create_topic(
+                    CreatableTopic::default()
+                        .name(name)
+                        .num_partitions(1)
+                        .replication_factor(0)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                )
+                .await?;
+        }
+
+        // the survivor holds a record, so the cascade is observable as data loss
+        // and not just as a missing topic row
+        let topition = Topition::new(survivor.clone(), 0);
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0),
+            )
+            .last_offset_delta(0)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage.delete_topic(&TopicId::Name(doomed.clone())).await?,
+        );
+
+        let batches = storage
+            .fetch(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        let records = batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            Batch::try_from(batch).map(|inflated| {
+                acc.extend(inflated.records);
+                acc
+            })
+        })?;
+
+        assert_eq!(
+            1,
+            records.len(),
+            "deleting {doomed} must not cascade into the records of {survivor}",
+        );
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .delete_topic(&TopicId::Name(survivor.clone()))
+                .await?,
+            "deleting {doomed} must leave {survivor} present and deletable",
+        );
+
+        Ok(())
+    }
 }
