@@ -548,7 +548,8 @@ impl Engine {
                 .inspect_err(|err| error!(?err, ?topic, ?partition, ?offset, ?key, ?value))
                 .map_err(unique_constraint(ErrorCode::UnknownServerError))?;
 
-            for header in record.headers.iter().as_ref() {
+            for (ordinal, header) in record.headers.iter().enumerate() {
+                let ordinal = i32::try_from(ordinal)?;
                 let key = header.key.as_deref();
                 let value = header.value.as_deref();
 
@@ -556,7 +557,15 @@ impl Engine {
                     .prepare_execute(
                         tx,
                         &sql_lookup("header_insert.sql")?,
-                        (self.cluster.as_str(), topic, partition, offset, key, value),
+                        (
+                            self.cluster.as_str(),
+                            topic,
+                            partition,
+                            offset,
+                            ordinal,
+                            key,
+                            value,
+                        ),
                     )
                     .await
                     .inspect_err(|err| {

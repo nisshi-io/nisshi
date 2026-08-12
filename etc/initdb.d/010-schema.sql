@@ -156,9 +156,10 @@ order by
 create table if not exists header (
     topition int,
     offset_id bigint,
-    k bytea,
-    primary key (topition, offset_id, k),
+    ordinal int,
+    primary key (topition, offset_id, ordinal),
     foreign key (topition, offset_id) references record (topition, offset_id) on delete cascade,
+    k bytea,
     v bytea,
     last_updated timestamp default current_timestamp not null,
     created_at timestamp default current_timestamp not null

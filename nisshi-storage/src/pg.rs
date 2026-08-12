@@ -906,7 +906,8 @@ impl Postgres {
 
             {
                 let header_sink = tx.copy_in(self.sql_lookup("header_copy.sql")?).await?;
-                let header_column_types = [Type::INT4, Type::INT8, Type::BYTEA, Type::BYTEA];
+                let header_column_types =
+                    [Type::INT4, Type::INT8, Type::INT4, Type::BYTEA, Type::BYTEA];
                 let header_writer = BinaryCopyInWriter::new(header_sink, &header_column_types);
                 pin_mut!(header_writer);
 
@@ -914,7 +915,8 @@ impl Postgres {
                     let delta = i64::try_from(delta)?;
                     let offset = high.unwrap_or_default() + delta;
 
-                    for header in record.headers.iter().as_ref() {
+                    for (ordinal, header) in record.headers.iter().enumerate() {
+                        let ordinal = i32::try_from(ordinal)?;
                         let key = header.key.as_deref();
                         let value = header.value.as_deref();
 
@@ -923,6 +925,7 @@ impl Postgres {
 
                         row.push(&topition_id);
                         row.push(&offset);
+                        row.push(&ordinal);
                         row.push(&key);
                         row.push(&value);
 
@@ -6010,6 +6013,123 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Record headers are an ordered list and may repeat a key. header_fetch.sql
+    /// had no `order by` and the only index was the primary key
+    /// (topition, offset_id, k), so postgres served headers from that index in
+    /// key order, and the key being part of the primary key meant a repeated key
+    /// could not be stored at all.
+    ///
+    /// The produce order below is the one librdkafka 0073_headers uses; sorted by
+    /// key it starts with "empty", which is exactly what 0073 reported at index 0.
+    #[tokio::test]
+    async fn headers_keep_produce_order_and_allow_repeated_keys() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping headers_keep_produce_order_and_allow_repeated_keys: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let keys = [
+            "msgid", "static", "multi", "multi", "multi", "null", "empty",
+        ];
+
+        let batch = Batch::builder()
+            .record(
+                keys.iter().enumerate().fold(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(0),
+                    |builder, (ordinal, key)| {
+                        builder.header(
+                            Header::builder()
+                                .key(Bytes::copy_from_slice(key.as_bytes()))
+                                .value(Bytes::from(format!("{key}-{ordinal}"))),
+                        )
+                    },
+                ),
+            )
+            .last_offset_delta(0)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let batches = storage
+            .fetch(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        let records = batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            Batch::try_from(batch).map(|inflated| {
+                acc.extend(inflated.records);
+                acc
+            })
+        })?;
+
+        let fetched = records
+            .first()
+            .map(|record| {
+                record
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        header
+                            .key
+                            .as_deref()
+                            .map(|key| String::from_utf8_lossy(key).into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert_eq!(
+            keys.iter().map(|key| key.to_string()).collect::<Vec<_>>(),
+            fetched,
+            "headers must be served in produce order, repeats included",
+        );
 
         Ok(())
     }
