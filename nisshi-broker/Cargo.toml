@@ -1,0 +1,76 @@
+[package]
+name = "nisshi-broker"
+description = "Tansu Kafka API compatible broker"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[features]
+default = ["dynostore", "libsql", "postgres", "slatedb", "turso"]
+dynostore = ["dep:object_store"]
+libsql = ["dep:libsql"]
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+slatedb = ["dep:object_store", "dep:slatedb", "nisshi-storage/slatedb"]
+turso = ["dep:turso"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+console.workspace = true
+deadpool-postgres = { workspace = true, optional = true }
+futures.workspace = true
+glob.workspace = true
+http-body-util.workspace = true
+humantime.workspace = true
+hyper-util.workspace = true
+hyper.workspace = true
+indicatif.workspace = true
+jsonschema.workspace = true
+libsql = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+rama.workspace = true
+rand.workspace = true
+regex.workspace = true
+rsasl.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+slatedb = { workspace = true, optional = true }
+nisshi-auth.workspace = true
+nisshi-model.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-schema.workspace = true
+nisshi-service.workspace = true
+nisshi-storage.workspace = true
+thiserror.workspace = true
+tokio-postgres = { workspace = true, optional = true }
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+turso = { workspace = true, optional = true }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+object_store = { workspace = true }
+pretty_assertions.workspace = true
+slatedb = { workspace = true }
+nisshi-schema = { workspace = true }
+nisshi-storage = { workspace = true }

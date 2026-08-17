@@ -1,0 +1,45 @@
+-- -*- mode: sql; sql-product: postgres; -*-
+-- Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+-- http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+
+-- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, blob) as
+with sized as (
+select
+
+r.offset_id,
+r.attributes,
+r.timestamp,
+r.k,
+r.v,
+sum(coalesce(length(r.k), 0) + coalesce(length(r.v), 0)) over (order by r.offset_id) as bytes,
+r.producer_id,
+r.producer_epoch
+
+from
+
+cluster c
+join topic t on t.cluster = c.id
+join topition tp on tp.topic = t.id
+join record r on r.topition = tp.id
+
+where
+
+c.name = $1
+and t.name = $2
+and tp.partition = $3
+and r.offset_id >= $4
+and r.offset_id < $6
+and r.k = $7)
+
+select * from sized where bytes < $5;

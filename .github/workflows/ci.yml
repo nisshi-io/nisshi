@@ -35,27 +35,29 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CARGO_BUILD_BUILD_DIR: /mnt/build
-      CLUSTER_ID: tansu-ci
+      CLUSTER_ID: nisshi-ci
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
-      ICEBERG_WAREHOUSE: tansu
+      ICEBERG_WAREHOUSE: nisshi
       LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
       RUST_BACKTRACE: 1
-      RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
+      RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
       SCHEMA_REGISTRY: file://./etc/schema
-      STORAGE_ENGINE: s3://tansu/
-      TANSU_IMAGE: ghcr.io/tansu-io/tansu
+      STORAGE_ENGINE: s3://nisshi/
+      NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi
     steps:
       - run: sudo mkdir /mnt/build
       - run: sudo chmod a+rwxt /mnt/build
       - run: echo "PG_IMAGE_DASH=${POSTGRES_IMAGE/:/-}" >> $GITHUB_ENV
       - run: echo ${PG_IMAGE_DASH}
       - run: df -h
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
       - run: just ci
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
@@ -69,7 +71,7 @@ jobs:
         if: always()
       - run: tar --create --verbose --gzip --file=logs-${{env.PG_IMAGE_DASH}}.tar.gz logs
         if: always()
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: logs-${{env.PG_IMAGE_DASH}}.tar.gz
@@ -85,8 +87,8 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
@@ -99,8 +101,8 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
@@ -113,8 +115,8 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
@@ -133,12 +135,14 @@ jobs:
           - postgres
           - slatedb
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
           cache: false
-      - run: cargo build --features ${{matrix.storage}}
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - run: cargo build  --no-default-features --features ${{matrix.storage}}
   build-storage-lake:
     runs-on: ${{matrix.os}}
     strategy:
@@ -156,12 +160,166 @@ jobs:
           - iceberg
           - parquet
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
           cache: false
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: cargo build --features ${{matrix.storage}} --features ${{matrix.lake}}
+  compat-librdkafka:
+    runs-on: ${{matrix.os}}
+    continue-on-error: ${{ matrix.storage.experimental }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os:
+          - ubuntu-latest
+        storage:
+          - name: memory
+            engine: memory://
+            features: dynostore
+            experimental: false
+          - name: s3
+            engine: s3://nisshi/
+            features: dynostore
+            experimental: true
+          - name: postgres
+            engine: postgres://postgres:postgres@localhost
+            features: postgres
+            experimental: true
+          - name: sqlite
+            engine: sqlite://nisshi.db
+            features: libsql
+            experimental: true
+    env:
+      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: true
+      AWS_DEFAULT_REGION: eu-west-2
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLUSTER_ID: librdkafka-integration
+      LAKEKEEPER_IMAGE: unused
+      RESULTS_FILE: results-${{matrix.storage.name}}.csv
+      RUST_BACKTRACE: 1
+      RUST_LOG: warn
+      STORAGE_ENGINE: ${{matrix.storage.engine}}
+      NISSHI_IMAGE: hello-world
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - run: just compat-infra-up
+      - run: just compat-librdkafka '${{matrix.storage.engine}}' '${{matrix.storage.features}}'
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compat-librdkafka-results-${{matrix.storage.name}}
+          path: ${{env.RESULTS_FILE}}
+          if-no-files-found: warn
+  compat-librdkafka-report:
+    if: always()
+    needs: [compat-librdkafka]
+    runs-on: ubuntu-latest
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/workflows/scripts/pivot-integration-report.sql
+          sparse-checkout-cone-mode: false
+          path: reports
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: compat-librdkafka-results-*
+          path: results
+          merge-multiple: true
+      - run: curl https://install.duckdb.org | sh
+      - run: echo "## librdkafka compatibility report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: $DUCKDB_CLI/duckdb -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
+  compat-franz-go:
+    runs-on: ${{matrix.os}}
+    continue-on-error: ${{ matrix.storage.experimental }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os:
+          - ubuntu-latest
+        storage:
+          - name: memory
+            engine: memory://
+            features: dynostore
+            experimental: false
+          - name: s3
+            engine: s3://nisshi/
+            features: dynostore
+            experimental: true
+          - name: postgres
+            engine: postgres://postgres:postgres@localhost
+            features: postgres
+            experimental: true
+          - name: sqlite
+            engine: sqlite://nisshi.db
+            features: libsql
+            experimental: true
+    env:
+      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: true
+      AWS_DEFAULT_REGION: eu-west-2
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLUSTER_ID: librdkafka-integration
+      LAKEKEEPER_IMAGE: unused
+      RESULTS_FILE: results-${{matrix.storage.name}}.csv
+      RUST_BACKTRACE: 1
+      RUST_LOG: warn
+      STORAGE_ENGINE: ${{matrix.storage.engine}}
+      NISSHI_IMAGE: hello-world
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - run: just compat-franz-go '${{matrix.storage.engine}}' '${{matrix.storage.features}}'
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compat-franz-go-results-${{matrix.storage.name}}
+          path: ${{env.RESULTS_FILE}}
+          if-no-files-found: warn
+  compat-franz-go-report:
+    if: always()
+    needs: [compat-franz-go]
+    runs-on: ubuntu-latest
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/workflows/scripts/pivot-integration-report.sql
+          sparse-checkout-cone-mode: false
+          path: reports
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: compat-franz-go-results-*
+          path: results
+          merge-multiple: true
+      - run: curl https://install.duckdb.org | sh
+      - run: echo "## franz-go compatibility report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: $DUCKDB_CLI/duckdb -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   cargo-publish-dry-run:
     runs-on: ${{matrix.os}}
     strategy:
@@ -170,27 +328,29 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: cargo publish --dry-run --workspace
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: crate-ci/typos@v1.43.1
+      - uses: actions/checkout@v7
+      - uses: crate-ci/typos@v1.48.0
         with:
           config: typos.toml
   third-party-license:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - env:
-          CARGO_ABOUT_VERSION: 0.8.2
+          CARGO_ABOUT_VERSION: 0.8.4
         run: |
           cargo install "cargo-about@$CARGO_ABOUT_VERSION"
           cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: third-party-license
           path: THIRD-PARTY-LICENSE.html
@@ -198,16 +358,16 @@ jobs:
   src:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: |
           git archive --format=tar.gz HEAD >${{runner.temp}}/src.tar.gz
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: src
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   package:
-    needs: [test, cargo-publish-dry-run, third-party-license, typos]
+    needs: [test, cargo-publish-dry-run, typos]
     runs-on: ${{matrix.os}}
     permissions:
       packages: write
@@ -217,8 +377,8 @@ jobs:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: docker/metadata-action@v5
+      - uses: actions/checkout@v7
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ${{env.REGISTRY}}/${{github.repository}}
@@ -227,15 +387,15 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         with:
           buildkitd-flags: --debug
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ${{env.REGISTRY}}
           username: ${{github.actor}}
           password: ${{secrets.GITHUB_TOKEN}}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -252,16 +412,16 @@ jobs:
           - ubuntu-latest
           - ubuntu-24.04-arm
         storage:
-          - s3://tansu/
+          - s3://nisshi/
           - postgres://postgres:postgres@db
-          - sqlite://tansu.db
+          - sqlite://nisshi.db
         kafka:
           - apache/kafka:3.9.0
           - apache/kafka:3.8.1
           - apache/kafka:3.7.0
     runs-on: ${{matrix.os}}
     env:
-      ADVERTISED_LISTENER_URL: tcp://tansu:9092
+      ADVERTISED_LISTENER_URL: tcp://nisshi:9092
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_ALLOW_HTTP: true
       AWS_DEFAULT_REGION: auto
@@ -271,10 +431,10 @@ jobs:
       KAFKA_IMAGE: ${{matrix.kafka}}
       PROMETHEUS_LISTENER_URL: tcp://localhost:9100
       RUST_BACKTRACE: 1
-      RUST_LOG: warn,tansu_broker=debug,tansu_storage=debug,tansu_schema=debug
+      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
       STORAGE_ENGINE: ${{matrix.storage}}
     steps:
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ${{env.REGISTRY}}/${{github.repository}}
@@ -283,11 +443,11 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
-          repository: tansu-io/example-java
+          repository: nisshi-io/example-java
           path: integration
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: |
             etc/initdb.d/010-schema.sql
@@ -298,36 +458,36 @@ jobs:
       - run: docker compose --ansi never --progress plain up --no-color --quiet-pull --detach
         working-directory: integration
         env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
       - run: docker compose --ansi never exec minio /usr/bin/mc ready local
         working-directory: integration
         env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
       - run: docker compose --ansi never exec minio /usr/bin/mc alias set local http://localhost:9000 ${{ env.AWS_ACCESS_KEY_ID }} ${{ env.AWS_SECRET_ACCESS_KEY }}
         working-directory: integration
         env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never exec minio /usr/bin/mc mb local/tansu
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
+      - run: docker compose --ansi never exec minio /usr/bin/mc mb local/nisshi
         working-directory: integration
         env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
       - run: sudo apt-get update
       - run: sudo apt-get install -y bats
       - run: docker compose exec db /usr/bin/pg_isready --timeout=60
         working-directory: integration
         env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
       - run: docker compose logs
         working-directory: integration
         env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
       - run: bats --trace --verbose-run tests
         working-directory: integration
         env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
   release:
     if: ${{github.actor == 'shortishly'}}
-    needs: [test, src, third-party-license, typos]
+    needs: [test, src, typos]
     permissions:
       contents: write
     runs-on: ${{matrix.os}}
@@ -352,12 +512,12 @@ jobs:
             flags: ""
             enabled: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
       - run: rustc -vV
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -381,18 +541,17 @@ jobs:
           cargo build --release --target ${{matrix.target}} --features delta,dynostore,iceberg,libsql,parquet,postgres
           dist=$(mktemp -d -p ${{runner.temp}})
           mkdir "$dist"/bin
-          cp target/"${TARGET}"/release/tansu "$dist"/bin
+          cp target/"${TARGET}"/release/nisshi "$dist"/bin
           cp compose.yaml example.env LICENSE README.md "$dist"
           cp -r etc "$dist"
-          cp artifacts/THIRD-PARTY-LICENSE.html "$dist"
-          tar --create --verbose --gzip --file=tansu-"${TARGET}".tar.gz -C "$dist" .
+          tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       - if: ${{matrix.enabled && github.ref_type != 'tag'}}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: tansu-${{matrix.target}}
-          path: tansu-${{matrix.target}}.tar.gz
+          name: nisshi-${{matrix.target}}
+          path: nisshi-${{matrix.target}}.tar.gz
           if-no-files-found: error
       - if: ${{matrix.enabled && github.ref_type == 'tag'}}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          files: tansu-${{matrix.target}}.tar.gz
+          files: nisshi-${{matrix.target}}.tar.gz

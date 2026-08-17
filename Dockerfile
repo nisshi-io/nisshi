@@ -24,12 +24,12 @@ ADD / /usr/src/
 
 ARG TARGETPLATFORM
 RUN xx-apk add --no-cache musl-dev zlib-dev zlib-static gcc
-RUN xx-cargo build --bin tansu --all-features --release --target-dir ./build
-RUN xx-verify --static ./build/$(xx-cargo --print-target-triple)/release/tansu
+RUN xx-cargo build --bin nisshi --all-features --release --target-dir ./build
+RUN xx-verify --static ./build/$(xx-cargo --print-target-triple)/release/nisshi
 
 RUN <<EOF
 mkdir -p /image/schema /image/data /image/tmp /image/etc/ssl
-cp -v build/$(xx-cargo --print-target-triple)/release/tansu /image
+cp -v build/$(xx-cargo --print-target-triple)/release/nisshi /image
 cp -v LICENSE /image
 cp -rv /etc/ssl /image/etc
 EOF
@@ -37,5 +37,5 @@ EOF
 FROM scratch
 COPY --from=builder /image /
 ENV TMP=/tmp
-ENTRYPOINT ["/tansu"]
+ENTRYPOINT ["/nisshi"]
 CMD ["broker"]

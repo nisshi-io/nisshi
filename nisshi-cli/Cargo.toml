@@ -1,0 +1,56 @@
+[package]
+name = "nisshi-cli"
+description = "Tansu CLI"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+delta = []
+dynostore = []
+iceberg = []
+libsql = []
+parquet = []
+postgres = []
+slatedb = []
+turso = []
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+console.workspace = true
+dotenv.workspace = true
+human-units.workspace = true
+humantime.workspace = true
+owo-colors.workspace = true
+pbkdf2.workspace = true
+rand.workspace = true
+regex.workspace = true
+rsasl.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+nisshi-broker.workspace = true
+nisshi-cat.workspace = true
+nisshi-client.workspace = true
+nisshi-generator.workspace = true
+nisshi-perf.workspace = true
+nisshi-proxy.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-schema.workspace = true
+nisshi-storage.workspace = true
+nisshi-topic.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true

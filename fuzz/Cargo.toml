@@ -11,7 +11,7 @@ cargo-fuzz = true
 [dependencies]
 bytes.workspace = true
 libfuzzer-sys.workspace = true
-tansu-sans-io.workspace = true
+nisshi-sans-io.workspace = true
 
 [[bin]]
 name = "generate_seeds"
@@ -20,6 +20,13 @@ path = "fuzz_targets/generate_seeds.rs"
 [[bin]]
 name = "fuzz_request_decode"
 path = "fuzz_targets/fuzz_request_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_member_metadata"
+path = "fuzz_targets/fuzz_member_metadata.rs"
 test = false
 doc = false
 bench = false

@@ -52,8 +52,8 @@ services:
       retries: 1
       start_period: 5s
       timeout: 5s
-  tansu:
-    image: ${TANSU_IMAGE}
+  nisshi:
+    image: ${NISSHI_IMAGE}
     restart: unless-stopped
     environment:
       RUST_BACKTRACE: ${RUST_BACKTRACE}
@@ -87,8 +87,6 @@ services:
     ports:
       - 9090:9090
     command: --web.enable-otlp-receiver
-    extra_hosts:
-      - "host.docker.internal=host-gateway"
     configs:
       - source: prometheus_yaml
         target: /prometheus/prometheus.yml
