@@ -87,7 +87,7 @@ deadpool = "0.12.2"
 deadpool-postgres = "0.14.1"
 delta_kernel = { version = "0.20.0", default-features = false, features = ["arrow-57"] }
 deltalake = { version = "0.30", features = ["datafusion", "s3"] }
-digest = "0.10.7"
+digest = "0.11.3"
 dotenv = "0.15.0"
 fake = "5.1.0"
 flate2 = "1.1"
