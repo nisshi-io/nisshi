@@ -663,7 +663,40 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             otel::metric_exporter(otlp_endpoint_url)?;
         }
 
-        let storage = StorageContainer::builder()
+        let builder = {
+            let mut builder = StorageContainer::builder();
+
+            builder.with_factory(Arc::new(nisshi_storage_null::EngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(nisshi_storage_dynostore::MemoryEngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::S3OptimisticConcurrencyEngineFactory,
+            ));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::GoogleCloudStorageEngineFactory,
+            ));
+
+            #[cfg(feature = "libsql")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LiteEngineFactory));
+
+            #[cfg(feature = "postgres")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::PostgresEngineFactory));
+
+            #[cfg(feature = "slatedb")]
+            builder.with_factory(Arc::new(nisshi_storage_slatedb::EngineFactory));
+
+            #[cfg(feature = "turso")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LimboEngineFactory));
+
+            builder
+        };
+
+        let storage = builder
             .cluster_id(self.cluster_id.clone())
             .node_id(self.node_id)
             .advertised_listener(self.advertised_listener.clone())

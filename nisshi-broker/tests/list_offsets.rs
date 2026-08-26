@@ -741,14 +741,13 @@ where
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Postgres,
             cluster,
@@ -806,14 +805,13 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::InMemory,
             cluster,
@@ -871,14 +869,13 @@ mod in_memory {
 
 #[cfg(feature = "libsql")]
 mod lite {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Lite,
             cluster,
@@ -936,14 +933,13 @@ mod lite {
 
 #[cfg(feature = "slatedb")]
 mod slatedb {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::SlateDb,
             cluster,

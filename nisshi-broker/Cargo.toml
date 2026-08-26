@@ -12,11 +12,11 @@ version.workspace = true
 
 [features]
 default = ["dynostore", "libsql", "postgres", "slatedb", "turso"]
-dynostore = ["dep:object_store"]
-libsql = ["dep:libsql"]
-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
-slatedb = ["dep:object_store", "dep:slatedb", "nisshi-storage/slatedb"]
-turso = ["dep:turso"]
+dynostore = ["dep:nisshi-storage-dynostore"]
+libsql = ["dep:nisshi-storage-sql", "nisshi-storage-sql/libsql"]
+postgres = ["dep:nisshi-storage-sql", "nisshi-storage-sql/postgres"]
+slatedb = ["dep:nisshi-storage-slatedb"]
+turso = ["dep:nisshi-storage-sql", "nisshi-storage-sql/turso"]
 
 [lints]
 workspace = true
@@ -26,7 +26,6 @@ async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 console.workspace = true
-deadpool-postgres = { workspace = true, optional = true }
 futures.workspace = true
 glob.workspace = true
 http-body-util.workspace = true
@@ -35,8 +34,16 @@ hyper-util.workspace = true
 hyper.workspace = true
 indicatif.workspace = true
 jsonschema.workspace = true
-libsql = { workspace = true, optional = true }
-object_store = { workspace = true, optional = true }
+nisshi-auth.workspace = true
+nisshi-model.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-schema.workspace = true
+nisshi-service.workspace = true
+nisshi-storage-dynostore = { workspace = true, optional = true }
+nisshi-storage-null.workspace = true
+nisshi-storage-slatedb = { workspace = true, optional = true }
+nisshi-storage-sql = { workspace = true, optional = true }
+nisshi-storage.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
@@ -48,29 +55,21 @@ rsasl.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-slatedb = { workspace = true, optional = true }
-nisshi-auth.workspace = true
-nisshi-model.workspace = true
-nisshi-sans-io.workspace = true
-nisshi-schema.workspace = true
-nisshi-service.workspace = true
-nisshi-storage.workspace = true
 thiserror.workspace = true
-tokio-postgres = { workspace = true, optional = true }
 tokio-rustls.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
-turso = { workspace = true, optional = true }
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-object_store = { workspace = true }
+assert_matches.workspace = true
+object_store.workspace = true
 pretty_assertions.workspace = true
-slatedb = { workspace = true }
-nisshi-schema = { workspace = true }
-nisshi-storage = { workspace = true }
+slatedb.workspace = true
+nisshi-schema.workspace = true
+nisshi-storage.workspace = true

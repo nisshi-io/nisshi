@@ -41,7 +41,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{Storage, StorageContainer};
+use nisshi_storage::{ArcDynStorage, Storage, StorageContainer};
 use rama::{Context, Layer as _, Service as _};
 use rsasl::{
     config::SASLConfig,
@@ -49,7 +49,6 @@ use rsasl::{
 };
 use url::Url;
 
-type Storages = Arc<Box<dyn Storage>>;
 type Broker = BytesFrameService<FrameRouteService<(), Error>>;
 
 fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
@@ -64,7 +63,7 @@ where
         })
 }
 
-async fn memory_storage() -> Result<Storages> {
+async fn memory_storage() -> Result<ArcDynStorage> {
     StorageContainer::builder()
         .cluster_id("tansu")
         .node_id(111)

@@ -82,9 +82,8 @@ where
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use rand::{prelude::*, rng};
 
     use super::*;
@@ -93,7 +92,7 @@ mod pg {
         cluster: impl Into<String> + Clone,
         node: i32,
         advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Postgres,
             cluster,
@@ -124,9 +123,8 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use rand::{prelude::*, rng};
 
     use super::*;
@@ -135,7 +133,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
         advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::InMemory,
             cluster,
@@ -166,9 +164,8 @@ mod in_memory {
 
 #[cfg(feature = "libsql")]
 mod lite {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use rand::{prelude::*, rng};
 
     use super::*;
@@ -177,7 +174,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
         advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(StorageType::Lite, cluster, node, advertised_listener, None).await
     }
 
@@ -201,9 +198,8 @@ mod lite {
 
 #[cfg(feature = "slatedb")]
 mod slatedb {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use rand::{prelude::*, rng};
 
     use super::*;
@@ -212,7 +208,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
         advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::SlateDb,
             cluster,

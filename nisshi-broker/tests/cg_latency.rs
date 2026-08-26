@@ -26,10 +26,11 @@ use nisshi_sans_io::{
 use nisshi_service::{
     BytesFrameLayer, FrameBytesLayer, FrameRouteService, LatencyIntroducingLayer, RequestFrameLayer,
 };
-use nisshi_storage::StorageContainer;
 use rama::{Context, Layer, Service};
 use tracing::debug;
 use url::Url;
+
+use crate::common::{StorageType, storage_container};
 
 pub mod common;
 
@@ -42,14 +43,14 @@ async fn stack() -> Result<(), Error> {
 
     let cluster = "nisshi";
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
+    let storage = storage_container(
+        StorageType::InMemory,
+        cluster,
+        NODE_ID,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await?;
 
     let coordinator = Controller::with_storage(storage)?;
 

@@ -117,8 +117,6 @@ use bytes::{Bytes, TryGetError};
 use console::Emoji;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use deadpool::managed::PoolError;
-#[cfg(feature = "dynostore")]
-use dynostore::DynoStore;
 
 use glob::{GlobError, PatternError};
 
@@ -134,9 +132,6 @@ use opentelemetry::{
     metrics::{Counter, Meter},
 };
 use opentelemetry_semantic_conventions::SCHEMA_URL;
-
-#[cfg(feature = "postgres")]
-use pg::Postgres;
 
 use governor::InsufficientCapacity;
 use nisshi_sans_io::{
@@ -197,27 +192,14 @@ use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
 
-#[cfg(feature = "dynostore")]
-use tracing::warn;
-
-#[cfg(feature = "dynostore")]
-mod dynostore;
-
-#[cfg(feature = "postgres")]
-mod pg;
-
-#[cfg(feature = "dynostore")]
 mod batch;
 mod latency;
-
-mod null;
-
-#[cfg(feature = "libsql")]
 mod proxy;
-
 mod service;
 
+pub use batch::ProduceRequestBatcher;
 pub use latency::LatencyIntroducingStorage;
+pub use proxy::SemaphoreProxy;
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
@@ -232,23 +214,8 @@ pub use service::{
     TxnEndService, TxnOffsetCommitService, bounded_channel,
 };
 
-#[cfg(feature = "slatedb")]
-pub mod slate;
-
-#[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
-pub(crate) mod sql;
-
-#[cfg(feature = "libsql")]
-mod lite;
-
-#[cfg(feature = "dynostore")]
-mod gcs;
-
 #[cfg(feature = "dynostore")]
 mod os;
-
-#[cfg(feature = "turso")]
-mod limbo;
 
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
@@ -503,8 +470,8 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 /// A topic partition pair.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Topition {
-    topic: String,
-    partition: i32,
+    pub topic: String,
+    pub partition: i32,
 }
 
 impl Topition {
@@ -658,10 +625,10 @@ impl ListOffsetResponse {
 /// A structure representing an [`nisshi_sans_io::OffsetCommitRequestPartition](OffsetCommitRequestPartition).
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct OffsetCommitRequest {
-    offset: i64,
-    leader_epoch: Option<i32>,
-    timestamp: Option<SystemTime>,
-    metadata: Option<String>,
+    pub offset: i64,
+    pub leader_epoch: Option<i32>,
+    pub timestamp: Option<SystemTime>,
+    pub metadata: Option<String>,
 }
 
 impl OffsetCommitRequest {
@@ -803,10 +770,10 @@ pub struct BrokerRegistrationRequest {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct MetadataResponse {
-    cluster: Option<String>,
-    controller: Option<i32>,
-    brokers: Vec<MetadataResponseBroker>,
-    topics: Vec<MetadataResponseTopic>,
+    pub cluster: Option<String>,
+    pub controller: Option<i32>,
+    pub brokers: Vec<MetadataResponseBroker>,
+    pub topics: Vec<MetadataResponseTopic>,
 }
 
 impl MetadataResponse {
@@ -834,9 +801,9 @@ impl MetadataResponse {
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]
 pub struct OffsetStage {
-    last_stable: i64,
-    high_watermark: i64,
-    log_start: i64,
+    pub last_stable: i64,
+    pub high_watermark: i64,
+    pub log_start: i64,
 }
 
 impl OffsetStage {
@@ -1034,8 +1001,8 @@ pub enum GroupDetailResponse {
 /// or [`describe_groups_response::DescribedGroup`].
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NamedGroupDetail {
-    name: String,
-    response: GroupDetailResponse,
+    pub name: String,
+    pub response: GroupDetailResponse,
 }
 
 impl NamedGroupDetail {
@@ -1163,8 +1130,8 @@ pub struct PartitionDetail {
 /// Version representing an `e_tag` and `version` used in conditional writes to an object store.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Version {
-    e_tag: Option<String>,
-    version: Option<String>,
+    pub e_tag: Option<String>,
+    pub version: Option<String>,
 }
 
 impl From<&Uuid> for Version {
@@ -1336,6 +1303,31 @@ impl From<TxnState> for String {
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct StorageFactoryConfiguration {
+    pub node_id: i32,
+    pub cluster: String,
+    pub advertised_listener: Url,
+    pub storage: Url,
+    pub schema_registry: Option<Registry>,
+    pub lake_house: Option<House>,
+    pub cancellation: CancellationToken,
+}
+
+#[async_trait]
+pub trait StorageFactory: Debug + Send + Sync + 'static {
+    fn scheme(&self) -> Result<Regex>;
+
+    async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage>;
+}
+
+pub type DynStorageFactory = dyn StorageFactory;
+pub type ArcDynStorageFactory = Arc<DynStorageFactory>;
+
+// The existence of this function makes the compiler catch if the StorageFactory
+// trait is "object-safe" or not.
+fn _assert_storage_factory_trait_object(_s: &dyn StorageFactory) {}
 
 /// Storage
 ///
@@ -2136,62 +2128,8 @@ impl<T> From<tokio_postgres::error::Error> for UpdateError<T> {
 }
 
 /// Storage Container
-#[derive(Clone)]
-#[cfg_attr(
-    not(any(
-        feature = "dynostore",
-        feature = "libsql",
-        feature = "postgres",
-        feature = "slatedb",
-        feature = "turso"
-    )),
-    allow(missing_copy_implementations)
-)]
-pub enum StorageContainer {
-    Null(null::Engine),
-
-    #[cfg(feature = "postgres")]
-    Postgres(Postgres),
-
-    #[cfg(feature = "dynostore")]
-    DynoStore(DynoStore),
-
-    #[cfg(feature = "libsql")]
-    Lite(lite::Engine),
-
-    #[cfg(feature = "slatedb")]
-    Slate(slate::Engine),
-
-    #[cfg(feature = "turso")]
-    Turso(limbo::Engine),
-}
-
-impl Debug for StorageContainer {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Null(_) => f.debug_tuple(stringify!(StorageContainer::Null)).finish(),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(_) => f
-                .debug_tuple(stringify!(StorageContainer::Postgres))
-                .finish(),
-
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(_) => f
-                .debug_tuple(stringify!(StorageContainer::DynoStore))
-                .finish(),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(_) => f.debug_tuple(stringify!(StorageContainer::Lite)).finish(),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(_) => f.debug_tuple(stringify!(StorageContainer::Slate)).finish(),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(_) => f.debug_tuple(stringify!(StorageContainer::Turso)).finish(),
-        }
-    }
-}
+#[derive(Clone, Copy, Debug)]
+pub struct StorageContainer;
 
 impl StorageContainer {
     pub fn builder() -> PhantomBuilder {
@@ -2211,6 +2149,8 @@ pub struct Builder<N, C, A, S> {
     silent: bool,
 
     cancellation: CancellationToken,
+
+    factories: Vec<ArcDynStorageFactory>,
 }
 
 type PhantomBuilder =
@@ -2227,6 +2167,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            factories: self.factories,
         }
     }
 
@@ -2240,6 +2181,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            factories: self.factories,
         }
     }
 
@@ -2253,6 +2195,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            factories: self.factories,
         }
     }
 
@@ -2268,6 +2211,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            factories: self.factories,
         }
     }
 
@@ -2300,277 +2244,49 @@ impl<N, C, A, S> Builder<N, C, A, S> {
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
     }
+
+    pub fn with_factory(&mut self, factory: ArcDynStorageFactory) {
+        self.factories.push(factory);
+    }
+}
+
+impl From<Builder<i32, String, Url, Url>> for StorageFactoryConfiguration {
+    fn from(value: Builder<i32, String, Url, Url>) -> Self {
+        Self {
+            node_id: value.node_id,
+            cluster: value.cluster_id,
+            advertised_listener: value.advertised_listener,
+            storage: value.storage,
+            schema_registry: value.schema_registry,
+            lake_house: value.lake_house,
+            cancellation: value.cancellation,
+        }
+    }
 }
 
 impl Builder<i32, String, Url, Url> {
-    pub async fn build(self) -> Result<Arc<Box<dyn Storage>>> {
-        let storage = match self.storage.scheme() {
-            #[cfg(feature = "postgres")]
-            "postgres" | "postgresql" => Postgres::builder(self.storage.to_string().as_str())
-                .map(|builder| builder.cluster(self.cluster_id.as_str()))
-                .map(|builder| builder.node(self.node_id))
-                .map(|builder| builder.advertised_listener(self.advertised_listener.clone()))
-                .map(|builder| builder.schemas(self.schema_registry))
-                .map(|builder| builder.lake(self.lake_house.clone()))
-                .map(|builder| builder.build())
-                .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                .map(Arc::new),
-
-            #[cfg(not(feature = "postgres"))]
-            "postgres" | "postgresql" => Err(Error::FeatureNotEnabled {
-                feature: "postgres".into(),
+    pub async fn build(self) -> Result<ArcDynStorage> {
+        let Some(factory) = self
+            .factories
+            .iter()
+            .find(|factory| {
+                factory
+                    .scheme()
+                    .is_ok_and(|scheme| scheme.is_match(self.storage.scheme()))
+            })
+            .cloned()
+        else {
+            return Err(Error::FeatureNotEnabled {
+                feature: self.storage.scheme().into(),
                 message: self.storage.to_string(),
-            }),
+            });
+        };
 
-            #[cfg(feature = "dynostore")]
-            "s3" => {
-                use crate::batch::ProduceRequestBatcher;
+        let silent = self.silent;
 
-                let bucket_name = self.storage.host_str().unwrap_or("nisshi");
+        let storage = factory.build(self.into()).await?;
 
-                let minimum_size = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_min_size" {
-                        human_units::Size::from_str(v.as_ref())
-                            .map(|size| size.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                            .and_then(|size| usize::try_from(size).ok())
-                    } else {
-                        None
-                    }
-                });
-
-                let maximum_delay = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_max_delay" {
-                        human_units::Duration::from_str(v.as_ref())
-                            .map(|duration| duration.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                    } else {
-                        None
-                    }
-                });
-
-                debug!(?minimum_size, ?maximum_delay);
-
-                AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket_name)
-                    .with_conditional_put(S3ConditionalPut::ETagMatch)
-                    .build()
-                    .map(|object_store| {
-                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
-                            .advertised_listener(self.advertised_listener.clone())
-                            .schemas(self.schema_registry)
-                            .lake(self.lake_house.clone())
-                    })
-                    .map(|storage| {
-                        ProduceRequestBatcher::new(storage)
-                            .with_minimum_size(minimum_size)
-                            .with_maximum_delay(maximum_delay)
-                    })
-                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                    .map(Arc::new)
-                    .map_err(Into::into)
-            }
-
-            #[cfg(feature = "dynostore")]
-            "gs" => {
-                use std::num::NonZeroU32;
-
-                use object_store::gcp::GoogleCloudStorageBuilder;
-
-                use crate::{batch::ProduceRequestBatcher, gcs::limit::PutRateLimiter};
-
-                let bucket_name = self.storage.host_str().unwrap_or("nisshi");
-
-                let minimum_size = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_min_size" {
-                        human_units::Size::from_str(v.as_ref())
-                            .map(|size| size.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                            .and_then(|size| usize::try_from(size).ok())
-                    } else {
-                        None
-                    }
-                });
-
-                let maximum_delay = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_max_delay" {
-                        human_units::Duration::from_str(v.as_ref())
-                            .map(|duration| duration.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                    } else {
-                        None
-                    }
-                });
-
-                GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(bucket_name)
-                    .build()
-                    .map(|object_store| {
-                        PutRateLimiter::new(object_store, Duration::from_mins(5))
-                            .with_rate_per_second(NonZeroU32::new(1))
-                            .with_jitter(Some(Duration::from_millis(50)))
-                    })
-                    .map(|object_store| {
-                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
-                            .advertised_listener(self.advertised_listener.clone())
-                            .schemas(self.schema_registry)
-                            .lake(self.lake_house.clone())
-                    })
-                    .map(|storage| {
-                        ProduceRequestBatcher::new(storage)
-                            .with_minimum_size(minimum_size)
-                            .with_maximum_delay(maximum_delay)
-                    })
-                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                    .map(Arc::new)
-                    .map_err(Into::into)
-            }
-
-            #[cfg(feature = "dynostore")]
-            "memory" => Ok(
-                DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
-                    .advertised_listener(self.advertised_listener.clone())
-                    .schemas(self.schema_registry)
-                    .lake(self.lake_house.clone()),
-            )
-            .map(|storage| Box::new(storage) as Box<dyn Storage>)
-            .map(Arc::new),
-
-            #[cfg(not(feature = "dynostore"))]
-            "s3" | "memory" => Err(Error::FeatureNotEnabled {
-                feature: "dynostore".into(),
-                message: self.storage.to_string(),
-            }),
-
-            #[cfg(feature = "libsql")]
-            "sqlite" => {
-                lite::Engine::builder()
-                    .storage(self.storage.clone())
-                    .node(self.node_id)
-                    .cluster(self.cluster_id.clone())
-                    .advertised_listener(self.advertised_listener.clone())
-                    .schemas(self.schema_registry)
-                    .lake(self.lake_house.clone())
-                    .cancellation(self.cancellation.clone())
-                    .build()
-                    .await
-            }
-
-            #[cfg(not(feature = "libsql"))]
-            "sqlite" => Err(Error::FeatureNotEnabled {
-                feature: "libsql".into(),
-                message: self.storage.to_string(),
-            }),
-
-            #[cfg(feature = "slatedb")]
-            "slatedb" => {
-                use slatedb::Db;
-                use slatedb::object_store::{
-                    ObjectStore as SlateObjectStore,
-                    aws::{
-                        AmazonS3Builder as SlateS3Builder,
-                        S3ConditionalPut as SlateS3ConditionalPut,
-                    },
-                    memory::InMemory as SlateInMemory,
-                };
-
-                let host = self.storage.host_str().unwrap_or("nisshi");
-                let db_path = format!("nisshi-{}.slatedb", self.cluster_id);
-
-                // Support memory backend for testing: slatedb://memory
-                let object_store: Arc<dyn SlateObjectStore> = if host == "memory" {
-                    Arc::new(SlateInMemory::new())
-                } else {
-                    // Use S3 backend with host as bucket name
-                    SlateS3Builder::from_env()
-                        .with_bucket_name(host)
-                        .with_conditional_put(SlateS3ConditionalPut::ETagMatch)
-                        .build()
-                        .map(Arc::new)
-                        .map_err(|e| Error::Message(e.to_string()))?
-                };
-
-                Db::open(db_path, object_store)
-                    .await
-                    .map(Arc::new)
-                    .map(|db| {
-                        slate::Engine::builder()
-                            .cluster(self.cluster_id.clone())
-                            .node(self.node_id)
-                            .advertised_listener(self.advertised_listener.clone())
-                            .db(db)
-                            .schemas(self.schema_registry)
-                            .lake(self.lake_house)
-                            .build()
-                    })
-                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                    .map(Arc::new)
-                    .map_err(Into::into)
-            }
-
-            #[cfg(not(feature = "slatedb"))]
-            "slatedb" => Err(Error::FeatureNotEnabled {
-                feature: "slatedb".into(),
-                message: self.storage.to_string(),
-            }),
-
-            #[cfg(feature = "turso")]
-            "turso" => limbo::Engine::builder()
-                .storage(self.storage.clone())
-                .node(self.node_id)
-                .cluster(self.cluster_id.clone())
-                .advertised_listener(self.advertised_listener.clone())
-                .schemas(self.schema_registry)
-                .lake(self.lake_house.clone())
-                .build()
-                .await
-                .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                .map(Arc::new),
-
-            #[cfg(not(feature = "turso"))]
-            "turso" => Err(Error::FeatureNotEnabled {
-                feature: "turso".into(),
-                message: self.storage.to_string(),
-            }),
-
-            "null" => Ok(null::Engine::new(
-                self.cluster_id.clone(),
-                self.node_id,
-                self.advertised_listener.clone(),
-            ))
-            .map(|storage| Box::new(storage) as Box<dyn Storage>)
-            .map(Arc::new),
-
-            #[cfg(not(any(
-                feature = "dynostore",
-                feature = "libsql",
-                feature = "postgres",
-                feature = "slatedb",
-                feature = "turso"
-            )))]
-            _storage => Ok(null::Engine::new(
-                self.cluster_id.clone(),
-                self.node_id,
-                self.advertised_listener.clone(),
-            ))
-            .map(|storage| Box::new(storage) as Box<dyn Storage>)
-            .map(Arc::new),
-
-            #[cfg(any(
-                feature = "dynostore",
-                feature = "libsql",
-                feature = "postgres",
-                feature = "slatedb",
-                feature = "turso"
-            ))]
-            _unsupported => Err(Error::UnsupportedStorageUrl(self.storage.clone())),
-        }?;
-
-        let pb = if self.silent {
+        let pb = if silent {
             None
         } else {
             let pb = ProgressBar::new(1);
@@ -2596,7 +2312,7 @@ impl Builder<i32, String, Url, Url> {
     }
 }
 
-pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
+pub static METER: LazyLock<Meter> = LazyLock::new(|| {
     global::meter_with_scope(
         InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
             .with_version(env!("CARGO_PKG_VERSION"))
@@ -2605,1270 +2321,12 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
     )
 });
 
-static STORAGE_CONTAINER_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("nisshi_storage_container_requests")
-        .with_description("nisshi storage container requests")
-        .build()
-});
-
-static STORAGE_CONTAINER_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("nisshi_storage_container_errors")
-        .with_description("nisshi storage container errors")
-        .build()
-});
-
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ScramCredential {
     pub salt: Bytes,
     pub iterations: i32,
     pub stored_key: Bytes,
     pub server_key: Bytes,
-}
-
-#[async_trait]
-impl Storage for StorageContainer {
-    #[instrument(skip_all)]
-    async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        let attributes = [KeyValue::new("method", "register_broker")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.register_broker(broker_registration),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.register_broker(broker_registration),
-
-            Self::Null(engine) => engine.register_broker(broker_registration),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.register_broker(broker_registration),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.register_broker(broker_registration),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.register_broker(broker_registration),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn incremental_alter_resource(
-        &self,
-        resource: AlterConfigsResource,
-    ) -> Result<AlterConfigsResourceResponse> {
-        let attributes = [KeyValue::new("method", "incremental_alter_resource")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.incremental_alter_resource(resource),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.incremental_alter_resource(resource),
-
-            Self::Null(engine) => engine.incremental_alter_resource(resource),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.incremental_alter_resource(resource),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.incremental_alter_resource(resource),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.incremental_alter_resource(resource),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
-        let attributes = [KeyValue::new("method", "create_topic")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.create_topic(topic, validate_only),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.create_topic(topic, validate_only),
-
-            Self::Null(engine) => engine.create_topic(topic, validate_only),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.create_topic(topic, validate_only),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.create_topic(topic, validate_only),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.create_topic(topic, validate_only),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_records(
-        &self,
-        topics: &[DeleteRecordsTopic],
-    ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        let attributes = [KeyValue::new("method", "delete_records")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.delete_records(topics),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.delete_records(topics),
-
-            Self::Null(engine) => engine.delete_records(topics),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.delete_records(topics),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.delete_records(topics),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.delete_records(topics),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
-        let attributes = [KeyValue::new("method", "delete_topic")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.delete_topic(topic),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.delete_topic(topic),
-
-            Self::Null(engine) => engine.delete_topic(topic),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.delete_topic(topic),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.delete_topic(topic),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.delete_topic(topic),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        let attributes = [KeyValue::new("method", "brokers")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.brokers(),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.brokers(),
-
-            Self::Null(engine) => engine.brokers(),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.brokers(),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.brokers(),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.brokers(),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn produce(
-        &self,
-        transaction_id: Option<&str>,
-        topition: &Topition,
-        batch: deflated::Batch,
-    ) -> Result<i64> {
-        let attributes = [KeyValue::new("method", "produce")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.produce(transaction_id, topition, batch),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.produce(transaction_id, topition, batch),
-
-            Self::Null(engine) => engine.produce(transaction_id, topition, batch),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.produce(transaction_id, topition, batch),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.produce(transaction_id, topition, batch),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.produce(transaction_id, topition, batch),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn fetch(
-        &self,
-        topition: &'_ Topition,
-        offset: i64,
-        min_bytes: u32,
-        max_bytes: u32,
-        isolation: IsolationLevel,
-        max_wait: Duration,
-    ) -> Result<Vec<deflated::Batch>> {
-        let attributes = [KeyValue::new("method", "fetch")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => {
-                engine.fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            }
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => {
-                engine.fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            }
-
-            Self::Null(engine) => {
-                engine.fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            }
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => {
-                engine.fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            }
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => {
-                engine.fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            }
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => {
-                engine.fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            }
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        let attributes = [KeyValue::new("method", "offset_stage")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.offset_stage(topition),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.offset_stage(topition),
-
-            Self::Null(engine) => engine.offset_stage(topition),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.offset_stage(topition),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.offset_stage(topition),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.offset_stage(topition),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn list_offsets(
-        &self,
-        isolation_level: IsolationLevel,
-        offsets: &[(Topition, ListOffset)],
-    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        let attributes = [KeyValue::new("method", "list_offsets")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.list_offsets(isolation_level, offsets),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.list_offsets(isolation_level, offsets),
-
-            Self::Null(engine) => engine.list_offsets(isolation_level, offsets),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.list_offsets(isolation_level, offsets),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.list_offsets(isolation_level, offsets),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.list_offsets(isolation_level, offsets),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn offset_commit(
-        &self,
-        group_id: &str,
-        retention_time_ms: Option<Duration>,
-        offsets: &[(Topition, OffsetCommitRequest)],
-    ) -> Result<Vec<(Topition, ErrorCode)>> {
-        let attributes = [KeyValue::new("method", "offset_commit")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
-
-            Self::Null(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
-        let attributes = [KeyValue::new("method", "committed_offset_topitions")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.committed_offset_topitions(group_id),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.committed_offset_topitions(group_id),
-
-            Self::Null(engine) => engine.committed_offset_topitions(group_id),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.committed_offset_topitions(group_id),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.committed_offset_topitions(group_id),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.committed_offset_topitions(group_id),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn offset_fetch(
-        &self,
-        group_id: Option<&str>,
-        topics: &[Topition],
-        require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
-        let attributes = [KeyValue::new("method", "offset_fetch")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.offset_fetch(group_id, topics, require_stable),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.offset_fetch(group_id, topics, require_stable),
-
-            Self::Null(engine) => engine.offset_fetch(group_id, topics, require_stable),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.offset_fetch(group_id, topics, require_stable),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.offset_fetch(group_id, topics, require_stable),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.offset_fetch(group_id, topics, require_stable),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-        let attributes = [KeyValue::new("method", "metadata")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.metadata(topics),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.metadata(topics),
-
-            Self::Null(engine) => engine.metadata(topics),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.metadata(topics),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.metadata(topics),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.metadata(topics),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn describe_config(
-        &self,
-        name: &str,
-        resource: ConfigResource,
-        keys: Option<&[String]>,
-    ) -> Result<DescribeConfigsResult> {
-        let attributes = [KeyValue::new("method", "describe_config")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.describe_config(name, resource, keys),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.describe_config(name, resource, keys),
-
-            Self::Null(engine) => engine.describe_config(name, resource, keys),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.describe_config(name, resource, keys),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.describe_config(name, resource, keys),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.describe_config(name, resource, keys),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn describe_topic_partitions(
-        &self,
-        topics: Option<&[TopicId]>,
-        partition_limit: i32,
-        cursor: Option<Topition>,
-    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        let attributes = [KeyValue::new("method", "describe_topic_partitions")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => {
-                engine.describe_topic_partitions(topics, partition_limit, cursor)
-            }
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.describe_topic_partitions(topics, partition_limit, cursor),
-
-            Self::Null(engine) => engine.describe_topic_partitions(topics, partition_limit, cursor),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => {
-                engine.describe_topic_partitions(topics, partition_limit, cursor)
-            }
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => {
-                engine.describe_topic_partitions(topics, partition_limit, cursor)
-            }
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => {
-                engine.describe_topic_partitions(topics, partition_limit, cursor)
-            }
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        let attributes = [KeyValue::new("method", "list_groups")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.list_groups(states_filter),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.list_groups(states_filter),
-
-            Self::Null(engine) => engine.list_groups(states_filter),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.list_groups(states_filter),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.list_groups(states_filter),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.list_groups(states_filter),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_groups(
-        &self,
-        group_ids: Option<&[String]>,
-    ) -> Result<Vec<DeletableGroupResult>> {
-        let attributes = [KeyValue::new("method", "delete_groups")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.delete_groups(group_ids),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.delete_groups(group_ids),
-
-            Self::Null(engine) => engine.delete_groups(group_ids),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.delete_groups(group_ids),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.delete_groups(group_ids),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.delete_groups(group_ids),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn describe_groups(
-        &self,
-        group_ids: Option<&[String]>,
-        include_authorized_operations: bool,
-    ) -> Result<Vec<NamedGroupDetail>> {
-        let attributes = [KeyValue::new("method", "describe_groups")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => {
-                engine.describe_groups(group_ids, include_authorized_operations)
-            }
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.describe_groups(group_ids, include_authorized_operations),
-
-            Self::Null(engine) => engine.describe_groups(group_ids, include_authorized_operations),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => {
-                engine.describe_groups(group_ids, include_authorized_operations)
-            }
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.describe_groups(group_ids, include_authorized_operations),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.describe_groups(group_ids, include_authorized_operations),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn update_group(
-        &self,
-        group_id: &str,
-        detail: GroupDetail,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GroupDetail>> {
-        let attributes = [KeyValue::new("method", "update_group")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.update_group(group_id, detail, version),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.update_group(group_id, detail, version),
-
-            Self::Null(engine) => engine.update_group(group_id, detail, version),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.update_group(group_id, detail, version),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.update_group(group_id, detail, version),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.update_group(group_id, detail, version),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn init_producer(
-        &self,
-        transaction_id: Option<&str>,
-        transaction_timeout_ms: i32,
-        producer_id: Option<i64>,
-        producer_epoch: Option<i16>,
-    ) -> Result<ProducerIdResponse> {
-        let attributes = [KeyValue::new("method", "init_producer")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            ),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            ),
-
-            Self::Null(engine) => engine.init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            ),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            ),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            ),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            ),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_add_offsets(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        group_id: &str,
-    ) -> Result<ErrorCode> {
-        let attributes = [KeyValue::new("method", "txn_add_offsets")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => {
-                engine.txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            }
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => {
-                engine.txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            }
-
-            Self::Null(engine) => {
-                engine.txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            }
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => {
-                engine.txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            }
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => {
-                engine.txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            }
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => {
-                engine.txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            }
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_add_partitions(
-        &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
-        let attributes = [KeyValue::new("method", "txn_add_partitions")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.txn_add_partitions(partitions),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.txn_add_partitions(partitions),
-
-            Self::Null(engine) => engine.txn_add_partitions(partitions),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.txn_add_partitions(partitions),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.txn_add_partitions(partitions),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.txn_add_partitions(partitions),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_offset_commit(
-        &self,
-        offsets: TxnOffsetCommitRequest,
-    ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-        let attributes = [KeyValue::new("method", "txn_offset_commit")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.txn_offset_commit(offsets),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.txn_offset_commit(offsets),
-
-            Self::Null(engine) => engine.txn_offset_commit(offsets),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.txn_offset_commit(offsets),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.txn_offset_commit(offsets),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.txn_offset_commit(offsets),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_end(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        committed: bool,
-    ) -> Result<ErrorCode> {
-        let attributes = [KeyValue::new("method", "txn_end")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => {
-                engine.txn_end(transaction_id, producer_id, producer_epoch, committed)
-            }
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => {
-                engine.txn_end(transaction_id, producer_id, producer_epoch, committed)
-            }
-
-            Self::Null(engine) => {
-                engine.txn_end(transaction_id, producer_id, producer_epoch, committed)
-            }
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => {
-                engine.txn_end(transaction_id, producer_id, producer_epoch, committed)
-            }
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => {
-                engine.txn_end(transaction_id, producer_id, producer_epoch, committed)
-            }
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => {
-                engine.txn_end(transaction_id, producer_id, producer_epoch, committed)
-            }
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn maintain(&self, now: SystemTime) -> Result<()> {
-        let attributes = [KeyValue::new("method", "maintain")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.maintain(now),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.maintain(now),
-
-            Self::Null(engine) => engine.maintain(now),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.maintain(now),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.maintain(now),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.maintain(now),
-        }
-        .await
-        .inspect(|maintain| {
-            debug!(?maintain);
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|err| {
-            debug!(?err);
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
-        let attributes = [KeyValue::new("method", "maintain_transactions")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.maintain_transactions(now),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.maintain_transactions(now),
-
-            Self::Null(engine) => engine.maintain_transactions(now),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.maintain_transactions(now),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.maintain_transactions(now),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.maintain_transactions(now),
-        }
-        .await
-        .inspect(|maintain| {
-            debug!(?maintain);
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|err| {
-            debug!(?err);
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn aborted_transactions(
-        &self,
-        topition: &Topition,
-        offset: i64,
-        last_stable_offset: i64,
-    ) -> Result<Vec<AbortedTransaction>> {
-        let attributes = [KeyValue::new("method", "aborted_transactions")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => {
-                engine.aborted_transactions(topition, offset, last_stable_offset)
-            }
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.aborted_transactions(topition, offset, last_stable_offset),
-
-            Self::Null(engine) => engine.aborted_transactions(topition, offset, last_stable_offset),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => {
-                engine.aborted_transactions(topition, offset, last_stable_offset)
-            }
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => {
-                engine.aborted_transactions(topition, offset, last_stable_offset)
-            }
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => {
-                engine.aborted_transactions(topition, offset, last_stable_offset)
-            }
-        }
-        .await
-        .inspect(|aborted_transactions| {
-            debug!(?aborted_transactions);
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|err| {
-            debug!(?err);
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn cluster_id(&self) -> Result<String> {
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.cluster_id().await,
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.cluster_id().await,
-
-            Self::Null(engine) => engine.cluster_id().await,
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.cluster_id().await,
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.cluster_id().await,
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.cluster_id().await,
-        }
-    }
-
-    #[instrument(skip_all)]
-    async fn node(&self) -> Result<i32> {
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.node().await,
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.node().await,
-
-            Self::Null(engine) => engine.node().await,
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.node().await,
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.node().await,
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.node().await,
-        }
-    }
-
-    #[instrument(skip_all)]
-    async fn advertised_listener(&self) -> Result<Url> {
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.advertised_listener().await,
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.advertised_listener().await,
-
-            Self::Null(engine) => engine.advertised_listener().await,
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.advertised_listener().await,
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.advertised_listener().await,
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.advertised_listener().await,
-        }
-    }
-
-    async fn delete_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<()> {
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.delete_user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.delete_user_scram_credential(user, mechanism).await,
-
-            Self::Null(engine) => engine.delete_user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.delete_user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.delete_user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.delete_user_scram_credential(user, mechanism).await,
-        }
-    }
-
-    async fn upsert_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> Result<()> {
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => {
-                engine
-                    .upsert_user_scram_credential(user, mechanism, credential)
-                    .await
-            }
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => {
-                engine
-                    .upsert_user_scram_credential(user, mechanism, credential)
-                    .await
-            }
-
-            Self::Null(engine) => {
-                engine
-                    .upsert_user_scram_credential(user, mechanism, credential)
-                    .await
-            }
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => {
-                engine
-                    .upsert_user_scram_credential(user, mechanism, credential)
-                    .await
-            }
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => {
-                engine
-                    .upsert_user_scram_credential(user, mechanism, credential)
-                    .await
-            }
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => {
-                engine
-                    .upsert_user_scram_credential(user, mechanism, credential)
-                    .await
-            }
-        }
-    }
-
-    async fn user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<Option<ScramCredential>> {
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.user_scram_credential(user, mechanism).await,
-
-            Self::Null(engine) => engine.user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.user_scram_credential(user, mechanism).await,
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.user_scram_credential(user, mechanism).await,
-        }
-    }
-
-    #[instrument(skip_all)]
-    async fn ping(&self) -> Result<()> {
-        let attributes = [KeyValue::new("method", "ping")];
-
-        match self {
-            #[cfg(feature = "dynostore")]
-            Self::DynoStore(engine) => engine.ping(),
-
-            #[cfg(feature = "libsql")]
-            Self::Lite(engine) => engine.ping(),
-
-            Self::Null(engine) => engine.ping(),
-
-            #[cfg(feature = "postgres")]
-            Self::Postgres(engine) => engine.ping(),
-
-            #[cfg(feature = "turso")]
-            Self::Turso(engine) => engine.ping(),
-
-            #[cfg(feature = "slatedb")]
-            Self::Slate(engine) => engine.ping(),
-        }
-        .await
-        .inspect(|_| {
-            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
-        })
-        .inspect_err(|_| {
-            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
-        })
-    }
 }
 
 #[cfg(test)]

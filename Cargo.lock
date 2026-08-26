@@ -5801,11 +5801,11 @@ name = "nisshi-broker"
 version = "0.7.0-pre.2"
 dependencies = [
  "anyhow",
+ "assert_matches",
  "async-trait",
  "bytes",
  "clap",
  "console",
- "deadpool-postgres",
  "futures",
  "glob",
  "http-body-util",
@@ -5814,13 +5814,16 @@ dependencies = [
  "hyper-util",
  "indicatif",
  "jsonschema",
- "libsql",
  "nisshi-auth",
  "nisshi-model",
  "nisshi-sans-io",
  "nisshi-schema",
  "nisshi-service",
  "nisshi-storage",
+ "nisshi-storage-dynostore",
+ "nisshi-storage-null",
+ "nisshi-storage-slatedb",
+ "nisshi-storage-sql",
  "object_store 0.13.2",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -5837,13 +5840,11 @@ dependencies = [
  "slatedb",
  "thiserror 2.0.19",
  "tokio",
- "tokio-postgres",
  "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "turso",
  "url",
  "uuid",
 ]
@@ -6185,6 +6186,105 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "time",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "turso",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "nisshi-storage-dynostore"
+version = "0.7.0-pre.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cached",
+ "dotenv",
+ "futures",
+ "governor",
+ "human-units",
+ "nisshi-sans-io",
+ "nisshi-schema",
+ "nisshi-storage",
+ "object_store 0.13.2",
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "rama",
+ "rand 0.10.2",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "nisshi-storage-null"
+version = "0.7.0-pre.2"
+dependencies = [
+ "async-trait",
+ "nisshi-sans-io",
+ "nisshi-storage",
+ "regex",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "nisshi-storage-slatedb"
+version = "0.7.0-pre.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "nisshi-sans-io",
+ "nisshi-schema",
+ "nisshi-storage",
+ "postcard",
+ "regex",
+ "serde",
+ "slatedb",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "nisshi-storage-sql"
+version = "0.7.0-pre.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "deadpool",
+ "deadpool-postgres",
+ "futures",
+ "futures-util",
+ "glob",
+ "human-units",
+ "libsql",
+ "nisshi-sans-io",
+ "nisshi-schema",
+ "nisshi-storage",
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "rama",
+ "rand 0.10.2",
+ "regex",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",

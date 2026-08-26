@@ -16,7 +16,8 @@ members = [
     "nisshi-sans-io",
     "nisshi-schema",
     "nisshi-service",
-    "nisshi-storage",
+    "nisshi-storage", "nisshi-storage-dynostore",
+    "nisshi-storage-null", "nisshi-storage-slatedb", "nisshi-storage-sql",
     "nisshi-topic",
 ]
 
@@ -162,6 +163,10 @@ nisshi-sans-io = { version = "0.7.0-pre.2", path = "nisshi-sans-io", default-fea
 nisshi-schema = { version = "0.7.0-pre.2", path = "nisshi-schema", default-features = false }
 nisshi-service = { version = "0.7.0-pre.2", path = "nisshi-service", default-features = false }
 nisshi-storage = { version = "0.7.0-pre.2", path = "nisshi-storage", default-features = false }
+nisshi-storage-dynostore = { version = "0.7.0-pre.2", path = "nisshi-storage-dynostore", default-features = false }
+nisshi-storage-null = { version = "0.7.0-pre.2", path = "nisshi-storage-null", default-features = false }
+nisshi-storage-slatedb = { version = "0.7.0-pre.2", path = "nisshi-storage-slatedb", default-features = false }
+nisshi-storage-sql = { version = "0.7.0-pre.2", path = "nisshi-storage-sql", default-features = false }
 nisshi-topic = { version = "0.7.0-pre.2", path = "nisshi-topic", default-features = false }
 tempfile = "3"
 thiserror = "2.0"

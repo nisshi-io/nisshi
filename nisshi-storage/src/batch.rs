@@ -177,7 +177,7 @@ enum BatchResponse {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProduceRequestBatcher<G> {
+pub struct ProduceRequestBatcher<G> {
     storage: G,
     maximum_delay: Option<Duration>,
     minimum_size: Option<usize>,
@@ -207,7 +207,7 @@ impl<G> ProduceRequestBatcher<G>
 where
     G: Storage,
 {
-    pub(crate) fn new(storage: G) -> Self {
+    pub fn new(storage: G) -> Self {
         Self {
             storage,
             minimum_size: Default::default(),
@@ -218,14 +218,14 @@ where
         }
     }
 
-    pub(crate) fn with_minimum_size(self, minimum_size: Option<usize>) -> Self {
+    pub fn with_minimum_size(self, minimum_size: Option<usize>) -> Self {
         Self {
             minimum_size,
             ..self
         }
     }
 
-    pub(crate) fn with_maximum_delay(self, maximum_delay: Option<Duration>) -> Self {
+    pub fn with_maximum_delay(self, maximum_delay: Option<Duration>) -> Self {
         Self {
             maximum_delay,
             ..self
