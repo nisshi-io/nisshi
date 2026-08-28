@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
 use bytes::{BufMut, Bytes, BytesMut};
 use nisshi_broker::{
     Error, Result,
@@ -41,13 +42,16 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{ArcDynStorage, Storage, StorageContainer};
+use nisshi_storage::{ArcDynStorage, Storage};
 use rama::{Context, Layer as _, Service as _};
+use rand::{RngExt as _, rng};
 use rsasl::{
     config::SASLConfig,
     prelude::{Mechname, SASLClient, State},
 };
-use url::Url;
+use uuid::Uuid;
+
+mod common;
 
 type Broker = BytesFrameService<FrameRouteService<(), Error>>;
 
@@ -61,17 +65,6 @@ where
         .map(|frame_route| {
             (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
         })
-}
-
-async fn memory_storage() -> Result<ArcDynStorage> {
-    StorageContainer::builder()
-        .cluster_id("tansu")
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092").expect("listener"))
-        .storage(Url::parse("memory://tansu/").expect("storage"))
-        .build()
-        .await
-        .map_err(Into::into)
 }
 
 fn create_topics_frame(correlation_id: i32) -> Result<Bytes> {
@@ -109,10 +102,8 @@ fn is_not_authenticated<T>(result: &Result<T>) -> bool {
     )
 }
 
-#[tokio::test]
-async fn scram_rejects_unverified_client() -> Result<()> {
+async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result<()> {
     // The broker enforces SASL/SCRAM: `sasl_config` is Some(..).
-    let engine = memory_storage().await?;
     let sasl_config = nisshi_auth::configuration(engine.clone())
         .map(Some)
         .map_err(Error::from)?;
@@ -234,4 +225,108 @@ async fn scram_rejects_unverified_client() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
 }

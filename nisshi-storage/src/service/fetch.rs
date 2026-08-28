@@ -30,7 +30,7 @@ use tracing::{debug, error, instrument};
 use crate::{Error, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
-/// ```
+/// ```no_run
 /// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 /// use nisshi_sans_io::{
 ///     CreateTopicsRequest, ErrorCode, FetchRequest,

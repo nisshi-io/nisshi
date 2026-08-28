@@ -35,7 +35,7 @@ use nisshi_service::{
     BytesFrameLayer, ConsumerGroupLayer, ConsumerGroupService, FrameBytesLayer, FrameRouteService,
     LatencyIntroducingLayer,
 };
-use nisshi_storage::{Storage, StorageContainer};
+use nisshi_storage::Storage;
 use rama::{Context, Layer as _, Service};
 use rand::{RngExt, SeedableRng as _, rngs::SmallRng};
 use tokio::{
@@ -50,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 use url::Url;
 
-use crate::common::{alphanumeric_string, init_tracing};
+use crate::common::{alphanumeric_string, init_tracing, memory_storage};
 
 pub mod common;
 
@@ -528,14 +528,7 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
 
     let cluster = "nisshi";
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
+    let storage = memory_storage(cluster, NODE_ID).await?;
 
     let coordinator = Controller::with_storage(storage)?;
 
@@ -1193,7 +1186,6 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use crate::common::StorageType;
     use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
@@ -1204,15 +1196,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster.clone(),
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        memory_storage(cluster, node).await.map_err(Into::into)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1316,7 +1300,7 @@ mod in_memory {
 
 #[cfg(feature = "libsql")]
 mod lite {
-    use crate::common::StorageType;
+    use crate::common::lite_storage;
     use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
@@ -1327,15 +1311,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::Lite,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        lite_storage(cluster, node).await.map_err(Into::into)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1439,7 +1415,7 @@ mod lite {
 
 #[cfg(feature = "slatedb")]
 mod slatedb {
-    use crate::common::StorageType;
+    use crate::common::slate_storage;
     use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
@@ -1450,15 +1426,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::SlateDb,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        slate_storage(cluster, node).await.map_err(Into::into)
     }
 
     #[tokio::test(start_paused = true)]

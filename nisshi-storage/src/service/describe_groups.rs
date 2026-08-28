@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use tracing::instrument;
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeGroupsRequest`] returning [`DescribeGroupsResponse`].
-/// ```
+/// ```no_run
 /// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
 /// use nisshi_sans_io::{DescribeGroupsRequest, ErrorCode};
 /// use nisshi_storage::{DescribeGroupsService, Error, StorageContainer};

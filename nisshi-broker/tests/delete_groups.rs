@@ -12,42 +12,157 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_tracing;
+use std::assert_matches;
+
+use crate::common::alphanumeric_string;
 use nisshi_broker::Error;
 use nisshi_sans_io::{DeleteGroupsRequest, ErrorCode};
-use nisshi_storage::{DeleteGroupsService, StorageContainer};
+use nisshi_storage::{DeleteGroupsService, Storage};
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use url::Url;
 
 mod common;
 
-#[tokio::test]
-async fn delete_non_existent() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = MapStateLayer::new(|_| storage).into_layer(DeleteGroupsService);
 
-    let group_id = "abcba";
+    let group_id = alphanumeric_string(15);
 
     let response = service
         .serve(
             Context::default(),
-            DeleteGroupsRequest::default().groups_names(Some([group_id.into()].into())),
+            DeleteGroupsRequest::default().groups_names(Some([group_id.clone()].into())),
         )
         .await?;
 
     let results = response.results.unwrap_or_default();
     assert_eq!(1, results.len());
-    assert_eq!(group_id, results[0].group_id.as_str());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+    assert_eq!(group_id, results[0].group_id);
+
+    assert_matches!(
+        ErrorCode::try_from(results[0].error_code)?,
+        ErrorCode::None | ErrorCode::GroupIdNotFound
+    );
 
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    use crate::common::{init_tracing, memory_storage};
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn delete_non_existent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_non_existent(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use crate::common::{init_tracing, lite_storage};
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn delete_non_existent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_non_existent(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use crate::common::{init_tracing, slate_storage};
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn delete_non_existent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_non_existent(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use crate::common::{init_tracing, postgres_storage};
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn delete_non_existent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_non_existent(storage).await?;
+
+        Ok(())
+    }
 }

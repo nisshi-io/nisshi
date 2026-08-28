@@ -12,38 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_tracing;
+use crate::common::{
+    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
+    slate_storage,
+};
 use assert_matches::assert_matches;
 use nisshi_broker::Error;
+use nisshi_broker::Result;
 use nisshi_sans_io::{
     CreateTopicsRequest, CreateTopicsResponse, DeleteTopicsRequest, DeleteTopicsResponse,
     ErrorCode, NULL_TOPIC_ID, create_topics_request::CreatableTopic,
     delete_topics_request::DeleteTopicState, delete_topics_response::DeletableTopicResult,
 };
-use nisshi_storage::{CreateTopicsService, DeleteTopicsService, StorageContainer};
+use nisshi_storage::{ArcDynStorage, CreateTopicsService, DeleteTopicsService, Storage};
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-use url::Url;
+use rand::{RngExt as _, rng};
 use uuid::Uuid;
 
 mod common;
 
-#[tokio::test]
-async fn delete_unknown_by_name() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn delete_unknown_by_name(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
 
-    let topic = "pqr";
+    let topic = alphanumeric_string(15);
 
     let error_code = ErrorCode::UnknownTopicOrPartition;
 
@@ -54,12 +45,12 @@ async fn delete_unknown_by_name() -> Result<(), Error> {
                 DeletableTopicResult::default()
                     .error_code(error_code.into())
                     .error_message(Some(error_code.to_string()))
-                    .name(Some(topic.into())),
+                    .name(Some(topic.clone())),
             ])),
         service
             .serve(
                 Context::default(),
-                DeleteTopicsRequest::default().topic_names(Some(vec![topic.into()]))
+                DeleteTopicsRequest::default().topic_names(Some(vec![topic]))
             )
             .await?
     );
@@ -67,18 +58,7 @@ async fn delete_unknown_by_name() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn delete_unknown_by_uuid() -> Result<(), Error> {
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn delete_unknown_by_uuid(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
 
     let topic = Uuid::new_v4();
@@ -107,30 +87,17 @@ async fn delete_unknown_by_uuid() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn create_delete_create_by_name() -> Result<(), Error> {
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(), Error> {
     let create_topics = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
     };
 
-    let name = "pqr";
+    let name = alphanumeric_string(15);
     let num_partitions = 5;
     let replication_factor = 3;
     let assignments = Some([].into());
     let configs = Some([].into());
-
-    let topic = "pqr";
 
     let error_code = ErrorCode::None;
 
@@ -141,7 +108,7 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
                 CreateTopicsRequest::default()
                     .topics(Some(
                         [CreatableTopic::default()
-                            .name(name.into())
+                            .name(name.clone())
                             .num_partitions(num_partitions)
                             .replication_factor(replication_factor)
                             .assignments(assignments.clone())
@@ -153,7 +120,7 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
             .await?,
         CreateTopicsResponse { topics: Some(topics), ..} => {
             assert_eq!(topics.len(), 1);
-            assert_eq!(topic, topics[0].name.as_str());
+            assert_eq!(name, topics[0].name.as_str());
             assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
             assert_eq!(topics[0].topic_config_error_code, Some(0));
             assert_eq!(topics[0].num_partitions, Some(num_partitions));
@@ -176,7 +143,7 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
                 DeletableTopicResult::default()
                     .error_code(error_code.into())
                     .error_message(Some(error_code.to_string()))
-                    .name(Some(name.into()))
+                    .name(Some(name.clone()))
                     .topic_id(Some(NULL_TOPIC_ID)),
             ])),
         delete_topics
@@ -184,7 +151,7 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
                 Context::default(),
                 DeleteTopicsRequest::default().topics(Some(vec![
                     DeleteTopicState::default()
-                        .name(Some(name.into()))
+                        .name(Some(name.clone()))
                         .topic_id(NULL_TOPIC_ID),
                 ]))
             )
@@ -198,7 +165,7 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
                 CreateTopicsRequest::default()
                     .topics(Some(
                         [CreatableTopic::default()
-                            .name(name.into())
+                            .name(name.clone())
                             .num_partitions(num_partitions)
                             .replication_factor(replication_factor)
                             .assignments(assignments.clone())
@@ -210,7 +177,7 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
             .await?,
         CreateTopicsResponse { topics: Some(topics), ..} => {
             assert_eq!(topics.len(), 1);
-            assert_eq!(topic, topics[0].name.as_str());
+            assert_eq!(name, topics[0].name.as_str());
             assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
             assert_eq!(topics[0].topic_config_error_code, Some(0));
             assert_eq!(topics[0].num_partitions, Some(num_partitions));
@@ -220,4 +187,220 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
     );
 
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_name(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_uuid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_uuid(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_delete_create_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_delete_create_by_name(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_name(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_uuid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_uuid(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_delete_create_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_delete_create_by_name(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_name(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_uuid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_uuid(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_delete_create_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_delete_create_by_name(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_name(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_uuid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_uuid(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_delete_create_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_delete_create_by_name(storage).await?;
+
+        Ok(())
+    }
 }

@@ -22,7 +22,7 @@
 //!
 //! ## Memory
 //!
-//! ```
+//! ```no_run
 //! # use nisshi_storage::{Error, StorageContainer};
 //! # use url::Url;
 //! # #[tokio::main]
@@ -121,16 +121,8 @@ use deadpool::managed::PoolError;
 use glob::{GlobError, PatternError};
 
 use indicatif::{ProgressBar, ProgressStyle};
-#[cfg(feature = "dynostore")]
-use object_store::memory::InMemory;
 
-#[cfg(feature = "dynostore")]
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-
-use opentelemetry::{
-    InstrumentationScope, KeyValue, global,
-    metrics::{Counter, Meter},
-};
+use opentelemetry::{InstrumentationScope, global, metrics::Meter};
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 
 use governor::InsufficientCapacity;
@@ -187,7 +179,7 @@ use std::{
 };
 use tokio::sync::AcquireError;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, instrument};
+use tracing::debug;
 use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;

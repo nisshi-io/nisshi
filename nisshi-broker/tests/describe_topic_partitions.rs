@@ -12,32 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_tracing;
-use nisshi_broker::Error;
+use crate::common::{
+    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
+    slate_storage,
+};
+use nisshi_broker::Result;
 use nisshi_sans_io::{
     DescribeTopicPartitionsRequest, ErrorCode, describe_topic_partitions_request::TopicRequest,
 };
-use nisshi_storage::{DescribeTopicPartitionsService, StorageContainer};
+use nisshi_storage::{ArcDynStorage, DescribeTopicPartitionsService, Storage};
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use url::Url;
+use rand::{RngExt as _, rng};
+use uuid::Uuid;
 
 mod common;
 
-#[tokio::test]
-async fn req() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let service = MapStateLayer::new(|_| storage).into_layer(DescribeTopicPartitionsService);
 
-    let topic = "abcba";
+    let topic = &alphanumeric_string(15)[..];
 
     let response = service
         .serve(
@@ -56,4 +49,108 @@ async fn req() -> Result<(), Error> {
     assert_eq!(Some(topic), topics[0].name.as_deref());
 
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn simple() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::simple(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn simple() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::simple(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn simple() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::simple(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn simple() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::simple(storage).await?;
+
+        Ok(())
+    }
 }

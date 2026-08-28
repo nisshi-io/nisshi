@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,38 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_tracing;
-use nisshi_broker::Error;
+use crate::common::{
+    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
+    slate_storage,
+};
+use nisshi_broker::Result;
 use nisshi_sans_io::{
     CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, MetadataRequest,
     create_topics_request::CreatableTopic, metadata_request::MetadataRequestTopic,
 };
-use nisshi_storage::{CreateTopicsService, DeleteTopicsService, MetadataService, StorageContainer};
+use nisshi_storage::{
+    ArcDynStorage, CreateTopicsService, DeleteTopicsService, MetadataService, Storage,
+};
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use rand::{distr::Alphanumeric, prelude::*, rng};
-use url::Url;
+use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 mod common;
 
-#[tokio::test]
-async fn topic_lifecycle() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7().to_string();
-    let node_id = rng().random_range(0..i32::MAX);
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id)
-        .node_id(node_id)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
     let create_topic = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
@@ -59,11 +46,7 @@ async fn topic_lifecycle() -> Result<(), Error> {
         MapStateLayer::new(|_| storage).into_layer(MetadataService)
     };
 
-    let name = &rng()
-        .sample_iter(&Alphanumeric)
-        .take(15)
-        .map(char::from)
-        .collect::<String>()[..];
+    let name = &alphanumeric_string(15)[..];
 
     let num_partitions = rng().random_range(1..64);
     let replication_factor = rng().random_range(0..64);
@@ -197,4 +180,108 @@ async fn topic_lifecycle() -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn topic_lifecycle() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::topic_lifecycle(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn topic_lifecycle() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::topic_lifecycle(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn topic_lifecycle() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::topic_lifecycle(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn topic_lifecycle() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::topic_lifecycle(storage).await?;
+
+        Ok(())
+    }
 }

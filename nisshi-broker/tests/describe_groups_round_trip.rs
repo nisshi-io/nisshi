@@ -24,71 +24,29 @@
 
 mod common;
 
-use std::{slice::from_ref, thread};
-
-use crate::common::init_tracing;
-use nisshi_broker::Error;
-use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, GroupDetail, Storage, StorageContainer,
+use crate::common::{
+    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
+    slate_storage,
 };
+use nisshi_broker::{Error, Result};
+use nisshi_storage::{ArcDynStorage, GroupDetail, Storage};
 use rand::{prelude::*, rng};
 use tracing::debug;
-use url::Url;
 use uuid::Uuid;
 
-fn storage_url(scheme: &str) -> Result<Url, Error> {
-    thread::current()
-        .name()
-        .ok_or_else(|| Error::Message("unnamed thread".into()))
-        .map(|name| {
-            format!(
-                "{scheme}://../logs/{}/{}::{name}.db",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_CRATE_NAME"),
-            )
-        })
-        .and_then(|url| Url::parse(&url).map_err(Into::into))
-}
-
-async fn build_storage(scheme: &str, cluster: &str, node: i32) -> Result<ArcDynStorage, Error> {
-    StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(node)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
-        .storage(storage_url(scheme)?)
-        .build()
-        .await
-        .map_err(Into::into)
-}
-
-async fn round_trip(scheme: &str) -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7().to_string();
-    let node_id = rng().random_range(0..i32::MAX);
-    let group_id = format!("test-group-{}", Uuid::now_v7());
-
-    let storage = build_storage(scheme, &cluster_id, node_id).await?;
-
-    storage
-        .register_broker(BrokerRegistrationRequest {
-            broker_id: node_id,
-            cluster_id: cluster_id.clone(),
-            incarnation_id: Uuid::new_v4(),
-            rack: None,
-        })
-        .await?;
+async fn round_trip(storage: impl Storage + Clone) -> Result<(), Error> {
+    let group_id = &alphanumeric_string(15)[..];
 
     let detail = GroupDetail::default();
 
     let _version = storage
-        .update_group(&group_id, detail.clone(), None)
+        .update_group(group_id, detail.clone(), None)
         .await
         .inspect(|version| debug!(?version))
         .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
 
     let described = storage
-        .describe_groups(Some(from_ref(&group_id)), false)
+        .describe_groups(Some(&[group_id.into()]), false)
         .await?;
 
     assert_eq!(1, described.len(), "describe_groups must return one entry");
@@ -96,18 +54,106 @@ async fn round_trip(scheme: &str) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(feature = "libsql")]
-#[tokio::test]
-async fn libsql_describe_groups_round_trip() -> Result<(), Error> {
-    round_trip("sqlite").await
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn round_trip() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::round_trip(storage).await?;
+
+        Ok(())
+    }
 }
 
-// The turso end-to-end harness is unstable (existing turso tests in
-// `nisshi-broker` are all `#[ignore]`); run this by hand with
-// `cargo test --features turso -- --ignored` once the harness lands.
-#[cfg(feature = "turso")]
-#[ignore]
-#[tokio::test]
-async fn turso_describe_groups_round_trip() -> Result<(), Error> {
-    round_trip("turso").await
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn round_trip() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::round_trip(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn round_trip() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::round_trip(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn round_trip() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::round_trip(storage).await?;
+
+        Ok(())
+    }
 }

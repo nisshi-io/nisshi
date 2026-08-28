@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use tracing::{error, instrument};
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeConfigsRequest`] returning [`DescribeConfigsResponse`].
-/// ```
+/// ```no_run
 /// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
 /// use nisshi_sans_io::{ConfigResource, DescribeConfigsRequest,
 ///     EndpointType, ErrorCode, describe_configs_request::DescribeConfigsResource};

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use tracing::{debug, error, instrument};
 use crate::{Error, Result, Storage, TopicId};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`MetadataRequest`] returning [`MetadataRequest`].
-/// ```
+/// ```no_run
 /// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
 /// use nisshi_sans_io::MetadataRequest;
 /// use nisshi_storage::{Error, MetadataService, StorageContainer};

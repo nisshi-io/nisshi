@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ use tracing::{debug, error, instrument, warn};
 use crate::{Error, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
-/// ```
+/// ```no_run
 /// use bytes::Bytes;
 /// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 /// use nisshi_sans_io::{

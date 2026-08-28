@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_tracing;
+use crate::common::{
+    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
+    slate_storage,
+};
 use bytes::Bytes;
-use nisshi_broker::Error;
+use nisshi_broker::Result;
 use nisshi_sans_io::{
     CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest, IsolationLevel,
     ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse,
@@ -29,13 +32,12 @@ use nisshi_sans_io::{
     },
 };
 use nisshi_storage::{
-    CreateTopicsService, DeleteTopicsService, InitProducerIdService, ListOffsetsService,
-    ProduceService, StorageContainer,
+    ArcDynStorage, CreateTopicsService, DeleteTopicsService, InitProducerIdService,
+    ListOffsetsService, ProduceService, Storage,
 };
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-use rand::{distr::Alphanumeric, prelude::*, rng};
+use rand::{RngExt as _, rng};
 use tracing::debug;
-use url::Url;
 use uuid::Uuid;
 
 mod common;
@@ -44,7 +46,7 @@ fn topic_data(
     topic: &str,
     index: i32,
     builder: inflated::Builder,
-) -> Result<Option<Vec<TopicProduceData>>, Error> {
+) -> Result<Option<Vec<TopicProduceData>>> {
     builder
         .build()
         .and_then(deflated::Batch::try_from)
@@ -65,24 +67,41 @@ fn topic_data(
         .map_err(Into::into)
 }
 
-#[tokio::test]
-async fn non_txn_idempotent_unknown_producer_id() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -> Result<()> {
+    let topic = &alphanumeric_string(15)[..];
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
+    let create_topic = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    };
 
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
+    let num_partitions = rng().random_range(1..64);
+    let replication_factor = rng().random_range(0..64);
 
-    let topic = "pqr";
-    let index = 0;
+    {
+        let response = create_topic
+            .serve(
+                Context::default(),
+                CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(topic.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let index = rng().random_range(0..num_partitions);
 
     let transactional_id = None;
     let acks = 0;
@@ -101,7 +120,7 @@ async fn non_txn_idempotent_unknown_producer_id() -> Result<(), Error> {
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    topic,
+                    &topic[..],
                     index,
                     inflated::Batch::builder()
                         .record(Record::builder().value(Bytes::from_static(b"lorem").into()))
@@ -135,24 +154,41 @@ async fn non_txn_idempotent_unknown_producer_id() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn non_txn_idempotent() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
+    let topic = &alphanumeric_string(15)[..];
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
+    let create_topic = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    };
 
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
+    let num_partitions = rng().random_range(1..64);
+    let replication_factor = rng().random_range(0..64);
 
-    let topic = "pqr";
-    let index = 0;
+    {
+        let response = create_topic
+            .serve(
+                Context::default(),
+                CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(topic.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let index = rng().random_range(0..num_partitions);
 
     let init_producer_id = {
         let storage = storage.clone();
@@ -315,24 +351,41 @@ async fn non_txn_idempotent() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn non_txn_idempotent_duplicate_sequence() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) -> Result<()> {
+    let topic = &alphanumeric_string(15)[..];
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
+    let create_topic = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    };
 
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
+    let num_partitions = rng().random_range(1..64);
+    let replication_factor = rng().random_range(0..64);
 
-    let topic = "pqr";
-    let index = 0;
+    {
+        let response = create_topic
+            .serve(
+                Context::default(),
+                CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(topic.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let index = rng().random_range(0..num_partitions);
 
     let init_producer_id = {
         let storage = storage.clone();
@@ -367,7 +420,7 @@ async fn non_txn_idempotent_duplicate_sequence() -> Result<(), Error> {
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    topic,
+                    &topic[..],
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -409,7 +462,7 @@ async fn non_txn_idempotent_duplicate_sequence() -> Result<(), Error> {
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    topic,
+                    &topic[..],
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -446,22 +499,7 @@ async fn non_txn_idempotent_duplicate_sequence() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone) -> Result<()> {
     let init_producer_id = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(InitProducerIdService)
@@ -472,8 +510,40 @@ async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
         MapStateLayer::new(|_| storage).into_layer(ProduceService)
     };
 
-    let topic = "pqr";
-    let index = 0;
+    let topic = &alphanumeric_string(15)[..];
+
+    let create_topic = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    };
+
+    let num_partitions = rng().random_range(1..64);
+    let replication_factor = rng().random_range(0..64);
+
+    {
+        let response = create_topic
+            .serve(
+                Context::default(),
+                CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(topic.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let index = rng().random_range(0..num_partitions);
 
     let producer = init_producer_id
         .serve(
@@ -498,7 +568,7 @@ async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    topic,
+                    &topic[..],
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -540,7 +610,7 @@ async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    topic,
+                    &topic[..],
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -578,24 +648,7 @@ async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn list_offsets() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7().to_string();
-    let node_id = rng().random_range(0..i32::MAX);
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id)
-        .node_id(node_id)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
     let create_topic = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
@@ -616,11 +669,7 @@ async fn list_offsets() -> Result<(), Error> {
         MapStateLayer::new(|_| storage).into_layer(ProduceService)
     };
 
-    let name = &rng()
-        .sample_iter(&Alphanumeric)
-        .take(15)
-        .map(char::from)
-        .collect::<String>()[..];
+    let name = &alphanumeric_string(15)[..];
 
     let num_partitions = rng().random_range(1..64);
     let replication_factor = rng().random_range(0..64);
@@ -838,110 +887,329 @@ async fn list_offsets() -> Result<(), Error> {
     Ok(())
 }
 
-mod doctest_template {
-    use crate::common::init_tracing;
-    use bytes::Bytes;
-    use nisshi_broker::Error;
-    use nisshi_sans_io::{
-        CreateTopicsRequest, ErrorCode, ProduceRequest,
-        create_topics_request::CreatableTopic,
-        produce_request::{PartitionProduceData, TopicProduceData},
-        record::{Record, deflated::Frame, inflated},
-    };
-    use nisshi_storage::{CreateTopicsService, ProduceService, StorageContainer};
-    use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-    use url::Url;
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
 
     #[tokio::test]
-    async fn req() -> Result<(), Error> {
+    async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
         let _guard = init_tracing()?;
 
-        const CLUSTER_ID: &str = "nisshi";
-        const NODE_ID: i32 = 111;
-        const HOST: &str = "localhost";
-        const PORT: i32 = 9092;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
 
-        let storage = StorageContainer::builder()
-            .cluster_id(CLUSTER_ID)
-            .node_id(NODE_ID)
-            .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-            .storage(Url::parse("memory://nisshi/")?)
-            .build()
-            .await?;
+        let storage = storage_container(cluster_id, broker_id).await?;
 
-        let create_topic = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-        };
+        super::non_txn_idempotent_unknown_producer_id(storage).await?;
 
-        let name = "abcba";
+        Ok(())
+    }
 
-        let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .topics(Some(vec![
-                        CreatableTopic::default()
-                            .name(name.into())
-                            .num_partitions(5)
-                            .replication_factor(3)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into())),
-                    ]))
-                    .validate_only(Some(false)),
-            )
-            .await?;
+    #[tokio::test]
+    async fn non_txn_idempotent() -> Result<()> {
+        let _guard = init_tracing()?;
 
-        let topics = response.topics.unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
 
-        let produce = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(ProduceService)
-        };
+        let storage = storage_container(cluster_id, broker_id).await?;
 
-        let partition = 0;
+        super::non_txn_idempotent(storage).await?;
 
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(name.into())
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(partition)
-                                .records(Some(Frame {
-                                    batches: vec![
-                                        inflated::Batch::builder()
-                                            .record(
-                                                Record::builder().value(
-                                                    Bytes::from_static(
-                                                        b"Lorem ipsum dolor sit amet",
-                                                    )
-                                                    .into(),
-                                                ),
-                                            )
-                                            .build()
-                                            .and_then(TryInto::try_into)?,
-                                    ],
-                                }))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-            )
-            .await?;
+        Ok(())
+    }
 
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
+    #[tokio::test]
+    async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_sequence_out_of_order() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_sequence_out_of_order(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_offsets() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::list_offsets(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_unknown_producer_id(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_sequence_out_of_order() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_sequence_out_of_order(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_offsets() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::list_offsets(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_unknown_producer_id(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_sequence_out_of_order() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_sequence_out_of_order(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_offsets() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::list_offsets(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_unknown_producer_id(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_sequence_out_of_order() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_sequence_out_of_order(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_offsets() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::list_offsets(storage).await?;
 
         Ok(())
     }

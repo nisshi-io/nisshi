@@ -184,18 +184,6 @@ impl Builder {
             lake: self.lake,
         }
     }
-
-    /// Try to build the Engine, returning None if required fields are missing
-    pub(crate) fn try_build(self) -> Option<Engine> {
-        Some(Engine {
-            cluster: self.cluster?,
-            node: self.node?,
-            advertised_listener: self.advertised_listener?,
-            db: self.db?,
-            schemas: self.schemas,
-            lake: self.lake,
-        })
-    }
 }
 
 impl Engine {

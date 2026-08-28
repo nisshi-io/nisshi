@@ -254,6 +254,62 @@ pub(crate) async fn storage_container(
     Ok(storage)
 }
 
+pub(crate) async fn memory_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::InMemory,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lite_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::Lite,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn slate_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::SlateDb,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn postgres_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::Postgres,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
 pub(crate) fn alphanumeric_string(length: usize) -> String {
     rng()
         .sample_iter(&Alphanumeric)

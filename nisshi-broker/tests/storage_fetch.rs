@@ -15,6 +15,8 @@
 mod common;
 
 mod doctest_template {
+    use std::sync::Arc;
+
     use crate::common::init_tracing;
     use nisshi_broker::Error;
     use nisshi_sans_io::{
@@ -35,7 +37,14 @@ mod doctest_template {
         const HOST: &str = "localhost";
         const PORT: i32 = 9092;
 
-        let storage = StorageContainer::builder()
+        let builder = {
+            let mut builder = StorageContainer::builder();
+            builder.with_factory(Arc::new(nisshi_storage_dynostore::MemoryEngineFactory));
+
+            builder
+        };
+
+        let storage = builder
             .cluster_id(CLUSTER_ID)
             .node_id(NODE_ID)
             .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)

@@ -350,20 +350,15 @@ where
 mod pg {
     use nisshi_storage::ArcDynStorage;
 
+    use crate::common::postgres_storage;
+
     use super::*;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::Postgres,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
+        postgres_storage(cluster, node).await
     }
 
     #[tokio::test]

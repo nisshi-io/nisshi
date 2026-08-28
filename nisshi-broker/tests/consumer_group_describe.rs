@@ -12,29 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_tracing;
-use nisshi_broker::Error;
+use nisshi_broker::Result;
 use nisshi_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};
-use nisshi_storage::{ConsumerGroupDescribeService, StorageContainer};
+use nisshi_storage::{ConsumerGroupDescribeService, Storage};
 use rama::{Context, Layer, Service as _, layer::MapStateLayer};
 use tracing::debug;
 use url::Url;
 
+use crate::common::register_broker;
+
 mod common;
 
-#[tokio::test]
-async fn describe_non_existent_group() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+pub async fn describe_non_existent_group<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    advertised_listener: Url,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    debug!(broker_id, %advertised_listener);
+    register_broker(cluster_id, broker_id, &sc).await?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(ConsumerGroupDescribeService);
+    let service = MapStateLayer::new(|_| sc).into_layer(ConsumerGroupDescribeService);
 
     let group_id = "abc";
 
@@ -55,4 +57,47 @@ async fn describe_non_existent_group() -> Result<(), Error> {
     assert_eq!("Empty", groups[0].group_state.as_str());
 
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use nisshi_storage::ArcDynStorage;
+
+    use common::{StorageType, init_tracing};
+    use rand::{prelude::*, rng};
+    use uuid::Uuid;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+        advertised_listener: Url,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(
+            StorageType::InMemory,
+            cluster,
+            node,
+            advertised_listener,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn describe_non_existent_group() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster = Uuid::now_v7();
+        let node = rng().random_range(0..i32::MAX);
+        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+
+        super::describe_non_existent_group(
+            cluster,
+            node,
+            advertised_listener.clone(),
+            storage_container(cluster, node, advertised_listener).await?,
+        )
+        .await
+    }
 }

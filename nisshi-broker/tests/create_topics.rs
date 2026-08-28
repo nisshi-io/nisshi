@@ -12,35 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::init_tracing;
+use crate::common::{alphanumeric_string, init_tracing};
 use nisshi_broker::Error;
 use nisshi_sans_io::{
     CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID,
     create_topics_request::CreatableTopic, describe_topic_partitions_request::TopicRequest,
 };
-use nisshi_storage::{CreateTopicsService, DescribeTopicPartitionsService, StorageContainer};
+use nisshi_storage::{CreateTopicsService, DescribeTopicPartitionsService, Storage};
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-use url::Url;
 
 mod common;
 
-#[tokio::test]
-async fn create() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn create(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
 
-    let name = "pqr";
+    let name = alphanumeric_string(15);
     let num_partitions = 5;
     let replication_factor = 3;
     let assignments = Some([].into());
@@ -52,7 +38,7 @@ async fn create() -> Result<(), Error> {
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
-                        .name(name.into())
+                        .name(name.clone())
                         .num_partitions(num_partitions)
                         .replication_factor(replication_factor)
                         .assignments(assignments)
@@ -74,26 +60,13 @@ async fn create() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn create_with_default() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Result<(), Error> {
     let service = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
     };
 
-    let name = "pqr";
+    let name = alphanumeric_string(15);
     let num_partitions = -1;
     let replication_factor = -1;
     let assignments = Some([].into());
@@ -105,7 +78,7 @@ async fn create_with_default() -> Result<(), Error> {
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
-                        .name(name.into())
+                        .name(name.clone())
                         .num_partitions(num_partitions)
                         .replication_factor(replication_factor)
                         .assignments(assignments)
@@ -133,13 +106,13 @@ async fn create_with_default() -> Result<(), Error> {
         .serve(
             Context::default(),
             DescribeTopicPartitionsRequest::default()
-                .topics(Some([TopicRequest::default().name(name.into())].into())),
+                .topics(Some([TopicRequest::default().name(name.clone())].into())),
         )
         .await?;
 
     let topics = response.topics.unwrap_or_default();
     assert_eq!(1, topics.len());
-    assert_eq!(Some(name), topics[0].name.as_deref());
+    assert_eq!(Some(name), topics[0].name);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
     let partitions = topics[0].partitions.as_deref().unwrap_or_default();
 
@@ -174,23 +147,10 @@ async fn create_with_default() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::test]
-async fn duplicate() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id("nisshi")
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://nisshi/")?)
-        .build()
-        .await?;
-
+async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
 
-    let name = "pqr";
+    let name = alphanumeric_string(15);
     let num_partitions = 5;
     let replication_factor = 3;
     let assignments = Some([].into());
@@ -202,7 +162,7 @@ async fn duplicate() -> Result<(), Error> {
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
-                        .name(name.into())
+                        .name(name.clone())
                         .num_partitions(num_partitions)
                         .replication_factor(replication_factor)
                         .assignments(assignments.clone())
@@ -227,7 +187,7 @@ async fn duplicate() -> Result<(), Error> {
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
-                        .name(name.into())
+                        .name(name.clone())
                         .num_partitions(num_partitions)
                         .replication_factor(replication_factor)
                         .assignments(assignments)
@@ -249,4 +209,245 @@ async fn duplicate() -> Result<(), Error> {
         ErrorCode::try_from(topics[0].error_code)?
     );
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    use crate::common::memory_storage;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn create() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_with_default() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_with_default(broker_id, storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::duplicate(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use crate::common::lite_storage;
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn create() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_with_default() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_with_default(broker_id, storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::duplicate(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use crate::common::slate_storage;
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn create() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_with_default() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_with_default(broker_id, storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::duplicate(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use crate::common::postgres_storage;
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn create() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_with_default() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_with_default(broker_id, storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::duplicate(storage).await?;
+
+        Ok(())
+    }
 }
