@@ -205,6 +205,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             "producer_update_sequence.sql",
             include_sql!("sql/producer_update_sequence.sql"),
         ),
+        (
+            "record_control_marker_select_pg.sql",
+            include_sql!("pg/record_control_marker_select.sql"),
+        ),
         ("record_copy.sql", include_sql!("sql/record_copy.sql")),
         (
             "record_delete_by_topic.sql",
