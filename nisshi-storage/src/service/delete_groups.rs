@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, DeleteGroupsRequest, DeleteGroupsResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, DeleteGroupsRequest, DeleteGroupsResponse, RequestInput};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteGroupsRequest`] returning [`DeleteGroupsResponse`].
 /// ```no_run
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
+/// use rama::Service as _;
 /// use nisshi_sans_io::{DeleteGroupsRequest, ErrorCode};
 /// use nisshi_storage::{DeleteGroupsService, Error, StorageContainer};
 /// use url::Url;
@@ -35,13 +35,12 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DeleteGroupsService);
+/// let service = DeleteGroupsService { storage };
 ///
 /// let group_id = "abcba";
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         DeleteGroupsRequest::default().groups_names(Some([group_id.into()].into())),
 ///     )
 ///     .await?;
@@ -53,28 +52,29 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DeleteGroupsService;
+#[derive(Clone, Debug)]
+pub struct DeleteGroupsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DeleteGroupsService {
+impl<G> ApiKey for DeleteGroupsService<G> {
     const KEY: i16 = DeleteGroupsRequest::KEY;
 }
 
-impl<G> Service<G, DeleteGroupsRequest> for DeleteGroupsService
+impl<G, I> Service<I> for DeleteGroupsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DeleteGroupsRequest>> + Send + 'static,
 {
-    type Response = DeleteGroupsResponse;
+    type Output = DeleteGroupsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DeleteGroupsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .delete_groups(req.groups_names.as_deref())
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
+        self.storage
+            .delete_groups(input.request.groups_names.as_deref())
             .await
             .map(Some)
             .map(|results| {

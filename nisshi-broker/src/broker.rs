@@ -24,8 +24,9 @@ use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nisshi_sans_io::{ErrorCode, RootMessageMeta};
 use nisshi_schema::{Registry, lake::House};
+use nisshi_service::ProgressBarExtension;
 use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
-use rama::{Context, Service};
+use rama::{Service, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
@@ -296,7 +297,7 @@ where
             tokio::select! {
                 Ok((stream, addr)) = listener.accept() => {
 
-                    let mut c = Context::default();
+                    let extensions = Extensions::default();
 
                     let pb = if self.silent {
                         None
@@ -307,7 +308,7 @@ where
                         pb.set_message("connected");
                         pb.tick();
 
-                        _ = c.insert(pb.clone());
+                        _ = extensions.insert(ProgressBarExtension::new(pb.clone()));
                         Some(pb)
                     };
 
@@ -321,8 +322,10 @@ where
                         self.sasl_config.clone()
                     )?;
 
+                    let stream = TcpStream::from_tokio_tcp_stream(stream, extensions);
+
                     let handle = set.spawn(async move {
-                            match service.serve(c, stream).await {
+                            match service.serve(stream).await {
                                 Err(Error::Io(ref io))
                                     if io.kind() == ErrorKind::UnexpectedEof
                                         || io.kind() == ErrorKind::BrokenPipe

@@ -19,7 +19,7 @@ use crate::common::{
 use nisshi_broker::Result;
 use nisshi_sans_io::{
     ConfigResource, CreateTopicsRequest, DescribeConfigsRequest, ErrorCode,
-    IncrementalAlterConfigsRequest, OpType,
+    IncrementalAlterConfigsRequest, OpType, RequestInput,
     create_topics_request::CreatableTopic,
     describe_configs_request::DescribeConfigsResource,
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
@@ -28,7 +28,7 @@ use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, DescribeConfigsService, IncrementalAlterConfigsService,
     Storage,
 };
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use tracing::debug;
 use uuid::Uuid;
@@ -38,22 +38,23 @@ mod common;
 async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let resource_name = &alphanumeric_string(15)[..];
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
+    let extensions = Extensions::default();
+
     let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default().topics(Some(
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default().topics(Some(
                 [CreatableTopic::default()
                     .name(resource_name.into())
                     .num_partitions(3)
                     .replication_factor(1)]
                 .into(),
             )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|create_topic_response| debug!(?create_topic_response))?;
 
@@ -65,15 +66,13 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let config_name = "x.y.z";
     let config_value = "pqr";
 
-    let describe_configs = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DescribeConfigsService)
+    let describe_configs = DescribeConfigsService {
+        storage: storage.clone(),
     };
 
     let response = describe_configs
-        .serve(
-            Context::default(),
-            DescribeConfigsRequest::default()
+        .serve(RequestInput {
+            request: DescribeConfigsRequest::default()
                 .include_documentation(Some(false))
                 .include_synonyms(Some(false))
                 .resources(Some(
@@ -83,7 +82,8 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
                         .configuration_keys(Some([config_name.into()].into()))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|describe_configs_response| debug!(?describe_configs_response))?;
 
@@ -95,15 +95,13 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
             .is_some_and(|first| first.configs.as_deref().unwrap_or_default().is_empty())
     );
 
-    let alter_configs = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(IncrementalAlterConfigsService)
+    let alter_configs = IncrementalAlterConfigsService {
+        storage: storage.clone(),
     };
 
     let _response = alter_configs
-        .serve(
-            Context::default(),
-            IncrementalAlterConfigsRequest::default().resources(Some(
+        .serve(RequestInput {
+            request: IncrementalAlterConfigsRequest::default().resources(Some(
                 [AlterConfigsResource::default()
                     .resource_name(resource_name.into())
                     .resource_type(ConfigResource::Topic.into())
@@ -116,13 +114,13 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
                     ))]
                 .into(),
             )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let response = describe_configs
-        .serve(
-            Context::default(),
-            DescribeConfigsRequest::default()
+        .serve(RequestInput {
+            request: DescribeConfigsRequest::default()
                 .include_documentation(Some(false))
                 .include_synonyms(Some(false))
                 .resources(Some(
@@ -132,7 +130,8 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
                         .configuration_keys(Some([config_name.into()].into()))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let results = response.results.as_deref().unwrap_or(&[]);
@@ -154,7 +153,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -180,7 +179,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -206,7 +205,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

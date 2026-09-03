@@ -26,7 +26,7 @@ use nisshi_broker::{
     NODE_ID, coordinator::group::administrator::Controller, service::coordinator::services,
 };
 use nisshi_sans_io::{
-    Body, ErrorCode, Frame, HeartbeatResponse, JoinGroupResponse, MetadataResponse,
+    Body, ErrorCode, Frame, FrameInput, HeartbeatResponse, JoinGroupResponse, MetadataResponse,
     SyncGroupResponse,
     consumer::{ConsumerProtocolAssignment, ConsumerProtocolSubscription, MemberAssignment},
     metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
@@ -36,7 +36,7 @@ use nisshi_service::{
     LatencyIntroducingLayer,
 };
 use nisshi_storage::Storage;
-use rama::{Context, Layer as _, Service};
+use rama::{Layer as _, Service};
 use rand::{RngExt, SeedableRng as _, rngs::SmallRng};
 use tokio::{
     sync::{
@@ -85,7 +85,7 @@ pub async fn one_consumer_session_delay_after_initial_join(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -198,7 +198,7 @@ pub async fn one_consumer_next_action(storage: impl Storage + Clone) -> Result<(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -267,7 +267,7 @@ pub async fn two_consumer_next_action(storage: impl Storage + Clone) -> Result<(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -388,7 +388,7 @@ async fn group_consumer_next_action(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -533,7 +533,7 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -730,7 +730,7 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
 #[instrument(skip(service))]
 async fn simple_consumer<S>(name: &str, service: &S) -> Result<()>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     S::Error: Into<Error>,
 {
     // join without member id
@@ -834,11 +834,11 @@ fn consumer(
     group: &str,
     id: u64,
     topics: impl IntoIterator<Item = impl Into<String>>,
-    route: impl Service<(), Frame, Response = Frame, Error = nisshi_broker::Error> + Clone,
+    route: impl Service<FrameInput, Output = Frame, Error = nisshi_broker::Error> + Clone,
     metadata: MetadataResponse,
     latency_ms: Range<u64>,
 ) -> ConsumerGroupService<
-    impl Service<(), Frame, Response = Frame, Error = nisshi_broker::Error> + Clone,
+    impl Service<FrameInput, Output = Frame, Error = nisshi_broker::Error> + Clone,
 > {
     (
         ConsumerGroupLayer::new(group, topics.into_iter(), metadata.clone()).on_assignment(
@@ -965,7 +965,7 @@ async fn consumer_with_iterations<S>(
     service: &S,
 ) -> Result<()>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     S::Error: Into<Error> + Send + Sync + 'static,
 {
     let mut next_action = None;
@@ -973,7 +973,7 @@ where
     while iterations > 0 && !simulation.is_cancelled() {
         let instant = Instant::now();
         next_action = service
-            .serve(Context::default(), next_action)
+            .serve( next_action)
             .await
             .inspect(|next_action| debug!(?next_action, iterations, elapsed = ?instant.elapsed(), simulation = simulation.is_cancelled()))
             .map(Some)
@@ -1004,12 +1004,12 @@ where
 #[instrument(skip_all)]
 async fn join<I, S>(service: &S, input: Option<I>) -> Result<JoinGroupResponse, Error>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     I: Into<Body>,
     S::Error: Into<Error>,
 {
     let next_action = service
-        .serve(Context::default(), input.map(Into::into))
+        .serve(input.map(Into::into))
         .await
         .inspect(|output| debug!(?output))
         .map_err(Into::into)?;
@@ -1024,12 +1024,12 @@ where
 #[instrument(skip_all)]
 async fn sync<I, S>(service: &S, input: Option<I>) -> Result<SyncGroupResponse, Error>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     I: Into<Body>,
     S::Error: Into<Error>,
 {
     let next_action = service
-        .serve(Context::default(), input.map(Into::into))
+        .serve(input.map(Into::into))
         .await
         .inspect(|output| debug!(?output))
         .map_err(Into::into)?;
@@ -1044,12 +1044,12 @@ where
 #[instrument(skip_all)]
 async fn heartbeat<I, S>(service: &S, input: Option<I>) -> Result<HeartbeatResponse, Error>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     I: Into<Body>,
     S::Error: Into<Error>,
 {
     let next_action = service
-        .serve(Context::default(), input.map(Into::into))
+        .serve(input.map(Into::into))
         .await
         .inspect(|output| debug!(?output))
         .map_err(Into::into)?;

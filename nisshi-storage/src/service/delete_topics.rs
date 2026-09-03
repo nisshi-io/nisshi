@@ -13,16 +13,17 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, delete_topics_response::DeletableTopicResult,
+    ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, RequestInput,
+    delete_topics_response::DeletableTopicResult,
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteTopicsRequest`] returning [`DeleteTopicsResponse`].
 /// ```no_run
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
+/// use rama::Service as _;
 /// use nisshi_sans_io::{DeleteTopicsRequest, DeleteTopicsResponse,
 ///     delete_topics_response::DeletableTopicResult, ErrorCode};
 /// use nisshi_storage::{DeleteTopicsService, Error, StorageContainer};
@@ -38,7 +39,7 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
+/// let service = DeleteTopicsService { storage };
 ///
 /// let topic = "pqr";
 ///
@@ -55,7 +56,6 @@ use crate::{Error, Result, Storage};
 ///         ])),
 ///     service
 ///         .serve(
-///             Context::default(),
 ///             DeleteTopicsRequest::default().topic_names(Some(vec![topic.into()]))
 ///         )
 ///         .await?
@@ -63,30 +63,31 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DeleteTopicsService;
+#[derive(Clone, Debug)]
+pub struct DeleteTopicsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DeleteTopicsService {
+impl<G> ApiKey for DeleteTopicsService<G> {
     const KEY: i16 = DeleteTopicsRequest::KEY;
 }
 
-impl<G> Service<G, DeleteTopicsRequest> for DeleteTopicsService
+impl<G, I> Service<I> for DeleteTopicsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DeleteTopicsRequest>> + Send + 'static,
 {
-    type Response = DeleteTopicsResponse;
+    type Output = DeleteTopicsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DeleteTopicsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
         let mut responses = vec![];
 
-        for topic in req.topics.unwrap_or_default() {
-            let error_code = ctx.state().delete_topic(&topic.clone().into()).await?;
+        for topic in input.request.topics.unwrap_or_default() {
+            let error_code = self.storage.delete_topic(&topic.clone().into()).await?;
             responses.push(
                 DeletableTopicResult::default()
                     .name(topic.name.clone())
@@ -96,8 +97,8 @@ where
             );
         }
 
-        for topic in req.topic_names.unwrap_or_default() {
-            let error_code = ctx.state().delete_topic(&topic.clone().into()).await?;
+        for topic in input.request.topic_names.unwrap_or_default() {
+            let error_code = self.storage.delete_topic(&topic.clone().into()).await?;
 
             responses.push(
                 DeletableTopicResult::default()

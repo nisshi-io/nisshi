@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,22 +14,22 @@
 
 use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
 use nisshi_broker::Result;
-use nisshi_sans_io::{ErrorCode, ListGroupsRequest};
+use nisshi_sans_io::{ErrorCode, ListGroupsRequest, RequestInput};
 use nisshi_storage::{ArcDynStorage, ListGroupsService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn simple(storage: impl Storage + Clone) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(ListGroupsService);
+    let service = ListGroupsService { storage };
 
     let response = service
-        .serve(
-            Context::default(),
-            ListGroupsRequest::default().states_filter(Some(["Empty".into()].into())),
-        )
+        .serve(RequestInput {
+            request: ListGroupsRequest::default().states_filter(Some(["Empty".into()].into())),
+            extensions: Extensions::default(),
+        })
         .await?;
 
     assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
@@ -46,7 +46,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -72,7 +72,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -98,7 +98,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

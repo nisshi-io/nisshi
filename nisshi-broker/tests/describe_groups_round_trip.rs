@@ -62,7 +62,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -88,7 +88,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -114,7 +114,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

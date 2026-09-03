@@ -15,11 +15,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nisshi_sans_io::{
-    ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, TimestampType,
+    ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
+    TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
@@ -27,7 +28,7 @@ use crate::{Error, Result, Storage, Topition};
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
 /// use bytes::Bytes;
-/// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+/// use rama::Service as _;
 /// use nisshi_sans_io::{
 ///     CreateTopicsRequest, ErrorCode, ProduceRequest,
 ///     create_topics_request::CreatableTopic,
@@ -52,16 +53,14 @@ use crate::{Error, Result, Storage, Topition};
 ///     .build()
 ///     .await?;
 ///
-/// let create_topic = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+/// let create_topic = CreateTopicsService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let name = "abcba";
 ///
 /// let response = create_topic
 ///     .serve(
-///         Context::default(),
 ///         CreateTopicsRequest::default()
 ///             .topics(Some(vec![
 ///                 CreatableTopic::default()
@@ -79,16 +78,14 @@ use crate::{Error, Result, Storage, Topition};
 /// assert_eq!(1, topics.len());
 /// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 ///
-/// let produce = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(ProduceService)
+/// let produce = ProduceService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let partition = 0;
 ///
 /// let response = produce
 ///     .serve(
-///         Context::default(),
 ///         ProduceRequest::default().topic_data(Some(
 ///             [TopicProduceData::default()
 ///                 .name(name.into())
@@ -128,14 +125,19 @@ use crate::{Error, Result, Storage, Topition};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProduceService;
+#[derive(Clone, Debug)]
+pub struct ProduceService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for ProduceService {
+impl<G> ApiKey for ProduceService<G> {
     const KEY: i16 = ProduceRequest::KEY;
 }
 
-impl ProduceService {
+impl<G> ProduceService<G>
+where
+    G: Storage,
+{
     fn error(&self, index: i32, error_code: ErrorCode) -> PartitionProduceResponse {
         PartitionProduceResponse::default()
             .index(index)
@@ -149,16 +151,12 @@ impl ProduceService {
     }
 
     #[instrument(skip_all)]
-    async fn partition<G>(
+    async fn partition(
         &self,
-        ctx: &Context<G>,
         transaction_id: Option<&str>,
         name: &str,
         partition: PartitionProduceData,
-    ) -> PartitionProduceResponse
-    where
-        G: Storage,
-    {
+    ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
             let mut base_offset = None;
 
@@ -178,8 +176,8 @@ impl ProduceService {
                     batch.max_timestamp = base_timestamp;
                 }
 
-                match ctx
-                    .state()
+                match self
+                    .storage
                     .produce(transaction_id, &tp, batch)
                     .await
                     .inspect_err(|err| match err {
@@ -222,23 +220,16 @@ impl ProduceService {
     }
 
     #[instrument(skip_all)]
-    async fn topic<G>(
+    async fn topic(
         &self,
-        ctx: &Context<G>,
         transaction_id: Option<&str>,
         topic: TopicProduceData,
-    ) -> TopicProduceResponse
-    where
-        G: Storage,
-    {
+    ) -> TopicProduceResponse {
         let mut partitions = vec![];
 
         if let Some(partition_data) = topic.partition_data {
             for partition in partition_data {
-                partitions.push(
-                    self.partition(ctx, transaction_id, &topic.name, partition)
-                        .await,
-                )
+                partitions.push(self.partition(transaction_id, &topic.name, partition).await)
             }
         }
 
@@ -248,29 +239,30 @@ impl ProduceService {
     }
 }
 
-impl<G> Service<G, ProduceRequest> for ProduceService
+impl<G, I> Service<I> for ProduceService<G>
 where
     G: Storage,
+    I: Into<RequestInput<ProduceRequest>> + Send + 'static,
 {
-    type Response = ProduceResponse;
+    type Output = ProduceResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ProduceRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
         let mut responses = Vec::with_capacity(
-            req.topic_data
+            input
+                .request
+                .topic_data
                 .as_ref()
                 .map_or(0, |topic_data| topic_data.len()),
         );
 
-        if let Some(topics) = req.topic_data {
+        if let Some(topics) = input.request.topic_data {
             for topic in topics {
                 responses.push(
-                    self.topic(&ctx, req.transactional_id.as_deref(), topic)
+                    self.topic(input.request.transactional_id.as_deref(), topic)
                         .await,
                 )
             }

@@ -37,13 +37,13 @@ use nisshi_broker::{
     service::{auth, storage},
 };
 use nisshi_sans_io::{
-    ApiKey, Body, CreateTopicsRequest, ErrorCode, Frame, Header, SaslAuthenticateRequest,
-    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
+    ApiKey, Body, BytesInput, CreateTopicsRequest, ErrorCode, Frame, Header,
+    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
     create_topics_request::CreatableTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use nisshi_storage::{ArcDynStorage, Storage};
-use rama::{Context, Layer as _, Service as _};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use rsasl::{
     config::SASLConfig,
@@ -53,13 +53,13 @@ use uuid::Uuid;
 
 mod common;
 
-type Broker = BytesFrameService<FrameRouteService<(), Error>>;
+type Broker = BytesFrameService<FrameRouteService<Error>>;
 
 fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
+    storage::services(FrameRouteService::<Error>::builder(), storage)
         .and_then(auth::services)
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|frame_route| {
@@ -109,15 +109,19 @@ async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result
         .map_err(Error::from)?;
     let broker = broker(engine, sasl_config)?;
 
+    let extensions = Extensions::default();
+
     const API_VERSION: i16 = 1;
-    let ctx = Context::default();
     let mut correlation_id = 0;
 
     // Baseline: a gated request before any SASL is rejected.
     assert!(
         is_not_authenticated(
             &broker
-                .serve(ctx.clone(), create_topics_frame(correlation_id)?)
+                .serve(BytesInput {
+                    bytes: create_topics_frame(correlation_id)?,
+                    extensions: extensions.clone()
+                })
                 .await
         ),
         "baseline: an unauthenticated CreateTopics must be rejected",
@@ -126,9 +130,8 @@ async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result
     // 1. Negotiate SCRAM-SHA-256.
     correlation_id += 1;
     let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
+        .serve(BytesInput {
+            bytes: Frame::request(
                 Header::Request {
                     api_key: SaslHandshakeRequest::KEY,
                     api_version: API_VERSION,
@@ -139,7 +142,8 @@ async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result
                     SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
                 ),
             )?,
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
     let handshake = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
         .and_then(|frame| SaslHandshakeResponse::try_from(frame.body))?;
@@ -175,9 +179,8 @@ async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result
         match session.step(input.as_deref(), &mut output) {
             Ok(State::Running) => {
                 let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
+                    .serve(BytesInput {
+                        bytes: Frame::request(
                             Header::Request {
                                 api_key: SaslAuthenticateRequest::KEY,
                                 api_version: API_VERSION,
@@ -189,7 +192,8 @@ async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result
                                     .auth_bytes(Bytes::from(output.into_inner())),
                             ),
                         )?,
-                    )
+                        extensions: extensions.clone(),
+                    })
                     .await;
 
                 match response {
@@ -215,7 +219,10 @@ async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result
     // rejected, because the client never proved a valid identity.
     correlation_id += 1;
     let result = broker
-        .serve(ctx.clone(), create_topics_frame(correlation_id)?)
+        .serve(BytesInput {
+            bytes: create_topics_frame(correlation_id)?,
+            extensions: extensions.clone(),
+        })
         .await;
     assert!(
         is_not_authenticated(&result),
@@ -235,7 +242,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -261,7 +268,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -287,7 +294,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

@@ -21,18 +21,20 @@ use nisshi_broker::Error;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
     CreateTopicsRequest, CreateTopicsResponse, DeleteTopicsRequest, DeleteTopicsResponse,
-    ErrorCode, NULL_TOPIC_ID, create_topics_request::CreatableTopic,
+    ErrorCode, NULL_TOPIC_ID, RequestInput, create_topics_request::CreatableTopic,
     delete_topics_request::DeleteTopicState, delete_topics_response::DeletableTopicResult,
 };
 use nisshi_storage::{ArcDynStorage, CreateTopicsService, DeleteTopicsService, Storage};
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn delete_unknown_by_name(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
+    let service = DeleteTopicsService {
+        storage: storage.clone(),
+    };
 
     let topic = alphanumeric_string(15);
 
@@ -48,10 +50,10 @@ async fn delete_unknown_by_name(storage: impl Storage + Clone) -> Result<(), Err
                     .name(Some(topic.clone())),
             ])),
         service
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topic_names(Some(vec![topic]))
-            )
+            .serve(RequestInput {
+                request: DeleteTopicsRequest::default().topic_names(Some(vec![topic])),
+                extensions: Extensions::default()
+            })
             .await?
     );
 
@@ -59,7 +61,9 @@ async fn delete_unknown_by_name(storage: impl Storage + Clone) -> Result<(), Err
 }
 
 async fn delete_unknown_by_uuid(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
+    let service = DeleteTopicsService {
+        storage: storage.clone(),
+    };
 
     let topic = Uuid::new_v4();
 
@@ -75,12 +79,12 @@ async fn delete_unknown_by_uuid(storage: impl Storage + Clone) -> Result<(), Err
                     .topic_id(Some(topic.into_bytes()))
             ])),
         service
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topics(Some(vec![
+            .serve(RequestInput {
+                request: DeleteTopicsRequest::default().topics(Some(vec![
                     DeleteTopicState::default().topic_id(topic.into_bytes())
-                ]))
-            )
+                ])),
+                extensions: Extensions::default()
+            },)
             .await?
     );
 
@@ -88,9 +92,8 @@ async fn delete_unknown_by_uuid(storage: impl Storage + Clone) -> Result<(), Err
 }
 
 async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(), Error> {
-    let create_topics = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topics = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let name = alphanumeric_string(15);
@@ -101,11 +104,13 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
 
     let error_code = ErrorCode::None;
 
+    let extensions = Extensions::default();
+
     assert_matches!(
         create_topics
             .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+                RequestInput{
+                request: CreateTopicsRequest::default()
                     .topics(Some(
                         [CreatableTopic::default()
                             .name(name.clone())
@@ -115,7 +120,7 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
                             .configs(configs.clone()),]
                         .into()
                     ))
-                    .validate_only(Some(false))
+                    .validate_only(Some(false)), extensions: extensions.clone()},
             )
             .await?,
         CreateTopicsResponse { topics: Some(topics), ..} => {
@@ -129,9 +134,8 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
         }
     );
 
-    let delete_topics = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService)
+    let delete_topics = DeleteTopicsService {
+        storage: storage.clone(),
     };
 
     let error_code = ErrorCode::None;
@@ -147,22 +151,22 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
                     .topic_id(Some(NULL_TOPIC_ID)),
             ])),
         delete_topics
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topics(Some(vec![
+            .serve(RequestInput {
+                request: DeleteTopicsRequest::default().topics(Some(vec![
                     DeleteTopicState::default()
                         .name(Some(name.clone()))
                         .topic_id(NULL_TOPIC_ID),
-                ]))
-            )
+                ])),
+                extensions: extensions.clone()
+            })
             .await?
     );
 
     assert_matches!(
         create_topics
             .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+                RequestInput {
+                request: CreateTopicsRequest::default()
                     .topics(Some(
                         [CreatableTopic::default()
                             .name(name.clone())
@@ -172,9 +176,10 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
                             .configs(configs.clone()),]
                         .into()
                     ))
-                    .validate_only(Some(false))
-            )
-            .await?,
+                    .validate_only(Some(false)),
+                extensions: extensions.clone()
+                }
+            ).await?,
         CreateTopicsResponse { topics: Some(topics), ..} => {
             assert_eq!(topics.len(), 1);
             assert_eq!(name, topics[0].name.as_str());
@@ -197,7 +202,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -251,7 +256,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -305,7 +310,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

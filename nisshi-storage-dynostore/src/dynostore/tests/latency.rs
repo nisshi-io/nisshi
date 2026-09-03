@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use nisshi_sans_io::{
-    CreateTopicsRequest, ErrorCode, FetchRequest, NULL_TOPIC_ID, ProduceRequest,
+    CreateTopicsRequest, ErrorCode, FetchRequest, NULL_TOPIC_ID, ProduceRequest, RequestInput,
     create_topics_request::CreatableTopic,
     fetch_request::{FetchPartition, FetchTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -37,7 +37,7 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+use rama::{Service as _, extensions::Extensions};
 use tokio::time::sleep;
 use tracing::{debug, instrument};
 use url::Url;
@@ -216,9 +216,10 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -228,9 +229,8 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
     let configs = Some([].into());
 
     let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.into())
@@ -240,7 +240,8 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -252,17 +253,15 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
     assert_eq!(Some(3), topics[0].replication_factor);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let partition = 0;
 
     let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
                         .topic(Some(name.into()))
@@ -273,7 +272,8 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
                 ))
                 .max_bytes(Some(1))
                 .max_wait_ms(MAX_WAIT_MS),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.responses.as_deref().unwrap_or_default();
@@ -297,15 +297,16 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
     const LATENCY_INTRODUCED: Option<Duration> = Some(Duration::from_millis(100));
     const MAX_WAIT_MS: i32 = 50;
 
+    let extensions = Extensions::default();
+
     let object_store =
         LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(LATENCY_INTRODUCED);
 
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -315,9 +316,8 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
     let configs = Some([].into());
 
     let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.into())
@@ -327,7 +327,8 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -339,17 +340,15 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
     assert_eq!(Some(3), topics[0].replication_factor);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let partition = 0;
 
     let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
                         .topic(Some(name.into()))
@@ -360,7 +359,8 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
                 ))
                 .max_bytes(Some(1))
                 .max_wait_ms(MAX_WAIT_MS),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.responses.as_deref().unwrap_or_default();
@@ -384,25 +384,24 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
     const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
     const MAX_WAIT: Duration = Duration::from_secs(5);
 
+    let extensions = Extensions::default();
+
     let object_store =
         LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
 
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -412,9 +411,8 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
     let configs = Some([].into());
 
     let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.into())
@@ -424,7 +422,8 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -448,14 +447,14 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
         CULPA_QUI,
     ] {
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
+            .serve(RequestInput {
+                request: ProduceRequest::default().topic_data(topic_data(
                     name,
                     PARTITION,
                     inflated::Batch::builder().record(Record::builder().value(value.into())),
                 )?),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -468,9 +467,8 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
 
     let started_at = SystemTime::now();
     let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
                         .topic(Some(name.into()))
@@ -482,7 +480,8 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
                 .min_bytes(1)
                 .max_bytes(Some(52_428_800))
                 .max_wait_ms(MAX_WAIT.as_millis() as i32),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
     let elapsed = started_at.elapsed()?;
     assert!(
@@ -639,6 +638,8 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
 
     let advertised_listener = Url::parse("tcp://localhost:9092")?;
 
+    let extensions = Extensions::default();
+
     const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
     let max_wait = 1 * LATENCY_INTRODUCED;
 
@@ -648,19 +649,16 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -670,9 +668,8 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
     let configs = Some([].into());
 
     let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.into())
@@ -682,7 +679,8 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -706,14 +704,14 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
         CULPA_QUI,
     ] {
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
+            .serve(RequestInput {
+                request: ProduceRequest::default().topic_data(topic_data(
                     name,
                     PARTITION,
                     inflated::Batch::builder().record(Record::builder().value(value.into())),
                 )?),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -726,9 +724,8 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
 
     let started_at = SystemTime::now();
     let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
                         .topic(Some(name.into()))
@@ -740,7 +737,8 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
                 .min_bytes(1)
                 .max_bytes(Some(52_428_800))
                 .max_wait_ms(max_wait.as_millis() as i32),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
     let elapsed = started_at.elapsed()?;
     assert!(
@@ -795,6 +793,8 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
 
     let advertised_listener = Url::parse("tcp://localhost:9092")?;
 
+    let extensions = Extensions::default();
+
     const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
     let max_wait = 2 * LATENCY_INTRODUCED;
 
@@ -804,19 +804,16 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -826,9 +823,8 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
     let configs = Some([].into());
 
     let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.into())
@@ -838,7 +834,8 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -862,14 +859,14 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
         CULPA_QUI,
     ] {
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
+            .serve(RequestInput {
+                request: ProduceRequest::default().topic_data(topic_data(
                     name,
                     PARTITION,
                     inflated::Batch::builder().record(Record::builder().value(value.into())),
                 )?),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -882,9 +879,8 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
 
     let started_at = SystemTime::now();
     let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
                         .topic(Some(name.into()))
@@ -896,7 +892,8 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
                 .min_bytes(1)
                 .max_bytes(Some(52_428_800))
                 .max_wait_ms(max_wait.as_millis() as i32),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
     let elapsed = started_at.elapsed()?;
     assert!(
@@ -977,19 +974,16 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -1000,7 +994,6 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
 
     let response = create_topic
         .serve(
-            Context::default(),
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
@@ -1035,14 +1028,11 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
         CULPA_QUI,
     ] {
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
+            .serve(ProduceRequest::default().topic_data(topic_data(
+                name,
+                PARTITION,
+                inflated::Batch::builder().record(Record::builder().value(value.into())),
+            )?))
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -1056,7 +1046,6 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
     let started_at = SystemTime::now();
     let response = fetch
         .serve(
-            Context::default(),
             FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
@@ -1134,19 +1123,16 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -1157,7 +1143,6 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
 
     let response = create_topic
         .serve(
-            Context::default(),
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
@@ -1192,14 +1177,11 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
         CULPA_QUI,
     ] {
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
+            .serve(ProduceRequest::default().topic_data(topic_data(
+                name,
+                PARTITION,
+                inflated::Batch::builder().record(Record::builder().value(value.into())),
+            )?))
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -1213,7 +1195,6 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
     let started_at = SystemTime::now();
     let response = fetch
         .serve(
-            Context::default(),
             FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
@@ -1292,19 +1273,16 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -1315,7 +1293,6 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
 
     let response = create_topic
         .serve(
-            Context::default(),
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
@@ -1350,14 +1327,11 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
         CULPA_QUI,
     ] {
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
+            .serve(ProduceRequest::default().topic_data(topic_data(
+                name,
+                PARTITION,
+                inflated::Batch::builder().record(Record::builder().value(value.into())),
+            )?))
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -1371,7 +1345,6 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
     let started_at = SystemTime::now();
     let response = fetch
         .serve(
-            Context::default(),
             FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()
@@ -1464,19 +1437,16 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
+    let fetch = FetchService {
+        storage: storage.clone(),
     };
 
     let name = "pqr";
@@ -1487,7 +1457,6 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
 
     let response = create_topic
         .serve(
-            Context::default(),
             CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
@@ -1522,14 +1491,11 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
         CULPA_QUI,
     ] {
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
+            .serve(ProduceRequest::default().topic_data(topic_data(
+                name,
+                PARTITION,
+                inflated::Batch::builder().record(Record::builder().value(value.into())),
+            )?))
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -1543,7 +1509,6 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
     let started_at = SystemTime::now();
     let response = fetch
         .serve(
-            Context::default(),
             FetchRequest::default()
                 .topics(Some(
                     [FetchTopic::default()

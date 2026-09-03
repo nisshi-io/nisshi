@@ -18,32 +18,31 @@ use crate::common::{
 };
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, MetadataRequest,
+    CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, MetadataRequest, RequestInput,
     create_topics_request::CreatableTopic, metadata_request::MetadataRequestTopic,
 };
 use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, DeleteTopicsService, MetadataService, Storage,
 };
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let delete_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService)
+    let delete_topic = DeleteTopicsService {
+        storage: storage.clone(),
     };
 
-    let metadata = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(MetadataService)
+    let metadata = MetadataService {
+        storage: storage.clone(),
     };
 
     let name = &alphanumeric_string(15)[..];
@@ -52,9 +51,8 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
     let replication_factor = rng().random_range(0..64);
 
     let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .validate_only(Some(false))
                 .topics(Some(
                     [CreatableTopic::default()
@@ -65,7 +63,8 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
                         .configs(Some([].into()))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topic_id = response.topics.as_deref().unwrap_or_default()[0]
@@ -77,16 +76,16 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
         //
 
         let response = metadata
-            .serve(
-                Context::default(),
-                MetadataRequest::default()
+            .serve(RequestInput {
+                request: MetadataRequest::default()
                     .allow_auto_topic_creation(Some(false))
                     .include_cluster_authorized_operations(Some(false))
                     .include_cluster_authorized_operations(Some(false))
                     .topics(Some(
                         [MetadataRequestTopic::default().topic_id(Some(topic_id))].into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -102,16 +101,16 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
         //
 
         let response = metadata
-            .serve(
-                Context::default(),
-                MetadataRequest::default()
+            .serve(RequestInput {
+                request: MetadataRequest::default()
                     .allow_auto_topic_creation(Some(false))
                     .include_cluster_authorized_operations(Some(false))
                     .include_cluster_authorized_operations(Some(false))
                     .topics(Some(
                         [MetadataRequestTopic::default().name(Some(name.into()))].into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -126,9 +125,8 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
         // creating a topic with the same name causes an API error: topic already exists
         //
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .validate_only(Some(false))
                     .topics(Some(
                         [CreatableTopic::default()
@@ -139,7 +137,8 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
                             .configs(Some([].into()))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -152,10 +151,10 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
 
     {
         let response = delete_topic
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
-            )
+            .serve(RequestInput {
+                request: DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let results = response.responses.as_deref().unwrap_or_default();
@@ -165,10 +164,10 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
 
     {
         let response = delete_topic
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
-            )
+            .serve(RequestInput {
+                request: DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let results = response.responses.as_deref().unwrap_or_default();
@@ -190,7 +189,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -216,7 +215,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -242,7 +241,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

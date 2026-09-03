@@ -14,24 +14,25 @@
 
 use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
 use nisshi_broker::Result;
-use nisshi_sans_io::{ErrorCode, GetTelemetrySubscriptionsRequest};
+use nisshi_sans_io::{ErrorCode, GetTelemetrySubscriptionsRequest, RequestInput};
 use nisshi_storage::{ArcDynStorage, GetTelemetrySubscriptionsService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn simple(storage: impl Storage + Clone) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(GetTelemetrySubscriptionsService);
+    let service = GetTelemetrySubscriptionsService { storage };
 
     let client_instance_id = [0; 16];
 
     let response = service
-        .serve(
-            Context::default(),
-            GetTelemetrySubscriptionsRequest::default().client_instance_id(client_instance_id),
-        )
+        .serve(RequestInput {
+            request: GetTelemetrySubscriptionsRequest::default()
+                .client_instance_id(client_instance_id),
+            extensions: Extensions::default(),
+        })
         .await?;
 
     assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
@@ -47,7 +48,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -73,7 +74,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -99,7 +100,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

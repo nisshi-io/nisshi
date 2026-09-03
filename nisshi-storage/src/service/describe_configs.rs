@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{
+    ApiKey, ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse, RequestInput,
+};
+use rama::Service;
 use tracing::{error, instrument};
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeConfigsRequest`] returning [`DescribeConfigsResponse`].
 /// ```no_run
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
+/// use rama::Service as _;
 /// use nisshi_sans_io::{ConfigResource, DescribeConfigsRequest,
 ///     EndpointType, ErrorCode, describe_configs_request::DescribeConfigsResource};
 /// use nisshi_storage::{DescribeConfigsService, Error, StorageContainer};
@@ -36,11 +38,10 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DescribeConfigsService);
+/// let service = DescribeConfigsService { storage };
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         DescribeConfigsRequest::default()
 ///             .include_documentation(Some(false))
 ///             .include_synonyms(Some(false))
@@ -61,31 +62,31 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DescribeConfigsService;
+#[derive(Clone, Debug)]
+pub struct DescribeConfigsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DescribeConfigsService {
+impl<G> ApiKey for DescribeConfigsService<G> {
     const KEY: i16 = DescribeConfigsRequest::KEY;
 }
 
-impl<G> Service<G, DescribeConfigsRequest> for DescribeConfigsService
+impl<G, I> Service<I> for DescribeConfigsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DescribeConfigsRequest>> + Send + 'static,
 {
-    type Response = DescribeConfigsResponse;
+    type Output = DescribeConfigsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DescribeConfigsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
         let mut results = vec![];
 
-        for resource in req.resources.unwrap_or_default() {
+        for resource in input.request.resources.unwrap_or_default() {
             results.push(
-                ctx.state()
+                self.storage
                     .describe_config(
                         resource.resource_name.as_str(),
                         ConfigResource::from(resource.resource_type),

@@ -13,17 +13,17 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, ConsumerGroupDescribeRequest,
+    ApiKey, ConsumerGroupDescribeRequest, RequestInput,
     consumer_group_describe_response::{ConsumerGroupDescribeResponse, DescribedGroup},
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ConsumerGroupDescribeRequest`] returning [`ConsumerGroupDescribeResponse`].
 /// ```no_run
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
+/// use rama::Service as _;
 /// use nisshi_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};
 /// use nisshi_storage::{ConsumerGroupDescribeService, Error, StorageContainer};
 /// use url::Url;
@@ -38,13 +38,12 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(ConsumerGroupDescribeService);
+/// let service = ConsumerGroupDescribeService { storage };
 ///
 /// let group_id = "abc";
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         ConsumerGroupDescribeRequest::default()
 ///             .group_ids(Some([group_id.into()].into()))
 ///             .include_authorized_operations(false),
@@ -59,28 +58,32 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConsumerGroupDescribeService;
+#[derive(Clone, Debug)]
+pub struct ConsumerGroupDescribeService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for ConsumerGroupDescribeService {
+impl<G> ApiKey for ConsumerGroupDescribeService<G> {
     const KEY: i16 = ConsumerGroupDescribeRequest::KEY;
 }
 
-impl<G> Service<G, ConsumerGroupDescribeRequest> for ConsumerGroupDescribeService
+impl<G, I> Service<I> for ConsumerGroupDescribeService<G>
 where
     G: Storage,
+    I: Into<RequestInput<ConsumerGroupDescribeRequest>> + Send + 'static,
 {
-    type Response = ConsumerGroupDescribeResponse;
+    type Output = ConsumerGroupDescribeResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ConsumerGroupDescribeRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .describe_groups(req.group_ids.as_deref(), req.include_authorized_operations)
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
+        self.storage
+            .describe_groups(
+                input.request.group_ids.as_deref(),
+                input.request.include_authorized_operations,
+            )
             .await
             .inspect(|described| debug!(?described))
             .map(|described| {

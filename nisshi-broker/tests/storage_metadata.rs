@@ -15,27 +15,27 @@
 use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    ErrorCode, MetadataRequest, NULL_TOPIC_ID, metadata_request::MetadataRequestTopic,
+    ErrorCode, MetadataRequest, NULL_TOPIC_ID, RequestInput, metadata_request::MetadataRequestTopic,
 };
 use nisshi_storage::{ArcDynStorage, MetadataService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(MetadataService);
+    let service = MetadataService { storage };
 
     let response = service
-        .serve(
-            Context::default(),
-            MetadataRequest::default()
+        .serve(RequestInput {
+            request: MetadataRequest::default()
                 .allow_auto_topic_creation(Some(false))
                 .include_cluster_authorized_operations(Some(false))
                 .include_topic_authorized_operations(Some(false))
                 .topics(Some([].into())),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let brokers = response.brokers.as_deref().unwrap_or_default();
@@ -47,19 +47,19 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
 }
 
 async fn auto_create_topic(storage: impl Storage + Clone) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(MetadataService);
+    let service = MetadataService { storage };
 
     let name = "auto-created";
 
     let response = service
-        .serve(
-            Context::default(),
-            MetadataRequest::default()
+        .serve(RequestInput {
+            request: MetadataRequest::default()
                 .allow_auto_topic_creation(Some(true))
                 .topics(Some(vec![
                     MetadataRequestTopic::default().name(Some(name.into())),
                 ])),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -73,19 +73,19 @@ async fn auto_create_topic(storage: impl Storage + Clone) -> Result<()> {
 }
 
 async fn auto_create_topic_invalid_name(storage: impl Storage + Clone) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(MetadataService);
+    let service = MetadataService { storage };
 
     let name = "not a valid topic name";
 
     let response = service
-        .serve(
-            Context::default(),
-            MetadataRequest::default()
+        .serve(RequestInput {
+            request: MetadataRequest::default()
                 .allow_auto_topic_creation(Some(true))
                 .topics(Some(vec![
                     MetadataRequestTopic::default().name(Some(name.into())),
                 ])),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -99,19 +99,19 @@ async fn auto_create_topic_invalid_name(storage: impl Storage + Clone) -> Result
 }
 
 async fn auto_create_topic_not_allowed(storage: impl Storage + Clone) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(MetadataService);
+    let service = MetadataService { storage };
 
     let name = "not-auto-created";
 
     let response = service
-        .serve(
-            Context::default(),
-            MetadataRequest::default()
+        .serve(RequestInput {
+            request: MetadataRequest::default()
                 .allow_auto_topic_creation(Some(false))
                 .topics(Some(vec![
                     MetadataRequestTopic::default().name(Some(name.into())),
                 ])),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -132,7 +132,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -200,7 +200,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -268,7 +268,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

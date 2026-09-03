@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,12 +20,12 @@ mod doctest_template {
     use crate::common::init_tracing;
     use nisshi_broker::Error;
     use nisshi_sans_io::{
-        CreateTopicsRequest, ErrorCode, FetchRequest,
+        CreateTopicsRequest, ErrorCode, FetchRequest, RequestInput,
         create_topics_request::CreatableTopic,
         fetch_request::{FetchPartition, FetchTopic},
     };
     use nisshi_storage::{CreateTopicsService, FetchService, StorageContainer};
-    use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+    use rama::{Service, extensions::Extensions};
     use url::Url;
 
     #[tokio::test]
@@ -52,17 +52,17 @@ mod doctest_template {
             .build()
             .await?;
 
-        let create_topic = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        let extensions = Extensions::default();
+
+        let create_topic = CreateTopicsService {
+            storage: storage.clone(),
         };
 
         let name = "abcba";
 
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .topics(Some(vec![
                         CreatableTopic::default()
                             .name(name.into())
@@ -72,24 +72,23 @@ mod doctest_template {
                             .configs(Some([].into())),
                     ]))
                     .validate_only(Some(false)),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.unwrap_or_default();
         assert_eq!(1, topics.len());
         assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
-        let fetch = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(FetchService)
+        let fetch = FetchService {
+            storage: storage.clone(),
         };
 
         let partition = 0;
 
         let response = fetch
-            .serve(
-                Context::default(),
-                FetchRequest::default()
+            .serve(RequestInput {
+                request: FetchRequest::default()
                     .topics(Some(
                         [FetchTopic::default()
                             .topic(Some(name.into()))
@@ -100,7 +99,8 @@ mod doctest_template {
                     ))
                     .max_bytes(Some(0))
                     .max_wait_ms(5_000),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,4 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod group;
+use rama::extensions::{Extensions, ExtensionsRef};
+use tokio::net::TcpListener;
+
+#[derive(Debug)]
+pub struct TcpListenerInput {
+    pub listener: TcpListener,
+    pub extensions: Extensions,
+}
+
+impl ExtensionsRef for TcpListenerInput {
+    fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+}

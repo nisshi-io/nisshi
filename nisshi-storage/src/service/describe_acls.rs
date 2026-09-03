@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,30 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, DescribeAclsRequest, DescribeAclsResponse, ErrorCode};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, DescribeAclsRequest, DescribeAclsResponse, ErrorCode, RequestInput};
+use rama::Service;
+use tracing::instrument;
 
 use crate::{Error, Storage};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DescribeAclsService;
+#[derive(Clone, Debug)]
+pub struct DescribeAclsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DescribeAclsService {
+impl<G> ApiKey for DescribeAclsService<G> {
     const KEY: i16 = DescribeAclsRequest::KEY;
 }
 
-impl<G> Service<G, DescribeAclsRequest> for DescribeAclsService
+impl<G, I> Service<I> for DescribeAclsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DescribeAclsRequest>> + Send + 'static,
 {
-    type Response = DescribeAclsResponse;
+    type Output = DescribeAclsResponse;
     type Error = Error;
 
-    async fn serve(
-        &self,
-        _ctx: Context<G>,
-        _req: DescribeAclsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let _ = input;
         Ok(DescribeAclsResponse::default()
             .error_code(i16::from(ErrorCode::None))
             .resources(Some([].into())))

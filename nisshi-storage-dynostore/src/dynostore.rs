@@ -406,17 +406,15 @@ impl DynoStore {
         debug!(?topic);
 
         self.meta
-            .with(&self.object_store, |meta| match topic {
-                TopicId::Name(name) => Ok(meta.topics.get(name).cloned()),
-                TopicId::Id(id) => {
-                    for (_, metadata) in meta.topics.iter() {
-                        if &metadata.id == id {
-                            return Ok(Some(metadata.clone()));
-                        }
-                    }
-
-                    Ok(None)
-                }
+            .with(&self.object_store, |meta| {
+                Ok(match topic {
+                    TopicId::Name(name) => meta.topics.get(name).cloned(),
+                    TopicId::Id(id) => meta
+                        .topics
+                        .values()
+                        .find(|metadata| &metadata.id == id)
+                        .cloned(),
+                })
             })
             .await
     }

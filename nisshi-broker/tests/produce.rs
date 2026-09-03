@@ -20,7 +20,7 @@ use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
     CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest, IsolationLevel,
-    ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse,
+    ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse, RequestInput,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -35,7 +35,7 @@ use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, DeleteTopicsService, InitProducerIdService,
     ListOffsetsService, ProduceService, Storage,
 };
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use tracing::debug;
 use uuid::Uuid;
@@ -70,9 +70,10 @@ fn topic_data(
 async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -> Result<()> {
     let topic = &alphanumeric_string(15)[..];
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let num_partitions = rng().random_range(1..64);
@@ -80,9 +81,8 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
 
     {
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .validate_only(Some(false))
                     .topics(Some(
                         [CreatableTopic::default()
@@ -93,7 +93,8 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
                             .configs(Some([].into()))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -107,26 +108,25 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
     let acks = 0;
     let timeout_ms = 0;
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id)
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    &topic[..],
+                    topic,
                     index,
                     inflated::Batch::builder()
                         .record(Record::builder().value(Bytes::from_static(b"lorem").into()))
                         .producer_id(54345),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -157,9 +157,10 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
 async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
     let topic = &alphanumeric_string(15)[..];
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let num_partitions = rng().random_range(1..64);
@@ -167,9 +168,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
 
     {
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .validate_only(Some(false))
                     .topics(Some(
                         [CreatableTopic::default()
@@ -180,7 +180,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
                             .configs(Some([].into()))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -190,25 +191,23 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
 
     let index = rng().random_range(0..num_partitions);
 
-    let init_producer_id = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(InitProducerIdService)
+    let init_producer_id = InitProducerIdService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
     let producer = init_producer_id
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
+        .serve(RequestInput {
+            request: InitProducerIdRequest::default()
                 .transactional_id(None)
                 .transaction_timeout_ms(0)
                 .producer_id(Some(-1))
                 .producer_epoch(Some(-1)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let transactional_id = None;
@@ -216,9 +215,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
     let timeout_ms = 0;
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id.clone())
                 .acks(acks)
                 .timeout_ms(timeout_ms)
@@ -232,7 +230,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
                         )
                         .producer_id(producer.producer_id),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -258,9 +257,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
     );
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id.clone())
                 .acks(acks)
                 .timeout_ms(timeout_ms)
@@ -280,7 +278,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
                         .last_offset_delta(1)
                         .producer_id(producer.producer_id),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -306,9 +305,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
     );
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id.clone())
                 .acks(acks)
                 .timeout_ms(timeout_ms)
@@ -323,7 +321,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
                         .base_sequence(3)
                         .producer_id(producer.producer_id),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -354,9 +353,10 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
 async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) -> Result<()> {
     let topic = &alphanumeric_string(15)[..];
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let num_partitions = rng().random_range(1..64);
@@ -364,9 +364,8 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
 
     {
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .validate_only(Some(false))
                     .topics(Some(
                         [CreatableTopic::default()
@@ -377,7 +376,8 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
                             .configs(Some([].into()))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -387,25 +387,23 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
 
     let index = rng().random_range(0..num_partitions);
 
-    let init_producer_id = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(InitProducerIdService)
+    let init_producer_id = InitProducerIdService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
     let producer = init_producer_id
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
+        .serve(RequestInput {
+            request: InitProducerIdRequest::default()
                 .transactional_id(None)
                 .transaction_timeout_ms(0)
                 .producer_id(Some(-1))
                 .producer_epoch(Some(-1)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let transactional_id = None;
@@ -413,14 +411,13 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
     let timeout_ms = 0;
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id.clone())
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    &topic[..],
+                    topic,
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -429,7 +426,8 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
                         )
                         .producer_id(producer.producer_id),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -455,14 +453,13 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
     );
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id)
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    &topic[..],
+                    topic,
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -471,7 +468,8 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
                         )
                         .producer_id(producer.producer_id),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -500,21 +498,20 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
 }
 
 async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone) -> Result<()> {
-    let init_producer_id = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(InitProducerIdService)
+    let extensions = Extensions::default();
+
+    let init_producer_id = InitProducerIdService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
     let topic = &alphanumeric_string(15)[..];
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let num_partitions = rng().random_range(1..64);
@@ -522,9 +519,8 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
 
     {
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .validate_only(Some(false))
                     .topics(Some(
                         [CreatableTopic::default()
@@ -535,7 +531,8 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
                             .configs(Some([].into()))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -546,14 +543,14 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
     let index = rng().random_range(0..num_partitions);
 
     let producer = init_producer_id
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
+        .serve(RequestInput {
+            request: InitProducerIdRequest::default()
                 .transactional_id(None)
                 .transaction_timeout_ms(0)
                 .producer_id(Some(-1))
                 .producer_epoch(Some(-1)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let transactional_id = None;
@@ -561,14 +558,13 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
     let timeout_ms = 0;
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id.clone())
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    &topic[..],
+                    topic,
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -577,7 +573,8 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
                         )
                         .producer_id(producer.producer_id),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -603,14 +600,13 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
     );
 
     let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .transactional_id(transactional_id)
                 .acks(acks)
                 .timeout_ms(timeout_ms)
                 .topic_data(topic_data(
-                    &topic[..],
+                    topic,
                     index,
                     inflated::Batch::builder()
                         .record(
@@ -620,7 +616,8 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
                         .base_sequence(2)
                         .producer_id(producer.producer_id),
                 )?),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(
@@ -649,24 +646,22 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
 }
 
 async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
-    let delete_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService)
+    let delete_topic = DeleteTopicsService {
+        storage: storage.clone(),
     };
 
-    let list_offsets = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ListOffsetsService)
+    let list_offsets = ListOffsetsService {
+        storage: storage.clone(),
     };
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    let produce = ProduceService {
+        storage: storage.clone(),
     };
 
     let name = &alphanumeric_string(15)[..];
@@ -676,9 +671,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
 
     {
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .validate_only(Some(false))
                     .topics(Some(
                         [CreatableTopic::default()
@@ -689,7 +683,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
                             .configs(Some([].into()))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -701,9 +696,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
 
     let before_produce_earliest = {
         let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
                     .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
                     .topics(Some(
                         [ListOffsetsTopic::default()
@@ -716,7 +710,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
                             ))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -734,9 +729,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
 
     let before_produce_latest = {
         let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
                     .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
                     .topics(Some(
                         [ListOffsetsTopic::default()
@@ -749,7 +743,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
                             ))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -775,9 +770,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
             .inspect(|deflated| debug!(?deflated))?;
 
         let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(Some(
+            .serve(RequestInput {
+                request: ProduceRequest::default().topic_data(Some(
                     [TopicProduceData::default()
                         .name(name.into())
                         .partition_data(Some(
@@ -790,7 +784,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
                         ))]
                     .into(),
                 )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.responses.as_deref().unwrap_or_default();
@@ -805,9 +800,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
 
     let after_produce_earliest = {
         let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
                     .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
                     .topics(Some(
                         [ListOffsetsTopic::default()
@@ -820,7 +814,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
                             ))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -840,9 +835,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
 
     let after_produce_latest = {
         let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
                     .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
                     .topics(Some(
                         [ListOffsetsTopic::default()
@@ -855,7 +849,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
                             ))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -874,10 +869,10 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
     assert_eq!(Some(offset + 1), after_produce_latest);
 
     let response = delete_topic
-        .serve(
-            Context::default(),
-            DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
-        )
+        .serve(RequestInput {
+            request: DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.responses.as_deref().unwrap_or_default();
@@ -895,7 +890,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -977,7 +972,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -1059,7 +1054,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

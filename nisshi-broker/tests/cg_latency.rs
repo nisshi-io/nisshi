@@ -19,14 +19,15 @@ use nisshi_broker::{
     Error, NODE_ID, coordinator::group::administrator::Controller, service::coordinator::services,
 };
 use nisshi_sans_io::{
-    ErrorCode, HeartbeatRequest, JoinGroupRequest, MetadataResponse, SyncGroupRequest,
+    ErrorCode, HeartbeatRequest, JoinGroupRequest, MetadataResponse, RequestInput,
+    SyncGroupRequest,
     consumer::{GroupConsumer, MemberAssignment},
     metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
 };
 use nisshi_service::{
     BytesFrameLayer, FrameBytesLayer, FrameRouteService, LatencyIntroducingLayer, RequestFrameLayer,
 };
-use rama::{Context, Layer, Service};
+use rama::{Layer, Service, extensions::Extensions};
 use tracing::debug;
 use url::Url;
 
@@ -54,7 +55,7 @@ async fn stack() -> Result<(), Error> {
 
     let coordinator = Controller::with_storage(storage)?;
 
-    let route = services(FrameRouteService::<(), Error>::builder(), coordinator)
+    let route = services(FrameRouteService::<Error>::builder(), coordinator)
         .and_then(|builder| builder.build().map_err(Into::into))?;
 
     let latency_introducing = LatencyIntroducingLayer::default()
@@ -98,9 +99,14 @@ async fn stack() -> Result<(), Error> {
         .and_then(JoinGroupRequest::try_from)?;
     assert!(initial.member_id.is_empty());
 
-    let context = Context::default();
+    let extensions = Extensions::default();
 
-    let r0 = sut.serve(context.clone(), initial).await?;
+    let r0 = sut
+        .serve(RequestInput {
+            request: initial,
+            extensions: extensions.clone(),
+        })
+        .await?;
     assert_eq!(i16::from(ErrorCode::MemberIdRequired), r0.error_code);
     assert!(!r0.member_id.is_empty());
 
@@ -109,7 +115,12 @@ async fn stack() -> Result<(), Error> {
     let join = JoinGroupRequest::try_from(next_action)?;
     assert!(!join.member_id.is_empty());
 
-    let r1 = sut.serve(context.clone(), join).await?;
+    let r1 = sut
+        .serve(RequestInput {
+            request: join,
+            extensions: extensions.clone(),
+        })
+        .await?;
     assert_eq!(i16::from(ErrorCode::None), r1.error_code);
     assert_eq!(0, r1.generation_id);
     assert_eq!(r1.leader, r1.member_id);
@@ -121,7 +132,12 @@ async fn stack() -> Result<(), Error> {
     assert_eq!(0, sync.generation_id);
     assert_eq!(1, sync.assignments.as_deref().unwrap_or_default().len());
 
-    let r2 = sut.serve(context.clone(), sync).await?;
+    let r2 = sut
+        .serve(RequestInput {
+            request: sync,
+            extensions: extensions.clone(),
+        })
+        .await?;
     assert_eq!(i16::from(ErrorCode::None), r2.error_code);
 
     let member_assignment = MemberAssignment::try_from(r2.assignment.clone())

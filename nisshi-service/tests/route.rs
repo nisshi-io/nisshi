@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,16 +13,17 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey as _, ApiVersionsRequest, ErrorCode, Frame, Header, MetadataRequest, MetadataResponse,
-    metadata_response::MetadataResponseBroker,
+    ApiKey as _, ApiVersionsRequest, ErrorCode, Frame, FrameInput, Header, MetadataRequest,
+    MetadataResponse, RequestInput, metadata_response::MetadataResponseBroker,
 };
 use nisshi_service::{
     BytesFrameLayer, BytesLayer, FrameApiKeyMatcher, FrameBytesLayer, FrameRequestLayer,
     FrameRouteService, FrameService, RequestFrameLayer, RequestLayer, ResponseService,
 };
 use rama::{
-    Context, Layer, Service,
-    layer::{HijackLayer, MapResponseLayer},
+    Layer, Service,
+    extensions::Extensions,
+    layer::{HijackLayer, MapOutputLayer},
 };
 use tracing::debug;
 
@@ -31,20 +32,22 @@ use crate::common::{Error, init_tracing};
 mod common;
 
 mod doctest_code_a {
-    use nisshi_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
+    use nisshi_sans_io::{
+        ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse, RequestInput,
+    };
     use nisshi_service::{
         BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
         FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
         ResponseService,
     };
-    use rama::{Context, Layer as _, Service as _};
+    use rama::{Layer as _, Service as _, extensions::Extensions};
 
     use crate::common::Error;
 
-    async fn frame_route() -> Result<FrameRouteService<(), Error>, Error> {
-        let frame_route = FrameRouteService::<(), Error>::builder()
+    async fn frame_route() -> Result<FrameRouteService<Error>, Error> {
+        let frame_route = FrameRouteService::<Error>::builder()
             .with_service(
-                RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
+                RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_| {
                     Ok(MetadataResponse::default()
                         .brokers(Some([].into()))
                         .topics(Some([].into()))
@@ -61,7 +64,7 @@ mod doctest_code_a {
 
     async fn layers() -> Result<
         RequestFrameService<
-            FrameBytesService<BytesService<BytesFrameService<FrameRouteService<(), Error>>>>,
+            FrameBytesService<BytesService<BytesFrameService<FrameRouteService<Error>>>>,
         >,
         Error,
     > {
@@ -82,15 +85,18 @@ mod doctest_code_a {
     async fn metadata_request() -> Result<(), Error> {
         let service = layers().await?;
 
-        let ctx = Context::default();
-
         let request = MetadataRequest::default()
             .topics(Some([].into()))
             .allow_auto_topic_creation(Some(false))
             .include_cluster_authorized_operations(Some(false))
             .include_topic_authorized_operations(Some(false));
 
-        let response = service.serve(ctx, request).await?;
+        let response = service
+            .serve(RequestInput {
+                request,
+                extensions: Extensions::default(),
+            })
+            .await?;
         assert_eq!(Some("nisshi".into()), response.cluster_id);
 
         Ok(())
@@ -104,12 +110,12 @@ mod doctest_code_a {
         let client_software_version = "12321";
 
         let response = service
-            .serve(
-                Context::default(),
-                ApiVersionsRequest::default()
+            .serve(RequestInput {
+                request: ApiVersionsRequest::default()
                     .client_software_name(Some(client_software_name.into()))
                     .client_software_version(Some(client_software_version.into())),
-            )
+                extensions: Extensions::default(),
+            })
             .await?;
 
         let api_versions = response
@@ -133,8 +139,6 @@ async fn simple_routes() -> Result<(), Error> {
 
     let cluster_id = "abc";
 
-    type State = ();
-
     let service = (
         RequestFrameLayer,
         FrameBytesLayer,
@@ -144,7 +148,7 @@ async fn simple_routes() -> Result<(), Error> {
         .into_layer(
             FrameRouteService::builder()
                 .with_service(RequestLayer::<MetadataRequest>::new().into_layer(
-                    ResponseService::new(|_ctx: Context<State>, _req: MetadataRequest| {
+                    ResponseService::new(|_req: RequestInput<MetadataRequest>| {
                         Ok::<_, Error>(
                             MetadataResponse::default()
                                 .brokers(Some([].into()))
@@ -159,7 +163,7 @@ async fn simple_routes() -> Result<(), Error> {
                 .and_then(|builder| builder.build())?,
         );
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     {
         let client_software_name = "abcba";
@@ -169,7 +173,12 @@ async fn simple_routes() -> Result<(), Error> {
             .client_software_name(Some(client_software_name.into()))
             .client_software_version(Some(client_software_version.into()));
 
-        let response = service.serve(ctx.clone(), request).await?;
+        let response = service
+            .serve(RequestInput {
+                request,
+                extensions: extensions.clone(),
+            })
+            .await?;
 
         assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
 
@@ -191,7 +200,12 @@ async fn simple_routes() -> Result<(), Error> {
         .include_cluster_authorized_operations(Some(false))
         .include_topic_authorized_operations(Some(false));
 
-    let response = service.serve(ctx, request).await?;
+    let response = service
+        .serve(RequestInput {
+            request,
+            extensions,
+        })
+        .await?;
     assert_eq!(Some(cluster_id.into()), response.cluster_id);
 
     Ok(())
@@ -207,11 +221,9 @@ async fn route_request_map_response() -> Result<(), Error> {
     let host = "defgfed";
     let port = 32123;
 
-    type State = ();
-
     let rl = (
         RequestLayer::<MetadataRequest>::new(),
-        MapResponseLayer::new(move |response: MetadataResponse| {
+        MapOutputLayer::new(move |response: MetadataResponse| {
             response.brokers(Some(vec![
                 MetadataResponseBroker::default()
                     .node_id(node_id)
@@ -222,7 +234,7 @@ async fn route_request_map_response() -> Result<(), Error> {
         }),
     )
         .into_layer(ResponseService::new(
-            |_ctx: Context<State>, _req: MetadataRequest| {
+            |_req: RequestInput<MetadataRequest>| {
                 Ok::<_, Error>(
                     MetadataResponse::default()
                         .brokers(Some([].into()))
@@ -242,12 +254,12 @@ async fn route_request_map_response() -> Result<(), Error> {
         BytesFrameLayer::default(),
     )
         .into_layer(
-            FrameRouteService::<(), Error>::builder()
+            FrameRouteService::<Error>::builder()
                 .with_service(rl)
                 .and_then(|builder| builder.build())?,
         );
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     {
         let client_software_name = "abcba";
@@ -257,7 +269,12 @@ async fn route_request_map_response() -> Result<(), Error> {
             .client_software_name(Some(client_software_name.into()))
             .client_software_version(Some(client_software_version.into()));
 
-        let response = service.serve(ctx.clone(), request).await?;
+        let response = service
+            .serve(RequestInput {
+                request,
+                extensions: extensions.clone(),
+            })
+            .await?;
 
         assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
 
@@ -279,7 +296,12 @@ async fn route_request_map_response() -> Result<(), Error> {
         .include_cluster_authorized_operations(Some(false))
         .include_topic_authorized_operations(Some(false));
 
-    let response = service.serve(ctx, request).await?;
+    let response = service
+        .serve(RequestInput {
+            request,
+            extensions,
+        })
+        .await?;
     assert_eq!(Some(cluster_id.into()), response.cluster_id);
     assert_eq!(Some(111), response.controller_id);
 
@@ -299,8 +321,6 @@ async fn simple_layers() -> Result<(), Error> {
 
     let cluster_id = "abc";
 
-    type State = ();
-
     let service = (
         RequestFrameLayer,
         FrameBytesLayer,
@@ -310,7 +330,7 @@ async fn simple_layers() -> Result<(), Error> {
         .into_layer(
             FrameRouteService::builder()
                 .with_service(RequestLayer::<MetadataRequest>::new().into_layer(
-                    ResponseService::new(|_ctx: Context<State>, _req: MetadataRequest| {
+                    ResponseService::new(|_req: RequestInput<MetadataRequest>| {
                         Ok::<_, Error>(
                             MetadataResponse::default()
                                 .brokers(Some([].into()))
@@ -325,7 +345,7 @@ async fn simple_layers() -> Result<(), Error> {
                 .and_then(|builder| builder.build())?,
         );
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     let request = MetadataRequest::default()
         .topics(Some([].into()))
@@ -333,7 +353,12 @@ async fn simple_layers() -> Result<(), Error> {
         .include_cluster_authorized_operations(Some(false))
         .include_topic_authorized_operations(Some(false));
 
-    let response = service.serve(ctx, request).await?;
+    let response = service
+        .serve(RequestInput {
+            request,
+            extensions,
+        })
+        .await?;
     assert_eq!(Some(cluster_id.into()), response.cluster_id);
 
     Ok(())
@@ -350,7 +375,7 @@ async fn api_key_hijack() -> Result<(), Error> {
 
     let service = (
         FrameRequestLayer::<MetadataRequest>::new(),
-        MapResponseLayer::new(move |response: MetadataResponse| {
+        MapOutputLayer::new(move |response: MetadataResponse| {
             response.brokers(Some(vec![
                 MetadataResponseBroker::default()
                     .node_id(NODE_ID)
@@ -360,28 +385,29 @@ async fn api_key_hijack() -> Result<(), Error> {
             ]))
         }),
     )
-        .into_layer(ResponseService::new(|_, _req: MetadataRequest| {
-            Ok::<_, Error>(
-                MetadataResponse::default()
-                    .brokers(Some([].into()))
-                    .topics(Some([].into()))
-                    .cluster_id(Some(CLUSTER_ID.into()))
-                    .controller_id(Some(NODE_ID))
-                    .throttle_time_ms(Some(0))
-                    .cluster_authorized_operations(Some(-1)),
-            )
-        }));
+        .into_layer(ResponseService::new(
+            |_req: RequestInput<MetadataRequest>| {
+                Ok::<_, Error>(
+                    MetadataResponse::default()
+                        .brokers(Some([].into()))
+                        .topics(Some([].into()))
+                        .cluster_id(Some(CLUSTER_ID.into()))
+                        .controller_id(Some(NODE_ID))
+                        .throttle_time_ms(Some(0))
+                        .cluster_authorized_operations(Some(-1)),
+                )
+            },
+        ));
 
     let hijack = HijackLayer::new(FrameApiKeyMatcher(MetadataRequest::KEY), service.clone())
-        .into_layer(FrameService::new(|_, req: Frame| {
+        .into_layer(FrameService::new(|req: FrameInput| {
             debug!(?req);
             Err(Error::Message("unmapped".into()))
         }));
 
     let frame = hijack
-        .serve(
-            Context::default(),
-            Frame {
+        .serve(FrameInput {
+            frame: Frame {
                 header: Header::Request {
                     api_key: MetadataRequest::KEY,
                     api_version: 12,
@@ -391,7 +417,8 @@ async fn api_key_hijack() -> Result<(), Error> {
                 body: MetadataRequest::default().into(),
                 size: 0,
             },
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let response: MetadataResponse = frame.body.try_into()?;

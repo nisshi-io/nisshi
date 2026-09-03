@@ -15,11 +15,11 @@
 use common::register_broker;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    DescribeClusterRequest, DescribeClusterResponse, ErrorCode,
+    DescribeClusterRequest, DescribeClusterResponse, ErrorCode, RequestInput,
     describe_cluster_response::DescribeClusterBroker,
 };
 use nisshi_storage::{DescribeClusterService, Storage};
-use rama::{Context, Service};
+use rama::{Service, extensions::Extensions};
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
@@ -42,16 +42,17 @@ where
     let include_cluster_authorized_operations = true;
     let endpoint_type = Some(6);
 
-    let ctx = Context::with_state(sc);
-    let service = DescribeClusterService;
+    let service = DescribeClusterService {
+        storage: sc.clone(),
+    };
 
     let response = service
-        .serve(
-            ctx,
-            DescribeClusterRequest::default()
+        .serve(RequestInput {
+            request: DescribeClusterRequest::default()
                 .include_cluster_authorized_operations(include_cluster_authorized_operations)
                 .endpoint_type(endpoint_type),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let host = advertised_listener.host_str().unwrap().to_string();

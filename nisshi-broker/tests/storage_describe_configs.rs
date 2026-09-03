@@ -20,11 +20,11 @@ use crate::common::{
 };
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    ConfigResource, DescribeConfigsRequest, ErrorCode,
+    ConfigResource, DescribeConfigsRequest, ErrorCode, RequestInput,
     describe_configs_request::DescribeConfigsResource,
 };
 use nisshi_storage::{ArcDynStorage, DescribeConfigsService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
@@ -33,12 +33,11 @@ mod common;
 async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let resource_name = &alphanumeric_string(15)[..];
 
-    let service = MapStateLayer::new(|_| storage).into_layer(DescribeConfigsService);
+    let service = DescribeConfigsService { storage };
 
     let response = service
-        .serve(
-            Context::default(),
-            DescribeConfigsRequest::default()
+        .serve(RequestInput {
+            request: DescribeConfigsRequest::default()
                 .include_documentation(Some(false))
                 .include_synonyms(Some(false))
                 .resources(Some(
@@ -48,7 +47,8 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
                         .configuration_keys(Some([].into()))]
                     .into(),
                 )),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let results = response.results.unwrap_or_default();
@@ -72,7 +72,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -98,7 +98,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -124,7 +124,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

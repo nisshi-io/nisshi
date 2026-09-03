@@ -19,7 +19,7 @@ use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
 use nisshi_broker::{Error, Result, service::storage};
 use nisshi_sans_io::{
     Ack, CreateTopicsRequest, ErrorCode, FetchRequest, IsolationLevel, ListOffset,
-    ListOffsetsRequest, NULL_TOPIC_ID, ProduceRequest,
+    ListOffsetsRequest, NULL_TOPIC_ID, ProduceRequest, RequestInput,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic, ReplicaState},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
@@ -31,7 +31,7 @@ use nisshi_service::{
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
 use nisshi_storage::Storage;
-use rama::{Context, Layer as _, Service};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
 use url::Url;
@@ -45,14 +45,14 @@ const DELETE: &str = "delete";
 const RETENTION_MS: &str = "retention.ms";
 
 type Broker = RequestFrameService<
-    FrameBytesService<BytesService<BytesFrameService<FrameRouteService<(), Error>>>>,
+    FrameBytesService<BytesService<BytesFrameService<FrameRouteService<Error>>>>,
 >;
 
 fn broker<S>(storage: S) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
+    storage::services(FrameRouteService::<Error>::builder(), storage)
         .inspect(|builder| debug!(?builder))
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|frame_route| {
@@ -79,10 +79,11 @@ where
     let num_partitions = 6;
     let replication_factor = 0;
 
+    let extensions = Extensions::default();
+
     let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .timeout_ms(timeout)
                 .validate_only(Some(false))
                 .topics(Some(
@@ -99,7 +100,8 @@ where
                         .name(topic_name.into())]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -134,9 +136,8 @@ where
     let partition = 0;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -150,7 +151,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -173,9 +175,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -189,7 +190,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -212,9 +214,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -228,7 +229,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -245,9 +247,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -266,7 +267,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -293,9 +295,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -314,7 +315,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -344,9 +346,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -365,7 +366,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -392,9 +394,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -413,7 +414,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -437,9 +439,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -462,7 +463,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -502,10 +504,11 @@ where
     let num_partitions = 6;
     let replication_factor = 0;
 
+    let extensions = Extensions::default();
+
     let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .timeout_ms(timeout)
                 .validate_only(Some(false))
                 .topics(Some(
@@ -527,7 +530,8 @@ where
                         .name(topic_name.into())]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -562,9 +566,8 @@ where
     let partition = 0;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -578,7 +581,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -602,9 +606,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -618,7 +621,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -642,9 +646,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -658,7 +661,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -675,9 +679,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -696,7 +699,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -723,9 +727,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -744,7 +747,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -768,9 +772,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -793,7 +796,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -831,9 +835,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -852,7 +855,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -879,9 +883,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -900,7 +903,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -924,9 +928,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -949,7 +952,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -992,9 +996,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1013,7 +1016,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1034,9 +1038,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1055,7 +1058,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1073,9 +1077,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -1098,7 +1101,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -1134,10 +1138,11 @@ where
     let num_partitions = 6;
     let replication_factor = 0;
 
+    let extensions = Extensions::default();
+
     let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .timeout_ms(timeout)
                 .validate_only(Some(false))
                 .topics(Some(
@@ -1154,7 +1159,8 @@ where
                         .name(topic_name.into())]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1189,9 +1195,8 @@ where
     let partition = 0;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -1205,7 +1210,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -1229,9 +1235,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -1245,7 +1250,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -1269,9 +1275,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -1285,7 +1290,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -1302,9 +1308,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1323,7 +1328,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1350,9 +1356,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1371,7 +1376,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1395,9 +1401,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -1420,7 +1425,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -1458,9 +1464,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1479,7 +1484,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1506,9 +1512,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1527,7 +1532,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1551,9 +1557,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -1576,7 +1581,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -1619,9 +1625,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1640,7 +1645,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1661,9 +1667,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1682,7 +1687,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1700,9 +1706,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -1725,7 +1730,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -1761,10 +1767,11 @@ where
     let num_partitions = 6;
     let replication_factor = 0;
 
+    let extensions = Extensions::default();
+
     let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .timeout_ms(timeout)
                 .validate_only(Some(false))
                 .topics(Some(
@@ -1786,7 +1793,8 @@ where
                         .name(topic_name.into())]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1821,9 +1829,8 @@ where
     let partition = 0;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -1837,7 +1844,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -1861,9 +1869,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -1877,7 +1884,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -1901,9 +1909,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -1917,7 +1924,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -1934,9 +1942,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -1955,7 +1962,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -1982,9 +1990,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2003,7 +2010,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2027,9 +2035,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -2052,7 +2059,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -2090,9 +2098,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2111,7 +2118,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2138,9 +2146,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2159,7 +2166,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2183,9 +2191,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -2208,7 +2215,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -2248,10 +2256,11 @@ where
     let num_partitions = 6;
     let replication_factor = 0;
 
+    let extensions = Extensions::default();
+
     let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .timeout_ms(timeout)
                 .validate_only(Some(false))
                 .topics(Some(
@@ -2273,7 +2282,8 @@ where
                         .name(topic_name.into())]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2308,9 +2318,8 @@ where
     let partition = 0;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -2324,7 +2333,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -2348,9 +2358,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -2364,7 +2373,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -2388,9 +2398,8 @@ where
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -2404,7 +2413,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -2421,9 +2431,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2442,7 +2451,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2469,9 +2479,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2490,7 +2499,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2514,9 +2524,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -2539,7 +2548,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -2577,9 +2587,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2598,7 +2607,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2625,9 +2635,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2646,7 +2655,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2670,9 +2680,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -2695,7 +2704,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {
@@ -2730,9 +2740,8 @@ where
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2751,7 +2760,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2772,9 +2782,8 @@ where
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -2793,7 +2802,8 @@ where
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -2811,9 +2821,8 @@ where
     }
 
     let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
+        .serve(RequestInput {
+            request: FetchRequest::default()
                 .cluster_id(Some("".into()))
                 .replica_id(Some(-1))
                 .replica_state(Some(ReplicaState::default()))
@@ -2836,7 +2845,8 @@ where
                 ]))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     {

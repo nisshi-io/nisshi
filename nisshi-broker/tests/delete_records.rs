@@ -15,11 +15,11 @@
 use crate::common::init_tracing;
 use nisshi_broker::Error;
 use nisshi_sans_io::{
-    DeleteRecordsRequest,
+    DeleteRecordsRequest, RequestInput,
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
 };
 use nisshi_storage::{DeleteRecordsService, StorageContainer};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use tracing::debug;
 use url::Url;
 
@@ -38,14 +38,15 @@ async fn delete_non_existent_records() -> Result<(), Error> {
         .build()
         .await?;
 
-    let service = MapStateLayer::new(|_| storage).into_layer(DeleteRecordsService);
+    let service = DeleteRecordsService {
+        storage: storage.clone(),
+    };
 
     let topic = "abcba";
 
     let response = service
-        .serve(
-            Context::default(),
-            DeleteRecordsRequest::default().topics(Some(
+        .serve(RequestInput {
+            request: DeleteRecordsRequest::default().topics(Some(
                 [DeleteRecordsTopic::default()
                     .name(topic.into())
                     .partitions(Some(
@@ -56,7 +57,8 @@ async fn delete_non_existent_records() -> Result<(), Error> {
                     ))]
                 .into(),
             )),
-        )
+            extensions: Extensions::default(),
+        })
         .await
         .inspect(|response| debug!(?response))?;
 

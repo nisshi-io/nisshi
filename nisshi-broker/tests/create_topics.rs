@@ -15,16 +15,16 @@
 use crate::common::{alphanumeric_string, init_tracing};
 use nisshi_broker::Error;
 use nisshi_sans_io::{
-    CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID,
+    CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID, RequestInput,
     create_topics_request::CreatableTopic, describe_topic_partitions_request::TopicRequest,
 };
 use nisshi_storage::{CreateTopicsService, DescribeTopicPartitionsService, Storage};
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+use rama::{Service as _, extensions::Extensions};
 
 mod common;
 
 async fn create(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
+    let service = CreateTopicsService { storage };
 
     let name = alphanumeric_string(15);
     let num_partitions = 5;
@@ -33,9 +33,8 @@ async fn create(storage: impl Storage + Clone) -> Result<(), Error> {
     let configs = Some([].into());
 
     let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.clone())
@@ -45,7 +44,8 @@ async fn create(storage: impl Storage + Clone) -> Result<(), Error> {
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -61,9 +61,8 @@ async fn create(storage: impl Storage + Clone) -> Result<(), Error> {
 }
 
 async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let service = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let name = alphanumeric_string(15);
@@ -72,10 +71,11 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
     let assignments = Some([].into());
     let configs = Some([].into());
 
+    let extensions = Extensions::default();
+
     let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.clone())
@@ -85,7 +85,8 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -97,17 +98,16 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
     assert_eq!(Some(1), topics[0].replication_factor);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
-    let service = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DescribeTopicPartitionsService)
+    let service = DescribeTopicPartitionsService {
+        storage: storage.clone(),
     };
 
     let response = service
-        .serve(
-            Context::default(),
-            DescribeTopicPartitionsRequest::default()
+        .serve(RequestInput {
+            request: DescribeTopicPartitionsRequest::default()
                 .topics(Some([TopicRequest::default().name(name.clone())].into())),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -148,7 +148,9 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
 }
 
 async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
+    let service = CreateTopicsService {
+        storage: storage.clone(),
+    };
 
     let name = alphanumeric_string(15);
     let num_partitions = 5;
@@ -156,10 +158,11 @@ async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
     let assignments = Some([].into());
     let configs = Some([].into());
 
+    let extensions = Extensions::default();
+
     let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.clone())
@@ -169,7 +172,8 @@ async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
                         .configs(configs.clone()),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -182,9 +186,8 @@ async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
     let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .topics(Some(vec![
                     CreatableTopic::default()
                         .name(name.clone())
@@ -194,7 +197,8 @@ async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
                         .configs(configs),
                 ]))
                 .validate_only(Some(false)),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.unwrap_or_default();
@@ -226,7 +230,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -286,7 +290,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -346,7 +350,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

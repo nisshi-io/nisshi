@@ -16,22 +16,24 @@ use std::assert_matches;
 
 use crate::common::alphanumeric_string;
 use nisshi_broker::Error;
-use nisshi_sans_io::{DeleteGroupsRequest, ErrorCode};
+use nisshi_sans_io::{DeleteGroupsRequest, ErrorCode, RequestInput};
 use nisshi_storage::{DeleteGroupsService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 
 mod common;
 
 async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = MapStateLayer::new(|_| storage).into_layer(DeleteGroupsService);
+    let service = DeleteGroupsService {
+        storage: storage.clone(),
+    };
 
     let group_id = alphanumeric_string(15);
 
     let response = service
-        .serve(
-            Context::default(),
-            DeleteGroupsRequest::default().groups_names(Some([group_id.clone()].into())),
-        )
+        .serve(RequestInput {
+            request: DeleteGroupsRequest::default().groups_names(Some([group_id.clone()].into())),
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let results = response.results.unwrap_or_default();
@@ -59,7 +61,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -89,7 +91,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -119,7 +121,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

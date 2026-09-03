@@ -14,31 +14,35 @@
 
 use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
 use nisshi_broker::Result;
-use nisshi_sans_io::{ErrorCode, InitProducerIdRequest};
+use nisshi_sans_io::{ErrorCode, InitProducerIdRequest, RequestInput};
 use nisshi_storage::{ArcDynStorage, InitProducerIdService, Storage};
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn no_txn_init_producer_id(storage: impl Storage + Clone) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(InitProducerIdService);
+    let service = InitProducerIdService {
+        storage: storage.clone(),
+    };
 
     let transactional_id = None;
     let transaction_timeout_ms = 0;
     let producer_id = Some(-1);
     let producer_epoch = Some(-1);
 
+    let extensions = Extensions::default();
+
     let r0 = service
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
+        .serve(RequestInput {
+            request: InitProducerIdRequest::default()
                 .transactional_id(transactional_id.clone())
                 .transaction_timeout_ms(transaction_timeout_ms)
                 .producer_id(producer_id)
                 .producer_epoch(producer_epoch),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(r0.error_code, i16::from(ErrorCode::None));
@@ -46,14 +50,14 @@ async fn no_txn_init_producer_id(storage: impl Storage + Clone) -> Result<()> {
     assert!(r0.producer_id > 0);
 
     let r1 = service
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
+        .serve(RequestInput {
+            request: InitProducerIdRequest::default()
                 .transactional_id(transactional_id.clone())
                 .transaction_timeout_ms(transaction_timeout_ms)
                 .producer_id(producer_id)
                 .producer_epoch(producer_epoch),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     assert_eq!(r1.error_code, i16::from(ErrorCode::None));
@@ -71,7 +75,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -97,7 +101,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -123,7 +127,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

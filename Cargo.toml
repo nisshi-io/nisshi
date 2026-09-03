@@ -16,8 +16,11 @@ members = [
     "nisshi-sans-io",
     "nisshi-schema",
     "nisshi-service",
-    "nisshi-storage", "nisshi-storage-dynostore",
-    "nisshi-storage-null", "nisshi-storage-slatedb", "nisshi-storage-sql",
+    "nisshi-storage",
+    "nisshi-storage-dynostore",
+    "nisshi-storage-null",
+    "nisshi-storage-slatedb",
+    "nisshi-storage-sql",
     "nisshi-topic",
 ]
 
@@ -116,7 +119,7 @@ lz4 = "1.28.1"
 nanoid = "0.4.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
-object_store = { version = "0.13.1", features = ["aws", "gcp"] }
+object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 opentelemetry = "0.31.0"
 opentelemetry-otlp = "0.31.0"
 opentelemetry-semantic-conventions = "0.31.0"
@@ -135,7 +138,7 @@ protobuf = { version = "3.7.1", features = ["with-bytes"] }
 protobuf-json-mapping = "3.7.1"
 protobuf-parse = "3.7.1"
 quote = "1.0"
-rama = { version = "0.2.0", features = ["http", "tcp"] }
+rama = { version = "0.4.0", features = ["http", "tcp"] }
 rand = "0.10"
 regex = "1.12.3"
 rhai = { version = "1.24.0", features = ["sync"] }

@@ -158,6 +158,7 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_schema::{Registry, lake::House};
+use rama::error::BoxError;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -222,6 +223,8 @@ pub enum Error {
     DeadPoolBuild(#[from] deadpool::managed::BuildError),
 
     Decode(Bytes),
+
+    Boxed(Arc<BoxError>),
 
     FeatureNotEnabled {
         feature: String,
@@ -452,6 +455,12 @@ impl From<nisshi_schema::Error> for Error {
         } else {
             Self::Schema(Arc::new(value))
         }
+    }
+}
+
+impl From<BoxError> for Error {
+    fn from(value: BoxError) -> Self {
+        Self::Boxed(Arc::new(value))
     }
 }
 

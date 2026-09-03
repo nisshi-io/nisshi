@@ -22,12 +22,13 @@ use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
 use nisshi_broker::Result;
 use nisshi_sans_io::{
     ErrorCode, FetchRequest, FetchResponse, IsolationLevel, ListOffset, NULL_TOPIC_ID,
+    RequestInput,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
     record::{Header, Record, inflated},
 };
 use nisshi_storage::{FetchService, ListOffsetResponse, Storage, Topition};
-use rama::{Context, Service};
+use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::{debug, error};
 use url::Url;
@@ -85,19 +86,21 @@ where
                 .replica_directory_id(None),
         ]))];
 
-    let ctx = Context::with_state(sc);
+    let extensions = Extensions::default();
 
-    let fetch = FetchService
-        .serve(
-            ctx,
-            FetchRequest::default()
-                .max_wait_ms(max_wait_ms)
-                .min_bytes(min_bytes)
-                .max_bytes(max_bytes)
-                .isolation_level(Some(isolation_level.into()))
-                .topics(Some(topics.into())),
-        )
-        .await?;
+    let fetch = FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: FetchRequest::default()
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(min_bytes)
+            .max_bytes(max_bytes)
+            .isolation_level(Some(isolation_level.into()))
+            .topics(Some(topics.into())),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     assert_eq!(
         ErrorCode::None,
@@ -251,20 +254,22 @@ pub async fn kv_header(
             .into(),
         ))];
 
-    let ctx = Context::with_state(sc);
+    let extensions = Extensions::default();
 
-    let fetched = FetchService
-        .serve(
-            ctx,
-            FetchRequest::default()
-                .max_wait_ms(max_wait_ms)
-                .min_bytes(min_bytes)
-                .max_bytes(max_bytes)
-                .isolation_level(Some(isolation_level.into()))
-                .topics(Some(topics.into())),
-        )
-        .await
-        .map(records)?;
+    let fetched = FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: FetchRequest::default()
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(min_bytes)
+            .max_bytes(max_bytes)
+            .isolation_level(Some(isolation_level.into()))
+            .topics(Some(topics.into())),
+        extensions: extensions.clone(),
+    })
+    .await
+    .map(records)?;
 
     assert_eq!(messages.len(), fetched.len());
 
@@ -448,20 +453,20 @@ pub async fn compacted_header(
             .into(),
         ))];
 
-    let ctx = Context::with_state(sc);
-
-    let fetched = FetchService
-        .serve(
-            ctx,
-            FetchRequest::default()
-                .max_wait_ms(max_wait_ms)
-                .min_bytes(min_bytes)
-                .max_bytes(max_bytes)
-                .isolation_level(Some(isolation_level.into()))
-                .topics(Some(topics.into())),
-        )
-        .await
-        .map(records)?;
+    let fetched = FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: FetchRequest::default()
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(min_bytes)
+            .max_bytes(max_bytes)
+            .isolation_level(Some(isolation_level.into()))
+            .topics(Some(topics.into())),
+        extensions: Extensions::default(),
+    })
+    .await
+    .map(records)?;
 
     // the record at offset 0 has been compacted away, leaving only the
     // record at offset 1, which must be fetched with its own headers
@@ -599,19 +604,19 @@ where
             .into(),
         ))];
 
-    let ctx = Context::with_state(sc);
-
-    let fetch = FetchService
-        .serve(
-            ctx,
-            FetchRequest::default()
-                .max_wait_ms(max_wait_ms)
-                .min_bytes(min_bytes)
-                .max_bytes(max_bytes)
-                .isolation_level(Some(isolation_level.into()))
-                .topics(Some(topics.into())),
-        )
-        .await?;
+    let fetch = FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: FetchRequest::default()
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(min_bytes)
+            .max_bytes(max_bytes)
+            .isolation_level(Some(isolation_level.into()))
+            .topics(Some(topics.into())),
+        extensions: Extensions::default(),
+    })
+    .await?;
 
     assert_eq!(
         ErrorCode::None,

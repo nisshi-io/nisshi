@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use nisshi_broker::Result;
-use nisshi_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};
+use nisshi_sans_io::{ConsumerGroupDescribeRequest, ErrorCode, RequestInput};
 use nisshi_storage::{ConsumerGroupDescribeService, Storage};
-use rama::{Context, Layer, Service as _, layer::MapStateLayer};
+use rama::{Service as _, extensions::Extensions};
 use tracing::debug;
 use url::Url;
 
@@ -27,26 +27,26 @@ pub async fn describe_non_existent_group<C, G>(
     cluster_id: C,
     broker_id: i32,
     advertised_listener: Url,
-    sc: G,
+    storage: G,
 ) -> Result<()>
 where
     C: Into<String>,
     G: Storage + Clone,
 {
     debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, &sc).await?;
+    register_broker(cluster_id, broker_id, &storage).await?;
 
-    let service = MapStateLayer::new(|_| sc).into_layer(ConsumerGroupDescribeService);
+    let service = ConsumerGroupDescribeService { storage };
 
     let group_id = "abc";
 
     let response = service
-        .serve(
-            Context::default(),
-            ConsumerGroupDescribeRequest::default()
+        .serve(RequestInput {
+            request: ConsumerGroupDescribeRequest::default()
                 .group_ids(Some([group_id.into()].into()))
                 .include_authorized_operations(false),
-        )
+            extensions: Extensions::default(),
+        })
         .await
         .inspect(|response| debug!(?response))?;
 

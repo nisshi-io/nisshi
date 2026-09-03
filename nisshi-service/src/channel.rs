@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use nisshi_sans_io::Frame;
-use rama::{Context, Layer, Service};
+use rama::{Layer, Service};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -53,27 +53,22 @@ pub struct ChannelFrameService<S> {
 /// A channel frame receiver
 pub type FrameReceiver = mpsc::Receiver<(Frame, oneshot::Sender<Frame>)>;
 
-impl<S, State> Service<State, FrameReceiver> for ChannelFrameService<S>
+impl<S> Service<FrameReceiver> for ChannelFrameService<S>
 where
-    S: Service<State, Frame, Response = Frame>,
-    State: Clone + Send + Sync + 'static,
+    S: Service<Frame, Output = Frame>,
     S::Error: From<Error>,
 {
-    type Response = ();
+    type Output = ();
     type Error = S::Error;
 
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        mut req: FrameReceiver,
-    ) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, mut req: FrameReceiver) -> Result<Self::Output, Self::Error> {
         loop {
             tokio::select! {
                 Some((frame, tx)) = req.recv() => {
                     debug!(?frame, ?tx);
 
                     self.inner
-                        .serve(ctx.clone(), frame)
+                        .serve(frame)
                         .await
                         .and_then(|response| {
                             tx.send(response)
@@ -108,15 +103,12 @@ impl FrameChannelService {
     }
 }
 
-impl<State> Service<State, Frame> for FrameChannelService
-where
-    State: Send + Sync + 'static,
-{
-    type Response = Frame;
+impl Service<Frame> for FrameChannelService {
+    type Output = Frame;
 
     type Error = Error;
 
-    async fn serve(&self, _ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, req: Frame) -> Result<Self::Output, Self::Error> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
         self.tx

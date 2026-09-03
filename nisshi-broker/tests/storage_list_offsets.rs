@@ -18,21 +18,22 @@ use crate::common::{
 };
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest,
+    CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest, RequestInput,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
 };
 use nisshi_storage::{ArcDynStorage, CreateTopicsService, ListOffsetsService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
     };
 
     let topic = &alphanumeric_string(15)[..];
@@ -42,9 +43,8 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
 
     {
         let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
                     .validate_only(Some(false))
                     .topics(Some(
                         [CreatableTopic::default()
@@ -55,7 +55,8 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
                             .configs(Some([].into()))]
                         .into(),
                     )),
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let topics = response.topics.as_deref().unwrap_or_default();
@@ -63,12 +64,13 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
         assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
     }
 
-    let service = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
+    let service = ListOffsetsService {
+        storage: storage.clone(),
+    };
 
     let response = service
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
                 .replica_id(broker_id)
                 .topics(Some(
@@ -84,7 +86,8 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -114,7 +117,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -140,7 +143,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -166,7 +169,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

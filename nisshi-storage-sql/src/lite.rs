@@ -61,7 +61,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
 };
-use rama::{Context, Layer as _, Service as _};
+use rama::{Layer as _, Service as _};
 use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
 use std::{
@@ -2269,7 +2269,7 @@ impl Builder<String, i32, Url, Url> {
                         let server = ChannelRequestLayer::new(cancellation)
                             .into_layer(RequestStorageService::new(storage));
 
-                        server.serve(Context::default(), receiver).await
+                        server.serve(receiver).await
                     })
                 };
 

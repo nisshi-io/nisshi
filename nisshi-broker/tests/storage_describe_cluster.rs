@@ -14,24 +14,24 @@
 
 use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
 use nisshi_broker::Result;
-use nisshi_sans_io::{DescribeClusterRequest, EndpointType};
+use nisshi_sans_io::{DescribeClusterRequest, EndpointType, RequestInput};
 use nisshi_storage::{ArcDynStorage, DescribeClusterService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(DescribeClusterService);
+    let service = DescribeClusterService { storage };
 
     let response = service
-        .serve(
-            Context::default(),
-            DescribeClusterRequest::default()
+        .serve(RequestInput {
+            request: DescribeClusterRequest::default()
                 .endpoint_type(Some(EndpointType::Broker.into()))
                 .include_cluster_authorized_operations(false),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let brokers = response.brokers.unwrap_or_default();
@@ -49,7 +49,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -75,7 +75,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -101,7 +101,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]

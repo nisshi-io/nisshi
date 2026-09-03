@@ -17,26 +17,26 @@ use crate::common::{
     slate_storage,
 };
 use nisshi_broker::Result;
-use nisshi_sans_io::{ErrorCode, FindCoordinatorRequest};
+use nisshi_sans_io::{ErrorCode, FindCoordinatorRequest, RequestInput};
 use nisshi_storage::{ArcDynStorage, FindCoordinatorService, Storage};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
 
 mod common;
 
 async fn simple(broker_id: i32, storage: impl Storage + Clone) -> Result<()> {
-    let service = MapStateLayer::new(|_| storage).into_layer(FindCoordinatorService);
+    let service = FindCoordinatorService { storage };
     let name = &alphanumeric_string(15)[..];
 
     let response = service
-        .serve(
-            Context::default(),
-            FindCoordinatorRequest::default()
+        .serve(RequestInput {
+            request: FindCoordinatorRequest::default()
                 .key(Some(name.into()))
                 .key_type(Some(0))
                 .coordinator_keys(Some([name.into()].into())),
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     assert_eq!(
@@ -57,7 +57,7 @@ mod in_memory {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await.map_err(Into::into)
+        memory_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -83,7 +83,7 @@ mod lite {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        lite_storage(cluster, node).await
     }
 
     #[tokio::test]
@@ -109,7 +109,7 @@ mod slatedb {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await.map_err(Into::into)
+        slate_storage(cluster, node).await
     }
 
     #[tokio::test]
