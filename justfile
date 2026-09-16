@@ -14,7 +14,7 @@ clean-workspace:
 license:
     cargo about generate about.hbs > license.html
 
-build-all profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb": (cargo-build "--profile" profile "--timings" "--no-default-features" "--features" features)
+build-all profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb": (cargo-build "--profile" profile "--timings" "--no-default-features" "--features" features "--all-targets")
 
 build profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb" bin="nisshi": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 

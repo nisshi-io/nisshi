@@ -17,12 +17,14 @@ The project uses `just` as a task runner (loads `.env` automatically).
 ```shell
 just                 # default: fmt, build, test, clippy
 just build           # build with all features (dev profile)
-just test            # nextest + doc tests
+just build-all       # build every target (bins, examples, tests, benches) with all features - use this to verify a change builds cleanly workspace-wide
+just test            # nextest + doc tests - use this to rerun the full test suite after a change
 just test-workspace  # cargo nextest run --workspace --all-targets --all-features
 just test-doc        # cargo test --workspace --doc --all-features
 just clippy          # cargo clippy --workspace --all-features --all-targets -- -D warnings
 just fmt             # cargo fmt --all --check
 just check           # cargo check --workspace --all-features --all-targets
+just ci              # (re)starts the docker compose services (postgres, minio, lakehouse) that integration tests depend on - safe to rerun if services are in a bad state
 ```
 
 Run a single test with nextest:
@@ -73,6 +75,18 @@ Uses `rama` crate for Layer/Service composition:
 - `TcpBytesLayer` (TCP) -> `BytesFrameLayer` (bytes -> Kafka Frame) -> `FrameRouteService` (route to typed handlers) -> `FrameBytesLayer` -> `BytesTcpService`
 - Same layering pattern used for broker, proxy, and CLI clients
 
+#### rama 0.4.0: `Context<State>` replaced by `Extensions`
+
+As of rama 0.4.0, `Service::serve` takes a single `req` parameter — the old `Service<State, Req>::serve(&self, ctx: Context<State>, req: Req)` two-parameter form and generic `State` are gone. Any ambient data (auth state, cluster id, maximum frame size, etc.) that used to travel via `Context<State>` now travels as a `rama::extensions::Extensions` bag carried *inside* the request wrapper type — see `nisshi-sans-io/src/input.rs` for `FrameInput`, `BodyInput`, `RequestInput<Q>`, and `BytesInput`, each a `{ value, extensions: Extensions }` pair.
+
+Two things about `Extensions` are easy to get wrong when touching this code:
+
+- **It is not fresh per request.** `Extensions` is `Arc`-backed; `.clone()` shares the same underlying store, and it is typically created once per connection (or per long-lived session, e.g. a consumer group) and reused/cloned across every request on it — not reconstructed per request the way the old per-call `Context` was. Code that inserts something once (e.g. `AuthenticationExtension` in `BytesFrameService`) must check `extensions.contains::<T>()` before inserting, since on the 2nd+ request on the same connection it will already be there. Don't assert it's absent — that's a real invariant violation waiting to break multi-round-trip flows like SCRAM.
+- **`.fork()` vs `.clone()`**: `.fork()` creates an isolated child scope — reads fall through to the parent, but inserts land only on the child and don't leak back up. Use `.fork()` when issuing an internal/side request that should see the caller's extensions but not mutate them (e.g. `nisshi-proxy`'s internal `DescribeConfigsRequest` lookup). Use `.clone()` (sharing the same store) when the request is part of the same logical session and should accumulate/observe state alongside sibling requests (e.g. `ConsumerGroupService`'s per-session `Extensions` field).
+- **`Extension` requires an explicit impl** (or `#[derive(Extension)]`) — there is no blanket impl for arbitrary `T`, so a generic type can't automatically be stored as an extension unless its concrete implementors opt in.
+
+Per-handler dependencies (the `Coordinator` in `nisshi-broker/src/broker/group/*.rs`, the `Storage` handle `G` in `nisshi-storage/src/service/*.rs`) are still injected as plain struct fields (`struct FooService<C> { coordinator: C }`) on each handler rather than through the `Extensions` bag — that's deliberate, not a leftover of the migration.
+
 ### Storage Backends (`nisshi-storage`)
 
 Selected at compile time via feature flags, dispatched at runtime through `StorageContainer` enum:
@@ -81,6 +95,8 @@ Selected at compile time via feature flags, dispatched at runtime through `Stora
 - `postgres://` - PostgreSQL (feature: `postgres`)
 - `sqlite://` - libSQL/SQLite (feature: `libsql`)
 - `slatedb://` - SlateDB KV store (feature: `slatedb`)
+
+`RequestChannelService`'s `Storage` trait impl (`nisshi-storage/src/service.rs`) sends a `Request` over a channel and extracts the matching `Response` variant; every method does this via the `serve_and_extract!(self, request_expr, ResponseVariant)` macro rather than repeating the match/unwrap boilerplate - add new methods the same way.
 
 ### Broker Specifics
 
@@ -99,7 +115,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 
 - Tests use `cargo-nextest` (not `cargo test` for workspace tests)
 - Test logs go to `logs/<crate-name>/` (one file per test thread, dirs must exist)
-- Integration tests require external services started via `just ci`
+- Integration tests require external services started via `just ci` (postgres, minio, lakehouse); rerun `just ci` if those services are in a bad state, then `just test` to rerun the suite
 - Tests load `.env` via `dotenv().ok()`
 - Tests in `nisshi-broker` run against multiple backends: InMemory, Lite (libSQL), Postgres, SlateDb
 - Tests with specific feature requirements use `required-features` in their `Cargo.toml`

@@ -19,7 +19,7 @@ use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
 use nisshi_broker::{Error, Result, service::storage};
 use nisshi_sans_io::{
     Ack, CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest,
-    ProduceRequest,
+    ProduceRequest, RequestInput,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -31,7 +31,7 @@ use nisshi_service::{
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
 use nisshi_storage::{Storage, Topition};
-use rama::{Context, Layer as _, Service};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tokio::time::sleep;
 use tracing::debug;
@@ -41,14 +41,14 @@ use uuid::Uuid;
 pub mod common;
 
 type Broker = RequestFrameService<
-    FrameBytesService<BytesService<BytesFrameService<FrameRouteService<(), Error>>>>,
+    FrameBytesService<BytesService<BytesFrameService<FrameRouteService<Error>>>>,
 >;
 
 fn broker<S>(storage: S) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
+    storage::services(FrameRouteService::<Error>::builder(), storage)
         .inspect(|builder| debug!(?builder))
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|frame_route| {
@@ -70,10 +70,11 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     let num_partitions = 6;
     let replication_factor = 0;
 
+    let extensions = Extensions::default();
+
     let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
                 .timeout_ms(timeout)
                 .validate_only(Some(false))
                 .topics(Some(
@@ -85,7 +86,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         .name(topic_name.into())]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -101,9 +103,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -122,7 +123,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -141,9 +143,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -162,7 +163,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -191,9 +193,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     let partition = 0;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -207,7 +208,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -232,9 +234,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -248,7 +249,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -273,9 +275,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
         .and_then(deflated::Frame::try_from)?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
                 .timeout_ms(timeout)
                 .acks(Ack::Leader.into())
                 .topic_data(Some(
@@ -289,7 +290,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await
         .inspect(|response| debug!("{response:?}"))?;
 
@@ -306,9 +308,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     let timestamp = ListOffset::Earliest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -327,7 +328,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -354,9 +356,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     let timestamp = ListOffset::Latest.try_into()?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -375,7 +376,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -404,9 +406,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
         .inspect(|first| debug!(?first))?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -425,7 +426,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -454,9 +456,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
         .inspect(|second| debug!(?second))?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -475,7 +476,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -504,9 +506,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
         .inspect(|third| debug!(?third))?;
 
     let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
                 .isolation_level(isolation)
                 .replica_id(replica_id)
                 .topics(Some(
@@ -525,7 +526,8 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
                         ))]
                     .into(),
                 )),
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
@@ -741,14 +743,13 @@ where
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Postgres,
             cluster,
@@ -806,14 +807,13 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::InMemory,
             cluster,
@@ -871,14 +871,13 @@ mod in_memory {
 
 #[cfg(feature = "libsql")]
 mod lite {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Lite,
             cluster,
@@ -936,14 +935,13 @@ mod lite {
 
 #[cfg(feature = "slatedb")]
 mod slatedb {
-    use std::sync::Arc;
-
     use super::*;
+    use nisshi_storage::ArcDynStorage;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::SlateDb,
             cluster,

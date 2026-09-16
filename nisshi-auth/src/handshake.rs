@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Authentication, Error, Stage};
-use nisshi_sans_io::{ApiKey, ErrorCode, SaslHandshakeRequest, SaslHandshakeResponse};
-use rama::{Context, Service};
+use crate::{AuthenticationExtension, Error, Stage};
+use nisshi_sans_io::{
+    ApiKey, ErrorCode, RequestInput, SaslHandshakeRequest, SaslHandshakeResponse,
+};
+use rama::{Service, extensions::ExtensionsRef as _};
 use rsasl::prelude::Mechname;
 use tracing::{debug, instrument};
 
@@ -25,20 +27,20 @@ impl ApiKey for SaslHandshakeService {
     const KEY: i16 = SaslHandshakeRequest::KEY;
 }
 
-impl<S> Service<S, SaslHandshakeRequest> for SaslHandshakeService
-where
-    S: Send + Sync + 'static,
-{
-    type Response = SaslHandshakeResponse;
+impl Service<RequestInput<SaslHandshakeRequest>> for SaslHandshakeService {
+    type Output = SaslHandshakeResponse;
     type Error = Error;
 
-    #[instrument(skip(self, ctx), ret)]
+    #[instrument(skip(self), ret)]
     async fn serve(
         &self,
-        ctx: Context<S>,
-        req: SaslHandshakeRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        if let Some(authentication) = ctx.get::<Authentication>().cloned() {
+        input: RequestInput<SaslHandshakeRequest>,
+    ) -> Result<Self::Output, Self::Error> {
+        if let Some(authentication) = input
+            .extensions()
+            .get_ref::<AuthenticationExtension>()
+            .cloned()
+        {
             authentication.stage
             .lock()
             .map_err(Into::into)
@@ -56,7 +58,7 @@ where
                     _ = guard.replace(authentication.fresh_server());
                 }
 
-                if let Some(Stage::Server(server)) = guard.take() && let Ok(mechanism) = Mechname::parse(req.mechanism.as_bytes()) {
+                if let Some(Stage::Server(server)) = guard.take() && let Ok(mechanism) = Mechname::parse(input.request.mechanism.as_bytes()) {
                     debug!(available = ?server.get_available().into_iter().map(|mechanism|mechanism.mechanism.as_str()).collect::<Vec<_>>());
 
                     server
@@ -75,13 +77,13 @@ where
                 } else {
                     Ok(SaslHandshakeResponse::default()
                         .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                        .mechanisms(Some([req.mechanism].into())))
+                        .mechanisms(Some([input.request.mechanism].into())))
                 }
             })
         } else {
             Ok(SaslHandshakeResponse::default()
                 .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                .mechanisms(Some([req.mechanism].into())))
+                .mechanisms(Some([input.request.mechanism].into())))
         }
     }
 }

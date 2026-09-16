@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse, RequestInput};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service;
 /// use nisshi_sans_io::{ErrorCode, ListGroupsRequest};
 /// use nisshi_storage::{Error, ListGroupsService, StorageContainer};
 /// use url::Url;
@@ -39,11 +39,10 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(ListGroupsService);
+/// let service = ListGroupsService { storage };
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         ListGroupsRequest::default().states_filter(Some(["Empty".into()].into())),
 ///     )
 ///     .await?;
@@ -53,28 +52,29 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ListGroupsService;
+#[derive(Clone, Debug)]
+pub struct ListGroupsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for ListGroupsService {
+impl<G> ApiKey for ListGroupsService<G> {
     const KEY: i16 = ListGroupsRequest::KEY;
 }
 
-impl<G> Service<G, ListGroupsRequest> for ListGroupsService
+impl<G, I> Service<I> for ListGroupsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<ListGroupsRequest>> + Send + 'static,
 {
-    type Response = ListGroupsResponse;
+    type Output = ListGroupsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ListGroupsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .list_groups(req.states_filter.as_deref())
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
+        self.storage
+            .list_groups(input.request.states_filter.as_deref())
             .await
             .map(Some)
             .map(|groups| {

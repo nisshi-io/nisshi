@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,44 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, TxnOffsetCommitResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, RequestInput, TxnOffsetCommitResponse};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`nisshi_sans_io::TxnOffsetCommitRequest`] returning [`TxnOffsetCommitResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OffsetCommitService;
+#[derive(Clone, Debug)]
+pub struct OffsetCommitService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for OffsetCommitService {
+impl<G> ApiKey for OffsetCommitService<G> {
     const KEY: i16 = nisshi_sans_io::TxnOffsetCommitRequest::KEY;
 }
 
-impl<G> Service<G, nisshi_sans_io::TxnOffsetCommitRequest> for OffsetCommitService
+impl<G, I> Service<I> for OffsetCommitService<G>
 where
     G: Storage,
+    I: Into<RequestInput<nisshi_sans_io::TxnOffsetCommitRequest>> + Send + 'static,
 {
-    type Response = TxnOffsetCommitResponse;
+    type Output = TxnOffsetCommitResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: nisshi_sans_io::TxnOffsetCommitRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let responses = ctx
-            .state()
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
+        let responses = self
+            .storage
             .txn_offset_commit(crate::TxnOffsetCommitRequest {
-                transaction_id: req.transactional_id.to_owned(),
-                group_id: req.group_id.to_owned(),
-                producer_id: req.producer_id,
-                producer_epoch: req.producer_epoch,
-                generation_id: req.generation_id,
-                member_id: req.member_id,
-                group_instance_id: req.group_instance_id,
-                topics: req.topics.unwrap_or_default(),
+                transaction_id: input.request.transactional_id.to_owned(),
+                group_id: input.request.group_id.to_owned(),
+                producer_id: input.request.producer_id,
+                producer_epoch: input.request.producer_epoch,
+                generation_id: input.request.generation_id,
+                member_id: input.request.member_id,
+                group_instance_id: input.request.group_instance_id,
+                topics: input.request.topics.unwrap_or_default(),
             })
             .await?;
 

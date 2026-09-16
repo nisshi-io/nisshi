@@ -1059,7 +1059,7 @@ fn process(messages: &[Message], include_tag: bool) -> TokenStream {
                 let module = syn::parse_str::<syn::Path>(
                     &name.to_token_stream().to_string().to_case(Case::Snake),
                 )
-                .unwrap_or_else(|_| panic!("module: {}", &name.to_token_stream().to_string()));
+                .unwrap_or_else(|_| panic!("module: {}", name.to_token_stream()));
 
                 let as_name = syn::parse_str::<syn::Path>(
                     &format!("As{}", name.to_token_stream()).to_case(Case::Snake),
@@ -1128,26 +1128,24 @@ fn process(messages: &[Message], include_tag: bool) -> TokenStream {
                 let name = message.type_name();
 
                 quote! {
-                    impl<State> rama::matcher::Matcher<State, Frame> for #name {
+                    impl rama::matcher::Matcher<Frame> for #name {
                         fn matches(
                             &self,
-                            ext: Option<&mut rama::context::Extensions>,
-                            ctx: &rama::Context<State>,
-                            req: &Frame,
+                            ext: Option<&rama::extensions::Extensions>,
+                            input: &Frame,
                         ) -> bool {
-                            req.api_key().is_ok_and(|api_key| api_key == Self::KEY)
+                            input.api_key().is_ok_and(|api_key| api_key == Self::KEY)
                         }
                     }
 
-                    impl<State, T> rama::matcher::Matcher<State, T> for #name
+                    impl<T> rama::matcher::Matcher<T> for #name
                     where
                         T: ApiKey,
                     {
                         fn matches(
                             &self,
-                            ext: Option<&mut rama::context::Extensions>,
-                            ctx: &rama::Context<State>,
-                            req: &T,
+                            ext: Option<&rama::extensions::Extensions>,
+                            input: &T,
                         ) -> bool {
                             T::KEY == Self::KEY
                         }

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,17 +13,17 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse,
+    ApiKey, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse, RequestInput,
     find_coordinator_response::Coordinator,
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FindCoordinatorRequest`] returning [`FindCoordinatorResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service;
 /// use nisshi_sans_io::{ErrorCode, FindCoordinatorRequest};
 /// use nisshi_storage::{Error, FindCoordinatorService, StorageContainer};
 /// use url::Url;
@@ -42,11 +42,10 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(FindCoordinatorService);
+/// let service = FindCoordinatorService { storage };
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         FindCoordinatorRequest::default()
 ///             .key(Some("abcba".into()))
 ///             .key_type(Some(0))
@@ -69,29 +68,30 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FindCoordinatorService;
+#[derive(Clone, Debug)]
+pub struct FindCoordinatorService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for FindCoordinatorService {
+impl<G> ApiKey for FindCoordinatorService<G> {
     const KEY: i16 = FindCoordinatorRequest::KEY;
 }
 
-impl<G> Service<G, FindCoordinatorRequest> for FindCoordinatorService
+impl<G, I> Service<I> for FindCoordinatorService<G>
 where
     G: Storage,
+    I: Into<RequestInput<FindCoordinatorRequest>> + Send + 'static,
 {
-    type Response = FindCoordinatorResponse;
+    type Output = FindCoordinatorResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: FindCoordinatorRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let node_id = ctx.state().node().await?;
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
 
-        let listener = ctx.state().advertised_listener().await?;
+        let node_id = self.storage.node().await?;
+
+        let listener = self.storage.advertised_listener().await?;
         let host = listener.host_str().unwrap_or("localhost");
         let port = i32::from(listener.port().unwrap_or(9092));
 
@@ -102,7 +102,7 @@ where
             .node_id(Some(node_id))
             .host(Some(host.into()))
             .port(Some(port))
-            .coordinators(req.coordinator_keys.map(|keys| {
+            .coordinators(input.request.coordinator_keys.map(|keys| {
                 keys.iter()
                     .map(|key| {
                         Coordinator::default()
