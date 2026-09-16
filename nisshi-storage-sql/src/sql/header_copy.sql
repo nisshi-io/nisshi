@@ -13,4 +13,4 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-COPY header (topition, offset_id, k, v) FROM STDIN BINARY
+COPY header (topition, offset_id, ordinal, k, v) FROM STDIN BINARY

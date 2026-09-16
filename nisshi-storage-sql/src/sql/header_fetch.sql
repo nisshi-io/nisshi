@@ -22,4 +22,5 @@ join cluster c on t.cluster = c.id
 where c.name = $1
 and t.name = $2
 and tp.partition = $3
-and r.offset_id = $4;
+and r.offset_id = $4
+order by h.ordinal;

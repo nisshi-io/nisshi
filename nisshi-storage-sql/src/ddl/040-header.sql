@@ -15,9 +15,11 @@
 create table if not exists header (
     topition integer,
     offset_id integer,
+    ordinal integer,
     k blob,
     v blob,
     last_updated datetime default current_timestamp not null,
     created_at datetime default current_timestamp not null,
+    primary key (topition, offset_id, ordinal),
     foreign key (topition, offset_id) references record (topition, offset_id) on delete cascade
 );

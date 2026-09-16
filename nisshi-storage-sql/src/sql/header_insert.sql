@@ -14,11 +14,11 @@
 -- limitations under the License.
 
 insert into header
-(topition, offset_id, k, v)
+(topition, offset_id, ordinal, k, v)
 
 select
 
-r.topition, r.offset_id, $5, $6
+r.topition, r.offset_id, $5, $6, $7
 
 from
 
