@@ -34,7 +34,15 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE, frame_length,
+    frame_size,
 };
+
+/// The largest request payload a listener accepts unless [`TcpContext::maximum_frame_size`]
+/// says otherwise, matching the Apache Kafka default for `socket.request.max.bytes`.
+///
+/// The size prefix is read before authentication, so an unbounded listener lets
+/// a client make it allocate up to 2 GiB per connection by sending 4 bytes.
+pub const DEFAULT_MAXIMUM_FRAME_SIZE: usize = 100 * 1024 * 1024;
 
 /// A [`Layer`] that listens for TCP connections
 #[derive(Clone, Debug, Default)]
@@ -131,10 +139,19 @@ where
 
 /// A [context state][`Context#method.state`] state used by [`TcpContextLayer`] and [`TcpContextService`]
 #[non_exhaustive]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TcpContext {
     cluster_id: Option<String>,
     maximum_frame_size: Option<usize>,
+}
+
+impl Default for TcpContext {
+    fn default() -> Self {
+        Self {
+            cluster_id: None,
+            maximum_frame_size: Some(DEFAULT_MAXIMUM_FRAME_SIZE),
+        }
+    }
 }
 
 impl TcpContext {
@@ -142,6 +159,8 @@ impl TcpContext {
         Self { cluster_id, ..self }
     }
 
+    /// Largest request payload (excluding the 4 byte size prefix) this listener
+    /// reads, or `None` for no limit. Defaults to [`DEFAULT_MAXIMUM_FRAME_SIZE`].
     pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
         Self {
             maximum_frame_size,
@@ -229,7 +248,7 @@ impl Service<TcpStream, Bytes> for BytesTcpService {
         let mut size = [0u8; 4];
         _ = stream.read_exact(&mut size).await?;
 
-        let mut buffer: Vec<u8> = vec![0u8; frame_length(size)];
+        let mut buffer: Vec<u8> = vec![0u8; frame_length(size)?];
         buffer[0..size.len()].copy_from_slice(&size[..]);
         _ = stream.read_exact(&mut buffer[4..]).await?;
         BYTES_RECEIVED.add(buffer.len() as u64, &[]);
@@ -298,13 +317,13 @@ where
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        if maximum_frame_size
-            .is_some_and(|maximum_frame_size| maximum_frame_size > frame_length(size))
-        {
-            return Err(Into::into(Error::FrameTooBig(frame_length(size))));
-        } else {
-            Ok(size)
+        let frame_size = frame_size(size)?;
+
+        if maximum_frame_size.is_some_and(|maximum_frame_size| frame_size > maximum_frame_size) {
+            return Err(Into::into(Error::FrameTooBig(frame_size)));
         }
+
+        Ok(size)
     }
 
     #[instrument(skip_all)]
@@ -312,7 +331,7 @@ where
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut request: Vec<u8> = vec![0u8; frame_length(size)];
+        let mut request: Vec<u8> = vec![0u8; frame_length(size)?];
 
         request[0..size.len()].copy_from_slice(&size[..]);
 
@@ -459,5 +478,108 @@ where
             .serve(ctx, req)
             .await
             .inspect(|response| debug!(response = ?&response[..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Inner service standing in for the frame router: echoes the request bytes.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Echo;
+
+    impl Service<(), Bytes> for Echo {
+        type Response = Bytes;
+        type Error = Error;
+
+        async fn serve(&self, _ctx: Context<()>, req: Bytes) -> Result<Bytes, Error> {
+            Ok(req)
+        }
+    }
+
+    fn service() -> TcpBytesService<Echo, ()> {
+        TcpBytesLayer::<()>::default().into_layer(Echo)
+    }
+
+    fn header(size: i32) -> [u8; 4] {
+        size.to_be_bytes()
+    }
+
+    #[tokio::test]
+    async fn frame_within_limit_is_accepted() -> Result<(), Error> {
+        let mut reader = &header(12)[..];
+
+        let size = service().wait(&mut reader, Some(1024)).await?;
+
+        assert_eq!(header(12), size);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frame_exactly_at_limit_is_accepted() -> Result<(), Error> {
+        let mut reader = &header(1024)[..];
+
+        let size = service().wait(&mut reader, Some(1024)).await?;
+
+        assert_eq!(header(1024), size);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frame_over_limit_is_rejected() {
+        let mut reader = &header(1025)[..];
+
+        let err = service()
+            .wait(&mut reader, Some(1024))
+            .await
+            .expect_err("oversized frame must be rejected before the body is read");
+
+        assert!(matches!(err, Error::FrameTooBig(1025)), "{err:?}");
+    }
+
+    #[test]
+    fn listeners_are_bounded_by_default() {
+        assert_eq!(
+            Some(DEFAULT_MAXIMUM_FRAME_SIZE),
+            TcpContext::default().maximum_frame_size
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_frame_length_is_rejected() {
+        let mut reader = &header(-1)[..];
+
+        let err = service()
+            .wait(&mut reader, None)
+            .await
+            .expect_err("negative frame length must be rejected");
+
+        assert!(matches!(err, Error::InvalidFrameLength(-1)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_oversized_frame_without_reading_body() -> Result<(), Error> {
+        let (mut client, server) = tokio::io::duplex(64);
+
+        let ctx = Context::with_state(TcpContext::default().maximum_frame_size(Some(1024)));
+        let handle = tokio::spawn(async move { service().serve(ctx, server).await });
+
+        // Only the length prefix is sent. If the guard admitted the frame,
+        // `read` would block in `read_exact` waiting for a body that never
+        // arrives, so the timeout is what turns that into a failure.
+        client.write_all(&header(65_536)).await?;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("oversized frame was admitted: serve is blocked reading the body")?;
+
+        assert!(
+            matches!(outcome, Err(Error::FrameTooBig(65_536))),
+            "{outcome:?}"
+        );
+        Ok(())
     }
 }
