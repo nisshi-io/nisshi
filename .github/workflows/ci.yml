@@ -6,15 +6,24 @@ on:
     branches:
       - main
 jobs:
-  gated:
+  gated-membership:
     if: ${{ github.event_name == 'push' || contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association) }}
     runs-on: ubuntu-latest
     steps:
-      - run: echo "gate passed for author_association=${{ github.event.pull_request.author_association }}"
+      - run: echo "membership gate passed"
+  gated-same-repo:
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "same-repo gate passed"
   ungated:
     runs-on: ubuntu-latest
     steps:
       - run: |
           echo "event=${{ github.event_name }}"
           echo "author_association=${{ github.event.pull_request.author_association }}"
-          echo "gate=${{ github.event_name == 'push' || contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association) }}"
+          echo "head_repo=${{ github.event.pull_request.head.repo.full_name }}"
+          echo "head_is_fork=${{ github.event.pull_request.head.repo.fork }}"
+          echo "repository=${{ github.repository }}"
+          echo "gate_membership=${{ github.event_name == 'push' || contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association) }}"
+          echo "gate_same_repo=${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}"
