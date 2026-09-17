@@ -359,7 +359,14 @@ where
     E: error::Error + Send + Sync + 'static,
 {
     fn from(value: PoolError<E>) -> Self {
-        Self::Pool(Arc::new(Box::new(value)))
+        // a pool-acquisition timeout is transient load, not a backend failure: map it to a
+        // retriable Kafka error code so callers (e.g. produce.rs's `Error::Api(_)` branch)
+        // don't turn it into a non-retriable `UnknownServerError` for the client.
+        if matches!(value, PoolError::Timeout(_)) {
+            Self::Api(ErrorCode::RequestTimedOut)
+        } else {
+            Self::Pool(Arc::new(Box::new(value)))
+        }
     }
 }
 
@@ -437,7 +444,18 @@ impl From<Arc<serde_json::Error>> for Error {
 #[cfg(feature = "postgres")]
 impl From<tokio_postgres::error::Error> for Error {
     fn from(value: tokio_postgres::error::Error) -> Self {
-        Self::from(Arc::new(value))
+        // Postgres reports SQLSTATE 57014 (query_canceled) when `statement_timeout` aborts a
+        // stalled query. That's transient, not a real backend failure, so map it to a
+        // retriable Kafka error code the same way a pool-acquisition timeout is (see
+        // `From<PoolError<E>>` above) rather than the generic `Error::TokioPostgres`.
+        if value
+            .code()
+            .is_some_and(|code| *code == tokio_postgres::error::SqlState::QUERY_CANCELED)
+        {
+            Self::Api(ErrorCode::RequestTimedOut)
+        } else {
+            Self::from(Arc::new(value))
+        }
     }
 }
 
