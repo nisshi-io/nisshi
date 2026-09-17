@@ -27,7 +27,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Transaction};
+use deadpool_postgres::{
+    Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
+    Transaction,
+};
 use futures::pin_mut;
 use futures_util::future;
 use nisshi_sans_io::{
@@ -158,6 +161,37 @@ impl Builder<String, i32, Url, Pool> {
     }
 }
 
+/// Postgres statement timeout applied to every connection by default, so a stalled query
+/// (e.g. a lock wait) is aborted server-side instead of holding a pooled connection open
+/// indefinitely. An operator's own `?options=-c%20statement_timeout%3D...` in the connection
+/// URL still wins over this default; see [`merge_statement_timeout_option`]. Maintenance
+/// sweeps (`policy_compact`, `policy_delete`) explicitly opt out via `SET LOCAL` since their
+/// full-table scans can legitimately run longer than a request-path query should.
+const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
+/// How long a caller waits for a free pooled connection before failing fast with a retriable
+/// error, rather than queuing indefinitely while the pool is exhausted.
+const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long establishing a brand new connection to Postgres (TCP + TLS + auth) may take when
+/// the pool needs to grow, both at the deadpool level and (as defense in depth) directly on
+/// the underlying `tokio_postgres` connection.
+const DEFAULT_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Merges a default `statement_timeout` into an existing libpq `options` startup string.
+///
+/// Postgres applies `-c name=value` startup options in order with last-one-wins semantics,
+/// so the default is prepended: an operator's own explicit `statement_timeout` (if present in
+/// `existing`) is appended after it and therefore takes precedence.
+fn merge_statement_timeout_option(existing: Option<&str>, default_ms: u64) -> String {
+    let default_option = format!("-c statement_timeout={default_ms}");
+
+    match existing {
+        Some(existing) if !existing.is_empty() => format!("{default_option} {existing}"),
+        _ => default_option,
+    }
+}
+
 impl<C, N> FromStr for Builder<C, N, Url, Pool>
 where
     C: Default,
@@ -166,7 +200,12 @@ where
     type Err = Error;
 
     fn from_str(config: &str) -> Result<Self, Self::Err> {
-        let pg_config = Config::from_str(config).inspect(|pg_config| debug!(?pg_config))?;
+        let mut pg_config = Config::from_str(config).inspect(|pg_config| debug!(?pg_config))?;
+
+        let options =
+            merge_statement_timeout_option(pg_config.get_options(), DEFAULT_STATEMENT_TIMEOUT_MS);
+        _ = pg_config.options(options);
+        _ = pg_config.connect_timeout(DEFAULT_POOL_CREATE_TIMEOUT);
 
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
@@ -194,6 +233,9 @@ where
 
         Pool::builder(mgr)
             .max_size(16)
+            .runtime(Runtime::Tokio1)
+            .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+            .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
             .build()
             .map(|pool| Self {
                 pool,
@@ -248,7 +290,26 @@ impl Postgres {
     }
 
     async fn connection(&self) -> Result<Object> {
-        self.pool.get().await.map_err(Into::into)
+        self.pool
+            .get()
+            .await
+            .inspect_err(|err| match err {
+                // routine under load: the pool is momentarily saturated, not broken.
+                PoolError::Timeout(TimeoutType::Wait) => debug!(?err, cluster = ?self.cluster),
+
+                // likely means Postgres itself is unreachable or misbehaving.
+                _ => {
+                    error!(?err, cluster = ?self.cluster);
+                    SQL_ERROR.add(
+                        1,
+                        &[
+                            KeyValue::new("cluster_id", self.cluster.clone()),
+                            KeyValue::new("kind", "pool"),
+                        ],
+                    );
+                }
+            })
+            .map_err(Into::into)
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
@@ -1623,6 +1684,13 @@ impl Postgres {
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
 
+        // exempt this sweep from DEFAULT_STATEMENT_TIMEOUT_MS: its full-table scan can
+        // legitimately outrun a request-path query's timeout, and re-aborting it on every
+        // maintenance tick would only let the backlog it exists to clear keep growing.
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .inspect_err(|err| error!(?err))?;
+
         let compacted = self
             .tx_prepare_execute(&tx, "policy_compact.sql", &[&self.cluster])
             .await?;
@@ -1636,6 +1704,11 @@ impl Postgres {
 
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
+
+        // see policy_compact: exempt this sweep from the default statement_timeout.
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .inspect_err(|err| error!(?err))?;
 
         let deleted = self
             .tx_prepare_execute(
@@ -4059,6 +4132,175 @@ mod tests {
             .take(length)
             .map(char::from)
             .collect()
+    }
+
+    #[test]
+    fn merge_statement_timeout_option_no_existing_options() {
+        assert_eq!(
+            merge_statement_timeout_option(None, 30_000),
+            "-c statement_timeout=30000"
+        );
+        assert_eq!(
+            merge_statement_timeout_option(Some(""), 30_000),
+            "-c statement_timeout=30000"
+        );
+    }
+
+    /// Postgres applies startup `-c name=value` options in order with last-one-wins
+    /// semantics, so an operator's own explicit `statement_timeout` must appear after (and
+    /// therefore override) our default.
+    #[test]
+    fn merge_statement_timeout_option_preserves_operator_override() {
+        assert_eq!(
+            merge_statement_timeout_option(Some("-c statement_timeout=120000"), 30_000),
+            "-c statement_timeout=30000 -c statement_timeout=120000"
+        );
+    }
+
+    #[test]
+    fn merge_statement_timeout_option_preserves_unrelated_existing_options() {
+        assert_eq!(
+            merge_statement_timeout_option(Some("-c search_path=foo"), 30_000),
+            "-c statement_timeout=30000 -c search_path=foo"
+        );
+    }
+
+    /// Regression test for a real blocker found in review: deadpool's `PoolBuilder::build()`
+    /// returns `Err(BuildError::NoRuntimeSpecified)` if `wait_timeout`/`create_timeout` are
+    /// set without also configuring `.runtime(..)`. This doesn't need a live Postgres:
+    /// `Config::from_str` and `Pool::builder(..).build()` only parse/construct, they don't
+    /// connect.
+    #[test]
+    fn pool_builds_with_configured_timeouts() -> Result<()> {
+        let builder = Postgres::builder(CONNECTION)?;
+
+        let timeouts = builder.pool.timeouts();
+        assert_eq!(timeouts.wait, Some(DEFAULT_POOL_WAIT_TIMEOUT));
+        assert_eq!(timeouts.create, Some(DEFAULT_POOL_CREATE_TIMEOUT));
+
+        Ok(())
+    }
+
+    #[test]
+    fn pool_error_timeout_maps_to_retriable_error_code() {
+        let error = Error::from(PoolError::Timeout(TimeoutType::Wait));
+        assert!(
+            matches!(error, Error::Api(ErrorCode::RequestTimedOut)),
+            "expected a retriable RequestTimedOut, got {error:?}"
+        );
+
+        let error = Error::from(PoolError::Timeout(TimeoutType::Create));
+        assert!(
+            matches!(error, Error::Api(ErrorCode::RequestTimedOut)),
+            "expected a retriable RequestTimedOut, got {error:?}"
+        );
+
+        // a non-timeout pool error is a real backend failure, not transient load, and must
+        // stay the generic (non-retriable) variant.
+        let error = Error::from(PoolError::Closed);
+        assert!(
+            matches!(error, Error::Pool(_)),
+            "expected the generic Pool error, got {error:?}"
+        );
+    }
+
+    /// Proves the exact mechanism `policy_compact`/`policy_delete` now rely on: `SET LOCAL
+    /// statement_timeout = 0` inside a transaction must survive a query that would otherwise
+    /// be aborted by a short connection-level default, and the abort must map to a retriable
+    /// error when the override is absent.
+    #[tokio::test]
+    async fn set_local_statement_timeout_exempts_a_transaction() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(&format!(
+            "{CONNECTION}?options=-c%20statement_timeout%3D100"
+        ))?
+        .cluster(cluster.as_str())
+        .node(rng().random_range(0..i32::MAX))
+        .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping set_local_statement_timeout_exempts_a_transaction: {err:?}");
+            return Ok(());
+        }
+
+        // baseline: the connection's 100ms default aborts a 1s sleep with a retriable error.
+        let mut c = storage.connection().await?;
+        let tx = c.transaction().await?;
+        let started = SystemTime::now();
+        let result = tx.query("select pg_sleep(1)", &[]).await;
+        let elapsed = started.elapsed().unwrap_or_default();
+        _ = tx.rollback().await;
+
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "expected the 100ms default to abort quickly, took {elapsed:?}"
+        );
+        match result {
+            Ok(_) => panic!("expected pg_sleep(1) to be cancelled by the 100ms default"),
+            Err(err) => {
+                let error = Error::from(err);
+                assert!(
+                    matches!(error, Error::Api(ErrorCode::RequestTimedOut)),
+                    "expected a retriable RequestTimedOut, got {error:?}"
+                );
+            }
+        }
+
+        // with the SET LOCAL override, the same sleep must complete.
+        let mut c = storage.connection().await?;
+        let tx = c.transaction().await?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0").await?;
+        let started = SystemTime::now();
+        _ = tx
+            .query("select pg_sleep(1)", &[])
+            .await
+            .inspect_err(|err| error!(?err))
+            .expect("SET LOCAL statement_timeout = 0 should exempt this query");
+        let elapsed = started.elapsed().unwrap_or_default();
+        tx.commit().await?;
+
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected the exempted query to actually sleep ~1s, took {elapsed:?}"
+        );
+
+        Ok(())
+    }
+
+    /// End-to-end smoke test: `policy_compact`/`policy_delete` must still complete
+    /// successfully even when the connection's global `statement_timeout` is set far below
+    /// what a real (if fast, in this test) sweep could take, proving the `SET LOCAL` guard
+    /// added to both doesn't break their normal, fast-completing path.
+    #[tokio::test]
+    async fn maintenance_sweeps_are_exempt_from_statement_timeout() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(&format!(
+            "{CONNECTION}?options=-c%20statement_timeout%3D100"
+        ))?
+        .cluster(cluster.as_str())
+        .node(rng().random_range(0..i32::MAX))
+        .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintenance_sweeps_are_exempt_from_statement_timeout: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage.policy_compact().await?;
+        _ = storage.policy_delete(SystemTime::now()).await?;
+
+        Ok(())
     }
 
     /// An open (uncommitted) transaction must pin the read_committed last stable
