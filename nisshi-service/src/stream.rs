@@ -59,9 +59,16 @@ pub const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 ///
 /// Deliberately much shorter than [`DEFAULT_CONNECTION_IDLE_TIMEOUT`]: once a
 /// peer has committed to sending or receiving, it shouldn't stall for minutes.
-/// Without this, a peer that declares a large frame and trickles one byte
-/// every few seconds would hold the connection open indefinitely even though
-/// the connection idle timeout never fires.
+/// Without this, a peer that declares a large frame and then goes fully
+/// quiet mid-transfer would hold the connection open indefinitely even
+/// though the connection idle timeout never fires (that one only guards the
+/// gap *before* a request starts).
+///
+/// This bounds a stall, not a slow trickle: a peer sending one byte just
+/// under this deadline, repeatedly, still resets it every time and can hold
+/// a single connection open indefinitely. Closing that fully needs a
+/// per-frame minimum-throughput floor or a connection cap; out of scope
+/// here, tracked as a follow-up.
 pub const DEFAULT_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bytes read from (or written to) the peer in one chunk while a transfer is
@@ -780,11 +787,17 @@ mod tests {
     async fn quiet_connection_is_closed_after_connection_idle_timeout() -> Result<(), Error> {
         let (_client, server) = tokio::io::duplex(64);
 
+        // io_idle_timeout disabled: this test must fail (not hang, thanks to
+        // the outer guard below) if wait() is ever wired to the wrong tier.
         let ctx = Context::with_state(
-            TcpContext::default().connection_idle_timeout(Some(Duration::from_millis(50))),
+            TcpContext::default()
+                .connection_idle_timeout(Some(Duration::from_millis(50)))
+                .io_idle_timeout(None),
         );
 
-        let outcome = service().serve(ctx, server).await;
+        let outcome = timeout(Duration::from_secs(5), service().serve(ctx, server))
+            .await
+            .expect("wait() did not respect connection_idle_timeout");
 
         assert!(
             matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
@@ -801,8 +814,13 @@ mod tests {
     async fn stalled_mid_frame_read_times_out() -> Result<(), Error> {
         let (mut client, server) = tokio::io::duplex(4096);
 
+        // connection_idle_timeout disabled: this test must fail (not hang,
+        // thanks to the outer guard below) if read() is ever wired to the
+        // wrong tier.
         let ctx = Context::with_state(
-            TcpContext::default().io_idle_timeout(Some(Duration::from_millis(50))),
+            TcpContext::default()
+                .io_idle_timeout(Some(Duration::from_millis(50)))
+                .connection_idle_timeout(None),
         );
         let handle = tokio::spawn(async move { service().serve(ctx, server).await });
 
@@ -810,7 +828,9 @@ mod tests {
         client.write_all(&header(100)).await?;
         client.write_all(&[0u8; 10]).await?;
 
-        let outcome = handle.await?;
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("read() did not respect io_idle_timeout")?;
 
         assert!(
             matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
