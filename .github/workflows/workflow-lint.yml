@@ -1,0 +1,64 @@
+---
+name: Workflow lint
+
+# actionlint (correctness) and zizmor (security) over .github/workflows/, so
+# that a broken or unsafe workflow edit is caught the same way a broken Rust
+# change is caught, instead of only being noticed when it actually misbehaves
+# on a real PR or release.
+#
+# WHY THERE IS NO `paths:` FILTER
+#
+# The obvious shape for this workflow is `pull_request` filtered to
+# `.github/workflows/**`. That shape is wrong for a *required* status check:
+# GitHub's branch protection waits for a check to report on the exact commit
+# being merged, and a path-filtered workflow never runs (and never reports)
+# on a PR that doesn't touch that path. A required check that never fires
+# blocks the PR forever rather than passing it. Running on every PR is the
+# price of using this as a required check; the job itself is seconds, not
+# minutes, so it's cheap either way.
+#
+# zizmor is filtered to medium+ severity and medium+ confidence: its
+# low-confidence heuristics (e.g. flagging any composite action with
+# caching enabled as a theoretical cache-poisoning vector, regardless of
+# whether that action actually writes the cache on untrusted triggers) are
+# genuinely useful to read but too noisy to gate merges on. High-confidence,
+# medium+ severity findings (unpinned actions, unpinned installed tools,
+# credential persistence) still fail the build.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Installed directly (not via a reporting wrapper action) so the job's
+      # own exit code is what gates the merge; a wrapper that posts to the
+      # Checks API would need `checks: write`, which this workflow doesn't
+      # grant and shouldn't need to just run a linter.
+      - run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - run: |
+          "$(go env GOPATH)/bin/actionlint"
+
+  zizmor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+        with:
+          tool: zizmor
+      # GH_TOKEN enables zizmor's online audits (e.g. known-vulnerable-actions,
+      # which checks pinned SHAs against GHSA) - the complement to SHA-pinning
+      # below: pinning stops tag mutation, this catches a pin that's already
+      # bad. contents:read is sufficient; no extra permission needed.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --min-confidence medium --min-severity medium .github/workflows/
