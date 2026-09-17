@@ -173,9 +173,11 @@ const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 /// error, rather than queuing indefinitely while the pool is exhausted.
 const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long establishing a brand new connection to Postgres (TCP + TLS + auth) may take when
-/// the pool needs to grow, both at the deadpool level and (as defense in depth) directly on
-/// the underlying `tokio_postgres` connection.
+/// How long establishing a brand new connection to Postgres may take when the pool needs to
+/// grow, both at the deadpool level (which bounds the full TCP + TLS + auth handshake via
+/// `Manager::create`) and, as defense in depth, directly on `tokio_postgres::Config`'s own
+/// `connect_timeout` (which in this version only bounds the socket-level TCP connect per
+/// resolved address, not the TLS/auth steps that follow it).
 const DEFAULT_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
