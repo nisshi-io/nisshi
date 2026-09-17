@@ -2026,7 +2026,11 @@ where
                 .error_code(ErrorCode::InconsistentGroupProtocol.into())
                 .generation_id(self.generation_id)
                 .protocol_type(Some(protocol_type.into()))
-                .protocol_name(self.state.protocol_name.clone())
+                // ProtocolName is non-nullable for versions < 7 (only nullableVersions 7+),
+                // and self.state.protocol_name is always None on this fresh-group path, so
+                // encoding None here would omit the length prefix and truncate the frame.
+                // Every other error path in this function uses "" for the same reason.
+                .protocol_name(Some("".into()))
                 .leader("".into())
                 .skip_assignment(self.skip_assignment)
                 .member_id("".into())
@@ -4216,7 +4220,7 @@ mod tests {
                     .error_code(ErrorCode::InconsistentGroupProtocol.into())
                     .generation_id(0)
                     .protocol_type(Some(CONSUMER.into()))
-                    .protocol_name(None)
+                    .protocol_name(Some("".into()))
                     .leader("".into())
                     .skip_assignment(Some(false))
                     .member_id("".into())
