@@ -1,20 +1,14 @@
 ---
 name: Dependencies
 
-# cargo-deny over the full dependency graph: security advisories (RustSec),
-# license compatibility, banned/duplicate crates, and untrusted registries.
-# cargo-deny always shells out to `cargo metadata`, so a Rust toolchain is
-# required regardless of whether it's invoked as `cargo deny` or as the
-# standalone binary; this job still installs the pinned binary directly
-# (rather than through `cargo install cargo-deny`) since that's much faster
-# than compiling it from source.
+# cargo-deny over the full dependency graph: security advisories, license
+# compatibility, banned/duplicate crates, and untrusted registries. Installs
+# the pinned binary directly rather than `cargo install`, since cargo-deny
+# shells out to `cargo metadata` either way and the binary is much faster.
 #
-# `deny.toml` ignores a fixed, dated list of pre-existing RUSTSEC advisories
-# that have no upstream fix yet (see the comment there) and downgrades
-# `unmaintained` findings to non-blocking - being unmaintained isn't the same
-# as being vulnerable, and several stable, frozen micro-crates in this tree
-# are unmaintained by design, not by neglect. Any advisory not already on
-# that list still fails the build.
+# `deny.toml` ignores a fixed, dated list of pre-existing advisories with no
+# upstream fix (see its own comment) and downgrades `unmaintained` findings
+# to non-blocking; anything else still fails the build.
 permissions:
   contents: read
 

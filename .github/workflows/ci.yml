@@ -1,5 +1,13 @@
 ---
 name: ci
+
+# `cache-save-if: github.event_name == 'push'` on a job's toolchain setup
+# means every PR restores the shared cache but only a push to main refreshes
+# it. This isn't a poisoning fix (GitHub already scopes a PR run's cache
+# writes to that PR's own ref) - it's hygiene, keeping the repo's cache
+# budget from being consumed by one entry per open PR instead of one per
+# branch. Applies to check, fmt, clippy, cargo-publish-dry-run and
+# third-party-license below.
 permissions:
   contents: read
 on:
@@ -96,11 +104,6 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy, rustfmt
-          # Every PR restores the cache but doesn't write to it; only a push to
-          # main refreshes it. GitHub already scopes a pull_request run's cache
-          # writes to that PR's own ref, so this isn't a poisoning fix - it's
-          # hygiene: it keeps the 10GB repo cache budget from being consumed by
-          # every open PR's cache entry instead of one shared entry per branch.
           cache-save-if: ${{ github.event_name == 'push' }}
       - run: just check
   fmt:
@@ -117,11 +120,6 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy, rustfmt
-          # Every PR restores the cache but doesn't write to it; only a push to
-          # main refreshes it. GitHub already scopes a pull_request run's cache
-          # writes to that PR's own ref, so this isn't a poisoning fix - it's
-          # hygiene: it keeps the 10GB repo cache budget from being consumed by
-          # every open PR's cache entry instead of one shared entry per branch.
           cache-save-if: ${{ github.event_name == 'push' }}
       - run: just fmt
   clippy:
@@ -138,11 +136,6 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy, rustfmt
-          # Every PR restores the cache but doesn't write to it; only a push to
-          # main refreshes it. GitHub already scopes a pull_request run's cache
-          # writes to that PR's own ref, so this isn't a poisoning fix - it's
-          # hygiene: it keeps the 10GB repo cache budget from being consumed by
-          # every open PR's cache entry instead of one shared entry per branch.
           cache-save-if: ${{ github.event_name == 'push' }}
       - run: just clippy
   build-storage:
