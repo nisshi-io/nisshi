@@ -44,7 +44,7 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
     },
     task::{JoinSet, yield_now},
-    time::{Instant, advance, sleep},
+    time::{Instant, advance, resume, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
@@ -128,6 +128,14 @@ pub async fn one_consumer_session_delay_after_initial_join(
     yield_now().await;
     advance(c0.session_timeout()?).await;
     yield_now().await;
+
+    // Real backends (pg, lite, slatedb) do genuine socket I/O for every request from here on,
+    // and since #730 that I/O is guarded by tokio::time::timeout-based pool/connect timeouts
+    // (nisshi-storage's DEFAULT_POOL_WAIT_TIMEOUT/DEFAULT_POOL_CREATE_TIMEOUT). Those timeouts
+    // ride the same paused clock as `advance` above, so leaving time paused here lets a fresh
+    // pool checkout's 10s timeout fire immediately instead of waiting on the real connection -
+    // resume the real clock now that the deliberate time-jump is done.
+    resume();
 
     // join with member id
     //
