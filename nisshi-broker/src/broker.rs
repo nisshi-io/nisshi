@@ -328,6 +328,11 @@ where
                         }
                     };
 
+                    if let Err(err) = stream.set_nodelay(true) {
+                        error!(?err, %addr, "set_nodelay failed; dropping connection");
+                        continue;
+                    }
+
                     let mut c = Context::default();
 
                     let pb = if self.silent {
@@ -342,12 +347,6 @@ where
                         _ = c.insert(pb.clone());
                         Some(pb)
                     };
-
-
-                    if let Err(err) = stream.set_nodelay(true) {
-                        error!(?err, %addr, "set_nodelay failed; dropping connection");
-                        continue;
-                    }
 
                     let service = services(
                         self.cluster_id.as_str(),

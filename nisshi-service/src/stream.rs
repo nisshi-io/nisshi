@@ -103,8 +103,8 @@ impl Acceptor for TcpListener {
 /// reset before we could accept it) and never backs off.
 ///
 /// The backoff sleep runs inside the `select!` arm, blocking the whole `select!` call
-/// -- including the branch that frees resources under fd pressure -- so it is kept
-/// short and capped.
+/// for its duration -- delaying cancellation and any other periodic branch a caller
+/// composes alongside this one -- so it is kept short and capped.
 struct AcceptBackoff {
     consecutive_errors: u32,
 }
@@ -146,7 +146,7 @@ where
     S::Response: Debug,
     S::Error: error::Error,
     State: Clone + Send + Sync + 'static,
-    A: Acceptor + Send + Sync + 'static,
+    A: Acceptor + Debug + Send + Sync + 'static,
 {
     type Response = ();
     type Error = S::Error;
@@ -162,7 +162,7 @@ where
                     match result {
                         Ok((stream, addr)) => {
                             backoff.reset();
-                            debug!(?stream, %addr);
+                            debug!(?req, ?stream, %addr);
 
                             let service = self.inner.clone();
                             let ctx = ctx.clone();
@@ -683,6 +683,7 @@ mod tests {
 
         /// Yields a scripted sequence of accept outcomes, then hangs (as a real
         /// listener with nothing pending would) once the script is exhausted.
+        #[derive(Debug)]
         struct ScriptedAcceptor {
             results: tokio::sync::Mutex<VecDeque<io::Result<(TcpStream, SocketAddr)>>>,
         }
