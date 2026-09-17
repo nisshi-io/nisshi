@@ -329,6 +329,11 @@ where
                         }
                     };
 
+                    if let Err(err) = stream.set_nodelay(true) {
+                        error!(?err, %addr, "set_nodelay failed; dropping connection");
+                        continue;
+                    }
+
                     let extensions = Extensions::default();
 
                     let pb = if self.silent {
@@ -343,12 +348,6 @@ where
                         _ = extensions.insert(ProgressBarExtension::new(pb.clone()));
                         Some(pb)
                     };
-
-
-                    if let Err(err) = stream.set_nodelay(true) {
-                        error!(?err, %addr, "set_nodelay failed; dropping connection");
-                        continue;
-                    }
 
                     let service = services(
                         self.cluster_id.as_str(),
