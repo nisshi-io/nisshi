@@ -1,0 +1,40 @@
+---
+name: Dependencies
+
+# cargo-deny over the full dependency graph: security advisories (RustSec),
+# license compatibility, banned/duplicate crates, and untrusted registries.
+# cargo-deny always shells out to `cargo metadata`, so a Rust toolchain is
+# required regardless of whether it's invoked as `cargo deny` or as the
+# standalone binary; this job still installs the pinned binary directly
+# (rather than through `cargo install cargo-deny`) since that's much faster
+# than compiling it from source.
+#
+# `deny.toml` ignores a fixed, dated list of pre-existing RUSTSEC advisories
+# that have no upstream fix yet (see the comment there) and downgrades
+# `unmaintained` findings to non-blocking - being unmaintained isn't the same
+# as being vulnerable, and several stable, frozen micro-crates in this tree
+# are unmaintained by design, not by neglect. Any advisory not already on
+# that list still fails the build.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+        with:
+          tool: cargo-deny
+      - run: cargo-deny --all-features --locked check --warn unmaintained
