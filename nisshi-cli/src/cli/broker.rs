@@ -229,6 +229,18 @@ impl Arg {
     }
 
     async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
+        // A bad TLS configuration must fail startup loudly rather than silently
+        // falling back to a plaintext listener. It is checked first: it is a
+        // cheap local validation, so it fails before any registry, lake or
+        // storage connection is attempted.
+        let tls_server_config = match (self.cert.as_deref(), self.key.as_deref()) {
+            (Some(cert), Some(key)) => Some(server_config(cert, key)?),
+            (None, None) => None,
+            // clap enforces this pairing already; keep the invariant if the
+            // arguments are ever constructed another way.
+            _ => return Err(Error::TlsRequiresCertAndKey),
+        };
+
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
         let otlp_endpoint_url = self
@@ -296,16 +308,6 @@ impl Arg {
             ),
 
             None => None,
-        };
-
-        // A bad TLS configuration must fail startup loudly rather than silently
-        // falling back to a plaintext listener.
-        let tls_server_config = match (self.cert.as_deref(), self.key.as_deref()) {
-            (Some(cert), Some(key)) => Some(server_config(cert, key)?),
-            (None, None) => None,
-            // clap enforces this pairing already; keep the invariant if the
-            // arguments are ever constructed another way.
-            _ => return Err(Error::TlsRequiresCertAndKey),
         };
 
         let broker = Broker::<Controller<StorageContainer>, StorageContainer>::builder()
