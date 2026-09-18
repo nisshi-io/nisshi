@@ -35,7 +35,7 @@ ENV CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM},sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM},sharing=locked \
     --mount=type=cache,target=/usr/src/build,id=cargo-build-${TARGETPLATFORM} <<EOF
-xx-cargo build --bin nisshi --no-default-features --features dynostore --release --target-dir ./build
+xx-cargo build --bin nisshi --all-features --release --target-dir ./build
 xx-verify --static ./build/$(xx-cargo --print-target-triple)/release/nisshi
 install ./build/$(xx-cargo --print-target-triple)/release/nisshi /usr/bin
 EOF
