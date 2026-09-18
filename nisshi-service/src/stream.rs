@@ -15,9 +15,11 @@
 use std::{
     error::{self},
     fmt::Debug,
+    future::Future,
     io,
     marker::PhantomData,
-    time::SystemTime,
+    net::SocketAddr,
+    time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
@@ -80,45 +82,115 @@ impl<S> Debug for TcpListenerService<S> {
     }
 }
 
-impl<State, S> Service<State, TcpListener> for TcpListenerService<S>
+/// A source of accepted TCP connections.
+///
+/// Exists so [`TcpListenerService::serve`] is testable against a scripted sequence of
+/// accept outcomes (in particular, an `Err` followed by an `Ok`) without depending on
+/// triggering a real OS-level `accept()` failure, which is fragile and platform-dependent.
+trait Acceptor {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+}
+
+impl Acceptor for TcpListener {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+        TcpListener::accept(self)
+    }
+}
+
+/// Backs off after a run of consecutive `accept()` errors that look like resource
+/// exhaustion (e.g. `EMFILE`/`ENFILE`), so a persistent failure doesn't spin the loop
+/// at 100% CPU. `ConnectionAborted` is a routine, expected per-connection error (a peer
+/// reset before we could accept it) and never backs off.
+///
+/// The backoff sleep runs inside the `select!` arm, blocking the whole `select!` call
+/// for its duration -- delaying cancellation and any other periodic branch a caller
+/// composes alongside this one -- so it is kept short and capped.
+struct AcceptBackoff {
+    consecutive_errors: u32,
+}
+
+impl AcceptBackoff {
+    const CAP: Duration = Duration::from_millis(200);
+    const INITIAL: Duration = Duration::from_millis(5);
+
+    const fn new() -> Self {
+        Self {
+            consecutive_errors: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    /// Returns the backoff to sleep for, or `None` if this error shouldn't back off.
+    fn on_error(&mut self, err: &io::Error) -> Option<Duration> {
+        if err.kind() == io::ErrorKind::ConnectionAborted {
+            self.reset();
+            return None;
+        }
+
+        let backoff = Self::INITIAL
+            .saturating_mul(1 << self.consecutive_errors.min(6))
+            .min(Self::CAP);
+
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+
+        Some(backoff)
+    }
+}
+
+impl<State, S, A> Service<State, A> for TcpListenerService<S>
 where
     S: Service<State, TcpStream> + Clone,
     S::Response: Debug,
     S::Error: error::Error,
     State: Clone + Send + Sync + 'static,
+    A: Acceptor + Debug + Send + Sync + 'static,
 {
     type Response = ();
     type Error = S::Error;
 
     #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        req: TcpListener,
-    ) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, ctx: Context<State>, req: A) -> Result<Self::Response, Self::Error> {
         let mut set = JoinSet::new();
+        let mut backoff = AcceptBackoff::new();
 
         loop {
             tokio::select! {
-                Ok((stream, addr)) = req.accept() => {
-                    debug!(?req, ?stream, %addr);
+                result = req.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            backoff.reset();
+                            debug!(?req, ?stream, %addr);
 
-                    let service = self.inner.clone();
-                    let ctx = ctx.clone();
+                            let service = self.inner.clone();
+                            let ctx = ctx.clone();
 
-                    let handle = set.spawn(async move {
-                            match service.serve(ctx, stream).await {
-                                Err(error) => {
-                                    debug!(%addr, %error);
-                                },
+                            let handle = set.spawn(async move {
+                                    match service.serve(ctx, stream).await {
+                                        Err(error) => {
+                                            debug!(%addr, %error);
+                                        },
 
-                                Ok(response) => {
-                                    debug!(%addr, ?response)
+                                        Ok(response) => {
+                                            debug!(%addr, ?response)
+                                        }
                                 }
-                        }
-                    });
+                            });
 
-                    debug!(?handle);
+                            debug!(?handle);
+                        }
+
+                        Err(err) => {
+                            error!(?err, "accept() failed; continuing to listen");
+
+                            if let Some(backoff) = backoff.on_error(&err) {
+                                tokio::time::sleep(backoff).await;
+                            }
+                        }
+                    }
+
                     continue;
                 }
 
@@ -483,7 +555,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::VecDeque, time::Duration};
 
     use super::*;
 
@@ -580,6 +652,92 @@ mod tests {
             matches!(outcome, Err(Error::FrameTooBig(65_536))),
             "{outcome:?}"
         );
+        Ok(())
+    }
+
+    /// A single `accept()` error must not stop the loop from serving the next,
+    /// successful accept -- the bug this guards against is `tokio::select!`
+    /// disabling the `Ok((stream, addr)) = req.accept()` arm for the rest of the
+    /// macro invocation whenever that future resolves to `Err`, which, combined
+    /// with `join_next` being gated on a non-empty `set`, could wedge the loop
+    /// until cancellation. This fails against the pre-fix pattern-matched arm and
+    /// passes against the `match`-in-the-body fix.
+    #[tokio::test]
+    async fn accept_error_does_not_wedge_the_loop() -> Result<(), Box<dyn error::Error>> {
+        /// Proves a connection was actually handed to the inner service (not just
+        /// accepted) by echoing one byte back over the raw stream.
+        #[derive(Clone, Copy, Debug, Default)]
+        struct RawEcho;
+
+        impl Service<(), TcpStream> for RawEcho {
+            type Response = ();
+            type Error = Error;
+
+            async fn serve(&self, _ctx: Context<()>, mut stream: TcpStream) -> Result<(), Error> {
+                let mut buf = [0u8; 1];
+                _ = stream.read_exact(&mut buf).await?;
+                stream.write_all(&buf).await?;
+                Ok(())
+            }
+        }
+
+        /// Yields a scripted sequence of accept outcomes, then hangs (as a real
+        /// listener with nothing pending would) once the script is exhausted.
+        #[derive(Debug)]
+        struct ScriptedAcceptor {
+            results: tokio::sync::Mutex<VecDeque<io::Result<(TcpStream, SocketAddr)>>>,
+        }
+
+        impl Acceptor for ScriptedAcceptor {
+            async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+                match self.results.lock().await.pop_front() {
+                    Some(result) => result,
+                    None => std::future::pending().await,
+                }
+            }
+        }
+
+        let real_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = real_listener.local_addr()?;
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(local_addr).await?;
+            stream.write_all(b"x").await?;
+
+            let mut buf = [0u8; 1];
+            _ = stream.read_exact(&mut buf).await?;
+
+            Ok::<_, io::Error>(buf[0])
+        });
+
+        let (stream, addr) = real_listener.accept().await?;
+        drop(real_listener);
+
+        let mut results = VecDeque::new();
+        results.push_back(Err(io::Error::from(io::ErrorKind::ConnectionAborted)));
+        results.push_back(Ok((stream, addr)));
+
+        let acceptor = ScriptedAcceptor {
+            results: tokio::sync::Mutex::new(results),
+        };
+
+        let cancellation = CancellationToken::new();
+        let service = TcpListenerLayer::new(cancellation.clone()).layer(RawEcho);
+
+        let handle = tokio::spawn(async move { service.serve(Context::default(), acceptor).await });
+
+        let echoed = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect(
+                "accept() error wedged the loop: the Ok connection scripted after it \
+                 was never served",
+            )??;
+
+        assert_eq!(b'x', echoed);
+
+        cancellation.cancel();
+        handle.await??;
+
         Ok(())
     }
 }
