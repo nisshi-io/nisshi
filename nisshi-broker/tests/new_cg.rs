@@ -44,7 +44,7 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
     },
     task::{JoinSet, yield_now},
-    time::{Instant, advance, sleep},
+    time::{Instant, advance, pause, resume, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
@@ -125,9 +125,18 @@ pub async fn one_consumer_session_delay_after_initial_join(
     let c0_member_id = c0_next_action.member_id.clone();
 
     // allow the session expire
+    //
+    // Pause the clock only for this deliberate jump. A paused tokio runtime auto-advances to
+    // the next pending timer whenever it has nothing runnable, and the Postgres backend parks
+    // on real socket I/O while a pool wait/create timeout is armed, so a clock paused for the
+    // whole test fires that 10s timeout on the very first `pool.get()` (during storage
+    // construction) after ~0.1s of wall time. Blocking-thread backends (lite, slatedb) are
+    // unaffected because in-flight `spawn_blocking` work inhibits auto-advance.
+    pause();
     yield_now().await;
     advance(c0.session_timeout()?).await;
     yield_now().await;
+    resume();
 
     // join with member id
     //
@@ -1095,7 +1104,7 @@ mod pg {
         .map_err(Into::into)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -1221,7 +1230,7 @@ mod in_memory {
         .map_err(Into::into)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -1346,7 +1355,7 @@ mod lite {
         .map_err(Into::into)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -1471,7 +1480,7 @@ mod slatedb {
         .map_err(Into::into)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
         let _guard = init_tracing()?;
 
