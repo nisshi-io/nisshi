@@ -135,6 +135,7 @@ protobuf-parse = "3.7.1"
 quote = "1.0"
 rama = { version = "0.2.0", features = ["http", "tcp"] }
 rand = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex = "1.12.3"
 rhai = { version = "1.24.0", features = ["sync"] }
 rhai-rand = "0.1"

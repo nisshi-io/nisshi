@@ -69,6 +69,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
 object_store = { workspace = true }
 pretty_assertions.workspace = true
 slatedb = { workspace = true }
