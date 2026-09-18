@@ -357,6 +357,19 @@ fn into_record_data(records: &[Record], compression: Compression) -> Result<Byte
                 .map_err(Into::into)
         }
 
+        // A raw snappy block, without xerial framing. Every Kafka client
+        // decoder accepts the raw form (franz-go, librdkafka, kafka-python
+        // and snappy-java all check for the xerial magic and fall back to
+        // a raw block), as does [`Compression::inflator`].
+        Compression::Snappy => {
+            let uncompressed = records.encode()?;
+
+            snap::raw::Encoder::new()
+                .compress_vec(&uncompressed[..])
+                .map(Bytes::from)
+                .map_err(Into::into)
+        }
+
         Compression::Lz4 => {
             let uncompressed = records.encode()?;
 
@@ -384,8 +397,6 @@ fn into_record_data(records: &[Record], compression: Compression) -> Result<Byte
                 .map(Bytes::from)
                 .map_err(Into::into)
         }
-
-        unexpected => Err(Error::UnexpectedType(format!("{unexpected:?}",))),
     }
 }
 
@@ -901,6 +912,61 @@ mod tests {
                 headers: [].into()
             }],
             records
+        );
+
+        Ok(())
+    }
+
+    /// An inflated batch marked snappy deflates to a raw snappy block that
+    /// both the batch's own decoder and [`Compression::inflator`] accept.
+    #[test]
+    fn deflate_snappy_round_trip() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let values = [
+            Bytes::from_static(LOREM),
+            Bytes::from_static(b"foobarfoobarfoobarfoobar"),
+            Bytes::from_static(&[0u8; 8_192]),
+        ];
+
+        let mut builder = inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Snappy)
+                    .into(),
+            )
+            .last_offset_delta(values.len() as i32 - 1);
+
+        for (delta, value) in values.iter().enumerate() {
+            builder = builder.record(
+                Record::builder()
+                    .offset_delta(delta as i32)
+                    .value(Some(value.clone())),
+            );
+        }
+
+        let deflated = builder.build().and_then(Batch::try_from)?;
+
+        assert_eq!(
+            Compression::Snappy,
+            Compression::try_from(deflated.attributes)?
+        );
+        assert_eq!(values.len() as u32, deflated.record_count);
+        assert!(
+            deflated.record_data.len() < values.iter().map(Bytes::len).sum::<usize>(),
+            "record data is not compressed"
+        );
+
+        let records: Vec<Record> = (&deflated).try_into()?;
+        assert_eq!(
+            values.to_vec(),
+            records.iter().filter_map(Record::value).collect::<Vec<_>>()
+        );
+
+        let records: Vec<Record> = deflated.try_into()?;
+        assert_eq!(
+            values.to_vec(),
+            records.iter().filter_map(Record::value).collect::<Vec<_>>()
         );
 
         Ok(())

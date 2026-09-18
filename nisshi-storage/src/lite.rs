@@ -700,6 +700,13 @@ impl Delegate {
 
         debug!(?low, ?high);
 
+        // The producer's batch attributes, validated and normalised. Inflating
+        // clears the compression codec (the records are now plaintext), so the
+        // codec is kept from here: fetch rebuilds the batch from its rows and
+        // re-deflates with the codec the producer used, as Kafka does with
+        // compression.type=producer.
+        let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
+
         let inflated = inflated::Batch::try_from(deflated).inspect_err(|err| error!(?err))?;
 
         debug!(after_inflate = elapsed_millis(start));
@@ -777,7 +784,7 @@ impl Delegate {
                             topic,
                             partition,
                             offset,
-                            inflated.attributes,
+                            produced_attributes,
                             if transaction_id.is_none() {
                                 None
                             } else {

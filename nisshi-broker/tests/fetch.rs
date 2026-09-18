@@ -21,7 +21,8 @@ use bytes::Bytes;
 use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    ErrorCode, FetchRequest, FetchResponse, IsolationLevel, ListOffset, NULL_TOPIC_ID,
+    BatchAttribute, Compression, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
+    ListOffset, NULL_TOPIC_ID,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
     record::{Header, Record, inflated},
@@ -780,6 +781,111 @@ where
     Ok(())
 }
 
+/// A fetched batch carries the compression codec it was produced with, as
+/// Kafka does with `compression.type=producer`. Engines that rebuild
+/// batches from per-record rows must keep the codec and re-deflate with it
+/// rather than hand back plaintext.
+pub async fn compression_preserved<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    let topic_id = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+    debug!(?topic_id);
+
+    let topition = Topition::new(topic_name.clone(), 0);
+
+    let codecs = [
+        Compression::None,
+        Compression::Gzip,
+        Compression::Snappy,
+        Compression::Lz4,
+        Compression::Zstd,
+    ];
+
+    // one batch of three records per codec, produced in order
+    let mut produced = Vec::with_capacity(codecs.len());
+
+    for codec in codecs {
+        let values: Vec<Bytes> = (0..3)
+            .map(|_| Bytes::copy_from_slice(alphanumeric_string(64).as_bytes()))
+            .collect();
+
+        let mut builder = inflated::Batch::builder()
+            .attributes(BatchAttribute::default().compression(codec.clone()).into())
+            .last_offset_delta(values.len() as i32 - 1);
+
+        for (delta, value) in values.iter().enumerate() {
+            builder = builder.record(
+                Record::builder()
+                    .offset_delta(delta as i32)
+                    .value(Some(value.clone())),
+            );
+        }
+
+        let batch = builder.build().and_then(TryInto::try_into)?;
+
+        _ = sc
+            .produce(None, &topition, batch)
+            .await
+            .inspect(|offset| debug!(?codec, offset))?;
+
+        produced.push((codec, values));
+    }
+
+    // a generous max_wait: the pg and lite engines stop assembling at the
+    // deadline, and nothing here depends on timing
+    let fetched = sc
+        .fetch(
+            &topition,
+            0,
+            1,
+            50 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_secs(5),
+        )
+        .await
+        .inspect_err(|err| error!(?err))?
+        .into_iter()
+        // the pg and lite engines return an empty placeholder batch when
+        // there are no records to fetch
+        .filter(|batch| batch.record_count > 0)
+        .map(|batch| {
+            let codec = Compression::try_from(batch.attributes)?;
+
+            inflated::Batch::try_from(batch).map(|inflated| {
+                (
+                    codec,
+                    inflated
+                        .records
+                        .iter()
+                        .filter_map(Record::value)
+                        .collect::<Vec<_>>(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(produced, fetched);
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use std::sync::Arc;
@@ -796,6 +902,21 @@ mod pg {
             node,
             Url::parse("tcp://127.0.0.1/")?,
             None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn compression_preserved() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::compression_preserved(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -882,6 +1003,21 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn compression_preserved() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::compression_preserved(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn kv_header() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -958,6 +1094,21 @@ mod lite {
             node,
             Url::parse("tcp://127.0.0.1/")?,
             None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn compression_preserved() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::compression_preserved(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1054,6 +1205,21 @@ mod slatedb {
             node,
             Url::parse("tcp://127.0.0.1/")?,
             None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn compression_preserved() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::compression_preserved(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
