@@ -42,6 +42,8 @@ EOF
 
 FROM scratch AS out
 
+RUN mkdir -p /schema /data /tmp
+
 COPY --from=builder --parents /etc/ssl /
 COPY --from=builder /usr/src/LICENSE /usr/bin/nisshi /
 
