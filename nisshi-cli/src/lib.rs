@@ -36,7 +36,16 @@ pub enum Error {
     Schema(Box<nisshi_schema::Error>),
     Server(Box<nisshi_broker::Error>),
     Tls(#[from] rustls::Error),
-    TlsPkiPem(#[from] rustls::pki_types::pem::Error),
+    /// The `--cert` file could not be read or parsed as PEM certificates.
+    TlsCertificate {
+        path: PathBuf,
+        source: rustls::pki_types::pem::Error,
+    },
+    /// The `--key` file could not be read or parsed as a PEM private key.
+    TlsPrivateKey {
+        path: PathBuf,
+        source: rustls::pki_types::pem::Error,
+    },
     /// `--cert` and `--key` must be supplied together.
     TlsRequiresCertAndKey,
     Topic(#[from] nisshi_topic::Error),

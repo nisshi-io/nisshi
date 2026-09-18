@@ -40,13 +40,41 @@ use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
     task::{AbortHandle, JoinSet},
-    time::{self, Instant, sleep},
+    time::{self, Instant, sleep, timeout},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Level, debug, error, span, warn};
+use tracing::{Instrument, Level, debug, error, info, span, warn};
 use url::Url;
 use uuid::Uuid;
+
+/// How long a client has to complete the TLS handshake once its TCP
+/// connection is accepted. Bounds the rustls state held for a peer that
+/// connects and never speaks, much like Kafka's `connections.max.idle.ms`.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Report a failed TLS handshake at a level that matches its cause.
+///
+/// A peer that connects and hangs up (health checks, port scanners) is
+/// routine and logged at debug, mirroring how the plaintext path swallows
+/// EOF and reset. Anything else is a client that spoke but could not
+/// negotiate: almost always a plaintext client or one that does not trust
+/// the broker certificate, so the warning says so.
+fn handshake_failed(addr: SocketAddr, err: &std::io::Error) {
+    match err.kind() {
+        ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
+            debug!(%addr, ?err, "peer closed during tls handshake");
+        }
+
+        _ => {
+            warn!(
+                %addr,
+                ?err,
+                "tls handshake failed: the client is either plaintext (set security.protocol=SSL) or does not trust the broker certificate"
+            );
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
@@ -287,6 +315,10 @@ where
         // is TLS only. Without one the listener stays plain TCP.
         let acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
 
+        if acceptor.is_some() {
+            info!(%self.listener, "listener is tls only");
+        }
+
         let mut connections = 0;
 
         loop {
@@ -327,19 +359,23 @@ where
                     let acceptor = acceptor.clone();
 
                     let handle = set.spawn(async move {
-                        // The handshake runs inside the connection task so a slow
-                        // or hostile client cannot stall the accept loop.
+                        // The handshake runs inside the connection task, bounded by
+                        // TLS_HANDSHAKE_TIMEOUT, so a slow or hostile client can
+                        // neither stall the accept loop nor pin rustls state forever.
                         let result = match acceptor {
-                            Some(acceptor) => match acceptor.accept(stream).await {
-                                Ok(tls) => service.serve(c, tls).await,
-                                Err(err) => {
-                                    // A plaintext or untrusting client is a client
-                                    // configuration problem, not a broker fault, so
-                                    // report it once here at warn rather than as an error.
-                                    warn!(%addr, ?err, "tls handshake failed");
-                                    Ok(())
+                            Some(acceptor) => {
+                                match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                                    Ok(Ok(tls)) => service.serve(c, tls).await,
+                                    Ok(Err(err)) => {
+                                        handshake_failed(addr, &err);
+                                        Ok(())
+                                    }
+                                    Err(elapsed) => {
+                                        debug!(%addr, %elapsed, "tls handshake timed out");
+                                        Ok(())
+                                    }
                                 }
-                            },
+                            }
                             None => service.serve(c, stream).await,
                         };
 
@@ -361,7 +397,7 @@ where
                         if let Some(ref pb) = pb {
                             pb.finish_and_clear();
                         }
-                    }.instrument(span!(Level::DEBUG, "peer", %addr)));
+                    }.instrument(span!(Level::INFO, "peer", %addr)));
 
 
                     debug!(?handle);

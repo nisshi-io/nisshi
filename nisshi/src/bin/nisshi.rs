@@ -60,6 +60,24 @@ async fn main() -> Result<ErrorCode> {
                 nisshi_topic::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
                 _ => error!("Unknown error occurred during command: {}", error),
             },
+            nisshi_cli::Error::TlsCertificate { path, source } => error!(
+                "TLS certificate {} could not be loaded: {source}. Expected one or more PEM certificates (--cert).",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsPrivateKey { path, source } => error!(
+                "TLS private key {} could not be loaded: {source}. Expected an unencrypted PKCS#8, SEC1 or RSA PEM key (--key).",
+                path.display()
+            ),
+            nisshi_cli::Error::EncryptedTlsKey(path) => error!(
+                "TLS private key {} is passphrase protected, which is not supported: decrypt it first (for example: openssl pkey -in key.pem -out key-plain.pem).",
+                path.display()
+            ),
+            nisshi_cli::Error::Tls(error) => error!(
+                "TLS configuration rejected: {error}. Check that --key is the private key for the certificate in --cert."
+            ),
+            nisshi_cli::Error::TlsRequiresCertAndKey => {
+                error!("TLS requires both --cert and --key.")
+            }
             _ => error!("Unknown error occurred during command: {}", err),
         })
 }

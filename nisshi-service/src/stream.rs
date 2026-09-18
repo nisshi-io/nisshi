@@ -30,7 +30,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{Instrument as _, Level, debug, error, instrument, span};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE, frame_length,
@@ -106,17 +106,20 @@ where
                     let service = self.inner.clone();
                     let ctx = ctx.clone();
 
-                    let handle = set.spawn(async move {
+                    let handle = set.spawn(
+                        async move {
                             match service.serve(ctx, stream).await {
                                 Err(error) => {
                                     debug!(%addr, %error);
-                                },
+                                }
 
                                 Ok(response) => {
                                     debug!(%addr, ?response)
                                 }
+                            }
                         }
-                    });
+                        .instrument(span!(Level::INFO, "peer", %addr)),
+                    );
 
                     debug!(?handle);
                     continue;

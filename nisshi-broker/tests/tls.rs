@@ -324,6 +324,18 @@ async fn plaintext_rejected_on_tls_listener() -> Result<()> {
             "plaintext request on a tls listener must fail, got {outcome:?}"
         );
 
+        // The rejected connection must not have taken the listener with it:
+        // a proper TLS client is still served afterwards.
+        let connector = TlsConnector::from(Arc::new(client_config_trusting(&certified.cert)?));
+        let tcp = TcpStream::connect(broker.addr).await?;
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost")?, tcp)
+            .await
+            .context("tls handshake after a rejected plaintext peer failed")?;
+
+        let response = api_versions(&mut tls).await?;
+        assert!(!response.api_keys.unwrap_or_default().is_empty());
+
         Ok(())
     })
     .await?

@@ -113,21 +113,40 @@ pub(super) struct Arg {
 fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_file_iter(filename)
         .and_then(|der| der.collect::<Result<Vec<_>, TlsPkiPemError>>())
-        .map_err(Into::into)
+        .and_then(|certs| {
+            // A file with no certificate blocks (garbage, or the key file by
+            // mistake) iterates to an empty chain rather than an error.
+            if certs.is_empty() {
+                Err(TlsPkiPemError::NoItemsFound)
+            } else {
+                Ok(certs)
+            }
+        })
+        .map_err(|source| Error::TlsCertificate {
+            path: filename.to_path_buf(),
+            source,
+        })
 }
 
 fn load_private_key(filename: &Path) -> Result<PrivateKeyDer<'static>> {
+    let key_error = |source| Error::TlsPrivateKey {
+        path: filename.to_path_buf(),
+        source,
+    };
+
     // rustls' PEM loader has no passphrase support and would otherwise report
     // an encrypted key as "no private key found", so name the real problem.
+    // Covers PKCS#8 (`ENCRYPTED PRIVATE KEY`) and legacy OpenSSL encrypted
+    // PEM (`Proc-Type: 4,ENCRYPTED` header on an RSA/EC key).
     let pem = fs::read_to_string(filename)
         .map_err(TlsPkiPemError::Io)
-        .inspect_err(|err| debug!(?filename, ?err))?;
+        .map_err(key_error)?;
 
-    if pem.contains("BEGIN ENCRYPTED PRIVATE KEY") {
+    if pem.contains("BEGIN ENCRYPTED PRIVATE KEY") || pem.contains("Proc-Type: 4,ENCRYPTED") {
         return Err(Error::EncryptedTlsKey(filename.to_path_buf()));
     }
 
-    PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(Into::into)
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(key_error)
 }
 
 fn server_config(certs: &Path, private_key: &Path) -> Result<ServerConfig> {
@@ -529,8 +548,59 @@ mod tests {
             .expect_err("build must fail with an unreadable certificate");
 
         assert!(
-            matches!(err, Error::TlsPkiPem(_) | Error::Tls(_)),
-            "expected a tls error before anything else, got {err:?}"
+            matches!(err, Error::TlsCertificate { ref path, .. } if *path == garbage),
+            "expected the certificate error naming its path before anything else, got {err:?}"
+        );
+    }
+
+    /// A common operator slip: pointing `--cert` at the key file yields an
+    /// empty certificate chain, which must be rejected rather than served.
+    #[test]
+    fn key_file_as_cert_fails() {
+        let pem = pem();
+
+        let err = server_config(&pem.key, &pem.key).expect_err("empty certificate chain");
+
+        assert!(
+            matches!(
+                err,
+                Error::TlsCertificate {
+                    ref path,
+                    source: TlsPkiPemError::NoItemsFound
+                } if *path == pem.key
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_key_names_its_path() {
+        let pem = pem();
+        let missing = pem.key.with_file_name("missing.pem");
+
+        let err = server_config(&pem.cert, &missing).expect_err("missing key file");
+
+        assert!(
+            matches!(err, Error::TlsPrivateKey { ref path, .. } if *path == missing),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_encrypted_key_rejected() {
+        let pem = pem();
+        let encrypted = pem.key.with_file_name("legacy.pem");
+        fs::write(
+            &encrypted,
+            "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0102030405060708090A0B0C0D0E0F10\n\nMIIB\n-----END EC PRIVATE KEY-----\n",
+        )
+        .unwrap();
+
+        let err = server_config(&pem.cert, &encrypted).expect_err("encrypted key must fail");
+
+        assert!(
+            matches!(err, Error::EncryptedTlsKey(ref path) if *path == encrypted),
+            "{err:?}"
         );
     }
 }
