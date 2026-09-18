@@ -22,6 +22,43 @@ tests self-skip).
    affected. Regression test: `mid_batch` in
    `nisshi-broker/tests/fetch.rs`, run against every engine.
 
+2. **Fetch looped once per record after `max_wait` on the pg and lite
+   engines** *(fixed 2026-09-17)* — `FetchService::fetch_partition`
+   kept calling storage until `max_bytes` was spent or nothing came
+   back, with no deadline of its own. The pg and lite engines stop
+   assembling a batch at the deadline but still return the record they
+   were on, so once `max_wait` had passed every storage call returned
+   one record and re-ran the fetch query (a window sum over every
+   remaining row) plus a header query. Ten thousand small records
+   became thousands of round trips inside one Fetch response, longer
+   than the client's request timeout; the client dropped the
+   connection and re-asked the same offset forever (`TestIssue865` to
+   the 10 minute `go test` timeout; librdkafka `0038_performance`
+   consumed 0 of 83,886). `memory://` and `s3://` return whole batches
+   and never looped. The loop now returns what it has once `max_wait`
+   has elapsed, and advances to the offset after the last one returned
+   rather than `base_offset + record_count` (wrong across compaction
+   gaps). Regression tests: `service::fetch::tests` in
+   `nisshi-storage`.
+
+3. **Fetched batches lost the producer's compression on the pg and lite
+   engines** *(fixed 2026-09-17)* — both engines stored the attributes
+   of the *inflated* batch on each record row, and inflating clears the
+   codec, so the batch rebuilt at fetch time was always sent
+   uncompressed (`TestPooling`: `did not put decompress!`). Kafka with
+   `compression.type=producer` (the default) hands back the producer's
+   codec, which `memory://` and `s3://` already did by storing the
+   produced batch verbatim. The row now keeps the produced attributes
+   and fetch re-deflates with that codec. `nisshi-sans-io` gained the
+   missing Snappy encoder (franz-go's default codec) as a raw snappy
+   block, which the clients we test with (franz-go, librdkafka,
+   kafka-python, snappy-java) and nisshi's own inflator accept.
+   Regression test:
+   `compression_preserved` in `nisshi-broker/tests/fetch.rs`, run
+   against every engine. Not covered: `s3://` with request batching
+   enabled re-deflates combined batches as uncompressed
+   (`ProduceRequestBatcher::combine`); CI runs it without batching.
+
 ## Open gaps, most impactful first
 
 1. **Group coordinator returns UNKNOWN_MEMBER_ID during concurrent

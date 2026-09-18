@@ -98,7 +98,6 @@ fn produce_request_zstd() -> Result<()> {
     produce_request(Compression::Zstd)
 }
 
-#[ignore]
 #[test]
 fn produce_request_snappy() -> Result<()> {
     produce_request(Compression::Snappy)
