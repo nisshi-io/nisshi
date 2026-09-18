@@ -1,0 +1,40 @@
+[package]
+name = "nisshi"
+description = "Apache Kafka compatible broker with S3, PostgreSQL, Apache Iceberg and Delta Lake"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dotenv.workspace = true
+nisshi-broker = { workspace = true, default-features = false, optional = true }
+nisshi-cat.workspace = true
+nisshi-cli = { workspace = true, default-features = false, optional = true }
+nisshi-generator.workspace = true
+nisshi-perf.workspace = true
+nisshi-proxy.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-schema = { workspace = true, default-features = false, optional = true }
+nisshi-storage = { workspace = true, default-features = false, optional = true }
+nisshi-topic.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage"]
+delta = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-cli/delta", "nisshi-schema/delta"]
+dynostore = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/dynostore", "nisshi-cli/dynostore", "nisshi-storage/dynostore"]
+iceberg = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-cli/iceberg", "nisshi-schema/iceberg"]
+libsql = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/libsql", "nisshi-cli/libsql", "nisshi-storage/libsql"]
+parquet = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-cli/parquet", "nisshi-schema/parquet"]
+postgres = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/postgres", "nisshi-cli/postgres", "nisshi-storage/postgres"]
+slatedb = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/slatedb", "nisshi-cli/slatedb", "nisshi-storage/slatedb"]
+turso = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/turso", "nisshi-cli/turso", "nisshi-storage/turso"]

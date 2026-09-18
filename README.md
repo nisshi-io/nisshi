@@ -1,31 +1,31 @@
 <div align="center">
 
-# Tansu 🗃️
+# Nisshi (née Tansu) 🗃️
 stateless Kafka-compatible broker with pluggable storage (PostgreSQL, SQLite, S3, memory)
 
 <br>
 
-[![License](https://img.shields.io/badge/License-Apache-165dfc.svg)](https://github.com/tansu-io/tansu/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache-165dfc.svg)](https://github.com/nisshi-io/nisshi/blob/main/LICENSE)
 &nbsp;
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-165dfc.svg?logo=rust)](https://www.rust-lang.org/)
 &nbsp;
 <br>
-[![Docs](https://img.shields.io/badge/📖%20docs-docs.tansu.io-165dfc.svg)](https://docs.tansu.io/)
+[![Docs](https://img.shields.io/badge/📖%20docs-docs.nisshi.io-165dfc.svg)](https://docs.nisshi.io/)
 &nbsp;
-[![Blog](https://img.shields.io/badge/%F0%9F%93%98%20blog-blog.tansu.io-165dfc.svg)](https://blog.tansu.io/articles)
+[![Blog](https://img.shields.io/badge/%F0%9F%93%98%20blog-blog.nisshi.io-165dfc.svg)](https://blog.nisshi.io/articles)
 &nbsp;
 <br>
-[![GitHub stars](https://img.shields.io/github/stars/tansu-io/tansu?style=social)](https://github.com/tansu-io/tansu)
+[![GitHub stars](https://img.shields.io/github/stars/nisshi-io/nisshi?style=social)](https://github.com/nisshi-io/nisshi)
 &nbsp;
-[![Bluesky](https://img.shields.io/bluesky/followers/tansu.io)](https://bsky.app/profile/tansu.io)
+[![Bluesky](https://img.shields.io/bluesky/followers/nisshi.io)](https://bsky.app/profile/tansu.io)
 
 <br>
 
 </div>
 
-# What is Tansu?
+# What is Nisshi?
 
-[Tansu][github-com-tansu-io] is a drop-in replacement for
+[Nisshi][github-com-nisshi-io] (née Tansu) is a drop-in replacement for
 Apache Kafka with PostgreSQL, libSQL (SQLite), S3 or memory storage engines.
 Schema backed topics (Avro, JSON or Protocol buffers) can
 be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables.
@@ -37,7 +37,7 @@ Features:
 - Topics [validated](docs/schema-registry.md) by [JSON Schema][json-schema-org], [Apache Avro](https://avro.apache.org)
   or [Protocol buffers](protocol-buffers) can be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables
 
-See [examples using pyiceberg](https://github.com/tansu-io/example-pyiceberg), [examples using Apache Spark](https://github.com/tansu-io/example-spark) or 🆕 [examples using Delta Lake](https://github.com/tansu-io/example-delta-lake).
+See [examples using pyiceberg](https://github.com/nisshi-io/example-pyiceberg), [examples using Apache Spark](https://github.com/nisshi-io/example-spark) or 🆕 [examples using Delta Lake](https://github.com/nisshi-io/example-delta-lake).
 
 For data durability:
 
@@ -46,7 +46,7 @@ For data durability:
   streaming transaction logs files to an archive
 - The memory storage engine is designed for ephemeral non-production environments
 
-Tansu is a single statically linked binary containing the following:
+Nisshi is a single statically linked binary containing the following:
 
 - **broker** an Apache Kafka API compatible broker and schema registry
 - **topic** a CLI to create/delete Topics
@@ -58,8 +58,8 @@ Tansu is a single statically linked binary containing the following:
 The broker subcommand is default if no other command is supplied.
 
 ```shell
-Usage: tansu [OPTIONS]
-       tansu <COMMAND>
+Usage: nisshi [OPTIONS]
+       nisshi <COMMAND>
 
 Commands:
   broker  Apache Kafka compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
@@ -70,21 +70,21 @@ Commands:
 
 Options:
       --kafka-cluster-id <KAFKA_CLUSTER_ID>
-          All members of the same cluster should use the same id [env: CLUSTER_ID=RvQwrYegSUCkIPkaiAZQlQ] [default: tansu_cluster]
+          All members of the same cluster should use the same id [env: CLUSTER_ID=RvQwrYegSUCkIPkaiAZQlQ] [default: nisshi_cluster]
       --kafka-listener-url <KAFKA_LISTENER_URL>
           The broker will listen on this address [env: LISTENER_URL=] [default: tcp://[::]:9092]
       --kafka-advertised-listener-url <KAFKA_ADVERTISED_LISTENER_URL>
           This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=tcp://localhost:9092] [default: tcp://localhost:9092]
       --storage-engine <STORAGE_ENGINE>
-          Storage engine examples are: postgres://postgres:postgres@localhost, memory://tansu/ or s3://tansu/ [env: STORAGE_ENGINE=s3://tansu/] [default: memory://tansu/]
+          Storage engine examples are: postgres://postgres:postgres@localhost, memory://nisshi/ or s3://nisshi/ [env: STORAGE_ENGINE=s3://nisshi/] [default: memory://nisshi/]
       --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://tansu/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=file://./etc/schema]
+          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=file://./etc/schema]
       --data-lake <DATA_LAKE>
           Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/ [env: DATA_LAKE=s3://lake/]
       --iceberg-catalog <ICEBERG_CATALOG>
           Apache Iceberg Catalog, examples are: http://localhost:8181/ [env: ICEBERG_CATALOG=http://localhost:8181/]
       --iceberg-namespace <ICEBERG_NAMESPACE>
-          Iceberg namespace [env: ICEBERG_NAMESPACE=] [default: tansu]
+          Iceberg namespace [env: ICEBERG_NAMESPACE=] [default: nisshi]
       --prometheus-listener-url <PROMETHEUS_LISTENER_URL>
           Broker metrics can be scraped by Prometheus from this URL [env: PROMETHEUS_LISTENER_URL=tcp://0.0.0.0:9100] [default: tcp://[::]:9100]
   -h, --help
@@ -93,7 +93,7 @@ Options:
           Print version
 ```
 
-A broker can be started by simply running `tansu`, all options have defaults. Tansu pickup any existing environment,
+A broker can be started by simply running `nisshi`, all options have defaults. Nisshi pickup any existing environment,
 loading any found in `.env`. An [example.env](example.env) is provided as part of the distribution
 and can be copied into `.env` for local modification. Sample schemas can be found in [etc/schema](etc/schema), used in the examples.
 
@@ -103,12 +103,12 @@ as Apache Parquet when the `-data-lake` option is provided.
 
 ## topic
 
-The `tansu topic` command has the following subcommands:
+The `nisshi topic` command has the following subcommands:
 
 ```shell
 Create or delete topics managed by the broker
 
-Usage: tansu topic <COMMAND>
+Usage: nisshi topic <COMMAND>
 
 Commands:
   create  Create a topic
@@ -122,18 +122,18 @@ Options:
 To create a topic use:
 
 ```shell
-tansu topic create taxi
+nisshi topic create taxi
 ```
 
 ## cat
 
-The `tansu cat` command, has the following subcommands:
+The `nisshi cat` command, has the following subcommands:
 
 ```shell
-tansu cat --help
+nisshi cat --help
 Easily consume or produce Avro, JSON or Protobuf messages to a topic
 
-Usage: tansu cat <COMMAND>
+Usage: nisshi cat <COMMAND>
 
 Commands:
   produce  Produce Avro/JSON/Protobuf messages to a topic
@@ -149,10 +149,10 @@ Apache Avro, Protobuf or JSON depending on the schema used by the topic.
 
 For example, the `taxi` topic is backed by [taxi.proto](etc/schema/taxi.proto).
 Using [trips.json](etc/data/trips.json) containing a JSON array of objects,
-`tansu cat produce` encodes each message into protobuf into the broker:
+`nisshi cat produce` encodes each message into protobuf into the broker:
 
 ```
-tansu cat produce taxi etc/data/trips.json
+nisshi cat produce taxi etc/data/trips.json
 ```
 
 Using [duckdb](https://duckdb.org) we can read the
@@ -181,7 +181,7 @@ Results in the following output:
 ### s3
 
 The following will configure a S3 storage engine
-using the "tansu" bucket (full context is in
+using the "nisshi" bucket (full context is in
 [compose.yaml](compose.yaml) and [example.env](example.env)):
 
 Copy `example.env` into `.env` so that you have a local working copy:
@@ -193,13 +193,13 @@ cp example.env .env
 Edit `.env` so that `STORAGE_ENGINE` is defined as:
 
 ```shell
-STORAGE_ENGINE="s3://tansu/"
+STORAGE_ENGINE="s3://nisshi/"
 ```
 
 First time startup, you'll need to create a bucket, an access key
 and a secret in minio.
 
-Just bring minio up, without tansu:
+Just bring minio up, without nisshi:
 
 ```shell
 docker compose up -d minio
@@ -218,21 +218,21 @@ docker compose exec minio \
    minioadmin
 ```
 
-Create a `tansu` bucket in minio using the `local` alias:
+Create a `nisshi` bucket in minio using the `local` alias:
 
 ```shell
 docker compose exec minio \
-   /usr/bin/mc mb local/tansu
+   /usr/bin/mc mb local/nisshi
 ```
 
-Once this is done, you can start tansu with:
+Once this is done, you can start nisshi with:
 
 ```shell
-docker compose up -d tansu
+docker compose up -d nisshi
 ```
 
 Using the regular Apache Kafka CLI you can create topics, produce and consume
-messages with Tansu:
+messages with Nisshi:
 
 ```shell
 kafka-topics \
@@ -290,17 +290,17 @@ kafka-consumer-groups \
 ### PostgreSQL
 
 To switch between the minio and PostgreSQL examples, firstly
-shutdown Tansu:
+shutdown Nisshi:
 
 ```shell
-docker compose down tansu
+docker compose down nisshi
 ```
 
 Switch to the PostgreSQL storage engine by updating [.env](.env):
 
 ```env
 # minio storage engine
-# STORAGE_ENGINE="s3://tansu/"
+# STORAGE_ENGINE="s3://nisshi/"
 
 # PostgreSQL storage engine -- NB: @db and NOT @localhost :)
 STORAGE_ENGINE="postgres://postgres:postgres@db"
@@ -312,14 +312,14 @@ Start PostgreSQL:
 docker compose up -d db
 ```
 
-Bring Tansu back up:
+Bring Nisshi back up:
 
 ```shell
-docker compose up -d tansu
+docker compose up -d nisshi
 ```
 
 Using the regular Apache Kafka CLI you can create topics, produce and consume
-messages with Tansu:
+messages with Nisshi:
 
 ```shell
 kafka-topics \
@@ -374,11 +374,11 @@ Consumer:
 
 ## Feedback
 
-Please [raise an issue][tansu-issues] if you encounter a problem.
+Please [raise an issue][nisshi-issues] if you encounter a problem.
 
 ## License
 
-Tansu is licensed under [Apache 2.0][apache-license].
+Nisshi is licensed under [Apache 2.0][apache-license].
 
 [apache-license]: https://www.apache.org/licenses/LICENSE-2.0
 [apache-zookeeper]: https://en.wikipedia.org/wiki/Apache_ZooKeeper
@@ -388,7 +388,7 @@ Tansu is licensed under [Apache 2.0][apache-license].
 [cloudflare-r2]: https://developers.cloudflare.com/r2/
 [continuous-archiving]: https://www.postgresql.org/docs/current/continuous-archiving.html
 [crates-io-object-store]: https://crates.io/crates/object_store
-[github-com-tansu-io]: https://github.com/tansu-io/tansu
+[github-com-nisshi-io]: https://github.com/nisshi-io/nisshi
 [json-schema-org]: https://json-schema.org/
 [librdkafka]: https://github.com/confluentinc/librdkafka
 [min-io]: https://min.io
@@ -398,5 +398,5 @@ Tansu is licensed under [Apache 2.0][apache-license].
 [protocol-buffers]: https://protobuf.dev
 [raft-consensus]: https://raft.github.io
 [rust-lang-org]: https://www.rust-lang.org
-[tansu-issues]: https://github.com/tansu-io/tansu/issues
+[nisshi-issues]: https://github.com/nisshi-io/nisshi/issues
 [tigris-conditional-writes]: https://www.tigrisdata.com/blog/s3-conditional-writes/
