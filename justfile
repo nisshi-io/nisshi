@@ -447,7 +447,7 @@ compat-librdkafka storage="memory://" features="dynostore": clean-nisshi-db (bui
         --advertised-listener-url=tcp://127.0.0.1:9092 &
     broker=$!
     trap 'kill ${broker}' EXIT
-    ./compat/librdkafka/run.sh
+    BROKER_PID=${broker} ./compat/librdkafka/run.sh
 
 # run the franz-go integration test suite against the given storage engine
 compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build "dev" features)
@@ -457,7 +457,7 @@ compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build
         --advertised-listener-url=tcp://127.0.0.1:9092 &
     broker=$!
     trap 'kill ${broker}' EXIT
-    ./compat/franz-go/run.sh
+    BROKER_PID=${broker} ./compat/franz-go/run.sh
 
 compat-franz-go-test tests timeout="600s" count="1":
     #!/usr/bin/env bash
