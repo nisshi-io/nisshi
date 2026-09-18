@@ -44,7 +44,7 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Level, debug, error, span};
+use tracing::{Instrument, Level, debug, error, span, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -282,7 +282,10 @@ where
             Some(ls)
         };
 
-        let _acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
+        // When a TLS configuration is present every accepted connection must
+        // complete a TLS handshake before any Kafka frame is read: the listener
+        // is TLS only. Without one the listener stays plain TCP.
+        let acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
 
         let mut connections = 0;
 
@@ -321,26 +324,44 @@ where
                         self.sasl_config.clone()
                     )?;
 
+                    let acceptor = acceptor.clone();
+
                     let handle = set.spawn(async move {
-                            match service.serve(c, stream).await {
-                                Err(Error::Io(ref io))
-                                    if io.kind() == ErrorKind::UnexpectedEof
-                                        || io.kind() == ErrorKind::BrokenPipe
-                                        || io.kind() == ErrorKind::ConnectionReset => {}
-
-                                Err(error) => {
-                                    error!(?error);
-                                },
-
-                                Ok(response) => {
-                                    debug!(?response)
+                        // The handshake runs inside the connection task so a slow
+                        // or hostile client cannot stall the accept loop.
+                        let result = match acceptor {
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(tls) => service.serve(c, tls).await,
+                                Err(err) => {
+                                    // A plaintext or untrusting client is a client
+                                    // configuration problem, not a broker fault, so
+                                    // report it once here at warn rather than as an error.
+                                    warn!(%addr, ?err, "tls handshake failed");
+                                    Ok(())
                                 }
+                            },
+                            None => service.serve(c, stream).await,
+                        };
+
+                        match result {
+                            Err(Error::Io(ref io))
+                                if io.kind() == ErrorKind::UnexpectedEof
+                                    || io.kind() == ErrorKind::BrokenPipe
+                                    || io.kind() == ErrorKind::ConnectionReset => {}
+
+                            Err(error) => {
+                                error!(?error);
+                            },
+
+                            Ok(response) => {
+                                debug!(?response)
+                            }
                         }
 
                         if let Some(ref pb) = pb {
                             pb.finish_and_clear();
                         }
-                    });
+                    }.instrument(span!(Level::DEBUG, "peer", %addr)));
 
 
                     debug!(?handle);

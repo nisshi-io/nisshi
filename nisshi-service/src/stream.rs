@@ -193,6 +193,10 @@ impl<S> Layer<S> for TcpContextLayer {
 }
 
 /// A [`Service`] that requires the [`TcpContext`] as the service [`Context`] state
+///
+/// The connection may be any stream type, for example a [`TcpStream`] or a TLS
+/// stream wrapping one: this service only swaps the context state and passes
+/// the stream through to the inner service.
 #[derive(Clone)]
 pub struct TcpContextService<S> {
     inner: S,
@@ -205,21 +209,18 @@ impl<S> Debug for TcpContextService<S> {
     }
 }
 
-impl<State, S> Service<State, TcpStream> for TcpContextService<S>
+impl<State, S, Stream> Service<State, Stream> for TcpContextService<S>
 where
-    S: Service<TcpContext, TcpStream>,
+    S: Service<TcpContext, Stream>,
     S::Error: From<io::Error>,
     State: Clone + Send + Sync + 'static,
+    Stream: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
 
-    #[instrument(skip_all, fields(peer = %req.peer_addr()?))]
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        req: TcpStream,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip_all)]
+    async fn serve(&self, ctx: Context<State>, req: Stream) -> Result<Self::Response, Self::Error> {
         let (ctx, _) = ctx.swap_state(self.state.clone());
 
         self.inner.serve(ctx, req).await

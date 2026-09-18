@@ -101,6 +101,23 @@ If an Apache Avro, Protobuf or JSON schema has been assigned to a topic, the
 broker will reject any messages that are invalid. Schema backed topics are written
 as Apache Parquet when the `-data-lake` option is provided.
 
+### TLS
+
+The listener speaks TLS when both `--cert` (the certificate chain) and `--key`
+(the private key) are supplied as PEM files, and clap rejects one without the other:
+
+```shell
+nisshi broker --cert broker.pem --key broker-key.pem
+```
+
+With TLS configured the listener is TLS only: plaintext clients are refused
+during the handshake, so clients must be configured with `security.protocol=SSL`
+(and a truststore containing the certificate, if it is self-signed). The private
+key must be an unencrypted PKCS#8, SEC1 or RSA PEM key; passphrase protected
+(`ENCRYPTED PRIVATE KEY`) keys are rejected at startup. Any problem loading the
+certificate or key, or a key that does not match the certificate, fails startup
+rather than falling back to plaintext.
+
 ## topic
 
 The `nisshi topic` command has the following subcommands:

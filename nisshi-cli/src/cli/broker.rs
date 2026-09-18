@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
-use crate::{EnvVarExp, Result, cli::storage_engines};
+use crate::{EnvVarExp, Error, Result, cli::storage_engines};
 
 use super::DEFAULT_BROKER;
 use clap::Parser;
@@ -94,12 +96,13 @@ pub(super) struct Arg {
     #[arg(long)]
     authentication: bool,
 
-    /// Transport Layer Security Certificate
-    #[arg(group = "tls", long)]
+    /// Transport Layer Security certificate chain (PEM), requires --key.
+    /// When present the listener only accepts TLS connections
+    #[arg(long, requires = "key")]
     cert: Option<PathBuf>,
 
-    /// Transport Layer Security Key
-    #[arg(group = "tls", long)]
+    /// Transport Layer Security private key (unencrypted PKCS#8, SEC1 or RSA PEM), requires --cert
+    #[arg(long, requires = "cert")]
     key: Option<PathBuf>,
 
     /// Silent
@@ -114,11 +117,25 @@ fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_private_key(filename: &Path) -> Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(filename).map_err(Into::into)
+    // rustls' PEM loader has no passphrase support and would otherwise report
+    // an encrypted key as "no private key found", so name the real problem.
+    let pem = fs::read_to_string(filename)
+        .map_err(TlsPkiPemError::Io)
+        .inspect_err(|err| debug!(?filename, ?err))?;
+
+    if pem.contains("BEGIN ENCRYPTED PRIVATE KEY") {
+        return Err(Error::EncryptedTlsKey(filename.to_path_buf()));
+    }
+
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(Into::into)
 }
 
 fn server_config(certs: &Path, private_key: &Path) -> Result<ServerConfig> {
-    ServerConfig::builder()
+    // Both `ring` and `aws-lc-rs` are compiled into this binary (via other
+    // dependencies), so the provider must be chosen explicitly: rustls panics
+    // when asked to pick a default between two.
+    ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(load_certs(certs)?, load_private_key(private_key)?)
         .map_err(Into::into)
@@ -262,9 +279,15 @@ impl Arg {
             None => None,
         };
 
-        let tls_server_config = self
-            .cert
-            .and_then(|certs| self.key.and_then(|key| server_config(&certs, &key).ok()));
+        // A bad TLS configuration must fail startup loudly rather than silently
+        // falling back to a plaintext listener.
+        let tls_server_config = match (self.cert.as_deref(), self.key.as_deref()) {
+            (Some(cert), Some(key)) => Some(server_config(cert, key)?),
+            (None, None) => None,
+            // clap enforces this pairing already; keep the invariant if the
+            // arguments are ever constructed another way.
+            _ => return Err(Error::TlsRequiresCertAndKey),
+        };
 
         let broker = Broker::<Controller<StorageContainer>, StorageContainer>::builder()
             .node_id(NODE_ID)
@@ -317,6 +340,15 @@ impl Arg {
                         .style(sheet.schema_registry))
                 );
             }
+
+            if let Some(cert) = self.cert.as_deref() {
+                println!(
+                    "tls: {} ({})",
+                    "enabled".if_supports_color(Stream::Stdout, |text| text.style(sheet.tls)),
+                    cert.display()
+                        .if_supports_color(Stream::Stdout, |text| text.style(sheet.tls))
+                );
+            }
         }
 
         broker.build().await.map_err(Into::into)
@@ -329,6 +361,7 @@ struct Sheet {
     listener: Style,
     schema_registry: Style,
     storage: Style,
+    tls: Style,
     version: Style,
 }
 
@@ -340,7 +373,164 @@ impl Default for Sheet {
             listener: Style::new().magenta().bold(),
             schema_registry: Style::new().magenta().bold(),
             storage: Style::new().magenta().bold(),
+            tls: Style::new().magenta().bold(),
             version: Style::new().magenta().bold(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use clap::Parser as _;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::Error;
+
+    struct Pem {
+        _dir: TempDir,
+        cert: PathBuf,
+        key: PathBuf,
+    }
+
+    /// A freshly generated self-signed certificate and its private key as PEM files.
+    fn pem() -> Pem {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(["localhost".to_owned()]).expect("self-signed");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+
+        fs::write(&cert_path, cert.pem()).expect("write cert");
+        fs::write(&key_path, signing_key.serialize_pem()).expect("write key");
+
+        Pem {
+            _dir: dir,
+            cert: cert_path,
+            key: key_path,
+        }
+    }
+
+    fn parse(args: &[&str]) -> Result<Arg, clap::Error> {
+        Arg::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn cert_requires_key() {
+        let pem = pem();
+
+        let err = parse(&["--cert", pem.cert.to_str().unwrap()])
+            .expect_err("--cert without --key must be rejected");
+
+        assert_eq!(clap::error::ErrorKind::MissingRequiredArgument, err.kind());
+    }
+
+    #[test]
+    fn key_requires_cert() {
+        let pem = pem();
+
+        let err = parse(&["--key", pem.key.to_str().unwrap()])
+            .expect_err("--key without --cert must be rejected");
+
+        assert_eq!(clap::error::ErrorKind::MissingRequiredArgument, err.kind());
+    }
+
+    #[test]
+    fn cert_and_key_together_parse() {
+        let pem = pem();
+
+        let arg = parse(&[
+            "--cert",
+            pem.cert.to_str().unwrap(),
+            "--key",
+            pem.key.to_str().unwrap(),
+        ])
+        .expect("--cert and --key together must parse");
+
+        assert_eq!(Some(pem.cert.as_path()), arg.cert.as_deref());
+        assert_eq!(Some(pem.key.as_path()), arg.key.as_deref());
+    }
+
+    #[test]
+    fn valid_pem_builds_server_config() {
+        let pem = pem();
+
+        _ = server_config(&pem.cert, &pem.key).expect("valid cert and key");
+    }
+
+    #[test]
+    fn missing_files_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.pem");
+
+        assert!(server_config(&missing, &missing).is_err());
+    }
+
+    #[test]
+    fn invalid_pem_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = dir.path().join("garbage.pem");
+        fs::write(&garbage, "not a pem file").unwrap();
+
+        assert!(server_config(&garbage, &garbage).is_err());
+    }
+
+    #[test]
+    fn mismatched_key_fails() {
+        let a = pem();
+        let b = pem();
+
+        let err = server_config(&a.cert, &b.key).expect_err("key from another pair must fail");
+
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+    }
+
+    #[test]
+    fn encrypted_key_rejected() {
+        let pem = pem();
+        let encrypted = pem.key.with_file_name("encrypted.pem");
+        fs::write(
+            &encrypted,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBvTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQI\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        )
+        .unwrap();
+
+        let err = server_config(&pem.cert, &encrypted).expect_err("encrypted key must fail");
+
+        assert!(
+            matches!(err, Error::EncryptedTlsKey(ref path) if *path == encrypted),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_fails_on_bad_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = dir.path().join("garbage.pem");
+        fs::write(&garbage, "not a pem file").unwrap();
+
+        let arg = parse(&[
+            "--storage-engine",
+            "memory://nisshi/",
+            "--silent",
+            "--cert",
+            garbage.to_str().unwrap(),
+            "--key",
+            garbage.to_str().unwrap(),
+        ])
+        .expect("arguments parse");
+
+        let err = arg
+            .build()
+            .await
+            .expect_err("build must fail with an unreadable certificate");
+
+        assert!(
+            matches!(err, Error::TlsPkiPem(_) | Error::Tls(_)),
+            "expected a tls error before anything else, got {err:?}"
+        );
     }
 }

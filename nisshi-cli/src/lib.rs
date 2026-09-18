@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, env::vars, fmt, result, str::FromStr};
+use std::{collections::HashMap, env::vars, fmt, path::PathBuf, result, str::FromStr};
 
 mod cli;
 
@@ -25,6 +25,8 @@ pub enum Error {
     Cat(Box<nisshi_cat::Error>),
     Client(Box<nisshi_client::Error>),
     DotEnv(#[from] dotenv::Error),
+    /// The TLS private key file is passphrase protected, which is not supported.
+    EncryptedTlsKey(PathBuf),
     Generate(#[from] nisshi_generator::Error),
     InvalidLength(#[from] sha2::digest::InvalidLength),
     Perf(#[from] nisshi_perf::Error),
@@ -35,6 +37,8 @@ pub enum Error {
     Server(Box<nisshi_broker::Error>),
     Tls(#[from] rustls::Error),
     TlsPkiPem(#[from] rustls::pki_types::pem::Error),
+    /// `--cert` and `--key` must be supplied together.
+    TlsRequiresCertAndKey,
     Topic(#[from] nisshi_topic::Error),
     Url(#[from] url::ParseError),
 }
