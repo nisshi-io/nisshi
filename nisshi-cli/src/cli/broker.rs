@@ -36,7 +36,7 @@ use rustls::{
     },
 };
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -135,27 +135,94 @@ fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
 
 /// Reads the passphrase file, if any. A trailing newline (as left by most
 /// editors and `echo`) is not part of the passphrase. An empty file means
-/// "no passphrase", matching `openssl -passin file:` and mounted secrets.
+/// "no passphrase", matching how OpenSSL reads a `file:` password source and
+/// how mounted secrets behave.
 fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>> {
-    let _ = filename;
-    Ok(None)
+    let Some(filename) = filename else {
+        return Ok(None);
+    };
+
+    let mut passphrase =
+        fs::read(filename)
+            .map(Zeroizing::new)
+            .map_err(|source| Error::TlsKeyPassphraseFile {
+                path: filename.to_path_buf(),
+                source,
+            })?;
+
+    while passphrase
+        .last()
+        .is_some_and(|b| *b == b'\n' || *b == b'\r')
+    {
+        _ = passphrase.pop();
+    }
+
+    Ok((!passphrase.is_empty()).then_some(passphrase))
+}
+
+const ENCRYPTED_PKCS8_BEGIN: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
+const ENCRYPTED_PKCS8_END: &str = "-----END ENCRYPTED PRIVATE KEY-----";
+
+/// The encrypted PKCS#8 section of `pem`, which may be a certificate and key
+/// bundle, from its BEGIN line through its END line.
+fn encrypted_pkcs8_section(pem: &str) -> Option<&str> {
+    let start = pem.find(ENCRYPTED_PKCS8_BEGIN)?;
+    let end = pem[start..].find(ENCRYPTED_PKCS8_END)? + start + ENCRYPTED_PKCS8_END.len();
+    Some(&pem[start..end])
+}
+
+fn decrypt_pkcs8(section: &str, passphrase: &[u8]) -> pkcs8::Result<PrivateKeyDer<'static>> {
+    use pkcs8::{EncryptedPrivateKeyInfo, SecretDocument, der::pem::PemLabel as _};
+
+    let (label, encrypted) = SecretDocument::from_pem(section)?;
+    EncryptedPrivateKeyInfo::validate_pem_label(label)?;
+
+    let decrypted = EncryptedPrivateKeyInfo::try_from(encrypted.as_bytes())?.decrypt(passphrase)?;
+
+    Ok(PrivateKeyDer::Pkcs8(decrypted.as_bytes().to_vec().into()))
 }
 
 fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<PrivateKeyDer<'static>> {
-    let _ = passphrase;
     let key_error = |source| Error::TlsPrivateKey {
         path: filename.to_path_buf(),
         source,
     };
 
     let pem = fs::read_to_string(filename)
+        .map(Zeroizing::new)
         .map_err(TlsPkiPemError::Io)
         .map_err(key_error)?;
 
-    if pem.contains("BEGIN ENCRYPTED PRIVATE KEY") || pem.contains("Proc-Type: 4,ENCRYPTED") {
-        return Err(Error::TlsKeyPassphraseRequired {
+    // Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED` on an RSA/EC
+    // key) derives its key with a single round of MD5: not supported, and
+    // `openssl pkcs8 -topk8` converts it in place, so say so rather than
+    // letting rustls report "no private key found".
+    if pem.contains("Proc-Type: 4,ENCRYPTED") {
+        return Err(Error::TlsKeyLegacyEncrypted {
             path: filename.to_path_buf(),
         });
+    }
+
+    if let Some(section) = encrypted_pkcs8_section(&pem) {
+        let Some(passphrase) = passphrase else {
+            return Err(Error::TlsKeyPassphraseRequired {
+                path: filename.to_path_buf(),
+            });
+        };
+
+        // A wrong passphrase may still decrypt to well-padded garbage; the
+        // certificate and key are compared by `with_single_cert` afterwards.
+        return decrypt_pkcs8(section, passphrase).map_err(|source| Error::TlsKeyDecrypt {
+            path: filename.to_path_buf(),
+            source,
+        });
+    }
+
+    if passphrase.is_some() {
+        warn!(
+            "TLS private key {} is not encrypted; --key-passphrase-file ignored",
+            filename.display()
+        );
     }
 
     PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(key_error)
@@ -628,141 +695,40 @@ mod tests {
         );
     }
 
-    // OpenSSL-generated fixtures: interop guards so the in-process encryption
-    // used by `encrypted_key_with_passphrase_builds` cannot mask a mismatch
-    // with what `openssl pkcs8 -topk8` actually emits. Every encrypted key
-    // below uses the passphrase `correct-horse`. `with_single_cert` does not
-    // check validity dates, so short fixture lifetimes do not matter.
+    // OpenSSL-generated fixtures (`tests/fixtures/tls/`): interop guards so
+    // the in-process encryption used by `encrypted_key_with_passphrase_builds`
+    // cannot mask a mismatch with what `openssl pkcs8 -topk8` actually emits.
+    // Every encrypted key uses the passphrase `correct-horse`. Neither key
+    // protects anything. `with_single_cert` does not check validity dates,
+    // so short fixture lifetimes do not matter.
     const FIXTURE_PASSPHRASE: &[u8] = b"correct-horse";
 
     /// Self-signed P-256 certificate:
     /// `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj /CN=localhost -days 1`
-    const EC_CERT: &str = "-----BEGIN CERTIFICATE-----
-MIIBfjCCASOgAwIBAgIUHl9NpgkfaUtOrRGrOZw/y/nfZgcwCgYIKoZIzj0EAwIw
-FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDkxODE0MDY1MVoXDTI2MDkxOTE0
-MDY1MVowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
-AQcDQgAEL8rJJA2RV6/uE6W9odOBwxWx5mnr6m7r4ibZiDvQp+6mSLzMXvZYp0hd
-STa2vEKRbUNkrzhlCwwdtvslpiwcj6NTMFEwHQYDVR0OBBYEFKTXTx4XYXZUkLkC
-hHq/B1GmgDUxMB8GA1UdIwQYMBaAFKTXTx4XYXZUkLkChHq/B1GmgDUxMA8GA1Ud
-EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAMBaTNFHz+DrYFoRwf5ZAegf
-bSV0we8Q7sqHKvsqnv+wAiEAl2kRYe/00mr314W/x4/h482nYc1djh87vZW6fAJB
-zls=
------END CERTIFICATE-----
-";
+    const EC_CERT: &str = include_str!("../../tests/fixtures/tls/ec-cert.pem");
 
     /// The P-256 key as PBES2 / PBKDF2-HMAC-SHA256 (100 000 iterations) / AES-256-CBC:
     /// `openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 100000`
-    const EC_KEY_ENCRYPTED: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----
-MIH1MGAGCSqGSIb3DQEFDTBTMDIGCSqGSIb3DQEFDDAlBBBYtY4DQzoGJCi3T/4q
-eAUhAgMBhqAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEH1uoF9wz80u4QvO
-lUj8qdMEgZBzlzdi8f/Oi9Yu/xb8w128zZt1Lfu7CeFc1TB7gZh0D0t1/qimPFQp
-TPYIJAdPednrcmqvX7MfM5U25dWw/WUIYkrqbkQeHpJlXrf0iWML6UzwbT5fmLXV
-jHZXdIAogaiK02kmPPdm/LxL75gmQeNkp78T34qnk+DETOwoKsEjzsTuODRWcDfX
-DeCIawGEBIY=
------END ENCRYPTED PRIVATE KEY-----
-";
+    const EC_KEY_ENCRYPTED: &str =
+        include_str!("../../tests/fixtures/tls/ec-key-pkcs8-encrypted.pem");
 
     /// The P-256 key with legacy OpenSSL PEM encryption: `openssl ec -aes256`
-    const EC_KEY_LEGACY_ENCRYPTED: &str = "-----BEGIN EC PRIVATE KEY-----
-Proc-Type: 4,ENCRYPTED
-DEK-Info: AES-256-CBC,1AB0CD970CE00250B53705F97C46DDE3
-
-scIN/NMh5E595NAFXao5+rH7Czbh7wiJYOGBz+MMhJ14RchhDq5lLTGKGLUnQvMD
-dqcPRYe8mSX5RFstiH1El0jsHv83c5MThHOEmjrUrwPydOkhKTuuGKW8IGIEL6zN
-cr5gOkcev/kzfVV75cSo3kqlCrHg+xQ7+qMFNyykTw4=
------END EC PRIVATE KEY-----
-";
+    const EC_KEY_LEGACY_ENCRYPTED: &str =
+        include_str!("../../tests/fixtures/tls/ec-key-legacy-encrypted.pem");
 
     /// Self-signed RSA-2048 certificate:
     /// `openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=localhost -days 397`
-    const RSA_CERT: &str = "-----BEGIN CERTIFICATE-----
-MIIDCTCCAfGgAwIBAgIUVSMR8KlQZAh5oLDehCP4NWBd/VMwDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDkyMTEzNDE1M1oXDTI3MTAy
-MzEzNDE1M1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAvYvwOHg90sBUgD8bSAne5ra+5tjJ3n1xW24IOqzgcjRW
-GqfCwXumESaHBbrahMDaa3JOcX5zmAioEapKa0wy+NNNtKWkfrkN9XRcGXaKeMLz
-7LaTrepRdabARX3BxrogugABg5QK8LoFPbz/RRU/wE1llr9eSG4udj0faYyYhYjl
-+vfM7RAuUCxRjuDJXBhsjBnskQoyyz9rjl23c7n2Lciw4h9GdDjl1gpWrejbO9wl
-esEdSDIi4QXYnm0ZihhJbeFQHapPE3WeyuPOsGcPIl7eoUhk3HIecp8ce1IvZdZ8
-gS3AoaPfaNGsflxCZAtLOJkYzjFbTnsbI+c82ZueVwIDAQABo1MwUTAdBgNVHQ4E
-FgQUcJm8S7uari/hUo/599kYlw2nuSIwHwYDVR0jBBgwFoAUcJm8S7uari/hUo/5
-99kYlw2nuSIwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAnUPx
-Stxvyo0gQHcNo6WAYpdWVUBeZgp/2RRV5rJczJTk07MvG4hV3BJjmxAfHKQNl9Qu
-VgnTCe4gYCd8kW3YU7nTFYnI+hfBW9IgJmFP1pqfVrIdprYtem6VS0TTyhBxkjcE
-dV/GPa036XIt7b2BH6tNn/UzlehREdZSAMZzozMZQI+A752v/x/54PFbTo/UqlCB
-c+HgZOxWYJMWDIVKHgRG7UV1ZL22TMcBsJLEBMzH941wyPrgOtghwMI5f+4XU6BE
-LwGGwdLGKzTl+XV6XXNVjgrvPi9UdOS42Uph/IS866A6Uh7JxFX/bxtbhgSNQKGC
-lVS7O3/MSoZWGj9WSA==
------END CERTIFICATE-----
-";
+    const RSA_CERT: &str = include_str!("../../tests/fixtures/tls/rsa-cert.pem");
 
     /// The RSA key as PBES2 / PBKDF2-HMAC-SHA256 (2048 iterations) / AES-256-CBC:
     /// `openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 2048`
-    const RSA_KEY_ENCRYPTED_AES: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----
-MIIFNTBfBgkqhkiG9w0BBQ0wUjAxBgkqhkiG9w0BBQwwJAQQT24Fd4IrIW/qevOh
-5LbZugICCAAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEPRYmpZUt+NCW0Zb
-R2O0/DsEggTQQnIY6Gb9E1U1u16zqySwaYoeYGRAW8tNAfdic1dmFM3E4j1xNaJ7
-PEGhzz4efkWSPgQ4J8eWqjvMobevhQW+i+Zinob08hWMTtywKrLooyQHuCX4v20v
-XgHxdv50Y+TbqnAZ6B22QqggJN0IL66JBS4+eiyVpcrasDbICRSEzqvUUO7RjDCe
-pweMHWX5887Y2I+lWjssc0Y+vN+KkeJnk6FIj/OQ4VzMLX4b6TiiRQTuLWbNiCAy
-wHM+6+1mOObrSUmg0TDqoKx38Y78EXxi4MreVL9of2wF4RKB1afaomSYATUgQ5T0
-Ui1/QVkZPGYvU+cIRoI3WBdU+PrDWHCHZM+COnwssAMfcfTwHzbodIzfDKmEk0yn
-5GYonmqz7Ow0FxGTDTaoP0CpWpRyPBeudUueL8LdN+8PaU4qX7IV9aSHpuwNt2l7
-PDnOF+th+z7AF1iSxWp16FGtPqojvtS1M1ZtHi44tbB8G8eEg0Aspz+Hc3TuOBpY
-zOAsGZR0fhY0exHOf1luyIaH4iMZyTQu+F9HrHiRwbIatBUUchDSHuNmkOnBKf/I
-cXGoZTZU3ASNOlfB8XQz9SodoUKANzx6qqvc988OmGgpP7E9odiPRZ5FCA2sMcvX
-khEAl0nRivhvoWzu6gzdF39Df9jUcnjUU2PWcwGnv6Xml/5/o0rJDD3qmzdo6NI5
-JnTmRcbbQXTZpf1qHnjDqZRmp+ashGKnkVtoe972WgeSzQjDREs+y6micMw25Lif
-Hea2fH+j/JQyvZR2S7siEk6z3uqkbv0LhCohUtJ5nTJdBswp/mWcQ+uxsjiFDL1t
-8/TmDbpX3qvX7ZbFGRAInVE6oHlx/nPxIx3d2bHTNsl/LLGuAnR1H9ICLz+NuO81
-B/14rwKjQSd5tSeAIeSHBCeOnGKqOfhUJPuchN28lJ8pW7IhZwN8V9WSuZFYcviY
-T2zcRGhFVyAb8GtIPhdbsvk7zCTRC5lxOVsruOWPhj+fmOr6BQV45pYl1MFlktdX
-QWuDM1C2L9qPDcV33PvmUqCsU31qURtl/WsySrTkG/vKlebYcej0o5WkQpoH71U2
-E6tYuujg/jbDTip01XZE+0JIX7BW03tWWGRO9iPG+WdUgnRwERZn/folvGAMx4xj
-8/NNkwhgBjMOhEVfs13Y/brnCv06zMzZnMcdQjP0WrR7wHwNcEIU4ROjJsaOP6ZK
-LOLMnnq6FXsSOTC8CPgLkD+vmQKEzw0eZZbcSAf+82+Aqh/veJBhs16sS2bhWotb
-Cudf2Uj4fU42hu+FkY7jsudKc18fjMmKCab1MEZLBjAx9XoSgck5VIphsJY2Xrb1
-fLHXH1+OdrnT/3+n8vhBq7buhTYOHfn3Ss6JvaDaV9mXfSuXbbOxFYkXCs9k5I/D
-zQcSfze5Wj1CGEGpt7d5ld4haWOpzkMlZX4LyGtmMH5L5/W5A4VoIN9VZME2+Rke
-8aSlLupsDCSy/0Nt5ezRBQRvPK0VFdfiRqroj7FwRj4sxBJEah8LRCjfHVgjuCeY
-3WNinMha6z6enWrMF4jWm9jaFDAlENK271Gd5CYPzVu5GY7KTgtcT8ViNsvjhkFd
-VSodkRftC9jstxvgUli37k0OUTBazTtwYa1fyzet/A9YEy82ouGzD1Q=
------END ENCRYPTED PRIVATE KEY-----
-";
+    const RSA_KEY_ENCRYPTED_AES: &str =
+        include_str!("../../tests/fixtures/tls/rsa-key-pkcs8-aes.pem");
 
-    /// The same RSA key as PBES2 / PBKDF2-HMAC-SHA256 (2048 iterations) / DES-EDE3-CBC:
+    /// The same RSA key as PBES2 / PBKDF2-HMAC-SHA256 (2048 iterations) / Triple DES CBC:
     /// `openssl pkcs8 -topk8 -v2 des3 -v2prf hmacWithSHA256 -iter 2048`
-    const RSA_KEY_ENCRYPTED_3DES: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----
-MIIFJDBWBgkqhkiG9w0BBQ0wSTAxBgkqhkiG9w0BBQwwJAQQ51VJallY1wTKI8qy
-1oxg3AICCAAwDAYIKoZIhvcNAgkFADAUBggqhkiG9w0DBwQIq+HsYMCnuWwEggTI
-FjZVZHGA05TDUffzEmrgYvGKUFboDtxPVMaaa62hHEhME/iN3k1jQrZ60hsqaOHE
-53YA9qAYkT4B5UAGFcsBKJIM8aYTQ4pU6FBKYJJoE5NYVPAn3yhvBwubLplFRLoT
-x5vE8NAZRUcOzV6hbvk28EJQH0SXGsbZKxP6aW1xZpfmmWVYsXuHCjnC+1NnKSaa
-rVkvdIjTYzgBkpbZ/TdoNkm2xM3Vim5AEJgRX2cJSOAzCUoI5ouFo9xCv+pHEy3E
-09v6ZGDfT3GlDinmEqj0MrFFJd11Tq/LWlbNjpiMRUwwcNrF9eSOWO7pclIujbXa
-tvpmnNdff5yZbLbd54lYK+pXXqhO05VOwo3yh0EUEkVFWCFyThrYdC2dw4r21SvF
-YJaeMWT+fSasYeSCQMu/TjIGAGfJh2bVvyNOpGEmA619x4ocRBwI0Ijp3g2vmVO/
-qPA2VXFZ934yzYpE3lfFZURnCcnutNlX0/hh2ipBd7MCoA5rf559xhFEtNWUy6q/
-DLk57M54PlPVaqxcnOeU/AX4EhjAQeEgLOwUlp1JXXQ1X2JqRZvZQJsyIIU/l00+
-Xomcpzv6wmUAJcdwu/Fi/uadja1EJnYjN6Mlmw/CShimzMpBuWKtf+HF9wfbsELG
-N8mebmH24TznTjAqdFGIU+Ht+eAco1rWmbD0NlEH9EZrtxbzl8spJsXPRvTr2NnS
-/RvAYcOSPGpm9w8cSTlwfgA4a4GgcR/3d4a+Q2nKKp8FBbFaFiB7nnbcQaEqMAlV
-Q+H+0HrFRKAsqAC7inLtgqshjCrNw2hkRsaBdiTQPoBA1walKwS/MAkvXkhyJbO8
-KNxYJh9aAgkxn9FO4blpZUrjMsETj8tlN0Zkassd6MNgORd8t8ID0b62PPTVFh4K
-JYYkOgMMVQevFPLp1YaMNjuWh6vE/YPJKytGqdt+OMVb/VFAVVvvO8QJZ+N7zenT
-P10UuOGG9wcetEzinNavBNcAG1/954bzlavJXkFMejevIhuRkZZM5RsacTwqq9KW
-YQcYXsdnrjv/kE54KcmHNZOPVKutFOPXjruKM2Ab84LwpwRms9LdeK2+4xd3Ez4p
-Oua/B1DQtKHTiv740oZPlQ7BVLm/3znq2LnVxCfocl4Yfu/NFEAZWtdKP3uRqTrk
-sPnyLXguiMBP7BlEwkGua+3nyHd0jECxF462YwFGS9QBuBm1GlKkvDS1Cn9FndBL
-NqIH7B/A0wURTgN3CQgGogHl2Wl3PQbmXyKVyHHzcFc7FmXmkgkUaaF/FsIzdx2r
-MHRufCYu/AxurJ8pnNyXT+D9MzZYTeTRi6NpJVII44+NyhvKAyZVeyCQtrkwFP4w
-Kn9AcmkHGnOv4CbgN17kR3HEe/CkPlLlpYFjZzHrwH4h2A2P1eTLZ0tLI6Whzkzu
-bhsR/cpkAkP+N4EUeZmu9MX1v0SVzVBD3QuYfHwxti0/e1PXzJiCBarUytKKISe4
-fMPm9WC+WVyS4Xdn8wh/McW5SnhygsY3fvCQ9gJTp73fGvSdf9OxWwbQWUMC0Lux
-qEzMvwcM/bLv3wOZz49uBFa0aMhJirjADxoTJzQJ2/MKlmd3tbsJNRmfzMABiN21
-1CNrYSlL6sDJkgzxsDj+heU0IGcoj466
------END ENCRYPTED PRIVATE KEY-----
-";
+    const RSA_KEY_ENCRYPTED_3DES: &str =
+        include_str!("../../tests/fixtures/tls/rsa-key-pkcs8-3des.pem");
 
     /// Writes `contents` next to the generated PEM files and returns its path.
     fn write(pem: &Pem, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {

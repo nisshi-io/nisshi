@@ -5,6 +5,8 @@ extend-exclude = [
     # not our typos
     "license.html",
     "nisshi-sans-io/message",
+    # PEM fixtures: base64, not prose
+    "nisshi-cli/tests/fixtures/tls",
 ]
 
 [default]

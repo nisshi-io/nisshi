@@ -73,7 +73,7 @@ async fn main() -> Result<ErrorCode> {
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyDecrypt { path, source } => error!(
-                "TLS private key {} could not be decrypted: {source}. Check the passphrase; supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or DES-EDE3 (openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256).",
+                "TLS private key {} could not be decrypted: {source}. Check the passphrase; supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES (openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256).",
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => error!(

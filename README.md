@@ -115,10 +115,31 @@ during the handshake, so clients must be configured with `security.protocol=SSL`
 (and a truststore containing the certificate, if it is self-signed). The
 `--listener-url` keeps its `tcp://` scheme. TLS here provides encryption only;
 client authentication is still SASL (see `--authentication`). The private key
-must be an unencrypted PKCS#8, SEC1 or RSA PEM key; passphrase protected keys
-(`ENCRYPTED PRIVATE KEY`, or `Proc-Type: 4,ENCRYPTED`) are rejected at startup.
-Any problem loading the certificate or key, or a key that does not match the
+is a PKCS#8, SEC1 or RSA PEM key. `--cert` and `--key` may point at the same
+file when the certificate chain and key are kept in one PEM bundle. Any
+problem loading the certificate or key, or a key that does not match the
 certificate, fails startup rather than falling back to plaintext.
+
+A passphrase protected key (the counterpart of Kafka's `ssl.key.password`) is
+read with `--key-passphrase-file`, a file holding the passphrase; a trailing
+newline is ignored:
+
+```shell
+nisshi broker --cert broker.pem --key broker-key.pem --key-passphrase-file broker-key.passphrase
+```
+
+Only PKCS#8 encryption (`ENCRYPTED PRIVATE KEY`, PBES2 with PBKDF2-HMAC-SHA2 or
+scrypt and AES-CBC or Triple DES, which is what `openssl pkcs8 -topk8` emits) is
+supported. Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) is rejected
+at startup; convert it first, keeping the passphrase:
+
+```shell
+openssl pkcs8 -topk8 -in broker-key.pem -out broker-key-pkcs8.pem
+```
+
+An empty passphrase file means no passphrase, so a mounted secret that is
+absent for unencrypted keys works unchanged. A passphrase given for a key that
+is not encrypted is ignored with a warning.
 
 Note for existing deployments: before 0.7 these flags were accepted but had no
 effect, so a broker started with `--cert` and `--key` was serving plaintext.
