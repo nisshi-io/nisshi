@@ -136,13 +136,14 @@ jobs:
           - slatedb
     steps:
       - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
           cache: false
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
-      - run: cargo build  --no-default-features --features ${{matrix.storage}}
+      - run: just build dev ${{matrix.storage}}
   build-storage-lake:
     runs-on: ${{matrix.os}}
     strategy:
