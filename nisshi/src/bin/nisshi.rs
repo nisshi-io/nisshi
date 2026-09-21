@@ -73,7 +73,11 @@ async fn main() -> Result<ErrorCode> {
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyDecrypt { path, source } => error!(
-                "TLS private key {} could not be decrypted: {source}. Check the passphrase; supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES (openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256).",
+                "TLS private key {} could not be decrypted: {source}. Check the passphrase in --key-passphrase-file.",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyUnsupportedEncryption { path, algorithm } => error!(
+                "TLS private key {} is encrypted with {algorithm}, which is not supported. Supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES. Re-encrypt it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem -v2 aes-256-cbc -v2prf hmacWithSHA256",
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => error!(
@@ -85,7 +89,7 @@ async fn main() -> Result<ErrorCode> {
                 path.display()
             ),
             nisshi_cli::Error::Tls(error) => error!(
-                "TLS configuration rejected: {error}. Check that --key is the private key for the certificate in --cert."
+                "TLS configuration rejected: {error}. Check that --key is the private key for the certificate in --cert and, for an encrypted key, that the passphrase is correct."
             ),
             nisshi_cli::Error::TlsRequiresCertAndKey => {
                 error!("TLS requires both --cert and --key.")

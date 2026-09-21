@@ -179,7 +179,35 @@ fn decrypt_pkcs8(section: &str, passphrase: &[u8]) -> pkcs8::Result<PrivateKeyDe
 
     let decrypted = EncryptedPrivateKeyInfo::try_from(encrypted.as_bytes())?.decrypt(passphrase)?;
 
+    // `decrypted` is zeroized on drop; the copy handed to rustls is not,
+    // because `PrivatePkcs8KeyDer` has no zeroize-on-drop. The unencrypted
+    // path (`from_pem_slice`) has the same property.
     Ok(PrivateKeyDer::Pkcs8(decrypted.as_bytes().to_vec().into()))
+}
+
+/// The name of the encryption algorithm a decrypt error says this build does
+/// not support, if that is what it says. A wrong passphrase is reported
+/// differently, so the operator is not sent to retype a passphrase when the
+/// key needs re-encrypting.
+fn unsupported_encryption(error: &pkcs8::Error) -> Option<String> {
+    use pkcs8::pkcs5::Error as Pkcs5Error;
+
+    const HMAC_WITH_SHA1: &str = "1.2.840.113549.2.7";
+    const DES_CBC: &str = "1.3.14.3.2.7";
+
+    match error {
+        pkcs8::Error::EncryptedPrivateKey(Pkcs5Error::UnsupportedAlgorithm { oid }) => {
+            Some(match oid.to_string().as_str() {
+                HMAC_WITH_SHA1 => "PBKDF2 with HMAC-SHA1".to_owned(),
+                DES_CBC => "DES-CBC".to_owned(),
+                other => format!("algorithm {other}"),
+            })
+        }
+        pkcs8::Error::EncryptedPrivateKey(Pkcs5Error::NoPbes1CryptSupport) => {
+            Some("PBES1".to_owned())
+        }
+        _ => None,
+    }
 }
 
 fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<PrivateKeyDer<'static>> {
@@ -212,9 +240,17 @@ fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<Privat
 
         // A wrong passphrase may still decrypt to well-padded garbage; the
         // certificate and key are compared by `with_single_cert` afterwards.
-        return decrypt_pkcs8(section, passphrase).map_err(|source| Error::TlsKeyDecrypt {
-            path: filename.to_path_buf(),
-            source,
+        return decrypt_pkcs8(section, passphrase).map_err(|source| {
+            unsupported_encryption(&source).map_or_else(
+                || Error::TlsKeyDecrypt {
+                    path: filename.to_path_buf(),
+                    source,
+                },
+                |algorithm| Error::TlsKeyUnsupportedEncryption {
+                    path: filename.to_path_buf(),
+                    algorithm,
+                },
+            )
         });
     }
 
@@ -730,6 +766,16 @@ mod tests {
     const RSA_KEY_ENCRYPTED_3DES: &str =
         include_str!("../../tests/fixtures/tls/rsa-key-pkcs8-3des.pem");
 
+    /// The same RSA key as PBES2 / scrypt / AES-256-CBC: `openssl pkcs8 -topk8 -scrypt`
+    const RSA_KEY_ENCRYPTED_SCRYPT: &str =
+        include_str!("../../tests/fixtures/tls/rsa-key-pkcs8-scrypt.pem");
+
+    /// The same RSA key as PBES2 / PBKDF2-HMAC-SHA1 (2048 iterations) / AES-256-CBC,
+    /// older OpenSSL releases' default PRF, which this build does not support:
+    /// `openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA1 -iter 2048`
+    const RSA_KEY_ENCRYPTED_SHA1_PRF: &str =
+        include_str!("../../tests/fixtures/tls/rsa-key-pkcs8-sha1-prf.pem");
+
     /// Writes `contents` next to the generated PEM files and returns its path.
     fn write(pem: &Pem, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
         let path = pem.key.with_file_name(name);
@@ -774,6 +820,18 @@ mod tests {
 
         _ = server_config(&pem.cert, &encrypted, Some(&passphrase))
             .expect("encrypted key with its passphrase");
+    }
+
+    /// A passphrase file written on Windows, or with a blank line after the
+    /// passphrase: every trailing CR and LF is dropped, not just one byte.
+    #[test]
+    fn encrypted_key_with_crlf_passphrase_builds() {
+        let pem = pem();
+        let encrypted = encrypt_key(&pem, b"pw");
+        let passphrase = write(&pem, "passphrase", "pw\r\n\n");
+
+        _ = server_config(&pem.cert, &encrypted, Some(&passphrase))
+            .expect("trailing line endings are not part of the passphrase");
     }
 
     #[test]
@@ -833,6 +891,38 @@ mod tests {
         let passphrase = write(&pem, "passphrase", FIXTURE_PASSPHRASE);
 
         _ = server_config(&cert, &key, Some(&passphrase)).expect("openssl pkcs8 rsa 3des key");
+    }
+
+    #[test]
+    fn openssl_pkcs8_rsa_scrypt_fixture_decrypts() {
+        let pem = pem();
+        let cert = write(&pem, "rsa-cert.pem", RSA_CERT);
+        let key = write(&pem, "rsa-key.pem", RSA_KEY_ENCRYPTED_SCRYPT);
+        let passphrase = write(&pem, "passphrase", FIXTURE_PASSPHRASE);
+
+        _ = server_config(&cert, &key, Some(&passphrase)).expect("openssl pkcs8 rsa scrypt key");
+    }
+
+    /// A SHA-1 PRF key with the right passphrase must name the algorithm, not
+    /// blame the passphrase.
+    #[test]
+    fn openssl_pkcs8_sha1_prf_fixture_names_the_algorithm() {
+        let pem = pem();
+        let cert = write(&pem, "rsa-cert.pem", RSA_CERT);
+        let key = write(&pem, "rsa-key.pem", RSA_KEY_ENCRYPTED_SHA1_PRF);
+        let passphrase = write(&pem, "passphrase", FIXTURE_PASSPHRASE);
+
+        let err =
+            server_config(&cert, &key, Some(&passphrase)).expect_err("sha-1 prf is not supported");
+
+        assert!(
+            matches!(
+                err,
+                Error::TlsKeyUnsupportedEncryption { ref path, ref algorithm }
+                    if *path == key && algorithm == "PBKDF2 with HMAC-SHA1"
+            ),
+            "{err:?}"
+        );
     }
 
     /// A common deployment shape: certificate chain and encrypted key in one

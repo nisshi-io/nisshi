@@ -130,11 +130,12 @@ nisshi broker --cert broker.pem --key broker-key.pem --key-passphrase-file broke
 
 Only PKCS#8 encryption (`ENCRYPTED PRIVATE KEY`, PBES2 with PBKDF2-HMAC-SHA2 or
 scrypt and AES-CBC or Triple DES, which is what `openssl pkcs8 -topk8` emits) is
-supported. Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) is rejected
-at startup; convert it first, keeping the passphrase:
+supported. Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) and keys
+derived with a SHA-1 PRF (older OpenSSL releases' default) are rejected at
+startup, naming the algorithm; re-encrypt the key first, keeping the passphrase:
 
 ```shell
-openssl pkcs8 -topk8 -in broker-key.pem -out broker-key-pkcs8.pem
+openssl pkcs8 -topk8 -in broker-key.pem -out broker-key-pkcs8.pem -v2 aes-256-cbc -v2prf hmacWithSHA256
 ```
 
 An empty passphrase file means no passphrase, so a mounted secret that is
@@ -146,7 +147,8 @@ effect, so a broker started with `--cert` and `--key` was serving plaintext.
 After upgrading, that same command line serves TLS only, and `--cert` without
 `--key` (or the reverse) is rejected. The bundled `nisshi cat`, `topic`, `perf`
 and `proxy` subcommands connect in plaintext and cannot yet talk to a TLS
-listener.
+listener. `--key-passphrase-file` is unknown to earlier releases, so rolling
+the binary back means removing that flag from the command line as well.
 
 ## topic
 

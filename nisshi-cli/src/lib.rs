@@ -48,10 +48,16 @@ pub enum Error {
     TlsKeyPassphraseRequired {
         path: PathBuf,
     },
-    /// The passphrase did not decrypt the key, or the PBES2 algorithm is unsupported.
+    /// The passphrase did not decrypt the key.
     TlsKeyDecrypt {
         path: PathBuf,
         source: pkcs8::Error,
+    },
+    /// The key is encrypted with an algorithm this build does not support,
+    /// named by `algorithm` (a friendly name, or the OID when unknown).
+    TlsKeyUnsupportedEncryption {
+        path: PathBuf,
+        algorithm: String,
     },
     /// Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) is not supported.
     TlsKeyLegacyEncrypted {
