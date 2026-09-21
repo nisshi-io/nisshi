@@ -42,7 +42,11 @@ EOF
 
 FROM scratch AS out
 
-RUN mkdir -p /schema /data /tmp
+# create empty directories
+WORKDIR /schema
+WORKDIR /data
+WORKDIR /tmp
+WORKDIR /
 
 COPY --from=builder --parents /etc/ssl /
 COPY --from=builder /usr/src/LICENSE /usr/bin/nisshi /
