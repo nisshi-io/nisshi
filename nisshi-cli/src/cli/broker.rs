@@ -1043,6 +1043,14 @@ mod tests {
         ])
         .expect("arguments parse");
 
+        // `--schema-registry` also reads SCHEMA_REGISTRY, which CI exports
+        // as a path relative to the workspace root; this test is about TLS,
+        // not the registry, so it must not depend on the environment.
+        let arg = Arg {
+            schema_registry: None,
+            ..arg
+        };
+
         _ = arg
             .build()
             .await
