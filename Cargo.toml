@@ -129,6 +129,7 @@ ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
 parquet = {version = "57", features = ["async"]}
 pbkdf2 = "0.12.2"
+pkcs8 = { version = "0.10", default-features = false, features = ["encryption", "pem", "std", "3des"] }
 postcard = { version = "1.1.3", features = ["use-std"] }
 pretty_assertions = "1"
 prettyplease = "0.2.29"
@@ -187,6 +188,7 @@ tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 turso = "0.7.1"
 url = { version = "2.5.4", features = ["serde"] }
+zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }
 zstd = "0.13.2"
 

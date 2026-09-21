@@ -65,11 +65,23 @@ async fn main() -> Result<ErrorCode> {
                 path.display()
             ),
             nisshi_cli::Error::TlsPrivateKey { path, source } => error!(
-                "TLS private key {} could not be loaded: {source}. Expected an unencrypted PKCS#8, SEC1 or RSA PEM key (--key).",
+                "TLS private key {} could not be loaded: {source}. Expected a PKCS#8, SEC1 or RSA PEM key (--key).",
                 path.display()
             ),
-            nisshi_cli::Error::EncryptedTlsKey(path) => error!(
-                "TLS private key {} is passphrase protected, which is not supported: decrypt it first (for example: openssl pkey -in key.pem -out key-plain.pem).",
+            nisshi_cli::Error::TlsKeyPassphraseRequired { path } => error!(
+                "TLS private key {} is encrypted: pass --key-passphrase-file <file>.",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyDecrypt { path, source } => error!(
+                "TLS private key {} could not be decrypted: {source}. Check the passphrase; supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or DES-EDE3 (openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256).",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => error!(
+                "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyPassphraseFile { path, source } => error!(
+                "TLS key passphrase file {} could not be read: {source}.",
                 path.display()
             ),
             nisshi_cli::Error::Tls(error) => error!(

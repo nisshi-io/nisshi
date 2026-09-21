@@ -25,8 +25,6 @@ pub enum Error {
     Cat(Box<nisshi_cat::Error>),
     Client(Box<nisshi_client::Error>),
     DotEnv(#[from] dotenv::Error),
-    /// The TLS private key file is passphrase protected, which is not supported.
-    EncryptedTlsKey(PathBuf),
     Generate(#[from] nisshi_generator::Error),
     InvalidLength(#[from] sha2::digest::InvalidLength),
     Perf(#[from] nisshi_perf::Error),
@@ -45,6 +43,24 @@ pub enum Error {
     TlsPrivateKey {
         path: PathBuf,
         source: rustls::pki_types::pem::Error,
+    },
+    /// The `--key` file is encrypted but no `--key-passphrase-file` was given.
+    TlsKeyPassphraseRequired {
+        path: PathBuf,
+    },
+    /// The passphrase did not decrypt the key, or the PBES2 algorithm is unsupported.
+    TlsKeyDecrypt {
+        path: PathBuf,
+        source: pkcs8::Error,
+    },
+    /// Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) is not supported.
+    TlsKeyLegacyEncrypted {
+        path: PathBuf,
+    },
+    /// The `--key-passphrase-file` could not be read.
+    TlsKeyPassphraseFile {
+        path: PathBuf,
+        source: std::io::Error,
     },
     /// `--cert` and `--key` must be supplied together.
     TlsRequiresCertAndKey,
