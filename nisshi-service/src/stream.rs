@@ -141,10 +141,19 @@ where
 
 /// A [context state][`Context#method.state`] state used by [`TcpContextLayer`] and [`TcpContextService`]
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, Extension)]
+#[derive(Clone, Debug, Extension)]
 pub struct TcpContext {
     cluster_id: Option<String>,
     maximum_frame_size: Option<usize>,
+}
+
+impl Default for TcpContext {
+    fn default() -> Self {
+        Self {
+            cluster_id: Default::default(),
+            maximum_frame_size: Some(DEFAULT_MAXIMUM_FRAME_SIZE),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Extension)]
@@ -152,6 +161,18 @@ struct ClusterIdExtension(String);
 
 #[derive(Clone, Debug, Extension)]
 struct MaximumFrameSizeExtension(usize);
+
+impl Default for MaximumFrameSizeExtension {
+    fn default() -> Self {
+        Self(DEFAULT_MAXIMUM_FRAME_SIZE)
+    }
+}
+
+impl From<&MaximumFrameSizeExtension> for usize {
+    fn from(value: &MaximumFrameSizeExtension) -> Self {
+        value.0
+    }
+}
 
 impl TcpContext {
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
@@ -262,6 +283,17 @@ impl Service<TcpStream> for ReadHalfService {
     async fn serve(&self, mut input: TcpStream) -> Result<Self::Output, Self::Error> {
         let mut size = [0u8; 4];
         _ = input.read_exact(&mut size).await?;
+
+        let frame_size = frame_size(size)?;
+
+        if frame_size
+            > input
+                .extensions()
+                .get_ref_or_insert(MaximumFrameSizeExtension::default)
+                .into()
+        {
+            return Err(Into::into(Error::FrameTooBig(frame_size)));
+        }
 
         let mut buffer: Vec<u8> = vec![0u8; frame_length(size)?];
         buffer[0..size.len()].copy_from_slice(&size[..]);
@@ -572,6 +604,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use tokio::{
+        io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex},
+        spawn,
+    };
+
     use super::*;
 
     /// Inner service standing in for the frame router: echoes the request bytes.
@@ -647,26 +690,82 @@ mod tests {
         assert!(matches!(err, Error::InvalidFrameLength(-1)), "{err:?}");
     }
 
+    struct DuplexStreamWithExtensions {
+        stream: DuplexStream,
+        extensions: Extensions,
+    }
+
+    impl AsRef<DuplexStream> for DuplexStreamWithExtensions {
+        fn as_ref(&self) -> &DuplexStream {
+            &self.stream
+        }
+    }
+
+    impl AsyncRead for DuplexStreamWithExtensions {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DuplexStreamWithExtensions {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    impl ExtensionsRef for DuplexStreamWithExtensions {
+        fn extensions(&self) -> &Extensions {
+            &self.extensions
+        }
+    }
+
     #[tokio::test]
     async fn serve_rejects_oversized_frame_without_reading_body() -> Result<(), Error> {
-        // let (mut client, server) = tokio::io::duplex(64);
+        let (mut client, server) = duplex(64);
 
-        // let ctx = Context::with_state(TcpContext::default().maximum_frame_size(Some(1024)));
-        // let handle = tokio::spawn(async move { service().serve(server).await });
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(MaximumFrameSizeExtension(1_024));
+
+            let input = DuplexStreamWithExtensions {
+                stream: server,
+                extensions,
+            };
+
+            service().serve(input).await
+        });
+
+        const SIZE: usize = 65_536;
 
         // Only the length prefix is sent. If the guard admitted the frame,
         // `read` would block in `read_exact` waiting for a body that never
         // arrives, so the timeout is what turns that into a failure.
-        // client.write_all(&header(65_536)).await?;
+        client.write_all(&header(SIZE as i32)).await?;
 
-        // let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
-        //     .await
-        //     .expect("oversized frame was admitted: serve is blocked reading the body")?;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("oversized frame was admitted: serve is blocked reading the body")?;
 
-        // assert!(
-        //     matches!(outcome, Err(Error::FrameTooBig(65_536))),
-        //     "{outcome:?}"
-        // );
+        assert!(
+            matches!(outcome, Err(Error::FrameTooBig(SIZE))),
+            "{outcome:?}"
+        );
         Ok(())
     }
 }
