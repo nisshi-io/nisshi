@@ -797,6 +797,13 @@ impl Postgres {
 
         debug!(?low, ?high);
 
+        // The producer's batch attributes, validated and normalised. Inflating
+        // clears the compression codec (the records are now plaintext), so the
+        // codec is kept from here: fetch rebuilds the batch from its rows and
+        // re-deflates with the codec the producer used, as Kafka does with
+        // compression.type=producer.
+        let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
+
         let inflated = Batch::try_from(deflated).inspect_err(|err| error!(?err))?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
@@ -870,7 +877,7 @@ impl Postgres {
                 for (delta, record) in inflated.records.iter().enumerate() {
                     let delta = i64::try_from(delta)?;
                     let offset = high.unwrap_or_default() + delta;
-                    let attributes = inflated.attributes;
+                    let attributes = produced_attributes;
                     let key = record.key.as_deref();
                     let value = record.value.as_deref();
 

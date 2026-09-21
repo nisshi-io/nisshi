@@ -116,7 +116,7 @@ use deadpool::managed::{self, BuildError, Object, PoolError};
 use nisshi_sans_io::{
     ApiKey, ApiVersionsRequest, Body, Frame, FrameInput, Header, Request, RootMessageMeta,
 };
-use nisshi_service::host_port;
+use nisshi_service::{frame_length, host_port};
 use opentelemetry::{
     InstrumentationScope, KeyValue, global,
     metrics::{Counter, Gauge, Histogram, Meter},
@@ -748,7 +748,7 @@ impl BytesConnectionService {
         let mut size = [0u8; 4];
         _ = stream.read_exact(&mut size).await?;
 
-        let mut buffer: Vec<u8> = vec![0u8; frame_length(size)];
+        let mut buffer: Vec<u8> = vec![0u8; frame_length(size)?];
         buffer[0..size.len()].copy_from_slice(&size[..]);
         _ = stream
             .read_exact(&mut buffer[4..])
@@ -794,10 +794,6 @@ impl Service<BytesConnection> for BytesConnectionService {
         .instrument(span)
         .await
     }
-}
-
-fn frame_length(encoded: [u8; 4]) -> usize {
-    i32::from_be_bytes(encoded) as usize + encoded.len()
 }
 
 static TCP_CONNECT_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {

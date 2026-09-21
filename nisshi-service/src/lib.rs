@@ -274,8 +274,9 @@ pub use frame::{
 };
 
 pub use stream::{
-    BytesLayer, BytesService, BytesTcpService, TcpBytesLayer, TcpBytesService, TcpContext,
-    TcpContextLayer, TcpContextService, TcpListenerLayer, TcpStreamLayer, TcpStreamService,
+    BytesLayer, BytesService, BytesTcpService, DEFAULT_MAXIMUM_FRAME_SIZE, TcpBytesLayer,
+    TcpBytesService, TcpContext, TcpContextLayer, TcpContextService, TcpListenerLayer,
+    TcpStreamLayer, TcpStreamService,
 };
 
 #[derive(Clone, Debug, Extension)]
@@ -298,6 +299,7 @@ pub enum Error {
     Auth(#[from] nisshi_auth::Error),
     DuplicateRoute(i16),
     FrameTooBig(usize),
+    InvalidFrameLength(i32),
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Message(String),
@@ -335,8 +337,22 @@ impl<T> From<PoisonError<T>> for Error {
     }
 }
 
-fn frame_length(encoded: [u8; 4]) -> usize {
-    i32::from_be_bytes(encoded) as usize + encoded.len()
+/// Payload size declared by a frame's 4 byte size prefix.
+///
+/// The prefix is untrusted input from the peer: a negative size is a protocol
+/// error, and letting it through would otherwise wrap into a multi-gigabyte
+/// allocation.
+fn frame_size(encoded: [u8; 4]) -> Result<usize, Error> {
+    let size = i32::from_be_bytes(encoded);
+
+    usize::try_from(size).map_err(|_| Error::InvalidFrameLength(size))
+}
+
+/// Total length of a frame, the 4 byte size prefix plus the payload it declares.
+///
+/// Fails with [`Error::InvalidFrameLength`] when the prefix declares a negative size.
+pub fn frame_length(encoded: [u8; 4]) -> Result<usize, Error> {
+    frame_size(encoded).map(|size| size + encoded.len())
 }
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {

@@ -292,6 +292,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
+      - run: just compat-infra-up
       - run: just compat-franz-go '${{matrix.storage.engine}}' '${{matrix.storage.features}}'
       - if: always()
         uses: actions/upload-artifact@v7

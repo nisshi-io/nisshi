@@ -179,9 +179,11 @@ where
                 break;
             }
 
+            // the offset after the last one returned; a batch can have gaps
+            // (compaction), so this is not the record count
             if let Some(latest) = fetched
                 .iter()
-                .map(|batch| batch.base_offset + batch.record_count as i64)
+                .map(|batch| batch.max_offset() + 1)
                 .max()
                 .inspect(|latest| debug!(latest))
             {
@@ -189,6 +191,15 @@ where
             }
 
             batches.append(&mut fetched);
+
+            // max_wait bounds the response: engines that assemble batches
+            // from rows stop at the deadline but return what they have, so
+            // another round now would return one record per round trip
+            // until max_bytes is spent
+            if started_at.elapsed() >= max_wait {
+                debug!(?offset, elapsed = ?started_at.elapsed(), ?max_wait);
+                break;
+            }
         }
 
         let offset_stage = self
@@ -489,5 +500,450 @@ impl ByteSize for PartitionData {
 impl ByteSize for FetchableTopicResponse {
     fn byte_size(&self) -> u64 {
         self.partitions.byte_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+        time::SystemTime,
+    };
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use nisshi_sans_io::{
+        ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
+        create_topics_request::CreatableTopic,
+        delete_groups_response::DeletableGroupResult,
+        delete_records_request::DeleteRecordsTopic,
+        delete_records_response::DeleteRecordsTopicResult,
+        describe_cluster_response::DescribeClusterBroker,
+        describe_configs_response::DescribeConfigsResult,
+        describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
+        fetch_request::FetchPartition,
+        fetch_response::AbortedTransaction,
+        incremental_alter_configs_request::AlterConfigsResource,
+        incremental_alter_configs_response::AlterConfigsResourceResponse,
+        list_groups_response::ListedGroup,
+        record::{Record, deflated, inflated},
+        txn_offset_commit_response::TxnOffsetCommitResponseTopic,
+    };
+    use tokio::time::{Duration, advance};
+    use url::Url;
+    use uuid::Uuid;
+
+    use super::FetchService;
+    use crate::{
+        BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
+        NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+        ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+        TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    };
+
+    /// A batch at `base_offset` holding one record per entry in `deltas`,
+    /// each at that offset delta.
+    fn batch(base_offset: i64, deltas: &[i32]) -> Result<deflated::Batch> {
+        let mut builder = inflated::Batch::builder()
+            .base_offset(base_offset)
+            .last_offset_delta(deltas.last().copied().unwrap_or_default());
+
+        for delta in deltas {
+            builder = builder.record(
+                Record::builder()
+                    .offset_delta(*delta)
+                    .value(Some(Bytes::from_static(b"foobarfoobarfoobarfoobar"))),
+            );
+        }
+
+        builder
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    /// Storage whose `fetch` replays scripted responses, records the offset
+    /// and remaining `max_wait` of each call, and optionally advances the
+    /// (paused) clock past the deadline on the first call, as an engine
+    /// that spends the whole budget assembling one truncated batch does.
+    #[derive(Clone, Debug)]
+    struct Scripted {
+        responses: Arc<Mutex<Vec<Vec<deflated::Batch>>>>,
+        calls: Arc<Mutex<Vec<(i64, Duration)>>>,
+        consume_budget_on_first_call: Option<Duration>,
+    }
+
+    impl Scripted {
+        fn calls(&self) -> Vec<(i64, Duration)> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Storage for Scripted {
+        async fn fetch(
+            &self,
+            _topition: &Topition,
+            offset: i64,
+            _min_bytes: u32,
+            _max_bytes: u32,
+            _isolation_level: IsolationLevel,
+            max_wait: Duration,
+        ) -> Result<Vec<deflated::Batch>> {
+            let calls = {
+                let mut calls = self.calls.lock()?;
+                calls.push((offset, max_wait));
+                calls.len()
+            };
+
+            let response = {
+                let mut responses = self.responses.lock()?;
+
+                if responses.is_empty() {
+                    return Err(Error::Message(format!(
+                        "storage fetch called {calls} times, past the end of the script"
+                    )));
+                }
+
+                responses.remove(0)
+            };
+
+            if calls == 1
+                && let Some(budget) = self.consume_budget_on_first_call
+            {
+                advance(budget).await;
+            }
+
+            Ok(response)
+        }
+
+        async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
+            Ok(OffsetStage {
+                last_stable: 1_000,
+                high_watermark: 1_000,
+                log_start: 0,
+            })
+        }
+
+        async fn register_broker(
+            &self,
+            _broker_registration: BrokerRegistrationRequest,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
+            unimplemented!()
+        }
+
+        async fn create_topic(&self, _topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
+            unimplemented!()
+        }
+
+        async fn delete_records(
+            &self,
+            _topics: &[DeleteRecordsTopic],
+        ) -> Result<Vec<DeleteRecordsTopicResult>> {
+            unimplemented!()
+        }
+
+        async fn delete_topic(&self, _topic: &TopicId) -> Result<ErrorCode> {
+            unimplemented!()
+        }
+
+        async fn incremental_alter_resource(
+            &self,
+            _resource: AlterConfigsResource,
+        ) -> Result<AlterConfigsResourceResponse> {
+            unimplemented!()
+        }
+
+        async fn produce(
+            &self,
+            _transaction_id: Option<&str>,
+            _topition: &Topition,
+            _deflated: deflated::Batch,
+        ) -> Result<i64> {
+            unimplemented!()
+        }
+
+        async fn offset_commit(
+            &self,
+            _group: &str,
+            _retention: Option<Duration>,
+            _offsets: &[(Topition, OffsetCommitRequest)],
+        ) -> Result<Vec<(Topition, ErrorCode)>> {
+            unimplemented!()
+        }
+
+        async fn committed_offset_topitions(
+            &self,
+            _group_id: &str,
+        ) -> Result<BTreeMap<Topition, i64>> {
+            unimplemented!()
+        }
+
+        async fn offset_fetch(
+            &self,
+            _group_id: Option<&str>,
+            _topics: &[Topition],
+            _require_stable: Option<bool>,
+        ) -> Result<BTreeMap<Topition, i64>> {
+            unimplemented!()
+        }
+
+        async fn list_offsets(
+            &self,
+            _isolation_level: IsolationLevel,
+            _offsets: &[(Topition, ListOffset)],
+        ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+            unimplemented!()
+        }
+
+        async fn metadata(&self, _topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+            unimplemented!()
+        }
+
+        async fn describe_config(
+            &self,
+            _name: &str,
+            _resource: ConfigResource,
+            _keys: Option<&[String]>,
+        ) -> Result<DescribeConfigsResult> {
+            unimplemented!()
+        }
+
+        async fn describe_topic_partitions(
+            &self,
+            _topics: Option<&[TopicId]>,
+            _partition_limit: i32,
+            _cursor: Option<Topition>,
+        ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
+            unimplemented!()
+        }
+
+        async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+            unimplemented!()
+        }
+
+        async fn delete_groups(
+            &self,
+            _group_ids: Option<&[String]>,
+        ) -> Result<Vec<DeletableGroupResult>> {
+            unimplemented!()
+        }
+
+        async fn describe_groups(
+            &self,
+            _group_ids: Option<&[String]>,
+            _include_authorized_operations: bool,
+        ) -> Result<Vec<NamedGroupDetail>> {
+            unimplemented!()
+        }
+
+        async fn update_group(
+            &self,
+            _group_id: &str,
+            _detail: GroupDetail,
+            _version: Option<Version>,
+        ) -> Result<Version, UpdateError<GroupDetail>> {
+            unimplemented!()
+        }
+
+        async fn init_producer(
+            &self,
+            _transaction_id: Option<&str>,
+            _transaction_timeout_ms: i32,
+            _producer_id: Option<i64>,
+            _producer_epoch: Option<i16>,
+        ) -> Result<ProducerIdResponse> {
+            unimplemented!()
+        }
+
+        async fn txn_add_offsets(
+            &self,
+            _transaction_id: &str,
+            _producer_id: i64,
+            _producer_epoch: i16,
+            _group_id: &str,
+        ) -> Result<ErrorCode> {
+            unimplemented!()
+        }
+
+        async fn txn_add_partitions(
+            &self,
+            _partitions: TxnAddPartitionsRequest,
+        ) -> Result<TxnAddPartitionsResponse> {
+            unimplemented!()
+        }
+
+        async fn txn_offset_commit(
+            &self,
+            _offsets: TxnOffsetCommitRequest,
+        ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
+            unimplemented!()
+        }
+
+        async fn txn_end(
+            &self,
+            _transaction_id: &str,
+            _producer_id: i64,
+            _producer_epoch: i16,
+            _committed: bool,
+        ) -> Result<ErrorCode> {
+            unimplemented!()
+        }
+
+        async fn maintain(&self, _now: SystemTime) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn aborted_transactions(
+            &self,
+            _topition: &Topition,
+            _offset: i64,
+            _last_stable_offset: i64,
+        ) -> Result<Vec<AbortedTransaction>> {
+            unimplemented!()
+        }
+
+        async fn cluster_id(&self) -> Result<String> {
+            unimplemented!()
+        }
+
+        async fn node(&self) -> Result<i32> {
+            unimplemented!()
+        }
+
+        async fn advertised_listener(&self) -> Result<Url> {
+            unimplemented!()
+        }
+
+        async fn ping(&self) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn delete_user_scram_credential(
+            &self,
+            _user: &str,
+            _mechanism: ScramMechanism,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn upsert_user_scram_credential(
+            &self,
+            _user: &str,
+            _mechanism: ScramMechanism,
+            _credential: ScramCredential,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn user_scram_credential(
+            &self,
+            _user: &str,
+            _mechanism: ScramMechanism,
+        ) -> Result<Option<ScramCredential>> {
+            unimplemented!()
+        }
+    }
+
+    async fn fetch_partition(
+        storage: Scripted,
+        max_wait: Duration,
+        max_bytes: u32,
+    ) -> Result<Vec<deflated::Batch>> {
+        let mut remaining = max_bytes;
+
+        FetchService { storage }
+            .fetch_partition(
+                max_wait,
+                1,
+                &mut remaining,
+                IsolationLevel::ReadUncommitted,
+                "abc",
+                &FetchPartition::default()
+                    .partition(0)
+                    .fetch_offset(0)
+                    .partition_max_bytes(max_bytes as i32),
+            )
+            .await
+            .map(|partition| {
+                partition
+                    .records
+                    .map(|frame| frame.batches)
+                    .unwrap_or_default()
+            })
+    }
+
+    /// Engines that rebuild batches from rows stop assembling at the
+    /// deadline, but still return the record they were on, so after the
+    /// deadline every storage call yields one record. Once the deadline
+    /// has passed the loop must return what it has rather than issue a
+    /// storage round trip per remaining record until `max_bytes` is spent.
+    #[tokio::test(start_paused = true)]
+    async fn stops_at_the_deadline() -> Result<()> {
+        let max_wait = Duration::from_millis(100);
+
+        // one truncated batch spends the whole budget, then a single record
+        // per call forever
+        let responses = (0..10_000)
+            .map(|offset| batch(offset, &[0]).map(|batch| vec![batch]))
+            .collect::<Result<Vec<_>>>()?;
+
+        let storage = Scripted {
+            responses: Arc::new(Mutex::new(responses)),
+            calls: Arc::new(Mutex::new(vec![])),
+            consume_budget_on_first_call: Some(max_wait),
+        };
+
+        let batches = fetch_partition(storage.clone(), max_wait, 1024 * 1024).await?;
+
+        assert_eq!(1, batches.len());
+        assert_eq!(0, batches[0].base_offset);
+        assert_eq!(
+            vec![(0, max_wait)],
+            storage.calls(),
+            "storage was called again after the deadline"
+        );
+
+        Ok(())
+    }
+
+    /// The next fetch offset follows the last offset in the batch, not its
+    /// record count: compaction leaves gaps, and re-reading from inside a
+    /// batch that has already been returned duplicates records.
+    #[tokio::test(start_paused = true)]
+    async fn next_offset_follows_the_last_offset_in_the_batch() -> Result<()> {
+        let max_wait = Duration::from_millis(100);
+
+        // records at offsets 0 and 3 (1 and 2 compacted away), then nothing
+        let responses = vec![vec![batch(0, &[0, 3])?], vec![]];
+
+        let storage = Scripted {
+            responses: Arc::new(Mutex::new(responses)),
+            calls: Arc::new(Mutex::new(vec![])),
+            consume_budget_on_first_call: None,
+        };
+
+        let batches = fetch_partition(storage.clone(), max_wait, 1024 * 1024).await?;
+
+        assert_eq!(1, batches.len());
+        assert_eq!(
+            vec![0, 4],
+            storage
+                .calls()
+                .into_iter()
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
     }
 }
