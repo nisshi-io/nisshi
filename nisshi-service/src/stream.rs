@@ -588,7 +588,7 @@ mod tests {
     }
 
     fn service() -> TcpBytesService<Echo> {
-        TcpBytesLayer::default().into_layer(Echo)
+        TcpBytesLayer.into_layer(Echo)
     }
 
     fn header(size: i32) -> [u8; 4] {
