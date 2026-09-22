@@ -30,49 +30,41 @@
 
 use std::sync::Arc;
 
+use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
 use bytes::{BufMut, Bytes, BytesMut};
 use nisshi_broker::{
     Error, Result,
     service::{auth, storage},
 };
 use nisshi_sans_io::{
-    ApiKey, Body, CreateTopicsRequest, ErrorCode, Frame, Header, SaslAuthenticateRequest,
-    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
+    ApiKey, Body, BytesInput, CreateTopicsRequest, ErrorCode, Frame, Header,
+    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
     create_topics_request::CreatableTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{Storage, StorageContainer};
-use rama::{Context, Layer as _, Service as _};
+use nisshi_storage::{ArcDynStorage, Storage};
+use rama::{Layer as _, Service as _, extensions::Extensions};
+use rand::{RngExt as _, rng};
 use rsasl::{
     config::SASLConfig,
     prelude::{Mechname, SASLClient, State},
 };
-use url::Url;
+use uuid::Uuid;
 
-type Storages = Arc<Box<dyn Storage>>;
-type Broker = BytesFrameService<FrameRouteService<(), Error>>;
+mod common;
+
+type Broker = BytesFrameService<FrameRouteService<Error>>;
 
 fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
+    storage::services(FrameRouteService::<Error>::builder(), storage)
         .and_then(auth::services)
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|frame_route| {
             (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
         })
-}
-
-async fn memory_storage() -> Result<Storages> {
-    StorageContainer::builder()
-        .cluster_id("tansu")
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092").expect("listener"))
-        .storage(Url::parse("memory://tansu/").expect("storage"))
-        .build()
-        .await
-        .map_err(Into::into)
 }
 
 fn create_topics_frame(correlation_id: i32) -> Result<Bytes> {
@@ -110,24 +102,26 @@ fn is_not_authenticated<T>(result: &Result<T>) -> bool {
     )
 }
 
-#[tokio::test]
-async fn scram_rejects_unverified_client() -> Result<()> {
+async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result<()> {
     // The broker enforces SASL/SCRAM: `sasl_config` is Some(..).
-    let engine = memory_storage().await?;
     let sasl_config = nisshi_auth::configuration(engine.clone())
         .map(Some)
         .map_err(Error::from)?;
     let broker = broker(engine, sasl_config)?;
 
+    let extensions = Extensions::default();
+
     const API_VERSION: i16 = 1;
-    let ctx = Context::default();
     let mut correlation_id = 0;
 
     // Baseline: a gated request before any SASL is rejected.
     assert!(
         is_not_authenticated(
             &broker
-                .serve(ctx.clone(), create_topics_frame(correlation_id)?)
+                .serve(BytesInput {
+                    bytes: create_topics_frame(correlation_id)?,
+                    extensions: extensions.clone()
+                })
                 .await
         ),
         "baseline: an unauthenticated CreateTopics must be rejected",
@@ -136,9 +130,8 @@ async fn scram_rejects_unverified_client() -> Result<()> {
     // 1. Negotiate SCRAM-SHA-256.
     correlation_id += 1;
     let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
+        .serve(BytesInput {
+            bytes: Frame::request(
                 Header::Request {
                     api_key: SaslHandshakeRequest::KEY,
                     api_version: API_VERSION,
@@ -149,7 +142,8 @@ async fn scram_rejects_unverified_client() -> Result<()> {
                     SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
                 ),
             )?,
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
     let handshake = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
         .and_then(|frame| SaslHandshakeResponse::try_from(frame.body))?;
@@ -185,9 +179,8 @@ async fn scram_rejects_unverified_client() -> Result<()> {
         match session.step(input.as_deref(), &mut output) {
             Ok(State::Running) => {
                 let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
+                    .serve(BytesInput {
+                        bytes: Frame::request(
                             Header::Request {
                                 api_key: SaslAuthenticateRequest::KEY,
                                 api_version: API_VERSION,
@@ -199,7 +192,8 @@ async fn scram_rejects_unverified_client() -> Result<()> {
                                     .auth_bytes(Bytes::from(output.into_inner())),
                             ),
                         )?,
-                    )
+                        extensions: extensions.clone(),
+                    })
                     .await;
 
                 match response {
@@ -225,7 +219,10 @@ async fn scram_rejects_unverified_client() -> Result<()> {
     // rejected, because the client never proved a valid identity.
     correlation_id += 1;
     let result = broker
-        .serve(ctx.clone(), create_topics_frame(correlation_id)?)
+        .serve(BytesInput {
+            bytes: create_topics_frame(correlation_id)?,
+            extensions: extensions.clone(),
+        })
         .await;
     assert!(
         is_not_authenticated(&result),
@@ -235,4 +232,108 @@ async fn scram_rejects_unverified_client() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "slatedb")]
+mod slatedb {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
 }

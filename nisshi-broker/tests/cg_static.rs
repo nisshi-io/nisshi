@@ -187,11 +187,11 @@ where
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use std::sync::Arc;
+    use nisshi_storage::ArcDynStorage;
 
     use super::*;
 
-    async fn storage_container(cluster: Uuid, node: i32) -> Result<Arc<Box<dyn Storage>>> {
+    async fn storage_container(cluster: Uuid, node: i32) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Postgres,
             cluster,
@@ -237,11 +237,11 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use std::sync::Arc;
+    use nisshi_storage::ArcDynStorage;
 
     use super::*;
 
-    async fn storage_container(cluster: Uuid, node: i32) -> Result<Arc<Box<dyn Storage>>> {
+    async fn storage_container(cluster: Uuid, node: i32) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::InMemory,
             cluster,

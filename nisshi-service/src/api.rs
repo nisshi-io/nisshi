@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
 use nisshi_sans_io::{
-    ApiKey, ApiVersionsRequest, ApiVersionsResponse, Body, ErrorCode, Frame, Header,
-    RootMessageMeta, api_versions_response::ApiVersion,
+    ApiKey, ApiVersionsRequest, ApiVersionsResponse, Body, BodyInput, ErrorCode, Frame, FrameInput,
+    Header, RequestInput, RootMessageMeta, api_versions_response::ApiVersion,
 };
-use rama::{Context, Service, service::BoxService};
+use rama::{Service, extensions::Extensions, service::BoxService};
 
 use crate::Error;
 
@@ -29,19 +29,17 @@ pub struct ApiVersionsService<E> {
     error: PhantomData<E>,
 }
 
-impl<State, E> Service<State, ApiVersionsRequest> for ApiVersionsService<E>
+impl<E> Service<RequestInput<ApiVersionsRequest>> for ApiVersionsService<E>
 where
-    State: Clone + Send + Sync + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    type Response = ApiVersionsResponse;
+    type Output = ApiVersionsResponse;
     type Error = E;
 
     async fn serve(
         &self,
-        _ctx: Context<State>,
-        _req: ApiVersionsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+        _req: RequestInput<ApiVersionsRequest>,
+    ) -> Result<Self::Output, Self::Error> {
         Ok::<_, E>(
             ApiVersionsResponse::default()
                 .finalized_features(Some([].into()))
@@ -67,31 +65,38 @@ where
     }
 }
 
-impl<State, E> Service<State, Body> for ApiVersionsService<E>
+impl<E> Service<BodyInput> for ApiVersionsService<E>
 where
-    State: Clone + Send + Sync + 'static,
     E: std::error::Error + From<nisshi_sans_io::Error> + Send + Sync + 'static,
 {
-    type Response = Body;
+    type Output = Body;
     type Error = E;
 
-    async fn serve(&self, ctx: Context<State>, req: Body) -> Result<Self::Response, Self::Error> {
-        let req = ApiVersionsRequest::try_from(req)?;
-        self.serve(ctx, req).await.map(Into::into)
+    async fn serve(&self, req: BodyInput) -> Result<Self::Output, Self::Error> {
+        let req = ApiVersionsRequest::try_from(req.body).map(|request| RequestInput {
+            request,
+            extensions: req.extensions,
+        })?;
+        self.serve(req).await.map(Into::into)
     }
 }
 
-impl<State, E> Service<State, Frame> for ApiVersionsService<E>
+impl<E> Service<FrameInput> for ApiVersionsService<E>
 where
-    State: Clone + Send + Sync + 'static,
     E: std::error::Error + From<nisshi_sans_io::Error> + Send + Sync + 'static,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = E;
 
-    async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        self.serve(ctx, req.body).await.map(|body| Frame {
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let correlation_id = req.frame.correlation_id()?;
+
+        self.serve(BodyInput {
+            body: req.frame.body,
+            extensions: req.extensions,
+        })
+        .await
+        .map(|body| Frame {
             size: 0,
             header: Header::Response { correlation_id },
             body,
@@ -113,9 +118,9 @@ where
 /// # use nisshi_service::{Error, FrameRouteService, RequestLayer, ResponseService};
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Error> {
-/// let router = FrameRouteService::<(), Error>::builder()
+/// let router = FrameRouteService::<Error>::builder()
 ///     .with_service(
-///         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
+///         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_| {
 ///             Ok(MetadataResponse::default()
 ///                 .brokers(Some([].into()))
 ///                 .topics(Some([].into()))
@@ -127,7 +132,7 @@ where
 ///     )
 ///     .and_then(|builder| {
 ///         builder.with_service(RequestLayer::<CreateTopicsRequest>::new().into_layer(
-///             ResponseService::new(|_, _| {
+///             ResponseService::new(|_| {
 ///                 Ok(CreateTopicsResponse::default()
 ///                     .throttle_time_ms(Some(0))
 ///                     .topics(Some([].into())))
@@ -139,37 +144,61 @@ where
 /// # }
 /// ```
 #[derive(Clone, Debug, Default)]
-pub struct FrameRouteService<State = (), E = Error> {
-    routes: Arc<BTreeMap<i16, BoxService<State, Frame, Frame, E>>>,
+pub struct FrameRouteService<E = Error> {
+    routes: Arc<BTreeMap<i16, BoxService<FrameInput, Frame, E>>>,
 }
 
-impl<State, E> FrameRouteService<State, E>
+impl<E> FrameRouteService<E>
 where
-    State: Clone + Send + Sync + 'static,
     E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,
 {
-    pub fn new(routes: Arc<BTreeMap<i16, BoxService<State, Frame, Frame, E>>>) -> Self {
+    pub fn new(routes: Arc<BTreeMap<i16, BoxService<FrameInput, Frame, E>>>) -> Self {
         Self { routes }
     }
 
-    pub fn builder() -> FrameRouteBuilder<State, E> {
-        FrameRouteBuilder::<State, E>::new()
+    pub fn builder() -> FrameRouteBuilder<E> {
+        FrameRouteBuilder::<E>::new()
     }
 }
 
-impl<State, E> Service<State, Frame> for FrameRouteService<State, E>
+impl<E> Service<FrameInput> for FrameRouteService<E>
 where
-    State: Clone + Send + Sync + 'static,
     E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = E;
 
-    async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let api_key = req.frame.api_key()?;
+
+        if let Some(service) = self.routes.get(&api_key) {
+            service.serve(req).await
+        } else {
+            Err(E::from(Error::UnknownServiceFrame(Box::new(req.frame))))
+        }
+    }
+}
+
+/// Routes a bare [`Frame`] with no [`Extensions`], for callers on the extensions-free
+/// channel-based path (e.g. [`FrameChannelService`][crate::channel::FrameChannelService]),
+/// where there is no ambient extensions to propagate in the first place.
+impl<E> Service<Frame> for FrameRouteService<E>
+where
+    E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,
+{
+    type Output = Frame;
+    type Error = E;
+
+    async fn serve(&self, req: Frame) -> Result<Self::Output, Self::Error> {
         let api_key = req.api_key()?;
 
         if let Some(service) = self.routes.get(&api_key) {
-            service.serve(ctx, req).await
+            service
+                .serve(FrameInput {
+                    frame: req,
+                    extensions: Extensions::default(),
+                })
+                .await
         } else {
             Err(E::from(Error::UnknownServiceFrame(Box::new(req))))
         }
@@ -178,13 +207,12 @@ where
 
 /// A [`Frame`] route builder providing an [`ApiVersionsResponse`] for all available routes
 #[derive(Debug)]
-pub struct FrameRouteBuilder<State, E> {
-    routes: BTreeMap<i16, BoxService<State, Frame, Frame, E>>,
+pub struct FrameRouteBuilder<E> {
+    routes: BTreeMap<i16, BoxService<FrameInput, Frame, E>>,
 }
 
-impl<State, E> FrameRouteBuilder<State, E>
+impl<E> FrameRouteBuilder<E>
 where
-    State: Clone + Send + Sync + 'static,
     E: std::error::Error + From<nisshi_sans_io::Error> + Send + Sync + 'static,
 {
     fn new() -> Self {
@@ -195,7 +223,7 @@ where
 
     pub fn with_service<S>(self, service: S) -> Result<Self, Error>
     where
-        S: Into<BoxService<State, Frame, Frame, E>> + ApiKey,
+        S: Into<BoxService<FrameInput, Frame, E>> + ApiKey,
     {
         self.with_route(S::KEY, service.into())
     }
@@ -203,14 +231,14 @@ where
     pub fn with_route(
         mut self,
         api_key: i16,
-        service: BoxService<State, Frame, Frame, E>,
+        service: BoxService<FrameInput, Frame, E>,
     ) -> Result<Self, Error> {
         self.routes
             .insert(api_key, service)
             .map_or(Ok(self), |_existing| Err(Error::DuplicateRoute(api_key)))
     }
 
-    pub fn build(self) -> Result<FrameRouteService<State, E>, Error> {
+    pub fn build(self) -> Result<FrameRouteService<E>, Error> {
         let api_key = ApiVersionsRequest::KEY;
         let mut supported = self.routes.keys().copied().collect::<Vec<_>>();
         supported.push(api_key);

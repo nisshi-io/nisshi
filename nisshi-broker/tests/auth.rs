@@ -26,11 +26,11 @@ use nisshi_broker::{
     service::{auth, storage},
 };
 use nisshi_sans_io::{
-    ApiKey, Body, ConfigResource, CreateTopicsRequest, ErrorCode, Frame, Header, IsolationLevel,
-    ListOffset, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
-    SaslHandshakeResponse, ScramMechanism, create_topics_request::CreatableTopic,
-    delete_groups_response::DeletableGroupResult, delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
+    ApiKey, Body, BytesInput, ConfigResource, CreateTopicsRequest, ErrorCode, Frame, Header,
+    IsolationLevel, ListOffset, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    SaslHandshakeRequest, SaslHandshakeResponse, ScramMechanism,
+    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
@@ -46,7 +46,7 @@ use nisshi_storage::{
     Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     UpdateError, Version,
 };
-use rama::{Context, Layer as _, Service as _};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use rsasl::{
     config::SASLConfig,
     prelude::{Mechname, SASLClient, SessionError, State},
@@ -57,13 +57,13 @@ use uuid::Uuid;
 
 pub mod common;
 
-type Broker = BytesFrameService<FrameRouteService<(), Error>>;
+type Broker = BytesFrameService<FrameRouteService<Error>>;
 
 fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
+    storage::services(FrameRouteService::<Error>::builder(), storage)
         .and_then(auth::services)
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|frame_route| {
@@ -107,12 +107,11 @@ async fn auth_handshake_scram_256_v1() -> Result<()> {
     const API_VERSION: i16 = 1;
     let mut correlation_id = 0;
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
+        .serve(BytesInput {
+            bytes: Frame::request(
                 Header::Request {
                     api_key: SaslHandshakeRequest::KEY,
                     api_version: API_VERSION,
@@ -123,7 +122,8 @@ async fn auth_handshake_scram_256_v1() -> Result<()> {
                     SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
                 ),
             )?,
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
@@ -156,9 +156,8 @@ async fn auth_handshake_scram_256_v1() -> Result<()> {
         match session.step(input.as_deref(), &mut output).unwrap() {
             State::Running => {
                 let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
+                    .serve(BytesInput {
+                        bytes: Frame::request(
                             Header::Request {
                                 api_key: SaslAuthenticateRequest::KEY,
                                 api_version: API_VERSION,
@@ -170,7 +169,8 @@ async fn auth_handshake_scram_256_v1() -> Result<()> {
                                     .auth_bytes(Bytes::from(output.into_inner())),
                             ),
                         )?,
-                    )
+                        extensions: extensions.clone(),
+                    })
                     .await?;
 
                 let response = Frame::response_from_bytes(
@@ -235,16 +235,16 @@ async fn auth_handshake_scram_256_v1_reauth() -> Result<()> {
         .and_then(|sasl_config| broker(engine, sasl_config))?;
 
     const API_VERSION: i16 = 1;
-    let ctx = Context::default();
     let mut correlation_id = 0;
+
+    let extensions = Extensions::default();
 
     // Run a full handshake + authenticate twice on the same broker
     // (i.e. same `Authentication` shared via the BytesFrameLayer).
     for round in 0..2 {
         let response = broker
-            .serve(
-                ctx.clone(),
-                Frame::request(
+            .serve(BytesInput {
+                bytes: Frame::request(
                     Header::Request {
                         api_key: SaslHandshakeRequest::KEY,
                         api_version: API_VERSION,
@@ -255,7 +255,8 @@ async fn auth_handshake_scram_256_v1_reauth() -> Result<()> {
                         SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
                     ),
                 )?,
-            )
+                extensions: extensions.clone(),
+            })
             .await?;
 
         let response =
@@ -293,9 +294,8 @@ async fn auth_handshake_scram_256_v1_reauth() -> Result<()> {
             match session.step(input.as_deref(), &mut output).unwrap() {
                 State::Running => {
                     let response = broker
-                        .serve(
-                            ctx.clone(),
-                            Frame::request(
+                        .serve(BytesInput {
+                            bytes: Frame::request(
                                 Header::Request {
                                     api_key: SaslAuthenticateRequest::KEY,
                                     api_version: API_VERSION,
@@ -307,7 +307,8 @@ async fn auth_handshake_scram_256_v1_reauth() -> Result<()> {
                                         .auth_bytes(Bytes::from(output.into_inner())),
                                 ),
                             )?,
-                        )
+                            extensions: extensions.clone(),
+                        })
                         .await?;
 
                     let response = Frame::response_from_bytes(
@@ -369,12 +370,11 @@ async fn auth_handshake_scram_512_v1() -> Result<()> {
     const API_VERSION: i16 = 1;
     let mut correlation_id = 0;
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
+        .serve(BytesInput {
+            bytes: Frame::request(
                 Header::Request {
                     api_key: SaslHandshakeRequest::KEY,
                     api_version: API_VERSION,
@@ -385,7 +385,8 @@ async fn auth_handshake_scram_512_v1() -> Result<()> {
                     SaslHandshakeRequest::default().mechanism("SCRAM-SHA-512".into()),
                 ),
             )?,
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
@@ -418,9 +419,8 @@ async fn auth_handshake_scram_512_v1() -> Result<()> {
         match session.step(input.as_deref(), &mut output).unwrap() {
             State::Running => {
                 let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
+                    .serve(BytesInput {
+                        bytes: Frame::request(
                             Header::Request {
                                 api_key: SaslAuthenticateRequest::KEY,
                                 api_version: API_VERSION,
@@ -432,7 +432,8 @@ async fn auth_handshake_scram_512_v1() -> Result<()> {
                                     .auth_bytes(Bytes::from(output.into_inner())),
                             ),
                         )?,
-                    )
+                        extensions: extensions.clone(),
+                    })
                     .await?;
 
                 let response = Frame::response_from_bytes(
@@ -496,12 +497,11 @@ async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
     const API_VERSION: i16 = 1;
     let mut correlation_id = 0;
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
+        .serve(BytesInput {
+            bytes: Frame::request(
                 Header::Request {
                     api_key: SaslHandshakeRequest::KEY,
                     api_version: API_VERSION,
@@ -512,7 +512,8 @@ async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
                     SaslHandshakeRequest::default().mechanism("SCRAM-SHA-512".into()),
                 ),
             )?,
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
@@ -549,9 +550,8 @@ async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
         {
             Ok(State::Running) => {
                 let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
+                    .serve(BytesInput {
+                        bytes: Frame::request(
                             Header::Request {
                                 api_key: SaslAuthenticateRequest::KEY,
                                 api_version: API_VERSION,
@@ -563,7 +563,8 @@ async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
                                     .auth_bytes(Bytes::from(output.into_inner())),
                             ),
                         )?,
-                    )
+                        extensions: extensions.clone(),
+                    })
                     .await?;
 
                 let response = Frame::response_from_bytes(
@@ -606,13 +607,12 @@ async fn not_authenticated() -> Result<()> {
     const CLIENT_ID: &str = "client";
     const API_VERSION: i16 = 7;
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     assert!(matches!(
         broker
-            .serve(
-                ctx.clone(),
-                Frame::request(
+            .serve(BytesInput {
+                bytes: Frame::request(
                     Header::Request {
                         api_key: CreateTopicsRequest::KEY,
                         api_version: API_VERSION,
@@ -634,7 +634,8 @@ async fn not_authenticated() -> Result<()> {
                             )),
                     ),
                 )?,
-            )
+                extensions
+            })
             .await,
         Err(Error::KafkaProtocol(
             nisshi_sans_io::Error::NotAuthenticated
@@ -679,12 +680,11 @@ async fn auth_handshake_scram_256_v0() -> Result<()> {
 
     const API_VERSION: i16 = 0;
 
-    let ctx = Context::default();
+    let extensions = Extensions::default();
 
     let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
+        .serve(BytesInput {
+            bytes: Frame::request(
                 Header::Request {
                     api_key: SaslHandshakeRequest::KEY,
                     api_version: API_VERSION,
@@ -695,7 +695,8 @@ async fn auth_handshake_scram_256_v0() -> Result<()> {
                     SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
                 ),
             )?,
-        )
+            extensions: extensions.clone(),
+        })
         .await?;
 
     let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
@@ -740,7 +741,12 @@ async fn auth_handshake_scram_256_v0() -> Result<()> {
                     Bytes::from(frame)
                 })?;
 
-                let response = broker.serve(ctx.clone(), frame).await?;
+                let response = broker
+                    .serve(BytesInput {
+                        bytes: frame,
+                        extensions: extensions.clone(),
+                    })
+                    .await?;
 
                 input = Some(response.slice(4..));
             }

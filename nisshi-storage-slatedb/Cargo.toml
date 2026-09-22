@@ -1,0 +1,28 @@
+[package]
+name = "nisshi-storage-slatedb"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+authors.workspace = true
+include.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-schema.workspace = true
+nisshi-storage = {workspace = true, features = ["slatedb"]}
+postcard.workspace = true
+regex.workspace = true
+serde.workspace = true
+slatedb.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

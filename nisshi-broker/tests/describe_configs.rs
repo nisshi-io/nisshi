@@ -16,14 +16,14 @@ use common::{alphanumeric_string, register_broker};
 use nisshi_broker::Result;
 use nisshi_sans_io::{
     ConfigResource, ConfigSource, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode,
-    IncrementalAlterConfigsRequest, OpType,
+    IncrementalAlterConfigsRequest, OpType, RequestInput,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     describe_configs_request::DescribeConfigsResource,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
 };
 use nisshi_storage::{DescribeConfigsService, IncrementalAlterConfigsService, Storage};
-use rama::{Context, Service};
+use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
 use uuid::Uuid;
@@ -72,17 +72,17 @@ where
     let include_synonyms = Some(false);
     let include_documentation = Some(false);
 
-    let ctx = Context::with_state(sc);
-
-    let results = DescribeConfigsService
-        .serve(
-            ctx,
-            DescribeConfigsRequest::default()
-                .include_documentation(include_documentation)
-                .include_synonyms(include_synonyms)
-                .resources(Some(resources.into())),
-        )
-        .await?;
+    let results = DescribeConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: DescribeConfigsRequest::default()
+            .include_documentation(include_documentation)
+            .include_synonyms(include_synonyms)
+            .resources(Some(resources.into())),
+        extensions: Extensions::default(),
+    })
+    .await?;
 
     assert_eq!(
         results,
@@ -152,17 +152,19 @@ where
     let include_synonyms = Some(false);
     let include_documentation = Some(false);
 
-    let ctx = Context::with_state(sc);
+    let extensions = Extensions::default();
 
-    let results = DescribeConfigsService
-        .serve(
-            ctx.clone(),
-            DescribeConfigsRequest::default()
-                .include_documentation(include_documentation)
-                .include_synonyms(include_synonyms)
-                .resources(Some(resources.clone().into())),
-        )
-        .await?;
+    let results = DescribeConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: DescribeConfigsRequest::default()
+            .include_documentation(include_documentation)
+            .include_synonyms(include_synonyms)
+            .resources(Some(resources.clone().into())),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     let none = ErrorCode::None;
 
@@ -178,23 +180,25 @@ where
         ]))
     );
 
-    let response = IncrementalAlterConfigsService
-        .serve(
-            ctx.clone(),
-            IncrementalAlterConfigsRequest::default().resources(Some(
-                [AlterConfigsResource::default()
-                    .resource_type(ConfigResource::Topic.into())
-                    .resource_name(topic_name.clone())
-                    .configs(Some(vec![
-                        AlterableConfig::default()
-                            .name(cleanup_policy.into())
-                            .config_operation(OpType::Set.into())
-                            .value(Some(compact.into())),
-                    ]))]
-                .into(),
-            )),
-        )
-        .await?;
+    let response = IncrementalAlterConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: IncrementalAlterConfigsRequest::default().resources(Some(
+            [AlterConfigsResource::default()
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name(topic_name.clone())
+                .configs(Some(vec![
+                    AlterableConfig::default()
+                        .name(cleanup_policy.into())
+                        .config_operation(OpType::Set.into())
+                        .value(Some(compact.into())),
+                ]))]
+            .into(),
+        )),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     let responses = response.responses.unwrap_or_default();
     assert_eq!(1, responses.len());
@@ -202,15 +206,17 @@ where
     assert_eq!(i8::from(ConfigResource::Topic), responses[0].resource_type);
     assert_eq!(topic_name, responses[0].resource_name);
 
-    let results = DescribeConfigsService
-        .serve(
-            ctx.clone(),
-            DescribeConfigsRequest::default()
-                .include_documentation(include_documentation)
-                .include_synonyms(include_synonyms)
-                .resources(Some(resources.clone().into())),
-        )
-        .await?;
+    let results = DescribeConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: DescribeConfigsRequest::default()
+            .include_documentation(include_documentation)
+            .include_synonyms(include_synonyms)
+            .resources(Some(resources.clone().into())),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     assert_eq!(
         results,
@@ -236,23 +242,25 @@ where
         ],))
     );
 
-    let response = IncrementalAlterConfigsService
-        .serve(
-            ctx.clone(),
-            IncrementalAlterConfigsRequest::default().resources(Some(
-                [AlterConfigsResource::default()
-                    .resource_type(ConfigResource::Topic.into())
-                    .resource_name(topic_name.clone())
-                    .configs(Some(vec![
-                        AlterableConfig::default()
-                            .name(cleanup_policy.into())
-                            .config_operation(OpType::Set.into())
-                            .value(Some(delete.into())),
-                    ]))]
-                .into(),
-            )),
-        )
-        .await?;
+    let response = IncrementalAlterConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: IncrementalAlterConfigsRequest::default().resources(Some(
+            [AlterConfigsResource::default()
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name(topic_name.clone())
+                .configs(Some(vec![
+                    AlterableConfig::default()
+                        .name(cleanup_policy.into())
+                        .config_operation(OpType::Set.into())
+                        .value(Some(delete.into())),
+                ]))]
+            .into(),
+        )),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     let responses = response.responses.unwrap_or_default();
     assert_eq!(1, responses.len());
@@ -260,15 +268,17 @@ where
     assert_eq!(i8::from(ConfigResource::Topic), responses[0].resource_type);
     assert_eq!(topic_name, responses[0].resource_name);
 
-    let results = DescribeConfigsService
-        .serve(
-            ctx.clone(),
-            DescribeConfigsRequest::default()
-                .include_documentation(include_documentation)
-                .include_synonyms(include_synonyms)
-                .resources(Some(resources.clone().into())),
-        )
-        .await?;
+    let results = DescribeConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: DescribeConfigsRequest::default()
+            .include_documentation(include_documentation)
+            .include_synonyms(include_synonyms)
+            .resources(Some(resources.clone().into())),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     assert_eq!(
         results,
@@ -294,23 +304,25 @@ where
         ],))
     );
 
-    let response = IncrementalAlterConfigsService
-        .serve(
-            ctx.clone(),
-            IncrementalAlterConfigsRequest::default().resources(Some(
-                [AlterConfigsResource::default()
-                    .resource_type(ConfigResource::Topic.into())
-                    .resource_name(topic_name.clone())
-                    .configs(Some(vec![
-                        AlterableConfig::default()
-                            .name(cleanup_policy.into())
-                            .config_operation(OpType::Delete.into())
-                            .value(None),
-                    ]))]
-                .into(),
-            )),
-        )
-        .await?;
+    let response = IncrementalAlterConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: IncrementalAlterConfigsRequest::default().resources(Some(
+            [AlterConfigsResource::default()
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name(topic_name.clone())
+                .configs(Some(vec![
+                    AlterableConfig::default()
+                        .name(cleanup_policy.into())
+                        .config_operation(OpType::Delete.into())
+                        .value(None),
+                ]))]
+            .into(),
+        )),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     let responses = response.responses.unwrap_or_default();
     assert_eq!(1, responses.len());
@@ -318,15 +330,17 @@ where
     assert_eq!(i8::from(ConfigResource::Topic), responses[0].resource_type);
     assert_eq!(topic_name, responses[0].resource_name);
 
-    let results = DescribeConfigsService
-        .serve(
-            ctx,
-            DescribeConfigsRequest::default()
-                .include_documentation(include_documentation)
-                .include_synonyms(include_synonyms)
-                .resources(Some(resources.into())),
-        )
-        .await?;
+    let results = DescribeConfigsService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: DescribeConfigsRequest::default()
+            .include_documentation(include_documentation)
+            .include_synonyms(include_synonyms)
+            .resources(Some(resources.into())),
+        extensions: extensions.clone(),
+    })
+    .await?;
 
     assert_eq!(
         results,
@@ -346,9 +360,8 @@ where
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use url::Url;
 
     use super::*;
@@ -356,7 +369,7 @@ mod pg {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Postgres,
             cluster,
@@ -400,9 +413,8 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use url::Url;
 
     use super::*;
@@ -410,7 +422,7 @@ mod in_memory {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::InMemory,
             cluster,
@@ -454,9 +466,8 @@ mod in_memory {
 
 #[cfg(feature = "libsql")]
 mod lite {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use url::Url;
 
     use super::*;
@@ -464,7 +475,7 @@ mod lite {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Lite,
             cluster,
@@ -508,9 +519,8 @@ mod lite {
 
 #[cfg(feature = "slatedb")]
 mod slatedb {
-    use std::sync::Arc;
-
     use common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
     use url::Url;
 
     use super::*;
@@ -518,7 +528,7 @@ mod slatedb {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::SlateDb,
             cluster,

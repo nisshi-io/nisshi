@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -86,22 +86,13 @@ pub enum Error {
     Json(Arc<serde_json::Error>),
     KafkaProtocol(#[from] nisshi_sans_io::Error),
 
-    #[cfg(feature = "libsql")]
-    LibSql(Arc<libsql::Error>),
-
     Message(String),
     Model(#[from] nisshi_model::Error),
-
-    #[cfg(feature = "dynostore")]
-    ObjectStore(Arc<object_store::Error>),
 
     ParseFilter(Arc<ParseError>),
     ParseInt(#[from] std::num::ParseIntError),
     Pattern(Arc<PatternError>),
     Poison,
-
-    #[cfg(feature = "postgres")]
-    Pool(Arc<deadpool_postgres::PoolError>),
 
     Regex(#[from] regex::Error),
 
@@ -111,12 +102,7 @@ pub enum Error {
     StringUtf8(#[from] FromUtf8Error),
     SystemTime(#[from] SystemTimeError),
 
-    #[cfg(feature = "postgres")]
-    TokioPostgres(Arc<tokio_postgres::error::Error>),
     TryFromInt(#[from] TryFromIntError),
-
-    #[cfg(feature = "turso")]
-    Turso(Arc<turso::Error>),
 
     UnsupportedApiService(i16),
     UnsupportedStorageUrl(Url),
@@ -126,34 +112,6 @@ pub enum Error {
     Uuid(#[from] uuid::Error),
     SchemaValidation,
     Send(Arc<SendError<CancelKind>>),
-}
-
-#[cfg(feature = "libsql")]
-impl From<libsql::Error> for Error {
-    fn from(value: libsql::Error) -> Self {
-        Self::from(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "libsql")]
-impl From<Arc<libsql::Error>> for Error {
-    fn from(value: Arc<libsql::Error>) -> Self {
-        Self::LibSql(value)
-    }
-}
-
-#[cfg(feature = "turso")]
-impl From<turso::Error> for Error {
-    fn from(value: turso::Error) -> Self {
-        Self::from(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "turso")]
-impl From<Arc<turso::Error>> for Error {
-    fn from(value: Arc<turso::Error>) -> Self {
-        Self::Turso(value)
-    }
 }
 
 impl From<PatternError> for Error {
@@ -171,20 +129,6 @@ impl From<ExporterBuildError> for Error {
 impl From<SendError<CancelKind>> for Error {
     fn from(value: SendError<CancelKind>) -> Self {
         Self::Send(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl From<tokio_postgres::error::Error> for Error {
-    fn from(value: tokio_postgres::error::Error) -> Self {
-        Self::from(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl From<Arc<tokio_postgres::error::Error>> for Error {
-    fn from(value: Arc<tokio_postgres::error::Error>) -> Self {
-        Self::TokioPostgres(value)
     }
 }
 
@@ -212,37 +156,9 @@ impl From<Arc<serde_json::Error>> for Error {
     }
 }
 
-#[cfg(feature = "dynostore")]
-impl From<object_store::Error> for Error {
-    fn from(value: object_store::Error) -> Self {
-        Self::from(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "dynostore")]
-impl From<Arc<object_store::Error>> for Error {
-    fn from(value: Arc<object_store::Error>) -> Self {
-        Self::ObjectStore(value)
-    }
-}
-
 impl From<ParseError> for Error {
     fn from(value: ParseError) -> Self {
         Self::ParseFilter(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl From<deadpool_postgres::PoolError> for Error {
-    fn from(value: deadpool_postgres::PoolError) -> Self {
-        Self::from(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl From<Arc<deadpool_postgres::PoolError>> for Error {
-    fn from(value: Arc<deadpool_postgres::PoolError>) -> Self {
-        Self::Pool(value)
     }
 }
 

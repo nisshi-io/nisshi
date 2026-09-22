@@ -3146,7 +3146,7 @@ mod tests {
         },
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
-    use nisshi_storage::StorageContainer;
+    use nisshi_storage::{ArcDynStorage, StorageContainer};
     use pretty_assertions::assert_eq;
     use tracing::subscriber::DefaultGuard;
     use url::Url;
@@ -3184,6 +3184,51 @@ mod tests {
         ))
     }
 
+    async fn storage(cluster: &str, node: i32) -> Result<ArcDynStorage> {
+        let builder = {
+            let mut builder = StorageContainer::builder();
+
+            builder.with_factory(Arc::new(nisshi_storage_null::EngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(nisshi_storage_dynostore::MemoryEngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::S3OptimisticConcurrencyEngineFactory,
+            ));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::GoogleCloudStorageEngineFactory,
+            ));
+
+            #[cfg(feature = "libsql")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LiteEngineFactory));
+
+            #[cfg(feature = "postgres")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::PostgresEngineFactory));
+
+            #[cfg(feature = "slatedb")]
+            builder.with_factory(Arc::new(nisshi_storage_slatedb::EngineFactory));
+
+            #[cfg(feature = "turso")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LimboEngineFactory));
+
+            builder
+        };
+
+        builder
+            .cluster_id(cluster)
+            .node_id(node)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .schema_registry(None)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await
+            .map_err(Into::into)
+    }
+
     #[ignore]
     #[tokio::test]
     async fn lifecycle() -> Result<()> {
@@ -3201,14 +3246,7 @@ mod tests {
         const GROUP_ID: &str = "test-consumer-group";
         const TOPIC: &str = "test";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Controller::with_storage(storage)?;
 
@@ -3851,14 +3889,7 @@ mod tests {
         const CLIENT_ID: &str = "console-consumer";
         const GROUP_ID: &str = "test-consumer-group";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Controller::with_storage(storage)?;
 
@@ -4152,14 +4183,7 @@ mod tests {
 
         const PROTOCOL_TYPE: &str = "consumer";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Wrapper::with_storage_group_detail(
             storage,
@@ -4251,14 +4275,7 @@ mod tests {
 
         const PROTOCOL_TYPE: &str = "consumer";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Wrapper::with_storage_group_detail(
             storage,
@@ -4374,14 +4391,7 @@ mod tests {
 
         const PROTOCOL_TYPE: &str = "consumer";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Wrapper::with_storage_group_detail(
             storage,
