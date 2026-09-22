@@ -42,11 +42,7 @@ EOF
 
 FROM scratch AS out
 
-# create empty directories
-WORKDIR /schema
-WORKDIR /data
-WORKDIR /tmp
-WORKDIR /
+RUN --mount=from=busybox:musl,src=/bin/,dst=/bin/ /bin/mkdir /schema /data /tmp
 
 COPY --from=builder --parents /etc/ssl /
 COPY --from=builder /usr/src/LICENSE /usr/bin/nisshi /
