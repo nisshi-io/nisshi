@@ -13,13 +13,18 @@
 // limitations under the License.
 
 use std::{
+    env,
     fmt::{self, Display, Formatter},
     sync::Arc,
 };
 
-use opentelemetry::{KeyValue, Value, global};
+use opentelemetry::{Key, KeyValue, Value, global};
 use opentelemetry_otlp::{ExporterBuildError, Protocol, WithExportConfig as _};
-use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+use opentelemetry_sdk::{
+    Resource,
+    metrics::SdkMeterProvider,
+    resource::{EnvResourceDetector, ResourceDetector as _},
+};
 use opentelemetry_semantic_conventions::resource::SERVICE_NAME;
 use tracing::debug;
 use url::{ParseError, Url};
@@ -44,6 +49,8 @@ impl Display for Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
+
 /// Resource attached to exported metrics.
 ///
 /// Attributes come from `OTEL_RESOURCE_ATTRIBUTES` (via the SDK's
@@ -51,15 +58,36 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// `service.name` in `OTEL_RESOURCE_ATTRIBUTES`, then `fallback_service_name`.
 /// Unset or empty values fall through to the next source.
 pub fn resource(fallback_service_name: impl Into<Value>) -> Resource {
+    let from_env = EnvResourceDetector::new().detect();
+
+    let service_name = env::var(OTEL_SERVICE_NAME)
+        .ok()
+        .filter(|name| !name.is_empty())
+        .map(Value::from)
+        .or_else(|| {
+            from_env
+                .get(&Key::new(SERVICE_NAME))
+                .filter(|name| !name.as_str().is_empty())
+        })
+        .unwrap_or_else(|| fallback_service_name.into());
+
     Resource::builder_empty()
-        .with_service_name(fallback_service_name)
+        .with_attributes(
+            from_env
+                .iter()
+                .map(|(key, value)| KeyValue::new(key.clone(), value.clone())),
+        )
+        .with_service_name(service_name)
         .build()
 }
 
 pub fn meter_provider(
     otlp_endpoint_url: Url,
-    service_name: impl Into<String>,
+    fallback_service_name: impl Into<Value>,
 ) -> Result<SdkMeterProvider> {
+    let resource = resource(fallback_service_name);
+    debug!(?resource);
+
     otlp_endpoint_url
         .join("v1/metrics")
         .inspect(|endpoint| debug!(%endpoint))
@@ -75,11 +103,7 @@ pub fn meter_provider(
         .map(|exporter| {
             let meter_provider = SdkMeterProvider::builder()
                 .with_periodic_exporter(exporter)
-                .with_resource(
-                    Resource::builder_empty()
-                        .with_attributes([KeyValue::new(SERVICE_NAME, service_name.into())])
-                        .build(),
-                )
+                .with_resource(resource)
                 .build();
 
             global::set_meter_provider(meter_provider.clone());
@@ -95,7 +119,6 @@ mod tests {
 
     use super::*;
 
-    const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
     const OTEL_RESOURCE_ATTRIBUTES: &str = "OTEL_RESOURCE_ATTRIBUTES";
     const FALLBACK: &str = "fallback-svc";
 
