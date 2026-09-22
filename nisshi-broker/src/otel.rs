@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ::tracing::debug;
-use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{Protocol, WithExportConfig as _};
-use opentelemetry_sdk::Resource;
 use url::Url;
 
 use crate::{Result, TracingFormat};
@@ -33,26 +29,7 @@ pub fn init(tracing_format: TracingFormat) -> Result<Guard> {
 }
 
 pub fn metric_exporter(endpoint: Url) -> Result<()> {
-    let endpoint = endpoint
-        .join("v1/metrics")
-        .inspect(|endpoint| debug!(%endpoint))?;
-
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(endpoint.to_string())
-        .build()?;
-
-    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_periodic_exporter(exporter)
-        .with_resource(
-            Resource::builder_empty()
-                .with_attributes([KeyValue::new("service.name", env!("CARGO_PKG_NAME"))])
-                .build(),
-        )
-        .build();
-
-    global::set_meter_provider(meter_provider);
-
-    Ok(())
+    nisshi_otel::meter_provider(endpoint, env!("CARGO_PKG_NAME"))
+        .map(|_meter_provider| ())
+        .map_err(Into::into)
 }

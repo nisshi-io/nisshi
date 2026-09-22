@@ -5896,6 +5896,7 @@ dependencies = [
  "jsonschema",
  "nisshi-auth",
  "nisshi-model",
+ "nisshi-otel",
  "nisshi-sans-io",
  "nisshi-schema",
  "nisshi-service",

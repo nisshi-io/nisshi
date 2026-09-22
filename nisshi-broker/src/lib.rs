@@ -89,6 +89,8 @@ pub enum Error {
     Message(String),
     Model(#[from] nisshi_model::Error),
 
+    Otel(#[from] nisshi_otel::Error),
+
     ParseFilter(Arc<ParseError>),
     ParseInt(#[from] std::num::ParseIntError),
     Pattern(Arc<PatternError>),

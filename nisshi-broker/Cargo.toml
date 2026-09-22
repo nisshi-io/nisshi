@@ -36,6 +36,7 @@ indicatif.workspace = true
 jsonschema.workspace = true
 nisshi-auth.workspace = true
 nisshi-model.workspace = true
+nisshi-otel.workspace = true
 nisshi-sans-io.workspace = true
 nisshi-schema.workspace = true
 nisshi-service.workspace = true
