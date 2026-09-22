@@ -1,0 +1,50 @@
+---
+# CodeQL "advanced setup". Replaces the repository-settings "default setup",
+# which never scans pull requests opened from forks. This workflow reproduces
+# the default setup's coverage exactly: the `rust` and `actions` languages,
+# both in build-mode `none`.
+#
+# A green `Analyze` job means the scan uploaded, not that it found nothing.
+# Findings appear in the Security tab and on the `github-advanced-security`
+# pull request check.
+name: CodeQL
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  schedule:
+    # Weekly, Monday 06:23 UTC. Off the hour to avoid the top-of-hour rush.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - rust
+          - actions
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
