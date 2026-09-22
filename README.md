@@ -150,6 +150,24 @@ and `proxy` subcommands connect in plaintext and cannot yet talk to a TLS
 listener. `--key-passphrase-file` is unknown to earlier releases, so rolling
 the binary back means removing that flag from the command line as well.
 
+### Metrics
+
+Metrics are exported over OTLP/HTTP when `--otlp-endpoint-url` (or
+`OTEL_EXPORTER_OTLP_ENDPOINT`) is set; `v1/metrics` is appended to the URL.
+The exported resource honours the standard OpenTelemetry environment
+variables: every `key=value` pair in `OTEL_RESOURCE_ATTRIBUTES` is attached,
+and `service.name` is resolved as `OTEL_SERVICE_NAME`, then `service.name` in
+`OTEL_RESOURCE_ATTRIBUTES`, then the default for the subcommand
+(`nisshi-broker`, or `nisshi-proxy` / `nisshi-generator` for `proxy` and
+`generator`). Unset or empty values fall through to the next source.
+
+```shell
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318/ \
+OTEL_SERVICE_NAME=kafka-broker \
+OTEL_RESOURCE_ATTRIBUTES=service.version=0.7.0,deployment.environment.name=staging \
+nisshi broker
+```
+
 ## topic
 
 The `nisshi topic` command has the following subcommands:
