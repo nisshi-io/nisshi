@@ -1,0 +1,68 @@
+# cargo-deny configuration: RustSec advisories, license compatibility, banned
+# crates, and trusted sources for the full dependency graph.
+# Run locally with: cargo deny --all-features check --allow unmaintained
+# https://embarkstudios.github.io/cargo-deny/
+
+# Matches the `--all-features` flag CI passes, so a local `cargo deny check`
+# with no flags sees the same dependency graph as CI.
+[graph]
+all-features = true
+no-default-features = false
+
+[advisories]
+# Pre-existing debt found when this gate was introduced (2026-09-17), not
+# caused by any single PR. Tracked for follow-up; remove each entry once the
+# fix lands. New advisories are NOT covered by this list and will fail CI.
+# `unmaintained` findings are downgraded to non-blocking separately, via
+# `--warn unmaintained` on the command line (see .github/workflows/
+# dependencies.yml) - being unmaintained isn't the same as being vulnerable,
+# and they stay visible in the job log rather than being silenced outright.
+ignore = [
+    { id = "RUSTSEC-2026-0118", reason = "hickory-resolver NSEC3 unbounded loop; pulled in transitively via rama-dns, fix needs hickory-proto 0.26.x" },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto O(n^2) name compression; pulled in transitively via rama-dns, fix needs hickory-proto 0.26.x" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic start-tag check; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
+]
+# RUSTSEC-2026-0258 (h2) and RUSTSEC-2026-0285 (rustls) were on this list too,
+# but both had semver-compatible fixed versions available (h2 0.4.15->0.4.19,
+# rustls 0.23.43->0.23.45) - `cargo update -p h2 -p rustls` on 2026-09-17
+# resolved them instead of waiving them.
+
+[licenses]
+# Every license actually present in the dependency graph today. All are
+# permissive except MPL-2.0 (weak copyleft: file-level, no linking
+# obligation - fine for consuming unmodified crates as we do). Adding a
+# stronger copyleft license here should be a deliberate, reviewed decision,
+# not an incidental side effect of a dependency bump.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "MPL-2.0",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+    "MIT-0",
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Denies actual banned/untrusted crates (none listed today); duplicate
+# versions stay a warning, not a hard fail - the datafusion/iceberg/delta/
+# aws-sdk graph legitimately carries multiple versions of common crates
+# (syn, itertools, hashbrown, etc.) and denying that outright would fail
+# CI on version skew that has nothing to do with the PR being reviewed.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
