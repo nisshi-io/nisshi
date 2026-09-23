@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
     functions::core::expr_ext::FieldAccessor as _,
-    prelude::{Expr, SessionContext, cast, col},
+    prelude::{Expr, SessionContext, cast, ident},
 };
 use deltalake::{
     DeltaTable, DeltaTableBuilder, aws,
@@ -264,7 +264,7 @@ impl Config {
                         validate_generated_column_name(suffix)
                             .and_then(|()| parse_generated_expr(value))
                             .map(|generated| (suffix.to_owned(), generated))
-                            .inspect_err(|err| warn!(?err, name = suffix, %value))
+                            .inspect_err(|err| warn!(?err, name = suffix, ?value))
                             .ok()
                     })
             })
@@ -428,11 +428,19 @@ impl Delta {
             let mut result_batches = Vec::new();
 
             for batch in batches {
+                // Use `ident` (an exact, unqualified column reference)
+                // rather than `col`, which parses its argument as a
+                // qualified SQL name: it would split a field name
+                // containing a literal `.` (e.g. produced by
+                // `tansu.lake.normalize` with the default separator)
+                // into a spurious table-qualified reference, and it
+                // lower-cases unquoted names, silently corrupting any
+                // mixed-case field name.
                 let mut exprs: Vec<Expr> = batch
                     .schema()
                     .fields()
                     .iter()
-                    .map(|field| col(field.name().as_str()))
+                    .map(|field| ident(field.name().as_str()))
                     .collect();
 
                 for (column_name, generated) in &generated_entries {
@@ -440,7 +448,7 @@ impl Delta {
                         Error::Message(String::from("empty generated column path"))
                     })?;
 
-                    let source = rest.iter().fold(col(first.as_str()), |expr, segment| {
+                    let source = rest.iter().fold(ident(first.as_str()), |expr, segment| {
                         expr.field(segment.as_str())
                     });
 
