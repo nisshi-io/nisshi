@@ -411,7 +411,8 @@ jobs:
       - name: Verify Dockerfile builder matches rust-toolchain.toml
         run: |
           toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
-          dockerfile=$(sed -n 's/^FROM --platform=\$BUILDPLATFORM rust:\(.*\)-alpine AS chef$/\1/p' Dockerfile)
+          # shellcheck disable=SC2016 # $BUILDPLATFORM here is a literal in the sed pattern, not a shell expansion
+          dockerfile=$(sed -n 's/^FROM --platform=$BUILDPLATFORM rust:\(.*\)-alpine AS chef$/\1/p' Dockerfile)
           echo "rust-toolchain.toml channel: $toolchain"
           echo "Dockerfile chef stage:       $dockerfile"
           [ "$toolchain" = "$dockerfile" ] || { echo "::error::rust-toolchain.toml ($toolchain) and Dockerfile's chef stage ($dockerfile) disagree"; exit 1; }
