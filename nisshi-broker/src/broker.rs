@@ -363,7 +363,11 @@ where
                                 Err(Error::Io(ref io))
                                     if io.kind() == ErrorKind::UnexpectedEof
                                         || io.kind() == ErrorKind::BrokenPipe
-                                        || io.kind() == ErrorKind::ConnectionReset => {}
+                                        || io.kind() == ErrorKind::ConnectionReset
+                                        // A quiet connection closed by its idle timeout is
+                                        // routine (e.g. a consumer polling infrequently),
+                                        // not an anomaly worth an `error!` on every occurrence.
+                                        || io.kind() == ErrorKind::TimedOut => {}
 
                                 Err(error) => {
                                     error!(?error);
