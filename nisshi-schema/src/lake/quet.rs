@@ -161,7 +161,9 @@ impl TryFrom<Builder<Url, Registry>> for Parquet {
                     .map_err(Into::into)
             }
 
-            _unsupported => Err(Error::UnsupportedLakeHouseUrl(value.location.to_owned())),
+            _unsupported => Err(Error::UnsupportedLakeHouseUrl(crate::redact_url(
+                &value.location,
+            ))),
         }
     }
 }

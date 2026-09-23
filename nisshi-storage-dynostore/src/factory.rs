@@ -15,6 +15,7 @@
 use std::{num::NonZeroU32, str::FromStr as _, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use nisshi_schema::redact_url;
 use nisshi_storage::{
     ArcDynStorage, ProduceRequestBatcher, Result, StorageFactory, StorageFactoryConfiguration,
 };
@@ -67,9 +68,9 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             if k == "batch_min_size" {
                 human_units::Size::from_str(v.as_ref())
                     .map(|size| size.0)
-                    .inspect_err(
-                        |err| warn!(storage = %configuration.storage, v = v.as_ref(), ?err),
-                    )
+                    .inspect_err(|err| {
+                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
+                    })
                     .ok()
                     .and_then(|size| usize::try_from(size).ok())
             } else {
@@ -81,9 +82,9 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             if k == "batch_max_delay" {
                 human_units::Duration::from_str(v.as_ref())
                     .map(|duration| duration.0)
-                    .inspect_err(
-                        |err| warn!(storage = %configuration.storage, v = v.as_ref(), ?err),
-                    )
+                    .inspect_err(|err| {
+                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
+                    })
                     .ok()
             } else {
                 None
@@ -133,9 +134,9 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
             if k == "batch_min_size" {
                 human_units::Size::from_str(v.as_ref())
                     .map(|size| size.0)
-                    .inspect_err(
-                        |err| warn!(storage = %configuration.storage, v = v.as_ref(), ?err),
-                    )
+                    .inspect_err(|err| {
+                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
+                    })
                     .ok()
                     .and_then(|size| usize::try_from(size).ok())
             } else {
@@ -147,9 +148,9 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
             if k == "batch_max_delay" {
                 human_units::Duration::from_str(v.as_ref())
                     .map(|duration| duration.0)
-                    .inspect_err(
-                        |err| warn!(storage = %configuration.storage, v = v.as_ref(), ?err),
-                    )
+                    .inspect_err(|err| {
+                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
+                    })
                     .ok()
             } else {
                 None
