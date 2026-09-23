@@ -147,11 +147,11 @@ where
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use std::{env, sync::Arc};
-
     use common::{StorageType, init_tracing};
     use nisshi_broker::Error;
     use nisshi_schema::Registry;
+    use nisshi_storage::ArcDynStorage;
+    use std::env;
     use url::Url;
 
     use super::*;
@@ -159,7 +159,7 @@ mod pg {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         let current_dir = env::current_dir()?;
         debug!(?current_dir);
 
@@ -215,11 +215,11 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use std::{env, sync::Arc};
-
     use common::{StorageType, init_tracing};
     use nisshi_broker::Error;
     use nisshi_schema::Registry;
+    use nisshi_storage::ArcDynStorage;
+    use std::env;
     use url::Url;
 
     use super::*;
@@ -227,7 +227,7 @@ mod in_memory {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         let current_dir = env::current_dir()?;
         debug!(?current_dir);
 
@@ -283,11 +283,11 @@ mod in_memory {
 
 #[cfg(feature = "libsql")]
 mod lite {
-    use std::{env, sync::Arc};
-
     use common::{StorageType, init_tracing};
     use nisshi_broker::Error;
     use nisshi_schema::Registry;
+    use nisshi_storage::ArcDynStorage;
+    use std::env;
     use url::Url;
 
     use super::*;
@@ -295,7 +295,7 @@ mod lite {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         let current_dir = env::current_dir()?;
         debug!(?current_dir);
 
@@ -351,11 +351,11 @@ mod lite {
 
 #[cfg(feature = "slatedb")]
 mod slatedb {
-    use std::{env, sync::Arc};
-
     use common::{StorageType, init_tracing};
     use nisshi_broker::Error;
     use nisshi_schema::Registry;
+    use nisshi_storage::ArcDynStorage;
+    use std::env;
     use url::Url;
 
     use super::*;
@@ -363,7 +363,7 @@ mod slatedb {
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         let current_dir = env::current_dir()?;
         debug!(?current_dir);
 

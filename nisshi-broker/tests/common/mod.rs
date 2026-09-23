@@ -26,13 +26,15 @@ use nisshi_sans_io::{
     offset_fetch_request::OffsetFetchRequestTopic, sync_group_request::SyncGroupRequestAssignment,
 };
 use nisshi_schema::Registry;
-use nisshi_storage::{BrokerRegistrationRequest, Storage, StorageContainer};
+use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
 use rand::{
     distr::{Alphanumeric, StandardUniform},
     prelude::*,
     rng,
 };
-use std::{env, io::ErrorKind, sync::Arc, thread};
+#[cfg(feature = "dynostore")]
+use std::sync::Arc;
+use std::{env, io::ErrorKind, thread};
 use tokio::fs::remove_file;
 use tracing::{debug, subscriber::DefaultGuard};
 use tracing_subscriber::EnvFilter;
@@ -83,10 +85,41 @@ pub(crate) async fn storage_container(
     node: i32,
     advertised_listener: Url,
     schemas: Option<Registry>,
-) -> Result<Arc<Box<dyn Storage>>> {
+) -> Result<ArcDynStorage> {
+    let builder = {
+        let mut builder = StorageContainer::builder();
+
+        #[cfg(feature = "dynostore")]
+        builder.with_factory(Arc::new(nisshi_storage_dynostore::MemoryEngineFactory));
+
+        #[cfg(feature = "dynostore")]
+        builder.with_factory(Arc::new(
+            nisshi_storage_dynostore::S3OptimisticConcurrencyEngineFactory,
+        ));
+
+        #[cfg(feature = "dynostore")]
+        builder.with_factory(Arc::new(
+            nisshi_storage_dynostore::GoogleCloudStorageEngineFactory,
+        ));
+
+        #[cfg(feature = "libsql")]
+        builder.with_factory(Arc::new(nisshi_storage_sql::LiteEngineFactory));
+
+        #[cfg(feature = "postgres")]
+        builder.with_factory(Arc::new(nisshi_storage_sql::PostgresEngineFactory));
+
+        #[cfg(feature = "slatedb")]
+        builder.with_factory(Arc::new(nisshi_storage_slatedb::EngineFactory));
+
+        #[cfg(feature = "turso")]
+        builder.with_factory(Arc::new(nisshi_storage_sql::LimboEngineFactory));
+
+        builder
+    };
+
     let storage = match storage_type {
         StorageType::Postgres => {
-            StorageContainer::builder()
+            builder
                 .cluster_id(cluster.clone())
                 .node_id(node)
                 .advertised_listener(advertised_listener)
@@ -97,7 +130,7 @@ pub(crate) async fn storage_container(
         }
 
         StorageType::InMemory => {
-            StorageContainer::builder()
+            builder
                 .cluster_id(cluster.clone())
                 .node_id(node)
                 .advertised_listener(advertised_listener)
@@ -129,7 +162,7 @@ pub(crate) async fn storage_container(
                 otherwise @ Err(_) => otherwise,
             }?;
 
-            StorageContainer::builder()
+            builder
                 .cluster_id(cluster.clone())
                 .node_id(node)
                 .advertised_listener(advertised_listener)
@@ -180,7 +213,7 @@ pub(crate) async fn storage_container(
                 }
             }
 
-            StorageContainer::builder()
+            builder
                 .cluster_id(cluster.clone())
                 .node_id(node)
                 .advertised_listener(advertised_listener)
@@ -205,7 +238,7 @@ pub(crate) async fn storage_container(
 
         // Uses slatedb://memory for in-memory testing, no external S3 needed
         StorageType::SlateDb => {
-            StorageContainer::builder()
+            builder
                 .cluster_id(cluster.clone())
                 .node_id(node)
                 .advertised_listener(advertised_listener)
@@ -219,6 +252,62 @@ pub(crate) async fn storage_container(
     register_broker(cluster, node, &storage).await?;
 
     Ok(storage)
+}
+
+pub(crate) async fn memory_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::InMemory,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lite_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::Lite,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn slate_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::SlateDb,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn postgres_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::Postgres,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
 }
 
 pub(crate) fn alphanumeric_string(length: usize) -> String {

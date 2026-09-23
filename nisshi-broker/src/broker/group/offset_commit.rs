@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, Frame, Header, OffsetCommitRequest};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, Frame, FrameInput, Header, OffsetCommitRequest};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{
@@ -21,32 +21,33 @@ use crate::{
     coordinator::group::{Coordinator, OffsetCommit},
 };
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OffsetCommitService;
+#[derive(Clone, Debug)]
+pub struct OffsetCommitService<C> {
+    pub coordinator: C,
+}
 
-impl ApiKey for OffsetCommitService {
+impl<C> ApiKey for OffsetCommitService<C> {
     const KEY: i16 = OffsetCommitRequest::KEY;
 }
 
-impl<C> Service<C, Frame> for OffsetCommitService
+impl<C> Service<FrameInput> for OffsetCommitService<C>
 where
     C: Coordinator,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let coordinator = ctx.state_mut();
+    #[instrument(skip(req))]
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let correlation_id = req.frame.correlation_id()?;
 
-        let mut offset_commit = OffsetCommitRequest::try_from(req.body)?;
+        let mut offset_commit = OffsetCommitRequest::try_from(req.frame.body)?;
 
         _ = offset_commit
             .retention_time_ms
             .take_if(|retention_ms| retention_ms.is_negative());
 
-        coordinator
+        self.coordinator
             .offset_commit(OffsetCommit {
                 group_id: offset_commit.group_id.as_str(),
                 generation_id_or_member_epoch: offset_commit.generation_id_or_member_epoch,

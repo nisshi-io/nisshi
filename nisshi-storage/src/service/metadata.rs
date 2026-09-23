@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,16 +13,17 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, MetadataRequest, MetadataResponse, create_topics_request::CreatableTopic,
+    ApiKey, ErrorCode, MetadataRequest, MetadataResponse, RequestInput,
+    create_topics_request::CreatableTopic,
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, TopicId};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`MetadataRequest`] returning [`MetadataRequest`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service;
 /// use nisshi_sans_io::MetadataRequest;
 /// use nisshi_storage::{Error, MetadataService, StorageContainer};
 /// use url::Url;
@@ -41,11 +42,10 @@ use crate::{Error, Result, Storage, TopicId};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(MetadataService);
+/// let service = MetadataService { storage };
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         MetadataRequest::default()
 ///             .allow_auto_topic_creation(Some(false))
 ///             .include_cluster_authorized_operations(Some(false))
@@ -63,8 +63,10 @@ use crate::{Error, Result, Storage, TopicId};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct MetadataService;
+#[derive(Clone, Debug)]
+pub struct MetadataService<G> {
+    pub storage: G,
+}
 
 /// Defaults for topics created via auto creation: four partitions is the
 /// `num.partitions` that the Apache Kafka client test suites assume.
@@ -83,36 +85,36 @@ fn is_valid_topic_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
-impl ApiKey for MetadataService {
+impl<G> ApiKey for MetadataService<G> {
     const KEY: i16 = MetadataRequest::KEY;
 }
 
-impl<G> Service<G, MetadataRequest> for MetadataService
+impl<G, I> Service<I> for MetadataService<G>
 where
     G: Storage,
+    I: Into<RequestInput<MetadataRequest>> + Send + 'static,
 {
-    type Response = MetadataResponse;
+    type Output = MetadataResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: MetadataRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let topics = req
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
+        let topics = input
+            .request
             .topics
             .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>());
 
-        let mut response = ctx
-            .state()
+        let mut response = self
+            .storage
             .metadata(topics.as_deref())
             .await
             .inspect_err(|err| error!(?err))?;
 
         // versions prior to 4 do not have allow_auto_topic_creation,
         // and behave as if it were true
-        if req.allow_auto_topic_creation.unwrap_or(true) {
+        if input.request.allow_auto_topic_creation.unwrap_or(true) {
             let unknown = response
                 .topics()
                 .iter()
@@ -124,8 +126,8 @@ where
             let mut created = false;
 
             for name in unknown {
-                match ctx
-                    .state()
+                match self
+                    .storage
                     .create_topic(
                         CreatableTopic::default()
                             .name(name)
@@ -150,8 +152,8 @@ where
             }
 
             if created {
-                response = ctx
-                    .state()
+                response = self
+                    .storage
                     .metadata(topics.as_deref())
                     .await
                     .inspect_err(|err| error!(?err))?;

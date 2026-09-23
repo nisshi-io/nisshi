@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, DescribeClusterRequest, DescribeClusterResponse, ErrorCode};
-use rama::{Context, Service};
+use nisshi_sans_io::{
+    ApiKey, DescribeClusterRequest, DescribeClusterResponse, ErrorCode, RequestInput,
+};
+use rama::Service;
 use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeClusterRequest`] returning [`DescribeClusterResponse`].
-/// ```
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service as _;
 /// use nisshi_sans_io::{DescribeClusterRequest, EndpointType, ErrorCode};
 /// use nisshi_storage::{DescribeClusterService, Error, StorageContainer};
 /// use url::Url;
@@ -39,11 +41,10 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DescribeClusterService);
+/// let service = DescribeClusterService { storage };
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         DescribeClusterRequest::default()
 ///             .endpoint_type(Some(EndpointType::Broker.into()))
 ///             .include_cluster_authorized_operations(false),
@@ -58,36 +59,36 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DescribeClusterService;
+#[derive(Clone, Debug)]
+pub struct DescribeClusterService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DescribeClusterService {
+impl<G> ApiKey for DescribeClusterService<G> {
     const KEY: i16 = DescribeClusterRequest::KEY;
 }
 
-impl<G> Service<G, DescribeClusterRequest> for DescribeClusterService
+impl<G, I> Service<I> for DescribeClusterService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DescribeClusterRequest>> + Send + 'static,
 {
-    type Response = DescribeClusterResponse;
+    type Output = DescribeClusterResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DescribeClusterRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let brokers = ctx.state().brokers().await?;
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+        let brokers = self.storage.brokers().await?;
         debug!(?brokers);
 
-        let cluster_id = ctx.state().cluster_id().await?;
+        let cluster_id = self.storage.cluster_id().await?;
 
         Ok(DescribeClusterResponse::default()
             .throttle_time_ms(0)
             .error_code(ErrorCode::None.into())
             .error_message(None)
-            .endpoint_type(req.endpoint_type)
+            .endpoint_type(input.request.endpoint_type)
             .controller_id(brokers.first().map(|broker| broker.broker_id).unwrap_or(-1))
             .cluster_id(cluster_id.to_owned())
             .brokers(Some(brokers))

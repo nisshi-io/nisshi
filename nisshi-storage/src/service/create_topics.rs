@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,17 +13,17 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, NULL_TOPIC_ID,
+    ApiKey, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, NULL_TOPIC_ID, RequestInput,
     create_topics_response::CreatableTopicResult,
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
-/// ```
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service as _;
 /// use nisshi_sans_io::{NULL_TOPIC_ID, CreateTopicsRequest,
 ///     create_topics_request::CreatableTopic, ErrorCode};
 /// use nisshi_storage::{CreateTopicsService, Error, StorageContainer};
@@ -39,13 +39,12 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
+/// let service = CreateTopicsService { storage };
 ///
 /// let name = "abcba";
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         CreateTopicsRequest::default()
 ///             .topics(Some(vec![
 ///                 CreatableTopic::default()
@@ -70,29 +69,30 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CreateTopicsService;
+#[derive(Clone, Debug)]
+pub struct CreateTopicsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for CreateTopicsService {
+impl<G> ApiKey for CreateTopicsService<G> {
     const KEY: i16 = CreateTopicsRequest::KEY;
 }
 
-impl<G> Service<G, CreateTopicsRequest> for CreateTopicsService
+impl<G, I> Service<I> for CreateTopicsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<CreateTopicsRequest>> + Send + 'static,
 {
-    type Response = CreateTopicsResponse;
+    type Output = CreateTopicsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: CreateTopicsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
         let mut topics = vec![];
 
-        for mut topic in req.topics.unwrap_or_default() {
+        for mut topic in input.request.topics.unwrap_or_default() {
             let name = topic.name.clone();
 
             let num_partitions = Some(match topic.num_partitions {
@@ -111,9 +111,9 @@ where
                 otherwise => otherwise,
             });
 
-            match ctx
-                .state()
-                .create_topic(topic, req.validate_only.unwrap_or_default())
+            match self
+                .storage
+                .create_topic(topic, input.request.validate_only.unwrap_or_default())
                 .await
             {
                 Ok(topic_id) => {

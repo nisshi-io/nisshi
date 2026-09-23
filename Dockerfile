@@ -14,7 +14,7 @@
 
 FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
 
-FROM --platform=$BUILDPLATFORM rust:1.95-alpine AS chef
+FROM --platform=$BUILDPLATFORM rust:1.98-alpine AS chef
 ARG CARGO_CHEF_VERSION=0.1.78
 RUN cargo install cargo-chef --version ${CARGO_CHEF_VERSION} --locked
 WORKDIR /usr/src

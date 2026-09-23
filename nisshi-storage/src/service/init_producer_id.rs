@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, InitProducerIdRequest, InitProducerIdResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, InitProducerIdRequest, InitProducerIdResponse, RequestInput};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`InitProducerIdRequest`] returning [`InitProducerIdResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service as _;
 /// use nisshi_sans_io::{ErrorCode, InitProducerIdRequest, InitProducerIdResponse};
 /// use nisshi_storage::{Error, InitProducerIdService, StorageContainer};
 /// use url::Url;
@@ -39,7 +39,7 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(InitProducerIdService);
+/// let service = InitProducerIdService { storage };
 ///
 /// let transactional_id = None;
 /// let transaction_timeout_ms = 0;
@@ -49,7 +49,6 @@ use crate::{Error, Result, Storage};
 /// assert_eq!(
 ///     service
 ///         .serve(
-///             Context::default(),
 ///             InitProducerIdRequest::default()
 ///                 .transactional_id(transactional_id.clone())
 ///                 .transaction_timeout_ms(transaction_timeout_ms)
@@ -66,7 +65,6 @@ use crate::{Error, Result, Storage};
 /// assert_eq!(
 ///     service
 ///         .serve(
-///             Context::default(),
 ///             InitProducerIdRequest::default()
 ///                 .transactional_id(transactional_id)
 ///                 .transaction_timeout_ms(transaction_timeout_ms)
@@ -82,32 +80,33 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct InitProducerIdService;
+#[derive(Clone, Debug)]
+pub struct InitProducerIdService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for InitProducerIdService {
+impl<G> ApiKey for InitProducerIdService<G> {
     const KEY: i16 = InitProducerIdRequest::KEY;
 }
 
-impl<G> Service<G, InitProducerIdRequest> for InitProducerIdService
+impl<G, I> Service<I> for InitProducerIdService<G>
 where
     G: Storage,
+    I: Into<RequestInput<InitProducerIdRequest>> + Send + 'static,
 {
-    type Response = InitProducerIdResponse;
+    type Output = InitProducerIdResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: InitProducerIdRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
+        self.storage
             .init_producer(
-                req.transactional_id.as_deref(),
-                req.transaction_timeout_ms,
-                req.producer_id,
-                req.producer_epoch,
+                input.request.transactional_id.as_deref(),
+                input.request.transaction_timeout_ms,
+                input.request.producer_id,
+                input.request.producer_epoch,
             )
             .await
             .map(|response| {

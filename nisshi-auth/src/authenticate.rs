@@ -14,10 +14,12 @@
 
 use std::io::Cursor;
 
-use crate::{Authentication, Error, Stage};
+use crate::{AuthenticationExtension, Error, Stage};
 use bytes::Bytes;
-use nisshi_sans_io::{ApiKey, ErrorCode, SaslAuthenticateRequest, SaslAuthenticateResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{
+    ApiKey, ErrorCode, RequestInput, SaslAuthenticateRequest, SaslAuthenticateResponse,
+};
+use rama::{Service, extensions::ExtensionsRef as _};
 use rsasl::prelude::State;
 use tokio::task;
 use tracing::debug;
@@ -47,19 +49,19 @@ impl ApiKey for SaslAuthenticateService {
     const KEY: i16 = SaslAuthenticateRequest::KEY;
 }
 
-impl<S> Service<S, SaslAuthenticateRequest> for SaslAuthenticateService
-where
-    S: Send + Sync + 'static,
-{
-    type Response = SaslAuthenticateResponse;
+impl Service<RequestInput<SaslAuthenticateRequest>> for SaslAuthenticateService {
+    type Output = SaslAuthenticateResponse;
     type Error = Error;
 
     async fn serve(
         &self,
-        ctx: Context<S>,
-        req: SaslAuthenticateRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        if let Some(authentication) = ctx.get::<Authentication>().cloned() {
+        input: RequestInput<SaslAuthenticateRequest>,
+    ) -> Result<Self::Output, Self::Error> {
+        if let Some(authentication) = input
+            .extensions()
+            .get_ref::<AuthenticationExtension>()
+            .cloned()
+        {
             let session_lifetime_ms = self.session_lifetime_ms;
 
             task::spawn_blocking(move || {
@@ -72,7 +74,7 @@ where
                             let mut outcome = Cursor::new(Vec::new());
 
                             let Ok(state) = session
-                                .step(Some(&req.auth_bytes), &mut outcome)
+                                .step(Some(&input.request.auth_bytes), &mut outcome)
                                 .inspect(|state| debug!(?state))
                                 .inspect_err(|err| debug!(?err))
                             else {

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey as _, Frame, Header, MetadataRequest, MetadataResponse};
+use nisshi_sans_io::{ApiKey as _, Frame, FrameInput, Header, MetadataRequest, MetadataResponse};
 use nisshi_service::{
-    BytesFrameLayer, BytesTcpService, FrameBytesLayer, FrameService, TcpBytesLayer,
-    TcpContextLayer, TcpListenerLayer,
+    BytesFrameLayer, BytesTcpService, Error as ServiceError, FrameBytesLayer, FrameService,
+    TcpListenerInput, TcpListenerLayer, TcpStreamLayer,
 };
-use rama::{Context, Layer as _, Service as _};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task::JoinSet,
+use rama::{
+    Layer as _, Service as _,
+    error::BoxError,
+    extensions::Extensions,
+    tcp::{TcpStream, TokioTcpStream},
 };
+use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -32,14 +34,14 @@ mod common;
 async fn server(cancellation: CancellationToken, listener: TcpListener) -> Result<(), Error> {
     let server = (
         TcpListenerLayer::new(cancellation),
-        TcpContextLayer::default(),
-        TcpBytesLayer::<()>::default(),
+        TcpStreamLayer,
         BytesFrameLayer::default(),
     )
-        .into_layer(FrameService::new(|_, req: Frame| {
+        .into_layer(FrameService::new(|req: FrameInput| {
             debug!(?req);
 
-            req.correlation_id()
+            req.frame
+                .correlation_id()
                 .map(|correlation_id| Frame {
                     size: 0,
                     header: Header::Response { correlation_id },
@@ -52,14 +54,24 @@ async fn server(cancellation: CancellationToken, listener: TcpListener) -> Resul
                         .cluster_authorized_operations(Some(-1))
                         .into(),
                 })
-                .map_err(Error::from)
+                .map_err(ServiceError::from)
         }));
 
-    server.serve(Context::default(), listener).await
+    assert!(
+        server
+            .serve(TcpListenerInput {
+                listener,
+                extensions: Extensions::default(),
+            })
+            .await
+            .is_ok()
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn tcp_client_server() -> Result<(), Error> {
+async fn tcp_client_server() -> Result<(), BoxError> {
     let _guard = init_tracing()?;
 
     let cancellation = CancellationToken::new();
@@ -73,14 +85,16 @@ async fn tcp_client_server() -> Result<(), Error> {
         join.spawn(async move { server(cancellation, listener).await })
     };
 
-    let stream = TcpStream::connect(local_addr).await?;
+    let extensions = Extensions::default();
 
-    let client = FrameBytesLayer.into_layer(BytesTcpService);
+    let stream =
+        TcpStream::from_tokio_tcp_stream(TokioTcpStream::connect(local_addr).await?, extensions);
+
+    let client = FrameBytesLayer.into_layer(BytesTcpService::new(stream));
 
     let frame = client
-        .serve(
-            Context::with_state(stream),
-            Frame {
+        .serve(FrameInput {
+            frame: Frame {
                 header: Header::Request {
                     api_key: MetadataRequest::KEY,
                     api_version: 12,
@@ -95,7 +109,8 @@ async fn tcp_client_server() -> Result<(), Error> {
                     .into(),
                 size: 0,
             },
-        )
+            extensions: Extensions::default(),
+        })
         .await?;
 
     let response = MetadataResponse::try_from(frame.body)?;

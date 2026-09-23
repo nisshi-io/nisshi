@@ -26,7 +26,7 @@ use nisshi_broker::{
     NODE_ID, coordinator::group::administrator::Controller, service::coordinator::services,
 };
 use nisshi_sans_io::{
-    Body, ErrorCode, Frame, HeartbeatResponse, JoinGroupResponse, MetadataResponse,
+    Body, ErrorCode, Frame, FrameInput, HeartbeatResponse, JoinGroupResponse, MetadataResponse,
     SyncGroupResponse,
     consumer::{ConsumerProtocolAssignment, ConsumerProtocolSubscription, MemberAssignment},
     metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
@@ -35,8 +35,8 @@ use nisshi_service::{
     BytesFrameLayer, ConsumerGroupLayer, ConsumerGroupService, FrameBytesLayer, FrameRouteService,
     LatencyIntroducingLayer,
 };
-use nisshi_storage::{Storage, StorageContainer};
-use rama::{Context, Layer as _, Service};
+use nisshi_storage::Storage;
+use rama::{Layer as _, Service};
 use rand::{RngExt, SeedableRng as _, rngs::SmallRng};
 use tokio::{
     sync::{
@@ -50,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 use url::Url;
 
-use crate::common::{alphanumeric_string, init_tracing};
+use crate::common::{alphanumeric_string, init_tracing, memory_storage};
 
 pub mod common;
 
@@ -85,7 +85,7 @@ pub async fn one_consumer_session_delay_after_initial_join(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -198,7 +198,7 @@ pub async fn one_consumer_next_action(storage: impl Storage + Clone) -> Result<(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -267,7 +267,7 @@ pub async fn two_consumer_next_action(storage: impl Storage + Clone) -> Result<(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -388,7 +388,7 @@ async fn group_consumer_next_action(
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -528,19 +528,12 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
 
     let cluster = "nisshi";
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
+    let storage = memory_storage(cluster, NODE_ID).await?;
 
     let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
-        FrameRouteService::<(), nisshi_broker::Error>::builder(),
+        FrameRouteService::<nisshi_broker::Error>::builder(),
         coordinator,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
@@ -737,7 +730,7 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
 #[instrument(skip(service))]
 async fn simple_consumer<S>(name: &str, service: &S) -> Result<()>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     S::Error: Into<Error>,
 {
     // join without member id
@@ -841,11 +834,11 @@ fn consumer(
     group: &str,
     id: u64,
     topics: impl IntoIterator<Item = impl Into<String>>,
-    route: impl Service<(), Frame, Response = Frame, Error = nisshi_broker::Error> + Clone,
+    route: impl Service<FrameInput, Output = Frame, Error = nisshi_broker::Error> + Clone,
     metadata: MetadataResponse,
     latency_ms: Range<u64>,
 ) -> ConsumerGroupService<
-    impl Service<(), Frame, Response = Frame, Error = nisshi_broker::Error> + Clone,
+    impl Service<FrameInput, Output = Frame, Error = nisshi_broker::Error> + Clone,
 > {
     (
         ConsumerGroupLayer::new(group, topics.into_iter(), metadata.clone()).on_assignment(
@@ -972,7 +965,7 @@ async fn consumer_with_iterations<S>(
     service: &S,
 ) -> Result<()>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     S::Error: Into<Error> + Send + Sync + 'static,
 {
     let mut next_action = None;
@@ -980,7 +973,7 @@ where
     while iterations > 0 && !simulation.is_cancelled() {
         let instant = Instant::now();
         next_action = service
-            .serve(Context::default(), next_action)
+            .serve( next_action)
             .await
             .inspect(|next_action| debug!(?next_action, iterations, elapsed = ?instant.elapsed(), simulation = simulation.is_cancelled()))
             .map(Some)
@@ -1011,12 +1004,12 @@ where
 #[instrument(skip_all)]
 async fn join<I, S>(service: &S, input: Option<I>) -> Result<JoinGroupResponse, Error>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     I: Into<Body>,
     S::Error: Into<Error>,
 {
     let next_action = service
-        .serve(Context::default(), input.map(Into::into))
+        .serve(input.map(Into::into))
         .await
         .inspect(|output| debug!(?output))
         .map_err(Into::into)?;
@@ -1031,12 +1024,12 @@ where
 #[instrument(skip_all)]
 async fn sync<I, S>(service: &S, input: Option<I>) -> Result<SyncGroupResponse, Error>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     I: Into<Body>,
     S::Error: Into<Error>,
 {
     let next_action = service
-        .serve(Context::default(), input.map(Into::into))
+        .serve(input.map(Into::into))
         .await
         .inspect(|output| debug!(?output))
         .map_err(Into::into)?;
@@ -1051,12 +1044,12 @@ where
 #[instrument(skip_all)]
 async fn heartbeat<I, S>(service: &S, input: Option<I>) -> Result<HeartbeatResponse, Error>
 where
-    S: Service<(), Option<Body>, Response = Body>,
+    S: Service<Option<Body>, Output = Body>,
     I: Into<Body>,
     S::Error: Into<Error>,
 {
     let next_action = service
-        .serve(Context::default(), input.map(Into::into))
+        .serve(input.map(Into::into))
         .await
         .inspect(|output| debug!(?output))
         .map_err(Into::into)?;
@@ -1070,20 +1063,17 @@ where
 
 #[cfg(feature = "postgres")]
 mod pg {
-    use std::sync::Arc;
-
-    use nisshi_storage::Storage;
+    use crate::common::StorageType;
+    use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
-
-    use crate::common::StorageType;
 
     use super::*;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
+    ) -> Result<ArcDynStorage> {
         common::storage_container(
             StorageType::Postgres,
             cluster,
@@ -1196,29 +1186,17 @@ mod pg {
 
 #[cfg(feature = "dynostore")]
 mod in_memory {
-    use std::sync::Arc;
-
-    use nisshi_storage::Storage;
+    use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
-
-    use crate::common::StorageType;
 
     use super::*;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster.clone(),
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-        .map_err(Into::into)
+    ) -> Result<ArcDynStorage> {
+        memory_storage(cluster, node).await.map_err(Into::into)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1322,28 +1300,18 @@ mod in_memory {
 
 #[cfg(feature = "libsql")]
 mod lite {
-    use std::sync::Arc;
-
+    use crate::common::lite_storage;
+    use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
-
-    use crate::common::StorageType;
 
     use super::*;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::Lite,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-        .map_err(Into::into)
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1447,28 +1415,18 @@ mod lite {
 
 #[cfg(feature = "slatedb")]
 mod slatedb {
-    use std::sync::Arc;
-
+    use crate::common::slate_storage;
+    use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
-
-    use crate::common::StorageType;
 
     use super::*;
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
         node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::SlateDb,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-        .map_err(Into::into)
+    ) -> Result<ArcDynStorage> {
+        slate_storage(cluster, node).await.map_err(Into::into)
     }
 
     #[tokio::test(start_paused = true)]

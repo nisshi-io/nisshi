@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,31 +19,30 @@ use std::{
 };
 
 use bytes::{BufMut as _, Bytes, BytesMut};
-use indicatif::ProgressBar;
-use nisshi_auth::Authentication;
+use nisshi_auth::AuthenticationExtension;
 use nisshi_sans_io::{
-    ApiKey, ApiVersionsRequest, Body, Frame, Header, Request, Response, RootMessageMeta,
-    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    ApiKey, ApiVersionsRequest, Body, BodyInput, BytesInput, Frame, FrameInput, Header, Request,
+    RequestInput, Response, RootMessageMeta, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    SaslHandshakeRequest,
 };
 use opentelemetry::KeyValue;
-use rama::{Context, Layer, Service, context::Extensions, matcher::Matcher, service::BoxService};
+use rama::{Layer, Service, extensions::Extensions, matcher::Matcher, service::BoxService};
 use rsasl::config::SASLConfig;
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
 
-use crate::{API_ERRORS, API_REQUESTS};
+use crate::{API_ERRORS, API_REQUESTS, ProgressBarExtension};
 
 /// A [Matcher] of [`Request`]s using their [API key][`ApiKey`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RequestApiKeyMatcher(pub i16);
 
-impl<State, Q> Matcher<State, Q> for RequestApiKeyMatcher
+impl<Q> Matcher<RequestInput<Q>> for RequestApiKeyMatcher
 where
     Q: Request,
-    State: Clone + Debug,
 {
-    fn matches(&self, ext: Option<&mut Extensions>, ctx: &Context<State>, req: &Q) -> bool {
-        debug!(?ext, ?ctx, ?req);
+    fn matches(&self, ext: Option<&Extensions>, req: &RequestInput<Q>) -> bool {
+        debug!(?ext, ?req);
         Q::KEY == self.0
     }
 }
@@ -52,13 +51,9 @@ where
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FrameApiKeyMatcher(pub i16);
 
-impl<State> Matcher<State, Frame> for FrameApiKeyMatcher
-where
-    State: Clone + Debug,
-{
-    fn matches(&self, ext: Option<&mut Extensions>, ctx: &Context<State>, req: &Frame) -> bool {
-        let _ = (ext, ctx);
-        req.api_key().is_ok_and(|api_key| api_key == self.0)
+impl Matcher<FrameInput> for FrameApiKeyMatcher {
+    fn matches(&self, _ext: Option<&Extensions>, req: &FrameInput) -> bool {
+        req.frame.api_key().is_ok_and(|api_key| api_key == self.0)
     }
 }
 
@@ -100,23 +95,22 @@ impl<S, Q> Debug for RequestService<S, Q> {
     }
 }
 
-impl<State, S, Q> Service<State, Q> for RequestService<S, Q>
+impl<S, Q> Service<RequestInput<Q>> for RequestService<S, Q>
 where
-    S: Service<State, Q>,
+    S: Service<RequestInput<Q>>,
     Q: Request,
-    S::Error: From<<Q as TryFrom<Body>>::Error> + From<<S as Service<State, Q>>::Error>,
-    S::Response: Response,
-    Body: From<<S as Service<State, Q>>::Response>,
-    State: Send + Sync + 'static,
+    S::Error: From<<Q as TryFrom<Body>>::Error> + From<<S as Service<RequestInput<Q>>>::Error>,
+    S::Output: Response,
+    Body: From<<S as Service<RequestInput<Q>>>::Output>,
 {
-    type Response = S::Response;
+    type Output = S::Output;
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(req))]
+    async fn serve(&self, req: RequestInput<Q>) -> Result<Self::Output, Self::Error> {
         debug!(?req);
         self.inner
-            .serve(ctx, req)
+            .serve(req)
             .await
             .inspect(|response| debug!(?response))
     }
@@ -167,25 +161,32 @@ impl<S, Q> Debug for FrameRequestService<S, Q> {
     }
 }
 
-impl<S, Q, State> Service<State, Frame> for FrameRequestService<S, Q>
+impl<S, Q, I> Service<I> for FrameRequestService<S, Q>
 where
-    S: Service<State, Q>,
-    S::Response: Response,
+    I: Into<FrameInput> + Send + 'static,
+    S: Service<RequestInput<Q>>,
+    S::Output: Response,
     S::Error: From<nisshi_sans_io::Error>,
     Q: Request + TryFrom<Body>,
     <Q as TryFrom<Body>>::Error: Into<S::Error>,
-    State: Send + Sync + 'static,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
+    #[instrument(skip(req))]
+    async fn serve(&self, req: I) -> Result<Self::Output, Self::Error> {
+        let req = req.into();
 
-        let req = Q::try_from(req.body).map_err(Into::into)?;
+        let correlation_id = req.frame.correlation_id()?;
 
-        self.inner.serve(ctx, req).await.map(|response| Frame {
+        let req = Q::try_from(req.frame.body)
+            .map(|request| RequestInput {
+                request,
+                extensions: req.extensions,
+            })
+            .map_err(Into::into)?;
+
+        self.inner.serve(req).await.map(|response| Frame {
             size: 0,
             header: Header::Response { correlation_id },
             body: response.into(),
@@ -193,15 +194,14 @@ where
     }
 }
 
-impl<S, Q, State> Matcher<State, Frame> for FrameRequestService<S, Q>
+impl<S, Q> Matcher<FrameInput> for FrameRequestService<S, Q>
 where
     S: Clone + Send + Sync + 'static,
     Q: Request,
-    State: Clone + Debug,
 {
-    fn matches(&self, ext: Option<&mut Extensions>, ctx: &Context<State>, req: &Frame) -> bool {
-        debug!(?ext, ?ctx, ?req);
-        req.api_key().is_ok_and(|api_key| api_key == Q::KEY)
+    fn matches(&self, ext: Option<&Extensions>, req: &FrameInput) -> bool {
+        debug!(?ext, ?req);
+        req.frame.api_key().is_ok_and(|api_key| api_key == Q::KEY)
     }
 }
 
@@ -227,7 +227,7 @@ impl<S> Layer<S> for BytesFrameLayer {
                 .sasl_config
                 .clone()
                 .map(|sasl_config| AuthenticationFrame {
-                    authentication: Authentication::server(sasl_config),
+                    authentication: AuthenticationExtension::server(sasl_config),
                     v0: Arc::new(Mutex::new(None)),
                 }),
         }
@@ -236,7 +236,7 @@ impl<S> Layer<S> for BytesFrameLayer {
 
 #[derive(Clone)]
 struct AuthenticationFrame {
-    authentication: Authentication,
+    authentication: AuthenticationExtension,
     v0: Arc<Mutex<Option<bool>>>,
 }
 
@@ -270,21 +270,16 @@ impl<S> BytesFrameService<S> {
     }
 }
 
-impl<S, State> Service<State, Bytes> for BytesFrameService<S>
+impl<S> Service<BytesInput> for BytesFrameService<S>
 where
-    S: Service<State, Frame, Response = Frame>,
-    State: Clone + Send + Sync + 'static,
+    S: Service<FrameInput, Output = Frame>,
     S::Error: From<nisshi_sans_io::Error> + From<tokio::task::JoinError> + Debug,
 {
-    type Response = Bytes;
+    type Output = Bytes;
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        mut ctx: Context<State>,
-        req: Bytes,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(req))]
+    async fn serve(&self, req: BytesInput) -> Result<Self::Output, Self::Error> {
         let sasl_handshake_v0 = self
             .af
             .as_ref()
@@ -293,7 +288,9 @@ where
             .map(|v0| v0.unwrap_or_default())
             .unwrap_or_default();
 
-        debug!(request = ?&req[..], sasl_handshake_v0);
+        debug!(request = ?&req.bytes[..], sasl_handshake_v0);
+
+        let extensions = req.extensions;
 
         let req = if sasl_handshake_v0 {
             //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
@@ -311,11 +308,11 @@ where
                     client_id: None,
                 },
                 body: Body::SaslAuthenticateRequest(
-                    SaslAuthenticateRequest::default().auth_bytes(req.slice(4..)),
+                    SaslAuthenticateRequest::default().auth_bytes(req.bytes.slice(4..)),
                 ),
             }
         } else {
-            spawn_blocking(|| Frame::request_from_bytes(req))
+            spawn_blocking(|| Frame::request_from_bytes(req.bytes))
                 .await?
                 .inspect(|request| debug!(?request))?
         };
@@ -329,11 +326,12 @@ where
         let api_version = req.api_version()?;
         let correlation_id = req.correlation_id()?;
 
-        if let Some(pb) = ctx.get::<ProgressBar>() {
+        if let Some(pb) = extensions.get_ref::<ProgressBarExtension>() {
             let api_name = req.api_name();
 
-            pb.set_message(format!("{api_name} v{api_version}/{correlation_id}"));
-            pb.tick();
+            pb.as_ref()
+                .set_message(format!("{api_name} v{api_version}/{correlation_id}"));
+            pb.as_ref().tick();
         }
 
         let attributes = vec![
@@ -341,13 +339,18 @@ where
             KeyValue::new("api_version", api_version as i64),
         ];
 
-        let Frame { body, .. } = {
-            if let Some(authentication) = self.af.as_ref().map(|af| af.authentication.clone()) {
-                assert!(ctx.insert(authentication).is_none());
-            }
+        if !extensions.contains::<AuthenticationExtension>()
+            && let Some(authentication) = self.af.as_ref().map(|af| af.authentication.clone())
+        {
+            _ = extensions.insert(authentication);
+        }
 
+        let Frame { body, .. } = {
             self.inner
-                .serve(ctx, req)
+                .serve(FrameInput {
+                    frame: req,
+                    extensions,
+                })
                 .await
                 .inspect(|response| debug!(?response))?
         };
@@ -437,26 +440,28 @@ impl<S> Debug for FrameBytesService<S> {
     }
 }
 
-impl<S, State> Service<State, Frame> for FrameBytesService<S>
+impl<S> Service<FrameInput> for FrameBytesService<S>
 where
-    S: Service<State, Bytes, Response = Bytes>,
+    S: Service<BytesInput, Output = Bytes>,
     S::Error: From<nisshi_sans_io::Error>,
-    State: Send + Sync + 'static,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req), fields(api_key = req.api_key()?, api_version = req.api_version()?, correlation_id = req.correlation_id()?))]
-    async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(req), fields(api_key = req.frame.api_key()?, api_version = req.frame.api_version()?, correlation_id = req.frame.correlation_id()?))]
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
         debug!(?req);
 
-        let api_key = req.api_key()?;
-        let api_version = req.api_version()?;
+        let api_key = req.frame.api_key()?;
+        let api_version = req.frame.api_version()?;
 
-        let req = Frame::request(req.header, req.body)?;
+        let req = BytesInput {
+            bytes: Frame::request(req.frame.header, req.frame.body)?,
+            extensions: req.extensions.fork(),
+        };
 
         self.inner
-            .serve(ctx, req)
+            .serve(req)
             .await
             .and_then(|response| {
                 Frame::response_from_bytes(response, api_key, api_version).map_err(Into::into)
@@ -483,25 +488,30 @@ pub struct FrameBodyService<S> {
     inner: S,
 }
 
-impl<S, State> Service<State, Frame> for FrameBodyService<S>
+impl<S> Service<FrameInput> for FrameBodyService<S>
 where
-    S: Service<State, Body, Response = Body>,
+    S: Service<BodyInput, Output = Body>,
     S::Error: From<nisshi_sans_io::Error>,
-    State: Send + Sync + 'static,
 {
-    type Response = Frame;
+    type Output = Frame;
 
     type Error = S::Error;
 
-    #[instrument(skip_all, fields(api_key = req.api_key()?, api_version = req.api_version()?, correlation_id = req.correlation_id()?))]
-    async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
+    #[instrument(skip_all, fields(api_key = req.frame.api_key()?, api_version = req.frame.api_version()?, correlation_id = req.frame.correlation_id()?))]
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let correlation_id = req.frame.correlation_id()?;
 
-        self.inner.serve(ctx, req.body).await.map(|body| Frame {
-            size: 0,
-            header: Header::Response { correlation_id },
-            body,
-        })
+        self.inner
+            .serve(BodyInput {
+                body: req.frame.body,
+                extensions: req.extensions,
+            })
+            .await
+            .map(|body| Frame {
+                size: 0,
+                header: Header::Response { correlation_id },
+                body,
+            })
     }
 }
 
@@ -544,21 +554,23 @@ where
     const KEY: i16 = Q::KEY;
 }
 
-impl<S, State, Q> Service<State, Body> for BodyRequestService<S, Q>
+impl<S, Q> Service<BodyInput> for BodyRequestService<S, Q>
 where
-    S: Service<State, Q>,
+    S: Service<RequestInput<Q>>,
     Q: Request,
-    S::Error: From<<Q as TryFrom<Body>>::Error> + From<<S as Service<State, Q>>::Error>,
-    Body: From<<S as Service<State, Q>>::Response>,
-    State: Send + Sync + 'static,
+    S::Error: From<<Q as TryFrom<Body>>::Error> + From<<S as Service<RequestInput<Q>>>::Error>,
+    Body: From<<S as Service<RequestInput<Q>>>::Output>,
 {
-    type Response = Body;
+    type Output = Body;
     type Error = S::Error;
 
     #[instrument(skip_all)]
-    async fn serve(&self, ctx: Context<State>, req: Body) -> Result<Self::Response, Self::Error> {
-        let req = Q::try_from(req)?;
-        self.inner.serve(ctx, req).await.map(Body::from)
+    async fn serve(&self, req: BodyInput) -> Result<Self::Output, Self::Error> {
+        let req = Q::try_from(req.body).map(|request| RequestInput {
+            request,
+            extensions: req.extensions,
+        })?;
+        self.inner.serve(req).await.map(Body::from)
     }
 }
 
@@ -580,18 +592,17 @@ pub struct RequestFrameService<S> {
     inner: S,
 }
 
-impl<S, State, Q> Service<State, Q> for RequestFrameService<S>
+impl<S, Q> Service<RequestInput<Q>> for RequestFrameService<S>
 where
     Q: Request,
-    S: Service<State, Frame, Response = Frame>,
+    S: Service<FrameInput, Output = Frame>,
     S::Error: From<<<Q as Request>::Response as TryFrom<Body>>::Error>,
-    State: Send + Sync + 'static,
 {
-    type Response = Q::Response;
+    type Output = Q::Response;
     type Error = S::Error;
 
     #[instrument(skip_all)]
-    async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, req: RequestInput<Q>) -> Result<Self::Output, Self::Error> {
         debug!(?req);
 
         let api_key = Q::KEY;
@@ -603,49 +614,48 @@ where
         let correlation_id = 0;
         let client_id = Some(env!("CARGO_CRATE_NAME").into());
 
-        let req = Frame {
-            size: 0,
-            header: Header::Request {
-                api_key,
-                api_version,
-                correlation_id,
-                client_id,
-            },
-            body: req.into(),
-        };
-
         self.inner
-            .serve(ctx, req)
+            .serve(FrameInput {
+                frame: Frame {
+                    size: 0,
+                    header: Header::Request {
+                        api_key,
+                        api_version,
+                        correlation_id,
+                        client_id,
+                    },
+                    body: req.request.into(),
+                },
+                extensions: req.extensions,
+            })
             .await
             .and_then(|response| Q::Response::try_from(response.body).map_err(Into::into))
             .inspect(|response| debug!(?response))
     }
 }
 
-impl<S, State, Q, E> From<RequestService<S, Q>> for BoxService<State, Body, Body, E>
+impl<S, Q, E> From<RequestService<S, Q>> for BoxService<BodyInput, Body, E>
 where
-    S: Service<State, Q, Error = E>,
+    S: Service<RequestInput<Q>, Error = E>,
     Q: Request,
-    <S as Service<State, Q>>::Response: Response,
-    E: From<<Q as TryFrom<Body>>::Error> + From<<S as Service<State, Q>>::Error>,
-    Body: From<<S as Service<State, Q>>::Response>,
-    State: Send + Sync + 'static,
+    <S as Service<RequestInput<Q>>>::Output: Response,
+    E: From<<Q as TryFrom<Body>>::Error> + From<<S as Service<RequestInput<Q>>>::Error>,
+    Body: From<<S as Service<RequestInput<Q>>>::Output>,
 {
     fn from(value: RequestService<S, Q>) -> Self {
         BodyRequestLayer::<Q>::new().into_layer(value).boxed()
     }
 }
 
-impl<S, State, Q, E> From<RequestService<S, Q>> for BoxService<State, Frame, Frame, E>
+impl<S, Q, E> From<RequestService<S, Q>> for BoxService<FrameInput, Frame, E>
 where
-    S: Service<State, Q, Error = E>,
+    S: Service<RequestInput<Q>, Error = E>,
     Q: Request,
-    <S as Service<State, Q>>::Response: Response,
+    <S as Service<RequestInput<Q>>>::Output: Response,
     E: From<nisshi_sans_io::Error>
         + From<<Q as TryFrom<Body>>::Error>
-        + From<<S as Service<State, Q>>::Error>,
-    Body: From<<S as Service<State, Q>>::Response>,
-    State: Send + Sync + 'static,
+        + From<<S as Service<RequestInput<Q>>>::Error>,
+    Body: From<<S as Service<RequestInput<Q>>>::Output>,
 {
     fn from(value: RequestService<S, Q>) -> Self {
         (FrameBodyLayer, BodyRequestLayer::<Q>::new())
@@ -654,15 +664,14 @@ where
     }
 }
 
-impl<S, State, Q, E> From<BodyRequestService<S, Q>> for BoxService<State, Frame, Frame, E>
+impl<S, Q, E> From<BodyRequestService<S, Q>> for BoxService<FrameInput, Frame, E>
 where
-    S: Service<State, Q, Error = E>,
+    S: Service<RequestInput<Q>, Error = E>,
     Q: Request,
     E: From<nisshi_sans_io::Error>
         + From<<Q as TryFrom<Body>>::Error>
-        + From<<S as Service<State, Q>>::Error>,
-    Body: From<<S as Service<State, Q>>::Response>,
-    State: Send + Sync + 'static,
+        + From<<S as Service<RequestInput<Q>>>::Error>,
+    Body: From<<S as Service<RequestInput<Q>>>::Output>,
 {
     fn from(value: BodyRequestService<S, Q>) -> Self {
         FrameBodyLayer.into_layer(value).boxed()
@@ -675,25 +684,24 @@ pub struct FrameService<F> {
     response: F,
 }
 
-impl<State, E, F> Service<State, Frame> for FrameService<F>
+impl<E, F> Service<FrameInput> for FrameService<F>
 where
-    F: Fn(Context<State>, Frame) -> Result<Frame, E> + Clone + Send + Sync + 'static,
+    F: Fn(FrameInput) -> Result<Frame, E> + Clone + Send + Sync + 'static,
     E: Send + Sync + 'static,
-    State: Send + Sync + 'static,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = E;
 
     #[instrument(skip_all)]
-    async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        (self.response)(ctx, req)
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        (self.response)(req)
     }
 }
 
 impl<F> FrameService<F> {
-    pub fn new<State, E>(response: F) -> Self
+    pub fn new<E>(response: F) -> Self
     where
-        F: Fn(Context<State>, Frame) -> Result<Frame, E> + Clone,
+        F: Fn(FrameInput) -> Result<Frame, E> + Clone,
         E: Send + Sync + 'static,
     {
         Self { response }
@@ -712,26 +720,25 @@ impl<F> Debug for ResponseService<F> {
     }
 }
 
-impl<State, Q, E, F> Service<State, Q> for ResponseService<F>
+impl<Q, E, F> Service<RequestInput<Q>> for ResponseService<F>
 where
-    F: Fn(Context<State>, Q) -> Result<Q::Response, E> + Clone + Send + Sync + 'static,
+    F: Fn(RequestInput<Q>) -> Result<Q::Response, E> + Clone + Send + Sync + 'static,
     Q: Request,
     E: Send + Sync + 'static,
-    State: Send + Sync + 'static,
 {
-    type Response = Q::Response;
+    type Output = Q::Response;
     type Error = E;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
-        (self.response)(ctx, req)
+    #[instrument(skip_all)]
+    async fn serve(&self, req: RequestInput<Q>) -> Result<Self::Output, Self::Error> {
+        (self.response)(req)
     }
 }
 
 impl<F> ResponseService<F> {
-    pub fn new<State, Q, E>(response: F) -> Self
+    pub fn new<Q, E>(response: F) -> Self
     where
-        F: Fn(Context<State>, Q) -> Result<Q::Response, E> + Clone,
+        F: Fn(RequestInput<Q>) -> Result<Q::Response, E> + Clone,
         Q: Request,
         E: Send + Sync + 'static,
     {
