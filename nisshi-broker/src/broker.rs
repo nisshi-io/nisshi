@@ -343,6 +343,14 @@ where
 
         let mut connections = 0;
 
+        // Backs off after a run of consecutive accept()-arm errors that look like
+        // resource exhaustion (e.g. EMFILE/ENFILE), so a persistent failure doesn't
+        // spin the loop at 100% CPU. A routine, expected per-connection error
+        // (ConnectionAborted: a peer reset before we could accept it) never backs off.
+        // The sleep runs inside the select! arm, blocking the whole select! call, so it
+        // is kept short and capped.
+        let mut consecutive_accept_errors: u32 = 0;
+
         loop {
             connections += 1;
 
@@ -351,7 +359,36 @@ where
             }
 
             tokio::select! {
-                Ok((stream, addr)) = listener.accept() => {
+                result = listener.accept() => {
+                    let (stream, addr) = match result {
+                        Ok(accepted) => {
+                            consecutive_accept_errors = 0;
+                            accepted
+                        }
+
+                        Err(err) => {
+                            error!(?err, "accept() failed; continuing to listen");
+
+                            if err.kind() != ErrorKind::ConnectionAborted {
+                                let backoff = Duration::from_millis(5)
+                                    .saturating_mul(1u32 << consecutive_accept_errors.min(6))
+                                    .min(Duration::from_millis(200));
+
+                                consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+
+                                sleep(backoff).await;
+                            } else {
+                                consecutive_accept_errors = 0;
+                            }
+
+                            continue;
+                        }
+                    };
+
+                    if let Err(err) = stream.set_nodelay(true) {
+                        error!(?err, %addr, "set_nodelay failed; dropping connection");
+                        continue;
+                    }
 
                     let extensions = Extensions::default();
 
@@ -367,9 +404,6 @@ where
                         _ = extensions.insert(ProgressBarExtension::new(pb.clone()));
                         Some(pb)
                     };
-
-
-                    stream.set_nodelay(true)?;
 
                     let service = services(
                         self.cluster_id.as_str(),

@@ -15,8 +15,10 @@
 use std::{
     error::{self},
     fmt::Debug,
+    future::Future,
     io,
-    time::SystemTime,
+    net::SocketAddr,
+    time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
@@ -26,10 +28,11 @@ use opentelemetry::KeyValue;
 use rama::{
     Layer, Service,
     extensions::{Extension, Extensions, ExtensionsRef},
-    tcp::TcpStream,
+    tcp::{TcpStream, TokioTcpStream},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    net::TcpListener,
     sync::Mutex,
     task::JoinSet,
 };
@@ -84,6 +87,66 @@ impl<S> Debug for TcpListenerService<S> {
     }
 }
 
+/// A source of accepted TCP connections.
+///
+/// Exists so the accept loop in [`TcpListenerService`] is testable against a scripted
+/// sequence of accept outcomes (in particular, an `Err` followed by an `Ok`) without
+/// depending on triggering a real OS-level `accept()` failure, which is fragile and
+/// platform-dependent. Production code always passes the [`TcpListener`] carried by
+/// [`TcpListenerInput`]; only tests supply another implementation.
+trait Acceptor {
+    fn accept(&self) -> impl Future<Output = io::Result<(TokioTcpStream, SocketAddr)>> + Send;
+}
+
+impl Acceptor for TcpListener {
+    fn accept(&self) -> impl Future<Output = io::Result<(TokioTcpStream, SocketAddr)>> + Send {
+        TcpListener::accept(self)
+    }
+}
+
+/// Backs off after a run of consecutive `accept()` errors that look like resource
+/// exhaustion (e.g. `EMFILE`/`ENFILE`), so a persistent failure doesn't spin the loop
+/// at 100% CPU. `ConnectionAborted` is a routine, expected per-connection error (a peer
+/// reset before we could accept it) and never backs off.
+///
+/// The backoff sleep runs inside the `select!` arm, blocking the whole `select!` call
+/// for its duration -- delaying cancellation and any other periodic branch a caller
+/// composes alongside this one -- so it is kept short and capped.
+struct AcceptBackoff {
+    consecutive_errors: u32,
+}
+
+impl AcceptBackoff {
+    const CAP: Duration = Duration::from_millis(200);
+    const INITIAL: Duration = Duration::from_millis(5);
+
+    const fn new() -> Self {
+        Self {
+            consecutive_errors: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    /// Returns the backoff to sleep for, or `None` if this error shouldn't back off.
+    fn on_error(&mut self, err: &io::Error) -> Option<Duration> {
+        if err.kind() == io::ErrorKind::ConnectionAborted {
+            self.reset();
+            return None;
+        }
+
+        let backoff = Self::INITIAL
+            .saturating_mul(1 << self.consecutive_errors.min(6))
+            .min(Self::CAP);
+
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+
+        Some(backoff)
+    }
+}
+
 impl<S> Service<TcpListenerInput> for TcpListenerService<S>
 where
     S: Service<TcpStream> + Clone,
@@ -95,34 +158,66 @@ where
 
     #[instrument(skip(req))]
     async fn serve(&self, req: TcpListenerInput) -> Result<Self::Output, Self::Error> {
-        let mut set = JoinSet::new();
+        self.accept_loop(req.listener, req.extensions).await
+    }
+}
 
-        let extensions = req.extensions.clone();
+impl<S> TcpListenerService<S>
+where
+    S: Service<TcpStream> + Clone,
+    S::Output: Debug,
+    S::Error: error::Error,
+{
+    /// Accepts connections from `listener` until cancelled, handing each one to the
+    /// inner service with a clone of `extensions`.
+    ///
+    /// Generic over [`Acceptor`] (rather than taking [`TcpListenerInput`] directly) so a
+    /// test can drive the loop with a scripted accept sequence; see the trait docs.
+    async fn accept_loop<A>(&self, listener: A, extensions: Extensions) -> Result<(), S::Error>
+    where
+        A: Acceptor + Debug + Send + Sync + 'static,
+    {
+        let mut set = JoinSet::new();
+        let mut backoff = AcceptBackoff::new();
 
         loop {
             tokio::select! {
-                Ok((stream, addr)) = req.listener.accept() => {
-                    debug!(?req, ?stream, %addr);
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            backoff.reset();
+                            debug!(?listener, ?stream, %addr);
 
-                    let service = self.inner.clone();
-                    let extensions = extensions.clone();
+                            let service = self.inner.clone();
+                            let extensions = extensions.clone();
 
-                    let handle = set.spawn(
-                        async move {
-                            match service.serve(TcpStream::from_tokio_tcp_stream(stream, extensions)).await {
-                                Err(error) => {
-                                    debug!(%addr, %error);
+                            let handle = set.spawn(
+                                async move {
+                                    match service.serve(TcpStream::from_tokio_tcp_stream(stream, extensions)).await {
+                                        Err(error) => {
+                                            debug!(%addr, %error);
+                                        }
+
+                                        Ok(response) => {
+                                            debug!(%addr, ?response)
+                                        }
+                                    }
                                 }
+                                .instrument(span!(Level::INFO, "peer", %addr)),
+                            );
 
-                                Ok(response) => {
-                                    debug!(%addr, ?response)
-                                }
+                            debug!(?handle);
+                        }
+
+                        Err(err) => {
+                            error!(?err, "accept() failed; continuing to listen");
+
+                            if let Some(backoff) = backoff.on_error(&err) {
+                                tokio::time::sleep(backoff).await;
                             }
                         }
-                        .instrument(span!(Level::INFO, "peer", %addr)),
-                    );
+                    }
 
-                    debug!(?handle);
                     continue;
                 }
 
@@ -612,6 +707,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         pin::Pin,
         task::{Context, Poll},
         time::Duration,
@@ -773,6 +869,96 @@ mod tests {
             matches!(outcome, Err(Error::FrameTooBig(SIZE))),
             "{outcome:?}"
         );
+        Ok(())
+    }
+
+    /// A single `accept()` error must not stop the loop from serving the next,
+    /// successful accept -- the bug this guards against is `tokio::select!`
+    /// disabling the `Ok((stream, addr)) = req.accept()` arm for the rest of the
+    /// macro invocation whenever that future resolves to `Err`, which, combined
+    /// with `join_next` being gated on a non-empty `set`, could wedge the loop
+    /// until cancellation. This fails against the pre-fix pattern-matched arm and
+    /// passes against the `match`-in-the-body fix.
+    #[tokio::test]
+    async fn accept_error_does_not_wedge_the_loop() -> Result<(), Box<dyn error::Error>> {
+        /// Proves a connection was actually handed to the inner service (not just
+        /// accepted) by echoing one byte back over the raw stream.
+        #[derive(Clone, Copy, Debug, Default)]
+        struct RawEcho;
+
+        impl Service<TcpStream> for RawEcho {
+            type Output = ();
+            type Error = Error;
+
+            async fn serve(&self, mut stream: TcpStream) -> Result<(), Error> {
+                let mut buf = [0u8; 1];
+                _ = stream.read_exact(&mut buf).await?;
+                stream.write_all(&buf).await?;
+                Ok(())
+            }
+        }
+
+        /// Yields a scripted sequence of accept outcomes, then hangs (as a real
+        /// listener with nothing pending would) once the script is exhausted.
+        #[derive(Debug)]
+        struct ScriptedAcceptor {
+            results: Mutex<VecDeque<io::Result<(TokioTcpStream, SocketAddr)>>>,
+        }
+
+        impl Acceptor for ScriptedAcceptor {
+            async fn accept(&self) -> io::Result<(TokioTcpStream, SocketAddr)> {
+                match self.results.lock().await.pop_front() {
+                    Some(result) => result,
+                    None => std::future::pending().await,
+                }
+            }
+        }
+
+        let real_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = real_listener.local_addr()?;
+
+        let client = spawn(async move {
+            let mut stream = TokioTcpStream::connect(local_addr).await?;
+            stream.write_all(b"x").await?;
+
+            let mut buf = [0u8; 1];
+            _ = stream.read_exact(&mut buf).await?;
+
+            Ok::<_, io::Error>(buf[0])
+        });
+
+        let (stream, addr) = real_listener.accept().await?;
+        drop(real_listener);
+
+        let mut results = VecDeque::new();
+        results.push_back(Err(io::Error::from(io::ErrorKind::ConnectionAborted)));
+        results.push_back(Ok((stream, addr)));
+
+        let acceptor = ScriptedAcceptor {
+            results: Mutex::new(results),
+        };
+
+        let cancellation = CancellationToken::new();
+        let service = TcpListenerLayer::new(cancellation.clone()).layer(RawEcho);
+
+        // Drive the loop directly rather than through `Service<TcpListenerInput>`:
+        // that input carries a concrete `TcpListener`, and the whole point here is to
+        // inject an accept outcome a real listener can't be made to produce on demand.
+        let handle =
+            spawn(async move { service.accept_loop(acceptor, Extensions::default()).await });
+
+        let echoed = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect(
+                "accept() error wedged the loop: the Ok connection scripted after it \
+                 was never served",
+            )??;
+
+        assert_eq!(b'x', echoed);
+
+        cancellation.cancel();
+        handle.await??;
+
         Ok(())
     }
 }
