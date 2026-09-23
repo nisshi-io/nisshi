@@ -26,6 +26,7 @@ use nisshi_sans_io::{ErrorCode, RootMessageMeta};
 use nisshi_schema::{Registry, lake::House};
 use nisshi_service::ProgressBarExtension;
 use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
@@ -94,6 +95,10 @@ pub struct Broker<G, S> {
     transaction_maintenance_interval: Option<Duration>,
 
     cancellation: CancellationToken,
+
+    /// Present when OTLP metrics are enabled; flushed and shut down when
+    /// `main` returns so the last export interval is not lost on exit.
+    meter_provider: Option<SdkMeterProvider>,
 }
 
 impl<G, S> Broker<G, S>
@@ -129,6 +134,8 @@ where
             transaction_maintenance_interval: None,
 
             cancellation: CancellationToken::new(),
+
+            meter_provider: None,
         }
     }
 
@@ -160,6 +167,8 @@ where
         let silent = self.silent;
 
         let token = self.cancellation.clone();
+
+        let meter_provider = self.meter_provider.take();
 
         _ = set.spawn(async move {
             self.serve(started)
@@ -219,6 +228,18 @@ where
                 if stdout.is_term() {
                     _ = stdout.clear_screen().ok();
                 }
+            }
+        }
+
+        // A failed final export should not turn a clean shutdown into an
+        // error exit; it is reported and the broker still exits cleanly.
+        if let Some(meter_provider) = meter_provider {
+            if let Err(err) = meter_provider.force_flush() {
+                warn!(?err, "OTLP metrics could not be flushed on shutdown");
+            }
+
+            if let Err(err) = meter_provider.shutdown() {
+                warn!(?err, "OTLP metrics provider could not be shut down");
             }
         }
 
@@ -719,13 +740,12 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
 
 impl Builder<i32, String, Uuid, Url, Url, Url> {
     pub async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
-        if let Some(otlp_endpoint_url) = self
+        let meter_provider = self
             .otlp_endpoint_url
             .clone()
             .inspect(|otlp_endpoint_url| debug!(%otlp_endpoint_url))
-        {
-            otel::metric_exporter(otlp_endpoint_url)?;
-        }
+            .map(otel::metric_exporter)
+            .transpose()?;
 
         let builder = {
             let mut builder = StorageContainer::builder();
@@ -796,6 +816,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
             cancellation: self.cancellation,
+            meter_provider,
         })
     }
 }

@@ -45,7 +45,6 @@ nisshi-storage-null.workspace = true
 nisshi-storage-slatedb = { workspace = true, optional = true }
 nisshi-storage-sql = { workspace = true, optional = true }
 nisshi-storage.workspace = true
-opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

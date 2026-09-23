@@ -29,7 +29,6 @@ use glob::PatternError;
 use jsonschema::ValidationError;
 use nisshi_sans_io::ErrorCode;
 use opentelemetry::{InstrumentationScope, global, metrics::Meter};
-use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use regex::{Regex, Replacer};
 use thiserror::Error;
@@ -78,7 +77,6 @@ pub enum Error {
     EmptyCoordinatorWrapper,
     EmptyJoinGroupRequestProtocol,
     ExpectedJoinGroupRequestProtocol(&'static str),
-    ExporterBuild(Arc<ExporterBuildError>),
 
     Hyper(Arc<hyper::http::Error>),
     Io(Arc<io::Error>),
@@ -119,12 +117,6 @@ pub enum Error {
 impl From<PatternError> for Error {
     fn from(value: PatternError) -> Self {
         Self::Pattern(Arc::new(value))
-    }
-}
-
-impl From<ExporterBuildError> for Error {
-    fn from(value: ExporterBuildError) -> Self {
-        Self::ExporterBuild(Arc::new(value))
     }
 }
 

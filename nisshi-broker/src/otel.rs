@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use url::Url;
 
 use crate::{Result, TracingFormat};
@@ -28,8 +29,8 @@ pub fn init(tracing_format: TracingFormat) -> Result<Guard> {
     tracing::init_tracing_subscriber(tracing_format).map(|tracer| Guard { tracer })
 }
 
-pub fn metric_exporter(endpoint: Url) -> Result<()> {
-    nisshi_otel::meter_provider(endpoint, env!("CARGO_PKG_NAME"))
-        .map(|_meter_provider| ())
-        .map_err(Into::into)
+/// Installs the global OTLP meter provider and returns it so the caller can
+/// flush and shut it down on exit; the global keeps it alive meanwhile.
+pub fn metric_exporter(endpoint: Url) -> Result<SdkMeterProvider> {
+    nisshi_otel::meter_provider(endpoint, env!("CARGO_PKG_NAME")).map_err(Into::into)
 }
