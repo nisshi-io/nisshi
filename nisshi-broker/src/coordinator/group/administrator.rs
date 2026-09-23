@@ -4198,16 +4198,7 @@ mod tests {
         const CLIENT_ID: &str = "console-consumer";
         const GROUP_ID: &str = "test-consumer-group-empty-protocols";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Controller::with_storage(storage)?;
+        let s = Controller::with_storage(storage(cluster, node).await?)?;
 
         // A fresh group (never joined before) receiving a JoinGroupRequest whose
         // `protocols` array is present but empty must not panic indexing `protocols[0]`;
