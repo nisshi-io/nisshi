@@ -1213,12 +1213,10 @@ mod tests {
         let handle =
             spawn(async move { service.accept_loop(acceptor, Extensions::default()).await });
 
-        let echoed = timeout(Duration::from_secs(5), client)
-            .await
-            .expect(
-                "accept() error wedged the loop: the Ok connection scripted after it \
+        let echoed = timeout(Duration::from_secs(5), client).await.expect(
+            "accept() error wedged the loop: the Ok connection scripted after it \
                  was never served",
-            )??;
+        )??;
 
         assert_eq!(b'x', echoed);
 
