@@ -24,8 +24,9 @@ use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nisshi_sans_io::{ErrorCode, RootMessageMeta};
 use nisshi_schema::{Registry, lake::House};
+use nisshi_service::ProgressBarExtension;
 use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
-use rama::{Context, Service};
+use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
@@ -331,7 +332,7 @@ where
             tokio::select! {
                 Ok((stream, addr)) = listener.accept() => {
 
-                    let mut c = Context::default();
+                    let extensions = Extensions::default();
 
                     let pb = if self.silent {
                         None
@@ -342,7 +343,7 @@ where
                         pb.set_message("connected");
                         pb.tick();
 
-                        _ = c.insert(pb.clone());
+                        _ = extensions.insert(ProgressBarExtension::new(pb.clone()));
                         Some(pb)
                     };
 
@@ -365,7 +366,9 @@ where
                         let result = match acceptor {
                             Some(acceptor) => {
                                 match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-                                    Ok(Ok(tls)) => service.serve(c, tls).await,
+                                    Ok(Ok(tls)) => {
+                                        service.serve(ServiceInput { input: tls, extensions }).await
+                                    }
                                     Ok(Err(err)) => {
                                         handshake_failed(addr, &err);
                                         Ok(())
@@ -376,7 +379,11 @@ where
                                     }
                                 }
                             }
-                            None => service.serve(c, stream).await,
+                            None => {
+                                service
+                                    .serve(TcpStream::from_tokio_tcp_stream(stream, extensions))
+                                    .await
+                            }
                         };
 
                         match result {
@@ -720,7 +727,40 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             otel::metric_exporter(otlp_endpoint_url)?;
         }
 
-        let storage = StorageContainer::builder()
+        let builder = {
+            let mut builder = StorageContainer::builder();
+
+            builder.with_factory(Arc::new(nisshi_storage_null::EngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(nisshi_storage_dynostore::MemoryEngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::S3OptimisticConcurrencyEngineFactory,
+            ));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::GoogleCloudStorageEngineFactory,
+            ));
+
+            #[cfg(feature = "libsql")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LiteEngineFactory));
+
+            #[cfg(feature = "postgres")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::PostgresEngineFactory));
+
+            #[cfg(feature = "slatedb")]
+            builder.with_factory(Arc::new(nisshi_storage_slatedb::EngineFactory));
+
+            #[cfg(feature = "turso")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LimboEngineFactory));
+
+            builder
+        };
+
+        let storage = builder
             .cluster_id(self.cluster_id.clone())
             .node_id(self.node_id)
             .advertised_listener(self.advertised_listener.clone())

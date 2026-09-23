@@ -32,7 +32,7 @@ use nisshi_sans_io::{
     ApiKey as _, ApiVersionsRequest, ApiVersionsResponse, Body, Frame, Header, MetadataRequest,
     MetadataResponse,
 };
-use nisshi_storage::StorageContainer;
+use nisshi_storage::ArcDynStorage;
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _},
@@ -136,7 +136,7 @@ async fn spawn_broker(tls: Option<ServerConfig>) -> Result<RunningBroker> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = Url::parse(&format!("tcp://{addr}"))?;
 
-    let mut broker = Broker::<Controller<StorageContainer>, StorageContainer>::builder()
+    let mut broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
         .node_id(NODE_ID)
         .cluster_id(format!("tls-{}", Uuid::now_v7()))
         .incarnation_id(Uuid::now_v7())

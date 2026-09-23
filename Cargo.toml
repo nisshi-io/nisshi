@@ -17,6 +17,10 @@ members = [
     "nisshi-schema",
     "nisshi-service",
     "nisshi-storage",
+    "nisshi-storage-dynostore",
+    "nisshi-storage-null",
+    "nisshi-storage-slatedb",
+    "nisshi-storage-sql",
     "nisshi-topic",
 ]
 
@@ -49,6 +53,7 @@ all = { level = "warn", priority = -1 }
 [workspace.lints.rust]
 deprecated_in_future = "warn"
 elided_lifetimes_in_paths = "deny"
+linker_messages = "allow"
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 non_ascii_idents = "forbid"
@@ -114,7 +119,7 @@ lz4 = "1.28.1"
 nanoid = "0.4.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
-object_store = { version = "0.13.1", features = ["aws", "gcp"] }
+object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 opentelemetry = "0.31.0"
 opentelemetry-otlp = "0.31.0"
 opentelemetry-semantic-conventions = "0.31.0"
@@ -133,7 +138,7 @@ protobuf = { version = "3.7.1", features = ["with-bytes"] }
 protobuf-json-mapping = "3.7.1"
 protobuf-parse = "3.7.1"
 quote = "1.0"
-rama = { version = "0.2.0", features = ["http", "tcp"] }
+rama = { version = "0.4.0", features = ["http", "tcp"] }
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex = "1.12.3"
@@ -163,6 +168,10 @@ nisshi-sans-io = { version = "0.7.0-pre.2", path = "nisshi-sans-io", default-fea
 nisshi-schema = { version = "0.7.0-pre.2", path = "nisshi-schema", default-features = false }
 nisshi-service = { version = "0.7.0-pre.2", path = "nisshi-service", default-features = false }
 nisshi-storage = { version = "0.7.0-pre.2", path = "nisshi-storage", default-features = false }
+nisshi-storage-dynostore = { version = "0.7.0-pre.2", path = "nisshi-storage-dynostore", default-features = false }
+nisshi-storage-null = { version = "0.7.0-pre.2", path = "nisshi-storage-null", default-features = false }
+nisshi-storage-slatedb = { version = "0.7.0-pre.2", path = "nisshi-storage-slatedb", default-features = false }
+nisshi-storage-sql = { version = "0.7.0-pre.2", path = "nisshi-storage-sql", default-features = false }
 nisshi-topic = { version = "0.7.0-pre.2", path = "nisshi-topic", default-features = false }
 tempfile = "3"
 thiserror = "2.0"

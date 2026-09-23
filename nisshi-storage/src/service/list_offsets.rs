@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,17 @@
 use std::{collections::BTreeSet, ops::Deref as _};
 
 use nisshi_sans_io::{
-    ApiKey, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse,
+    ApiKey, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse, RequestInput,
     list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service;
 /// use nisshi_sans_io::{
 ///     ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest,
 ///     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
@@ -47,13 +47,12 @@ use crate::{Error, Result, Storage, Topition};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
+/// let service = ListOffsetsService { storage };
 ///
 /// let topic = "abcba";
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         ListOffsetsRequest::default()
 ///             .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
 ///             .replica_id(NODE_ID)
@@ -91,35 +90,36 @@ use crate::{Error, Result, Storage, Topition};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ListOffsetsService;
+#[derive(Clone, Debug)]
+pub struct ListOffsetsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for ListOffsetsService {
+impl<G> ApiKey for ListOffsetsService<G> {
     const KEY: i16 = ListOffsetsRequest::KEY;
 }
 
-impl<G> Service<G, ListOffsetsRequest> for ListOffsetsService
+impl<G, I> Service<I> for ListOffsetsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<ListOffsetsRequest>> + Send + 'static,
 {
-    type Response = ListOffsetsResponse;
+    type Output = ListOffsetsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ListOffsetsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
         let throttle_time_ms = Some(0);
 
-        let isolation_level = req
+        let isolation_level = input
+            .request
             .isolation_level
             .map_or(Ok(IsolationLevel::ReadUncommitted), |isolation_level| {
                 IsolationLevel::try_from(isolation_level)
             })?;
 
-        let topics = if let Some(topics) = req.topics {
+        let topics = if let Some(topics) = input.request.topics {
             let mut offsets = vec![];
 
             for topic in topics {
@@ -133,7 +133,7 @@ where
                 }
             }
 
-            ctx.state()
+            self.storage
                 .list_offsets(isolation_level, offsets.deref())
                 .await
                 .inspect(|r| debug!(?r, ?offsets))

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,25 +16,29 @@ use std::{
     error::{self},
     fmt::Debug,
     io,
-    marker::PhantomData,
     time::SystemTime,
 };
 
 use bytes::Bytes;
 use nanoid::nanoid;
+use nisshi_sans_io::BytesInput;
 use opentelemetry::KeyValue;
-use rama::{Context, Layer, Service};
+use rama::{
+    Layer, Service,
+    extensions::{Extension, Extensions, ExtensionsRef},
+    tcp::TcpStream,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
-    net::{TcpListener, TcpStream},
+    sync::Mutex,
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, Level, debug, error, instrument, span};
 
 use crate::{
-    BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE, frame_length,
-    frame_size,
+    BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
+    TcpListenerInput, frame_length, frame_size,
 };
 
 /// The largest request payload a listener accepts unless [`TcpContext::maximum_frame_size`]
@@ -80,35 +84,32 @@ impl<S> Debug for TcpListenerService<S> {
     }
 }
 
-impl<State, S> Service<State, TcpListener> for TcpListenerService<S>
+impl<S> Service<TcpListenerInput> for TcpListenerService<S>
 where
-    S: Service<State, TcpStream> + Clone,
-    S::Response: Debug,
+    S: Service<TcpStream> + Clone,
+    S::Output: Debug,
     S::Error: error::Error,
-    State: Clone + Send + Sync + 'static,
 {
-    type Response = ();
+    type Output = ();
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        req: TcpListener,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(req))]
+    async fn serve(&self, req: TcpListenerInput) -> Result<Self::Output, Self::Error> {
         let mut set = JoinSet::new();
+
+        let extensions = req.extensions.clone();
 
         loop {
             tokio::select! {
-                Ok((stream, addr)) = req.accept() => {
+                Ok((stream, addr)) = req.listener.accept() => {
                     debug!(?req, ?stream, %addr);
 
                     let service = self.inner.clone();
-                    let ctx = ctx.clone();
+                    let extensions = extensions.clone();
 
                     let handle = set.spawn(
                         async move {
-                            match service.serve(ctx, stream).await {
+                            match service.serve(TcpStream::from_tokio_tcp_stream(stream, extensions)).await {
                                 Err(error) => {
                                     debug!(%addr, %error);
                                 }
@@ -142,7 +143,7 @@ where
 
 /// A [context state][`Context#method.state`] state used by [`TcpContextLayer`] and [`TcpContextService`]
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Extension)]
 pub struct TcpContext {
     cluster_id: Option<String>,
     maximum_frame_size: Option<usize>,
@@ -151,9 +152,27 @@ pub struct TcpContext {
 impl Default for TcpContext {
     fn default() -> Self {
         Self {
-            cluster_id: None,
+            cluster_id: Default::default(),
             maximum_frame_size: Some(DEFAULT_MAXIMUM_FRAME_SIZE),
         }
+    }
+}
+
+#[derive(Clone, Debug, Extension)]
+struct ClusterIdExtension(String);
+
+#[derive(Clone, Debug, Extension)]
+struct MaximumFrameSizeExtension(usize);
+
+impl Default for MaximumFrameSizeExtension {
+    fn default() -> Self {
+        Self(DEFAULT_MAXIMUM_FRAME_SIZE)
+    }
+}
+
+impl From<&MaximumFrameSizeExtension> for usize {
+    fn from(value: &MaximumFrameSizeExtension) -> Self {
+        value.0
     }
 }
 
@@ -195,6 +214,98 @@ impl<S> Layer<S> for TcpContextLayer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TcpStreamLayer;
+
+impl<S> Layer<S> for TcpStreamLayer {
+    type Service = TcpStreamService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Self::Service { inner }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TcpStreamService<S> {
+    inner: S,
+}
+
+impl<S> Service<TcpStream> for TcpStreamService<S>
+where
+    S: Service<BytesInput, Output = Bytes>,
+    S::Error: Into<Error>,
+{
+    type Output = TcpStream;
+    type Error = Error;
+
+    async fn serve(&self, stream: TcpStream) -> Result<Self::Output, Self::Error> {
+        let (frame, stream) = ReadHalfService.serve(stream).await?;
+
+        let extensions = stream.extensions.fork();
+
+        let frame = self
+            .inner
+            .serve(BytesInput {
+                bytes: frame,
+                extensions,
+            })
+            .await
+            .map_err(Into::into)?;
+
+        WriteHalfService.serve((frame, stream)).await
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct WriteHalfService;
+
+impl Service<(Bytes, TcpStream)> for WriteHalfService {
+    type Output = TcpStream;
+    type Error = Error;
+
+    async fn serve(
+        &self,
+        (frame, mut stream): (Bytes, TcpStream),
+    ) -> Result<Self::Output, Self::Error> {
+        stream.write_all(&frame[..]).await?;
+
+        BYTES_SENT.add(frame.len() as u64, &[]);
+
+        Ok(stream)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ReadHalfService;
+
+impl Service<TcpStream> for ReadHalfService {
+    type Output = (Bytes, TcpStream);
+    type Error = Error;
+
+    async fn serve(&self, mut input: TcpStream) -> Result<Self::Output, Self::Error> {
+        let mut size = [0u8; 4];
+        _ = input.read_exact(&mut size).await?;
+
+        let frame_size = frame_size(size)?;
+
+        if frame_size
+            > input
+                .extensions()
+                .get_ref_or_insert(MaximumFrameSizeExtension::default)
+                .into()
+        {
+            return Err(Into::into(Error::FrameTooBig(frame_size)));
+        }
+
+        let mut buffer: Vec<u8> = vec![0u8; frame_length(size)?];
+        buffer[0..size.len()].copy_from_slice(&size[..]);
+        _ = input.read_exact(&mut buffer[4..]).await?;
+        BYTES_RECEIVED.add(buffer.len() as u64, &[]);
+
+        Ok((Bytes::from(buffer), input))
+    }
+}
+
 /// A [`Service`] that requires the [`TcpContext`] as the service [`Context`] state
 ///
 /// The connection may be any stream type, for example a [`TcpStream`] or a TLS
@@ -212,42 +323,60 @@ impl<S> Debug for TcpContextService<S> {
     }
 }
 
-impl<State, S, Stream> Service<State, Stream> for TcpContextService<S>
+impl<S, Stream> Service<Stream> for TcpContextService<S>
 where
-    S: Service<TcpContext, Stream>,
+    S: Service<Stream>,
     S::Error: From<io::Error>,
-    State: Clone + Send + Sync + 'static,
-    Stream: Send + 'static,
+    Stream: ExtensionsRef + Send + 'static,
 {
-    type Response = S::Response;
+    type Output = S::Output;
     type Error = S::Error;
 
     #[instrument(skip_all)]
-    async fn serve(&self, ctx: Context<State>, req: Stream) -> Result<Self::Response, Self::Error> {
-        let (ctx, _) = ctx.swap_state(self.state.clone());
+    async fn serve(&self, req: Stream) -> Result<Self::Output, Self::Error> {
+        if let Some(cluster_id) = self.state.cluster_id.clone() {
+            _ = req.extensions().insert(ClusterIdExtension(cluster_id));
+        }
 
-        self.inner.serve(ctx, req).await
+        if let Some(maximum_frame_size) = self.state.maximum_frame_size {
+            _ = req
+                .extensions()
+                .insert(MaximumFrameSizeExtension(maximum_frame_size));
+        }
+
+        self.inner.serve(req).await
     }
 }
 
 /// A [`Service`] writing [`Bytes`] into a [`TcpStream`], responding with a length delimited frame of [`Bytes`]
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct BytesTcpService;
+pub struct BytesTcpService {
+    stream: Mutex<TcpStream>,
+}
 
-impl Service<TcpStream, Bytes> for BytesTcpService {
-    type Response = Bytes;
+impl BytesTcpService {
+    pub fn new(stream: TcpStream) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+        }
+    }
+}
+
+impl Debug for BytesTcpService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BytesTcpService)).finish()
+    }
+}
+
+impl Service<BytesInput> for BytesTcpService {
+    type Output = Bytes;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        mut ctx: Context<TcpStream>,
-        req: Bytes,
-    ) -> Result<Self::Response, Self::Error> {
-        let stream = ctx.state_mut();
+    #[instrument(skip_all)]
+    async fn serve(&self, req: BytesInput) -> Result<Self::Output, Self::Error> {
+        let mut stream = self.stream.lock().await;
 
-        stream.write_all(&req[..]).await?;
-        BYTES_SENT.add(req.len() as u64, &[]);
+        stream.write_all(&req.bytes[..]).await?;
+        BYTES_SENT.add(req.bytes.len() as u64, &[]);
 
         let mut size = [0u8; 4];
         _ = stream.read_exact(&mut size).await?;
@@ -263,35 +392,29 @@ impl Service<TcpStream, Bytes> for BytesTcpService {
 
 /// A [`Layer`] receiving [`Bytes`] from a [`TcpStream`]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TcpBytesLayer<State = ()> {
-    _state: PhantomData<State>,
-}
+pub struct TcpBytesLayer;
 
-impl<S, State> Layer<S> for TcpBytesLayer<State> {
-    type Service = TcpBytesService<S, State>;
+impl<S> Layer<S> for TcpBytesLayer {
+    type Service = TcpBytesService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
-            inner,
-            _state: PhantomData,
-        }
+        Self::Service { inner }
     }
 }
 
 /// A [`Service`] receiving [`Bytes`] from a [`TcpStream`], calling an inner [`Service`] and sending [`Bytes`] into the [`TcpStream`]
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TcpBytesService<S, State> {
+pub struct TcpBytesService<S> {
     inner: S,
-    _state: PhantomData<State>,
 }
 
-impl<S, State> Debug for TcpBytesService<S, State> {
+impl<S> Debug for TcpBytesService<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(TcpBytesService)).finish()
     }
 }
 
-impl<S, State> TcpBytesService<S, State> {
+impl<S> TcpBytesService<S> {
     fn elapsed_millis(&self, start: SystemTime) -> u64 {
         start
             .elapsed()
@@ -299,11 +422,10 @@ impl<S, State> TcpBytesService<S, State> {
     }
 }
 
-impl<S, State> TcpBytesService<S, State>
+impl<S> TcpBytesService<S>
 where
-    S: Service<State, Bytes, Response = Bytes>,
+    S: Service<BytesInput, Output = Bytes>,
     S::Error: From<Error> + From<io::Error> + Debug,
-    State: Clone + Default + Send + Sync + 'static,
 {
     #[instrument(skip_all)]
     async fn wait<R>(
@@ -352,16 +474,18 @@ where
     async fn process(
         &self,
         attributes: &[KeyValue],
-        ctx: Context<TcpContext>,
         request: Bytes,
+        extensions: Extensions,
     ) -> Result<Bytes, S::Error> {
         REQUEST_SIZE.record(request.len() as u64, attributes);
 
-        let (ctx, _) = ctx.swap_state(State::default());
         let request_start = SystemTime::now();
 
         self.inner
-            .serve(ctx, request)
+            .serve(BytesInput {
+                bytes: request,
+                extensions,
+            })
             .await
             .inspect_err(|err| error!(?err))
             .inspect(|response| {
@@ -390,54 +514,55 @@ where
         req: &mut R,
         maximum_frame_size: Option<usize>,
         attributes: &[KeyValue],
-        ctx: Context<TcpContext>,
     ) -> Result<(), S::Error>
     where
-        R: AsyncReadExt + AsyncWriteExt + Unpin,
+        R: AsyncReadExt + AsyncWriteExt + Unpin + ExtensionsRef,
     {
         let size = self.wait(req, maximum_frame_size).await?;
         let request = self.read(req, size).await?;
-        let response = self.process(attributes, ctx, request).await?;
+        let response = self
+            .process(attributes, request, req.extensions().clone())
+            .await?;
         self.write(req, response).await
     }
 }
 
-impl<S, State, Stream> Service<TcpContext, Stream> for TcpBytesService<S, State>
+impl<S, Stream> Service<Stream> for TcpBytesService<S>
 where
-    S: Service<State, Bytes, Response = Bytes>,
+    S: Service<BytesInput, Output = Bytes>,
     S::Error: From<Error> + From<io::Error> + Debug,
-    State: Clone + Default + Send + Sync + 'static,
-    Stream: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
+    Stream: AsyncReadExt + AsyncWriteExt + ExtensionsRef + Unpin + Send + Sync + 'static,
 {
-    type Response = ();
+    type Output = ();
 
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<TcpContext>,
-        mut req: Stream,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(req))]
+    async fn serve(&self, mut req: Stream) -> Result<Self::Output, Self::Error> {
         let attributes = {
-            let state = ctx.state();
-
             let mut attributes = vec![];
 
-            if let Some(cluster_id) = state.cluster_id.clone() {
+            if let Some(cluster_id) = req
+                .extensions()
+                .get_ref::<ClusterIdExtension>()
+                .cloned()
+                .map(|cluster_id| cluster_id.0)
+            {
                 attributes.push(KeyValue::new("cluster_id", cluster_id))
             }
 
             attributes
         };
 
-        let maximum_frame_size = ctx.state().maximum_frame_size;
+        let maximum_frame_size = req
+            .extensions()
+            .get_ref::<MaximumFrameSizeExtension>()
+            .map(|maximum_frame_size| maximum_frame_size.0);
 
         loop {
-            let ctx = ctx.clone();
             let attributes = attributes.clone();
 
-            self.req(&mut req, maximum_frame_size, &attributes[..], ctx)
+            self.req(&mut req, maximum_frame_size, &attributes[..])
                 .await?
         }
     }
@@ -467,19 +592,18 @@ impl<S> Debug for BytesService<S> {
     }
 }
 
-impl<S, State> Service<State, Bytes> for BytesService<S>
+impl<S> Service<BytesInput> for BytesService<S>
 where
-    S: Service<State, Bytes, Response = Bytes>,
-    State: Clone + Send + Sync + 'static,
+    S: Service<BytesInput, Output = Bytes>,
 {
-    type Response = Bytes;
+    type Output = Bytes;
     type Error = S::Error;
 
     #[instrument(skip_all)]
-    async fn serve(&self, ctx: Context<State>, req: Bytes) -> Result<Self::Response, Self::Error> {
-        debug!(req = ?&req[..]);
+    async fn serve(&self, req: BytesInput) -> Result<Self::Output, Self::Error> {
+        debug!(req = ?&req.bytes[..]);
         self.inner
-            .serve(ctx, req)
+            .serve(req)
             .await
             .inspect(|response| debug!(response = ?&response[..]))
     }
@@ -487,7 +611,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use tokio::{
+        io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex},
+        spawn,
+    };
 
     use super::*;
 
@@ -495,17 +628,17 @@ mod tests {
     #[derive(Clone, Copy, Debug, Default)]
     struct Echo;
 
-    impl Service<(), Bytes> for Echo {
-        type Response = Bytes;
+    impl Service<BytesInput> for Echo {
+        type Output = Bytes;
         type Error = Error;
 
-        async fn serve(&self, _ctx: Context<()>, req: Bytes) -> Result<Bytes, Error> {
-            Ok(req)
+        async fn serve(&self, req: BytesInput) -> Result<Bytes, Error> {
+            Ok(req.bytes)
         }
     }
 
-    fn service() -> TcpBytesService<Echo, ()> {
-        TcpBytesLayer::<()>::default().into_layer(Echo)
+    fn service() -> TcpBytesService<Echo> {
+        TcpBytesLayer.into_layer(Echo)
     }
 
     fn header(size: i32) -> [u8; 4] {
@@ -564,24 +697,80 @@ mod tests {
         assert!(matches!(err, Error::InvalidFrameLength(-1)), "{err:?}");
     }
 
+    struct DuplexStreamWithExtensions {
+        stream: DuplexStream,
+        extensions: Extensions,
+    }
+
+    impl AsRef<DuplexStream> for DuplexStreamWithExtensions {
+        fn as_ref(&self) -> &DuplexStream {
+            &self.stream
+        }
+    }
+
+    impl AsyncRead for DuplexStreamWithExtensions {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DuplexStreamWithExtensions {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    impl ExtensionsRef for DuplexStreamWithExtensions {
+        fn extensions(&self) -> &Extensions {
+            &self.extensions
+        }
+    }
+
     #[tokio::test]
     async fn serve_rejects_oversized_frame_without_reading_body() -> Result<(), Error> {
-        let (mut client, server) = tokio::io::duplex(64);
+        let (mut client, server) = duplex(64);
 
-        let ctx = Context::with_state(TcpContext::default().maximum_frame_size(Some(1024)));
-        let handle = tokio::spawn(async move { service().serve(ctx, server).await });
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(MaximumFrameSizeExtension(1_024));
+
+            let input = DuplexStreamWithExtensions {
+                stream: server,
+                extensions,
+            };
+
+            service().serve(input).await
+        });
+
+        const SIZE: usize = 65_536;
 
         // Only the length prefix is sent. If the guard admitted the frame,
         // `read` would block in `read_exact` waiting for a body that never
         // arrives, so the timeout is what turns that into a failure.
-        client.write_all(&header(65_536)).await?;
+        client.write_all(&header(SIZE as i32)).await?;
 
         let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("oversized frame was admitted: serve is blocked reading the body")?;
 
         assert!(
-            matches!(outcome, Err(Error::FrameTooBig(65_536))),
+            matches!(outcome, Err(Error::FrameTooBig(SIZE))),
             "{outcome:?}"
         );
         Ok(())

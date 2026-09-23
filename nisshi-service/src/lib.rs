@@ -36,16 +36,16 @@
 //! # use nisshi_service::Error;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
+//! # use rama::{Layer as _, Service as _};
 //! # use nisshi_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
 //! # use nisshi_service::{
 //! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
 //! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
 //! #     ResponseService,
 //! # };
-//! let frame_route = FrameRouteService::<(), Error>::builder()
+//! let frame_route = FrameRouteService::<Error>::builder()
 //!     .with_service(
-//!         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
+//!         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_| {
 //!             Ok(MetadataResponse::default()
 //!                 .brokers(Some([].into()))
 //!                 .topics(Some([].into()))
@@ -75,16 +75,16 @@
 //! # use nisshi_service::Error;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
+//! # use rama::{Layer as _, Service as _};
 //! # use nisshi_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
 //! # use nisshi_service::{
 //! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
 //! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
 //! #     ResponseService,
 //! # };
-//! # let frame_route = FrameRouteService::<(), Error>::builder()
+//! # let frame_route = FrameRouteService::<Error>::builder()
 //! #     .with_service(
-//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
+//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_| {
 //! #             Ok(MetadataResponse::default()
 //! #                 .brokers(Some([].into()))
 //! #                 .topics(Some([].into()))
@@ -127,16 +127,16 @@
 //! # use nisshi_service::Error;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
+//! # use rama::{Layer as _, Service as _};
 //! # use nisshi_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
 //! # use nisshi_service::{
 //! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
 //! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
 //! #     ResponseService,
 //! # };
-//! # let frame_route = FrameRouteService::<(), Error>::builder()
+//! # let frame_route = FrameRouteService::<Error>::builder()
 //! #     .with_service(
-//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
+//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_| {
 //! #             Ok(MetadataResponse::default()
 //! #                 .brokers(Some([].into()))
 //! #                 .topics(Some([].into()))
@@ -160,7 +160,7 @@
 //!       .include_cluster_authorized_operations(Some(false))
 //!       .include_topic_authorized_operations(Some(false));
 //!
-//!   let response = service.serve(Context::default(), request).await?;
+//!   let response = service.serve(request.into()).await?;
 //!
 //!   assert_eq!(Some("nisshi".into()), response.cluster_id);
 //! # Ok(())
@@ -178,16 +178,16 @@
 //! # use nisshi_service::Error;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
+//! # use rama::{Layer as _, Service as _};
 //! # use nisshi_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
 //! # use nisshi_service::{
 //! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
 //! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
 //! #     ResponseService,
 //! # };
-//! # let frame_route = FrameRouteService::<(), Error>::builder()
+//! # let frame_route = FrameRouteService::<Error>::builder()
 //! #     .with_service(
-//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
+//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_| {
 //! #             Ok(MetadataResponse::default()
 //! #                 .brokers(Some([].into()))
 //! #                 .topics(Some([].into()))
@@ -207,10 +207,10 @@
 //! #      .into_layer(frame_route);
 //! let response = service
 //!     .serve(
-//!         Context::default(),
 //!         ApiVersionsRequest::default()
 //!             .client_software_name(Some("abcba".into()))
-//!             .client_software_version(Some("1.2321".into())),
+//!             .client_software_version(Some("1.2321".into()))
+//!             .into(),
 //!     )
 //!     .await?;
 //!
@@ -236,13 +236,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use indicatif::ProgressBar;
 use nisshi_sans_io::{Body, Frame};
 use opentelemetry::{
     InstrumentationScope, KeyValue, global,
     metrics::{Counter, Histogram, Meter},
 };
 use opentelemetry_semantic_conventions::SCHEMA_URL;
-use rama::{Context, Layer, Service};
+use rama::{Layer, Service, extensions::Extension};
 use rand::{prelude::*, rngs::SmallRng};
 use tokio::{net::lookup_host, sync::oneshot, task::JoinError, time::sleep};
 use tracing::{debug, instrument};
@@ -252,9 +253,12 @@ mod api;
 mod channel;
 mod consumer;
 mod frame;
+mod input;
 mod stream;
 
 pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
+
+pub use input::TcpListenerInput;
 
 pub use channel::{
     ChannelFrameLayer, ChannelFrameService, FrameChannelService, FrameReceiver, FrameSender,
@@ -272,7 +276,23 @@ pub use frame::{
 pub use stream::{
     BytesLayer, BytesService, BytesTcpService, DEFAULT_MAXIMUM_FRAME_SIZE, TcpBytesLayer,
     TcpBytesService, TcpContext, TcpContextLayer, TcpContextService, TcpListenerLayer,
+    TcpStreamLayer, TcpStreamService,
 };
+
+#[derive(Clone, Debug, Extension)]
+pub struct ProgressBarExtension(ProgressBar);
+
+impl ProgressBarExtension {
+    pub fn new(progress_bar: ProgressBar) -> Self {
+        Self(progress_bar)
+    }
+}
+
+impl AsRef<ProgressBar> for ProgressBarExtension {
+    fn as_ref(&self) -> &ProgressBar {
+        &self.0
+    }
+}
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -524,21 +544,20 @@ impl<S> LatencyIntroducingService<S> {
     }
 }
 
-impl<S, Q, State> Service<State, Q> for LatencyIntroducingService<S>
+impl<S, Q> Service<Q> for LatencyIntroducingService<S>
 where
-    S: Service<State, Q>,
+    S: Service<Q>,
     Q: Send + 'static,
     S::Error: From<Error>,
-    State: Send + Sync + 'static,
 {
-    type Response = S::Response;
+    type Output = S::Output;
 
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip_all)]
+    async fn serve(&self, req: Q) -> Result<Self::Output, Self::Error> {
         self.introduce_latency().await?;
-        let result = self.inner.serve(ctx, req).await;
+        let result = self.inner.serve(req).await;
         self.introduce_latency().await?;
         result
     }

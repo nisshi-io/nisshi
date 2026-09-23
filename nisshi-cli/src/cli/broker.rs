@@ -26,7 +26,7 @@ use clap::Parser;
 use nisshi_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use nisshi_sans_io::ErrorCode;
 use nisshi_schema::Registry;
-use nisshi_storage::{ArcDynStorage, StorageContainer};
+use nisshi_storage::ArcDynStorage;
 use owo_colors::{OwoColorize as _, Stream, Style};
 use rustls::{
     ServerConfig,
@@ -310,7 +310,7 @@ impl Arg {
             None => None,
         };
 
-        let broker = Broker::<Controller<StorageContainer>, StorageContainer>::builder()
+        let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
             .node_id(NODE_ID)
             .cluster_id(cluster_id)
             .incarnation_id(incarnation_id)
@@ -404,7 +404,6 @@ impl Default for Sheet {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use clap::Parser as _;
     use tempfile::TempDir;
 
     use super::*;

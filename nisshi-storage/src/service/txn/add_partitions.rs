@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,36 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, ErrorCode};
-use rama::{Context, Service};
+use nisshi_sans_io::{
+    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, ErrorCode, RequestInput,
+};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage, TxnAddPartitionsRequest, TxnAddPartitionsResponse};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`AddPartitionsToTxnRequest`] returning [`AddPartitionsToTxnResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AddPartitionService;
+#[derive(Clone, Debug)]
+pub struct AddPartitionService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for AddPartitionService {
+impl<G> ApiKey for AddPartitionService<G> {
     const KEY: i16 = AddPartitionsToTxnRequest::KEY;
 }
 
-impl<G> Service<G, AddPartitionsToTxnRequest> for AddPartitionService
+impl<G, I> Service<I> for AddPartitionService<G>
 where
     G: Storage,
+    I: Into<RequestInput<AddPartitionsToTxnRequest>> + Send + 'static,
 {
-    type Response = AddPartitionsToTxnResponse;
+    type Output = AddPartitionsToTxnResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: AddPartitionsToTxnRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let req = TxnAddPartitionsRequest::try_from(req)?;
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = TxnAddPartitionsRequest::try_from(input.into().request)?;
 
-        match ctx.state().txn_add_partitions(req).await? {
+        match self.storage.txn_add_partitions(input).await? {
             TxnAddPartitionsResponse::VersionZeroToThree(results_by_topic_v_3_and_below) => {
                 Ok(AddPartitionsToTxnResponse::default()
                     .throttle_time_ms(0)
