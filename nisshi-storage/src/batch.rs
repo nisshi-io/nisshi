@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt::Debug,
     pin::Pin,
     sync::{Arc, LazyLock, Mutex},
@@ -146,8 +146,9 @@ impl<G> Future for Ticket<G> {
 
         match responses.remove(&self.id) {
             Some(BatchResponse::Response(response)) => {
-                BATCH_TICKET_POLL.add(1, &[KeyValue::new("outcome", "ready")]);
-                Poll::Ready(Ok(response))
+                let outcome = if response.is_ok() { "ready" } else { "error" };
+                BATCH_TICKET_POLL.add(1, &[KeyValue::new("outcome", outcome)]);
+                Poll::Ready(response)
             }
             Some(BatchResponse::Waker(_)) | None => {
                 BATCH_TICKET_POLL.add(1, &[KeyValue::new("outcome", "pending")]);
@@ -173,7 +174,7 @@ struct BatchRequest {
 #[derive(Clone, Debug)]
 enum BatchResponse {
     Waker(Waker),
-    Response(i64),
+    Response(Result<i64, Error>),
 }
 
 #[derive(Clone, Debug)]
@@ -255,38 +256,76 @@ where
             return Ok(());
         };
 
+        // Capture each ticket's id alongside its own record count, in the
+        // original queue order, *before* `combine` consumes the batches into
+        // a single merged one. This lets us work out, once the merged write
+        // lands, exactly which offset range within that write belongs to
+        // each coalesced request. A `BTreeSet<Uuid>` (as used previously)
+        // cannot do this: it reorders by `Uuid` value and discards the
+        // per-request record counts needed to compute anything other than
+        // the merged write's overall base offset.
         let owners = queued
             .iter()
-            .map(|batch_request| batch_request.id)
-            .collect::<BTreeSet<_>>();
+            .map(|batch_request| {
+                (
+                    batch_request.id,
+                    i64::from(batch_request.batch.last_offset_delta) + 1,
+                )
+            })
+            .collect::<Vec<_>>();
 
         debug!(owners = owners.len());
 
         let attributes = [KeyValue::new("topic", topition.topic.clone())];
 
-        if let Some(queued) = combine(queued.into_iter().map(|queued| queued.batch).collect())? {
-            let record_count = (queued.last_offset_delta + 1) as u64;
+        // Every coalesced request shares the fate of this single merged
+        // write, whether it fails to even combine (e.g. a malformed batch
+        // from one producer) or fails on the underlying storage write: in
+        // both cases every owner (not just whichever caller happened to
+        // trigger this flush) must be told the outcome, not just the one
+        // that happened to call `send_queued`.
+        let outcome = match combine(queued.into_iter().map(|queued| queued.batch).collect()) {
+            Ok(Some(combined)) => {
+                let record_count = (combined.last_offset_delta + 1) as u64;
 
-            let offset = self
-                .storage
-                .produce(transaction_id, topition, queued)
-                .await
-                .inspect(|offset| debug!(offset))?;
+                let result = self
+                    .storage
+                    .produce(transaction_id, topition, combined)
+                    .await;
 
-            SEND_QUEUED_PRODUCED_RECORDS_COUNTER.add(record_count, &attributes);
-
-            self.responses.lock().map(|mut responses| {
-                for owner in owners {
-                    if let Some(BatchResponse::Waker(waker)) =
-                        responses.insert(owner, BatchResponse::Response(offset))
-                    {
-                        debug!(waking = %owner);
-                        SEND_QUEUED_WAKE_COUNTER.add(1, &attributes);
-                        waker.wake();
-                    }
+                if let Ok(base_offset) = result {
+                    debug!(base_offset);
+                    SEND_QUEUED_PRODUCED_RECORDS_COUNTER.add(record_count, &attributes);
                 }
-            })?;
-        }
+
+                result
+            }
+
+            Ok(None) => return Ok(()),
+
+            Err(error) => Err(error),
+        };
+
+        self.responses.lock().map(|mut responses| {
+            let mut cumulative = 0;
+
+            for (owner, count) in owners {
+                let response = outcome
+                    .as_ref()
+                    .map(|base_offset| base_offset + cumulative)
+                    .map_err(Clone::clone);
+
+                cumulative += count;
+
+                if let Some(BatchResponse::Waker(waker)) =
+                    responses.insert(owner, BatchResponse::Response(response))
+                {
+                    debug!(waking = %owner);
+                    SEND_QUEUED_WAKE_COUNTER.add(1, &attributes);
+                    waker.wake();
+                }
+            }
+        })?;
 
         Ok(())
     }
@@ -723,13 +762,22 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct FlightRecorder {
         produced: Arc<Mutex<BTreeMap<Topition, Vec<deflated::Batch>>>>,
+        fail_next_produce: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FlightRecorder {
         fn new() -> Self {
             Self {
                 produced: Arc::new(Mutex::new(BTreeMap::new())),
+                fail_next_produce: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        /// Cause the *next* call to `produce` to fail, simulating a storage
+        /// write failure for whichever coalesced batch is in flight.
+        fn fail_next_produce(&self) {
+            self.fail_next_produce
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn produced(&self, topition: &Topition) -> Result<Option<Vec<inflated::Batch>>> {
@@ -794,6 +842,13 @@ mod tests {
             topition: &Topition,
             deflated: deflated::Batch,
         ) -> Result<i64> {
+            if self
+                .fail_next_produce
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Message("simulated storage failure".to_string()));
+            }
+
             self.produced
                 .lock()
                 .map(|mut produced| {
@@ -1181,7 +1236,10 @@ mod tests {
             .await
             .expect("join_handle")
             .inspect(|produce_response| debug!(?produce_response))?;
-        assert_eq!(0, response_b);
+        // Batch A occupies offsets 0..=2 (3 records) in the merged write, so
+        // batch B's own records start at offset 3, not at the merged
+        // write's base offset (0).
+        assert_eq!(3, response_b);
 
         let sent = recorder.produced(&abc0)?.unwrap();
         assert_eq!(1, sent.len());
@@ -1191,6 +1249,213 @@ mod tests {
         assert_eq!(Some(C), sent[0].records[2].value());
         assert_eq!(Some(D), sent[0].records[3].value());
         assert_eq!(Some(E), sent[0].records[4].value());
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_produce_failure_is_delivered_to_every_producer() -> Result<()> {
+        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
+        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
+
+        let recorder = FlightRecorder::new();
+        let storage =
+            ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(Some(MINIMUM_DELAY));
+
+        // The single underlying storage write that the flush performs (for
+        // both coalesced requests together) will fail.
+        recorder.fail_next_produce();
+
+        let producer_id = 54345;
+        let producer_epoch = 32123;
+        let base_offset = 0;
+        let attributes: i16 = BatchAttribute::default().into();
+
+        let transaction_id = None;
+        let abc0 = Topition::new("abc", 0);
+
+        const A: Bytes = Bytes::from_static(b"a");
+        const B: Bytes = Bytes::from_static(b"b");
+        const C: Bytes = Bytes::from_static(b"c");
+
+        let batch_a = {
+            let storage = storage.clone();
+            let abc0 = abc0.clone();
+
+            tokio::spawn(async move {
+                storage
+                    .produce(
+                        transaction_id,
+                        &abc0,
+                        into_batch(
+                            attributes,
+                            producer_id,
+                            producer_epoch,
+                            base_offset,
+                            &[A, B, C],
+                        )?,
+                    )
+                    .await
+            })
+        };
+
+        const D: Bytes = Bytes::from_static(b"d");
+        const E: Bytes = Bytes::from_static(b"e");
+
+        let batch_b = {
+            let storage = storage.clone();
+            let abc0 = abc0.clone();
+
+            tokio::spawn(async move {
+                storage
+                    .produce(
+                        transaction_id,
+                        &abc0,
+                        into_batch(
+                            attributes,
+                            producer_id,
+                            producer_epoch,
+                            base_offset,
+                            &[D, E],
+                        )?,
+                    )
+                    .await
+            })
+        };
+
+        advance(ADVANCE_DELAY).await;
+        yield_now().await;
+
+        // Both coalesced requests share a single underlying write, so both
+        // must observe that write's failure. Neither one should hang
+        // waiting for a response that only the other producer's flush
+        // caller would otherwise have received. Each await is bounded by a
+        // timeout so that a regression here fails this test outright,
+        // rather than hanging the test binary indefinitely (this repo has
+        // no nextest slow-timeout/terminate-after configured); under
+        // `start_paused`, tokio auto-advances the virtual clock while
+        // idling on timers, so a genuine hang still surfaces quickly.
+        let response_a = tokio::time::timeout(Duration::from_secs(60), batch_a)
+            .await
+            .expect("producer A must not hang waiting for the failed write's outcome")
+            .expect("join_handle");
+        assert!(
+            response_a.is_err(),
+            "expected producer A to observe the failed write, got {response_a:?}"
+        );
+
+        let response_b = tokio::time::timeout(Duration::from_secs(60), batch_b)
+            .await
+            .expect("producer B must not hang waiting for the failed write's outcome")
+            .expect("join_handle");
+        assert!(
+            response_b.is_err(),
+            "expected producer B to observe the failed write, got {response_b:?}"
+        );
+
+        // Nothing should have actually landed in storage.
+        assert_eq!(None, recorder.produced(&abc0)?);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_combine_failure_is_delivered_to_every_producer() -> Result<()> {
+        // `combine` itself (not just the underlying storage write) can fail
+        // to merge a coalesced batch, e.g. if one producer's batch carries
+        // a corrupt/reserved compression attribute. That failure must also
+        // be delivered to every coalesced producer, not just whichever one
+        // triggered the flush.
+        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
+        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
+
+        let recorder = FlightRecorder::new();
+        let storage =
+            ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(Some(MINIMUM_DELAY));
+
+        let producer_id = 54345;
+        let producer_epoch = 32123;
+        let base_offset = 0;
+        let attributes: i16 = BatchAttribute::default().into();
+
+        let transaction_id = None;
+        let abc0 = Topition::new("abc", 0);
+
+        const A: Bytes = Bytes::from_static(b"a");
+        const B: Bytes = Bytes::from_static(b"b");
+        const C: Bytes = Bytes::from_static(b"c");
+
+        let batch_a = {
+            let storage = storage.clone();
+            let abc0 = abc0.clone();
+
+            tokio::spawn(async move {
+                storage
+                    .produce(
+                        transaction_id,
+                        &abc0,
+                        into_batch(
+                            attributes,
+                            producer_id,
+                            producer_epoch,
+                            base_offset,
+                            &[A, B, C],
+                        )?,
+                    )
+                    .await
+            })
+        };
+
+        const D: Bytes = Bytes::from_static(b"d");
+        const E: Bytes = Bytes::from_static(b"e");
+
+        let batch_b = {
+            let storage = storage.clone();
+            let abc0 = abc0.clone();
+
+            tokio::spawn(async move {
+                // Build a structurally valid batch, then corrupt its
+                // attributes with a reserved/unknown compression code
+                // (the low 3 bits, 5-7, are reserved). The batch was
+                // already compressed with a *valid* codec when built, so
+                // this only breaks decoding it back during `combine`, not
+                // its construction here.
+                let mut malformed = into_batch(
+                    attributes,
+                    producer_id,
+                    producer_epoch,
+                    base_offset,
+                    &[D, E],
+                )?;
+                malformed.attributes |= 0b101;
+
+                storage.produce(transaction_id, &abc0, malformed).await
+            })
+        };
+
+        advance(ADVANCE_DELAY).await;
+        yield_now().await;
+
+        let response_a = tokio::time::timeout(Duration::from_secs(60), batch_a)
+            .await
+            .expect("producer A must not hang waiting for the combine failure's outcome")
+            .expect("join_handle");
+        assert!(
+            response_a.is_err(),
+            "expected producer A to observe the combine failure, got {response_a:?}"
+        );
+
+        let response_b = tokio::time::timeout(Duration::from_secs(60), batch_b)
+            .await
+            .expect("producer B must not hang waiting for the combine failure's outcome")
+            .expect("join_handle");
+        assert!(
+            response_b.is_err(),
+            "expected producer B to observe the combine failure, got {response_b:?}"
+        );
+
+        // Nothing should have actually landed in storage.
+        assert_eq!(None, recorder.produced(&abc0)?);
 
         Ok(())
     }
