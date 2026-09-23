@@ -379,6 +379,13 @@ jobs:
           - ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Verify Dockerfile builder matches rust-toolchain.toml
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          dockerfile=$(sed -n 's/^FROM --platform=\$BUILDPLATFORM rust:\(.*\)-alpine AS chef$/\1/p' Dockerfile)
+          echo "rust-toolchain.toml channel: $toolchain"
+          echo "Dockerfile chef stage:       $dockerfile"
+          [ "$toolchain" = "$dockerfile" ] || { echo "::error::rust-toolchain.toml ($toolchain) and Dockerfile's chef stage ($dockerfile) disagree"; exit 1; }
       - uses: docker/metadata-action@v6
         id: meta
         with:
@@ -403,6 +410,8 @@ jobs:
           push: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
   smoke:
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: [package]

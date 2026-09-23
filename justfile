@@ -61,10 +61,10 @@ miri:
     cargo +nightly miri test --no-fail-fast --all-features
 
 docker-build:
-    docker build --tag ghcr.io/nisshi-io/nisshi --no-cache --progress plain --debug .
+    docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --debug .
 
 docker-build-cross:
-    docker build --tag ghcr.io/nisshi-io/nisshi --no-cache --progress plain --platform linux/amd64,linux/arm64 --debug .
+    docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --platform linux/amd64,linux/arm64 --debug .
 
 minio-up: (docker-compose-up "minio")
 
