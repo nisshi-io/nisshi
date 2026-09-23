@@ -21,14 +21,20 @@ use std::{
 };
 
 use crate::{
-    AsArrow as _, Error, METER, Registry, Result, lake::LakeHouseType, sql::typeof_sql_expr,
+    AsArrow as _, Error, METER, Registry, Result,
+    lake::LakeHouseType,
+    sql::{GeneratedExpr, parse_generated_expr, validate_generated_column_name},
 };
 use arrow::{
     array::RecordBatch,
     datatypes::{Field, Schema as ArrowSchema},
 };
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, prelude::SessionContext};
+use datafusion::{
+    datasource::TableProvider,
+    functions::core::expr_ext::FieldAccessor as _,
+    prelude::{Expr, SessionContext, cast, col},
+};
 use deltalake::{
     DeltaTable, DeltaTableBuilder, aws,
     kernel::{StructField, engine::arrow_conversion::TryFromArrow},
@@ -233,19 +239,32 @@ impl Config {
         self.as_columns("tansu.lake.z_order")
     }
 
-    fn generated_fields(&self) -> Vec<Arc<Field>> {
+    /// Returns the validated set of `tansu.lake.generate.*` entries: each
+    /// pairs a safe column name (the config key suffix) with its parsed
+    /// target type and source column path (the config value).
+    ///
+    /// Topic configuration can currently be set by any connected client
+    /// (a separate, known authorization gap), so both the key and the
+    /// value are untrusted here. This is the trust boundary for the
+    /// generated-column feature: every other consumer of "generate"
+    /// entries (the Arrow/Delta schema built by `generated_fields`/
+    /// `generated`, and the columns computed in `write_with_datafusion`)
+    /// is derived from this single validated list, so they can never
+    /// disagree on which columns exist, and neither ever sees a raw,
+    /// unvalidated value. An entry that fails validation is dropped
+    /// rather than failing the whole write, matching the historical
+    /// behaviour of this method, so an unrelated bogus key does not take
+    /// down writes for an otherwise-valid topic configuration.
+    fn generated_entries(&self) -> Vec<(String, GeneratedExpr)> {
         self.0
             .iter()
             .filter_map(|(name, value)| {
                 name.strip_prefix("tansu.lake.generate.")
                     .and_then(|suffix| {
-                        typeof_sql_expr(value)
-                            .map(|data_type| {
-                                // Create as a regular nullable column without generation expression
-                                // The values will be computed by write_with_datafusion
-                                Arc::new(Field::new(suffix, data_type, true))
-                            })
-                            .inspect_err(|err| debug!(?err, %value))
+                        validate_generated_column_name(suffix)
+                            .and_then(|()| parse_generated_expr(value))
+                            .map(|generated| (suffix.to_owned(), generated))
+                            .inspect_err(|err| warn!(?err, name = suffix, %value))
                             .ok()
                     })
             })
@@ -253,22 +272,21 @@ impl Config {
             .collect::<Vec<_>>()
     }
 
+    fn generated_fields(&self) -> Vec<Arc<Field>> {
+        self.generated_entries()
+            .into_iter()
+            // Create as a regular nullable column without generation
+            // expression. The values will be computed by
+            // write_with_datafusion.
+            .map(|(name, generated)| Arc::new(Field::new(name, generated.data_type, true)))
+            .collect()
+    }
+
     fn generated(&self) -> Result<Vec<StructField>> {
         self.generated_fields()
             .iter()
             .map(|field| StructField::try_from_arrow(field.as_ref()).map_err(Into::into))
             .collect::<Result<Vec<_>>>()
-    }
-
-    /// Returns a list of (column_name, sql_expression) pairs for generated columns
-    fn generated_expressions(&self) -> Vec<(String, String)> {
-        self.0
-            .iter()
-            .filter_map(|(name, value)| {
-                name.strip_prefix("tansu.lake.generate.")
-                    .map(|suffix| (suffix.to_string(), value.clone()))
-            })
-            .collect()
     }
 
     fn is_normalized(&self) -> bool {
@@ -388,65 +406,51 @@ impl Delta {
         batches: impl Iterator<Item = RecordBatch>,
         config: &Config,
     ) -> Result<()> {
-        // Transform dot notation struct access to bracket notation
-        // e.g., "meta.timestamp" -> "t.meta['timestamp']"
-        fn transform_struct_access(expr: &str) -> String {
-            use regex::Regex;
-            // Match patterns like "word.word" but not inside strings
-            let re = Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
-            re.replace_all(expr, |caps: &regex::Captures<'_>| {
-                format!("t.{}['{}']", &caps[1], &caps[2])
-            })
-            .to_string()
-        }
-
         let start = SystemTime::now();
 
         let table_url = Url::parse(&self.table_uri(name))?;
         let mut table = DeltaTableBuilder::from_url(table_url)?.build()?;
         table.load().await.inspect_err(|err| debug!(?err))?;
 
-        // Compute generated columns using DataFusion
-        let generated_exprs = config.generated_expressions();
-        let batches_with_generated: Vec<RecordBatch> = if generated_exprs.is_empty() {
+        // Compute generated columns using DataFusion's programmatic
+        // expression builder rather than building and executing SQL
+        // text: `generated_entries()` has already validated every
+        // "tansu.lake.generate.*" name and value (topic configuration is
+        // untrusted input - see `Config::generated_entries`), and the
+        // expressions below are assembled only from those validated
+        // atoms (column path segments and a fixed `cast` target type),
+        // never from a raw, unvalidated string.
+        let generated_entries = config.generated_entries();
+        let batches_with_generated: Vec<RecordBatch> = if generated_entries.is_empty() {
             batches.collect()
         } else {
             let ctx = SessionContext::new();
             let mut result_batches = Vec::new();
 
             for batch in batches {
-                // Register the batch as a table
-                _ = ctx.register_batch("t", batch.clone())?;
-
-                // Build SQL query with generated columns
-                let select_cols: Vec<String> = batch
+                let mut exprs: Vec<Expr> = batch
                     .schema()
                     .fields()
                     .iter()
-                    .map(|f| format!("t.\"{}\"", f.name()))
+                    .map(|field| col(field.name().as_str()))
                     .collect();
 
-                // Transform expressions to use struct field access syntax
-                // e.g., "cast(meta.timestamp as date)" -> "cast(t.meta['timestamp'] as date)"
-                let generated_cols: Vec<String> = generated_exprs
-                    .iter()
-                    .map(|(col_name, expr)| {
-                        // Convert dot notation to bracket notation for struct access
-                        let transformed_expr = transform_struct_access(expr);
-                        format!("{} AS \"{}\"", transformed_expr, col_name)
-                    })
-                    .collect();
+                for (column_name, generated) in &generated_entries {
+                    let (first, rest) = generated.path.split_first().ok_or_else(|| {
+                        Error::Message(String::from("empty generated column path"))
+                    })?;
 
-                let all_cols = [select_cols, generated_cols].concat().join(", ");
-                let sql = format!("SELECT {} FROM t", all_cols);
-                debug!(%sql);
+                    let source = rest.iter().fold(col(first.as_str()), |expr, segment| {
+                        expr.field(segment.as_str())
+                    });
 
-                let df = ctx.sql(&sql).await?;
+                    exprs
+                        .push(cast(source, generated.data_type.clone()).alias(column_name.clone()));
+                }
+
+                let df = ctx.read_batch(batch)?.select(exprs)?;
                 let computed_batches = df.collect().await?;
                 result_batches.extend(computed_batches);
-
-                // Deregister the table for the next iteration
-                _ = ctx.deregister_table("t")?;
             }
 
             result_batches
@@ -1874,6 +1878,139 @@ mod tests {
                 "+------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------+------+-------+-----+-----------+",
                 "| {partition: 32123, timestamp: 1973-10-17T18:36:57, year: 1973, month: 10, day: 17} | {vendor_id: 1, trip_id: 1000371, trip_distance: 1.8, fare_amount: 15.32, store_and_fwd: 0} | 1973 | 10    | 17  | 1         |",
                 "+------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------+------+-------+-----+-----------+",
+            ];
+
+            assert_eq!(pretty_results.trim().lines().collect::<Vec<_>>(), expected);
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn taxi_generated_field_expression_injection_is_rejected() -> Result<()> {
+            let _guard = init_tracing()?;
+
+            let topic = "taxi";
+
+            let schema = Schema::try_from(Bytes::from_static(include_bytes!(
+                "../../../etc/schema/taxi.proto"
+            )))?;
+
+            let value = schema.encode_from_value(
+                MessageKind::Value,
+                &json!({
+                  "vendor_id": 1,
+                  "trip_id": 1000371,
+                  "trip_distance": 1.8,
+                  "fare_amount": 15.32,
+                  "store_and_fwd": "N"
+                }),
+            )?;
+
+            let partition = 32123;
+
+            let record_batch = Batch::builder()
+                .record(Record::builder().value(value.into()))
+                .base_timestamp(119_731_017_000)
+                .build()?;
+
+            let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+            let location = format!("file://{}", temp_dir.path().to_str().unwrap());
+            let database = "pqr";
+
+            let schema_registry = Registry::from_str("file://../../../etc/schema")?;
+
+            schema_registry.validate(topic, &record_batch).await?;
+
+            let lake_house =
+                Url::parse(location.as_ref())
+                    .map_err(Into::into)
+                    .and_then(|location| {
+                        Builder::<PhantomData<Url>, PhantomData<Registry>>::default()
+                            .location(location)
+                            .database(Some(database.into()))
+                            .schema_registry(schema_registry)
+                            .build()
+                    })?;
+
+            // "date" is a legitimate generated column. "evil" is an
+            // attacker-controlled topic-config value (topic config can
+            // currently be set by any connected client) that is
+            // syntactically a valid `CAST(... AS INTEGER)` expression, so
+            // it is not rejected by the schema-building validation, but
+            // its inner expression is not a plain column reference.
+            // Pre-fix, this raw string is spliced verbatim into the SQL
+            // text executed by `write_with_datafusion`'s DataFusion
+            // `ctx.sql()` call, so `1/0` is actually evaluated and the
+            // write fails with a runtime divide-by-zero error, proving
+            // the injected expression executes. Post-fix, the expression
+            // grammar validator requires the CAST's inner expression to
+            // be a plain (optionally dotted) column reference, so the
+            // malicious entry is dropped before it ever reaches SQL
+            // text, and the write proceeds using only the legitimate
+            // "date" column.
+            let config = DescribeConfigsResult::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(None)
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name(topic.into())
+                .configs(Some(vec![
+                    DescribeConfigsResourceResult::default()
+                        .name(String::from("tansu.lake.generate.date"))
+                        .value(Some(String::from("cast(meta.timestamp as date)")))
+                        .read_only(true)
+                        .is_default(None)
+                        .config_source(None)
+                        .is_sensitive(false)
+                        .synonyms(None)
+                        .config_type(None)
+                        .documentation(None),
+                    DescribeConfigsResourceResult::default()
+                        .name(String::from("tansu.lake.generate.evil"))
+                        .value(Some(String::from("cast(1/0 as integer)")))
+                        .read_only(true)
+                        .is_default(None)
+                        .config_source(None)
+                        .is_sensitive(false)
+                        .synonyms(None)
+                        .config_type(None)
+                        .documentation(None),
+                ]));
+
+            let offset = 543212345;
+
+            lake_house
+                .store(topic, partition, offset, &record_batch, config)
+                .await
+                .inspect(|result| debug!(?result))
+                .inspect_err(|err| debug!(?err))?;
+
+            let table = {
+                let mut table = DeltaTableBuilder::from_url(Url::parse(&format!(
+                    "{location}/{database}.{topic}"
+                ))?)?
+                .build()?;
+                table.load().await?;
+                table
+            };
+
+            let ctx = SessionContext::new();
+
+            _ = ctx.register_table("t", Arc::new(table))?;
+
+            let df = ctx.sql("select * from t").await?;
+            let results = df.collect().await?;
+
+            let pretty_results = pretty_format_batches(&results)?.to_string();
+
+            // Only the legitimate "date" column is present: the
+            // malicious "evil" expression was rejected outright, never
+            // reached SQL execution, and never appears as a column.
+            let expected = vec![
+                "+------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------+------------+",
+                "| meta                                                                               | value                                                                                      | date       |",
+                "+------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------+------------+",
+                "| {partition: 32123, timestamp: 1973-10-17T18:36:57, year: 1973, month: 10, day: 17} | {vendor_id: 1, trip_id: 1000371, trip_distance: 1.8, fare_amount: 15.32, store_and_fwd: 0} | 1973-10-17 |",
+                "+------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------+------------+",
             ];
 
             assert_eq!(pretty_results.trim().lines().collect::<Vec<_>>(), expected);

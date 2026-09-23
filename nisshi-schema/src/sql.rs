@@ -12,25 +12,112 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Result;
+use std::sync::LazyLock;
+
+use crate::{Error, Result};
 use arrow::datatypes::DataType;
 use datafusion::sql::sqlparser::{
-    ast::{DataType as SqlDataType, Expr},
+    ast::{CastKind, DataType as SqlDataType, Expr, Ident},
     dialect::GenericDialect,
     parser::Parser,
 };
+use regex::Regex;
 use tracing::debug;
 
-pub(crate) fn typeof_sql_expr(expr: &str) -> Result<DataType> {
+/// A safe, unquoted SQL identifier: this is the entire allowlist for what
+/// may appear as a path segment inside a `tansu.lake.generate.*` value, or
+/// as the generated column name taken from the config key itself. Neither
+/// of these ever originates from us: topic configuration can currently be
+/// set by any connected client (a separate, known authorization gap), so
+/// both strings must be treated as untrusted input.
+static SAFE_IDENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
+
+/// Validates that `name` is safe to use verbatim as a generated column
+/// name (the suffix of a `tansu.lake.generate.<name>` config key).
+pub(crate) fn validate_generated_column_name(name: &str) -> Result<()> {
+    if SAFE_IDENT.is_match(name) {
+        Ok(())
+    } else {
+        Err(Error::Message(format!(
+            "unsafe generated column name: {name:?}"
+        )))
+    }
+}
+
+/// A `tansu.lake.generate.<name>` value, once validated: a target Arrow
+/// type and the dotted path of the (existing) column it is derived from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GeneratedExpr {
+    pub(crate) data_type: DataType,
+    pub(crate) path: Vec<String>,
+}
+
+/// Parses and validates a `tansu.lake.generate.<name>` value.
+///
+/// The only expression shape ever used by (or documented for) this
+/// feature is `CAST(<column path> AS DATE|INT|INTEGER)`, where `<column
+/// path>` is a plain, dotted reference to an existing column (e.g.
+/// `meta.timestamp`). This function enforces exactly that grammar and
+/// nothing more: any other SQL expression, however syntactically valid,
+/// is rejected with `Err`, never accepted, and never used to build SQL
+/// text.
+///
+/// Because topic configuration can currently be set by any connected
+/// client, `expr` is untrusted input. This function must never panic on
+/// malformed or hostile input: doing so would turn a rejected value into
+/// a broker-wide denial of service on every write to the topic.
+pub(crate) fn parse_generated_expr(expr: &str) -> Result<GeneratedExpr> {
     let dialect = GenericDialect {};
-    match Parser::new(&dialect)
+
+    let ast = Parser::new(&dialect)
         .try_with_sql(expr)?
         .parse_expr()
-        .inspect(|ast| debug!(?ast))?
-    {
-        Expr::Cast { data_type, .. } => delta_sql_type(data_type),
+        .inspect(|ast| debug!(?ast))?;
 
-        otherwise => todo!("{otherwise:?}"),
+    let Expr::Cast {
+        kind: CastKind::Cast,
+        expr: inner,
+        data_type,
+        format: None,
+    } = ast
+    else {
+        return Err(Error::Message(format!(
+            "unsupported generated column expression: {expr}"
+        )));
+    };
+
+    let data_type = delta_sql_type(data_type)?;
+    let path = identifier_path(*inner)?;
+
+    Ok(GeneratedExpr { data_type, path })
+}
+
+/// Requires `expr` to be a plain, unquoted column reference (optionally
+/// dotted, e.g. `meta.timestamp`), returning its path segments. Rejects
+/// everything else: function calls, subqueries, operators, literals, and
+/// quoted/exotic identifiers.
+fn identifier_path(expr: Expr) -> Result<Vec<String>> {
+    let idents = match expr {
+        Expr::Identifier(ident) => vec![ident],
+        Expr::CompoundIdentifier(idents) => idents,
+        otherwise => {
+            return Err(Error::Message(format!(
+                "unsupported generated column reference: {otherwise}"
+            )));
+        }
+    };
+
+    idents.into_iter().map(validate_ident).collect()
+}
+
+fn validate_ident(ident: Ident) -> Result<String> {
+    if ident.quote_style.is_none() && SAFE_IDENT.is_match(&ident.value) {
+        Ok(ident.value)
+    } else {
+        Err(Error::Message(format!(
+            "unsupported identifier in generated column expression: {ident}"
+        )))
     }
 }
 
@@ -39,7 +126,9 @@ fn delta_sql_type(data_type: SqlDataType) -> Result<DataType> {
         SqlDataType::Date => Ok(DataType::Date32),
         SqlDataType::Int(_) | SqlDataType::Integer(_) => Ok(DataType::Int32),
 
-        otherwise => todo!("{otherwise:?}"),
+        otherwise => Err(Error::Message(format!(
+            "unsupported generated column type: {otherwise}"
+        ))),
     }
 }
 
@@ -83,9 +172,120 @@ mod tests {
         let _guard = init_tracing()?;
 
         assert_eq!(
-            typeof_sql_expr("cast(meta.timestamp as date)")?,
-            DataType::Date32
+            parse_generated_expr("cast(meta.timestamp as date)")?,
+            GeneratedExpr {
+                data_type: DataType::Date32,
+                path: vec![String::from("meta"), String::from("timestamp")],
+            }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cast_to_integer_of_single_segment_column() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_eq!(
+            parse_generated_expr("cast(vendor_id as integer)")?,
+            GeneratedExpr {
+                data_type: DataType::Int32,
+                path: vec![String::from("vendor_id")],
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_cast_expression() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr("meta.timestamp").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_function_call_inside_cast() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr("cast(upper(meta.timestamp) as date)").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_subquery_inside_cast() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr("cast((select 1) as integer)").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_arithmetic_inside_cast() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr("cast(1/0 as integer)").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_literal_inside_cast() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr("cast(1 as integer)").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_quoted_identifier() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr(r#"cast(meta."ti""; drop table t; --" as date)"#).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_target_type_without_panicking() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr("cast(meta.timestamp as varchar)").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_garbage_without_panicking() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(parse_generated_expr("); drop table t; --").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_safe_generated_column_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(validate_generated_column_name("date").is_ok());
+        assert!(validate_generated_column_name("vendor_id").is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsafe_generated_column_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert!(validate_generated_column_name(r#"x" AS y --"#).is_err());
+        assert!(validate_generated_column_name("meta.timestamp").is_err());
+        assert!(validate_generated_column_name("").is_err());
 
         Ok(())
     }
