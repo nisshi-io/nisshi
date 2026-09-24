@@ -23,7 +23,11 @@ use crate::{
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nisshi_sans_io::{ErrorCode, RootMessageMeta};
-use nisshi_schema::{Registry, lake::House};
+use nisshi_schema::{
+    Registry,
+    lake::{House, LakeHouseType},
+    redact_url,
+};
 use nisshi_service::ProgressBarExtension;
 use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
 use rama::{Service, extensions::Extensions, tcp::TcpStream};
@@ -605,7 +609,11 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             _ = storage.query_pairs_mut().clear().extend_pairs(pairs);
         }
 
-        debug!(?maintenance_interval, ?transaction_maintenance_interval, %storage);
+        debug!(
+            ?maintenance_interval,
+            ?transaction_maintenance_interval,
+            storage = %redact_url(&storage)
+        );
 
         Builder {
             node_id: self.node_id,
@@ -658,9 +666,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
 
     pub fn lake_house(self, lake_house: Option<House>) -> Self {
-        _ = lake_house
-            .as_ref()
-            .inspect(|lake_house| debug!(?lake_house));
+        _ = lake_house.as_ref().inspect(|lake_house| {
+            debug!(lake_house = ?LakeHouseType::from(*lake_house));
+        });
 
         Self { lake_house, ..self }
     }

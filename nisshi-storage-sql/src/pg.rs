@@ -245,7 +245,11 @@ impl Postgres {
     pub fn builder(
         connection: &str,
     ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, Pool>> {
-        debug!(connection);
+        // Do not log `connection` here: it is the raw, unparsed connection
+        // string (e.g. `postgres://user:password@host/db`) and would leak
+        // the password in plaintext. `Builder::from_str` below logs the
+        // parsed `tokio_postgres::Config`, whose `Debug` impl redacts the
+        // password.
         Builder::from_str(connection)
     }
 
