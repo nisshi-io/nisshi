@@ -69,3 +69,26 @@ Sweeps of the librdkafka integration test suite against
 - 0064: needs an SSL-enabled librdkafka build.
 - 0028/0075/0088: sockem tests, filtered by `-E`.
 - 0101: needs RapidJSON. 0107: interactive. 0142: needs SASL listener.
+- 0086 (purge) *(excluded 2026-09-23)*: `0086_purge_remote` is
+  timing-sensitive against any broker that advertises the KIP-714 client
+  telemetry APIs. The test sets `max.in.flight=1`, produces 29 messages,
+  adds a 50 s sockem delay to the socket as soon as the first
+  ProduceResponse arrives, then asserts that a second ProduceRequest is
+  written within 15 s. librdkafka also sends `GetTelemetrySubscriptions`
+  to every learned broker that advertises it, and whether that request is
+  queued before or after the first Produce is a thread race. When it lands
+  after, its response sits behind the 50 s delay and, because
+  `max.in.flight` counts every request type, the second Produce is never
+  sent: `"produce_sent_req_cnt == 2" ... 1 sent produce requests`. Kafka
+  only advertises the telemetry APIs when a client-telemetry plugin is
+  configured (`ApiVersionsResponse.filterApis`), so upstream never sees
+  this; nisshi always advertises them and answers with an empty
+  subscription (`GetTelemetrySubscriptionsService`). Reproduced locally
+  against `memory://` at 5/25 under CPU load (0/5 idle), and 0/25 under
+  the same load with `enable.metrics.push=false`; ~3% in CI. The test
+  uses sockem but is
+  not flagged `TEST_F_SOCKEM`, so `-E` does not filter it, and `TESTS`
+  selects by test number, so `0086_purge_local` (which never contacts the
+  broker) cannot be kept on its own. Re-enable if nisshi stops advertising
+  the telemetry APIs when it has no subscription to offer, or if the suite
+  is run with `enable.metrics.push=false` in `test.conf`.
