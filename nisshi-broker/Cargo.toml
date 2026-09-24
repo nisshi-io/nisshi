@@ -36,6 +36,7 @@ indicatif.workspace = true
 jsonschema.workspace = true
 nisshi-auth.workspace = true
 nisshi-model.workspace = true
+nisshi-otel.workspace = true
 nisshi-sans-io.workspace = true
 nisshi-schema.workspace = true
 nisshi-service.workspace = true
@@ -44,7 +45,6 @@ nisshi-storage-null.workspace = true
 nisshi-storage-slatedb = { workspace = true, optional = true }
 nisshi-storage-sql = { workspace = true, optional = true }
 nisshi-storage.workspace = true
-opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -69,6 +69,8 @@ uuid.workspace = true
 anyhow.workspace = true
 assert_matches.workspace = true
 object_store.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
 pretty_assertions.workspace = true
 slatedb.workspace = true
 nisshi-schema.workspace = true

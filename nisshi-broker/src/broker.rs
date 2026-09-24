@@ -23,10 +23,15 @@ use crate::{
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nisshi_sans_io::{ErrorCode, RootMessageMeta};
-use nisshi_schema::{Registry, lake::House};
+use nisshi_schema::{
+    Registry,
+    lake::{House, LakeHouseType},
+    redact_url,
+};
 use nisshi_service::ProgressBarExtension;
 use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
-use rama::{Service, extensions::Extensions, tcp::TcpStream};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
@@ -41,13 +46,41 @@ use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
     task::{AbortHandle, JoinSet},
-    time::{self, Instant, sleep},
+    time::{self, Instant, sleep, timeout},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Level, debug, error, span};
+use tracing::{Instrument, Level, debug, error, info, span, warn};
 use url::Url;
 use uuid::Uuid;
+
+/// How long a client has to complete the TLS handshake once its TCP
+/// connection is accepted. Bounds the rustls state held for a peer that
+/// connects and never speaks, much like Kafka's `connections.max.idle.ms`.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Report a failed TLS handshake at a level that matches its cause.
+///
+/// A peer that connects and hangs up (health checks, port scanners) is
+/// routine and logged at debug, mirroring how the plaintext path swallows
+/// EOF and reset. Anything else is a client that spoke but could not
+/// negotiate: almost always a plaintext client or one that does not trust
+/// the broker certificate, so the warning says so.
+fn handshake_failed(addr: SocketAddr, err: &std::io::Error) {
+    match err.kind() {
+        ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
+            debug!(%addr, ?err, "peer closed during tls handshake");
+        }
+
+        _ => {
+            warn!(
+                %addr,
+                ?err,
+                "tls handshake failed: the client is either plaintext (set security.protocol=SSL) or does not trust the broker certificate"
+            );
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
@@ -66,6 +99,10 @@ pub struct Broker<G, S> {
     transaction_maintenance_interval: Option<Duration>,
 
     cancellation: CancellationToken,
+
+    /// Present when OTLP metrics are enabled; flushed and shut down when
+    /// `main` returns so the last export interval is not lost on exit.
+    meter_provider: Option<SdkMeterProvider>,
 }
 
 impl<G, S> Broker<G, S>
@@ -101,6 +138,8 @@ where
             transaction_maintenance_interval: None,
 
             cancellation: CancellationToken::new(),
+
+            meter_provider: None,
         }
     }
 
@@ -132,6 +171,8 @@ where
         let silent = self.silent;
 
         let token = self.cancellation.clone();
+
+        let meter_provider = self.meter_provider.take();
 
         _ = set.spawn(async move {
             self.serve(started)
@@ -191,6 +232,18 @@ where
                 if stdout.is_term() {
                     _ = stdout.clear_screen().ok();
                 }
+            }
+        }
+
+        // A failed final export should not turn a clean shutdown into an
+        // error exit; it is reported and the broker still exits cleanly.
+        if let Some(meter_provider) = meter_provider {
+            if let Err(err) = meter_provider.force_flush() {
+                warn!(?err, "OTLP metrics could not be flushed on shutdown");
+            }
+
+            if let Err(err) = meter_provider.shutdown() {
+                warn!(?err, "OTLP metrics provider could not be shut down");
             }
         }
 
@@ -283,7 +336,14 @@ where
             Some(ls)
         };
 
-        let _acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
+        // When a TLS configuration is present every accepted connection must
+        // complete a TLS handshake before any Kafka frame is read: the listener
+        // is TLS only. Without one the listener stays plain TCP.
+        let acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
+
+        if acceptor.is_some() {
+            info!(%self.listener, "listener is tls only");
+        }
 
         let mut connections = 0;
 
@@ -356,28 +416,58 @@ where
                         self.sasl_config.clone()
                     )?;
 
-                    let stream = TcpStream::from_tokio_tcp_stream(stream, extensions);
+                    let acceptor = acceptor.clone();
 
                     let handle = set.spawn(async move {
-                            match service.serve(stream).await {
-                                Err(Error::Io(ref io))
-                                    if io.kind() == ErrorKind::UnexpectedEof
-                                        || io.kind() == ErrorKind::BrokenPipe
-                                        || io.kind() == ErrorKind::ConnectionReset => {}
-
-                                Err(error) => {
-                                    error!(?error);
-                                },
-
-                                Ok(response) => {
-                                    debug!(?response)
+                        // The handshake runs inside the connection task, bounded by
+                        // TLS_HANDSHAKE_TIMEOUT, so a slow or hostile client can
+                        // neither stall the accept loop nor pin rustls state forever.
+                        let result = match acceptor {
+                            Some(acceptor) => {
+                                match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                                    Ok(Ok(tls)) => {
+                                        service.serve(ServiceInput { input: tls, extensions }).await
+                                    }
+                                    Ok(Err(err)) => {
+                                        handshake_failed(addr, &err);
+                                        Ok(())
+                                    }
+                                    Err(elapsed) => {
+                                        debug!(%addr, %elapsed, "tls handshake timed out");
+                                        Ok(())
+                                    }
                                 }
+                            }
+                            None => {
+                                service
+                                    .serve(TcpStream::from_tokio_tcp_stream(stream, extensions))
+                                    .await
+                            }
+                        };
+
+                        match result {
+                            Err(Error::Io(ref io))
+                                if io.kind() == ErrorKind::UnexpectedEof
+                                    || io.kind() == ErrorKind::BrokenPipe
+                                    || io.kind() == ErrorKind::ConnectionReset
+                                    // A quiet connection closed by its idle timeout is
+                                    // routine (e.g. a consumer polling infrequently),
+                                    // not an anomaly worth an `error!` on every occurrence.
+                                    || io.kind() == ErrorKind::TimedOut => {}
+
+                            Err(error) => {
+                                error!(?error);
+                            },
+
+                            Ok(response) => {
+                                debug!(?response)
+                            }
                         }
 
                         if let Some(ref pb) = pb {
                             pb.finish_and_clear();
                         }
-                    });
+                    }.instrument(span!(Level::INFO, "peer", %addr)));
 
 
                     debug!(?handle);
@@ -605,7 +695,11 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             _ = storage.query_pairs_mut().clear().extend_pairs(pairs);
         }
 
-        debug!(?maintenance_interval, ?transaction_maintenance_interval, %storage);
+        debug!(
+            ?maintenance_interval,
+            ?transaction_maintenance_interval,
+            storage = %redact_url(&storage)
+        );
 
         Builder {
             node_id: self.node_id,
@@ -658,9 +752,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
 
     pub fn lake_house(self, lake_house: Option<House>) -> Self {
-        _ = lake_house
-            .as_ref()
-            .inspect(|lake_house| debug!(?lake_house));
+        _ = lake_house.as_ref().inspect(|lake_house| {
+            debug!(lake_house = ?LakeHouseType::from(*lake_house));
+        });
 
         Self { lake_house, ..self }
     }
@@ -692,13 +786,12 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
 
 impl Builder<i32, String, Uuid, Url, Url, Url> {
     pub async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
-        if let Some(otlp_endpoint_url) = self
+        let meter_provider = self
             .otlp_endpoint_url
             .clone()
             .inspect(|otlp_endpoint_url| debug!(%otlp_endpoint_url))
-        {
-            otel::metric_exporter(otlp_endpoint_url)?;
-        }
+            .map(otel::metric_exporter)
+            .transpose()?;
 
         let builder = {
             let mut builder = StorageContainer::builder();
@@ -769,6 +862,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
             cancellation: self.cancellation,
+            meter_provider,
         })
     }
 }

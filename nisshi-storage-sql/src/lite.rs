@@ -48,6 +48,7 @@ use nisshi_sans_io::{
 use nisshi_schema::{
     Registry,
     lake::{House, LakeHouse as _},
+    redact_url,
 };
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, Error, GroupDetail,
@@ -1461,7 +1462,7 @@ impl<C, N, L, D> Builder<C, N, L, D> {
     }
 
     pub(crate) fn storage(self, storage: Url) -> Builder<C, N, L, Url> {
-        debug!(%storage);
+        debug!(storage = %redact_url(&storage));
         Builder {
             cluster: self.cluster,
             node: self.node,
@@ -2212,7 +2213,9 @@ impl Builder<String, i32, Url, Url> {
                 if k == "busy_timeout" {
                     human_units::Duration::from_str(v.as_ref())
                         .map(|duration| duration.0)
-                        .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
+                        .inspect_err(
+                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
+                        )
                         .ok()
                 } else {
                     None

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, env::vars, fmt, result, str::FromStr};
+use std::{collections::HashMap, env::vars, fmt, path::PathBuf, result, str::FromStr};
 
 mod cli;
 
@@ -34,7 +34,42 @@ pub enum Error {
     Schema(Box<nisshi_schema::Error>),
     Server(Box<nisshi_broker::Error>),
     Tls(#[from] rustls::Error),
-    TlsPkiPem(#[from] rustls::pki_types::pem::Error),
+    /// The `--cert` file could not be read or parsed as PEM certificates.
+    TlsCertificate {
+        path: PathBuf,
+        source: rustls::pki_types::pem::Error,
+    },
+    /// The `--key` file could not be read or parsed as a PEM private key.
+    TlsPrivateKey {
+        path: PathBuf,
+        source: rustls::pki_types::pem::Error,
+    },
+    /// The `--key` file is encrypted but no `--key-passphrase-file` was given.
+    TlsKeyPassphraseRequired {
+        path: PathBuf,
+    },
+    /// The passphrase did not decrypt the key.
+    TlsKeyDecrypt {
+        path: PathBuf,
+        source: pkcs8::Error,
+    },
+    /// The key is encrypted with an algorithm this build does not support,
+    /// named by `algorithm` (a friendly name, or the OID when unknown).
+    TlsKeyUnsupportedEncryption {
+        path: PathBuf,
+        algorithm: String,
+    },
+    /// Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) is not supported.
+    TlsKeyLegacyEncrypted {
+        path: PathBuf,
+    },
+    /// The `--key-passphrase-file` could not be read.
+    TlsKeyPassphraseFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// `--cert` and `--key` must be supplied together.
+    TlsRequiresCertAndKey,
     Topic(#[from] nisshi_topic::Error),
     Url(#[from] url::ParseError),
 }

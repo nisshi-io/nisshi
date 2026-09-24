@@ -31,13 +31,14 @@ use rama::{
     tcp::{TcpStream, TokioTcpStream},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::Mutex,
     task::JoinSet,
+    time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{Instrument as _, Level, debug, error, instrument, span};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
@@ -50,6 +51,119 @@ use crate::{
 /// The size prefix is read before authentication, so an unbounded listener lets
 /// a client make it allocate up to 2 GiB per connection by sending 4 bytes.
 pub const DEFAULT_MAXIMUM_FRAME_SIZE: usize = 100 * 1024 * 1024;
+
+/// How long an otherwise-idle connection may wait for the next request to begin
+/// before it's closed, unless [`TcpContext::connection_idle_timeout`] says
+/// otherwise, matching the Apache Kafka default for `connections.max.idle.ms`.
+///
+/// Long by design: a legitimate consumer or producer connection can sit idle
+/// between requests for a while.
+pub const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a request or response transfer already in progress may stall
+/// between successive chunks before it's abandoned, unless
+/// [`TcpContext::io_idle_timeout`] says otherwise.
+///
+/// Deliberately much shorter than [`DEFAULT_CONNECTION_IDLE_TIMEOUT`]: once a
+/// peer has committed to sending or receiving, it shouldn't stall for minutes.
+/// Without this, a peer that declares a large frame and then goes fully
+/// quiet mid-transfer would hold the connection open indefinitely even
+/// though the connection idle timeout never fires (that one only guards the
+/// gap *before* a request starts).
+///
+/// This bounds a stall, not a slow trickle: a peer sending one byte just
+/// under this deadline, repeatedly, still resets it every time and can hold
+/// a single connection open indefinitely. Closing that fully needs a
+/// per-frame minimum-throughput floor or a connection cap; out of scope
+/// here, tracked as a follow-up.
+pub const DEFAULT_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bytes read from (or written to) the peer in one chunk while a transfer is
+/// in progress, keeping [`TcpBytesService::read`]'s buffer growth bounded and
+/// the idle-timeout deadline reset at a reasonable cadence.
+const IO_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Reads one chunk into `buf`, bounding the wait by `idle_timeout` (if any).
+///
+/// Unlike wrapping a whole `read_exact` in one deadline, resetting this timeout
+/// on every chunk means a slow-but-progressing transfer is never killed, only
+/// a genuinely stalled one.
+async fn read_chunk<R>(
+    req: &mut R,
+    buf: &mut [u8],
+    idle_timeout: Option<Duration>,
+) -> io::Result<usize>
+where
+    R: AsyncReadExt + Unpin,
+{
+    match idle_timeout {
+        Some(idle_timeout) => timeout(idle_timeout, req.read(buf))
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+        None => req.read(buf).await,
+    }
+}
+
+/// Writes one chunk from `buf`, bounding the wait by `idle_timeout` (if any).
+async fn write_chunk<W>(
+    req: &mut W,
+    buf: &[u8],
+    idle_timeout: Option<Duration>,
+) -> io::Result<usize>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    match idle_timeout {
+        Some(idle_timeout) => timeout(idle_timeout, req.write(buf))
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+        None => req.write(buf).await,
+    }
+}
+
+/// Flushes anything the stream may still be buffering, bounding the wait by
+/// `idle_timeout` (if any).
+///
+/// [`AsyncWriteExt::write`] is allowed to buffer, so a completed write loop
+/// alone doesn't guarantee the peer has been sent the bytes; only a flush
+/// does. A bare TCP stream flushes as a no-op, but a TLS or buffered wrapper
+/// would otherwise leave the tail of a response unsent until the next I/O.
+async fn flush_with_idle_timeout<W>(req: &mut W, idle_timeout: Option<Duration>) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    match idle_timeout {
+        Some(idle_timeout) => timeout(idle_timeout, req.flush())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+        None => req.flush().await,
+    }
+}
+
+/// Reads exactly `buf.len()` bytes, chunk by chunk, resetting `idle_timeout`
+/// after every chunk of forward progress.
+async fn read_exact_with_idle_timeout<R>(
+    req: &mut R,
+    buf: &mut [u8],
+    idle_timeout: Option<Duration>,
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut read = 0;
+
+    while read < buf.len() {
+        let n = read_chunk(req, &mut buf[read..], idle_timeout).await?;
+
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+
+        read += n;
+    }
+
+    Ok(())
+}
 
 /// A [`Layer`] that listens for TCP connections
 #[derive(Clone, Debug, Default)]
@@ -191,17 +305,20 @@ where
                             let service = self.inner.clone();
                             let extensions = extensions.clone();
 
-                            let handle = set.spawn(async move {
-                                match service.serve(TcpStream::from_tokio_tcp_stream(stream, extensions)).await {
-                                    Err(error) => {
-                                        debug!(%addr, %error);
-                                    },
+                            let handle = set.spawn(
+                                async move {
+                                    match service.serve(TcpStream::from_tokio_tcp_stream(stream, extensions)).await {
+                                        Err(error) => {
+                                            debug!(%addr, %error);
+                                        }
 
-                                    Ok(response) => {
-                                        debug!(%addr, ?response)
+                                        Ok(response) => {
+                                            debug!(%addr, ?response)
+                                        }
                                     }
                                 }
-                            });
+                                .instrument(span!(Level::INFO, "peer", %addr)),
+                            );
 
                             debug!(?handle);
                         }
@@ -239,6 +356,8 @@ where
 pub struct TcpContext {
     cluster_id: Option<String>,
     maximum_frame_size: Option<usize>,
+    connection_idle_timeout: Option<Duration>,
+    io_idle_timeout: Option<Duration>,
 }
 
 impl Default for TcpContext {
@@ -246,6 +365,8 @@ impl Default for TcpContext {
         Self {
             cluster_id: Default::default(),
             maximum_frame_size: Some(DEFAULT_MAXIMUM_FRAME_SIZE),
+            connection_idle_timeout: Some(DEFAULT_CONNECTION_IDLE_TIMEOUT),
+            io_idle_timeout: Some(DEFAULT_IO_IDLE_TIMEOUT),
         }
     }
 }
@@ -268,6 +389,18 @@ impl From<&MaximumFrameSizeExtension> for usize {
     }
 }
 
+/// Per-connection [`TcpContext::connection_idle_timeout`], carried on the
+/// stream's [`Extensions`] like [`MaximumFrameSizeExtension`]. Absent means
+/// the timeout is disabled.
+#[derive(Clone, Debug, Extension)]
+struct ConnectionIdleTimeoutExtension(Duration);
+
+/// Per-connection [`TcpContext::io_idle_timeout`], carried on the stream's
+/// [`Extensions`] like [`MaximumFrameSizeExtension`]. Absent means the
+/// timeout is disabled.
+#[derive(Clone, Debug, Extension)]
+struct IoIdleTimeoutExtension(Duration);
+
 impl TcpContext {
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
         Self { cluster_id, ..self }
@@ -278,6 +411,26 @@ impl TcpContext {
     pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
         Self {
             maximum_frame_size,
+            ..self
+        }
+    }
+
+    /// How long an otherwise-idle connection may wait for the next request to
+    /// begin, or `None` for no limit. Defaults to
+    /// [`DEFAULT_CONNECTION_IDLE_TIMEOUT`].
+    pub fn connection_idle_timeout(self, connection_idle_timeout: Option<Duration>) -> Self {
+        Self {
+            connection_idle_timeout,
+            ..self
+        }
+    }
+
+    /// How long a request or response transfer already in progress may stall
+    /// between chunks before it's abandoned, or `None` for no limit. Defaults
+    /// to [`DEFAULT_IO_IDLE_TIMEOUT`].
+    pub fn io_idle_timeout(self, io_idle_timeout: Option<Duration>) -> Self {
+        Self {
+            io_idle_timeout,
             ..self
         }
     }
@@ -399,6 +552,10 @@ impl Service<TcpStream> for ReadHalfService {
 }
 
 /// A [`Service`] that requires the [`TcpContext`] as the service [`Context`] state
+///
+/// The connection may be any stream type, for example a [`TcpStream`] or a TLS
+/// stream wrapping one: this service only swaps the context state and passes
+/// the stream through to the inner service.
 #[derive(Clone)]
 pub struct TcpContextService<S> {
     inner: S,
@@ -411,24 +568,37 @@ impl<S> Debug for TcpContextService<S> {
     }
 }
 
-impl<S> Service<TcpStream> for TcpContextService<S>
+impl<S, Stream> Service<Stream> for TcpContextService<S>
 where
-    S: Service<TcpStream>,
+    S: Service<Stream>,
     S::Error: From<io::Error>,
+    Stream: ExtensionsRef + Send + 'static,
 {
     type Output = S::Output;
     type Error = S::Error;
 
-    #[instrument(skip_all, fields(peer = %req.stream.peer_addr()?))]
-    async fn serve(&self, req: TcpStream) -> Result<Self::Output, Self::Error> {
+    #[instrument(skip_all)]
+    async fn serve(&self, req: Stream) -> Result<Self::Output, Self::Error> {
         if let Some(cluster_id) = self.state.cluster_id.clone() {
-            _ = req.extensions.insert(ClusterIdExtension(cluster_id));
+            _ = req.extensions().insert(ClusterIdExtension(cluster_id));
         }
 
         if let Some(maximum_frame_size) = self.state.maximum_frame_size {
             _ = req
-                .extensions
+                .extensions()
                 .insert(MaximumFrameSizeExtension(maximum_frame_size));
+        }
+
+        if let Some(connection_idle_timeout) = self.state.connection_idle_timeout {
+            _ = req
+                .extensions()
+                .insert(ConnectionIdleTimeoutExtension(connection_idle_timeout));
+        }
+
+        if let Some(io_idle_timeout) = self.state.io_idle_timeout {
+            _ = req
+                .extensions()
+                .insert(IoIdleTimeoutExtension(io_idle_timeout));
         }
 
         self.inner.serve(req).await
@@ -509,49 +679,118 @@ impl<S> TcpBytesService<S> {
     }
 }
 
+/// The [`TcpContext`] limits relevant to a single connection's request/response
+/// loop, read from the stream's [`Extensions`] once per
+/// [`TcpBytesService::serve`] call instead of growing the positional argument
+/// list on [`TcpBytesService::wait`]/`read`/`write`.
+///
+/// `None` in any field means that limit is disabled, either because the
+/// [`TcpContext`] said so or because no [`TcpContextLayer`] set one.
+#[derive(Clone, Copy, Debug, Default)]
+struct ConnectionLimits {
+    maximum_frame_size: Option<usize>,
+    connection_idle_timeout: Option<Duration>,
+    io_idle_timeout: Option<Duration>,
+}
+
+impl ConnectionLimits {
+    fn from_extensions(extensions: &Extensions) -> Self {
+        Self {
+            maximum_frame_size: extensions
+                .get_ref::<MaximumFrameSizeExtension>()
+                .map(|maximum_frame_size| maximum_frame_size.0),
+            connection_idle_timeout: extensions
+                .get_ref::<ConnectionIdleTimeoutExtension>()
+                .map(|connection_idle_timeout| connection_idle_timeout.0),
+            io_idle_timeout: extensions
+                .get_ref::<IoIdleTimeoutExtension>()
+                .map(|io_idle_timeout| io_idle_timeout.0),
+        }
+    }
+}
+
 impl<S> TcpBytesService<S>
 where
     S: Service<BytesInput, Output = Bytes>,
     S::Error: From<Error> + From<io::Error> + Debug,
 {
     #[instrument(skip_all)]
-    async fn wait<R>(
-        &self,
-        req: &mut R,
-        maximum_frame_size: Option<usize>,
-    ) -> Result<[u8; 4], S::Error>
+    async fn wait<R>(&self, req: &mut R, limits: ConnectionLimits) -> Result<[u8; 4], S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
         let mut size = [0u8; 4];
 
-        _ = req
-            .read_exact(&mut size)
+        // The connection idle timeout guards only the gap *before* a request
+        // starts, so it covers the first prefix byte alone. Once that byte
+        // lands the peer has committed to a request, and the rest of the
+        // prefix is a transfer in progress like any other: otherwise a peer
+        // trickling one prefix byte per (long) connection idle window would
+        // hold the connection four times as long as a quiet one.
+        read_exact_with_idle_timeout(req, &mut size[..1], limits.connection_idle_timeout)
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
+        read_exact_with_idle_timeout(req, &mut size[1..], limits.io_idle_timeout)
             .await
             .inspect_err(|err| debug!(?err))?;
 
         let frame_size = frame_size(size)?;
 
-        if maximum_frame_size.is_some_and(|maximum_frame_size| frame_size > maximum_frame_size) {
+        if limits
+            .maximum_frame_size
+            .is_some_and(|maximum_frame_size| frame_size > maximum_frame_size)
+        {
             return Err(Into::into(Error::FrameTooBig(frame_size)));
         }
 
         Ok(size)
     }
 
+    /// Reads the frame body declared by `size`, growing the buffer as bytes
+    /// actually arrive rather than allocating the full declared length up
+    /// front.
+    ///
+    /// Without this, a peer that declares a near-maximum frame and then
+    /// stalls (or trickles bytes just under [`TcpContext::io_idle_timeout`])
+    /// would still pin the full declared size in memory immediately, even
+    /// though the idle timeout bounds *how long* that can go on. Growing
+    /// incrementally bounds *how much* an unfinished, stalled transfer can
+    /// pin at any point before its own idle timeout catches it. This alone
+    /// doesn't bound how many such connections a peer can open at once; a
+    /// connection-count limit is the complementary control for that, and is
+    /// tracked separately.
     #[instrument(skip_all)]
-    async fn read<R>(&self, req: &mut R, size: [u8; 4]) -> Result<Bytes, S::Error>
+    async fn read<R>(
+        &self,
+        req: &mut R,
+        size: [u8; 4],
+        limits: ConnectionLimits,
+    ) -> Result<Bytes, S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut request: Vec<u8> = vec![0u8; frame_length(size)?];
+        let declared = frame_length(size)?;
 
-        request[0..size.len()].copy_from_slice(&size[..]);
+        let mut request: Vec<u8> = Vec::with_capacity(declared.min(size.len() + IO_CHUNK_SIZE));
+        request.extend_from_slice(&size[..]);
 
-        _ = req
-            .read_exact(&mut request[4..])
-            .await
-            .inspect_err(|err| error!(?err))?;
+        while request.len() < declared {
+            let start = request.len();
+            let want = (declared - start).min(IO_CHUNK_SIZE);
+            request.resize(start + want, 0);
+
+            let n = read_chunk(req, &mut request[start..], limits.io_idle_timeout)
+                .await
+                .inspect_err(|err| debug!(?err))?;
+
+            if n == 0 {
+                return Err(Into::into(io::Error::from(io::ErrorKind::UnexpectedEof)));
+            }
+
+            request.truncate(start + n);
+        }
+
         BYTES_RECEIVED.add(request.len() as u64, &[]);
 
         Ok(Bytes::from(request))
@@ -585,32 +824,54 @@ where
     }
 
     #[instrument(skip_all)]
-    async fn write<W>(&self, req: &mut W, frame: Bytes) -> Result<(), S::Error>
+    async fn write<W>(
+        &self,
+        req: &mut W,
+        frame: Bytes,
+        limits: ConnectionLimits,
+    ) -> Result<(), S::Error>
     where
         W: AsyncWriteExt + Unpin,
     {
-        let mut w = BufWriter::new(req);
-        w.write_all(&frame).await.inspect_err(|err| error!(?err))?;
+        let mut written = 0;
+
+        while written < frame.len() {
+            let n = write_chunk(req, &frame[written..], limits.io_idle_timeout)
+                .await
+                .inspect_err(|err| debug!(?err))?;
+
+            if n == 0 {
+                return Err(Into::into(io::Error::from(io::ErrorKind::WriteZero)));
+            }
+
+            written += n;
+        }
+
+        flush_with_idle_timeout(req, limits.io_idle_timeout)
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
         BYTES_SENT.add(frame.len() as u64, &[]);
-        w.flush().await.map_err(Into::into)
+
+        Ok(())
     }
 
     #[instrument(skip_all, fields(id = nanoid!()))]
     async fn req<R>(
         &self,
         req: &mut R,
-        maximum_frame_size: Option<usize>,
+        limits: ConnectionLimits,
         attributes: &[KeyValue],
     ) -> Result<(), S::Error>
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin + ExtensionsRef,
     {
-        let size = self.wait(req, maximum_frame_size).await?;
-        let request = self.read(req, size).await?;
+        let size = self.wait(req, limits).await?;
+        let request = self.read(req, size, limits).await?;
         let response = self
             .process(attributes, request, req.extensions().clone())
             .await?;
-        self.write(req, response).await
+        self.write(req, response, limits).await
     }
 }
 
@@ -641,16 +902,12 @@ where
             attributes
         };
 
-        let maximum_frame_size = req
-            .extensions()
-            .get_ref::<MaximumFrameSizeExtension>()
-            .map(|maximum_frame_size| maximum_frame_size.0);
+        let limits = ConnectionLimits::from_extensions(req.extensions());
 
         loop {
             let attributes = attributes.clone();
 
-            self.req(&mut req, maximum_frame_size, &attributes[..])
-                .await?
+            self.req(&mut req, limits, &attributes[..]).await?
         }
     }
 }
@@ -702,11 +959,11 @@ mod tests {
         collections::VecDeque,
         pin::Pin,
         task::{Context, Poll},
-        time::Duration,
     };
 
     use tokio::{
         io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex},
+        net::{TcpListener, TcpStream as TokioTcpStream},
         spawn,
     };
 
@@ -733,11 +990,20 @@ mod tests {
         size.to_be_bytes()
     }
 
+    /// Limits with only `maximum_frame_size` set; the two idle timeouts stay
+    /// disabled (`None`) so frame-size tests aren't sensitive to timing.
+    fn limits(maximum_frame_size: Option<usize>) -> ConnectionLimits {
+        ConnectionLimits {
+            maximum_frame_size,
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn frame_within_limit_is_accepted() -> Result<(), Error> {
         let mut reader = &header(12)[..];
 
-        let size = service().wait(&mut reader, Some(1024)).await?;
+        let size = service().wait(&mut reader, limits(Some(1024))).await?;
 
         assert_eq!(header(12), size);
         Ok(())
@@ -747,7 +1013,7 @@ mod tests {
     async fn frame_exactly_at_limit_is_accepted() -> Result<(), Error> {
         let mut reader = &header(1024)[..];
 
-        let size = service().wait(&mut reader, Some(1024)).await?;
+        let size = service().wait(&mut reader, limits(Some(1024))).await?;
 
         assert_eq!(header(1024), size);
         Ok(())
@@ -758,7 +1024,7 @@ mod tests {
         let mut reader = &header(1025)[..];
 
         let err = service()
-            .wait(&mut reader, Some(1024))
+            .wait(&mut reader, limits(Some(1024)))
             .await
             .expect_err("oversized frame must be rejected before the body is read");
 
@@ -773,12 +1039,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn idle_timeouts_are_set_by_default() {
+        let ctx = TcpContext::default();
+        assert_eq!(
+            Some(DEFAULT_CONNECTION_IDLE_TIMEOUT),
+            ctx.connection_idle_timeout
+        );
+        assert_eq!(Some(DEFAULT_IO_IDLE_TIMEOUT), ctx.io_idle_timeout);
+    }
+
     #[tokio::test]
     async fn negative_frame_length_is_rejected() {
         let mut reader = &header(-1)[..];
 
         let err = service()
-            .wait(&mut reader, None)
+            .wait(&mut reader, limits(None))
             .await
             .expect_err("negative frame length must be rejected");
 
@@ -788,6 +1064,15 @@ mod tests {
     struct DuplexStreamWithExtensions {
         stream: DuplexStream,
         extensions: Extensions,
+    }
+
+    impl DuplexStreamWithExtensions {
+        /// The server end of a duplex pair, carrying only the extensions
+        /// the test inserts: any limit not inserted is disabled, exactly as
+        /// when a [`TcpContext`] field is `None`.
+        fn new(stream: DuplexStream, extensions: Extensions) -> Self {
+            Self { stream, extensions }
+        }
     }
 
     impl AsRef<DuplexStream> for DuplexStreamWithExtensions {
@@ -838,22 +1123,19 @@ mod tests {
             let extensions = Extensions::default();
             _ = extensions.insert(MaximumFrameSizeExtension(1_024));
 
-            let input = DuplexStreamWithExtensions {
-                stream: server,
-                extensions,
-            };
-
-            service().serve(input).await
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
         });
 
         const SIZE: usize = 65_536;
 
         // Only the length prefix is sent. If the guard admitted the frame,
-        // `read` would block in `read_exact` waiting for a body that never
-        // arrives, so the timeout is what turns that into a failure.
+        // `read` would block waiting for a body that never arrives, so the
+        // timeout is what turns that into a failure.
         client.write_all(&header(SIZE as i32)).await?;
 
-        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+        let outcome = timeout(Duration::from_secs(5), handle)
             .await
             .expect("oversized frame was admitted: serve is blocked reading the body")?;
 
@@ -939,18 +1221,246 @@ mod tests {
         let handle =
             spawn(async move { service.accept_loop(acceptor, Extensions::default()).await });
 
-        let echoed = tokio::time::timeout(Duration::from_secs(5), client)
-            .await
-            .expect(
-                "accept() error wedged the loop: the Ok connection scripted after it \
+        let echoed = timeout(Duration::from_secs(5), client).await.expect(
+            "accept() error wedged the loop: the Ok connection scripted after it \
                  was never served",
-            )??;
+        )??;
 
         assert_eq!(b'x', echoed);
 
         cancellation.cancel();
         handle.await??;
 
+        Ok(())
+    }
+
+    /// A peer that opens a connection and never sends anything must not hold
+    /// the connection (and its task) open forever; this is the Slowloris
+    /// vector the connection idle timeout closes. `start_paused` lets tokio
+    /// fast-forward straight to the timeout deadline instead of a real sleep.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_connection_is_closed_after_connection_idle_timeout() -> Result<(), Error> {
+        let (_client, server) = duplex(64);
+
+        // Only the connection idle timeout is set, so io_idle_timeout is
+        // disabled: this test must fail (not hang, thanks to the outer guard
+        // below) if wait() is ever wired to the wrong tier.
+        let extensions = Extensions::default();
+        _ = extensions.insert(ConnectionIdleTimeoutExtension(Duration::from_millis(50)));
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            service().serve(DuplexStreamWithExtensions::new(server, extensions)),
+        )
+        .await
+        .expect("wait() did not respect connection_idle_timeout");
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// A peer that declares a frame and then stops sending mid-body must not
+    /// hold the connection open forever either; the connection idle timeout
+    /// only guards the gap *before* a request starts, so this is what the
+    /// (shorter) io idle timeout closes instead.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_mid_frame_read_times_out() -> Result<(), Error> {
+        let (mut client, server) = duplex(4096);
+
+        // Only the io idle timeout is set, so connection_idle_timeout is
+        // disabled: this test must fail (not hang, thanks to the outer guard
+        // below) if read() is ever wired to the wrong tier.
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(IoIdleTimeoutExtension(Duration::from_millis(50)));
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        // Declare a 100 byte body, send 10 bytes of it, then go quiet.
+        client.write_all(&header(100)).await?;
+        client.write_all(&[0u8; 10]).await?;
+
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("read() did not respect io_idle_timeout")?;
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// A peer that sends part of the 4 byte size prefix and then stalls has
+    /// already committed to a request, so the remainder of the prefix is
+    /// guarded by the (shorter) io idle timeout, not the connection one.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_mid_prefix_read_times_out() -> Result<(), Error> {
+        let (mut client, server) = duplex(64);
+
+        // Only the io idle timeout is set, so connection_idle_timeout is
+        // disabled: this test must fail (not hang, thanks to the outer guard
+        // below) if the whole prefix is ever read under the connection tier.
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(IoIdleTimeoutExtension(Duration::from_millis(50)));
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        // One byte of the prefix, then silence.
+        client.write_all(&header(100)[..1]).await?;
+
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("wait() did not read the rest of the prefix under io_idle_timeout")?;
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// A slow-but-steadily-progressing transfer must not be penalized: each
+    /// chunk resets the idle deadline, so a transfer that would exceed a
+    /// single flat whole-transfer timeout still succeeds as long as no
+    /// individual gap between chunks exceeds `io_idle_timeout`. Uses real
+    /// time with a wide margin (chunk gap 20x under the deadline, so a
+    /// loaded CI runner overshooting a sleep can't fail it) rather than
+    /// paused time, to avoid orchestrating a multi-step manual clock
+    /// advance around the two concurrent tasks below.
+    #[tokio::test]
+    async fn slow_but_steady_transfer_is_not_penalized() -> Result<(), Error> {
+        let (mut client, server) = duplex(4096);
+
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(IoIdleTimeoutExtension(Duration::from_secs(2)));
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        let body = vec![7u8; 300];
+        client.write_all(&header(body.len() as i32)).await?;
+
+        // Three chunks, ~100ms apart: no single gap comes near the 2s idle
+        // timeout, while a single flat whole-transfer deadline would still
+        // have been exceeded by a transfer with that many gaps at that size.
+        for chunk in body.chunks(100) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            client.write_all(chunk).await?;
+        }
+
+        // `serve` loops forever reading requests, so it never returns `Ok`;
+        // instead prove the slow send wasn't penalized by reading back the
+        // echoed response in full before doing anything else.
+        let mut response_size = [0u8; 4];
+        _ = client.read_exact(&mut response_size).await?;
+        let mut response_body = vec![0u8; frame_length(response_size)? - 4];
+        _ = client.read_exact(&mut response_body).await?;
+        assert_eq!(body, response_body);
+
+        // Now end the connection; `serve`'s next `wait()` should see a clean
+        // EOF, not the timeout a penalized slow transfer would have produced
+        // instead.
+        drop(client);
+
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("serve should observe EOF promptly after the client disconnects")?;
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::UnexpectedEof),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// The duplex tests above insert extensions by hand, so they would stay
+    /// green even if [`TcpContextService`] never put the timeouts on the
+    /// stream. This runs the production stack (`TcpContextLayer` over
+    /// `TcpBytesLayer`, as the broker, proxy and client compose it) over a
+    /// real loopback socket to prove the [`TcpContext`] setting reaches
+    /// `wait()`.
+    #[tokio::test]
+    async fn tcp_context_layer_applies_connection_idle_timeout() -> Result<(), Error> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let _client = TokioTcpStream::connect(listener.local_addr()?).await?;
+        let (accepted, _) = listener.accept().await?;
+
+        let service = (
+            TcpContextLayer::new(
+                TcpContext::default()
+                    .connection_idle_timeout(Some(Duration::from_millis(50)))
+                    .io_idle_timeout(None),
+            ),
+            TcpBytesLayer,
+        )
+            .into_layer(Echo);
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            service.serve(TcpStream::from_tokio_tcp_stream(
+                accepted,
+                Extensions::default(),
+            )),
+        )
+        .await
+        .expect("TcpContextService did not wire connection_idle_timeout into the stream");
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// Same as above for the io tier: the connection idle timeout is
+    /// disabled and a frame is declared but never sent, so only a correctly
+    /// wired `io_idle_timeout` can end the connection.
+    #[tokio::test]
+    async fn tcp_context_layer_applies_io_idle_timeout() -> Result<(), Error> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut client = TokioTcpStream::connect(listener.local_addr()?).await?;
+        let (accepted, _) = listener.accept().await?;
+
+        let service = (
+            TcpContextLayer::new(
+                TcpContext::default()
+                    .connection_idle_timeout(None)
+                    .io_idle_timeout(Some(Duration::from_millis(50))),
+            ),
+            TcpBytesLayer,
+        )
+            .into_layer(Echo);
+
+        client.write_all(&header(100)).await?;
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            service.serve(TcpStream::from_tokio_tcp_stream(
+                accepted,
+                Extensions::default(),
+            )),
+        )
+        .await
+        .expect("TcpContextService did not wire io_idle_timeout into the stream");
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "{outcome:?}"
+        );
         Ok(())
     }
 }
