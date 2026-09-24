@@ -274,9 +274,10 @@ pub use frame::{
 };
 
 pub use stream::{
-    BytesLayer, BytesService, BytesTcpService, DEFAULT_MAXIMUM_FRAME_SIZE, TcpBytesLayer,
-    TcpBytesService, TcpContext, TcpContextLayer, TcpContextService, TcpListenerLayer,
-    TcpStreamLayer, TcpStreamService,
+    BytesLayer, BytesService, BytesTcpService, DEFAULT_CONNECTION_IDLE_TIMEOUT,
+    DEFAULT_IO_IDLE_TIMEOUT, DEFAULT_MAXIMUM_FRAME_SIZE, TcpBytesLayer, TcpBytesService,
+    TcpContext, TcpContextLayer, TcpContextService, TcpListenerLayer, TcpStreamLayer,
+    TcpStreamService,
 };
 
 #[derive(Clone, Debug, Extension)]
