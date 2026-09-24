@@ -44,7 +44,14 @@ COPY nisshi-sans-io/message nisshi-sans-io/message
 
 # --target-dir must not start with "./" - cargo-chef's cleanup step panics
 # (StripPrefixError) on that leading dot-slash. Use "build", not "./build".
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# sharing=locked on the registry mount: it's shared across both platform
+# legs of a multi-platform build (arch-independent contents, avoids
+# duplicate downloads), and those legs build concurrently. Without locked,
+# concurrent unsynchronized extraction of the same crate into that shared
+# path races - cargo fails with "failed to unpack package ...: File exists
+# (os error 17)" when one leg's extraction collides with the other's.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     xx-cargo chef cook --release --recipe-path recipe.json --bin nisshi --all-features --target-dir build
 
 FROM cook AS builder
@@ -54,7 +61,7 @@ ADD / /usr/src/
 # Flags here must match cook's above, or fingerprinting reruns everything.
 # The cache mount below must keep from=cook,source=/usr/src/build, or it
 # starts empty and hides the deps cook already built.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/build,id=cargo-target-$TARGETPLATFORM,from=cook,source=/usr/src/build <<EOF
 set -e
 xx-cargo build --bin nisshi --all-features --release --target-dir build
