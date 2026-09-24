@@ -157,7 +157,11 @@ use nisshi_sans_io::{
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use nisshi_schema::{Registry, lake::House};
+use nisshi_schema::{
+    Registry,
+    lake::{House, LakeHouseType},
+    redact_url,
+};
 use rama::error::BoxError;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -359,7 +363,14 @@ where
     E: error::Error + Send + Sync + 'static,
 {
     fn from(value: PoolError<E>) -> Self {
-        Self::Pool(Arc::new(Box::new(value)))
+        // a pool-acquisition timeout is transient load, not a backend failure: map it to a
+        // retriable Kafka error code so callers (e.g. produce.rs's `Error::Api(_)` branch)
+        // don't turn it into a non-retriable `UnknownServerError` for the client.
+        if matches!(value, PoolError::Timeout(_)) {
+            Self::Api(ErrorCode::RequestTimedOut)
+        } else {
+            Self::Pool(Arc::new(Box::new(value)))
+        }
     }
 }
 
@@ -437,7 +448,18 @@ impl From<Arc<serde_json::Error>> for Error {
 #[cfg(feature = "postgres")]
 impl From<tokio_postgres::error::Error> for Error {
     fn from(value: tokio_postgres::error::Error) -> Self {
-        Self::from(Arc::new(value))
+        // Postgres reports SQLSTATE 57014 (query_canceled) when `statement_timeout` aborts a
+        // stalled query. That's transient, not a real backend failure, so map it to a
+        // retriable Kafka error code the same way a pool-acquisition timeout is (see
+        // `From<PoolError<E>>` above) rather than the generic `Error::TokioPostgres`.
+        if value
+            .code()
+            .is_some_and(|code| *code == tokio_postgres::error::SqlState::QUERY_CANCELED)
+        {
+            Self::Api(ErrorCode::RequestTimedOut)
+        } else {
+            Self::from(Arc::new(value))
+        }
     }
 }
 
@@ -2201,7 +2223,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
     }
 
     pub fn storage(self, storage: Url) -> Builder<N, C, A, Url> {
-        debug!(%storage);
+        debug!(storage = %redact_url(&storage));
 
         Builder {
             node_id: self.node_id,
@@ -2228,9 +2250,9 @@ impl<N, C, A, S> Builder<N, C, A, S> {
     }
 
     pub fn lake_house(self, lake_house: Option<House>) -> Self {
-        _ = lake_house
-            .as_ref()
-            .inspect(|lake_house| debug!(?lake_house));
+        _ = lake_house.as_ref().inspect(|lake_house| {
+            debug!(lake_house = ?LakeHouseType::from(*lake_house));
+        });
 
         Self { lake_house, ..self }
     }
@@ -2279,7 +2301,7 @@ impl Builder<i32, String, Url, Url> {
         else {
             return Err(Error::FeatureNotEnabled {
                 feature: self.storage.scheme().into(),
-                message: self.storage.to_string(),
+                message: redact_url(&self.storage).to_string(),
             });
         };
 
@@ -2333,6 +2355,9 @@ pub struct ScramCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs::File, sync::Arc, thread};
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::EnvFilter;
 
     #[test]
     fn topition_from_str() -> Result<()> {
@@ -2347,6 +2372,94 @@ mod tests {
         let topition = Topition::from_str("test-topic-0000000-eFC79C8-2147483647")?;
         assert_eq!("test-topic-0000000-eFC79C8", topition.topic());
         assert_eq!(i32::MAX, topition.partition());
+        Ok(())
+    }
+
+    #[test]
+    fn redact_url_strips_password_only() -> Result<()> {
+        let url = Url::parse("postgres://user:secret@host/db")?;
+        let redacted = redact_url(&url);
+
+        assert_eq!(None, redacted.password());
+        assert_eq!("user", redacted.username());
+        assert_eq!(Some("host"), redacted.host_str());
+        assert_eq!("/db", redacted.path());
+        assert!(!redacted.as_str().contains("secret"));
+
+        // the original is untouched: it's the value still used to connect
+        assert_eq!(Some("secret"), url.password());
+
+        Ok(())
+    }
+
+    #[test]
+    fn redact_url_leaves_passwordless_url_unchanged() -> Result<()> {
+        let url = Url::parse("memory://nisshi/")?;
+        assert_eq!(url, redact_url(&url));
+        Ok(())
+    }
+
+    fn log_file_path() -> Result<String> {
+        thread::current()
+            .name()
+            .ok_or(Error::Message(String::from("unnamed thread")))
+            .map(|name| format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME")))
+    }
+
+    fn init_tracing() -> Result<DefaultGuard> {
+        Ok(tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_level(true)
+                .with_line_number(true)
+                .with_thread_names(false)
+                .with_env_filter(
+                    EnvFilter::from_default_env()
+                        .add_directive(format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?),
+                )
+                .with_writer(
+                    log_file_path()
+                        .and_then(|path| File::create(path).map_err(Into::into))
+                        .map(Arc::new)?,
+                )
+                .finish(),
+        ))
+    }
+
+    #[test]
+    fn builder_storage_does_not_log_password() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // Exercises `Builder::storage`, which used to `debug!(%storage)`
+        // the raw URL (nisshi-storage/src/lib.rs).
+        _ = StorageContainer::builder().storage(Url::parse("postgres://user:secret@host/db")?);
+
+        let log = std::fs::read_to_string(log_file_path()?)?;
+        assert!(!log.contains("secret"));
+        assert!(log.contains("user@host"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_not_enabled_error_does_not_leak_password() -> Result<()> {
+        // No factories are registered on a bare `StorageContainer::builder()`
+        // (those come from the storage backend crates, e.g.
+        // `nisshi-storage-sql`), so this always falls into the
+        // `Error::FeatureNotEnabled` branch regardless of scheme, which used
+        // to embed the raw, unredacted URL in its `message` field.
+        let err = StorageContainer::builder()
+            .node_id(1)
+            .cluster_id("test")
+            .advertised_listener(Url::parse("tcp://localhost:9092")?)
+            .storage(Url::parse("postgres://user:secret@host/db")?)
+            .build()
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(!message.contains("secret"));
+        assert!(message.contains("user@host"));
+
         Ok(())
     }
 }
