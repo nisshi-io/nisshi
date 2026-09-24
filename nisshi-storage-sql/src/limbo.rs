@@ -55,6 +55,7 @@ use nisshi_sans_io::{
 use nisshi_schema::{
     Registry,
     lake::{House, LakeHouse as _},
+    redact_url,
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
@@ -965,7 +966,7 @@ impl<C, N, L, D> Builder<C, N, L, D> {
     }
 
     pub(crate) fn storage(self, storage: Url) -> Builder<C, N, L, Url> {
-        debug!(%storage);
+        debug!(storage = %redact_url(&storage));
         Builder {
             cluster: self.cluster,
             node: self.node,

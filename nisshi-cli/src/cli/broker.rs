@@ -25,7 +25,7 @@ use super::DEFAULT_BROKER;
 use clap::Parser;
 use nisshi_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use nisshi_sans_io::ErrorCode;
-use nisshi_schema::Registry;
+use nisshi_schema::{Registry, redact_url};
 use nisshi_storage::ArcDynStorage;
 use owo_colors::{OwoColorize as _, Stream, Style};
 use rustls::{
@@ -208,14 +208,6 @@ pub(super) enum Lake {
     },
 }
 
-fn redact_password(mut url: Url) -> Url {
-    if url.password().is_some() {
-        _ = url.set_password(None).ok();
-    }
-
-    url
-}
-
 impl Arg {
     pub(super) async fn main(self) -> Result<ErrorCode> {
         let started = Instant::now();
@@ -345,7 +337,7 @@ impl Arg {
 
             println!(
                 "storage: {} {:?}",
-                redact_password(storage_engine)
+                redact_url(&storage_engine)
                     .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)),
                 storage_engines()
                     .iter()
@@ -357,7 +349,7 @@ impl Arg {
             if let Some(schema_registry) = schema_registry_url {
                 println!(
                     "schema registry: {}",
-                    schema_registry.if_supports_color(Stream::Stdout, |text| text
+                    redact_url(&schema_registry).if_supports_color(Stream::Stdout, |text| text
                         .style(sheet.schema_registry))
                 );
             }

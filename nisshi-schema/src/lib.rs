@@ -350,6 +350,31 @@ impl Generator for Schema {
 
 type SchemaCache = Arc<Mutex<BTreeMap<String, CachedSchema>>>;
 
+/// Returns a copy of `url` with any password component removed.
+///
+/// Intended for logging or displaying a connection URL (storage,
+/// schema registry, lake location, etc.) without leaking a plaintext
+/// password from the userinfo component. Only the password is
+/// touched: everything else, including any query parameters, passes
+/// through unchanged.
+///
+/// This does not redact a password passed as a query parameter (e.g.
+/// `postgres://user@host/db?password=secret`, which `tokio-postgres`
+/// accepts): only the userinfo component is covered. Prefer the
+/// userinfo form for any URL that flows through this function.
+///
+/// `url` itself is never mutated: this clones before redacting, so the
+/// value actually used to establish a connection is unaffected.
+pub fn redact_url(url: &Url) -> Url {
+    let mut redacted = url.clone();
+
+    if redacted.password().is_some() {
+        let _ = redacted.set_password(None);
+    }
+
+    redacted
+}
+
 // Schema Registry
 #[derive(Clone, Debug)]
 pub struct Registry {
@@ -380,7 +405,7 @@ impl TryFrom<&Url> for Builder {
     type Error = Error;
 
     fn try_from(storage: &Url) -> Result<Self, Self::Error> {
-        debug!(%storage);
+        debug!(storage = %redact_url(storage));
 
         match storage.scheme() {
             "s3" => {
@@ -415,7 +440,7 @@ impl TryFrom<&Url> for Builder {
 
             "memory" => Ok(Self::new(InMemory::new())),
 
-            _unsupported => Err(Error::UnsupportedSchemaRegistryUrl(storage.to_owned())),
+            _unsupported => Err(Error::UnsupportedSchemaRegistryUrl(redact_url(storage))),
         }
     }
 }
@@ -813,6 +838,55 @@ mod tests {
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
         debug!(unsupported_schema_runtime_value = size_of::<(DataType, serde_json::Value)>());
         debug!(uuid = size_of::<uuid::Error>());
+        Ok(())
+    }
+
+    #[test]
+    fn redact_url_strips_password_only() -> Result<()> {
+        let url = Url::parse("postgres://user:secret@host/db")?;
+        let redacted = redact_url(&url);
+
+        assert_eq!(None, redacted.password());
+        assert_eq!("user", redacted.username());
+        assert_eq!(Some("host"), redacted.host_str());
+        assert!(!redacted.as_str().contains("secret"));
+
+        // the original is untouched: it's the value still used to connect
+        assert_eq!(Some("secret"), url.password());
+
+        Ok(())
+    }
+
+    #[test]
+    fn redact_url_leaves_passwordless_url_unchanged() -> Result<()> {
+        let url = Url::parse("memory://nisshi/")?;
+        assert_eq!(url, redact_url(&url));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_schema_registry_url_does_not_leak_password() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let url = Url::parse("bogus://user:secret@host/db")?;
+        let err = Builder::try_from(&url).unwrap_err();
+
+        // `Error` has no `#[error(...)]` attributes, so `Display` falls back
+        // to `Debug`, e.g. `UnsupportedSchemaRegistryUrl(Url { username:
+        // "user", password: None, host: Some(Domain("host")), .. })`.
+        let message = err.to_string();
+        assert!(!message.contains("secret"));
+        assert!(message.contains("\"user\""));
+        assert!(message.contains("\"host\""));
+
+        let log = std::fs::read_to_string(format!(
+            "../logs/{}/{}.log",
+            env!("CARGO_PKG_NAME"),
+            thread::current().name().unwrap()
+        ))?;
+        assert!(!log.contains("secret"));
+        assert!(log.contains("user@host"));
+
         Ok(())
     }
 }
