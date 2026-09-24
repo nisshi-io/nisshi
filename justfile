@@ -60,10 +60,29 @@ fmt:
 miri:
     cargo +nightly miri test --no-fail-fast --all-features
 
-docker-build:
+docker_arch := if arch() == "aarch64" { "arm64" } else { "amd64" }
+
+# build the static musl binary the Dockerfile packages into dist/linux/<arch>/nisshi
+# (needs zig and cargo-zigbuild; works on macOS and Linux hosts)
+docker-dist arch=docker_arch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ arch }}" in
+        amd64) target=x86_64-unknown-linux-musl ;;
+        arm64) target=aarch64-unknown-linux-musl ;;
+        *) echo "unsupported arch: {{ arch }} (expected amd64 or arm64)" >&2; exit 1 ;;
+    esac
+    rustup target add "${target}"
+    cargo zigbuild --release --bin nisshi --all-features --target "${target}"
+    # honour a build.target-dir / CARGO_TARGET_DIR override rather than assuming ./target
+    target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    mkdir -p dist/linux/{{ arch }}
+    cp "${target_dir}/${target}"/release/nisshi dist/linux/{{ arch }}/nisshi
+
+docker-build: docker-dist
     docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --debug .
 
-docker-build-cross:
+docker-build-cross: (docker-dist "amd64") (docker-dist "arm64")
     docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --platform linux/amd64,linux/arm64 --debug .
 
 minio-up: (docker-compose-up "minio")

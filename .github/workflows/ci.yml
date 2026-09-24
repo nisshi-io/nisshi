@@ -6,8 +6,9 @@ name: ci
 # it. This isn't a poisoning fix (GitHub already scopes a PR run's cache
 # writes to that PR's own ref) - it's hygiene, keeping the repo's cache
 # budget from being consumed by one entry per open PR instead of one per
-# branch. Applies to check, fmt, clippy, cargo-publish-dry-run and
-# third-party-license below.
+# branch. Applies to check, fmt, clippy, cargo-publish-dry-run,
+# third-party-license and release below (release also skips the cache
+# entirely on tags).
 permissions:
   contents: read
 on:
@@ -397,7 +398,7 @@ jobs:
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   package:
-    needs: [test, cargo-publish-dry-run, typos]
+    needs: [test, cargo-publish-dry-run, typos, release]
     runs-on: ${{matrix.os}}
     permissions:
       packages: write
@@ -408,14 +409,12 @@ jobs:
           - ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Verify Dockerfile builder matches rust-toolchain.toml
-        run: |
-          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
-          # shellcheck disable=SC2016 # $BUILDPLATFORM here is a literal in the sed pattern, not a shell expansion
-          dockerfile=$(sed -n 's/^FROM --platform=$BUILDPLATFORM rust:\(.*\)-alpine AS chef$/\1/p' Dockerfile)
-          echo "rust-toolchain.toml channel: $toolchain"
-          echo "Dockerfile chef stage:       $dockerfile"
-          [ "$toolchain" = "$dockerfile" ] || { echo "::error::rust-toolchain.toml ($toolchain) and Dockerfile's chef stage ($dockerfile) disagree"; exit 1; }
+      # release's static musl binaries, as dist/linux/<arch>/nisshi.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: dist
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         id: meta
         with:
@@ -440,8 +439,6 @@ jobs:
           push: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
   smoke:
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: [package]
@@ -526,7 +523,6 @@ jobs:
         env:
           NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
   release:
-    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: [test, src, typos]
     permissions:
       contents: write
@@ -535,63 +531,86 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            flags: ""
-            enabled: true
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            flags: ""
-            enabled: true
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
           - target: aarch64-apple-darwin
             os: macos-latest
-            flags: ""
-            enabled: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            flags: ""
-            enabled: true
+    env:
+      # cc-rs otherwise looks for aarch64-linux-musl-gcc, which Ubuntu doesn't
+      # ship, and falls back to glibc gcc for the C deps (aws-lc-sys, ring,
+      # libsql-ffi, zstd-sys, ...).
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache: false
+          # The action otherwise sets RUSTFLAGS to "-D warnings".
+          rustflags: ""
+          # A tag's release build never restores a cache (cache poisoning).
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # rust-cache keys on job + OS + arch, which both macOS legs share.
+          cache-key: ${{ matrix.target }}
+          cache-save-if: ${{ github.event_name == 'push' }}
       - run: rustc -vV
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
-      - if: ${{matrix.os == 'macos-latest'}}
+      - env:
+          TARGET: ${{matrix.target}}
+        run: rustup target add "$TARGET"
+      - if: ${{runner.os == 'Linux'}}
         run: |
-          rustup target add x86_64-apple-darwin
-          rustup target add aarch64-apple-darwin
-      - if: ${{matrix.target == 'aarch64-unknown-linux-gnu'}}
-        run: |
-          sudo apt update
-          sudo apt install -y musl-tools zlib1g-dev libzstd-dev
-      - if: ${{matrix.target == 'x86_64-unknown-linux-gnu'}}
-        run: |
-          sudo apt update
-          sudo apt install -y musl-tools zlib1g-dev libzstd-dev
-      - if: ${{matrix.enabled}}
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - env:
+          TARGET: ${{matrix.target}}
+        run: cargo build --release --bin nisshi --all-features --target "$TARGET"
+      - if: ${{runner.os == 'Linux'}}
         env:
-          RUSTFLAGS: ${{matrix.flags}}
           TARGET: ${{matrix.target}}
         run: |
-          cargo build --release --target ${{matrix.target}} --features delta,dynostore,iceberg,libsql,parquet,postgres
+          bin=target/"${TARGET}"/release/nisshi
+          file "$bin"
+          file "$bin" | grep -Eq 'static(-pie|ally) linked' || { echo "::error::$bin is not statically linked"; exit 1; }
+      - env:
+          TARGET: ${{matrix.target}}
+        run: |
           dist=$(mktemp -d -p ${{runner.temp}})
           mkdir "$dist"/bin
           cp target/"${TARGET}"/release/nisshi "$dist"/bin
           cp compose.yaml example.env LICENSE README.md "$dist"
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
-      - if: ${{matrix.enabled && github.ref_type != 'tag'}}
+      - if: ${{github.ref_type != 'tag'}}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nisshi-${{matrix.target}}
           path: nisshi-${{matrix.target}}.tar.gz
           if-no-files-found: error
-      - if: ${{matrix.enabled && github.ref_type == 'tag'}}
+      - if: ${{github.ref_type == 'tag'}}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: nisshi-${{matrix.target}}.tar.gz
+      # package's Dockerfile copies dist/<platform>/nisshi into the image.
+      - if: ${{runner.os == 'Linux'}}
+        env:
+          PLATFORM: ${{matrix.platform}}
+          TARGET: ${{matrix.target}}
+        run: |
+          mkdir -p dist/"${PLATFORM}"
+          cp target/"${TARGET}"/release/nisshi dist/"${PLATFORM}"/nisshi
+      - if: ${{runner.os == 'Linux'}}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: image-${{matrix.target}}
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
