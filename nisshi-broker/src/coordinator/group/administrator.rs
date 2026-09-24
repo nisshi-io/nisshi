@@ -2018,6 +2018,25 @@ where
 
                 return (self, join_group_response.into());
             }
+        } else if protocol_type.is_empty() || protocols.is_empty() {
+            debug!(join_outcome = ?ErrorCode::InconsistentGroupProtocol);
+
+            let join_group_response = JoinGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::InconsistentGroupProtocol.into())
+                .generation_id(self.generation_id)
+                .protocol_type(Some(protocol_type.into()))
+                // ProtocolName is non-nullable for versions < 7 (only nullableVersions 7+),
+                // and self.state.protocol_name is always None on this fresh-group path, so
+                // encoding None here would omit the length prefix and truncate the frame.
+                // Every other error path in this function uses "" for the same reason.
+                .protocol_name(Some("".into()))
+                .leader("".into())
+                .skip_assignment(self.skip_assignment)
+                .member_id("".into())
+                .members(Some([].into()));
+
+            return (self, join_group_response.into());
         } else {
             self.state.protocol_type = Some(protocol_type.to_owned());
             self.state.protocol_name = Some(protocols[0].name.as_str().to_owned());
@@ -4156,6 +4175,57 @@ mod tests {
                 group_instance_id,
                 CONSUMER,
                 Some(&second_member_protocols[..]),
+                reason,
+            )
+            .await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_fresh_group_with_empty_protocols_is_inconsistent_group_protocol() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let session_timeout_ms = 45_000;
+        let rebalance_timeout_ms = Some(300_000);
+        let group_instance_id = None;
+        let reason = None;
+
+        let cluster = "abc";
+        let node = 12321;
+
+        const CLIENT_ID: &str = "console-consumer";
+        const GROUP_ID: &str = "test-consumer-group-empty-protocols";
+
+        let s = Controller::with_storage(storage(cluster, node).await?)?;
+
+        // A fresh group (never joined before) receiving a JoinGroupRequest whose
+        // `protocols` array is present but empty must not panic indexing `protocols[0]`;
+        // it should be rejected the same way the already-negotiated-group path rejects
+        // an unmatched/absent protocol: InconsistentGroupProtocol.
+        assert_eq!(
+            Body::from(
+                JoinGroupResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(ErrorCode::InconsistentGroupProtocol.into())
+                    .generation_id(0)
+                    .protocol_type(Some(CONSUMER.into()))
+                    .protocol_name(Some("".into()))
+                    .leader("".into())
+                    .skip_assignment(Some(false))
+                    .member_id("".into())
+                    .members(Some([].into()))
+            ),
+            s.join(
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                "",
+                group_instance_id,
+                CONSUMER,
+                Some(&[]),
                 reason,
             )
             .await?
