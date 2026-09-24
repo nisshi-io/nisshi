@@ -38,7 +38,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{Instrument as _, Level, debug, error, instrument, span};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
@@ -305,17 +305,20 @@ where
                             let service = self.inner.clone();
                             let extensions = extensions.clone();
 
-                            let handle = set.spawn(async move {
-                                match service.serve(TcpStream::from_tokio_tcp_stream(stream, extensions)).await {
-                                    Err(error) => {
-                                        debug!(%addr, %error);
-                                    },
+                            let handle = set.spawn(
+                                async move {
+                                    match service.serve(TcpStream::from_tokio_tcp_stream(stream, extensions)).await {
+                                        Err(error) => {
+                                            debug!(%addr, %error);
+                                        }
 
-                                    Ok(response) => {
-                                        debug!(%addr, ?response)
+                                        Ok(response) => {
+                                            debug!(%addr, ?response)
+                                        }
                                     }
                                 }
-                            });
+                                .instrument(span!(Level::INFO, "peer", %addr)),
+                            );
 
                             debug!(?handle);
                         }
@@ -549,6 +552,10 @@ impl Service<TcpStream> for ReadHalfService {
 }
 
 /// A [`Service`] that requires the [`TcpContext`] as the service [`Context`] state
+///
+/// The connection may be any stream type, for example a [`TcpStream`] or a TLS
+/// stream wrapping one: this service only swaps the context state and passes
+/// the stream through to the inner service.
 #[derive(Clone)]
 pub struct TcpContextService<S> {
     inner: S,
@@ -561,35 +568,36 @@ impl<S> Debug for TcpContextService<S> {
     }
 }
 
-impl<S> Service<TcpStream> for TcpContextService<S>
+impl<S, Stream> Service<Stream> for TcpContextService<S>
 where
-    S: Service<TcpStream>,
+    S: Service<Stream>,
     S::Error: From<io::Error>,
+    Stream: ExtensionsRef + Send + 'static,
 {
     type Output = S::Output;
     type Error = S::Error;
 
-    #[instrument(skip_all, fields(peer = %req.stream.peer_addr()?))]
-    async fn serve(&self, req: TcpStream) -> Result<Self::Output, Self::Error> {
+    #[instrument(skip_all)]
+    async fn serve(&self, req: Stream) -> Result<Self::Output, Self::Error> {
         if let Some(cluster_id) = self.state.cluster_id.clone() {
-            _ = req.extensions.insert(ClusterIdExtension(cluster_id));
+            _ = req.extensions().insert(ClusterIdExtension(cluster_id));
         }
 
         if let Some(maximum_frame_size) = self.state.maximum_frame_size {
             _ = req
-                .extensions
+                .extensions()
                 .insert(MaximumFrameSizeExtension(maximum_frame_size));
         }
 
         if let Some(connection_idle_timeout) = self.state.connection_idle_timeout {
             _ = req
-                .extensions
+                .extensions()
                 .insert(ConnectionIdleTimeoutExtension(connection_idle_timeout));
         }
 
         if let Some(io_idle_timeout) = self.state.io_idle_timeout {
             _ = req
-                .extensions
+                .extensions()
                 .insert(IoIdleTimeoutExtension(io_idle_timeout));
         }
 

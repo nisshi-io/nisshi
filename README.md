@@ -101,6 +101,91 @@ If an Apache Avro, Protobuf or JSON schema has been assigned to a topic, the
 broker will reject any messages that are invalid. Schema backed topics are written
 as Apache Parquet when the `-data-lake` option is provided.
 
+### TLS
+
+The listener speaks TLS when both `--cert` (the certificate chain) and `--key`
+(the private key) are supplied as PEM files, and clap rejects one without the other:
+
+```shell
+nisshi broker --cert broker.pem --key broker-key.pem
+```
+
+With TLS configured the listener is TLS only: plaintext clients are refused
+during the handshake, so clients must be configured with `security.protocol=SSL`
+(and a truststore containing the certificate, if it is self-signed). The
+`--listener-url` keeps its `tcp://` scheme. TLS here provides encryption only;
+client authentication is still SASL (see `--authentication`). The private key
+is a PKCS#8, SEC1 or RSA PEM key. `--cert` and `--key` may point at the same
+file when the certificate chain and key are kept in one PEM bundle. Any
+problem loading the certificate or key, or a key that does not match the
+certificate, fails startup rather than falling back to plaintext.
+
+A passphrase protected key (the counterpart of Kafka's `ssl.key.password`) is
+read with `--key-passphrase-file`, a file holding the passphrase; a trailing
+newline is ignored:
+
+```shell
+nisshi broker --cert broker.pem --key broker-key.pem --key-passphrase-file broker-key.passphrase
+```
+
+Only PKCS#8 encryption (`ENCRYPTED PRIVATE KEY`, PBES2 with PBKDF2-HMAC-SHA2 or
+scrypt and AES-CBC or Triple DES, which is what `openssl pkcs8 -topk8` emits) is
+supported. Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) and keys
+derived with a SHA-1 PRF (older OpenSSL releases' default) are rejected at
+startup, naming the algorithm; re-encrypt the key first, keeping the passphrase:
+
+```shell
+openssl pkcs8 -topk8 -in broker-key.pem -out broker-key-pkcs8.pem -v2 aes-256-cbc -v2prf hmacWithSHA256
+```
+
+An empty passphrase file means no passphrase, so a mounted secret that is
+absent for unencrypted keys works unchanged. A passphrase given for a key that
+is not encrypted is ignored with a warning.
+
+Note for existing deployments: before 0.7 these flags were accepted but had no
+effect, so a broker started with `--cert` and `--key` was serving plaintext.
+After upgrading, that same command line serves TLS only, and `--cert` without
+`--key` (or the reverse) is rejected. The bundled `nisshi cat`, `topic`, `perf`
+and `proxy` subcommands connect in plaintext and cannot yet talk to a TLS
+listener. `--key-passphrase-file` is unknown to earlier releases, so rolling
+the binary back means removing that flag from the command line as well.
+
+### Metrics
+
+Metrics are exported over OTLP/HTTP when `--otlp-endpoint-url` (or
+`OTEL_EXPORTER_OTLP_ENDPOINT`) is set. `v1/metrics` is appended to the URL's
+path, so `https://collector:4318` and `https://gateway/otlp` export to
+`https://collector:4318/v1/metrics` and `https://gateway/otlp/v1/metrics`.
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is not read. Collector credentials go
+in `OTEL_EXPORTER_OTLP_HEADERS`.
+
+The exported resource honours the standard OpenTelemetry environment
+variables. Every `key=value` pair in `OTEL_RESOURCE_ATTRIBUTES` is attached
+as given; values are not percent-decoded, and entries without a `=` are
+ignored with a warning. `service.name` is resolved as `OTEL_SERVICE_NAME`,
+then `service.name` in `OTEL_RESOURCE_ATTRIBUTES`, then the default for the
+subcommand (`nisshi-broker`, or `nisshi-proxy` / `nisshi-generator` for
+`proxy` and `generator`). Unset, empty or whitespace-only values fall through
+to the next source. The endpoint, `service.name` and attribute names are
+logged at `info` on startup. Resource attributes are sent with every export,
+so use an `https` endpoint when they carry anything sensitive.
+
+```shell
+OTEL_EXPORTER_OTLP_ENDPOINT=https://collector:4318/ \
+OTEL_SERVICE_NAME=kafka-broker \
+OTEL_RESOURCE_ATTRIBUTES=service.version=0.7.0,deployment.environment.name=staging \
+nisshi broker
+```
+
+Note for existing deployments: before 0.7 `service.name` was always
+`nisshi-broker` and these variables were ignored. If `OTEL_SERVICE_NAME` or
+`OTEL_RESOURCE_ATTRIBUTES` is already set in the broker's environment, for
+example injected pod-wide for another agent, its series move to that name on
+upgrade and dashboards or alerts keyed on `nisshi-broker` go quiet. Unset the
+inherited variable or set `OTEL_SERVICE_NAME=nisshi-broker`. Rolling back
+reverts to `nisshi-broker` regardless of these variables. On shutdown the
+broker now flushes pending metrics before exiting.
+
 ## topic
 
 The `nisshi topic` command has the following subcommands:

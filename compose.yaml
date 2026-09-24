@@ -37,7 +37,8 @@ services:
       retries: 5
     pull_policy: missing
   minio:
-    image: quay.io/minio/minio
+    # RELEASE.2026-09-22T19-25-18Z; Chainguard's free tier only publishes :latest, so pin by digest
+    image: cgr.dev/chainguard/minio:latest@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     command: server /data --console-address ":9001"
     volumes:
       - minio:/data

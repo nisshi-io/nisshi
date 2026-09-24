@@ -33,6 +33,7 @@ human-units.workspace = true
 humantime.workspace = true
 owo-colors.workspace = true
 pbkdf2.workspace = true
+pkcs8.workspace = true
 rand.workspace = true
 regex.workspace = true
 rsasl.workspace = true
@@ -54,3 +55,8 @@ tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
