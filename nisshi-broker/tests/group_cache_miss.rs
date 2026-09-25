@@ -12,12 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Two heartbeats for the same group that overlap on the broker must both
-//! see the formed group. While the first one is writing the group back to
-//! storage, the second finds no cached state for the group and starts from
-//! an empty one; the storage's conditional write has to reject that as
-//! outdated and hand back the stored group, or the second heartbeat drops
-//! every member (`UnknownMemberId`) or fails with a storage error.
+//! A group request that finds no cached state for its group starts from an
+//! empty group with no version. The storage's conditional write has to
+//! reject that as outdated and hand back the stored group, or the request
+//! drops every member (`UnknownMemberId`) or fails with a storage error.
+//!
+//! The coordinator finds nothing cached in two ways:
+//!
+//! - two requests for the same group overlap on the broker: while the first
+//!   is writing the group back to storage, the second finds its cached state
+//!   checked out;
+//! - the broker restarts: a new coordinator over the same storage has
+//!   nothing cached.
 
 mod common;
 
@@ -59,7 +65,33 @@ fn heartbeat_error(body: &Body) -> Result<i16> {
     }
 }
 
-async fn overlapping_heartbeats(storage: impl Storage + Clone, stagger: Duration) -> Result<()> {
+fn assert_heartbeats_ok<'a>(
+    outcomes: impl IntoIterator<Item = (&'a str, nisshi_broker::Result<Body>)>,
+) -> Result<()> {
+    for (heartbeat, outcome) in outcomes {
+        let body = outcome.map_err(|err| anyhow!("{heartbeat} heartbeat: {err}"))?;
+
+        assert_eq!(
+            i16::from(ErrorCode::None),
+            heartbeat_error(&body)?,
+            "{heartbeat} heartbeat"
+        );
+    }
+
+    Ok(())
+}
+
+/// A group with one member, formed through a coordinator.
+struct Formed {
+    group: String,
+    generation_id: i32,
+    member_id: String,
+}
+
+async fn form_group<S>(coordinator: &Controller<S>) -> Result<Formed>
+where
+    S: Storage + Clone,
+{
     let group = alphanumeric_string(15);
 
     let metadata = MetadataResponse::default().topics(Some(vec![
@@ -73,8 +105,6 @@ async fn overlapping_heartbeats(storage: impl Storage + Clone, stagger: Duration
                     .collect(),
             )),
     ]));
-
-    let coordinator = Controller::with_storage(storage)?;
 
     let route = services(
         FrameRouteService::<nisshi_broker::Error>::builder(),
@@ -109,6 +139,22 @@ async fn overlapping_heartbeats(storage: impl Storage + Clone, stagger: Duration
     let synced = serve(&consumer, Some(joined)).await?;
     assert!(matches!(synced, Body::SyncGroupResponse(_)), "{synced:?}");
 
+    Ok(Formed {
+        group,
+        generation_id,
+        member_id,
+    })
+}
+
+async fn overlapping_heartbeats(storage: impl Storage + Clone, stagger: Duration) -> Result<()> {
+    let coordinator = Controller::with_storage(storage)?;
+
+    let Formed {
+        group,
+        generation_id,
+        member_id,
+    } = form_group(&coordinator).await?;
+
     // two heartbeats from the member that overlap on the broker
     //
     let (first, second) = tokio::join!(
@@ -130,22 +176,41 @@ async fn overlapping_heartbeats(storage: impl Storage + Clone, stagger: Duration
         .heartbeat(&group, generation_id, &member_id, None)
         .await;
 
-    for (heartbeat, outcome) in [("first", first), ("second", second), ("after", after)] {
-        let body = outcome.map_err(|err| anyhow!("{heartbeat} heartbeat: {err}"))?;
-
-        assert_eq!(
-            i16::from(ErrorCode::None),
-            heartbeat_error(&body)?,
-            "{heartbeat} heartbeat"
-        );
-    }
-
-    Ok(())
+    assert_heartbeats_ok([("first", first), ("second", second), ("after", after)])
 }
 
-async fn run(storage: impl Storage + Clone, stagger: Duration) -> Result<()> {
+async fn heartbeat_after_restart(storage: impl Storage + Clone) -> Result<()> {
+    let Formed {
+        group,
+        generation_id,
+        member_id,
+    } = form_group(&Controller::with_storage(storage.clone())?).await?;
+
+    // a new coordinator over the same storage, as after a broker restart
+    //
+    let restarted = Controller::with_storage(storage)?;
+
+    let first = restarted
+        .heartbeat(&group, generation_id, &member_id, None)
+        .await;
+
+    // and one more afterwards, to see what was left in storage
+    //
+    let after = restarted
+        .heartbeat(&group, generation_id, &member_id, None)
+        .await;
+
+    assert_heartbeats_ok([("first", first), ("after", after)])
+}
+
+async fn overlap(storage: impl Storage + Clone, stagger: Duration) -> Result<()> {
     let _guard = init_tracing()?;
     overlapping_heartbeats(storage, stagger).await
+}
+
+async fn restart(storage: impl Storage + Clone) -> Result<()> {
+    let _guard = init_tracing()?;
+    heartbeat_after_restart(storage).await
 }
 
 fn ids() -> (Uuid, i32) {
@@ -163,54 +228,82 @@ const STAGGERED: Duration = Duration::from_millis(20);
 #[tokio::test]
 async fn in_memory_simultaneous() -> Result<()> {
     let (cluster, node) = ids();
-    run(memory_storage(cluster, node).await?, SIMULTANEOUS).await
+    overlap(memory_storage(cluster, node).await?, SIMULTANEOUS).await
 }
 
 #[cfg(feature = "dynostore")]
 #[tokio::test]
 async fn in_memory_staggered() -> Result<()> {
     let (cluster, node) = ids();
-    run(memory_storage(cluster, node).await?, STAGGERED).await
+    overlap(memory_storage(cluster, node).await?, STAGGERED).await
+}
+
+#[cfg(feature = "dynostore")]
+#[tokio::test]
+async fn in_memory_restart() -> Result<()> {
+    let (cluster, node) = ids();
+    restart(memory_storage(cluster, node).await?).await
 }
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn lite_simultaneous() -> Result<()> {
     let (cluster, node) = ids();
-    run(lite_storage(cluster, node).await?, SIMULTANEOUS).await
+    overlap(lite_storage(cluster, node).await?, SIMULTANEOUS).await
 }
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn lite_staggered() -> Result<()> {
     let (cluster, node) = ids();
-    run(lite_storage(cluster, node).await?, STAGGERED).await
+    overlap(lite_storage(cluster, node).await?, STAGGERED).await
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn lite_restart() -> Result<()> {
+    let (cluster, node) = ids();
+    restart(lite_storage(cluster, node).await?).await
 }
 
 #[cfg(feature = "slatedb")]
 #[tokio::test]
 async fn slatedb_simultaneous() -> Result<()> {
     let (cluster, node) = ids();
-    run(slate_storage(cluster, node).await?, SIMULTANEOUS).await
+    overlap(slate_storage(cluster, node).await?, SIMULTANEOUS).await
 }
 
 #[cfg(feature = "slatedb")]
 #[tokio::test]
 async fn slatedb_staggered() -> Result<()> {
     let (cluster, node) = ids();
-    run(slate_storage(cluster, node).await?, STAGGERED).await
+    overlap(slate_storage(cluster, node).await?, STAGGERED).await
+}
+
+#[cfg(feature = "slatedb")]
+#[tokio::test]
+async fn slatedb_restart() -> Result<()> {
+    let (cluster, node) = ids();
+    restart(slate_storage(cluster, node).await?).await
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn pg_simultaneous() -> Result<()> {
     let (cluster, node) = ids();
-    run(postgres_storage(cluster, node).await?, SIMULTANEOUS).await
+    overlap(postgres_storage(cluster, node).await?, SIMULTANEOUS).await
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn pg_staggered() -> Result<()> {
     let (cluster, node) = ids();
-    run(postgres_storage(cluster, node).await?, STAGGERED).await
+    overlap(postgres_storage(cluster, node).await?, STAGGERED).await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn pg_restart() -> Result<()> {
+    let (cluster, node) = ids();
+    restart(postgres_storage(cluster, node).await?).await
 }

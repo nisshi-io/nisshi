@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `update_group` is a conditional write: `version: None` means "create
-//! only", so it must not overwrite a group that already exists.
+//! `update_group` is a conditional write on the version of the group:
+//! `version: None` means "create only", and a version must match the stored
+//! one. A rejected write reports the group as outdated, carrying the stored
+//! group and its version, and leaves the stored group as it was.
 //!
 //! The group coordinator relies on this. It caches each group's state in
 //! memory, and a request that arrives while another request for the same
@@ -29,29 +31,60 @@ use crate::common::{
     slate_storage,
 };
 use nisshi_broker::{Error, Result};
-use nisshi_storage::{ArcDynStorage, GroupDetail, Storage, UpdateError};
+use nisshi_storage::{
+    ArcDynStorage, GroupDetail, GroupDetailResponse, NamedGroupDetail, Storage, UpdateError,
+    Version,
+};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
+
+fn generation(generation_id: i32) -> GroupDetail {
+    GroupDetail {
+        generation_id,
+        ..Default::default()
+    }
+}
+
+async fn update(
+    storage: &impl Storage,
+    group_id: &str,
+    detail: GroupDetail,
+    version: Option<Version>,
+) -> Result<Version, Error> {
+    storage
+        .update_group(group_id, detail, version)
+        .await
+        .map_err(|err| Error::Message(format!("update: {err:?}")))
+}
+
+/// The generation of the group as stored, read independently of
+/// `update_group`.
+async fn stored_generation(storage: &impl Storage, group_id: &str) -> Result<i32, Error> {
+    let described = storage
+        .describe_groups(Some(&[group_id.to_owned()]), false)
+        .await
+        .map_err(|err| Error::Message(format!("describe: {err:?}")))?;
+
+    match &described[..] {
+        [
+            NamedGroupDetail {
+                response: GroupDetailResponse::Found(detail),
+                ..
+            },
+        ] => Ok(detail.generation_id),
+
+        otherwise => Err(Error::Message(format!(
+            "expecting one described group: {otherwise:?}"
+        ))),
+    }
+}
 
 async fn create_only_without_version(storage: impl Storage + Clone) -> Result<(), Error> {
     let group_id = &alphanumeric_string(15)[..];
 
-    let created = GroupDetail {
-        generation_id: 1,
-        ..Default::default()
-    };
+    let version = update(&storage, group_id, generation(1), None).await?;
 
-    let version = storage
-        .update_group(group_id, created, None)
-        .await
-        .map_err(|err| Error::Message(format!("create: {err:?}")))?;
-
-    let overwrite = GroupDetail {
-        generation_id: 2,
-        ..Default::default()
-    };
-
-    match storage.update_group(group_id, overwrite, None).await {
+    match storage.update_group(group_id, generation(2), None).await {
         Err(UpdateError::Outdated {
             current,
             version: current_version,
@@ -62,6 +95,65 @@ async fn create_only_without_version(storage: impl Storage + Clone) -> Result<()
 
         otherwise => panic!("expected outdated, got: {otherwise:?}"),
     }
+
+    assert_eq!(1, stored_generation(&storage, group_id).await?);
+
+    Ok(())
+}
+
+async fn stale_version(storage: impl Storage + Clone) -> Result<(), Error> {
+    let group_id = &alphanumeric_string(15)[..];
+
+    let first = update(&storage, group_id, generation(1), None).await?;
+    let second = update(&storage, group_id, generation(2), Some(first.clone())).await?;
+
+    match storage
+        .update_group(group_id, generation(3), Some(first))
+        .await
+    {
+        Err(UpdateError::Outdated { current, version }) => {
+            assert_eq!(2, current.generation_id);
+            assert_eq!(second, version);
+        }
+
+        otherwise => panic!("expected outdated, got: {otherwise:?}"),
+    }
+
+    assert_eq!(2, stored_generation(&storage, group_id).await?);
+
+    Ok(())
+}
+
+/// Two updates from the same version race: exactly one wins, and the other
+/// is told the group is outdated, with the winner's group and version. On
+/// SlateDB the loser can pass the version check and then fail to commit with
+/// a transaction conflict, which must also be reported as outdated.
+async fn concurrent_same_version(storage: impl Storage + Clone) -> Result<(), Error> {
+    let group_id = &alphanumeric_string(15)[..];
+
+    let version = update(&storage, group_id, generation(1), None).await?;
+
+    let (second, third) = tokio::join!(
+        storage.update_group(group_id, generation(2), Some(version.clone())),
+        storage.update_group(group_id, generation(3), Some(version)),
+    );
+
+    let (winner, won, lost) = match (second, third) {
+        (Ok(won), Err(lost)) => (2, won, lost),
+        (Err(lost), Ok(won)) => (3, won, lost),
+        otherwise => panic!("expected exactly one update to win, got: {otherwise:?}"),
+    };
+
+    match lost {
+        UpdateError::Outdated { current, version } => {
+            assert_eq!(winner, current.generation_id);
+            assert_eq!(won, version);
+        }
+
+        otherwise => panic!("expected outdated, got: {otherwise:?}"),
+    }
+
+    assert_eq!(winner, stored_generation(&storage, group_id).await?);
 
     Ok(())
 }
@@ -88,6 +180,30 @@ mod in_memory {
 
         super::create_only_without_version(storage).await
     }
+
+    #[tokio::test]
+    async fn stale_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::stale_version(storage).await
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::concurrent_same_version(storage).await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -111,6 +227,30 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::create_only_without_version(storage).await
+    }
+
+    #[tokio::test]
+    async fn stale_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::stale_version(storage).await
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::concurrent_same_version(storage).await
     }
 }
 
@@ -136,6 +276,30 @@ mod slatedb {
 
         super::create_only_without_version(storage).await
     }
+
+    #[tokio::test]
+    async fn stale_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::stale_version(storage).await
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::concurrent_same_version(storage).await
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -159,5 +323,29 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::create_only_without_version(storage).await
+    }
+
+    #[tokio::test]
+    async fn stale_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::stale_version(storage).await
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::concurrent_same_version(storage).await
     }
 }

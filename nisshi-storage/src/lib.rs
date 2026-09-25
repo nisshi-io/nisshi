@@ -1485,10 +1485,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
 
     /// Conditionally update the state of a group in this storage.
     ///
-    /// The update only succeeds when `version` matches the stored version of
-    /// the group; `None` matches only a group that is not stored yet. Otherwise
-    /// the update fails with [`UpdateError::Outdated`], carrying the stored
-    /// group and its version for the caller to retry against.
+    /// `version` is the version of the group the caller last read. `None`
+    /// only succeeds when no state is stored for the group yet, and a version
+    /// for a stored group only succeeds when it matches the stored version.
+    /// Otherwise the update fails with [`UpdateError::Outdated`], carrying the
+    /// stored group and its version for the caller to retry against.
+    ///
+    /// Backends do not yet agree on a version for a group with no stored
+    /// state: some accept it, others report the group as outdated.
     async fn update_group(
         &self,
         group_id: &str,

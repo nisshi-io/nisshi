@@ -1823,9 +1823,10 @@ impl Storage for Engine {
             .map_err(|err| UpdateError::Error(Error::Postcard(err)))?;
 
         // Load the existing group; a missing key yields the default detail
-        // and version. The caller's version must match: no version only
-        // matches a missing group, so an existing group is reported as
-        // outdated rather than silently overwritten.
+        // and version. The caller's version must match: no version matches
+        // only a missing group or the empty placeholder that offset_commit
+        // stores, so a group with state is reported as outdated rather than
+        // silently overwritten.
         let current: GroupDetailVersion = self
             .load_metadata(&tx, &key)
             .await
@@ -1854,7 +1855,7 @@ impl Storage for Engine {
             // was open: report the group as outdated, so that the caller
             // retries against what is now stored.
             Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
-                debug!(?err);
+                debug!(?err, ?group_id);
 
                 let current: GroupDetailVersion = self
                     .db
