@@ -659,15 +659,6 @@ jobs:
   # (not relied on transitively through e.g. `test`) so a failure surfaces as
   # `failure` here even when it also cascades a downstream job to `skipped` -
   # `needs.*.result` reads each listed job's own outcome, not the masked one.
-  #
-  # `smoke` is deliberately not listed: it still runs and reports its own
-  # status, but it doesn't gate. Through 2026-09-24 its docker compose (in
-  # nisshi-io/example-java) pulled minio from a registry that rejects
-  # anonymous pulls ("unauthorized: access to the requested resource is not
-  # authorized"), failing runs regardless of the code under test; in a merge
-  # queue that would eject good entries. example-java #4 (2026-09-25) now
-  # builds minio from source, with one green main run on it so far. Re-add
-  # `smoke` here once it has stayed green across a run of queue entries.
   ci-gate:
     if: always()
     needs:
@@ -684,6 +675,7 @@ jobs:
       - third-party-license
       - src
       - package
+      - smoke
       - release
     runs-on: ubuntu-latest
     steps:
