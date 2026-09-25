@@ -33,7 +33,12 @@ name: ci
 # `merge_group` is here because the queue tests each entry on a
 # `gh-readonly-queue/...` branch; bound to `pull_request` alone, ci-gate
 # would never report there and every entry would hang until ejected. `push`
-# is scoped to `main`, so a queue entry doesn't double-run.
+# is scoped to `main`, so the queue branch itself doesn't also trigger a
+# push run. The queue fast-forwards main to the exact commit it tested, so
+# the post-merge push run does repeat Tier B on the same tree; that is what
+# refreshes the caches and publishes the `main` image, and it is the same
+# cost as today's post-merge run, not an addition. Trimming it is a
+# follow-up.
 permissions:
   contents: read
 on:
@@ -47,11 +52,16 @@ on:
       - main
   merge_group:
     types: [checks_requested]
-# Cancel a superseded pull_request run, never a push or a merge_group run:
-# `pull_request.number` is empty on merge_group, and cancelling an in-flight
-# queue run fails that queue entry outright.
+# Cancel a superseded pull_request run only. Off pull_request the group is
+# `ref@sha`, not `sha`: the queue fast-forwards main to the commit it just
+# tested, so the merge_group run and the post-merge push run share a sha,
+# and a `v*` tag on main's tip makes a third. Sharing a group would make the
+# push run pend behind the still-running queue run, and GitHub cancels a
+# pending run in a group whenever a newer one arrives, whatever
+# `cancel-in-progress` says. Cancelling a merge_group run also fails that
+# queue entry outright.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   REGISTRY: ghcr.io
@@ -651,12 +661,13 @@ jobs:
   # `needs.*.result` reads each listed job's own outcome, not the masked one.
   #
   # `smoke` is deliberately not listed: it still runs and reports its own
-  # status, but it doesn't gate. Its docker compose pulls a minio image from
-  # a registry with a recurring anonymous-pull auth failure ("unauthorized:
-  # access to the requested resource is not authorized"), unrelated to the
-  # code under test; in a merge queue that flake would eject good entries.
-  # The fix lives in nisshi-io/example-java's compose config. Re-add it here
-  # once that lands.
+  # status, but it doesn't gate. Through 2026-09-24 its docker compose (in
+  # nisshi-io/example-java) pulled minio from a registry that rejects
+  # anonymous pulls ("unauthorized: access to the requested resource is not
+  # authorized"), failing runs regardless of the code under test; in a merge
+  # queue that would eject good entries. example-java #4 (2026-09-25) now
+  # builds minio from source, with one green main run on it so far. Re-add
+  # `smoke` here once it has stayed green across a run of queue entries.
   ci-gate:
     if: always()
     needs:
@@ -685,4 +696,20 @@ jobs:
       - if: github.event_name != 'pull_request' && contains(needs.*.result, 'skipped')
         run: |
           echo "::error::a gated job was skipped on a ${GITHUB_EVENT_NAME} run; every listed job must run and succeed here"
+          exit 1
+      # And on pull_request, Tier A itself may not skip. A Tier A job is
+      # marked `skipped` if it gains a `needs` on a Tier B job, and without
+      # this the PR gate would stay green with no Tier A signal at all.
+      - if: >-
+          github.event_name == 'pull_request' && (
+            needs.check.result == 'skipped' ||
+            needs.fmt.result == 'skipped' ||
+            needs.clippy.result == 'skipped' ||
+            needs.test.result == 'skipped' ||
+            needs.compat-librdkafka.result == 'skipped' ||
+            needs.compat-franz-go.result == 'skipped' ||
+            needs.typos.result == 'skipped' ||
+            needs.third-party-license.result == 'skipped')
+        run: |
+          echo "::error::a Tier A job was skipped on a pull_request run; check for a needs edge onto a Tier B job"
           exit 1
