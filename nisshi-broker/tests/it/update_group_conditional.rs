@@ -24,8 +24,6 @@
 //! and hand back the stored group. SlateDB used to skip the check when no
 //! version was given and overwrote the group, dropping every member.
 
-mod common;
-
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,

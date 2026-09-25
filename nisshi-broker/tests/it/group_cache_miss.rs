@@ -25,8 +25,6 @@
 //! - the broker restarts: a new coordinator over the same storage has
 //!   nothing cached.
 
-mod common;
-
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
