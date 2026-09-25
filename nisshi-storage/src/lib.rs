@@ -1484,6 +1484,11 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>>;
 
     /// Conditionally update the state of a group in this storage.
+    ///
+    /// The update only succeeds when `version` matches the stored version of
+    /// the group; `None` matches only a group that is not stored yet. Otherwise
+    /// the update fails with [`UpdateError::Outdated`], carrying the stored
+    /// group and its version for the caller to retry against.
     async fn update_group(
         &self,
         group_id: &str,
