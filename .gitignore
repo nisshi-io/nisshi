@@ -16,6 +16,7 @@
 .zed
 Cargo.lock
 cargo-flamegraph.trace
+/dist
 debug
 dhat.*
 flamegraph*.svg
@@ -23,3 +24,9 @@ license.html
 perf.data*
 profile.json*
 target
+tmp
+
+# understand-anything: keep the committed graph, ignore its local scratch
+.ua/intermediate/
+.ua/diff-overlay.json
+.ua/.trash-*/

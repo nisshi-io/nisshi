@@ -15,7 +15,7 @@
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use tansu_sans_io::Frame;
+use nisshi_sans_io::Frame;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {

@@ -1,5 +1,5 @@
 {
-  "name": "tansu",
+  "name": "nisshi",
 
   "dockerFile": "Dockerfile",
 
@@ -15,7 +15,7 @@
     "3000": { "label": "grafana" },
     "5432": { "label": "postgresql" },
     "9090": { "label": "prom" },
-    "9092": { "label": "tansu" }
+    "9092": { "label": "nisshi" }
   },
 
   "features": {

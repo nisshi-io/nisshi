@@ -1,0 +1,57 @@
+---
+name: Workflow lint
+
+# actionlint (correctness) and zizmor (security) over .github/workflows/, so
+# a broken or unsafe workflow edit is caught the same way a broken Rust
+# change is.
+#
+# No `paths:` filter: a required check that's path-filtered never reports
+# on a PR outside that path and blocks it forever instead of passing it.
+# If a heavier job needs this later, gate it behind a `dorny/paths-filter`
+# output rather than filtering the trigger.
+#
+# zizmor is filtered to medium+ severity and confidence - its low-confidence
+# heuristics are useful to read but too noisy to gate merges on.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # Both jobs are required checks; the merge queue tests each entry on a
+  # `gh-readonly-queue/...` branch, and without this trigger they'd never
+  # report there and every entry would hang.
+  merge_group:
+    types: [checks_requested]
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Installed directly (not via a reporting wrapper action) so the job's
+      # own exit code is what gates the merge; a wrapper that posts to the
+      # Checks API would need `checks: write`, which this workflow doesn't
+      # grant and shouldn't need to just run a linter.
+      - run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - run: |
+          "$(go env GOPATH)/bin/actionlint"
+
+  zizmor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+        with:
+          tool: zizmor
+      # GH_TOKEN enables zizmor's online audits (e.g. known-vulnerable-actions,
+      # which checks pinned SHAs against GHSA) - the complement to SHA-pinning
+      # below: pinning stops tag mutation, this catches a pin that's already
+      # bad. contents:read is sufficient; no extra permission needed.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --min-confidence medium --min-severity medium .github/workflows/

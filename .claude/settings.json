@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt --all 2>/dev/null || true",
+            "statusMessage": "Formatting with cargo fmt..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,57 @@
+---
+# CodeQL "advanced setup". Replaces the repository-settings "default setup",
+# which never scans pull requests opened from forks. This workflow reproduces
+# the default setup's coverage exactly: the `rust` and `actions` languages,
+# both in build-mode `none`.
+#
+# A green `Analyze` job means the scan uploaded, not that it found nothing.
+# Findings appear in the Security tab and on the `github-advanced-security`
+# pull request check.
+name: CodeQL
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  # `Analyze (rust)` / `Analyze (actions)` are required checks; the merge
+  # queue tests each entry on a `gh-readonly-queue/...` branch, and without
+  # this trigger they'd never report there and every entry would hang.
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    # Weekly, Monday 06:23 UTC. Off the hour to avoid the top-of-hour rush.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+# Same grouping as ci.yml: `ref@sha` off pull_request, because a merge_group
+# run and the post-merge push run share a sha and must not share a group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - rust
+          - actions
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          category: "/language:${{ matrix.language }}"
