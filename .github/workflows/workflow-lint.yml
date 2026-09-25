@@ -22,6 +22,11 @@ on:
   pull_request:
     branches:
       - main
+  # Both jobs are required checks; the merge queue tests each entry on a
+  # `gh-readonly-queue/...` branch, and without this trigger they'd never
+  # report there and every entry would hang.
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   actionlint:

@@ -19,6 +19,11 @@ on:
   pull_request:
     branches:
       - main
+  # `cargo-deny` is a required check; the merge queue tests each entry on a
+  # `gh-readonly-queue/...` branch, and without this trigger it'd never
+  # report there and every entry would hang.
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   cargo-deny:
