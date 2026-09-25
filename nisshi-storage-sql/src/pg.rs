@@ -4131,7 +4131,7 @@ mod tests {
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
     use rand::distr::Alphanumeric;
 
-    // mirrors nisshi-broker/tests/common/mod.rs storage_container(StorageType::Postgres)
+    // mirrors nisshi-broker/tests/it/common/mod.rs storage_container(StorageType::Postgres)
     const CONNECTION: &str = "postgres://postgres:postgres@localhost";
 
     fn alphanumeric_string(length: usize) -> String {
