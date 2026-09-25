@@ -9,6 +9,41 @@ name: ci
 # branch. Applies to check, fmt, clippy, cargo-publish-dry-run,
 # third-party-license and release below (release also skips the cache
 # entirely on tags).
+#
+# Two tiers. The org is on GitHub's Free plan (20 concurrent jobs), and a
+# full run of this workflow is ~60 jobs, 31 of them with no `needs`. Running
+# all of that on every pull_request push starved every other PR of runners.
+# So:
+#
+# - Tier A runs on every pull_request push: check, fmt, clippy, typos,
+#   third-party-license, the single non-experimental leg of each compat
+#   suite, `test` on postgres:17 only (compose.yaml's default), and ci-gate.
+# - Tier B runs once per merge-queue entry (`merge_group`) and on push:
+#   the full build-storage/build-storage-lake matrix, `test` on pg16/pg18,
+#   the experimental compat legs, cargo-publish-dry-run, src, package,
+#   smoke, release.
+#
+# Tier B jobs carry `if: github.event_name != 'pull_request' ||
+# vars.MERGE_QUEUE != 'on'`, and the trimmed matrices pick the smaller list
+# under the same condition, so a leg's check-run name
+# (`test (ubuntu-latest, postgres:17)`) means the same thing whichever tier
+# produced it. The `MERGE_QUEUE` repository variable is the rollback switch:
+# the split only makes sense while a merge queue runs Tier B before merge,
+# so when the queue is off (variable unset or not `on`) pull_request runs
+# everything, as before the split. Flip the variable together with the
+# ruleset's merge_queue rule, in both directions. No Tier A job may `needs`
+# a Tier B job: GitHub marks a job `skipped` (not `failure`) when its own
+# `needs` didn't run, which would silently skip Tier A on every PR.
+#
+# `merge_group` is here because the queue tests each entry on a
+# `gh-readonly-queue/...` branch; bound to `pull_request` alone, ci-gate
+# would never report there and every entry would hang until ejected. `push`
+# is scoped to `main`, so the queue branch itself doesn't also trigger a
+# push run. The queue fast-forwards main to the exact commit it tested, so
+# the post-merge push run does repeat Tier B on the same tree; that is what
+# refreshes the caches and publishes the `main` image, and it is the same
+# cost as today's post-merge run, not an addition. Trimming it is a
+# follow-up.
 permissions:
   contents: read
 on:
@@ -20,22 +55,35 @@ on:
   pull_request:
     branches:
       - main
+  merge_group:
+    types: [checks_requested]
+# Cancel a superseded pull_request run only. Off pull_request the group is
+# `ref@sha`, not `sha`: the queue fast-forwards main to the commit it just
+# tested, so the merge_group run and the post-merge push run share a sha,
+# and a `v*` tag on main's tip makes a third. Sharing a group would make the
+# push run pend behind the still-running queue run, and GitHub cancels a
+# pending run in a group whenever a newer one arrives, whatever
+# `cancel-in-progress` says. Cancelling a merge_group run also fails that
+# queue entry outright.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   REGISTRY: ghcr.io
   CLICOLOR: 1
 jobs:
   test:
-    needs: [check, fmt, clippy, build-storage, build-storage-lake]
+    # Tier A on postgres:17 (compose.yaml's default), full pg matrix on
+    # merge_group/push. build-storage/build-storage-lake are Tier B, so they
+    # can't be `needs` here (see the header).
+    needs: [check, fmt, clippy]
     runs-on: ${{matrix.os}}
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
-        pg:
-          - postgres:16
-          - postgres:17
-          - postgres:18
+        pg: ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on') && '["postgres:17"]' || '["postgres:16", "postgres:17", "postgres:18"]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -140,6 +188,7 @@ jobs:
           cache-save-if: ${{ github.event_name == 'push' }}
       - run: just clippy
   build-storage:
+    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
     strategy:
       fail-fast: false
@@ -164,6 +213,7 @@ jobs:
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: just build dev ${{matrix.storage}}
   build-storage-lake:
+    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
     strategy:
       fail-fast: false
@@ -196,23 +246,15 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        storage:
-          - name: memory
-            engine: memory://
-            features: dynostore
-            experimental: false
-          - name: s3
-            engine: s3://nisshi/
-            features: dynostore
-            experimental: true
-          - name: postgres
-            engine: postgres://postgres:postgres@localhost
-            features: postgres
-            experimental: true
-          - name: sqlite
-            engine: sqlite://nisshi.db
-            features: libsql
-            experimental: true
+        # Tier A runs the one non-experimental leg (memory); merge_group/push
+        # run all four. Keep this list identical to compat-franz-go's.
+        storage: >-
+          ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on')
+          && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
+          || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
+          {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
+          {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": true},
+          {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": true}]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -275,23 +317,14 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        storage:
-          - name: memory
-            engine: memory://
-            features: dynostore
-            experimental: false
-          - name: s3
-            engine: s3://nisshi/
-            features: dynostore
-            experimental: true
-          - name: postgres
-            engine: postgres://postgres:postgres@localhost
-            features: postgres
-            experimental: true
-          - name: sqlite
-            engine: sqlite://nisshi.db
-            features: libsql
-            experimental: true
+        # Same tiering as compat-librdkafka; keep the two lists identical.
+        storage: >-
+          ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on')
+          && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
+          || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
+          {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
+          {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": true},
+          {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": true}]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -348,6 +381,7 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   cargo-publish-dry-run:
+    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
     strategy:
       fail-fast: false
@@ -387,6 +421,7 @@ jobs:
           path: THIRD-PARTY-LICENSE.html
           if-no-files-found: error
   src:
+    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -398,6 +433,7 @@ jobs:
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   package:
+    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     needs: [test, cargo-publish-dry-run, typos, release]
     runs-on: ${{matrix.os}}
     permissions:
@@ -436,11 +472,14 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+          # Push on repo-owned refs (push, merge_group) and same-repo PRs.
+          # Fork PRs get a read-only token, so they build without pushing,
+          # and smoke skips them (see its `if:`).
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
   smoke:
-    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     needs: [package]
     strategy:
       fail-fast: false
@@ -480,9 +519,12 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+      # Pinned: smoke gates every merge, so a push to example-java's default
+      # branch must not change this repo's gate without a reviewed bump here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nisshi-io/example-java
+          ref: 896d854efb515d1e1b14301e068d016356e17df5 # main 2026-09-25, minio built from source (#4)
           path: integration
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -523,7 +565,12 @@ jobs:
         env:
           NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
   release:
-    needs: [test, src, typos]
+    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    # build-storage/build-storage-lake are here (not on `test`, which is Tier
+    # A) so a feature combination that doesn't compile stops a queue entry
+    # before the release -> package -> smoke chain, and never publishes on a
+    # `v*` tag.
+    needs: [test, src, typos, build-storage, build-storage-lake]
     permissions:
       contents: write
     runs-on: ${{matrix.os}}
@@ -617,14 +664,13 @@ jobs:
 
   # Single stable required-check context for branch protection. Every other
   # job in this workflow is either matrixed (its context name bakes in the
-  # matrix values, so it shifts whenever a leg is added/removed/renamed) or,
-  # for smoke, intentionally skipped on fork PRs that can't reach the
-  # registry. Neither shape survives being named directly in a ruleset's
-  # required_status_checks list, so this job fans all of them into one name
-  # that does. Each job is listed directly (not relied on transitively
-  # through e.g. `test`) so a failure surfaces as `failure` here even when
-  # it also cascades a downstream job to `skipped` - `needs.*.result` reads
-  # each listed job's own outcome, not the masked one.
+  # matrix values, so it shifts whenever a leg is added/removed/renamed) or
+  # Tier B, intentionally skipped on pull_request. Neither shape survives
+  # being named directly in a ruleset's required_status_checks list, so this
+  # job fans all of them into one name that does. Each job is listed directly
+  # (not relied on transitively through e.g. `test`) so a failure surfaces as
+  # `failure` here even when it also cascades a downstream job to `skipped` -
+  # `needs.*.result` reads each listed job's own outcome, not the masked one.
   ci-gate:
     if: always()
     needs:
@@ -644,6 +690,39 @@ jobs:
       - smoke
       - release
     runs-on: ubuntu-latest
+    env:
+      NEEDS: ${{ toJSON(needs) }}
     steps:
-      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
-        run: exit 1
+      # This is the one check people land on when an entry is ejected, so
+      # say which job did it rather than making them scan ~60 jobs.
+      - name: Job results
+        run: |
+          {
+            echo '```'
+            jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' <<<"$NEEDS" | sort
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: No job failed or was cancelled
+        run: |
+          bad=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
+          [ -z "$bad" ] || { echo "::error::$(tr '\n' ' ' <<<"$bad")"; exit 1; }
+      # `skipped` is tolerated above because Tier B legitimately skips on
+      # pull_request. Off pull_request (merge_group, push) nothing may skip:
+      # a Tier B job whose `if:` is wrong must fail the gate, not slide
+      # through as "didn't fail".
+      - name: Nothing skipped off pull_request
+        if: github.event_name != 'pull_request'
+        run: |
+          skipped=$(jq -r 'to_entries[] | select(.value.result == "skipped") | .key' <<<"$NEEDS")
+          [ -z "$skipped" ] || { echo "::error::skipped on a ${GITHUB_EVENT_NAME} run, every listed job must run and succeed here: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
+      # And on pull_request only Tier B may skip. A Tier A job is marked
+      # `skipped` if it gains a `needs` on a Tier B job, and without this the
+      # PR gate would stay green with no Tier A signal at all. The list names
+      # the Tier B exemptions, so a newly added job defaults to must-not-skip.
+      - name: Tier A ran on pull_request
+        if: github.event_name == 'pull_request'
+        env:
+          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src package smoke release
+        run: |
+          skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
+          [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }

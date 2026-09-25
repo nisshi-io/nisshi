@@ -16,12 +16,19 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - main
+  # `Analyze (rust)` / `Analyze (actions)` are required checks; the merge
+  # queue tests each entry on a `gh-readonly-queue/...` branch, and without
+  # this trigger they'd never report there and every entry would hang.
+  merge_group:
+    types: [checks_requested]
   schedule:
     # Weekly, Monday 06:23 UTC. Off the hour to avoid the top-of-hour rush.
     - cron: "23 6 * * 1"
   workflow_dispatch:
+# Same grouping as ci.yml: `ref@sha` off pull_request, because a merge_group
+# run and the post-merge push run share a sha and must not share a group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
