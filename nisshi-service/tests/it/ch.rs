@@ -24,8 +24,6 @@ use tracing::debug;
 
 use crate::common::{Error, init_tracing};
 
-mod common;
-
 async fn server(cancellation: CancellationToken, rx: FrameReceiver) -> Result<(), Error> {
     let service =
         ChannelFrameLayer::new(cancellation).into_layer(

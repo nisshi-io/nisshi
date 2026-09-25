@@ -29,8 +29,6 @@ use tracing::debug;
 
 use crate::common::{Error, init_tracing};
 
-mod common;
-
 mod doctest_code_a {
     use nisshi_sans_io::{
         ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse, RequestInput,

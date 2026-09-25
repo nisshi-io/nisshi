@@ -29,8 +29,6 @@ use tracing::debug;
 
 use crate::common::{Error, init_tracing};
 
-mod common;
-
 async fn server(cancellation: CancellationToken, listener: TcpListener) -> Result<(), Error> {
     let server = (
         TcpListenerLayer::new(cancellation),
