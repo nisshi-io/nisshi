@@ -12,68 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
+# Packages a prebuilt static binary: nothing is compiled here. CI's release
+# job (or `just docker-dist` locally) places one per platform at
+# dist/<os>/<arch>/nisshi, e.g. dist/linux/arm64/nisshi.
 
-FROM --platform=$BUILDPLATFORM rust:1.98-alpine AS chef
-ARG CARGO_CHEF_VERSION=0.1.78
-RUN cargo install cargo-chef --version ${CARGO_CHEF_VERSION} --locked
-WORKDIR /usr/src
-
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --bin nisshi --recipe-path recipe.json
-
-FROM chef AS cook
-# ARG must precede any xx-* call, else xx-info defaults to the host arch.
-ARG TARGETPLATFORM
-COPY --from=xx / /
-RUN apk add clang cmake lld
-
-# Must exist before rustup/xx-cargo: its bare channel resolves to a
-# different toolchain name than the base image's default (rustup sees them
-# as separate installs), so cook and builder would target mismatched ones.
-COPY rust-toolchain.toml rust-toolchain.toml
-
-# Sysroot must exist before the first xx-cargo/xx-clang call for this
-# target, since that call does one-time per-target setup that never repeats.
-RUN xx-apk add --no-cache musl-dev zlib-dev zlib-static gcc
-RUN rustup target add $(xx-cargo --print-target-triple)
-
-COPY --from=planner /usr/src/recipe.json recipe.json
-COPY nisshi-sans-io/message nisshi-sans-io/message
-
-# --target-dir must not start with "./" - cargo-chef's cleanup step panics
-# (StripPrefixError) on that leading dot-slash. Use "build", not "./build".
-#
-# sharing=locked on the registry mount: it's shared across both platform
-# legs of a multi-platform build (arch-independent contents, avoids
-# duplicate downloads), and those legs build concurrently. Without locked,
-# concurrent unsynchronized extraction of the same crate into that shared
-# path races - cargo fails with "failed to unpack package ...: File exists
-# (os error 17)" when one leg's extraction collides with the other's.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    xx-cargo chef cook --release --recipe-path recipe.json --bin nisshi --all-features --target-dir build
-
-FROM cook AS builder
-ARG TARGETPLATFORM
-ADD / /usr/src/
-
-# Flags here must match cook's above, or fingerprinting reruns everything.
-# The cache mount below must keep from=cook,source=/usr/src/build, or it
-# starts empty and hides the deps cook already built.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/src/build,id=cargo-target-$TARGETPLATFORM,from=cook,source=/usr/src/build <<EOF
-set -e
-xx-cargo build --bin nisshi --all-features --release --target-dir build
-xx-verify --static build/$(xx-cargo --print-target-triple)/release/nisshi
-mkdir -p /image/schema /image/data /image/tmp /image/etc/ssl
-cp -v build/$(xx-cargo --print-target-triple)/release/nisshi /image
-cp -v LICENSE /image
-cp -rv /etc/ssl /image/etc
-EOF
+# CA certs are architecture-independent, so this stage runs on the build
+# host for every target platform and a multi-platform build needs no QEMU.
+FROM --platform=$BUILDPLATFORM alpine:3 AS base
+RUN mkdir -p /image/schema /image/data /image/tmp /image/etc && cp -r /etc/ssl /image/etc/
 
 FROM scratch
-COPY --from=builder /image /
+ARG TARGETPLATFORM
+COPY --from=base /image /
+# --chmod: the binary arrives via an Actions artifact, which drops the exec bit.
+COPY --chmod=755 dist/${TARGETPLATFORM}/nisshi /nisshi
+COPY LICENSE /LICENSE
 ENV TMP=/tmp
 ENTRYPOINT ["/nisshi"]
 CMD ["broker"]

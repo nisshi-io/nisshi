@@ -16,6 +16,7 @@
 .zed
 Cargo.lock
 cargo-flamegraph.trace
+/dist
 debug
 dhat.*
 flamegraph*.svg

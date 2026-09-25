@@ -1,6 +1,4 @@
-/target
-/work-dir
-/logs
-/.git
-perf.data
-*.log
+# Allowlist: the Dockerfile only packages a prebuilt binary (see Dockerfile).
+*
+!dist/
+!LICENSE
