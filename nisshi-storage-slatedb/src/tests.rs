@@ -16,7 +16,7 @@
 //!
 //! Note: Basic CRUD operations (create/delete topic, metadata, produce, offset commit,
 //! list offsets, init producer, describe config, list/delete groups, transactions)
-//! are covered by broker tests in nisshi-broker/tests/*.rs with slatedb module.
+//! are covered by broker tests in nisshi-broker/tests/it/*.rs with slatedb module.
 //!
 //! This file contains tests for:
 //! - Low-level API tests (offset_stage, brokers, cluster_id, node)
