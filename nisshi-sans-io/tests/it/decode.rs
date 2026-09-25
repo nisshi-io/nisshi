@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::init_tracing;
 use bytes::Bytes;
-use common::init_tracing;
 use nisshi_sans_io::{
     AlterUserScramCredentialsRequest, ApiKey, Body, CreateAclsRequest, DescribeAclsRequest,
     DescribeConfigsResponse, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse,
@@ -42,8 +42,6 @@ use nisshi_sans_io::{
     record::{self, Record, deflated, inflated},
 };
 use tracing::debug;
-
-pub mod common;
 
 #[test]
 fn sasl_handshake_request_v0_000() -> Result<()> {

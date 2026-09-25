@@ -19,8 +19,6 @@
 use bytes::Bytes;
 use nisshi_sans_io::{Body, Compression, ErrorCode, FindCoordinatorRequest, Frame, Header, Result};
 
-pub mod common;
-
 // ---------------------------------------------------------------------------
 // Helper: build a minimal valid request frame for FindCoordinator (api_key=10, v4)
 // ---------------------------------------------------------------------------

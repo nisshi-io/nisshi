@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::init_tracing;
 use bytes::Bytes;
-use common::init_tracing;
 use nisshi_sans_io::{
     ApiKey, ApiVersionsRequest, ApiVersionsResponse, Body, CreateTopicsResponse,
     DeleteTopicsRequest, DescribeClusterRequest, DescribeConfigsRequest, DescribeConfigsResponse,
@@ -33,8 +33,6 @@ use nisshi_sans_io::{
 };
 use pretty_assertions::assert_eq;
 use tracing::debug;
-
-pub mod common;
 
 #[test]
 fn api_versions_request_v3_000() -> Result<()> {

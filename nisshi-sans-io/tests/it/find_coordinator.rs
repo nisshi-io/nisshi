@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common::init_tracing;
+use crate::common::init_tracing;
 use nisshi_model::{MessageKind, VersionRange};
 use nisshi_sans_io::MESSAGE_META;
 use std::collections::BTreeMap;
-
-pub mod common;
 
 #[test]
 fn check_message_meta() {

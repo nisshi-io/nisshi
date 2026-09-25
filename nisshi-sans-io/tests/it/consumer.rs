@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
+use crate::common::init_tracing;
 use bytes::Bytes;
-use common::init_tracing;
 use nisshi_sans_io::{
     Body, Error, ErrorCode, HeartbeatResponse, JoinGroupResponse, MetadataResponse, Result,
     SyncGroupResponse,
@@ -27,8 +27,6 @@ use nisshi_sans_io::{
     metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
 };
 use tracing::debug;
-
-pub mod common;
 
 #[test]
 fn decode_range_metadata_001() -> Result<()> {

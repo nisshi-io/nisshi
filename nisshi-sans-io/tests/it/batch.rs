@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::init_tracing;
 use bytes::Bytes;
-use common::init_tracing;
 use nisshi_sans_io::{
     Ack, BatchAttribute, Compression, Frame, Header, ProduceRequest, Result,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, inflated},
 };
 use tracing::debug;
-
-pub mod common;
 
 fn produce_request(compression: Compression) -> Result<()> {
     let _guard = init_tracing()?;

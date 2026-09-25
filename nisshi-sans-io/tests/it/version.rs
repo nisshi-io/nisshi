@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::init_tracing;
 use bytes::Bytes;
-use common::init_tracing;
 use nisshi_sans_io::{
     Body, ErrorCode, Frame, Header, Result,
     join_group_response::{JoinGroupResponse, JoinGroupResponseMember},
@@ -24,8 +24,6 @@ use nisshi_sans_io::{
 };
 use pretty_assertions::assert_eq;
 use tracing::debug;
-
-pub mod common;
 
 #[test]
 fn join_group_response() -> Result<()> {

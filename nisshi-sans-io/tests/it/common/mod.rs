@@ -39,12 +39,8 @@ pub(crate) fn init_tracing() -> Result<DefaultGuard> {
                     .name()
                     .ok_or(Error::Message(String::from("unnamed thread")))
                     .and_then(|name| {
-                        File::create(format!(
-                            "../logs/{}/{}::{name}.log",
-                            env!("CARGO_PKG_NAME"),
-                            env!("CARGO_CRATE_NAME")
-                        ))
-                        .map_err(Into::into)
+                        File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME")))
+                            .map_err(Into::into)
                     })
                     .map(Arc::new)?,
             )

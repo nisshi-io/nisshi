@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common::init_tracing;
+use crate::common::init_tracing;
 use nisshi_sans_io::{ApiKey as _, FetchResponse, Frame, Result};
 use tracing::debug;
-
-pub mod common;
 
 #[test]
 fn api_versions_request_v3_000() -> Result<()> {

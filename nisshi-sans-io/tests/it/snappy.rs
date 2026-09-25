@@ -16,8 +16,6 @@ use nisshi_sans_io::{Frame, ProduceRequest, Result, record::inflated};
 
 use crate::common::init_tracing;
 
-pub mod common;
-
 #[test]
 fn batch_of_100() -> Result<()> {
     let _guard = init_tracing()?;
