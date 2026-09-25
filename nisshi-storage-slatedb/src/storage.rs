@@ -1823,14 +1823,16 @@ impl Storage for Engine {
             .map_err(|err| UpdateError::Error(Error::Postcard(err)))?;
 
         // Load the existing group; a missing key yields the default detail
-        // and version, so a caller providing a version for an unknown group
-        // is told it is outdated rather than silently overwriting.
+        // and version. The caller's version must match: no version matches
+        // only a missing group or the empty placeholder that offset_commit
+        // stores, so a group with state is reported as outdated rather than
+        // silently overwritten.
         let current: GroupDetailVersion = self
             .load_metadata(&tx, &key)
             .await
             .map_err(UpdateError::Error)?;
 
-        if version.is_some_and(|v| v != current.version) {
+        if version.unwrap_or_default() != current.version {
             tx.rollback();
             return Err(UpdateError::Outdated {
                 current: Box::new(current.detail),
@@ -1846,10 +1848,35 @@ impl Storage for Engine {
         self.save_metadata(&tx, &key, &new_group)
             .map_err(UpdateError::Error)?;
 
-        tx.commit()
-            .await
-            .map_err(|err| UpdateError::Error(Error::Slate(Arc::new(err))))
-            .and(Ok(updated_version))
+        match tx.commit().await {
+            Ok(()) => Ok(updated_version),
+
+            // Another update to this group committed while this transaction
+            // was open: report the group as outdated, so that the caller
+            // retries against what is now stored.
+            Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
+                debug!(?err, ?group_id);
+
+                let current: GroupDetailVersion = self
+                    .db
+                    .get(&key)
+                    .await
+                    .map_err(Error::from)
+                    .and_then(|encoded| {
+                        encoded.map_or(Ok(GroupDetailVersion::default()), |encoded| {
+                            postcard::from_bytes(&encoded[..]).map_err(Into::into)
+                        })
+                    })
+                    .map_err(UpdateError::Error)?;
+
+                Err(UpdateError::Outdated {
+                    current: Box::new(current.detail),
+                    version: current.version,
+                })
+            }
+
+            Err(err) => Err(UpdateError::Error(Error::Slate(Arc::new(err)))),
+        }
     }
 
     async fn init_producer(

@@ -331,13 +331,13 @@ pub async fn two_consumer_next_action(storage: impl Storage + Clone) -> Result<(
     debug!(?results);
     assert!(results.iter().all(|result| result.is_ok()));
 
-    let Ok(Some(c0_member_assignment)) = c0.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
+    let c0_member_assignment = c0
+        .member_assignment()?
+        .expect("c0 has no member assignment");
 
-    let Ok(Some(c1_member_assignment)) = c1.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
+    let c1_member_assignment = c1
+        .member_assignment()?
+        .expect("c1 has no member assignment");
 
     let assignments = c0_member_assignment
         .assignment
@@ -687,13 +687,13 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
 
     assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
 
-    let Ok(Some(c0_member_assignment)) = c0.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
+    let c0_member_assignment = c0
+        .member_assignment()?
+        .expect("c0 has no member assignment");
 
-    let Ok(Some(c1_member_assignment)) = c1.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
+    let c1_member_assignment = c1
+        .member_assignment()?
+        .expect("c1 has no member assignment");
 
     let assignments = c0_member_assignment
         .assignment
