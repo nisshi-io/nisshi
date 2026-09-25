@@ -614,3 +614,36 @@ jobs:
           path: dist/
           retention-days: 1
           if-no-files-found: error
+
+  # Single stable required-check context for branch protection. Every other
+  # job in this workflow is either matrixed (its context name bakes in the
+  # matrix values, so it shifts whenever a leg is added/removed/renamed) or,
+  # for smoke, intentionally skipped on fork PRs that can't reach the
+  # registry. Neither shape survives being named directly in a ruleset's
+  # required_status_checks list, so this job fans all of them into one name
+  # that does. Each job is listed directly (not relied on transitively
+  # through e.g. `test`) so a failure surfaces as `failure` here even when
+  # it also cascades a downstream job to `skipped` - `needs.*.result` reads
+  # each listed job's own outcome, not the masked one.
+  ci-gate:
+    if: always()
+    needs:
+      - check
+      - fmt
+      - clippy
+      - build-storage
+      - build-storage-lake
+      - test
+      - compat-librdkafka
+      - compat-franz-go
+      - cargo-publish-dry-run
+      - typos
+      - third-party-license
+      - src
+      - package
+      - smoke
+      - release
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
