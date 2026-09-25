@@ -472,14 +472,14 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          # Tier B only reaches here on push or merge_group, both repo-owned
-          # refs whose token can write packages. smoke pulls this image back
-          # by the same metadata-action version tag, so it must be pushed.
-          push: true
+          # Push on repo-owned refs (push, merge_group) and same-repo PRs.
+          # Fork PRs get a read-only token, so they build without pushing,
+          # and smoke skips them (see its `if:`).
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
   smoke:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     needs: [package]
     strategy:
       fail-fast: false
