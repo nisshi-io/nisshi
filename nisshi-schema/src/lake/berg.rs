@@ -14,7 +14,7 @@
 
 use std::{
     collections::HashMap,
-    env::vars,
+    env::{var, vars},
     marker::PhantomData,
     sync::{Arc, Mutex},
 };
@@ -141,6 +141,35 @@ impl Iceberg {
     }
 }
 
+/// Iceberg REST catalog property carrying a bearer token. The `iceberg-catalog-rest`
+/// crate reads this property and adds `Authorization: Bearer <token>` to catalog
+/// requests. It is separate from the S3 access key pair.
+const REST_CATALOG_PROP_TOKEN: &str = "token";
+
+/// Optional bearer token for the Iceberg REST catalog. Absent or empty values keep
+/// the existing unauthenticated behavior so local catalogs remain compatible.
+fn catalog_token() -> Option<String> {
+    var("ICEBERG_CATALOG_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+fn rest_catalog_props(
+    uri: String,
+    warehouse: Option<String>,
+    token: Option<String>,
+) -> HashMap<String, String> {
+    let mut props: HashMap<String, String> = env_s3_props().collect();
+    _ = props.insert(REST_CATALOG_PROP_URI.to_string(), uri);
+    if let Some(warehouse) = warehouse {
+        _ = props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
+    }
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        _ = props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token);
+    }
+    props
+}
+
 async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc<dyn Catalog>> {
     debug!(catalog = %crate::redact_url(catalog), ?warehouse);
 
@@ -157,14 +186,8 @@ async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc
                 catalog.to_string()
             };
 
-            let mut props: HashMap<String, String> = env_s3_props().collect();
-            _ = props.insert(REST_CATALOG_PROP_URI.to_string(), uri);
-            if let Some(wh) = warehouse {
-                _ = props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), wh);
-            }
-
             let catalog = RestCatalogBuilder::default()
-                .load("rest", props)
+                .load("rest", rest_catalog_props(uri, warehouse, catalog_token()))
                 .await
                 .map_err(|e| Error::Iceberg(Box::new(e)))?;
 
@@ -606,5 +629,111 @@ mod tests {
         assert_eq!("/catalog", uri.path());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod catalog_token_tests {
+    use super::*;
+    use iceberg_catalog_rest::RestCatalogBuilder;
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        sync::mpsc::{Receiver, channel},
+        thread,
+        time::Duration,
+    };
+
+    #[test]
+    fn rest_catalog_props_include_token_only_when_configured() {
+        let configured = rest_catalog_props(
+            String::from("https://catalog.example"),
+            Some(String::from("warehouse")),
+            Some(String::from("token-under-test")),
+        );
+        assert_eq!(
+            configured.get(REST_CATALOG_PROP_TOKEN).map(String::as_str),
+            Some("token-under-test")
+        );
+        assert_eq!(
+            configured
+                .get(REST_CATALOG_PROP_WAREHOUSE)
+                .map(String::as_str),
+            Some("warehouse")
+        );
+
+        for token in [None, Some(String::new())] {
+            let unconfigured =
+                rest_catalog_props(String::from("https://catalog.example"), None, token);
+            assert!(!unconfigured.contains_key(REST_CATALOG_PROP_TOKEN));
+        }
+    }
+
+    /// Records the first HTTP request a catalog client sends to a loopback listener,
+    /// then answers `401` so the request fails after the headers are observable.
+    fn capture_first_request() -> (Url, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = channel();
+
+        _ = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0_u8; 8192];
+                let read = stream.read(&mut buffer).unwrap_or_default();
+                _ = sender.send(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}")).expect("listener url"),
+            receiver,
+        )
+    }
+
+    async fn captured_request(token: Option<&str>) -> String {
+        let (uri, captured) = capture_first_request();
+        let mut props: HashMap<String, String> = HashMap::new();
+        _ = props.insert(REST_CATALOG_PROP_URI.to_string(), uri.to_string());
+        if let Some(token) = token {
+            _ = props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
+        }
+
+        let catalog = RestCatalogBuilder::default()
+            .load("rest", props)
+            .await
+            .expect("load rest catalog");
+
+        // The request is expected to fail against the stub; the captured request is
+        // the artifact under test.
+        _ = catalog
+            .namespace_exists(&NamespaceIdent::new(String::from("qualification")))
+            .await;
+
+        captured
+            .recv_timeout(Duration::from_secs(30))
+            .expect("captured request")
+    }
+
+    #[tokio::test]
+    async fn rest_catalog_request_carries_bearer_token_when_configured() {
+        let request = captured_request(Some("token-under-test")).await;
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer token-under-test"),
+            "expected bearer authorization header, captured: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_catalog_request_omits_authorization_when_token_absent() {
+        let request = captured_request(None).await;
+        assert!(
+            !request.to_lowercase().contains("authorization:"),
+            "expected no authorization header, captured: {request}"
+        );
     }
 }
