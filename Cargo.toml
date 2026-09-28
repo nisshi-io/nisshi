@@ -124,7 +124,7 @@ opentelemetry = "0.31.0"
 opentelemetry-otlp = "0.31.0"
 opentelemetry-semantic-conventions = "0.31.0"
 opentelemetry-stdout = "0.31.0"
-opentelemetry_sdk = { version = "0.31.0", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
 ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
 parquet = {version = "57", features = ["async"]}
