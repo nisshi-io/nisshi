@@ -1,12 +1,13 @@
 ---
 name: ci
 
-# `cache-save-if: github.event_name == 'push'` on a job's toolchain setup
-# means every PR restores the shared cache but only a push to main refreshes
-# it. This isn't a poisoning fix (GitHub already scopes a PR run's cache
-# writes to that PR's own ref) - it's hygiene, keeping the repo's cache
-# budget from being consumed by one entry per open PR instead of one per
-# branch. Applies to check, fmt, clippy, cargo-publish-dry-run,
+# `cache-save-if: github.ref == 'refs/heads/main'` on a job's toolchain
+# setup means every PR and queue entry restores main's cache but only a
+# push to main refreshes it; a `v*` tag push doesn't save either. This isn't
+# a poisoning fix (GitHub already scopes a run's cache writes to its own
+# ref) - it's hygiene, keeping the repo's cache budget from being consumed
+# by entries on refs nothing else can restore from. Applies to fmt, clippy,
+# test (its postgres:17 leg only), cargo-publish-dry-run,
 # third-party-license and release below (release also skips the cache
 # entirely on tags).
 #
@@ -15,7 +16,7 @@ name: ci
 # all of that on every pull_request push starved every other PR of runners.
 # So:
 #
-# - Tier A runs on every pull_request push: check, fmt, clippy, typos,
+# - Tier A runs on every pull_request push: fmt, clippy, typos,
 #   third-party-license, the single non-experimental leg of each compat
 #   suite, `test` on postgres:17 only (compose.yaml's default), and ci-gate.
 # - Tier B runs once per merge-queue entry (`merge_group`) and on push:
@@ -76,8 +77,9 @@ jobs:
     # Tier A on postgres:17 (compose.yaml's default), full pg matrix on
     # merge_group/push. build-storage/build-storage-lake are Tier B, so they
     # can't be `needs` here (see the header).
-    needs: [check, fmt, clippy]
+    needs: [fmt, clippy]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -91,12 +93,12 @@ jobs:
       AWS_DEFAULT_REGION: eu-west-2
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
-      CARGO_BUILD_BUILD_DIR: /mnt/build
       CLUSTER_ID: nisshi-ci
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
       LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
+      NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
       RUST_BACKTRACE: 1
@@ -105,8 +107,6 @@ jobs:
       STORAGE_ENGINE: s3://nisshi/
       NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi
     steps:
-      - run: sudo mkdir /mnt/build
-      - run: sudo chmod a+rwxt /mnt/build
       - run: echo "PG_IMAGE_DASH=${POSTGRES_IMAGE/:/-}" >> "$GITHUB_ENV"
       - run: echo "${PG_IMAGE_DASH}"
       - run: df -h
@@ -120,8 +120,13 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache: false
-      - run: cargo install cargo-nextest --locked
+          # rust-cache keys on the job, not the matrix, so every pg leg
+          # shares one entry and only one of them should save it: pg17,
+          # the leg that runs in both tiers.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.pg == 'postgres:17' }}
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-nextest@0.9.146
       - run: df -h
       - run: just test
       - run: df -h
@@ -139,24 +144,9 @@ jobs:
       - run: du -sh target
       - run: docker system df
       - run: df -h
-  check:
-    runs-on: ${{matrix.os}}
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
-        with:
-          just-version: 1.58.0
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          components: clippy, rustfmt
-          cache-save-if: ${{ github.event_name == 'push' }}
-      - run: just check
   fmt:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 10
     strategy:
       matrix:
         os:
@@ -169,10 +159,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just fmt
   clippy:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 15
     strategy:
       matrix:
         os:
@@ -185,11 +176,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just clippy
   build-storage:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -215,6 +207,7 @@ jobs:
   build-storage-lake:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -240,6 +233,7 @@ jobs:
       - run: cargo build --features ${{matrix.storage}} --features ${{matrix.lake}}
   compat-librdkafka:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
     strategy:
       fail-fast: true
@@ -291,6 +285,7 @@ jobs:
     if: always()
     needs: [compat-librdkafka]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       DUCKDB_CLI: /home/runner/.duckdb/cli/latest
     steps:
@@ -311,6 +306,7 @@ jobs:
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   compat-franz-go:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
     strategy:
       fail-fast: true
@@ -362,6 +358,7 @@ jobs:
     if: always()
     needs: [compat-franz-go]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       DUCKDB_CLI: /home/runner/.duckdb/cli/latest
     steps:
@@ -383,6 +380,7 @@ jobs:
   cargo-publish-dry-run:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -392,12 +390,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: cargo publish --dry-run --workspace
   typos:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3
@@ -405,16 +404,16 @@ jobs:
           config: typos.toml
   third-party-license:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          cache-save-if: ${{ github.event_name == 'push' }}
-      - env:
-          CARGO_ABOUT_VERSION: 0.8.4
-        run: |
-          cargo install "cargo-about@$CARGO_ABOUT_VERSION"
-          cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-about@0.8.4
+      - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: third-party-license
@@ -423,6 +422,7 @@ jobs:
   src:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: |
@@ -436,6 +436,7 @@ jobs:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     needs: [test, cargo-publish-dry-run, typos, release]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 15
     permissions:
       packages: write
     strategy:
@@ -496,6 +497,7 @@ jobs:
           - apache/kafka:3.8.1
           - apache/kafka:3.7.0
     runs-on: ${{matrix.os}}
+    timeout-minutes: 15
     env:
       ADVERTISED_LISTENER_URL: tcp://nisshi:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -574,6 +576,7 @@ jobs:
     permissions:
       contents: write
     runs-on: ${{matrix.os}}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -608,7 +611,7 @@ jobs:
           cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           # rust-cache keys on job + OS + arch, which both macOS legs share.
           cache-key: ${{ matrix.target }}
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustc -vV
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -678,7 +681,6 @@ jobs:
   ci-gate:
     if: always()
     needs:
-      - check
       - fmt
       - clippy
       - build-storage
@@ -694,6 +696,7 @@ jobs:
       - smoke
       - release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       NEEDS: ${{ toJSON(needs) }}
     steps:
