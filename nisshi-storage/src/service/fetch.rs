@@ -15,7 +15,7 @@
 use std::{cmp::min, time::SystemTime};
 
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
+    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{
         EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
@@ -23,15 +23,15 @@ use nisshi_sans_io::{
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
-use rama::{Context, Service};
+use rama::Service;
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service as _;
 /// use nisshi_sans_io::{
 ///     CreateTopicsRequest, ErrorCode, FetchRequest,
 ///     create_topics_request::CreatableTopic,
@@ -55,16 +55,14 @@ use crate::{Error, Result, Storage, Topition};
 ///     .build()
 ///     .await?;
 ///
-/// let create_topic = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+/// let create_topic = CreateTopicsService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let name = "abcba";
 ///
 /// let response = create_topic
 ///     .serve(
-///         Context::default(),
 ///         CreateTopicsRequest::default()
 ///             .topics(Some(vec![
 ///                 CreatableTopic::default()
@@ -82,16 +80,14 @@ use crate::{Error, Result, Storage, Topition};
 /// assert_eq!(1, topics.len());
 /// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 ///
-/// let fetch = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(FetchService)
+/// let fetch = FetchService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let partition = 0;
 ///
 /// let response = fetch
 ///     .serve(
-///         Context::default(),
 ///         FetchRequest::default()
 ///             .topics(Some(
 ///                 [FetchTopic::default()
@@ -117,19 +113,23 @@ use crate::{Error, Result, Storage, Topition};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FetchService;
+#[derive(Clone, Debug)]
+pub struct FetchService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for FetchService {
+impl<G> ApiKey for FetchService<G> {
     const KEY: i16 = FetchRequest::KEY;
 }
 
-impl FetchService {
+impl<G> FetchService<G>
+where
+    G: Storage,
+{
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self,ctx,min_bytes,isolation,fetch_partition), fields(partition = fetch_partition.partition))]
-    async fn fetch_partition<G>(
+    #[instrument(skip(self,min_bytes,isolation,fetch_partition), fields(partition = fetch_partition.partition))]
+    async fn fetch_partition(
         &self,
-        ctx: &Context<G>,
         max_wait: Duration,
         min_bytes: u32,
         max_bytes: &mut u32,
@@ -156,8 +156,8 @@ impl FetchService {
 
             debug!(offset);
 
-            let mut fetched = ctx
-                .state()
+            let mut fetched = self
+                .storage
                 .fetch(
                     &tp,
                     offset,
@@ -202,8 +202,8 @@ impl FetchService {
             }
         }
 
-        let offset_stage = ctx
-            .state()
+        let offset_stage = self
+            .storage
             .offset_stage(&tp)
             .await
             .inspect_err(|error| error!(?error, ?tp))?;
@@ -257,23 +257,19 @@ impl FetchService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, ctx, min_bytes, isolation, fetch))]
-    async fn fetch_topic<G>(
+    #[instrument(skip(self, min_bytes, isolation, fetch))]
+    async fn fetch_topic(
         &self,
-        ctx: &Context<G>,
         max_wait: Duration,
         min_bytes: u32,
         max_bytes: &mut u32,
         isolation: IsolationLevel,
         fetch: &FetchTopic,
         is_first_non_empty: &mut bool,
-    ) -> Result<FetchableTopicResponse>
-    where
-        G: Storage,
-    {
+    ) -> Result<FetchableTopicResponse> {
         let started_at = Instant::now();
 
-        let metadata = ctx.state().metadata(Some(&[fetch.into()])).await?;
+        let metadata = self.storage.metadata(Some(&[fetch.into()])).await?;
 
         if let Some(MetadataResponseTopic {
             topic_id,
@@ -297,7 +293,6 @@ impl FetchService {
 
                 let partition = self
                     .fetch_partition(
-                        ctx,
                         remaining,
                         min_bytes,
                         &mut partition_bytes,
@@ -330,19 +325,15 @@ impl FetchService {
         }
     }
 
-    #[instrument(skip(self, ctx, isolation, topics))]
-    pub(crate) async fn fetch<G>(
+    #[instrument(skip(self, isolation, topics))]
+    pub(crate) async fn fetch(
         &self,
-        ctx: &Context<G>,
         max_wait: Duration,
         min_bytes: u32,
         max_bytes: &mut u32,
         isolation: IsolationLevel,
         topics: &[FetchTopic],
-    ) -> Result<Vec<FetchableTopicResponse>>
-    where
-        G: Storage,
-    {
+    ) -> Result<Vec<FetchableTopicResponse>> {
         debug!(?isolation, ?topics);
 
         if topics.is_empty() {
@@ -363,7 +354,6 @@ impl FetchService {
                 for fetch in topics.iter() {
                     let fetch_response = self
                         .fetch_topic(
-                            ctx,
                             max_wait.saturating_sub(started_at.elapsed()?),
                             min_bytes,
                             max_bytes,
@@ -408,40 +398,44 @@ impl FetchService {
     }
 }
 
-impl<G> Service<G, FetchRequest> for FetchService
+impl<G, I> Service<I> for FetchService<G>
 where
     G: Storage,
+    I: Into<RequestInput<FetchRequest>> + Send + 'static,
 {
-    type Response = FetchResponse;
+    type Output = FetchResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: FetchRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let started_at = SystemTime::now();
 
-        let responses = Some(if let Some(topics) = req.topics {
-            let isolation_level = req
+        let input = input.into();
+
+        let responses = Some(if let Some(topics) = input.request.topics {
+            let isolation_level = input
+                .request
                 .isolation_level
                 .map_or(Ok(IsolationLevel::ReadUncommitted), |isolation| {
                     IsolationLevel::try_from(isolation)
                 })?;
 
-            let max_wait_ms = u64::try_from(req.max_wait_ms).map(Duration::from_millis)?;
+            let max_wait_ms =
+                u64::try_from(input.request.max_wait_ms).map(Duration::from_millis)?;
 
-            let min_bytes = u32::try_from(req.min_bytes)?;
+            let min_bytes = u32::try_from(input.request.min_bytes)?;
 
             const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
 
-            let mut max_bytes = req.max_bytes.map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
-                u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
-            })?;
+            let mut max_bytes =
+                input
+                    .request
+                    .max_bytes
+                    .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
+                        u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
+                    })?;
 
             self.fetch(
-                &ctx,
                 max_wait_ms,
                 min_bytes,
                 &mut max_bytes,
@@ -536,7 +530,6 @@ mod tests {
         record::{Record, deflated, inflated},
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
-    use rama::Context;
     use tokio::time::{Duration, advance};
     use url::Url;
     use uuid::Uuid;
@@ -866,12 +859,10 @@ mod tests {
         max_wait: Duration,
         max_bytes: u32,
     ) -> Result<Vec<deflated::Batch>> {
-        let ctx = Context::with_state(storage);
         let mut remaining = max_bytes;
 
-        FetchService
+        FetchService { storage }
             .fetch_partition(
-                &ctx,
                 max_wait,
                 1,
                 &mut remaining,

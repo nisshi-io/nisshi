@@ -2018,6 +2018,25 @@ where
 
                 return (self, join_group_response.into());
             }
+        } else if protocol_type.is_empty() || protocols.is_empty() {
+            debug!(join_outcome = ?ErrorCode::InconsistentGroupProtocol);
+
+            let join_group_response = JoinGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::InconsistentGroupProtocol.into())
+                .generation_id(self.generation_id)
+                .protocol_type(Some(protocol_type.into()))
+                // ProtocolName is non-nullable for versions < 7 (only nullableVersions 7+),
+                // and self.state.protocol_name is always None on this fresh-group path, so
+                // encoding None here would omit the length prefix and truncate the frame.
+                // Every other error path in this function uses "" for the same reason.
+                .protocol_name(Some("".into()))
+                .leader("".into())
+                .skip_assignment(self.skip_assignment)
+                .member_id("".into())
+                .members(Some([].into()));
+
+            return (self, join_group_response.into());
         } else {
             self.state.protocol_type = Some(protocol_type.to_owned());
             self.state.protocol_name = Some(protocols[0].name.as_str().to_owned());
@@ -3146,7 +3165,7 @@ mod tests {
         },
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
-    use nisshi_storage::StorageContainer;
+    use nisshi_storage::{ArcDynStorage, StorageContainer};
     use pretty_assertions::assert_eq;
     use tracing::subscriber::DefaultGuard;
     use url::Url;
@@ -3184,6 +3203,51 @@ mod tests {
         ))
     }
 
+    async fn storage(cluster: &str, node: i32) -> Result<ArcDynStorage> {
+        let builder = {
+            let mut builder = StorageContainer::builder();
+
+            builder.with_factory(Arc::new(nisshi_storage_null::EngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(nisshi_storage_dynostore::MemoryEngineFactory));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::S3OptimisticConcurrencyEngineFactory,
+            ));
+
+            #[cfg(feature = "dynostore")]
+            builder.with_factory(Arc::new(
+                nisshi_storage_dynostore::GoogleCloudStorageEngineFactory,
+            ));
+
+            #[cfg(feature = "libsql")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LiteEngineFactory));
+
+            #[cfg(feature = "postgres")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::PostgresEngineFactory));
+
+            #[cfg(feature = "slatedb")]
+            builder.with_factory(Arc::new(nisshi_storage_slatedb::EngineFactory));
+
+            #[cfg(feature = "turso")]
+            builder.with_factory(Arc::new(nisshi_storage_sql::LimboEngineFactory));
+
+            builder
+        };
+
+        builder
+            .cluster_id(cluster)
+            .node_id(node)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .schema_registry(None)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await
+            .map_err(Into::into)
+    }
+
     #[ignore]
     #[tokio::test]
     async fn lifecycle() -> Result<()> {
@@ -3201,14 +3265,7 @@ mod tests {
         const GROUP_ID: &str = "test-consumer-group";
         const TOPIC: &str = "test";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Controller::with_storage(storage)?;
 
@@ -3851,14 +3908,7 @@ mod tests {
         const CLIENT_ID: &str = "console-consumer";
         const GROUP_ID: &str = "test-consumer-group";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Controller::with_storage(storage)?;
 
@@ -4134,6 +4184,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_fresh_group_with_empty_protocols_is_inconsistent_group_protocol() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let session_timeout_ms = 45_000;
+        let rebalance_timeout_ms = Some(300_000);
+        let group_instance_id = None;
+        let reason = None;
+
+        let cluster = "abc";
+        let node = 12321;
+
+        const CLIENT_ID: &str = "console-consumer";
+        const GROUP_ID: &str = "test-consumer-group-empty-protocols";
+
+        let s = Controller::with_storage(storage(cluster, node).await?)?;
+
+        // A fresh group (never joined before) receiving a JoinGroupRequest whose
+        // `protocols` array is present but empty must not panic indexing `protocols[0]`;
+        // it should be rejected the same way the already-negotiated-group path rejects
+        // an unmatched/absent protocol: InconsistentGroupProtocol.
+        assert_eq!(
+            Body::from(
+                JoinGroupResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(ErrorCode::InconsistentGroupProtocol.into())
+                    .generation_id(0)
+                    .protocol_type(Some(CONSUMER.into()))
+                    .protocol_name(Some("".into()))
+                    .leader("".into())
+                    .skip_assignment(Some(false))
+                    .member_id("".into())
+                    .members(Some([].into()))
+            ),
+            s.join(
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                "",
+                group_instance_id,
+                CONSUMER,
+                Some(&[]),
+                reason,
+            )
+            .await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn member_id_required_error_code_joins_group() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -4152,14 +4253,7 @@ mod tests {
 
         const PROTOCOL_TYPE: &str = "consumer";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Wrapper::with_storage_group_detail(
             storage,
@@ -4251,14 +4345,7 @@ mod tests {
 
         const PROTOCOL_TYPE: &str = "consumer";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Wrapper::with_storage_group_detail(
             storage,
@@ -4374,14 +4461,7 @@ mod tests {
 
         const PROTOCOL_TYPE: &str = "consumer";
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = storage(cluster, node).await?;
 
         let s = Wrapper::with_storage_group_detail(
             storage,

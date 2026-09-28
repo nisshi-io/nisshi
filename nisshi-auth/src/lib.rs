@@ -14,6 +14,7 @@
 
 use nisshi_sans_io::ScramMechanism;
 use nisshi_storage::Storage;
+use rama::extensions::Extension;
 use rsasl::{
     callback::{Context, Request, SessionCallback, SessionData},
     config::SASLConfig,
@@ -76,8 +77,8 @@ impl From<SessionError> for Error {
     }
 }
 
-#[derive(Clone)]
-pub struct Authentication {
+#[derive(Clone, Extension)]
+pub struct AuthenticationExtension {
     config: Arc<SASLConfig>,
     stage: Arc<Mutex<Option<Stage>>>,
 }
@@ -94,7 +95,7 @@ impl Debug for Stage {
     }
 }
 
-impl Authentication {
+impl AuthenticationExtension {
     pub fn server(config: Arc<SASLConfig>) -> Self {
         let server = SASLServer::<Justification>::new(config.clone());
         Self {
@@ -123,7 +124,7 @@ impl Authentication {
     }
 }
 
-impl Debug for Authentication {
+impl Debug for AuthenticationExtension {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct(stringify!(Authentication)).finish()
     }
@@ -320,7 +321,7 @@ mod tests {
 
     #[test]
     fn authentication() {
-        is_send::<Authentication>();
-        is_sync::<Authentication>();
+        is_send::<AuthenticationExtension>();
+        is_sync::<AuthenticationExtension>();
     }
 }

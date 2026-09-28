@@ -21,3 +21,6 @@ opentelemetry_sdk.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+temp-env.workspace = true

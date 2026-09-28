@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,7 @@ use nisshi_sans_io::{
     OffsetFetchRequest, SyncGroupRequest,
 };
 use nisshi_service::FrameRouteBuilder;
-use rama::{
-    Layer as _, Service as _,
-    layer::{MapErrLayer, MapStateLayer},
-};
+use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
 use crate::{
     Error,
@@ -33,9 +30,9 @@ use crate::{
 };
 
 pub fn services<C>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     coordinator: C,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
 {
@@ -54,120 +51,102 @@ where
 }
 
 pub fn heartbeat<C>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     coordinator: C,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
 {
     builder
         .with_route(
             HeartbeatRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(HeartbeatService)
+            (MapErrLayer::new(Error::from),)
+                .into_layer(HeartbeatService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn join_group<C>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     coordinator: C,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
 {
     builder
         .with_route(
             JoinGroupRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(JoinGroupService)
+            (MapErrLayer::new(Error::from),)
+                .into_layer(JoinGroupService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn leave_group<C>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     coordinator: C,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
 {
     builder
         .with_route(
             LeaveGroupRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(LeaveGroupService)
+            (MapErrLayer::new(Error::from),)
+                .into_layer(LeaveGroupService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn offset_commit<C>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     coordinator: C,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
 {
     builder
         .with_route(
             OffsetCommitRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(OffsetCommitService)
+            (MapErrLayer::new(Error::from),)
+                .into_layer(OffsetCommitService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn offset_fetch<C>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     coordinator: C,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
 {
     builder
         .with_route(
             OffsetFetchRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(OffsetFetchService)
+            (MapErrLayer::new(Error::from),)
+                .into_layer(OffsetFetchService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn sync_group<C>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     coordinator: C,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
 {
     builder
         .with_route(
             SyncGroupRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(SyncGroupService)
+            (MapErrLayer::new(Error::from),)
+                .into_layer(SyncGroupService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)

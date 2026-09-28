@@ -16,41 +16,43 @@ use crate::{Error, Result, ScramCredential, Storage};
 use bytes::Bytes;
 use nisshi_sans_io::{
     AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse, ApiKey, ErrorCode,
-    ScramMechanism, alter_user_scram_credentials_response::AlterUserScramCredentialsResult,
+    RequestInput, ScramMechanism,
+    alter_user_scram_credentials_response::AlterUserScramCredentialsResult,
 };
-use rama::{Context, Service};
+use rama::Service;
 use rsasl::mechanisms::scram::tools::derive_keys;
 use sha2::{Digest, Sha256, Sha512};
 use tracing::{debug, instrument};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AlterUserScramCredentialsService;
+#[derive(Clone, Debug)]
+pub struct AlterUserScramCredentialsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for AlterUserScramCredentialsService {
+impl<G> ApiKey for AlterUserScramCredentialsService<G> {
     const KEY: i16 = AlterUserScramCredentialsRequest::KEY;
 }
 
-impl<G> Service<G, AlterUserScramCredentialsRequest> for AlterUserScramCredentialsService
+impl<G, I> Service<I> for AlterUserScramCredentialsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<AlterUserScramCredentialsRequest>> + Send + 'static,
 {
-    type Response = AlterUserScramCredentialsResponse;
+    type Output = AlterUserScramCredentialsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: AlterUserScramCredentialsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let mut results = vec![];
 
-        if let Some(deletions) = req.deletions {
+        let input = input.into();
+
+        if let Some(deletions) = input.request.deletions {
             for deletion in deletions {
                 let mechanism = ScramMechanism::try_from(deletion.mechanism)?;
 
                 results.push(
-                    ctx.state()
+                    self.storage
                         .delete_user_scram_credential(&deletion.name, mechanism)
                         .await
                         .map_or(
@@ -69,7 +71,7 @@ where
             }
         }
 
-        if let Some(upsertions) = req.upsertions {
+        if let Some(upsertions) = input.request.upsertions {
             for upsertion in upsertions {
                 let (mechanism, stored_key, server_key) =
                     ScramMechanism::try_from(upsertion.mechanism)
@@ -104,7 +106,7 @@ where
                 };
 
                 results.push(
-                    ctx.state()
+                    self.storage
                         .upsert_user_scram_credential(
                             upsertion.name.as_str(),
                             mechanism,

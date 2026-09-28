@@ -226,7 +226,7 @@ async fn iceberg_catalog(
     warehouse: Option<String>,
     token: Option<String>,
 ) -> Result<Arc<dyn Catalog>> {
-    debug!(%catalog, ?warehouse);
+    debug!(catalog = %crate::redact_url(catalog), ?warehouse);
 
     match (catalog.scheme(), catalog.path()) {
         ("http" | "https", "/") | ("http" | "https", _) => {
@@ -257,7 +257,9 @@ async fn iceberg_catalog(
             Ok(Arc::new(catalog) as Arc<dyn Catalog>)
         }
 
-        (_otherwise, _) => Err(Error::UnsupportedIcebergCatalogUrl(catalog.to_owned())),
+        (_otherwise, _) => Err(Error::UnsupportedIcebergCatalogUrl(crate::redact_url(
+            catalog,
+        ))),
     }
 }
 

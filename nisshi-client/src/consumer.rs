@@ -18,10 +18,10 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    Frame, Header, MetadataResponse, RootMessageMeta,
+    Frame, FrameInput, Header, MetadataResponse, RootMessageMeta,
     consumer::{GroupConsumer, MemberAssignment},
 };
-use rama::{Context, Layer, Service};
+use rama::{Layer, Service, extensions::Extensions};
 use tracing::debug;
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -59,7 +59,11 @@ impl<S> Layer<S> for ConsumerGroupLayer {
                 .build(),
         ));
 
-        Self::Service { inner, consumer }
+        Self::Service {
+            inner,
+            consumer,
+            extensions: Extensions::default(),
+        }
     }
 }
 
@@ -67,6 +71,7 @@ impl<S> Layer<S> for ConsumerGroupLayer {
 pub struct ConsumerGroupService<S> {
     inner: S,
     consumer: Arc<Mutex<GroupConsumer>>,
+    extensions: Extensions,
 }
 
 impl<S> fmt::Debug for ConsumerGroupService<S> {
@@ -75,18 +80,17 @@ impl<S> fmt::Debug for ConsumerGroupService<S> {
     }
 }
 
-impl<State, S> Service<State, ()> for ConsumerGroupService<S>
+impl<S> Service<()> for ConsumerGroupService<S>
 where
-    S: Service<State, Frame, Response = Frame>,
+    S: Service<FrameInput, Output = Frame>,
     S::Error:
         From<nisshi_sans_io::Error> + for<'a> From<PoisonError<MutexGuard<'a, GroupConsumer>>>,
-    State: Clone + Send + Sync + 'static,
 {
-    type Response = ();
+    type Output = ();
 
     type Error = S::Error;
 
-    async fn serve(&self, ctx: Context<State>, _: ()) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, _: ()) -> Result<Self::Output, Self::Error> {
         let mut input = None;
 
         loop {
@@ -110,21 +114,24 @@ where
                         .map(|message_meta| message_meta.version.valid().end)
                         .unwrap_or_default();
 
-                    Frame {
-                        size: 0,
-                        header: Header::Request {
-                            api_key,
-                            api_version,
-                            correlation_id: 0,
-                            client_id: Some(env!("CARGO_PKG_NAME").into()),
+                    FrameInput {
+                        frame: Frame {
+                            size: 0,
+                            header: Header::Request {
+                                api_key,
+                                api_version,
+                                correlation_id: 0,
+                                client_id: Some(env!("CARGO_PKG_NAME").into()),
+                            },
+                            body: next_action,
                         },
-                        body: next_action,
+                        extensions: self.extensions.clone(),
                     }
                 })?;
 
             input = self
                 .inner
-                .serve(ctx.clone(), next_action)
+                .serve(next_action)
                 .await
                 .map(|frame| frame.body)
                 .inspect(|input| debug!(input.api_name = input.api_name()))

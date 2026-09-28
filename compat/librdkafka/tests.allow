@@ -53,7 +53,6 @@
 0083 # cb_event
 0084 # destroy_flags
 0085 # headers
-0086 # purge
 0089 # max_poll_interval
 0090 # idempotence
 0095 # all_brokers_down

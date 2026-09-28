@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 //! ```no_run
 //! use nisshi_client::{Client, ConnectionManager, Error};
 //! use nisshi_sans_io::MetadataRequest;
-//! use rama::{Service as _, Context};
+//! use rama::{Service as _};
 //! use url::Url;
 //!
 //! # #[tokio::main]
@@ -51,13 +51,13 @@
 //! forwards each [`Frame`] to an origin broker on `tcp://example.com:9092`:
 //!
 //! ```no_run
-//! use rama::{Context, Layer as _, Service as _};
+//! use rama::{Layer as _, Service as _, extensions::Extensions};
 //! use nisshi_client::{
 //!     BytesConnectionService, ConnectionManager, Error, FrameConnectionLayer,
 //!     FramePoolLayer,
 //! };
 //! use nisshi_service::{
-//!     BytesFrameLayer, FrameBytesLayer, TcpBytesLayer, TcpContextLayer, TcpListenerLayer,
+//!     BytesFrameLayer, TcpBytesLayer, TcpContextLayer, TcpListenerInput, TcpListenerLayer,
 //!     host_port,
 //! };
 //! use tokio::net::TcpListener;
@@ -83,17 +83,21 @@
 //!     // server layers: reading tcp -> bytes -> frames:
 //!     TcpListenerLayer::new(token),
 //!     TcpContextLayer::default(),
-//!     TcpBytesLayer::<()>::default(),
+//!     TcpBytesLayer::default(),
 //!     BytesFrameLayer::default(),
 //!
 //!     // client layers: writing frames -> connection pool -> bytes -> origin:
 //!     FramePoolLayer::new(origin),
 //!     FrameConnectionLayer,
-//!     FrameBytesLayer,
 //! )
 //!     .into_layer(BytesConnectionService);
 //!
-//! stack.serve(Context::default(), listener).await?;
+//! stack
+//!     .serve(TcpListenerInput {
+//!         listener,
+//!         extensions: Extensions::default(),
+//!     })
+//!     .await?;
 //!
 //! # Ok(())
 //! # }
@@ -109,14 +113,19 @@ use std::{
 use backoff::{ExponentialBackoffBuilder, future::retry};
 use bytes::Bytes;
 use deadpool::managed::{self, BuildError, Object, PoolError};
-use nisshi_sans_io::{ApiKey, ApiVersionsRequest, Body, Frame, Header, Request, RootMessageMeta};
-use nisshi_service::{FrameBytesLayer, FrameBytesService, frame_length, host_port};
+use nisshi_sans_io::{
+    ApiKey, ApiVersionsRequest, Body, Frame, FrameInput, Header, Request, RootMessageMeta,
+};
+use nisshi_service::{frame_length, host_port};
 use opentelemetry::{
     InstrumentationScope, KeyValue, global,
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 use opentelemetry_semantic_conventions::SCHEMA_URL;
-use rama::{Context, Layer, Service};
+use rama::{
+    Layer, Service,
+    extensions::{Extensions, ExtensionsRef},
+};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpStream,
@@ -394,6 +403,19 @@ impl<S> Layer<S> for FramePoolLayer {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct FramePool {
+    pub frame: Frame,
+    pub pool: Pool,
+    pub extensions: Extensions,
+}
+
+impl ExtensionsRef for FramePool {
+    fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+}
+
 /// Inject the [`Pool`][`Pool`] into the [`Service`] [`Context`] of the inner [`Service`]
 #[derive(Clone, Debug)]
 pub struct FramePoolService<S> {
@@ -401,17 +423,21 @@ pub struct FramePoolService<S> {
     inner: S,
 }
 
-impl<State, S> Service<State, Frame> for FramePoolService<S>
+impl<S> Service<FrameInput> for FramePoolService<S>
 where
-    S: Service<Pool, Frame, Response = Frame>,
-    State: Send + Sync + 'static,
+    S: Service<FramePool, Output = Frame>,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = S::Error;
 
-    async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let (ctx, _) = ctx.swap_state(self.pool.clone());
-        self.inner.serve(ctx, req).await
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        self.inner
+            .serve(FramePool {
+                frame: req.frame,
+                pool: self.pool.clone(),
+                extensions: req.extensions,
+            })
+            .await
     }
 }
 
@@ -438,6 +464,19 @@ impl<S> Layer<S> for RequestPoolLayer {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RequestPool<Q> {
+    pub request: Q,
+    pub pool: Pool,
+    pub extensions: Extensions,
+}
+
+impl<Q> ExtensionsRef for RequestPool<Q> {
+    fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+}
+
 /// Inject the [`Pool`][`Pool`] into the [`Service`] [`Context`] of the inner [`Service`]
 #[derive(Clone, Debug)]
 pub struct RequestPoolService<S> {
@@ -445,37 +484,36 @@ pub struct RequestPoolService<S> {
     inner: S,
 }
 
-impl<State, S, Q> Service<State, Q> for RequestPoolService<S>
+impl<S, Q> Service<Q> for RequestPoolService<S>
 where
     Q: Request,
-    S: Service<Pool, Q>,
-    State: Send + Sync + 'static,
+    S: Service<RequestPool<Q>>,
 {
-    type Response = S::Response;
+    type Output = S::Output;
     type Error = S::Error;
 
     /// serve the request, injecting the pool into the context of the inner service
-    async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
-        let (ctx, _) = ctx.swap_state(self.pool.clone());
-        self.inner.serve(ctx, req).await
+    async fn serve(&self, req: Q) -> Result<Self::Output, Self::Error> {
+        self.inner
+            .serve(RequestPool {
+                request: req,
+                pool: self.pool.clone(),
+                extensions: Extensions::default(),
+            })
+            .await
     }
 }
 
 /// API client using a [`Connection`] [`Pool`]
 #[derive(Clone, Debug)]
 pub struct Client {
-    service:
-        RequestPoolService<RequestConnectionService<FrameBytesService<BytesConnectionService>>>,
+    service: RequestPoolService<RequestConnectionService<BytesConnectionService>>,
 }
 
 impl Client {
     /// Create a new client using the supplied pool
     pub fn new(pool: Pool) -> Self {
-        let service = (
-            RequestPoolLayer::new(pool),
-            RequestConnectionLayer,
-            FrameBytesLayer,
-        )
+        let service = (RequestPoolLayer::new(pool), RequestConnectionLayer)
             .into_layer(BytesConnectionService);
 
         Self { service }
@@ -487,7 +525,7 @@ impl Client {
         Q: Request,
         Error: From<<<Q as Request>::Response as TryFrom<Body>>::Error>,
     {
-        self.service.serve(Context::default(), req).await
+        self.service.serve(req).await
     }
 }
 
@@ -503,35 +541,48 @@ impl<S> Layer<S> for FrameConnectionLayer {
     }
 }
 
+#[derive(Debug)]
+pub struct FrameConnection {
+    pub frame: Frame,
+    pub connection: Object<ConnectionManager>,
+    pub extensions: Extensions,
+}
+
+impl ExtensionsRef for FrameConnection {
+    fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+}
+
 /// A [`Service`] that takes a [`Connection`] from the [`Pool`] calling an inner [`Service`] with that [`Connection`] as [`Context`]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FrameConnectionService<S> {
     inner: S,
 }
 
-impl<S> Service<Pool, Frame> for FrameConnectionService<S>
+impl<S> Service<FramePool> for FrameConnectionService<S>
 where
-    S: Service<Object<ConnectionManager>, Frame, Response = Frame>,
+    S: Service<BytesConnection, Output = Bytes>,
     S::Error: From<Error> + From<PoolError<Error>> + From<nisshi_sans_io::Error>,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = S::Error;
 
-    async fn serve(&self, ctx: Context<Pool>, req: Frame) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, req: FramePool) -> Result<Self::Output, Self::Error> {
         debug!(?req);
 
-        let api_key = req.api_key()?;
-        let api_version = req.api_version()?;
+        let api_key = req.frame.api_key()?;
+        let api_version = req.frame.api_version()?;
         let client_id = req
+            .frame
             .client_id()
             .map(|client_id| client_id.map(|client_id| client_id.to_string()))?;
 
-        let pool = ctx.state();
-        status_update(pool);
+        status_update(&req.pool);
 
         let connection = {
             let start = SystemTime::now();
-            pool.get().await.inspect(|_| {
+            req.pool.get().await.inspect(|_| {
                 POOL_GET_DURATION.record(
                     start
                         .elapsed()
@@ -543,20 +594,24 @@ where
 
         let correlation_id = connection.correlation_id;
 
-        let frame = Frame {
-            size: 0,
-            header: Header::Request {
-                api_key,
-                api_version,
-                correlation_id,
-                client_id,
-            },
-            body: req.body,
-        };
-
-        let (ctx, _) = ctx.swap_state(connection);
-
-        self.inner.serve(ctx, frame).await
+        self.inner
+            .serve(BytesConnection {
+                bytes: Frame::request(
+                    Header::Request {
+                        api_key,
+                        api_version,
+                        correlation_id,
+                        client_id,
+                    },
+                    req.frame.body,
+                )?,
+                connection,
+                extensions: req.extensions,
+            })
+            .await
+            .and_then(|response| {
+                Frame::response_from_bytes(response, api_key, api_version).map_err(Into::into)
+            })
     }
 }
 
@@ -580,29 +635,28 @@ pub struct RequestConnectionService<S> {
     inner: S,
 }
 
-impl<Q, S> Service<Pool, Q> for RequestConnectionService<S>
+impl<Q, S> Service<RequestPool<Q>> for RequestConnectionService<S>
 where
     Q: Request,
-    S: Service<Object<ConnectionManager>, Frame, Response = Frame>,
+    S: Service<BytesConnection, Output = Bytes>,
     S::Error: From<Error>
         + From<PoolError<Error>>
         + From<nisshi_sans_io::Error>
         + From<<Q::Response as TryFrom<Body>>::Error>,
 {
-    type Response = Q::Response;
+    type Output = Q::Response;
     type Error = S::Error;
 
-    async fn serve(&self, ctx: Context<Pool>, req: Q) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, req: RequestPool<Q>) -> Result<Self::Output, Self::Error> {
         debug!(?req);
-        let pool = ctx.state();
-        status_update(pool);
+        status_update(&req.pool);
 
         let api_key = Q::KEY;
-        let api_version = pool.manager().api_version(api_key)?;
-        let client_id = pool.manager().client_id();
+        let api_version = req.pool.manager().api_version(api_key)?;
+        let client_id = req.pool.manager().client_id();
         let connection = {
             let start = SystemTime::now();
-            pool.get().await.inspect(|_| {
+            req.pool.get().await.inspect(|_| {
                 POOL_GET_DURATION.record(
                     start
                         .elapsed()
@@ -614,24 +668,43 @@ where
 
         let correlation_id = connection.correlation_id;
 
-        let frame = Frame {
-            size: 0,
-            header: Header::Request {
+        let request = Frame::request(
+            Header::Request {
                 api_key,
                 api_version,
                 correlation_id,
                 client_id,
             },
-            body: req.into(),
-        };
+            req.request.into(),
+        )?;
 
-        let (ctx, _) = ctx.swap_state(connection);
+        let response = self
+            .inner
+            .serve(BytesConnection {
+                bytes: request,
+                connection,
+                extensions: req.extensions,
+            })
+            .await?;
 
-        let frame = self.inner.serve(ctx, frame).await?;
+        let frame = Frame::response_from_bytes(response, api_key, api_version)?;
 
         Q::Response::try_from(frame.body)
             .inspect(|response| debug!(?response))
             .map_err(Into::into)
+    }
+}
+
+#[derive(Debug)]
+pub struct BytesConnection {
+    bytes: Bytes,
+    connection: Object<ConnectionManager>,
+    extensions: Extensions,
+}
+
+impl ExtensionsRef for BytesConnection {
+    fn extensions(&self) -> &Extensions {
+        &self.extensions
     }
 }
 
@@ -698,30 +771,25 @@ impl BytesConnectionService {
     }
 }
 
-impl Service<Object<ConnectionManager>, Bytes> for BytesConnectionService {
-    type Response = Bytes;
+impl Service<BytesConnection> for BytesConnectionService {
+    type Output = Bytes;
     type Error = Error;
 
-    async fn serve(
-        &self,
-        mut ctx: Context<Object<ConnectionManager>>,
-        req: Bytes,
-    ) -> Result<Self::Response, Self::Error> {
-        let c = ctx.state_mut();
-
-        let local = c.stream.local_addr()?;
-        let peer = c.stream.peer_addr()?;
+    async fn serve(&self, mut req: BytesConnection) -> Result<Self::Output, Self::Error> {
+        let local = req.connection.stream.local_addr()?;
+        let peer = req.connection.stream.peer_addr()?;
 
         let attributes = [KeyValue::new("peer", peer.to_string())];
 
         let span = span!(Level::DEBUG, "client", local = %local, peer = %peer);
 
         async move {
-            self.write(&mut c.stream, req, &attributes).await?;
+            self.write(&mut req.connection.stream, req.bytes, &attributes)
+                .await?;
 
-            c.correlation_id += 1;
+            req.connection.correlation_id += 1;
 
-            self.read(&mut c.stream, &attributes).await
+            self.read(&mut req.connection.stream, &attributes).await
         }
         .instrument(span)
         .await
@@ -827,10 +895,10 @@ static POOL_WAITING: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 mod tests {
     use std::{fs::File, thread};
 
-    use nisshi_sans_io::{MetadataRequest, MetadataResponse};
+    use nisshi_sans_io::{MetadataRequest, MetadataResponse, RequestInput};
     use nisshi_service::{
         BytesFrameLayer, FrameRouteService, RequestLayer, ResponseService, TcpBytesLayer,
-        TcpContextLayer, TcpListenerLayer,
+        TcpContextLayer, TcpListenerInput, TcpListenerLayer,
     };
     use tokio::{net::TcpListener, task::JoinSet};
     use tokio_util::sync::CancellationToken;
@@ -867,13 +935,13 @@ mod tests {
         let server = (
             TcpListenerLayer::new(cancellation),
             TcpContextLayer::default(),
-            TcpBytesLayer::default(),
+            TcpBytesLayer,
             BytesFrameLayer::default(),
         )
             .into_layer(
                 FrameRouteService::builder()
                     .with_service(RequestLayer::<MetadataRequest>::new().into_layer(
-                        ResponseService::new(|_ctx: Context<()>, _req: MetadataRequest| {
+                        ResponseService::new(|_req: RequestInput<MetadataRequest>| {
                             Ok::<_, Error>(
                                 MetadataResponse::default()
                                     .brokers(Some([].into()))
@@ -888,7 +956,12 @@ mod tests {
                     .and_then(|builder| builder.build())?,
             );
 
-        server.serve(Context::default(), listener).await
+        server
+            .serve(TcpListenerInput {
+                listener,
+                extensions: Extensions::default(),
+            })
+            .await
     }
 
     #[tokio::test]
@@ -917,13 +990,11 @@ mod tests {
                 .inspect(|pool| debug!(?pool))?,
             ),
             RequestConnectionLayer,
-            FrameBytesLayer,
         )
             .into_layer(BytesConnectionService);
 
         let response = origin
             .serve(
-                Context::default(),
                 MetadataRequest::default()
                     .topics(Some([].into()))
                     .allow_auto_topic_creation(Some(false))

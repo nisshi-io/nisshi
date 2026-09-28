@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,35 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, DeleteRecordsRequest, DeleteRecordsResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, DeleteRecordsRequest, DeleteRecordsResponse, RequestInput};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteRecordsRequest`] returning [`DeleteRecordsResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DeleteRecordsService;
+#[derive(Clone, Debug)]
+pub struct DeleteRecordsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DeleteRecordsService {
+impl<G> ApiKey for DeleteRecordsService<G> {
     const KEY: i16 = DeleteRecordsRequest::KEY;
 }
 
-impl<G> Service<G, DeleteRecordsRequest> for DeleteRecordsService
+impl<G, I> Service<I> for DeleteRecordsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DeleteRecordsRequest>> + Send + 'static,
 {
-    type Response = DeleteRecordsResponse;
+    type Output = DeleteRecordsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DeleteRecordsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .delete_records(req.topics.as_deref().unwrap_or_default())
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+        self.storage
+            .delete_records(input.request.topics.as_deref().unwrap_or_default())
             .await
             .map(Some)
             .map(|topics| {

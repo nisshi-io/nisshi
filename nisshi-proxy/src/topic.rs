@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,10 @@ use std::{
 
 use nisshi_sans_io::{
     ConfigResource, ConfigType, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode,
-    ProduceRequest, ProduceResponse, describe_configs_request::DescribeConfigsResource,
+    ProduceRequest, ProduceResponse, RequestInput,
+    describe_configs_request::DescribeConfigsResource,
 };
-use rama::{Context, Layer, Service, context::Extensions, matcher::Matcher};
+use rama::{Layer, Service, extensions::Extensions, matcher::Matcher};
 use tracing::{debug, error};
 
 use crate::{Error, produce::topic_names};
@@ -137,17 +138,11 @@ impl ResourceConfigValueMatcher {
     }
 }
 
-impl<State> Matcher<State, ProduceRequest> for ResourceConfigValueMatcher {
-    fn matches(
-        &self,
-        ext: Option<&mut Extensions>,
-        ctx: &Context<State>,
-        req: &ProduceRequest,
-    ) -> bool {
-        let _ = (ext, ctx);
+impl Matcher<RequestInput<ProduceRequest>> for ResourceConfigValueMatcher {
+    fn matches(&self, _ext: Option<&Extensions>, req: &RequestInput<ProduceRequest>) -> bool {
         debug!(?req);
 
-        topic_names(req)
+        topic_names(&req.request)
             .into_iter()
             .inspect(|topic_name| debug!(%topic_name))
             .any(|topic_name| {
@@ -334,35 +329,29 @@ impl<I, O> TopicConfigService<I, O> {
     }
 }
 
-impl<I, O, State> Service<State, ProduceRequest> for TopicConfigService<I, O>
+impl<I, O> Service<RequestInput<ProduceRequest>> for TopicConfigService<I, O>
 where
-    I: Service<State, ProduceRequest, Response = ProduceResponse>,
-    O: Service<State, DescribeConfigsRequest, Response = DescribeConfigsResponse>,
-    State: Clone + Send + Sync + 'static,
+    I: Service<RequestInput<ProduceRequest>, Output = ProduceResponse>,
+    O: Service<RequestInput<DescribeConfigsRequest>, Output = DescribeConfigsResponse>,
     I::Error: From<Error> + From<O::Error>,
 {
-    type Response = ProduceResponse;
+    type Output = ProduceResponse;
     type Error = I::Error;
 
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        req: ProduceRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, req: RequestInput<ProduceRequest>) -> Result<Self::Output, Self::Error> {
         debug!(?req);
 
-        if !topic_names(&req)
+        if !topic_names(&req.request)
             .iter()
             .all(|topic| self.resource_config.has_resource(topic))
         {
             self.outer
-                .serve(
-                    ctx.clone(),
-                    DescribeConfigsRequest::default()
+                .serve(RequestInput {
+                    request: DescribeConfigsRequest::default()
                         .include_documentation(Some(false))
                         .include_synonyms(Some(false))
                         .resources(Some(
-                            topic_names(&req)
+                            topic_names(&req.request)
                                 .into_iter()
                                 .map(|resource_name| {
                                     DescribeConfigsResource::default()
@@ -372,7 +361,8 @@ where
                                 })
                                 .collect(),
                         )),
-                )
+                    extensions: req.extensions.fork(),
+                })
                 .await
                 .map_err(I::Error::from)
                 .and_then(|config_response| {
@@ -381,7 +371,7 @@ where
                 })?;
         }
 
-        self.inner.serve(ctx, req).await
+        self.inner.serve(req).await
     }
 }
 
@@ -471,16 +461,14 @@ mod tests {
         const RESOURCE_NAME_1: &str = "xyz";
         const PARAMETER: &str = "pqr";
 
-        type State = ();
-
         fn produce_response(
             error_code: ErrorCode,
-        ) -> impl Fn(Context<State>, ProduceRequest) -> Result<ProduceResponse, Error> + Clone
+        ) -> impl Fn(RequestInput<ProduceRequest>) -> Result<ProduceResponse, Error> + Clone
         {
-            move |_ctx: Context<State>, req: ProduceRequest| {
+            move |req: RequestInput<ProduceRequest>| {
                 Ok(ProduceResponse::default()
                     .node_endpoints(Some([].into()))
-                    .responses(req.topic_data.map(|topics| {
+                    .responses(req.request.topic_data.map(|topics| {
                         topics
                             .into_iter()
                             .map(|topic| {
@@ -505,7 +493,7 @@ mod tests {
             }
         }
 
-        let produce_request = |topic: &str| -> Result<ProduceRequest, Error> {
+        let produce_request = |topic: &str| -> Result<RequestInput<ProduceRequest>, Error> {
             inflated::Batch::builder()
                 .attributes(
                     BatchAttribute::default()
@@ -530,13 +518,14 @@ mod tests {
                         .into(),
                     ))
                 })
+                .map(Into::into)
                 .map_err(Into::into)
         };
 
         let describe_configuration = RequestLayer::<DescribeConfigsRequest>::new().into_layer(
-            ResponseService::new(|_ctx: Context<State>, req: DescribeConfigsRequest| {
-                Ok::<_, Error>(
-                    DescribeConfigsResponse::default().results(req.resources.map(|resources| {
+            ResponseService::new(|req: RequestInput<DescribeConfigsRequest>| {
+                Ok::<_, Error>(DescribeConfigsResponse::default().results(
+                    req.request.resources.map(|resources| {
                         resources
                             .into_iter()
                             .map(|resource| match resource.resource_name.as_str() {
@@ -565,8 +554,8 @@ mod tests {
                                 otherwise => unreachable!("{otherwise:?}"),
                             })
                             .collect::<Vec<_>>()
-                    })),
-                )
+                    }),
+                ))
             }),
         );
 
@@ -596,9 +585,7 @@ mod tests {
         assert!(!configuration.has_resource(RESOURCE_NAME_0));
 
         {
-            let response = service
-                .serve(Context::default(), produce_request(RESOURCE_NAME_0)?)
-                .await?;
+            let response = service.serve(produce_request(RESOURCE_NAME_0)?).await?;
 
             let responses = response.responses.unwrap_or_default();
             assert_eq!(1, responses.len());
@@ -625,9 +612,7 @@ mod tests {
         );
 
         {
-            let response = service
-                .serve(Context::default(), produce_request(RESOURCE_NAME_1)?)
-                .await?;
+            let response = service.serve(produce_request(RESOURCE_NAME_1)?).await?;
 
             let responses = response.responses.unwrap_or_default();
             assert_eq!(1, responses.len());

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,39 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, ApiKey};
-use rama::{Context, Service};
+use nisshi_sans_io::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, ApiKey, RequestInput};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`AddOffsetsToTxnRequest`] returning [`AddOffsetsToTxnResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AddOffsetsService;
+#[derive(Clone, Debug)]
+pub struct AddOffsetsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for AddOffsetsService {
+impl<G> ApiKey for AddOffsetsService<G> {
     const KEY: i16 = AddOffsetsToTxnRequest::KEY;
 }
 
-impl<G> Service<G, AddOffsetsToTxnRequest> for AddOffsetsService
+impl<G, I> Service<I> for AddOffsetsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<AddOffsetsToTxnRequest>> + Send + 'static,
 {
-    type Response = AddOffsetsToTxnResponse;
+    type Output = AddOffsetsToTxnResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: AddOffsetsToTxnRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
+        self.storage
             .txn_add_offsets(
-                req.transactional_id.as_str(),
-                req.producer_id,
-                req.producer_epoch,
-                req.group_id.as_str(),
+                input.request.transactional_id.as_str(),
+                input.request.producer_id,
+                input.request.producer_epoch,
+                input.request.group_id.as_str(),
             )
             .await
             .map(|error_code| {

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    ProduceRequest, ProduceResponse,
+    ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::{
@@ -157,15 +157,10 @@ impl<S> BatchProduceService<S>
 where
     S: Clone + Debug,
 {
-    async fn send_pending_batch<State>(
-        &self,
-        id: &Uuid,
-        ctx: rama::Context<State>,
-    ) -> Result<Option<ProduceResponse>, Error>
+    async fn send_pending_batch(&self, id: &Uuid) -> Result<Option<ProduceResponse>, Error>
     where
-        S: Service<State, ProduceRequest, Response = ProduceResponse> + Clone + Debug,
+        S: Service<RequestInput<ProduceRequest>, Output = ProduceResponse> + Clone + Debug,
         S::Error: Into<Error> + Send + Debug + 'static,
-        State: Send + Sync + 'static,
     {
         debug!(%id);
 
@@ -191,7 +186,7 @@ where
             let start = SystemTime::now();
 
             self.service
-                .serve(ctx, produce_request)
+                .serve(produce_request.into())
                 .await
                 .inspect(|response| debug!(?response))
                 .inspect_err(|err| debug!(?err))
@@ -273,25 +268,23 @@ static TICKET_READY_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-impl<S, State> Service<State, ProduceRequest> for BatchProduceService<S>
+impl<S> Service<RequestInput<ProduceRequest>> for BatchProduceService<S>
 where
-    S: Service<State, ProduceRequest, Response = ProduceResponse> + Clone + Debug,
+    S: Service<RequestInput<ProduceRequest>, Output = ProduceResponse> + Clone + Debug,
     S::Error: Clone + Into<Error> + Send + Debug + 'static,
-    State: Clone + Send + Sync + 'static,
 {
-    type Response = ProduceResponse;
+    type Output = ProduceResponse;
 
     type Error = Error;
 
     async fn serve(
         &self,
-        ctx: rama::Context<State>,
-        request: ProduceRequest,
-    ) -> Result<Self::Response, Self::Error> {
+        request: RequestInput<ProduceRequest>,
+    ) -> Result<Self::Output, Self::Error> {
         debug!(?request);
 
         let batch_timeout_ms = Duration::from_millis(
-            topic_names(&request)
+            topic_names(&request.request)
                 .iter()
                 .filter_map(|topic_name| {
                     self.resource_config
@@ -303,7 +296,7 @@ where
                 .unwrap_or(10_000),
         );
 
-        let max_records = topic_names(&request)
+        let max_records = topic_names(&request.request)
             .iter()
             .filter_map(|topic_name| {
                 self.resource_config
@@ -321,7 +314,7 @@ where
                 let ticket = Ticket::new(self.clone());
                 requests.push(BatchRequest {
                     id: ticket.id,
-                    request,
+                    request: request.request,
                 });
                 ticket
             })
@@ -329,7 +322,6 @@ where
 
         loop {
             let id = ticket.id;
-            let ctx = ctx.clone();
 
             if self
                 .requests
@@ -346,10 +338,8 @@ where
             {
                 BATCH_OVERFLOW_COUNTER.add(1, &[]);
 
-                if let Ok(Some(produce_response)) = self
-                    .send_pending_batch(&id, ctx.clone())
-                    .await
-                    .inspect(|r| debug!(?r))
+                if let Ok(Some(produce_response)) =
+                    self.send_pending_batch(&id).await.inspect(|r| debug!(?r))
                 {
                     return Ok(produce_response);
                 }
@@ -373,7 +363,7 @@ where
 
                     TIMEOUT_EXPIRED_COUNTER.add(1, &[]);
 
-                    if let Ok(Some(produce_response)) = self.send_pending_batch(&id, ctx).await.inspect(|r|debug!(?r)) {
+                    if let Ok(Some(produce_response)) = self.send_pending_batch(&id).await.inspect(|r|debug!(?r)) {
                         return Ok(produce_response)
                     }
                 }
@@ -741,23 +731,18 @@ mod tests {
         reqs: Arc<Mutex<Vec<ProduceRequest>>>,
     }
 
-    impl<State> Service<State, ProduceRequest> for MockProduceService
-    where
-        State: Send + Sync + 'static,
-    {
-        type Response = ProduceResponse;
+    impl Service<RequestInput<ProduceRequest>> for MockProduceService {
+        type Output = ProduceResponse;
         type Error = Error;
 
         async fn serve(
             &self,
-            ctx: rama::Context<State>,
-            req: ProduceRequest,
-        ) -> Result<Self::Response, Self::Error> {
-            let _ = ctx;
+            req: RequestInput<ProduceRequest>,
+        ) -> Result<Self::Output, Self::Error> {
             debug!(?req);
 
             let produce_response = ProduceResponse::default()
-                .responses(req.topic_data.as_ref().map(|topic_data| {
+                .responses(req.request.topic_data.as_ref().map(|topic_data| {
                     topic_data
                         .iter()
                         .map(|topic_produce_data| {
@@ -794,7 +779,7 @@ mod tests {
                 .node_endpoints(Some([].into()));
 
             let mut guard = self.reqs.lock().expect("poison");
-            guard.push(req);
+            guard.push(req.request);
 
             Ok(produce_response)
         }
@@ -874,7 +859,7 @@ mod tests {
                 let span = span!(Level::DEBUG, "batch", topic_a);
 
                 async move {
-                    bp.serve(rama::Context::default(), produce_request(topic_a, b"foo")?)
+                    bp.serve(produce_request(topic_a, b"foo").map(Into::into)?)
                         .await
                 }
                 .instrument(span)
@@ -996,7 +981,7 @@ mod tests {
                 let span = span!(Level::DEBUG, "batch", topic_a);
 
                 async move {
-                    bp.serve(rama::Context::default(), produce_request(topic_a, b"foo")?)
+                    bp.serve(produce_request(topic_a, b"foo").map(Into::into)?)
                         .await
                 }
                 .instrument(span)
@@ -1020,7 +1005,7 @@ mod tests {
                 let span = span!(Level::DEBUG, "batch", topic_b);
 
                 async move {
-                    bp.serve(rama::Context::default(), produce_request(topic_b, b"bar")?)
+                    bp.serve(produce_request(topic_b, b"bar").map(Into::into)?)
                         .await
                 }
                 .instrument(span)
@@ -1200,7 +1185,7 @@ mod tests {
                 let span = span!(Level::DEBUG, "batch", topic_a);
 
                 async move {
-                    bp.serve(rama::Context::default(), produce_request(topic_a, b"foo")?)
+                    bp.serve(produce_request(topic_a, b"foo").map(Into::into)?)
                         .await
                 }
                 .instrument(span)
@@ -1228,7 +1213,7 @@ mod tests {
                 let span = span!(Level::DEBUG, "batch", topic_a);
 
                 async move {
-                    bp.serve(rama::Context::default(), produce_request(topic_a, b"bar")?)
+                    bp.serve(produce_request(topic_a, b"bar").map(Into::into)?)
                         .await
                 }
                 .instrument(span)

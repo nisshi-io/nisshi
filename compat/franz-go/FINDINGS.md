@@ -20,7 +20,7 @@ tests self-skip).
    returned nothing; they now return `a1 b2 b3` and `b3`. The pg and
    lite engines rebuild batches from per-record rows and were not
    affected. Regression test: `mid_batch` in
-   `nisshi-broker/tests/fetch.rs`, run against every engine.
+   `nisshi-broker/tests/it/fetch.rs`, run against every engine.
 
 2. **Fetch looped once per record after `max_wait` on the pg and lite
    engines** *(fixed 2026-09-17)* — `FetchService::fetch_partition`
@@ -54,7 +54,7 @@ tests self-skip).
    block, which the clients we test with (franz-go, librdkafka,
    kafka-python, snappy-java) and nisshi's own inflator accept.
    Regression test:
-   `compression_preserved` in `nisshi-broker/tests/fetch.rs`, run
+   `compression_preserved` in `nisshi-broker/tests/it/fetch.rs`, run
    against every engine. Not covered: `s3://` with request batching
    enabled re-deflates combined batches as uncompressed
    (`ProduceRequestBatcher::combine`); CI runs it without batching.

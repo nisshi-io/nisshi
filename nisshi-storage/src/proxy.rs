@@ -61,13 +61,13 @@ static SEMAPHORE_ACQUIRE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
 });
 
 #[derive(Clone, Debug)]
-pub(crate) struct SemaphoreProxy<G> {
+pub struct SemaphoreProxy<G> {
     storage: G,
     semaphore: Arc<Semaphore>,
 }
 
 impl<G> SemaphoreProxy<G> {
-    pub(crate) fn new(storage: G) -> Self {
+    pub fn new(storage: G) -> Self {
         Self {
             storage,
             semaphore: Arc::new(Semaphore::new(1)),

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,21 +18,23 @@ use nisshi_client::{
 };
 use nisshi_otel::meter_provider;
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse, MetadataRequest,
-    MetadataResponse, NULL_TOPIC_ID, ProduceRequest, find_coordinator_response::Coordinator,
-    metadata_request::MetadataRequestTopic, metadata_response::MetadataResponseBroker,
+    ApiKey, DescribeConfigsRequest, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse,
+    MetadataRequest, MetadataResponse, NULL_TOPIC_ID, ProduceRequest, RequestInput,
+    find_coordinator_response::Coordinator, metadata_request::MetadataRequestTopic,
+    metadata_response::MetadataResponseBroker,
 };
 use nisshi_service::{
-    BytesFrameLayer, FrameApiKeyMatcher, FrameBytesLayer, FrameRequestLayer, TcpBytesLayer,
-    TcpContextLayer, TcpListenerLayer, host_port,
+    BytesFrameLayer, FrameApiKeyMatcher, FrameRequestLayer, TcpBytesLayer, TcpContextLayer,
+    TcpListenerInput, TcpListenerLayer, host_port,
 };
 use opentelemetry::{InstrumentationScope, global, metrics::Meter};
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_sdk::error::OTelSdkError;
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use rama::{
-    Context, Layer, Service,
-    layer::{HijackLayer, MapErrLayer, MapRequestLayer, MapResponseLayer},
+    Layer, Service,
+    extensions::Extensions,
+    layer::{HijackLayer, MapErrLayer, MapInputLayer, MapOutputLayer},
 };
 use std::{
     fmt, io,
@@ -156,7 +158,6 @@ impl Proxy {
             MapErrLayer::new(Error::from),
             RequestPoolLayer::new(pool.clone()),
             RequestConnectionLayer,
-            FrameBytesLayer,
         )
             .into_layer(BytesConnectionService);
 
@@ -164,7 +165,6 @@ impl Proxy {
             MapErrLayer::new(Error::from),
             FramePoolLayer::new(pool.clone()),
             FrameConnectionLayer,
-            FrameBytesLayer,
         )
             .into_layer(BytesConnectionService);
 
@@ -175,9 +175,9 @@ impl Proxy {
             FrameApiKeyMatcher(MetadataRequest::KEY),
             (
                 FrameRequestLayer::<MetadataRequest>::new(),
-                MapRequestLayer::new(move |request: MetadataRequest| {
+                MapInputLayer::new(move |input: RequestInput<MetadataRequest>| {
                     MetadataRequest::default()
-                        .topics(request.topics.map(|topics| {
+                        .topics(input.request.topics.map(|topics| {
                             topics
                                 .into_iter()
                                 .map(|topic| {
@@ -188,16 +188,19 @@ impl Proxy {
                                 .collect()
                         }))
                         .allow_auto_topic_creation(
-                            request.allow_auto_topic_creation.or(Some(false)),
+                            input.request.allow_auto_topic_creation.or(Some(false)),
                         )
                         .include_cluster_authorized_operations(
-                            request.include_cluster_authorized_operations,
+                            input.request.include_cluster_authorized_operations,
                         )
                         .include_topic_authorized_operations(
-                            request.include_topic_authorized_operations.or(Some(false)),
+                            input
+                                .request
+                                .include_topic_authorized_operations
+                                .or(Some(false)),
                         )
                 }),
-                MapResponseLayer::new(move |response: MetadataResponse| {
+                MapOutputLayer::new(move |response: MetadataResponse| {
                     let brokers = response.brokers.as_ref().map(|brokers| {
                         brokers
                             .iter()
@@ -223,16 +226,17 @@ impl Proxy {
             FrameApiKeyMatcher(FindCoordinatorRequest::KEY),
             (
                 FrameRequestLayer::<FindCoordinatorRequest>::new(),
-                MapRequestLayer::new(move |request: FindCoordinatorRequest| {
+                MapInputLayer::new(move |input: RequestInput<FindCoordinatorRequest>| {
                     FindCoordinatorRequest::default()
-                        .key_type(request.key_type)
+                        .key_type(input.request.key_type)
                         .coordinator_keys(
-                            request
+                            input
+                                .request
                                 .coordinator_keys
-                                .or(request.key.map(|key| vec![key])),
+                                .or(input.request.key.map(|key| vec![key])),
                         )
                 }),
-                MapResponseLayer::new(move |response: FindCoordinatorResponse| {
+                MapOutputLayer::new(move |response: FindCoordinatorResponse| {
                     let coordinators = response.coordinators.as_ref().map(|coordinators| {
                         coordinators
                             .iter()
@@ -279,11 +283,19 @@ impl Proxy {
                 .into_layer(request_origin.clone()),
         );
 
+        let produce_origin =
+            MapInputLayer::new(|input: RequestInput<ProduceRequest>| input.request)
+                .into_layer(request_origin.clone());
+
         let produce = HijackLayer::new(
             FrameApiKeyMatcher(ProduceRequest::KEY),
             (
                 FrameRequestLayer::<ProduceRequest>::new(),
-                TopicConfigLayer::new(configuration.clone(), request_origin.clone()),
+                TopicConfigLayer::new(
+                    configuration.clone(),
+                    MapInputLayer::new(|input: RequestInput<DescribeConfigsRequest>| input.request)
+                        .into_layer(request_origin.clone()),
+                ),
             )
                 .into_layer(
                     HijackLayer::new(
@@ -293,16 +305,16 @@ impl Proxy {
                             "true",
                         ),
                         BatchProduceLayer::new(configuration.clone())
-                            .into_layer(request_origin.clone()),
+                            .into_layer(produce_origin.clone()),
                     )
-                    .into_layer(request_origin.clone()),
+                    .into_layer(produce_origin.clone()),
                 ),
         );
 
         let s = (
             TcpListenerLayer::new(token),
             TcpContextLayer::default(),
-            TcpBytesLayer::<()>::default(),
+            TcpBytesLayer,
             BytesFrameLayer::default(),
             meta,
             produce,
@@ -310,7 +322,11 @@ impl Proxy {
         )
             .into_layer(frame_origin);
 
-        s.serve(Context::with_state(()), listener).await?;
+        s.serve(TcpListenerInput {
+            listener,
+            extensions: Extensions::default(),
+        })
+        .await?;
 
         Ok(())
     }
@@ -357,9 +373,10 @@ mod tests {
     use std::{fs::File, sync::Arc, thread};
 
     use nisshi_sans_io::{
-        DescribeConfigsRequest, DescribeConfigsResponse, Frame, Header, ProduceResponse,
+        DescribeConfigsRequest, DescribeConfigsResponse, Frame, FrameInput, Header, ProduceResponse,
     };
     use nisshi_service::{FrameService, RequestApiKeyMatcher, ResponseService};
+    use rama::extensions::Extensions;
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -395,27 +412,23 @@ mod tests {
 
         const THROTTLE_TIME_MS: Option<i32> = Some(43234);
 
-        let produce =
-            HijackLayer::new(
-                FrameApiKeyMatcher(ProduceRequest::KEY),
-                FrameRequestLayer::<ProduceRequest>::new().into_layer(ResponseService::new(
-                    |_ctx: Context<()>, _req: ProduceRequest| {
-                        Ok::<_, Error>(
-                            ProduceResponse::default().throttle_time_ms(THROTTLE_TIME_MS),
-                        )
-                    },
-                )),
-            )
-            .into_layer(FrameRequestLayer::<ProduceRequest>::new().into_layer(
-                ResponseService::new(|_ctx: Context<()>, _req: ProduceRequest| {
-                    Ok::<_, Error>(ProduceResponse::default())
-                }),
-            ));
+        let produce = HijackLayer::new(
+            FrameApiKeyMatcher(ProduceRequest::KEY),
+            FrameRequestLayer::<ProduceRequest>::new().into_layer(ResponseService::new(
+                |_req: RequestInput<ProduceRequest>| {
+                    Ok::<_, Error>(ProduceResponse::default().throttle_time_ms(THROTTLE_TIME_MS))
+                },
+            )),
+        )
+        .into_layer(FrameRequestLayer::<ProduceRequest>::new().into_layer(
+            ResponseService::new(|_req: RequestInput<ProduceRequest>| {
+                Ok::<_, Error>(ProduceResponse::default())
+            }),
+        ));
 
         let frame = produce
-            .serve(
-                Context::default(),
-                Frame {
+            .serve(FrameInput {
+                frame: Frame {
                     size: 0,
                     header: Header::Request {
                         api_key: ProduceRequest::KEY,
@@ -425,7 +438,8 @@ mod tests {
                     },
                     body: ProduceRequest::default().into(),
                 },
-            )
+                extensions: Extensions::default(),
+            })
             .await?;
 
         let response = ProduceResponse::try_from(frame.body)?;
@@ -442,16 +456,19 @@ mod tests {
 
         let service = HijackLayer::new(
             RequestApiKeyMatcher(ProduceRequest::KEY),
-            ResponseService::new(|_, _req: ProduceRequest| {
+            ResponseService::new(|_req: RequestInput<ProduceRequest>| {
                 Ok::<_, Error>(ProduceResponse::default().throttle_time_ms(THROTTLE_TIME_MS))
             }),
         )
-        .into_layer(ResponseService::new(|_, _req: ProduceRequest| {
-            Ok::<_, Error>(ProduceResponse::default())
-        }));
+        .into_layer(ResponseService::new(
+            |_req: RequestInput<ProduceRequest>| Ok::<_, Error>(ProduceResponse::default()),
+        ));
 
         let response = service
-            .serve(Context::default(), ProduceRequest::default())
+            .serve(RequestInput {
+                request: ProduceRequest::default(),
+                extensions: Extensions::default(),
+            })
             .await?;
 
         assert_eq!(THROTTLE_TIME_MS, response.throttle_time_ms);
@@ -472,20 +489,20 @@ mod tests {
                 FrameRequestLayer::<ProduceRequest>::new(),
                 TopicConfigLayer::new(
                     configuration.clone(),
-                    ResponseService::new(|_: Context<()>, _req: DescribeConfigsRequest| {
+                    ResponseService::new(|_req: RequestInput<DescribeConfigsRequest>| {
                         Ok::<_, Error>(DescribeConfigsResponse::default())
                     }),
                 ),
             )
                 .into_layer(ResponseService::new(
-                    |_: Context<()>, _req: ProduceRequest| {
+                    |_req: RequestInput<ProduceRequest>| {
                         Ok::<_, Error>(
                             ProduceResponse::default().throttle_time_ms(THROTTLE_TIME_MS),
                         )
                     },
                 )),
         )
-        .into_layer(FrameService::new(|_: Context<()>, _req: Frame| {
+        .into_layer(FrameService::new(|_req: FrameInput| {
             Ok::<_, Error>(Frame {
                 size: 0,
                 header: Header::Response {
@@ -496,9 +513,8 @@ mod tests {
         }));
 
         let response = service
-            .serve(
-                Context::default(),
-                Frame {
+            .serve(FrameInput {
+                frame: Frame {
                     size: 0,
                     header: Header::Request {
                         api_key: ProduceRequest::KEY,
@@ -508,7 +524,8 @@ mod tests {
                     },
                     body: ProduceRequest::default().into(),
                 },
-            )
+                extensions: Extensions::default(),
+            })
             .await?;
 
         assert!(ProduceResponse::try_from(response.body).is_ok());
@@ -523,18 +540,18 @@ mod tests {
 
         let service = TopicConfigLayer::new(
             configuration,
-            ResponseService::new(|_: Context<()>, _req: DescribeConfigsRequest| {
+            ResponseService::new(|_req: RequestInput<DescribeConfigsRequest>| {
                 Ok::<_, Error>(DescribeConfigsResponse::default())
             }),
         )
         .layer(ResponseService::new(
-            |_: Context<()>, _req: ProduceRequest| {
+            |_req: RequestInput<ProduceRequest>| {
                 Ok::<_, Error>(ProduceResponse::default().throttle_time_ms(THROTTLE_TIME_MS))
             },
         ));
 
         let response = service
-            .serve(Context::default(), ProduceRequest::default())
+            .serve(RequestInput::from(ProduceRequest::default()))
             .await?;
 
         assert_eq!(THROTTLE_TIME_MS, response.throttle_time_ms);
@@ -547,10 +564,10 @@ mod tests {
         let service = HijackLayer::new(
             FrameApiKeyMatcher(ProduceRequest::KEY),
             FrameRequestLayer::<ProduceRequest>::new().into_layer(ResponseService::new(
-                |_: Context<()>, _req: ProduceRequest| Ok::<_, Error>(ProduceResponse::default()),
+                |_req: RequestInput<ProduceRequest>| Ok::<_, Error>(ProduceResponse::default()),
             )),
         )
-        .into_layer(FrameService::new(|_: Context<()>, _req: Frame| {
+        .into_layer(FrameService::new(|_req: FrameInput| {
             Ok::<_, Error>(Frame {
                 size: 0,
                 header: Header::Response {
@@ -562,7 +579,6 @@ mod tests {
 
         let response = service
             .serve(
-                Context::default(),
                 Frame {
                     size: 0,
                     header: Header::Request {
@@ -572,7 +588,8 @@ mod tests {
                         client_id: Some("abc".into()),
                     },
                     body: ProduceRequest::default().into(),
-                },
+                }
+                .into(),
             )
             .await?;
 
@@ -580,7 +597,6 @@ mod tests {
 
         let response = service
             .serve(
-                Context::default(),
                 Frame {
                     size: 0,
                     header: Header::Request {
@@ -590,7 +606,8 @@ mod tests {
                         client_id: Some("abc".into()),
                     },
                     body: MetadataRequest::default().into(),
-                },
+                }
+                .into(),
             )
             .await?;
 

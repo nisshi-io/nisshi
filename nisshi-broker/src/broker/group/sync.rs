@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,33 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, Frame, Header, SyncGroupRequest};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, Frame, FrameInput, Header, SyncGroupRequest};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, coordinator::group::Coordinator};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SyncGroupService;
+#[derive(Clone, Debug)]
+pub struct SyncGroupService<C> {
+    pub coordinator: C,
+}
 
-impl ApiKey for SyncGroupService {
+impl<C> ApiKey for SyncGroupService<C> {
     const KEY: i16 = SyncGroupRequest::KEY;
 }
 
-impl<C> Service<C, Frame> for SyncGroupService
+impl<C> Service<FrameInput> for SyncGroupService<C>
 where
     C: Coordinator,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let coordinator = ctx.state_mut();
-        let sync_group = SyncGroupRequest::try_from(req.body)?;
+    #[instrument(skip(req))]
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let correlation_id = req.frame.correlation_id()?;
+        let sync_group = SyncGroupRequest::try_from(req.frame.body)?;
 
-        coordinator
+        self.coordinator
             .sync(
                 sync_group.group_id.as_str(),
                 sync_group.generation_id,

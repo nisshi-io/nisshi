@@ -13,34 +13,33 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, DescribeUserScramCredentialsRequest, DescribeUserScramCredentialsResponse,
+    ApiKey, DescribeUserScramCredentialsRequest, DescribeUserScramCredentialsResponse, RequestInput,
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Storage};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DescribeUserScramCredentialsService;
+#[derive(Clone, Debug)]
+pub struct DescribeUserScramCredentialsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DescribeUserScramCredentialsService {
+impl<G> ApiKey for DescribeUserScramCredentialsService<G> {
     const KEY: i16 = DescribeUserScramCredentialsRequest::KEY;
 }
 
-impl<G> Service<G, DescribeUserScramCredentialsRequest> for DescribeUserScramCredentialsService
+impl<G, I> Service<I> for DescribeUserScramCredentialsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DescribeUserScramCredentialsRequest>> + Send + 'static,
 {
-    type Response = DescribeUserScramCredentialsResponse;
+    type Output = DescribeUserScramCredentialsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DescribeUserScramCredentialsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let _ = (ctx, req);
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let _ = input;
 
         Ok(DescribeUserScramCredentialsResponse::default())
     }

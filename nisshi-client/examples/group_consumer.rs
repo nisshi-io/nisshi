@@ -24,8 +24,7 @@ use nisshi_sans_io::{
     CoordinatorType, FindCoordinatorRequest, MetadataRequest, NULL_TOPIC_ID,
     metadata_request::MetadataRequestTopic,
 };
-use nisshi_service::FrameBytesLayer;
-use rama::{Context, Layer as _, Service};
+use rama::{Layer as _, Service};
 use tracing::debug;
 use tracing_subscriber::{
     EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
@@ -119,10 +118,9 @@ async fn main() -> Result<()> {
         ConsumerGroupLayer::new(arg.group, arg.topics, metadata),
         FramePoolLayer::new(pool.clone()),
         FrameConnectionLayer,
-        FrameBytesLayer,
     )
         .into_layer(BytesConnectionService)
-        .serve(Context::default(), ())
+        .serve(())
         .await
         .map_err(Into::into)
 }

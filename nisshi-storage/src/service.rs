@@ -84,7 +84,7 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram},
 };
 pub use produce::ProduceService;
-use rama::{Context, Layer, Service};
+use rama::{Layer, Service};
 use tokio::sync::{
     mpsc::{self, error::SendError},
     oneshot,
@@ -367,21 +367,16 @@ pub struct RequestService<S> {
     inner: S,
 }
 
-impl<State, S> Service<State, Request> for RequestService<S>
+impl<S> Service<Request> for RequestService<S>
 where
-    S: Service<State, Request>,
-    State: Send + Sync + 'static,
+    S: Service<Request>,
 {
-    type Response = S::Response;
+    type Output = S::Output;
     type Error = S::Error;
 
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        req: Request,
-    ) -> Result<Self::Response, Self::Error> {
-        debug!(?req);
-        self.inner.serve(ctx, req).await
+    async fn serve(&self, input: Request) -> Result<Self::Output, Self::Error> {
+        debug!(?input);
+        self.inner.serve(input).await
     }
 }
 
@@ -410,25 +405,17 @@ static STORAGE_CHANNEL_CAPACITY: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-impl<State> Service<State, Request> for RequestChannelService
-where
-    State: Send + Sync + 'static,
-{
-    type Response = Response;
+impl Service<Request> for RequestChannelService {
+    type Output = Response;
     type Error = ServiceError;
 
     #[instrument(skip_all)]
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        req: Request,
-    ) -> Result<Self::Response, Self::Error> {
-        let _ = ctx;
+    async fn serve(&self, input: Request) -> Result<Self::Output, Self::Error> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
         let start = SystemTime::now();
 
-        let operation = req.to_string();
+        let operation = input.to_string();
         let attributes = [KeyValue::new("operation", operation.clone())];
 
         let capacity = self.tx.capacity();
@@ -438,7 +425,7 @@ where
         self.tx
             .reserve()
             .await
-            .map(|permit| permit.send((req, resp_tx)))
+            .map(|permit| permit.send((input, resp_tx)))
             .inspect(|_| {
                 let permit_elapsed = self.elapsed_millis(start);
                 STORAGE_CHANNEL_PERMIT_DURATION.record(permit_elapsed, &attributes);
@@ -487,23 +474,33 @@ static STORAGE_CHANNEL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Sends `$request` to the storage channel and extracts the `Response::$variant` payload,
+/// erroring if the channel responded with an unexpected variant.
+macro_rules! serve_and_extract {
+    ($self:ident, $request:expr, $variant:ident) => {
+        $self
+            .serve($request)
+            .await
+            .and_then(|response| {
+                if let Response::$variant(inner) = response {
+                    inner.map_err(Into::into)
+                } else {
+                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
+                }
+            })
+            .map_err(Into::into)
+    };
+}
+
 #[async_trait]
 impl Storage for RequestChannelService {
     #[instrument(skip_all)]
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::RegisterBroker(broker_registration),
+            RegisterBroker
         )
-        .await
-        .and_then(|response| {
-            if let Response::RegisterBroker(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -511,39 +508,23 @@ impl Storage for RequestChannelService {
         &self,
         resource: AlterConfigsResource,
     ) -> Result<AlterConfigsResourceResponse> {
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::IncrementalAlterResource(resource),
+            IncrementalAlterResponse
         )
-        .await
-        .and_then(|response| {
-            if let Response::IncrementalAlterResponse(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::CreateTopic {
                 topic,
                 validate_only,
             },
+            CreateTopic
         )
-        .await
-        .and_then(|response| {
-            if let Response::CreateTopic(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -551,47 +532,21 @@ impl Storage for RequestChannelService {
         &self,
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::DeleteRecords(Vec::from(topics)),
+            DeleteRecords
         )
-        .await
-        .and_then(|response| {
-            if let Response::DeleteRecords(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
-        self.serve(Context::default(), Request::DeleteTopic(topic.to_owned()))
-            .await
-            .and_then(|response| {
-                if let Response::DeleteTopic(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::DeleteTopic(topic.to_owned()), DeleteTopic)
     }
 
     #[instrument(skip_all)]
     async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        self.serve(Context::default(), Request::Brokers)
-            .await
-            .and_then(|response| {
-                if let Response::Brokers(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::Brokers, Brokers)
     }
 
     #[instrument(skip_all)]
@@ -604,23 +559,15 @@ impl Storage for RequestChannelService {
         let transaction_id = transaction_id.map(|s| s.to_string());
         let topition = topition.to_owned();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::Produce {
                 transaction_id,
                 topition,
                 batch,
             },
+            Produce
         )
-        .await
-        .and_then(|response| {
-            if let Response::Produce(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -635,8 +582,8 @@ impl Storage for RequestChannelService {
     ) -> Result<Vec<deflated::Batch>> {
         let topition = topition.to_owned();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::Fetch {
                 topition,
                 offset,
@@ -645,33 +592,13 @@ impl Storage for RequestChannelService {
                 isolation,
                 max_wait,
             },
+            Fetch
         )
-        .await
-        .and_then(|response| {
-            if let Response::Fetch(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        self.serve(
-            Context::default(),
-            Request::OffsetStage(topition.to_owned()),
-        )
-        .await
-        .and_then(|response| {
-            if let Response::OffsetStage(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
+        serve_and_extract!(self, Request::OffsetStage(topition.to_owned()), OffsetStage)
     }
 
     #[instrument(skip_all)]
@@ -682,22 +609,14 @@ impl Storage for RequestChannelService {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         let offsets = Vec::from(offsets);
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::ListOffsets {
                 isolation_level,
                 offsets,
             },
+            ListOffsets
         )
-        .await
-        .and_then(|response| {
-            if let Response::ListOffsets(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -710,42 +629,26 @@ impl Storage for RequestChannelService {
         let group_id = group_id.to_string();
         let offsets = Vec::from(offsets);
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::OffsetCommit {
                 group_id,
                 retention_time_ms,
                 offsets,
             },
+            OffsetCommit
         )
-        .await
-        .and_then(|response| {
-            if let Response::OffsetCommit(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
         let group_id = group_id.to_string();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::CommittedOffsetTopitions(group_id),
+            CommittedOffsetTopitions
         )
-        .await
-        .and_then(|response| {
-            if let Response::CommittedOffsetTopitions(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -758,39 +661,22 @@ impl Storage for RequestChannelService {
         let group_id = group_id.map(|s| s.to_string());
         let topics = Vec::from(topics);
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::OffsetFetch {
                 group_id,
                 topics,
                 require_stable,
             },
+            OffsetFetch
         )
-        .await
-        .and_then(|response| {
-            if let Response::OffsetFetch(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         let topics = topics.map(Vec::from);
 
-        self.serve(Context::default(), Request::Metadata(topics))
-            .await
-            .and_then(|response| {
-                if let Response::Metadata(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::Metadata(topics), Metadata)
     }
 
     #[instrument(skip_all)]
@@ -803,23 +689,15 @@ impl Storage for RequestChannelService {
         let name = name.to_string();
         let keys = keys.map(Vec::from);
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::DescribeConfig {
                 name,
                 resource,
                 keys,
             },
+            DescribeConfig
         )
-        .await
-        .and_then(|response| {
-            if let Response::DescribeConfig(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -831,39 +709,22 @@ impl Storage for RequestChannelService {
     ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
         let topics = topics.map(Vec::from);
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::DescribeTopicPartitions {
                 topics,
                 partition_limit,
                 cursor,
             },
+            DescribeTopicPartitions
         )
-        .await
-        .and_then(|response| {
-            if let Response::DescribeTopicPartitions(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
         let states_filter = states_filter.map(Vec::from);
 
-        self.serve(Context::default(), Request::ListGroups(states_filter))
-            .await
-            .and_then(|response| {
-                if let Response::ListGroups(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::ListGroups(states_filter), ListGroups)
     }
 
     #[instrument(skip_all)]
@@ -873,16 +734,7 @@ impl Storage for RequestChannelService {
     ) -> Result<Vec<DeletableGroupResult>> {
         let group_ids = group_ids.map(Vec::from);
 
-        self.serve(Context::default(), Request::DeleteGroups(group_ids))
-            .await
-            .and_then(|response| {
-                if let Response::DeleteGroups(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::DeleteGroups(group_ids), DeleteGroups)
     }
 
     #[instrument(skip_all)]
@@ -893,22 +745,14 @@ impl Storage for RequestChannelService {
     ) -> Result<Vec<NamedGroupDetail>> {
         let group_ids = group_ids.map(Vec::from);
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::DescribeGroups {
                 group_ids,
                 include_authorized_operations,
             },
+            DescribeGroups
         )
-        .await
-        .and_then(|response| {
-            if let Response::DescribeGroups(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -920,23 +764,15 @@ impl Storage for RequestChannelService {
     ) -> Result<Version, UpdateError<GroupDetail>> {
         let group_id = group_id.to_string();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::UpdateGroup {
                 group_id,
                 detail,
                 version,
             },
+            UpdateGroup
         )
-        .await
-        .and_then(|response| {
-            if let Response::UpdateGroup(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -949,24 +785,16 @@ impl Storage for RequestChannelService {
     ) -> Result<ProducerIdResponse> {
         let transaction_id = transaction_id.map(|transaction_id| transaction_id.to_owned());
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::InitProducer {
                 transaction_id,
                 transaction_timeout_ms,
                 producer_id,
                 producer_epoch,
             },
+            InitProducer
         )
-        .await
-        .and_then(|response| {
-            if let Response::InitProducer(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -980,24 +808,16 @@ impl Storage for RequestChannelService {
         let transaction_id = transaction_id.to_string();
         let group_id = group_id.to_string();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::TxnAddOffsets {
                 transaction_id,
                 producer_id,
                 producer_epoch,
                 group_id,
             },
+            TxnAddOffsets
         )
-        .await
-        .and_then(|response| {
-            if let Response::TxnAddOffsets(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -1005,16 +825,11 @@ impl Storage for RequestChannelService {
         &self,
         partitions: TxnAddPartitionsRequest,
     ) -> Result<TxnAddPartitionsResponse> {
-        self.serve(Context::default(), Request::TxnAddPartitions(partitions))
-            .await
-            .and_then(|response| {
-                if let Response::TxnAddPartitions(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(
+            self,
+            Request::TxnAddPartitions(partitions),
+            TxnAddPartitions
+        )
     }
 
     #[instrument(skip_all)]
@@ -1022,16 +837,7 @@ impl Storage for RequestChannelService {
         &self,
         offsets: TxnOffsetCommitRequest,
     ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-        self.serve(Context::default(), Request::TxnOffsetCommit(offsets))
-            .await
-            .and_then(|response| {
-                if let Response::TxnOffsetCommit(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::TxnOffsetCommit(offsets), TxnOffsetCommit)
     }
 
     #[instrument(skip_all)]
@@ -1044,52 +850,30 @@ impl Storage for RequestChannelService {
     ) -> Result<ErrorCode> {
         let transaction_id = transaction_id.to_string();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::TxnEnd {
                 transaction_id,
                 producer_id,
                 producer_epoch,
                 committed,
             },
+            TxnEnd
         )
-        .await
-        .and_then(|response| {
-            if let Response::TxnEnd(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn maintain(&self, now: SystemTime) -> Result<()> {
-        self.serve(Context::default(), Request::Maintain(now))
-            .await
-            .and_then(|response| {
-                if let Response::Maintain(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::Maintain(now), Maintain)
     }
 
     #[instrument(skip_all)]
     async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
-        self.serve(Context::default(), Request::MaintainTransactions(now))
-            .await
-            .and_then(|response| {
-                if let Response::MaintainTransactions(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(
+            self,
+            Request::MaintainTransactions(now),
+            MaintainTransactions
+        )
     }
 
     #[instrument(skip_all)]
@@ -1099,65 +883,30 @@ impl Storage for RequestChannelService {
         offset: i64,
         last_stable_offset: i64,
     ) -> Result<Vec<AbortedTransaction>> {
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::AbortedTransactions {
                 topition: topition.clone(),
                 offset,
                 last_stable_offset,
             },
+            AbortedTransactions
         )
-        .await
-        .and_then(|response| {
-            if let Response::AbortedTransactions(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn cluster_id(&self) -> Result<String> {
-        self.serve(Context::default(), Request::ClusterId)
-            .await
-            .and_then(|response| {
-                if let Response::ClusterId(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::ClusterId, ClusterId)
     }
 
     #[instrument(skip_all)]
     async fn node(&self) -> Result<i32> {
-        self.serve(Context::default(), Request::Node)
-            .await
-            .and_then(|response| {
-                if let Response::Node(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::Node, Node)
     }
 
     #[instrument(skip_all)]
     async fn advertised_listener(&self) -> Result<Url> {
-        self.serve(Context::default(), Request::AdvertisedListener)
-            .await
-            .and_then(|response| {
-                if let Response::AdvertisedListener(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::AdvertisedListener, AdvertisedListener)
     }
 
     #[instrument(skip_all)]
@@ -1168,19 +917,11 @@ impl Storage for RequestChannelService {
     ) -> Result<()> {
         let user = user.to_string();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::DeleteUserScramCredential { user, mechanism },
+            DeleteUserScramCredential
         )
-        .await
-        .and_then(|response| {
-            if let Response::DeleteUserScramCredential(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -1192,23 +933,15 @@ impl Storage for RequestChannelService {
     ) -> Result<()> {
         let user = user.to_string();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::UpsertUserScramCredential {
                 user,
                 mechanism,
                 credential,
             },
+            UpsertUserScramCredential
         )
-        .await
-        .and_then(|response| {
-            if let Response::UpsertUserScramCredential(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -1219,33 +952,16 @@ impl Storage for RequestChannelService {
     ) -> Result<Option<ScramCredential>> {
         let user = user.to_string();
 
-        self.serve(
-            Context::default(),
+        serve_and_extract!(
+            self,
             Request::UserScramCredential { user, mechanism },
+            UserScramCredential
         )
-        .await
-        .and_then(|response| {
-            if let Response::UserScramCredential(inner) = response {
-                inner.map_err(Into::into)
-            } else {
-                Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-            }
-        })
-        .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
     async fn ping(&self) -> Result<()> {
-        self.serve(Context::default(), Request::Ping)
-            .await
-            .and_then(|response| {
-                if let Response::Ping(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
+        serve_and_extract!(self, Request::Ping, Ping)
     }
 }
 
@@ -1277,24 +993,19 @@ pub struct ChannelRequestService<S> {
     cancellation: CancellationToken,
 }
 
-impl<S, State> Service<State, RequestReceiver> for ChannelRequestService<S>
+impl<S> Service<RequestReceiver> for ChannelRequestService<S>
 where
-    S: Service<State, Request, Response = Response, Error = Error>,
-    State: Clone + Send + Sync + 'static,
+    S: Service<Request, Output = Response, Error = Error>,
 {
-    type Response = ();
+    type Output = ();
     type Error = Error;
 
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        mut req: RequestReceiver,
-    ) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, mut req: RequestReceiver) -> Result<Self::Output, Self::Error> {
         loop {
             tokio::select! {
                 Some((request, tx)) = req.recv() => {
                     self.inner
-                    .serve(ctx.clone(), request)
+                    .serve(request)
                     .await
                     .and_then(|response| {
                         tx.send(response).map_err(|_unsent| Error::UnableToSend)
@@ -1326,19 +1037,14 @@ where
     }
 }
 
-impl<G, State> Service<State, Request> for RequestStorageService<G>
+impl<G> Service<Request> for RequestStorageService<G>
 where
     G: Storage,
-    State: Clone + Send + Sync + 'static,
 {
-    type Response = Response;
+    type Output = Response;
     type Error = Error;
 
-    async fn serve(
-        &self,
-        _ctx: Context<State>,
-        req: Request,
-    ) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, req: Request) -> Result<Self::Output, Self::Error> {
         match req {
             Request::RegisterBroker(broker_registration) => Ok(Response::RegisterBroker(
                 self.storage.register_broker(broker_registration).await,

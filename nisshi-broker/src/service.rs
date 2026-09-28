@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ pub mod coordinator;
 pub mod storage;
 
 type TcpRouteFrame =
-    TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<(), Error>>, ()>>;
+    TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<Error>>>>;
 
 pub fn services<C, S>(
     cluster_id: &str,
@@ -42,7 +42,7 @@ where
     S: Storage + Clone,
     C: Coordinator,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
+    storage::services(FrameRouteService::<Error>::builder(), storage)
         .inspect(|builder| debug!(?builder))
         .and_then(|builder| {
             coordinator::services(builder, coordinator).inspect(|builder| debug!(?builder))
@@ -52,7 +52,7 @@ where
         .map(|route| {
             (
                 TcpContextLayer::new(TcpContext::default().cluster_id(Some(cluster_id.into()))),
-                TcpBytesLayer::default(),
+                TcpBytesLayer,
                 BytesFrameLayer::default().with_sasl_config(sasl_config),
             )
                 .into_layer(route)

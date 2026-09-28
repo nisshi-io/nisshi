@@ -14,11 +14,11 @@ clean-workspace:
 license:
     cargo about generate about.hbs > license.html
 
-build-all profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb": (cargo-build "--profile" profile "--timings" "--no-default-features" "--features" features)
+build-all profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb": (cargo-build "--profile" profile "--timings" "--no-default-features" "--features" features "--all-targets")
 
 build profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb" bin="nisshi": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
-build-storage: clean-workspace (build "dev" "libsql") (build "dev" "postgres") (build "dev" "slatedb")
+build-storage: clean-workspace (build "dev" "libsql") (build "dev" "dynostore") (build "dev" "postgres") (build "dev" "slatedb")
 
 build-examples: (cargo-build "--examples")
 
@@ -60,11 +60,30 @@ fmt:
 miri:
     cargo +nightly miri test --no-fail-fast --all-features
 
-docker-build:
-    docker build --tag ghcr.io/nisshi-io/nisshi --no-cache --progress plain --debug .
+docker_arch := if arch() == "aarch64" { "arm64" } else { "amd64" }
 
-docker-build-cross:
-    docker build --tag ghcr.io/nisshi-io/nisshi --no-cache --progress plain --platform linux/amd64,linux/arm64 --debug .
+# build the static musl binary the Dockerfile packages into dist/linux/<arch>/nisshi
+# (needs zig and cargo-zigbuild; works on macOS and Linux hosts)
+docker-dist arch=docker_arch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ arch }}" in
+        amd64) target=x86_64-unknown-linux-musl ;;
+        arm64) target=aarch64-unknown-linux-musl ;;
+        *) echo "unsupported arch: {{ arch }} (expected amd64 or arm64)" >&2; exit 1 ;;
+    esac
+    rustup target add "${target}"
+    cargo zigbuild --release --bin nisshi --all-features --target "${target}"
+    # honour a build.target-dir / CARGO_TARGET_DIR override rather than assuming ./target
+    target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    mkdir -p dist/linux/{{ arch }}
+    cp "${target_dir}/${target}"/release/nisshi dist/linux/{{ arch }}/nisshi
+
+docker-build: docker-dist
+    docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --debug .
+
+docker-build-cross: (docker-dist "amd64") (docker-dist "arm64")
+    docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --platform linux/amd64,linux/arm64 --debug .
 
 minio-up: (docker-compose-up "minio")
 
@@ -447,7 +466,7 @@ compat-librdkafka storage="memory://" features="dynostore": clean-nisshi-db (bui
         --advertised-listener-url=tcp://127.0.0.1:9092 &
     broker=$!
     trap 'kill ${broker}' EXIT
-    ./compat/librdkafka/run.sh
+    BROKER_PID=${broker} ./compat/librdkafka/run.sh
 
 # run the franz-go integration test suite against the given storage engine
 compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build "dev" features)
@@ -457,7 +476,7 @@ compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build
         --advertised-listener-url=tcp://127.0.0.1:9092 &
     broker=$!
     trap 'kill ${broker}' EXIT
-    ./compat/franz-go/run.sh
+    BROKER_PID=${broker} ./compat/franz-go/run.sh
 
 compat-franz-go-test tests timeout="600s" count="1":
     #!/usr/bin/env bash

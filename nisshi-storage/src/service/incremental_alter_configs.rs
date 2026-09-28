@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, IncrementalAlterConfigsRequest, IncrementalAlterConfigsResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{
+    ApiKey, IncrementalAlterConfigsRequest, IncrementalAlterConfigsResponse, RequestInput,
+};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service;
 /// use nisshi_sans_io::{
 ///     ConfigResource, CreateTopicsRequest, DescribeConfigsRequest, ErrorCode,
 ///     IncrementalAlterConfigsRequest, OpType,
@@ -50,14 +52,12 @@ use crate::{Error, Result, Storage};
 ///
 /// let resource_name = "abcba";
 ///
-/// let create_topic = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+/// let create_topic = CreateTopicsService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let response = create_topic
 ///     .serve(
-///         Context::default(),
 ///         CreateTopicsRequest::default().topics(Some(
 ///             [CreatableTopic::default()
 ///                 .name(resource_name.into())
@@ -76,14 +76,12 @@ use crate::{Error, Result, Storage};
 /// let config_name = "x.y.z";
 /// let config_value = "pqr";
 ///
-/// let describe_configs = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(DescribeConfigsService)
+/// let describe_configs = DescribeConfigsService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let response = describe_configs
 ///     .serve(
-///         Context::default(),
 ///         DescribeConfigsRequest::default()
 ///             .include_documentation(Some(false))
 ///             .include_synonyms(Some(false))
@@ -99,14 +97,12 @@ use crate::{Error, Result, Storage};
 ///
 /// assert!(response.results.unwrap_or_default()[0].configs.is_none());
 ///
-/// let alter_configs = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(IncrementalAlterConfigsService)
+/// let alter_configs = IncrementalAlterConfigsService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let _response = alter_configs
 ///     .serve(
-///         Context::default(),
 ///         IncrementalAlterConfigsRequest::default().resources(Some(
 ///             [AlterConfigsResource::default()
 ///                 .resource_name(resource_name.into())
@@ -125,7 +121,6 @@ use crate::{Error, Result, Storage};
 ///
 /// let response = describe_configs
 ///     .serve(
-///         Context::default(),
 ///         DescribeConfigsRequest::default()
 ///             .include_documentation(Some(false))
 ///             .include_synonyms(Some(false))
@@ -149,30 +144,31 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct IncrementalAlterConfigsService;
+#[derive(Clone, Debug)]
+pub struct IncrementalAlterConfigsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for IncrementalAlterConfigsService {
+impl<G> ApiKey for IncrementalAlterConfigsService<G> {
     const KEY: i16 = IncrementalAlterConfigsRequest::KEY;
 }
 
-impl<G> Service<G, IncrementalAlterConfigsRequest> for IncrementalAlterConfigsService
+impl<G, I> Service<I> for IncrementalAlterConfigsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<IncrementalAlterConfigsRequest>> + Send + 'static,
 {
-    type Response = IncrementalAlterConfigsResponse;
+    type Output = IncrementalAlterConfigsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: IncrementalAlterConfigsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
         let mut responses = vec![];
 
-        for resource in req.resources.unwrap_or_default() {
-            responses.push(ctx.state().incremental_alter_resource(resource).await?);
+        for resource in input.request.resources.unwrap_or_default() {
+            responses.push(self.storage.incremental_alter_resource(resource).await?);
         }
 
         Ok(IncrementalAlterConfigsResponse::default()

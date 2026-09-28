@@ -20,11 +20,11 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    ApiKey as _, Body, ErrorCode, Frame, Header, HeartbeatResponse, MetadataResponse,
+    ApiKey as _, Body, ErrorCode, Frame, FrameInput, Header, HeartbeatResponse, MetadataResponse,
     RootMessageMeta,
     consumer::{DynConsumerAssignment, GroupConsumer, MemberAssignment},
 };
-use rama::{Context, Layer, Service};
+use rama::{Layer, Service, extensions::Extensions};
 use tokio::time::sleep;
 use tracing::debug;
 
@@ -107,6 +107,7 @@ impl<S> Layer<S> for ConsumerGroupLayer {
             inner,
             consumer,
             heartbeats: Default::default(),
+            extensions: Extensions::default(),
         }
     }
 }
@@ -116,6 +117,7 @@ pub struct ConsumerGroupService<S> {
     inner: S,
     consumer: Arc<Mutex<GroupConsumer>>,
     heartbeats: Arc<Mutex<Option<usize>>>,
+    extensions: Extensions,
 }
 
 impl<S> ConsumerGroupService<S> {
@@ -168,23 +170,18 @@ impl<S> fmt::Debug for ConsumerGroupService<S> {
     }
 }
 
-impl<State, S> Service<State, Option<Body>> for ConsumerGroupService<S>
+impl<S> Service<Option<Body>> for ConsumerGroupService<S>
 where
-    S: Service<State, Frame, Response = Frame>,
+    S: Service<FrameInput, Output = Frame>,
     S::Error: From<nisshi_sans_io::Error>
         + for<'a> From<PoisonError<MutexGuard<'a, GroupConsumer>>>
         + for<'a> From<PoisonError<MutexGuard<'a, Option<usize>>>>,
-    State: Clone + Send + Sync + 'static,
 {
-    type Response = Body;
+    type Output = Body;
 
     type Error = S::Error;
 
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        input: Option<Body>,
-    ) -> Result<Self::Response, Self::Error> {
+    async fn serve(&self, input: Option<Body>) -> Result<Self::Output, Self::Error> {
         let frame = self
             .consumer
             .lock()
@@ -217,7 +214,10 @@ where
 
         let output = self
             .inner
-            .serve(ctx.clone(), frame)
+            .serve(FrameInput {
+                frame,
+                extensions: self.extensions.clone(),
+            })
             .await
             .map(|frame| frame.body)
             .inspect(|input| debug!(input.api_name = input.api_name()))?;

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,20 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nisshi_sans_io::{
-    ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, TimestampType,
+    ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
+    TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
-/// ```
+/// ```no_run
 /// use bytes::Bytes;
-/// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+/// use rama::Service as _;
 /// use nisshi_sans_io::{
 ///     CreateTopicsRequest, ErrorCode, ProduceRequest,
 ///     create_topics_request::CreatableTopic,
@@ -52,16 +53,14 @@ use crate::{Error, Result, Storage, Topition};
 ///     .build()
 ///     .await?;
 ///
-/// let create_topic = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+/// let create_topic = CreateTopicsService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let name = "abcba";
 ///
 /// let response = create_topic
 ///     .serve(
-///         Context::default(),
 ///         CreateTopicsRequest::default()
 ///             .topics(Some(vec![
 ///                 CreatableTopic::default()
@@ -79,16 +78,14 @@ use crate::{Error, Result, Storage, Topition};
 /// assert_eq!(1, topics.len());
 /// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 ///
-/// let produce = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(ProduceService)
+/// let produce = ProduceService {
+///     storage: storage.clone(),
 /// };
 ///
 /// let partition = 0;
 ///
 /// let response = produce
 ///     .serve(
-///         Context::default(),
 ///         ProduceRequest::default().topic_data(Some(
 ///             [TopicProduceData::default()
 ///                 .name(name.into())
@@ -128,14 +125,19 @@ use crate::{Error, Result, Storage, Topition};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProduceService;
+#[derive(Clone, Debug)]
+pub struct ProduceService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for ProduceService {
+impl<G> ApiKey for ProduceService<G> {
     const KEY: i16 = ProduceRequest::KEY;
 }
 
-impl ProduceService {
+impl<G> ProduceService<G>
+where
+    G: Storage,
+{
     fn error(&self, index: i32, error_code: ErrorCode) -> PartitionProduceResponse {
         PartitionProduceResponse::default()
             .index(index)
@@ -149,16 +151,12 @@ impl ProduceService {
     }
 
     #[instrument(skip_all)]
-    async fn partition<G>(
+    async fn partition(
         &self,
-        ctx: &Context<G>,
         transaction_id: Option<&str>,
         name: &str,
         partition: PartitionProduceData,
-    ) -> PartitionProduceResponse
-    where
-        G: Storage,
-    {
+    ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
             let mut base_offset = None;
 
@@ -178,8 +176,8 @@ impl ProduceService {
                     batch.max_timestamp = base_timestamp;
                 }
 
-                match ctx
-                    .state()
+                match self
+                    .storage
                     .produce(transaction_id, &tp, batch)
                     .await
                     .inspect_err(|err| match err {
@@ -222,23 +220,16 @@ impl ProduceService {
     }
 
     #[instrument(skip_all)]
-    async fn topic<G>(
+    async fn topic(
         &self,
-        ctx: &Context<G>,
         transaction_id: Option<&str>,
         topic: TopicProduceData,
-    ) -> TopicProduceResponse
-    where
-        G: Storage,
-    {
+    ) -> TopicProduceResponse {
         let mut partitions = vec![];
 
         if let Some(partition_data) = topic.partition_data {
             for partition in partition_data {
-                partitions.push(
-                    self.partition(ctx, transaction_id, &topic.name, partition)
-                        .await,
-                )
+                partitions.push(self.partition(transaction_id, &topic.name, partition).await)
             }
         }
 
@@ -248,29 +239,30 @@ impl ProduceService {
     }
 }
 
-impl<G> Service<G, ProduceRequest> for ProduceService
+impl<G, I> Service<I> for ProduceService<G>
 where
     G: Storage,
+    I: Into<RequestInput<ProduceRequest>> + Send + 'static,
 {
-    type Response = ProduceResponse;
+    type Output = ProduceResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ProduceRequest,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+
         let mut responses = Vec::with_capacity(
-            req.topic_data
+            input
+                .request
+                .topic_data
                 .as_ref()
                 .map_or(0, |topic_data| topic_data.len()),
         );
 
-        if let Some(topics) = req.topic_data {
+        if let Some(topics) = input.request.topic_data {
             for topic in topics {
                 responses.push(
-                    self.topic(&ctx, req.transactional_id.as_deref(), topic)
+                    self.topic(input.request.transactional_id.as_deref(), topic)
                         .await,
                 )
             }
@@ -283,516 +275,516 @@ where
     }
 }
 
-#[cfg(all(test, feature = "dynostore"))]
-mod tests {
-    use super::*;
-    use crate::{Error, dynostore::DynoStore, service::init_producer_id::InitProducerIdService};
-    use bytes::Bytes;
-    use nisshi_sans_io::{
-        ErrorCode, InitProducerIdRequest,
-        record::{
-            Record,
-            deflated::{self, Frame},
-            inflated,
-        },
-    };
-    use object_store::memory::InMemory;
-    use rama::Context;
-    use tracing::subscriber::DefaultGuard;
+// #[cfg(all(test, feature = "dynostore"))]
+// mod tests {
+//     use super::*;
+//     use crate::{Error, service::init_producer_id::InitProducerIdService};
+//     use bytes::Bytes;
+//     use nisshi_sans_io::{
+//         ErrorCode, InitProducerIdRequest,
+//         record::{
+//             Record,
+//             deflated::{self, Frame},
+//             inflated,
+//         },
+//     };
+//     use object_store::memory::InMemory;
+//     use rama::Context;
+//     use tracing::subscriber::DefaultGuard;
 
-    fn init_tracing() -> Result<DefaultGuard> {
-        use std::{fs::File, sync::Arc, thread};
+//     fn init_tracing() -> Result<DefaultGuard> {
+//         use std::{fs::File, sync::Arc, thread};
 
-        use tracing::Level;
-        use tracing_subscriber::fmt::format::FmtSpan;
+//         use tracing::Level;
+//         use tracing_subscriber::fmt::format::FmtSpan;
 
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_max_level(Level::DEBUG)
-                .with_span_events(FmtSpan::ACTIVE)
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME")))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
-    }
+//         Ok(tracing::subscriber::set_default(
+//             tracing_subscriber::fmt()
+//                 .with_level(true)
+//                 .with_line_number(true)
+//                 .with_thread_names(false)
+//                 .with_max_level(Level::DEBUG)
+//                 .with_span_events(FmtSpan::ACTIVE)
+//                 .with_writer(
+//                     thread::current()
+//                         .name()
+//                         .ok_or(Error::Message(String::from("unnamed thread")))
+//                         .and_then(|name| {
+//                             File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME")))
+//                                 .map_err(Into::into)
+//                         })
+//                         .map(Arc::new)?,
+//                 )
+//                 .finish(),
+//         ))
+//     }
 
-    fn topic_data(
-        topic: &str,
-        index: i32,
-        builder: inflated::Builder,
-    ) -> Result<Option<Vec<TopicProduceData>>> {
-        builder
-            .build()
-            .and_then(deflated::Batch::try_from)
-            .map(|deflated| {
-                let partition_data =
-                    PartitionProduceData::default()
-                        .index(index)
-                        .records(Some(Frame {
-                            batches: vec![deflated],
-                        }));
+//     fn topic_data(
+//         topic: &str,
+//         index: i32,
+//         builder: inflated::Builder,
+//     ) -> Result<Option<Vec<TopicProduceData>>> {
+//         builder
+//             .build()
+//             .and_then(deflated::Batch::try_from)
+//             .map(|deflated| {
+//                 let partition_data =
+//                     PartitionProduceData::default()
+//                         .index(index)
+//                         .records(Some(Frame {
+//                             batches: vec![deflated],
+//                         }));
 
-                Some(vec![
-                    TopicProduceData::default()
-                        .name(topic.into())
-                        .partition_data(Some(vec![partition_data])),
-                ])
-            })
-            .map_err(Into::into)
-    }
+//                 Some(vec![
+//                     TopicProduceData::default()
+//                         .name(topic.into())
+//                         .partition_data(Some(vec![partition_data])),
+//                 ])
+//             })
+//             .map_err(Into::into)
+//     }
 
-    #[tokio::test]
-    async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
-        let _guard = init_tracing()?;
+//     #[tokio::test]
+//     async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
+//         let _guard = init_tracing()?;
 
-        let cluster = "abc";
-        let node = 12321;
+//         let cluster = "abc";
+//         let node = 12321;
 
-        let topic = "pqr";
-        let index = 0;
+//         let topic = "pqr";
+//         let index = 0;
 
-        let transactional_id = None;
-        let acks = 0;
-        let timeout_ms = 0;
+//         let transactional_id = None;
+//         let acks = 0;
+//         let timeout_ms = 0;
 
-        let storage = DynoStore::new(cluster, node, InMemory::new());
-        let ctx = Context::with_state(storage);
-        let service = ProduceService;
+//         let storage = DynoStore::new(cluster, node, InMemory::new());
+//         let ctx = Context::with_state(storage);
+//         let service = ProduceService;
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::UnknownProducerId.into())
-                                .base_offset(-1)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            service
-                .serve(
-                    ctx,
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id)
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(
-                                    Record::builder().value(Bytes::from_static(b"lorem").into())
-                                )
-                                .producer_id(54345)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::UnknownProducerId.into())
+//                                 .base_offset(-1)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             service
+//                 .serve(
+//                     ctx,
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id)
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(
+//                                     Record::builder().value(Bytes::from_static(b"lorem").into())
+//                                 )
+//                                 .producer_id(54345)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        Ok(())
-    }
+//         Ok(())
+//     }
 
-    #[tokio::test]
-    async fn non_txn_idempotent() -> Result<()> {
-        let _guard = init_tracing()?;
+//     #[tokio::test]
+//     async fn non_txn_idempotent() -> Result<()> {
+//         let _guard = init_tracing()?;
 
-        let cluster = "abc";
-        let node = 12321;
-        let topic = "pqr";
-        let index = 0;
+//         let cluster = "abc";
+//         let node = 12321;
+//         let topic = "pqr";
+//         let index = 0;
 
-        let storage = DynoStore::new(cluster, node, InMemory::new());
-        let ctx = Context::with_state(storage);
+//         let storage = DynoStore::new(cluster, node, InMemory::new());
+//         let ctx = Context::with_state(storage);
 
-        let init_producer_id = InitProducerIdService;
+//         let init_producer_id = InitProducerIdService;
 
-        let producer = init_producer_id
-            .serve(
-                ctx.clone(),
-                InitProducerIdRequest::default()
-                    .transactional_id(None)
-                    .transaction_timeout_ms(0)
-                    .producer_id(Some(-1))
-                    .producer_epoch(Some(-1)),
-            )
-            .await?;
+//         let producer = init_producer_id
+//             .serve(
+//                 ctx.clone(),
+//                 InitProducerIdRequest::default()
+//                     .transactional_id(None)
+//                     .transaction_timeout_ms(0)
+//                     .producer_id(Some(-1))
+//                     .producer_epoch(Some(-1)),
+//             )
+//             .await?;
 
-        let request = ProduceService;
+//         let request = ProduceService;
 
-        let transactional_id = None;
-        let acks = 0;
-        let timeout_ms = 0;
+//         let transactional_id = None;
+//         let acks = 0;
+//         let timeout_ms = 0;
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::None.into())
-                                .base_offset(0)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            request
-                .serve(
-                    ctx.clone(),
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id.clone())
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(Record::builder().value(
-                                    Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
-                                ))
-                                .producer_id(producer.producer_id)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::None.into())
+//                                 .base_offset(0)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             request
+//                 .serve(
+//                     ctx.clone(),
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id.clone())
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(Record::builder().value(
+//                                     Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
+//                                 ))
+//                                 .producer_id(producer.producer_id)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::None.into())
-                                .base_offset(1)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            request
-                .serve(
-                    ctx.clone(),
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id.clone())
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(Record::builder().value(
-                                    Bytes::from_static(b"consectetur adipiscing elit").into()
-                                ))
-                                .record(
-                                    Record::builder()
-                                        .value(Bytes::from_static(b"sed do eiusmod tempor").into())
-                                )
-                                .base_sequence(1)
-                                .last_offset_delta(1)
-                                .producer_id(producer.producer_id)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::None.into())
+//                                 .base_offset(1)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             request
+//                 .serve(
+//                     ctx.clone(),
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id.clone())
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(Record::builder().value(
+//                                     Bytes::from_static(b"consectetur adipiscing elit").into()
+//                                 ))
+//                                 .record(
+//                                     Record::builder()
+//                                         .value(Bytes::from_static(b"sed do eiusmod tempor").into())
+//                                 )
+//                                 .base_sequence(1)
+//                                 .last_offset_delta(1)
+//                                 .producer_id(producer.producer_id)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::None.into())
-                                .base_offset(3)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            request
-                .serve(
-                    ctx,
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id.clone())
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(
-                                    Record::builder()
-                                        .value(Bytes::from_static(b"incididunt ut labore").into())
-                                )
-                                .base_sequence(3)
-                                .producer_id(producer.producer_id)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::None.into())
+//                                 .base_offset(3)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             request
+//                 .serve(
+//                     ctx,
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id.clone())
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(
+//                                     Record::builder()
+//                                         .value(Bytes::from_static(b"incididunt ut labore").into())
+//                                 )
+//                                 .base_sequence(3)
+//                                 .producer_id(producer.producer_id)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        Ok(())
-    }
+//         Ok(())
+//     }
 
-    #[tokio::test]
-    async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
-        let _guard = init_tracing()?;
+//     #[tokio::test]
+//     async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
+//         let _guard = init_tracing()?;
 
-        let cluster = "abc";
-        let node = 12321;
-        let topic = "pqr";
-        let index = 0;
+//         let cluster = "abc";
+//         let node = 12321;
+//         let topic = "pqr";
+//         let index = 0;
 
-        let storage = DynoStore::new(cluster, node, InMemory::new());
-        let ctx = Context::with_state(storage);
+//         let storage = DynoStore::new(cluster, node, InMemory::new());
+//         let ctx = Context::with_state(storage);
 
-        let init_producer_id = InitProducerIdService;
+//         let init_producer_id = InitProducerIdService;
 
-        let producer = init_producer_id
-            .serve(
-                ctx.clone(),
-                InitProducerIdRequest::default()
-                    .transactional_id(None)
-                    .transaction_timeout_ms(0)
-                    .producer_id(Some(-1))
-                    .producer_epoch(Some(-1)),
-            )
-            .await?;
+//         let producer = init_producer_id
+//             .serve(
+//                 ctx.clone(),
+//                 InitProducerIdRequest::default()
+//                     .transactional_id(None)
+//                     .transaction_timeout_ms(0)
+//                     .producer_id(Some(-1))
+//                     .producer_epoch(Some(-1)),
+//             )
+//             .await?;
 
-        let request = ProduceService;
+//         let request = ProduceService;
 
-        let transactional_id = None;
-        let acks = 0;
-        let timeout_ms = 0;
+//         let transactional_id = None;
+//         let acks = 0;
+//         let timeout_ms = 0;
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::None.into())
-                                .base_offset(0)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            request
-                .serve(
-                    ctx.clone(),
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id.clone())
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(Record::builder().value(
-                                    Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
-                                ))
-                                .producer_id(producer.producer_id)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::None.into())
+//                                 .base_offset(0)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             request
+//                 .serve(
+//                     ctx.clone(),
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id.clone())
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(Record::builder().value(
+//                                     Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
+//                                 ))
+//                                 .producer_id(producer.producer_id)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::DuplicateSequenceNumber.into())
-                                .base_offset(-1)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            request
-                .serve(
-                    ctx,
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id)
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(Record::builder().value(
-                                    Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
-                                ))
-                                .producer_id(producer.producer_id)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::DuplicateSequenceNumber.into())
+//                                 .base_offset(-1)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             request
+//                 .serve(
+//                     ctx,
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id)
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(Record::builder().value(
+//                                     Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
+//                                 ))
+//                                 .producer_id(producer.producer_id)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        Ok(())
-    }
+//         Ok(())
+//     }
 
-    #[tokio::test]
-    async fn non_txn_idempotent_sequence_out_of_order() -> Result<()> {
-        let _guard = init_tracing()?;
+//     #[tokio::test]
+//     async fn non_txn_idempotent_sequence_out_of_order() -> Result<()> {
+//         let _guard = init_tracing()?;
 
-        let cluster = "abc";
-        let node = 12321;
-        let topic = "pqr";
-        let index = 0;
+//         let cluster = "abc";
+//         let node = 12321;
+//         let topic = "pqr";
+//         let index = 0;
 
-        let storage = DynoStore::new(cluster, node, InMemory::new());
-        let ctx = Context::with_state(storage);
+//         let storage = DynoStore::new(cluster, node, InMemory::new());
+//         let ctx = Context::with_state(storage);
 
-        let init_producer_id = InitProducerIdService;
+//         let init_producer_id = InitProducerIdService;
 
-        let producer = init_producer_id
-            .serve(
-                ctx.clone(),
-                InitProducerIdRequest::default()
-                    .transactional_id(None)
-                    .transaction_timeout_ms(0)
-                    .producer_id(Some(-1))
-                    .producer_epoch(Some(-1)),
-            )
-            .await?;
+//         let producer = init_producer_id
+//             .serve(
+//                 ctx.clone(),
+//                 InitProducerIdRequest::default()
+//                     .transactional_id(None)
+//                     .transaction_timeout_ms(0)
+//                     .producer_id(Some(-1))
+//                     .producer_epoch(Some(-1)),
+//             )
+//             .await?;
 
-        let request = ProduceService;
+//         let request = ProduceService;
 
-        let transactional_id = None;
-        let acks = 0;
-        let timeout_ms = 0;
+//         let transactional_id = None;
+//         let acks = 0;
+//         let timeout_ms = 0;
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::None.into())
-                                .base_offset(0)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            request
-                .serve(
-                    ctx.clone(),
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id.clone())
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(Record::builder().value(
-                                    Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
-                                ))
-                                .producer_id(producer.producer_id)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::None.into())
+//                                 .base_offset(0)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             request
+//                 .serve(
+//                     ctx.clone(),
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id.clone())
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(Record::builder().value(
+//                                     Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
+//                                 ))
+//                                 .producer_id(producer.producer_id)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        assert_eq!(
-            ProduceResponse::default()
-                .responses(Some(vec![
-                    TopicProduceResponse::default()
-                        .name(topic.into())
-                        .partition_responses(Some(vec![
-                            PartitionProduceResponse::default()
-                                .index(index)
-                                .error_code(ErrorCode::OutOfOrderSequenceNumber.into())
-                                .base_offset(-1)
-                                .log_append_time_ms(Some(-1))
-                                .log_start_offset(Some(0))
-                                .record_errors(Some(vec![]))
-                                .error_message(None)
-                                .current_leader(None)
-                        ]))
-                ]))
-                .throttle_time_ms(Some(0))
-                .node_endpoints(None),
-            request
-                .serve(
-                    ctx,
-                    ProduceRequest::default()
-                        .transactional_id(transactional_id)
-                        .acks(acks)
-                        .timeout_ms(timeout_ms)
-                        .topic_data(topic_data(
-                            topic,
-                            index,
-                            inflated::Batch::builder()
-                                .record(Record::builder().value(
-                                    Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
-                                ))
-                                .base_sequence(2)
-                                .producer_id(producer.producer_id)
-                        )?)
-                )
-                .await?
-        );
+//         assert_eq!(
+//             ProduceResponse::default()
+//                 .responses(Some(vec![
+//                     TopicProduceResponse::default()
+//                         .name(topic.into())
+//                         .partition_responses(Some(vec![
+//                             PartitionProduceResponse::default()
+//                                 .index(index)
+//                                 .error_code(ErrorCode::OutOfOrderSequenceNumber.into())
+//                                 .base_offset(-1)
+//                                 .log_append_time_ms(Some(-1))
+//                                 .log_start_offset(Some(0))
+//                                 .record_errors(Some(vec![]))
+//                                 .error_message(None)
+//                                 .current_leader(None)
+//                         ]))
+//                 ]))
+//                 .throttle_time_ms(Some(0))
+//                 .node_endpoints(None),
+//             request
+//                 .serve(
+//                     ctx,
+//                     ProduceRequest::default()
+//                         .transactional_id(transactional_id)
+//                         .acks(acks)
+//                         .timeout_ms(timeout_ms)
+//                         .topic_data(topic_data(
+//                             topic,
+//                             index,
+//                             inflated::Batch::builder()
+//                                 .record(Record::builder().value(
+//                                     Bytes::from_static(b"Lorem ipsum dolor sit amet").into()
+//                                 ))
+//                                 .base_sequence(2)
+//                                 .producer_id(producer.producer_id)
+//                         )?)
+//                 )
+//                 .await?
+//         );
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,16 +14,17 @@
 
 use nisshi_sans_io::{
     ApiKey, ErrorCode, GetTelemetrySubscriptionsRequest, GetTelemetrySubscriptionsResponse,
+    RequestInput,
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::instrument;
 use uuid::Uuid;
 
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`GetTelemetrySubscriptionsRequest`] returning [`GetTelemetrySubscriptionsResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service;
 /// use nisshi_sans_io::{ErrorCode, GetTelemetrySubscriptionsRequest};
 /// use nisshi_storage::{Error, GetTelemetrySubscriptionsService, StorageContainer};
 /// use url::Url;
@@ -43,13 +44,12 @@ use crate::{Error, Result, Storage};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(GetTelemetrySubscriptionsService);
+/// let service = GetTelemetrySubscriptionsService { storage };
 ///
 /// let client_instance_id = [0; 16];
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         GetTelemetrySubscriptionsRequest::default().client_instance_id(client_instance_id),
 ///     )
 ///     .await?;
@@ -58,27 +58,26 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct GetTelemetrySubscriptionsService;
+#[derive(Clone, Debug)]
+pub struct GetTelemetrySubscriptionsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for GetTelemetrySubscriptionsService {
+impl<G> ApiKey for GetTelemetrySubscriptionsService<G> {
     const KEY: i16 = GetTelemetrySubscriptionsRequest::KEY;
 }
 
-impl<G> Service<G, GetTelemetrySubscriptionsRequest> for GetTelemetrySubscriptionsService
+impl<G, I> Service<I> for GetTelemetrySubscriptionsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<GetTelemetrySubscriptionsRequest>> + Send + 'static,
 {
-    type Response = GetTelemetrySubscriptionsResponse;
+    type Output = GetTelemetrySubscriptionsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: GetTelemetrySubscriptionsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let _ = (ctx, req);
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let _ = input;
 
         let client_instance_id = *Uuid::new_v4().as_bytes();
 

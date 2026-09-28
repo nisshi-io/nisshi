@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,33 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, Frame, Header, LeaveGroupRequest};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, Frame, FrameInput, Header, LeaveGroupRequest};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, coordinator::group::Coordinator};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct LeaveGroupService;
+#[derive(Clone, Debug)]
+pub struct LeaveGroupService<C> {
+    pub coordinator: C,
+}
 
-impl ApiKey for LeaveGroupService {
+impl<C> ApiKey for LeaveGroupService<C> {
     const KEY: i16 = LeaveGroupRequest::KEY;
 }
 
-impl<C> Service<C, Frame> for LeaveGroupService
+impl<C> Service<FrameInput> for LeaveGroupService<C>
 where
     C: Coordinator,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let coordinator = ctx.state_mut();
-        let leave = LeaveGroupRequest::try_from(req.body)?;
+    #[instrument(skip(req))]
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let correlation_id = req.frame.correlation_id()?;
+        let leave = LeaveGroupRequest::try_from(req.frame.body)?;
 
-        coordinator
+        self.coordinator
             .leave(
                 leave.group_id.as_str(),
                 leave.member_id.as_deref(),

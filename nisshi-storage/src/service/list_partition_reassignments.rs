@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,42 +15,43 @@
 use crate::{Error, Result, Storage, TopicId};
 use nisshi_sans_io::{
     ApiKey, ErrorCode, ListPartitionReassignmentsRequest, ListPartitionReassignmentsResponse,
+    RequestInput,
     list_partition_reassignments_response::{
         OngoingPartitionReassignment, OngoingTopicReassignment,
     },
 };
-use rama::{Context, Service};
+use rama::Service;
 use tracing::instrument;
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListPartitionReassignmentsRequest`] returning [`ListPartitionReassignmentsResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ListPartitionReassignmentsService;
+#[derive(Clone, Debug)]
+pub struct ListPartitionReassignmentsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for ListPartitionReassignmentsService {
+impl<G> ApiKey for ListPartitionReassignmentsService<G> {
     const KEY: i16 = ListPartitionReassignmentsRequest::KEY;
 }
 
-impl<G> Service<G, ListPartitionReassignmentsRequest> for ListPartitionReassignmentsService
+impl<G, I> Service<I> for ListPartitionReassignmentsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<ListPartitionReassignmentsRequest>> + Send + 'static,
 {
-    type Response = ListPartitionReassignmentsResponse;
+    type Output = ListPartitionReassignmentsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ListPartitionReassignmentsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let topics = req.topics.map(|topics| {
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+        let topics = input.request.topics.map(|topics| {
             topics
                 .iter()
                 .map(|topic| TopicId::Name(topic.name.as_str().into()))
                 .collect::<Vec<_>>()
         });
 
-        let metadata = ctx.state().metadata(topics.as_deref()).await?;
+        let metadata = self.storage.metadata(topics.as_deref()).await?;
 
         let mut ongoing = vec![];
 

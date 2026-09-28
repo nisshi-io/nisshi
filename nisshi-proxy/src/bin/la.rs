@@ -20,7 +20,7 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use console::style;
 use nisshi_sans_io::{
@@ -34,7 +34,6 @@ use nisshi_sans_io::{
     SyncGroupRequest, SyncGroupResponse,
     consumer::{MemberAssignment, MemberMetadata},
 };
-use rama::error::ErrorContext;
 use regex::Regex;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 

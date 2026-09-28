@@ -36,13 +36,16 @@ nisshi-sans-io/
 │       ├── header.rs        # Record Header (key/value byte pairs)
 │       ├── deflated.rs      # Compressed record batches (wire format)
 │       └── inflated.rs      # Decompressed record batches (in-memory)
-├── tests/                   # 18 test files
-│   ├── encode.rs            # Encoding tests
-│   ├── decode.rs            # Decoding tests
-│   ├── codec.rs             # Round-trip tests
-│   ├── api.rs               # API-level tests
-│   ├── snappy.rs            # Snappy compression tests
-│   └── ...
+├── tests/
+│   ├── it/                  # One test binary: main.rs + 18 test modules
+│   │   ├── main.rs          # Declares every test module
+│   │   ├── encode.rs        # Encoding tests
+│   │   ├── decode.rs        # Decoding tests
+│   │   ├── codec.rs         # Round-trip tests
+│   │   ├── api.rs           # API-level tests
+│   │   ├── snappy.rs        # Snappy compression tests
+│   │   └── ...
+│   └── proptest-regressions/ # Failure seeds proptest replays (proptest.txt)
 └── benches/                 # Criterion benchmarks
 ```
 

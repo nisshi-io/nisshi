@@ -17,6 +17,10 @@ members = [
     "nisshi-schema",
     "nisshi-service",
     "nisshi-storage",
+    "nisshi-storage-dynostore",
+    "nisshi-storage-null",
+    "nisshi-storage-slatedb",
+    "nisshi-storage-sql",
     "nisshi-topic",
 ]
 
@@ -49,6 +53,7 @@ all = { level = "warn", priority = -1 }
 [workspace.lints.rust]
 deprecated_in_future = "warn"
 elided_lifetimes_in_paths = "deny"
+linker_messages = "allow"
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 non_ascii_idents = "forbid"
@@ -114,7 +119,7 @@ lz4 = "1.28.1"
 nanoid = "0.4.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
-object_store = { version = "0.13.1", features = ["aws", "gcp"] }
+object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 opentelemetry = "0.31.0"
 opentelemetry-otlp = "0.31.0"
 opentelemetry-semantic-conventions = "0.31.0"
@@ -124,6 +129,7 @@ ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
 parquet = {version = "57", features = ["async"]}
 pbkdf2 = "0.12.2"
+pkcs8 = { version = "0.10", default-features = false, features = ["encryption", "pem", "std", "3des"] }
 postcard = { version = "1.1.3", features = ["use-std"] }
 pretty_assertions = "1"
 prettyplease = "0.2.29"
@@ -133,8 +139,9 @@ protobuf = { version = "3.7.1", features = ["with-bytes"] }
 protobuf-json-mapping = "3.7.1"
 protobuf-parse = "3.7.1"
 quote = "1.0"
-rama = { version = "0.2.0", features = ["http", "tcp"] }
+rama = { version = "0.4.0", features = ["http", "tcp"] }
 rand = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex = "1.12.3"
 rhai = { version = "1.24.0", features = ["sync"] }
 rhai-rand = "0.1"
@@ -162,7 +169,12 @@ nisshi-sans-io = { version = "0.7.0-pre.2", path = "nisshi-sans-io", default-fea
 nisshi-schema = { version = "0.7.0-pre.2", path = "nisshi-schema", default-features = false }
 nisshi-service = { version = "0.7.0-pre.2", path = "nisshi-service", default-features = false }
 nisshi-storage = { version = "0.7.0-pre.2", path = "nisshi-storage", default-features = false }
+nisshi-storage-dynostore = { version = "0.7.0-pre.2", path = "nisshi-storage-dynostore", default-features = false }
+nisshi-storage-null = { version = "0.7.0-pre.2", path = "nisshi-storage-null", default-features = false }
+nisshi-storage-slatedb = { version = "0.7.0-pre.2", path = "nisshi-storage-slatedb", default-features = false }
+nisshi-storage-sql = { version = "0.7.0-pre.2", path = "nisshi-storage-sql", default-features = false }
 nisshi-topic = { version = "0.7.0-pre.2", path = "nisshi-topic", default-features = false }
+temp-env = "0.3"
 tempfile = "3"
 thiserror = "2.0"
 time = { version = "0.3.47", features = ["formatting", "macros", "parsing"] }
@@ -177,6 +189,7 @@ tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 turso = "0.7.1"
 url = { version = "2.5.4", features = ["serde"] }
+zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }
 zstd = "0.13.2"
 

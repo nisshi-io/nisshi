@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse};
-use rama::{Context, Service};
+use nisshi_sans_io::{
+    ApiKey, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse, RequestInput,
+};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, Storage, TopicId};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeTopicPartitionsRequest`] returning [`DescribeTopicPartitionsResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+/// ```no_run
+/// use rama::Service;
 /// use nisshi_sans_io::{
 ///     DescribeTopicPartitionsRequest, ErrorCode,
 ///     describe_topic_partitions_request::TopicRequest,
@@ -38,13 +40,12 @@ use crate::{Error, Result, Storage, TopicId};
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DescribeTopicPartitionsService);
+/// let service = DescribeTopicPartitionsService { storage };
 ///
 /// let topic = "abcba";
 ///
 /// let response = service
 ///     .serve(
-///         Context::default(),
 ///         DescribeTopicPartitionsRequest::default()
 ///             .topics(Some([TopicRequest::default().name(topic.into())].into())),
 ///     )
@@ -60,34 +61,36 @@ use crate::{Error, Result, Storage, TopicId};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DescribeTopicPartitionsService;
+#[derive(Clone, Debug)]
+pub struct DescribeTopicPartitionsService<G> {
+    pub storage: G,
+}
 
-impl ApiKey for DescribeTopicPartitionsService {
+impl<G> ApiKey for DescribeTopicPartitionsService<G> {
     const KEY: i16 = DescribeTopicPartitionsRequest::KEY;
 }
 
-impl<G> Service<G, DescribeTopicPartitionsRequest> for DescribeTopicPartitionsService
+impl<G, I> Service<I> for DescribeTopicPartitionsService<G>
 where
     G: Storage,
+    I: Into<RequestInput<DescribeTopicPartitionsRequest>> + Send + 'static,
 {
-    type Response = DescribeTopicPartitionsResponse;
+    type Output = DescribeTopicPartitionsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DescribeTopicPartitionsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
+    #[instrument(skip(self, input))]
+    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+        let input = input.into();
+        self.storage
             .describe_topic_partitions(
-                req.topics
+                input
+                    .request
+                    .topics
                     .as_ref()
                     .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>())
                     .as_deref(),
-                req.response_partition_limit,
-                req.cursor.map(Into::into),
+                input.request.response_partition_limit,
+                input.request.cursor.map(Into::into),
             )
             .await
             .map(|topics| {

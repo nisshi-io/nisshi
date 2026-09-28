@@ -18,17 +18,13 @@ use nisshi_sans_io::{ApiKey as _, SaslAuthenticateRequest, SaslHandshakeRequest}
 use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
-pub fn services(
-    builder: FrameRouteBuilder<(), Error>,
-) -> Result<FrameRouteBuilder<(), Error>, Error> {
+pub fn services(builder: FrameRouteBuilder<Error>) -> Result<FrameRouteBuilder<Error>, Error> {
     [authenticate, handshake]
         .iter()
         .try_fold(builder, |builder, service| service(builder))
 }
 
-pub fn authenticate(
-    builder: FrameRouteBuilder<(), Error>,
-) -> Result<FrameRouteBuilder<(), Error>, Error> {
+pub fn authenticate(builder: FrameRouteBuilder<Error>) -> Result<FrameRouteBuilder<Error>, Error> {
     builder
         .with_route(
             SaslAuthenticateRequest::KEY,
@@ -42,9 +38,7 @@ pub fn authenticate(
         .map_err(Into::into)
 }
 
-pub fn handshake(
-    builder: FrameRouteBuilder<(), Error>,
-) -> Result<FrameRouteBuilder<(), Error>, Error> {
+pub fn handshake(builder: FrameRouteBuilder<Error>) -> Result<FrameRouteBuilder<Error>, Error> {
     builder
         .with_route(
             SaslHandshakeRequest::KEY,

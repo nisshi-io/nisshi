@@ -20,6 +20,9 @@ set -euo pipefail
 
 FRANZ_GO_VERSION="${FRANZ_GO_VERSION:-v1.21.3}"
 BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-127.0.0.1:9092}"
+# when set (the compat-franz-go justfile recipe does), the PID of the broker
+# started for this run: the readiness wait fails immediately if it exits
+BROKER_PID="${BROKER_PID:-}"
 COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${WORK_DIR:-${COMPAT_DIR}/../../target/compat}"
 SRC_DIR="${WORK_DIR}/franz-go"
@@ -42,13 +45,37 @@ if [[ ! -d "${SRC_DIR}" ]]; then
         https://github.com/twmb/franz-go.git "${SRC_DIR}"
 fi
 
-for _ in $(seq 1 100); do
+# wait for the broker to listen, failing fast if it never does: falling
+# through to the suite against a dead broker buries the real cause under
+# dozens of "connection refused" test failures. The report card row keeps
+# this storage engine's column visible in CI when that happens.
+broker_not_ready() {
+    echo "$@" >&2
+    if [[ -n "${RESULTS_FILE}" ]]; then
+        printf 'broker-startup,FAIL\n' >> "${RESULTS_FILE}"
+    fi
+    exit 1
+}
+
+ready=""
+started="${SECONDS}"
+while (( SECONDS - started < 30 )); do
+    if [[ -n "${BROKER_PID}" ]] && ! kill -0 "${BROKER_PID}" 2> /dev/null; then
+        broker_not_ready "broker process ${BROKER_PID} exited during startup," \
+                         "see broker output above"
+    fi
     if (exec 3<> "/dev/tcp/${BOOTSTRAP_SERVERS%:*}/${BOOTSTRAP_SERVERS##*:}") \
            2> /dev/null; then
+        ready=1
         break
     fi
     sleep 0.1
 done
+
+if [[ -z "${ready}" ]]; then
+    broker_not_ready "broker did not start listening on ${BOOTSTRAP_SERVERS}" \
+                     "after $((SECONDS - started))s"
+fi
 
 tests=$(grep -Ev '^[[:space:]]*(#|$)' "${COMPAT_DIR}/tests.allow" |
             awk '{print $1}' | paste -s -d '|' -)

@@ -33,17 +33,14 @@ use nisshi_storage::{
     ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
     TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
-use rama::{
-    Layer as _, Service as _,
-    layer::{MapErrLayer, MapStateLayer},
-};
+use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
 use crate::Error;
 
 pub fn services<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
 {
@@ -83,567 +80,540 @@ where
 }
 
 pub fn alter_user_scram_credentials<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             AlterUserScramCredentialsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<AlterUserScramCredentialsRequest>::new(),
             )
-                .into_layer(AlterUserScramCredentialsService)
+                .into_layer(AlterUserScramCredentialsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn describe_user_scram_credentials<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DescribeUserScramCredentialsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DescribeUserScramCredentialsRequest>::new(),
             )
-                .into_layer(DescribeUserScramCredentialsService)
+                .into_layer(DescribeUserScramCredentialsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn create_acls<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             CreateAclsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<CreateAclsRequest>::new(),
             )
-                .into_layer(CreateAclsService)
+                .into_layer(CreateAclsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn describe_acls<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DescribeAclsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DescribeAclsRequest>::new(),
             )
-                .into_layer(DescribeAclsService)
+                .into_layer(DescribeAclsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn consumer_group_describe<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             ConsumerGroupDescribeRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<ConsumerGroupDescribeRequest>::new(),
             )
-                .into_layer(ConsumerGroupDescribeService)
+                .into_layer(ConsumerGroupDescribeService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn create_topics<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             CreateTopicsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<CreateTopicsRequest>::new(),
             )
-                .into_layer(CreateTopicsService)
+                .into_layer(CreateTopicsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn delete_groups<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DeleteGroupsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DeleteGroupsRequest>::new(),
             )
-                .into_layer(DeleteGroupsService)
+                .into_layer(DeleteGroupsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn delete_records<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DeleteRecordsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DeleteRecordsRequest>::new(),
             )
-                .into_layer(DeleteRecordsService)
+                .into_layer(DeleteRecordsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn delete_topics<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DeleteTopicsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DeleteTopicsRequest>::new(),
             )
-                .into_layer(DeleteTopicsService)
+                .into_layer(DeleteTopicsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn describe_cluster<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DescribeClusterRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DescribeClusterRequest>::new(),
             )
-                .into_layer(DescribeClusterService)
+                .into_layer(DescribeClusterService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn describe_configs<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DescribeConfigsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DescribeConfigsRequest>::new(),
             )
-                .into_layer(DescribeConfigsService)
+                .into_layer(DescribeConfigsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn describe_groups<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DescribeGroupsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DescribeGroupsRequest>::new(),
             )
-                .into_layer(DescribeGroupsService)
+                .into_layer(DescribeGroupsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn describe_topic_partitions<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             DescribeTopicPartitionsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<DescribeTopicPartitionsRequest>::new(),
             )
-                .into_layer(DescribeTopicPartitionsService)
+                .into_layer(DescribeTopicPartitionsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn fetch<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             FetchRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<FetchRequest>::new(),
             )
-                .into_layer(FetchService)
+                .into_layer(FetchService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn find_coordinator<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             FindCoordinatorRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<FindCoordinatorRequest>::new(),
             )
-                .into_layer(FindCoordinatorService)
+                .into_layer(FindCoordinatorService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn incremental_alter_configs<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             IncrementalAlterConfigsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<IncrementalAlterConfigsRequest>::new(),
             )
-                .into_layer(IncrementalAlterConfigsService)
+                .into_layer(IncrementalAlterConfigsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn init_producer_id<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             InitProducerIdRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<InitProducerIdRequest>::new(),
             )
-                .into_layer(InitProducerIdService)
+                .into_layer(InitProducerIdService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn list_groups<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             ListGroupsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<ListGroupsRequest>::new(),
             )
-                .into_layer(ListGroupsService)
+                .into_layer(ListGroupsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn list_offsets<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             ListOffsetsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<ListOffsetsRequest>::new(),
             )
-                .into_layer(ListOffsetsService)
+                .into_layer(ListOffsetsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn list_partition_reassignments<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             ListPartitionReassignmentsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<ListPartitionReassignmentsRequest>::new(),
             )
-                .into_layer(ListPartitionReassignmentsService)
+                .into_layer(ListPartitionReassignmentsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn metadata<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             MetadataRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<MetadataRequest>::new(),
             )
-                .into_layer(MetadataService)
+                .into_layer(MetadataService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn produce<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             ProduceRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<ProduceRequest>::new(),
             )
-                .into_layer(ProduceService)
+                .into_layer(ProduceService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn get_telemetry_subscriptions<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             GetTelemetrySubscriptionsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<GetTelemetrySubscriptionsRequest>::new(),
             )
-                .into_layer(GetTelemetrySubscriptionsService)
+                .into_layer(GetTelemetrySubscriptionsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn add_offsets_to_txn<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             AddOffsetsToTxnRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<AddOffsetsToTxnRequest>::new(),
             )
-                .into_layer(TxnAddOffsetsService)
+                .into_layer(TxnAddOffsetsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn add_partitions_to_txn<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             AddPartitionsToTxnRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<AddPartitionsToTxnRequest>::new(),
             )
-                .into_layer(TxnAddPartitionService)
+                .into_layer(TxnAddPartitionService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn txn_offset_commit<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             TxnOffsetCommitRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
             )
-                .into_layer(TxnOffsetCommitService)
+                .into_layer(TxnOffsetCommitService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
 }
 
 pub fn end_txn<S>(
-    builder: FrameRouteBuilder<(), Error>,
+    builder: FrameRouteBuilder<Error>,
     storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
+) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage + Clone,
+    S: Storage,
 {
     builder
         .with_route(
             EndTxnRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<EndTxnRequest>::new(),
             )
-                .into_layer(TxnEndService)
+                .into_layer(TxnEndService { storage })
                 .boxed(),
         )
         .map_err(Into::into)

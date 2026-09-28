@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,38 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, Frame, Header, JoinGroupRequest};
-use rama::{Context, Service};
+use nisshi_sans_io::{ApiKey, Frame, FrameInput, Header, JoinGroupRequest};
+use rama::Service;
 use tracing::instrument;
 
 use crate::{Error, Result, coordinator::group::Coordinator};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct JoinGroupService;
+#[derive(Clone, Debug)]
+pub struct JoinGroupService<C> {
+    pub coordinator: C,
+}
 
-impl ApiKey for JoinGroupService {
+impl<C> ApiKey for JoinGroupService<C> {
     const KEY: i16 = JoinGroupRequest::KEY;
 }
 
-impl<C> Service<C, Frame> for JoinGroupService
+impl<C> Service<FrameInput> for JoinGroupService<C>
 where
     C: Coordinator,
 {
-    type Response = Frame;
+    type Output = Frame;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let coordinator = ctx.state_mut();
+    #[instrument(skip(req))]
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let correlation_id = req.frame.correlation_id()?;
 
         let client_id = req
+            .frame
             .client_id()
             .map(|client_id| client_id.map(|client_id| client_id.to_owned()))?;
 
-        let join_group = JoinGroupRequest::try_from(req.body)?;
+        let join_group = JoinGroupRequest::try_from(req.frame.body)?;
 
-        coordinator
+        self.coordinator
             .join(
                 client_id.as_deref(),
                 join_group.group_id.as_str(),
