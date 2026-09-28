@@ -78,6 +78,7 @@ jobs:
     # can't be `needs` here (see the header).
     needs: [fmt, clippy]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -96,6 +97,7 @@ jobs:
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
       LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
+      NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
       RUST_BACKTRACE: 1
@@ -143,6 +145,7 @@ jobs:
       - run: df -h
   fmt:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 10
     strategy:
       matrix:
         os:
@@ -159,6 +162,7 @@ jobs:
       - run: just fmt
   clippy:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 15
     strategy:
       matrix:
         os:
@@ -176,6 +180,7 @@ jobs:
   build-storage:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -201,6 +206,7 @@ jobs:
   build-storage-lake:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -226,6 +232,7 @@ jobs:
       - run: cargo build --features ${{matrix.storage}} --features ${{matrix.lake}}
   compat-librdkafka:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
     strategy:
       fail-fast: true
@@ -277,6 +284,7 @@ jobs:
     if: always()
     needs: [compat-librdkafka]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       DUCKDB_CLI: /home/runner/.duckdb/cli/latest
     steps:
@@ -297,6 +305,7 @@ jobs:
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   compat-franz-go:
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
     strategy:
       fail-fast: true
@@ -348,6 +357,7 @@ jobs:
     if: always()
     needs: [compat-franz-go]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       DUCKDB_CLI: /home/runner/.duckdb/cli/latest
     steps:
@@ -369,6 +379,7 @@ jobs:
   cargo-publish-dry-run:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -384,6 +395,7 @@ jobs:
       - run: cargo publish --dry-run --workspace
   typos:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
@@ -391,6 +403,7 @@ jobs:
           config: typos.toml
   third-party-license:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -408,6 +421,7 @@ jobs:
   src:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: |
@@ -421,6 +435,7 @@ jobs:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     needs: [test, cargo-publish-dry-run, typos, release]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 15
     permissions:
       packages: write
     strategy:
@@ -481,6 +496,7 @@ jobs:
           - apache/kafka:3.8.1
           - apache/kafka:3.7.0
     runs-on: ${{matrix.os}}
+    timeout-minutes: 15
     env:
       ADVERTISED_LISTENER_URL: tcp://nisshi:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -559,6 +575,7 @@ jobs:
     permissions:
       contents: write
     runs-on: ${{matrix.os}}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -674,6 +691,7 @@ jobs:
       - smoke
       - release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       NEEDS: ${{ toJSON(needs) }}
     steps:

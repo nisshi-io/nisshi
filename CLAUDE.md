@@ -114,6 +114,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 ## Testing Notes
 
 - Tests use `cargo-nextest` (not `cargo test` for workspace tests)
+- CI runs nextest with the `ci` profile in `.config/nextest.toml` (`NEXTEST_PROFILE=ci`), which kills a test still running after 5 minutes; local runs use the default profile
 - Test logs go to `logs/<crate-name>/` (one file per test thread, dirs must exist)
 - Integration tests require external services started via `just ci` (postgres, minio, lakehouse); rerun `just ci` if those services are in a bad state, then `just test` to rerun the suite
 - Tests load `.env` via `dotenv().ok()`
