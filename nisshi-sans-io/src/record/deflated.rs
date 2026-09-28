@@ -23,7 +23,10 @@ use serde::{
 };
 use tracing::{debug, error, instrument};
 
-use crate::{ByteSize, Compression, Decode as _, Decoder, Encode, Error, Result, record::Record};
+use crate::{
+    ByteSize, Compression, Decode as _, Decoder, Encode, Error, Result,
+    record::{Record, codec::MAX_PREALLOCATED_ELEMENTS},
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Frame {
@@ -443,7 +446,7 @@ impl TryFrom<Batch> for Vec<Record> {
             .compression()
             .is_ok_and(|compression| compression == Compression::None)
         {
-            let mut records = Vec::with_capacity(record_count);
+            let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
             for _ in 0..record_count {
                 let record = Record::decode(&mut batch.record_data)?;
@@ -457,7 +460,7 @@ impl TryFrom<Batch> for Vec<Record> {
                 .and_then(|compression| compression.inflator(batch.record_data.reader()))?;
 
             let mut decoder = Decoder::new(&mut reader);
-            let mut records = Vec::with_capacity(record_count);
+            let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
             for _ in 0..record_count {
                 let record = Record::deserialize(&mut decoder)?;
@@ -483,7 +486,7 @@ impl TryFrom<&Batch> for Vec<Record> {
             .and_then(|compression| compression.inflator(batch.record_data.clone().reader()))?;
 
         let mut decoder = Decoder::new(&mut reader);
-        let mut records = Vec::with_capacity(record_count);
+        let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
         for _ in 0..record_count {
             let record = Record::deserialize(&mut decoder)?;
@@ -1129,6 +1132,72 @@ mod tests {
 
         assert_eq!(Some(key), inflated.records[0].key);
         assert_eq!(Some(value), inflated.records[0].value);
+
+        Ok(())
+    }
+
+    /// A `record_count` taken straight off the wire, with no `record_data`
+    /// to back it, must not succeed in preallocating hundreds of GB of
+    /// `Record`s before ever inspecting the data. Whether an
+    /// allocation that large is rejected by the allocator is platform
+    /// dependent; what must hold everywhere is that this returns `Err`
+    /// rather than `Ok` with a nonsensical result.
+    #[test]
+    fn record_count_near_u32_max_with_no_data_returns_err() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = Batch {
+            base_offset: 0,
+            batch_length: 0,
+            partition_leader_epoch: 0,
+            magic: 2,
+            crc: 0,
+            attributes: 0,
+            last_offset_delta: 0,
+            base_timestamp: 0,
+            max_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            record_count: u32::MAX,
+            record_data: Bytes::new(),
+        };
+
+        assert!(Vec::<Record>::try_from(batch.clone()).is_err());
+        assert!(Vec::<Record>::try_from(&batch).is_err());
+
+        Ok(())
+    }
+
+    /// Same as above, but for the compressed branch, where the inflator
+    /// itself never rejects the (empty) input up front.
+    #[test]
+    fn record_count_near_u32_max_with_empty_compressed_data_returns_err() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let attributes: i16 = BatchAttribute::default()
+            .compression(Compression::Gzip)
+            .into();
+
+        let batch = Batch {
+            base_offset: 0,
+            batch_length: 0,
+            partition_leader_epoch: 0,
+            magic: 2,
+            crc: 0,
+            attributes,
+            last_offset_delta: 0,
+            base_timestamp: 0,
+            max_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            record_count: u32::MAX,
+            record_data: Bytes::new(),
+        };
+
+        assert!(Vec::<Record>::try_from(batch.clone()).is_err());
+        assert!(Vec::<Record>::try_from(&batch).is_err());
 
         Ok(())
     }
