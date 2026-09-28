@@ -6,7 +6,7 @@ name: ci
 # it. This isn't a poisoning fix (GitHub already scopes a PR run's cache
 # writes to that PR's own ref) - it's hygiene, keeping the repo's cache
 # budget from being consumed by one entry per open PR instead of one per
-# branch. Applies to check, fmt, clippy, cargo-publish-dry-run,
+# branch. Applies to fmt, clippy, cargo-publish-dry-run,
 # third-party-license and release below (release also skips the cache
 # entirely on tags).
 #
@@ -15,7 +15,7 @@ name: ci
 # all of that on every pull_request push starved every other PR of runners.
 # So:
 #
-# - Tier A runs on every pull_request push: check, fmt, clippy, typos,
+# - Tier A runs on every pull_request push: fmt, clippy, typos,
 #   third-party-license, the single non-experimental leg of each compat
 #   suite, `test` on postgres:17 only (compose.yaml's default), and ci-gate.
 # - Tier B runs once per merge-queue entry (`merge_group`) and on push:
@@ -76,7 +76,7 @@ jobs:
     # Tier A on postgres:17 (compose.yaml's default), full pg matrix on
     # merge_group/push. build-storage/build-storage-lake are Tier B, so they
     # can't be `needs` here (see the header).
-    needs: [check, fmt, clippy]
+    needs: [fmt, clippy]
     runs-on: ${{matrix.os}}
     strategy:
       fail-fast: false
@@ -141,22 +141,6 @@ jobs:
       - run: du -sh target
       - run: docker system df
       - run: df -h
-  check:
-    runs-on: ${{matrix.os}}
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
-        with:
-          just-version: 1.58.0
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          components: clippy, rustfmt
-          cache-save-if: ${{ github.event_name == 'push' }}
-      - run: just check
   fmt:
     runs-on: ${{matrix.os}}
     strategy:
@@ -675,7 +659,6 @@ jobs:
   ci-gate:
     if: always()
     needs:
-      - check
       - fmt
       - clippy
       - build-storage

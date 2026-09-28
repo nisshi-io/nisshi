@@ -125,7 +125,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 
 GitHub Actions (`.github/workflows/ci.yml`) runs in two tiers, gated by `ci-gate`, the single required check that fans in every other job:
 
-- **Tier A, every pull_request push:** `check`, `fmt`, `clippy`, `typos`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
+- **Tier A, every pull_request push:** `fmt`, `clippy`, `typos`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
 - **Tier B, once per merge-queue entry (`merge_group`) and on push to `main`:** the full `build-storage` / `build-storage-lake` feature matrix, `test` on postgres:16/17/18, the experimental compat legs, `cargo-publish-dry-run`, `src`, `release`, `package`, `smoke` (Java Kafka client, Kafka 3.7/3.8/3.9).
 
 Merging goes through a merge queue: "Merge when ready" queues the PR, the queue re-runs CI on it against the current tip of `main`, and merges with a merge commit if everything is green. Tier B is skipped on PRs only while the `MERGE_QUEUE` repository variable is `on`; with it unset, PRs run everything. The other required checks come from `codeql.yml`, `workflow-lint.yml` and `dependencies.yml`.
