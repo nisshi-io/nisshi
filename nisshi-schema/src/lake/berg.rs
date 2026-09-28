@@ -15,6 +15,7 @@
 use std::{
     collections::HashMap,
     env::{var, vars},
+    fmt,
     marker::PhantomData,
     sync::{Arc, Mutex},
 };
@@ -66,6 +67,43 @@ pub fn env_s3_props() -> impl Iterator<Item = (String, String)> {
     vars().filter_map(|(k, v)| env_mapping(k.as_str()).map(|k| (k.to_owned(), v)))
 }
 
+/// `Environment` reads `ICEBERG_CATALOG_TOKEN` for callers that do not set a token.
+/// `Explicit` is the caller-supplied value and takes precedence, including when empty.
+#[derive(Clone, Default)]
+enum CatalogTokenSource {
+    #[default]
+    Environment,
+    Explicit(Option<String>),
+}
+
+impl fmt::Debug for CatalogTokenSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Environment => f.write_str("Environment"),
+            Self::Explicit(None) => f.write_str("Explicit(None)"),
+            Self::Explicit(Some(_)) => f.write_str("Explicit(Some([redacted]))"),
+        }
+    }
+}
+
+fn resolve_catalog_token(source: &CatalogTokenSource, environment: Option<&str>) -> Option<String> {
+    let token = match source {
+        CatalogTokenSource::Environment => environment,
+        CatalogTokenSource::Explicit(token) => token.as_deref(),
+    };
+    token.filter(|token| !token.is_empty()).map(str::to_owned)
+}
+
+impl CatalogTokenSource {
+    fn resolve(&self) -> Option<String> {
+        let environment = match self {
+            Self::Environment => var("ICEBERG_CATALOG_TOKEN").ok(),
+            Self::Explicit(_) => None,
+        };
+        resolve_catalog_token(self, environment.as_deref())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Builder<C = PhantomData<Url>, L = PhantomData<Url>, R = PhantomData<Registry>> {
     location: L,
@@ -73,6 +111,7 @@ pub struct Builder<C = PhantomData<Url>, L = PhantomData<Url>, R = PhantomData<R
     schema_registry: R,
     namespace: Option<String>,
     warehouse: Option<String>,
+    catalog_token: CatalogTokenSource,
 }
 
 impl<C, L, R> Builder<C, L, R> {
@@ -83,6 +122,7 @@ impl<C, L, R> Builder<C, L, R> {
             schema_registry: self.schema_registry,
             namespace: self.namespace,
             warehouse: self.warehouse,
+            catalog_token: self.catalog_token,
         }
     }
 
@@ -93,6 +133,7 @@ impl<C, L, R> Builder<C, L, R> {
             schema_registry: self.schema_registry,
             namespace: self.namespace,
             warehouse: self.warehouse,
+            catalog_token: self.catalog_token,
         }
     }
 
@@ -103,6 +144,7 @@ impl<C, L, R> Builder<C, L, R> {
             schema_registry,
             namespace: self.namespace,
             warehouse: self.warehouse,
+            catalog_token: self.catalog_token,
         }
     }
 
@@ -112,6 +154,18 @@ impl<C, L, R> Builder<C, L, R> {
 
     pub fn warehouse(self, warehouse: Option<String>) -> Self {
         Self { warehouse, ..self }
+    }
+
+    pub fn catalog_token(self, catalog_token: Option<String>) -> Self {
+        Self {
+            catalog_token: CatalogTokenSource::Explicit(catalog_token),
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    fn resolved_catalog_token_for(&self, environment: Option<&str>) -> Option<String> {
+        resolve_catalog_token(&self.catalog_token, environment)
     }
 }
 
@@ -131,7 +185,12 @@ pub struct Iceberg {
 
 impl Iceberg {
     async fn new(value: Builder<Url, Url, Registry>) -> Result<Self> {
-        let catalog = iceberg_catalog(&value.catalog, value.warehouse.clone()).await?;
+        let catalog = iceberg_catalog(
+            &value.catalog,
+            value.warehouse.clone(),
+            value.catalog_token.resolve(),
+        )
+        .await?;
         Ok(Self {
             catalog,
             namespace: value.namespace.unwrap_or(String::from("nisshi")),
@@ -145,14 +204,6 @@ impl Iceberg {
 /// crate reads this property and adds `Authorization: Bearer <token>` to catalog
 /// requests. It is separate from the S3 access key pair.
 const REST_CATALOG_PROP_TOKEN: &str = "token";
-
-/// Optional bearer token for the Iceberg REST catalog. Absent or empty values keep
-/// the existing unauthenticated behavior so local catalogs remain compatible.
-fn catalog_token() -> Option<String> {
-    var("ICEBERG_CATALOG_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
-}
 
 fn rest_catalog_props(
     uri: String,
@@ -170,7 +221,11 @@ fn rest_catalog_props(
     props
 }
 
-async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc<dyn Catalog>> {
+async fn iceberg_catalog(
+    catalog: &Url,
+    warehouse: Option<String>,
+    token: Option<String>,
+) -> Result<Arc<dyn Catalog>> {
     debug!(%catalog, ?warehouse);
 
     match (catalog.scheme(), catalog.path()) {
@@ -187,7 +242,7 @@ async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc
             };
 
             let catalog = RestCatalogBuilder::default()
-                .load("rest", rest_catalog_props(uri, warehouse, catalog_token()))
+                .load("rest", rest_catalog_props(uri, warehouse, token))
                 .await
                 .map_err(|e| Error::Iceberg(Box::new(e)))?;
 
@@ -641,6 +696,55 @@ mod catalog_token_tests {
         thread,
         time::Duration,
     };
+
+    fn bare_builder() -> Builder {
+        Builder::default()
+    }
+
+    #[test]
+    fn explicit_catalog_token_overrides_environment() {
+        let builder = bare_builder().catalog_token(Some(String::from("cli-token")));
+        assert_eq!(
+            builder
+                .resolved_catalog_token_for(Some("env-token"))
+                .as_deref(),
+            Some("cli-token")
+        );
+    }
+
+    #[test]
+    fn explicit_empty_catalog_token_suppresses_environment() {
+        let builder = bare_builder().catalog_token(Some(String::new()));
+        assert_eq!(builder.resolved_catalog_token_for(Some("env-token")), None);
+
+        let absent = bare_builder().catalog_token(None);
+        assert_eq!(absent.resolved_catalog_token_for(Some("env-token")), None);
+    }
+
+    #[test]
+    fn environment_catalog_token_is_used_when_the_caller_does_not_set_one() {
+        let builder = bare_builder();
+        assert_eq!(
+            builder
+                .resolved_catalog_token_for(Some("env-token"))
+                .as_deref(),
+            Some("env-token")
+        );
+        assert_eq!(builder.resolved_catalog_token_for(Some("")), None);
+        assert_eq!(builder.resolved_catalog_token_for(None), None);
+    }
+
+    #[test]
+    fn builder_debug_redacts_catalog_token() {
+        let secret = "token-under-test";
+        let builder = bare_builder().catalog_token(Some(String::from(secret)));
+        let rendered = format!("{builder:?}");
+        assert!(
+            !rendered.contains(secret),
+            "catalog token leaked into builder debug output"
+        );
+        assert!(rendered.contains("[redacted]"));
+    }
 
     #[test]
     fn rest_catalog_props_include_token_only_when_configured() {

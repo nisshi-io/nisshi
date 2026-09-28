@@ -85,6 +85,8 @@ Options:
           Apache Iceberg Catalog, examples are: http://localhost:8181/ [env: ICEBERG_CATALOG=http://localhost:8181/]
       --iceberg-namespace <ICEBERG_NAMESPACE>
           Iceberg namespace [env: ICEBERG_NAMESPACE=] [default: nisshi]
+      --iceberg-catalog-token <ICEBERG_CATALOG_TOKEN>
+          Bearer token that authenticates Iceberg REST catalog requests [env: ICEBERG_CATALOG_TOKEN]
       --prometheus-listener-url <PROMETHEUS_LISTENER_URL>
           Broker metrics can be scraped by Prometheus from this URL [env: PROMETHEUS_LISTENER_URL=tcp://0.0.0.0:9100] [default: tcp://[::]:9100]
   -h, --help
