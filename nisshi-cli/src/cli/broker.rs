@@ -148,7 +148,7 @@ pub(super) enum Lake {
 
         /// Bearer token that authenticates Iceberg REST catalog requests
         #[arg(long, env = "ICEBERG_CATALOG_TOKEN", hide_env_values = true)]
-        iceberg_catalog_token: Option<RedactedToken>,
+        catalog_token: Option<RedactedToken>,
     },
 
     /// Schema topics are written as Delta Lake tables
@@ -257,7 +257,7 @@ impl Arg {
                 catalog,
                 namespace,
                 warehouse,
-                iceberg_catalog_token,
+                catalog_token,
             }) => Some(
                 nisshi_schema::lake::House::iceberg()
                     .location(location.into_inner())
@@ -265,7 +265,7 @@ impl Arg {
                     .schema_registry(schema_registry.clone().unwrap())
                     .namespace(namespace)
                     .warehouse(warehouse)
-                    .catalog_token(iceberg_catalog_token.map(RedactedToken::into_inner))
+                    .catalog_token(catalog_token.map(RedactedToken::into_inner))
                     .build()
                     .await?,
             ),
@@ -416,7 +416,7 @@ mod tests {
             String::from("http://localhost:8181/"),
         ];
         if let Some(token) = token {
-            args.push(String::from("--iceberg-catalog-token"));
+            args.push(String::from("--catalog-token"));
             args.push(token.to_owned());
         }
         args
@@ -425,10 +425,9 @@ mod tests {
     fn catalog_token(args: &[String]) -> Option<String> {
         let parsed = Arg::try_parse_from(args).unwrap_or_else(|error| panic!("parse: {error}"));
         match parsed.command {
-            Some(Lake::Iceberg {
-                iceberg_catalog_token,
-                ..
-            }) => iceberg_catalog_token.map(RedactedToken::into_inner),
+            Some(Lake::Iceberg { catalog_token, .. }) => {
+                catalog_token.map(RedactedToken::into_inner)
+            }
             other => panic!("expected iceberg command, got {other:?}"),
         }
     }
@@ -514,8 +513,9 @@ mod tests {
     #[test]
     fn iceberg_help_names_the_catalog_token_without_a_value() {
         let help = iceberg_help();
-        assert!(help.contains("--iceberg-catalog-token"), "{help}");
+        assert!(help.contains("--catalog-token"), "{help}");
         assert!(help.contains("ICEBERG_CATALOG_TOKEN"), "{help}");
+        assert!(!help.contains("--iceberg-catalog-token"), "{help}");
         assert!(!help.contains("ICEBERG_CATALOG_TOKEN="), "{help}");
     }
 
@@ -555,7 +555,8 @@ mod tests {
         if combined.contains(secret) {
             panic!("catalog token leaked into help text");
         }
-        assert!(combined.contains("--iceberg-catalog-token"), "{combined}");
+        assert!(combined.contains("--catalog-token"), "{combined}");
+        assert!(!combined.contains("--iceberg-catalog-token"), "{combined}");
         assert!(combined.contains("ICEBERG_CATALOG_TOKEN"), "{combined}");
     }
 }
