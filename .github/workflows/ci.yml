@@ -91,7 +91,6 @@ jobs:
       AWS_DEFAULT_REGION: eu-west-2
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
-      CARGO_BUILD_BUILD_DIR: /mnt/build
       CLUSTER_ID: nisshi-ci
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
@@ -105,8 +104,6 @@ jobs:
       STORAGE_ENGINE: s3://nisshi/
       NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi
     steps:
-      - run: sudo mkdir /mnt/build
-      - run: sudo chmod a+rwxt /mnt/build
       - run: echo "PG_IMAGE_DASH=${POSTGRES_IMAGE/:/-}" >> "$GITHUB_ENV"
       - run: echo "${PG_IMAGE_DASH}"
       - run: df -h
@@ -120,7 +117,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy, rustfmt
-          cache: false
+          # rust-cache keys on the job, not the matrix, so every pg leg
+          # shares one entry and only one of them should save it: pg17,
+          # the leg that runs in both tiers.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.pg == 'postgres:17' }}
       - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: cargo-nextest@0.9.146
