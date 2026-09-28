@@ -1,12 +1,13 @@
 ---
 name: ci
 
-# `cache-save-if: github.event_name == 'push'` on a job's toolchain setup
-# means every PR restores the shared cache but only a push to main refreshes
-# it. This isn't a poisoning fix (GitHub already scopes a PR run's cache
-# writes to that PR's own ref) - it's hygiene, keeping the repo's cache
-# budget from being consumed by one entry per open PR instead of one per
-# branch. Applies to fmt, clippy, cargo-publish-dry-run,
+# `cache-save-if: github.ref == 'refs/heads/main'` on a job's toolchain
+# setup means every PR and queue entry restores main's cache but only a
+# push to main refreshes it; a `v*` tag push doesn't save either. This isn't
+# a poisoning fix (GitHub already scopes a run's cache writes to its own
+# ref) - it's hygiene, keeping the repo's cache budget from being consumed
+# by entries on refs nothing else can restore from. Applies to fmt, clippy,
+# test (its postgres:17 leg only), cargo-publish-dry-run,
 # third-party-license and release below (release also skips the cache
 # entirely on tags).
 #
@@ -158,7 +159,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy, rustfmt
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just fmt
   clippy:
     runs-on: ${{matrix.os}}
@@ -175,7 +176,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy, rustfmt
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just clippy
   build-storage:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
@@ -389,7 +390,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: cargo publish --dry-run --workspace
@@ -408,7 +409,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: cargo-about@0.8.4
@@ -606,7 +607,7 @@ jobs:
           cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           # rust-cache keys on job + OS + arch, which both macOS legs share.
           cache-key: ${{ matrix.target }}
-          cache-save-if: ${{ github.event_name == 'push' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustc -vV
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
