@@ -88,7 +88,7 @@ convert_case = "0.11.0"
 crc-fast = "1.8.0"
 criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
 datafusion = "51"
-deadpool = "0.12.2"
+deadpool = "0.13.1"
 deadpool-postgres = "0.14.1"
 delta_kernel = { version = "0.20.0", default-features = false, features = ["arrow-57"] }
 deltalake = { version = "0.30", features = ["datafusion", "s3"] }
