@@ -3073,35 +3073,23 @@ checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
 
 [[package]]
 name = "deadpool"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0be2b1d1d6ec8d846f05e137292d0b89133caf95ef33695424c09568bdd39b1b"
-dependencies = [
- "deadpool-runtime 0.1.4",
- "lazy_static",
- "num_cpus",
- "tokio",
-]
-
-[[package]]
-name = "deadpool"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e98a7e119cd347f4201e1159b19831029e203e2d8b790547708e8157b4acf1e"
 dependencies = [
- "deadpool-runtime 0.3.1",
+ "deadpool-runtime",
  "tokio",
 ]
 
 [[package]]
 name = "deadpool-postgres"
-version = "0.14.1"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d697d376cbfa018c23eb4caab1fd1883dd9c906a8c034e8d9a3cb06a7e0bef9"
+checksum = "65a536565624b97fc19f758cd01b15d12908d3344425066efc8162236fbd3749"
 dependencies = [
  "async-trait",
- "deadpool 0.12.3",
- "getrandom 0.2.17",
+ "deadpool",
+ "getrandom 0.4.3",
  "tokio",
  "tokio-postgres",
  "tracing",
@@ -3109,18 +3097,12 @@ dependencies = [
 
 [[package]]
 name = "deadpool-runtime"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
-dependencies = [
- "tokio",
-]
-
-[[package]]
-name = "deadpool-runtime"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2657f61fb1dd8bf37a8d51093cc7cee4e77125b22f7753f49b289f831bec2bae"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "defmt"
@@ -6014,7 +5996,7 @@ dependencies = [
  "backoff",
  "bytes",
  "clap",
- "deadpool 0.13.1",
+ "deadpool",
  "dotenv",
  "humantime",
  "nisshi-sans-io",
@@ -6228,7 +6210,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "deadpool 0.13.1",
+ "deadpool",
  "indicatif",
  "nanoid",
  "nisshi-auth",
@@ -6258,7 +6240,7 @@ dependencies = [
  "chrono",
  "console",
  "criterion",
- "deadpool 0.13.1",
+ "deadpool",
  "deadpool-postgres",
  "dotenv",
  "futures",
@@ -6369,7 +6351,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
- "deadpool 0.13.1",
+ "deadpool",
  "deadpool-postgres",
  "futures",
  "futures-util",
