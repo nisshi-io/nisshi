@@ -121,7 +121,9 @@ jobs:
         with:
           components: clippy, rustfmt
           cache: false
-      - run: cargo install cargo-nextest --locked
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-nextest@0.9.146
       - run: df -h
       - run: just test
       - run: df -h
