@@ -987,6 +987,36 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
         assert_eq!(-1, partitions[0].base_offset);
     }
 
+    // A `last_offset_delta` that is too large must also be rejected: two
+    // records claiming a delta of 2 is the off-by-one the generator and perf
+    // tools used to send.
+    let too_large = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(topic_data(
+                topic,
+                index,
+                inflated::Batch::builder()
+                    .record(Record::builder().value(Bytes::from_static(b"a").into()))
+                    .record(Record::builder().value(Bytes::from_static(b"b").into()))
+                    .last_offset_delta(2),
+            )?),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    {
+        let topics = too_large.responses.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::InvalidRecord,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(-1, partitions[0].base_offset);
+    }
+
     // An empty batch (no records at all) must also be rejected. This is a
     // distinct condition from the count/delta mismatch above: zero records
     // with `last_offset_delta(-1)` actually satisfies
@@ -1018,7 +1048,7 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
 
     // The partition must not be wedged: a well-formed batch to the same
     // topic/partition afterwards must still succeed, landing at offset 0 --
-    // proving none of the three rejected batches above wrote or advanced
+    // proving none of the four rejected batches above wrote or advanced
     // anything (on Postgres/libSQL, a partial write from any of them would
     // instead make this insert collide with an existing primary key).
     let well_formed = produce

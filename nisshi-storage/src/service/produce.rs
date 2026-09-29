@@ -26,17 +26,25 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
 
-/// A batch header must agree with the records it carries: at least one
-/// record, and `last_offset_delta + 1 == record_count`. Every backend uses
+/// Why a batch header disagrees with the records it carries, or `None` if it
+/// agrees. A consistent header has at least one record and
+/// `last_offset_delta + 1 == record_count`. Every backend uses
 /// `last_offset_delta` to advance the high watermark, so a mismatch corrupts
 /// or wedges the partition. Kafka rejects the same batch with
-/// `INVALID_RECORD`. `record_count` is an int32 on the wire, so values above
-/// `i32::MAX` are rejected too.
-fn is_consistent(batch: &deflated::Batch) -> bool {
-    let record_count = i64::from(batch.record_count);
-    let last_offset_delta = i64::from(batch.last_offset_delta);
+/// `INVALID_RECORD`. `record_count` is an int32 on the wire, so a value above
+/// `i32::MAX` is rejected too.
+fn inconsistency(batch: &deflated::Batch) -> Option<&'static str> {
+    let Ok(record_count) = i32::try_from(batch.record_count) else {
+        return Some("record_count exceeds i32::MAX");
+    };
 
-    (1..=i64::from(i32::MAX)).contains(&record_count) && last_offset_delta + 1 == record_count
+    if record_count < 1 {
+        Some("batch has no records")
+    } else if batch.last_offset_delta.checked_add(1) != Some(record_count) {
+        Some("last_offset_delta + 1 does not equal record_count")
+    } else {
+        None
+    }
 }
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
@@ -172,14 +180,23 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
-            if let Some(inconsistent) = records.batches.iter().find(|batch| !is_consistent(batch)) {
-                debug!(
+            if let Some((inconsistent, reason)) = records
+                .batches
+                .iter()
+                .find_map(|batch| inconsistency(batch).map(|reason| (batch, reason)))
+            {
+                warn!(
+                    topic = name,
+                    partition = partition.index,
                     record_count = inconsistent.record_count,
                     last_offset_delta = inconsistent.last_offset_delta,
-                    "batch header inconsistent: last_offset_delta + 1 must equal record_count",
+                    reason,
+                    "rejecting produce batch with inconsistent header",
                 );
 
-                return self.error(partition.index, ErrorCode::InvalidRecord);
+                return self
+                    .error(partition.index, ErrorCode::InvalidRecord)
+                    .error_message(Some(reason.into()));
             }
 
             let mut base_offset = None;
