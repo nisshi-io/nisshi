@@ -46,6 +46,11 @@ just broker-s3         # broker with S3/minio backend only
 
 Note: when running nisshi directly (not via docker compose), set `AWS_ENDPOINT="http://localhost:9000"` in `.env`.
 
+### Worktrees
+
+- **Build output stays per worktree.** Each worktree builds into its own `target/`. Don't point worktrees at a shared one (`CARGO_TARGET_DIR`, `build.target-dir`). Cargo gives a workspace crate the same artifact names in every checkout and decides whether to rebuild by comparing file modification times, so a checkout whose sources are older than another checkout's last build reuses that build, and `cargo test` runs the other worktree's code.
+- **`.env` is copied into Claude Code worktrees.** `.worktreeinclude` lists `.env`, so `claude --worktree` and subagent worktrees get a copy. For a worktree created any other way, copy `.env` yourself.
+
 ## Architecture
 
 Cargo workspace with 15 member crates, producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `generator`, `perf`, `proxy`.
