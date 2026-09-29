@@ -36,6 +36,7 @@ pub mod get_telemetry_subscriptions;
 pub mod group_cache_miss;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;
+pub mod join_invalid_session_timeout;
 pub mod list_groups;
 pub mod list_offsets;
 pub mod metadata;

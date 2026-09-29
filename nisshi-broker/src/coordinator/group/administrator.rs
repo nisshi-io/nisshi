@@ -58,6 +58,14 @@ use super::{Coordinator, OffsetCommit};
 
 const PAUSE_MS: u128 = 3_000;
 
+// Kafka's own `group.max.session.timeout.ms` default. There is no corresponding
+// nisshi config, so we hardcode it. We deliberately do NOT enforce Kafka's
+// `group.min.session.timeout.ms` default (6000): librdkafka's own compat test
+// suite (e.g. 0106-cgrp_sess_timeout.c, 0113-cooperative_rebalance.cpp) uses
+// session.timeout.ms as low as 5000. The actual bug class is non-positive
+// values, so the floor here is simply "greater than zero".
+const MAX_SESSION_TIMEOUT_MS: i32 = 1_800_000;
+
 static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_group_coordinator_requests")
@@ -820,6 +828,33 @@ where
             ?reason,
         );
 
+        // Validate before touching any group state or storage: a session timeout outside
+        // this range must never be persisted (nothing downstream re-validates it), and it
+        // must never reach the wait loop below, which casts it to u128 and divides by it.
+        // A negative value sign-extends into an astronomically large u128, turning the
+        // "wait up to session_timeout_ms/2" loop into an unbounded one.
+        if session_timeout_ms <= 0 || session_timeout_ms > MAX_SESSION_TIMEOUT_MS {
+            debug!(join_outcome = ?ErrorCode::InvalidSessionTimeout, session_timeout_ms);
+
+            COORDINATOR_REQUESTS.add(
+                1,
+                &[KeyValue::new("method", "join_invalid_session_timeout")],
+            );
+
+            let join_group_response = JoinGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::InvalidSessionTimeout.into())
+                .generation_id(-1)
+                .protocol_type(None)
+                .protocol_name(Some("".into()))
+                .leader("".into())
+                .skip_assignment(Some(false))
+                .member_id(member_id.to_owned())
+                .members(Some([].into()));
+
+            return Ok(join_group_response.into());
+        }
+
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join")]);
 
         let started_at = SystemTime::now();
@@ -891,7 +926,13 @@ where
                     let is_forming = updated.is_forming();
                     let is_ok = updated.is_ok(&body);
 
-                    let session_timeout_ms = updated.session_timeout_ms() as u128;
+                    // Defence in depth: `join` rejects an out-of-range session_timeout_ms
+                    // before it is ever persisted, but a group row written by a pre-fix
+                    // broker (or during a rolling upgrade) could still carry one. Fall back
+                    // rather than let a negative value sign-extend into ~2^128 here, the
+                    // same way `missed_heartbeat` already guards this field.
+                    let session_timeout_ms =
+                        u128::try_from(updated.session_timeout_ms()).unwrap_or(45_000);
 
                     debug!(
                         ?version,
@@ -1097,7 +1138,11 @@ where
                         is_stable
                     );
 
-                    let session_timeout_ms = updated.session_timeout_ms() as u128;
+                    // See the equivalent guard in `join`, above: defence in depth against a
+                    // group row persisted (pre-fix, or by an older broker) with an
+                    // out-of-range session_timeout_ms.
+                    let session_timeout_ms =
+                        u128::try_from(updated.session_timeout_ms()).unwrap_or(45_000);
 
                     _ = self.wrappers.lock().map(|mut wrappers| {
                         wrappers.insert(group_id.to_owned(), (updated, Some(version)))
