@@ -75,7 +75,7 @@ const AUTO_CREATE_REPLICATION_FACTOR: i16 = 1;
 
 /// The Apache Kafka topic name rules: 1 to 249 characters from
 /// `[a-zA-Z0-9._-]`, and not "." or "..".
-fn is_valid_topic_name(name: &str) -> bool {
+pub(super) fn is_valid_topic_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."

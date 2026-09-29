@@ -21,6 +21,27 @@ use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
 
+use super::metadata::is_valid_topic_name;
+
+/// Build the [`CreatableTopicResult`] for a topic that was rejected, either
+/// by storage or by validation performed before storage is ever consulted.
+fn error_result(
+    name: String,
+    num_partitions: Option<i32>,
+    replication_factor: Option<i16>,
+    error_code: ErrorCode,
+) -> CreatableTopicResult {
+    CreatableTopicResult::default()
+        .name(name)
+        .topic_id(Some(NULL_TOPIC_ID))
+        .error_code(error_code.into())
+        .error_message(Some(error_code.to_string()))
+        .topic_config_error_code(None)
+        .num_partitions(num_partitions)
+        .replication_factor(replication_factor)
+        .configs(Some([].into()))
+}
+
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
 /// ```no_run
 /// use rama::Service as _;
@@ -111,6 +132,31 @@ where
                 otherwise => otherwise,
             });
 
+            // Validate before storage is ever consulted, so invalid topics
+            // are rejected regardless of `validate_only`, and so a bad name
+            // (e.g. "", ".", "..", or one containing "/") can never reach a
+            // backend whose delete/list operations are prefix based.
+            if !is_valid_topic_name(&name) {
+                topics.push(error_result(
+                    name,
+                    num_partitions,
+                    replication_factor,
+                    ErrorCode::InvalidTopicException,
+                ));
+                continue;
+            }
+
+            if num_partitions == Some(0) || num_partitions.is_some_and(|partitions| partitions < -1)
+            {
+                topics.push(error_result(
+                    name,
+                    num_partitions,
+                    replication_factor,
+                    ErrorCode::InvalidPartitions,
+                ));
+                continue;
+            }
+
             match self
                 .storage
                 .create_topic(topic, input.request.validate_only.unwrap_or_default())
@@ -132,17 +178,12 @@ where
                     );
                 }
 
-                Err(Error::Api(error_code)) => topics.push(
-                    CreatableTopicResult::default()
-                        .name(name)
-                        .topic_id(Some(NULL_TOPIC_ID))
-                        .error_code(error_code.into())
-                        .error_message(Some(error_code.to_string()))
-                        .topic_config_error_code(None)
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .configs(Some([].into())),
-                ),
+                Err(Error::Api(error_code)) => topics.push(error_result(
+                    name,
+                    num_partitions,
+                    replication_factor,
+                    error_code,
+                )),
 
                 Err(error) => {
                     debug!(?error);
