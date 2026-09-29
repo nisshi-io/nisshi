@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{
-    ApiKey, DeleteGroupsRequest, DeleteGroupsResponse, ErrorCode, RequestInput,
-    delete_groups_response::DeletableGroupResult,
-};
+use nisshi_sans_io::{ApiKey, DeleteGroupsRequest, DeleteGroupsResponse, RequestInput};
 use rama::Service;
 use tracing::instrument;
 
@@ -76,38 +73,14 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        let results = match input.request.groups_names {
-            None => self.storage.delete_groups(None).await?,
-
-            Some(group_ids) => {
-                // An empty group id can't name a single group in every
-                // backend's key layout (on dynostore it widens the delete to
-                // every group), and Kafka has deprecated empty group ids
-                // (KIP-289). Reject it without calling storage. Clients match
-                // results by group_id, so order doesn't matter.
-                let (invalid, non_empty): (Vec<String>, Vec<String>) = group_ids
-                    .into_iter()
-                    .partition(|group_id| group_id.is_empty());
-
-                let mut results: Vec<DeletableGroupResult> = invalid
-                    .into_iter()
-                    .map(|group_id| {
-                        DeletableGroupResult::default()
-                            .group_id(group_id)
-                            .error_code(ErrorCode::InvalidGroupId.into())
-                    })
-                    .collect();
-
-                if !non_empty.is_empty() {
-                    results.extend(self.storage.delete_groups(Some(&non_empty)).await?);
-                }
-
-                results
-            }
-        };
-
-        Ok(DeleteGroupsResponse::default()
-            .throttle_time_ms(0)
-            .results(Some(results)))
+        self.storage
+            .delete_groups(input.request.groups_names.as_deref())
+            .await
+            .map(Some)
+            .map(|results| {
+                DeleteGroupsResponse::default()
+                    .throttle_time_ms(0)
+                    .results(results)
+            })
     }
 }

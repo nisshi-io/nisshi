@@ -52,10 +52,18 @@ async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error>
 }
 
 /// A DeleteGroups request naming an empty group id alongside a real one must
-/// reject only the empty id with INVALID_GROUP_ID, and must never touch groups
-/// that were not named. On dynostore an empty id used to widen the delete's key
-/// prefix to every group, wiping all group state and committed offsets.
-async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), Error> {
+/// never touch groups that were not named. On dynostore an empty id used to
+/// widen the delete's key prefix to every group, wiping all group state and
+/// committed offsets.
+///
+/// Kafka still accepts `""` in DeleteGroups for backwards compatibility, so
+/// the SQL and SlateDB backends, which store `""` exactly, treat it like any
+/// other id (`GROUP_ID_NOT_FOUND` here, since nothing was stored under it).
+/// Dynostore can't represent it and answers `INVALID_GROUP_ID`.
+async fn empty_group_id_mixed_list(
+    storage: impl Storage + Clone,
+    expected_for_empty: ErrorCode,
+) -> Result<(), Error> {
     let topic_name = alphanumeric_string(15);
     let num_partitions = 6;
 
@@ -124,7 +132,7 @@ async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), 
         .find(|result| result.group_id.is_empty())
         .expect("missing result for the empty group id");
     assert_eq!(
-        ErrorCode::InvalidGroupId,
+        expected_for_empty,
         ErrorCode::try_from(empty_result.error_code)?
     );
 
@@ -136,6 +144,13 @@ async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), 
         ErrorCode::None,
         ErrorCode::try_from(group_b_result.error_code)?
     );
+
+    // group_b was named, so its committed offset must be gone. On dynostore
+    // a NONE result alone doesn't prove this: deleting a missing key is Ok.
+    let offset_fetch = storage
+        .offset_fetch(Some(&group_b), slice::from_ref(&topition), None)
+        .await?;
+    assert_ne!(Some(&offset_b), offset_fetch.get(&topition));
 
     // group_a was never named in the request, so its committed offset must
     // still be fetchable, and it must still be listable/describable.
@@ -161,7 +176,7 @@ async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), 
 }
 
 /// `Storage::delete_groups` has callers other than `DeleteGroupsService`, and
-/// the service only rejects "". Dynostore must itself refuse any id with an
+/// the service passes every id through. Dynostore must itself refuse any id with an
 /// empty path segment ("", "/", "//", "a/"), since `Path::from` drops empty
 /// segments and the prefix delete would then cover every group.
 #[cfg(feature = "dynostore")]
@@ -222,6 +237,7 @@ async fn direct_storage_call_rejects_unrepresentable_group_ids(
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -258,7 +274,7 @@ mod in_memory {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::InvalidGroupId).await?;
 
         Ok(())
     }
@@ -282,6 +298,7 @@ mod in_memory {
 mod lite {
     use crate::common::{init_tracing, lite_storage};
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -316,7 +333,7 @@ mod lite {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
 
         Ok(())
     }
@@ -326,6 +343,7 @@ mod lite {
 mod slatedb {
     use crate::common::{init_tracing, slate_storage};
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -360,7 +378,7 @@ mod slatedb {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
 
         Ok(())
     }
@@ -370,6 +388,7 @@ mod slatedb {
 mod pg {
     use crate::common::{init_tracing, postgres_storage};
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -404,7 +423,7 @@ mod pg {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
 
         Ok(())
     }
