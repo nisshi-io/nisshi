@@ -17,9 +17,9 @@ and is satisfied merges it, and anyone who disagrees can say so during that
 same review.
 
 Changes with broader impact — a breaking API or wire-protocol change, a new
-storage backend, a change to this governance model — need explicit
-agreement from a majority of active maintainers discussed before merging,
-not just one reviewer's approval.
+storage backend, a change to this governance model — need approval on the
+PR from a majority of active maintainers before merging, not just one
+reviewer.
 
 Disagreements that don't resolve through discussion are decided by a vote of
 active maintainers, simple majority.
