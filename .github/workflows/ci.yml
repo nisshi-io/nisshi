@@ -526,7 +526,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: nisshi-io/example-java
-          ref: 896d854efb515d1e1b14301e068d016356e17df5 # main 2026-09-25, minio built from source (#4)
+          ref: 65bfbfdfd1dd77420b6af3b5d616ba7ae8b35b33 # 2026-09-29, minio from pgsty/silo (#5)
           path: integration
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

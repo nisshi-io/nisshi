@@ -37,7 +37,10 @@ services:
       retries: 5
     pull_policy: missing
   minio:
-    build: etc/minio
+    # MinIO no longer publishes images. pgsty/silo is a community-maintained
+    # AGPLv3 fork that still does, multi-arch, with mc at /usr/bin/mc and the
+    # MinIO S3 API, including conditional writes.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
     command: server /data --console-address ":9001"
     volumes:
       - minio:/data
@@ -52,6 +55,7 @@ services:
       retries: 1
       start_period: 5s
       timeout: 5s
+    pull_policy: missing
   nisshi:
     image: ${NISSHI_IMAGE}
     restart: unless-stopped
