@@ -73,7 +73,7 @@ private_intra_doc_links = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0.94"
-apache-avro = "0.21.0"
+apache-avro = "0.22.0"
 arrow = { version = "57" }
 assert_matches = "1.5.0"
 async-trait = "0.1.86"
