@@ -25,7 +25,6 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-cached.workspace = true
 console.workspace = true
 chrono.workspace = true
 deadpool = { workspace = true, optional = true }

@@ -21,7 +21,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use cached::stores::ExpiringSizedCache;
+use cached::{Cached as _, stores::TtlSortedCache};
 use futures::stream::{BoxStream, StreamExt};
 use nisshi_storage::Error;
 use object_store::{
@@ -79,7 +79,7 @@ impl From<&GetResult> for CacheEntry {
 
 #[derive(Clone)]
 pub(super) struct Cache<O> {
-    entries: Arc<Mutex<ExpiringSizedCache<Path, CacheEntry>>>,
+    entries: Arc<Mutex<TtlSortedCache<Path, CacheEntry>>>,
     object_store: O,
     retention: Duration,
 }
@@ -103,7 +103,12 @@ where
     O: ObjectStore,
 {
     pub(super) fn new(object_store: O, retention: Duration) -> Self {
-        let entries = Arc::new(Mutex::new(ExpiringSizedCache::new(retention)));
+        let entries = Arc::new(Mutex::new(
+            TtlSortedCache::builder()
+                .ttl(retention)
+                .build()
+                .expect("metadata cache retention must be non-zero"),
+        ));
 
         Self {
             entries,
@@ -686,6 +691,35 @@ mod tests {
             Err(object_store::Error::NotModified { .. })
         ));
         assert_eq!(0, cache.inner().get_opts()?);
+
+        Ok(())
+    }
+
+    /// Inserting sweeps entries that have already expired, so keys that are
+    /// never read again don't accumulate.
+    #[tokio::test]
+    async fn sweep_evicts_expired_entries_on_insert() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let ttl = Duration::from_millis(100);
+        let cache = Cache::new(Counter::new(InMemory::new()), ttl);
+
+        for (i, id) in ["a", "b"].into_iter().enumerate() {
+            if i > 0 {
+                sleep(ttl * 2).await;
+            }
+
+            _ = cache
+                .put(
+                    &Path::from(format!("/abc/{id}.json")),
+                    serde_json::to_vec(&X(6))
+                        .map(Bytes::from)
+                        .map(PutPayload::from)?,
+                )
+                .await?;
+
+            assert_eq!(1, cache.entries.lock().map(|guard| guard.len())?);
+        }
 
         Ok(())
     }
