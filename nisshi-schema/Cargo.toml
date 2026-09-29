@@ -12,8 +12,8 @@ version.workspace = true
 
 [features]
 default = ["delta", "iceberg", "parquet"]
-delta = ["dep:arrow", "dep:delta_kernel", "dep:deltalake", "dep:datafusion", "dep:parquet"]
-iceberg = ["dep:arrow", "dep:iceberg-catalog-rest", "dep:iceberg-datafusion", "dep:iceberg", "dep:datafusion", "dep:parquet"]
+delta = ["dep:arrow", "dep:buoyant_kernel_derive", "dep:deltalake", "dep:datafusion", "dep:parquet"]
+iceberg = ["dep:arrow", "dep:iceberg-catalog-rest", "dep:iceberg-datafusion", "dep:iceberg", "dep:iceberg-storage-opendal", "dep:datafusion", "dep:parquet"]
 parquet = ["dep:arrow", "dep:parquet"]
 
 
@@ -28,7 +28,7 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 datafusion = { workspace = true, optional = true }
-delta_kernel = { workspace = true, optional = true }
+buoyant_kernel_derive = { workspace = true, optional = true }
 deltalake = { workspace = true, optional = true }
 dotenv.workspace = true
 fake.workspace = true
@@ -37,6 +37,7 @@ governor.workspace = true
 iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-datafusion = { workspace = true, optional = true }
 iceberg = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
 jsonschema.workspace = true
 num-bigint.workspace = true
 object_store.workspace = true

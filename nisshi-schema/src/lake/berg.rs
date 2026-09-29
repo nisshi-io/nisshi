@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use iceberg::memory::MemoryCatalogBuilder;
 use iceberg::{
     Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
-    io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY},
+    io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY},
     spec::{DataFileFormat, Schema, TableMetadataBuilder},
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
@@ -44,6 +44,7 @@ use iceberg::{
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use nisshi_sans_io::{describe_configs_response::DescribeConfigsResult, record::inflated::Batch};
 use parquet::file::properties::WriterProperties;
 use tracing::{debug, error};
@@ -141,7 +142,12 @@ impl Iceberg {
     }
 }
 
-async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc<dyn Catalog>> {
+/// Builds the [`Catalog`] for `catalog`'s scheme (`http(s)` -> REST,
+/// `memory` -> in-process). `pub` so integration tests can build the same
+/// catalog nisshi itself uses (storage factory, path-style pin and all)
+/// instead of re-deriving their own `RestCatalogBuilder` call and risking
+/// drift between the two.
+pub async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc<dyn Catalog>> {
     debug!(catalog = %crate::redact_url(catalog), ?warehouse);
 
     match (catalog.scheme(), catalog.path()) {
@@ -162,8 +168,21 @@ async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result<Arc
             if let Some(wh) = warehouse {
                 _ = props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), wh);
             }
+            // iceberg-storage-opendal defaults to virtual-host-style S3
+            // addressing. The storage built into iceberg 0.8 used
+            // path-style, so keep path-style as the default rather than
+            // change addressing as a side effect of this upgrade. Catalog
+            // server and per-table config still override it.
+            _ = props
+                .entry(S3_PATH_STYLE_ACCESS.to_string())
+                .or_insert_with(|| "true".to_string());
 
+            // iceberg 0.10 no longer bundles S3 storage, so the catalog
+            // needs an explicit storage factory.
             let catalog = RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+                    customized_credential_load: None,
+                }))
                 .load("rest", props)
                 .await
                 .map_err(|e| Error::Iceberg(Box::new(e)))?;
@@ -313,7 +332,7 @@ impl LakeHouse for Iceberg {
         let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_writer_builder,
             table.file_io().clone(),
-            DefaultLocationGenerator::new(table.metadata().clone())?,
+            DefaultLocationGenerator::new(table.metadata())?,
             DefaultFileNameGenerator::new(
                 topic.to_owned(),
                 Some(format!("{partition:0>10}-{offset:0>20}")),

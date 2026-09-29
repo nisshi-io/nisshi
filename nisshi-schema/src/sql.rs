@@ -79,6 +79,10 @@ pub(crate) fn parse_generated_expr(expr: &str) -> Result<GeneratedExpr> {
         kind: CastKind::Cast,
         expr: inner,
         data_type,
+        // `array: true` is MySQL's `CAST(... AS type ARRAY)` functional
+        // index form, not a data type nisshi supports here: reject it
+        // explicitly rather than silently accepting a new syntax shape.
+        array: false,
         format: None,
     } = ast
     else {
