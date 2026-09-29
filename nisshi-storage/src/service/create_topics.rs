@@ -146,8 +146,9 @@ where
                 continue;
             }
 
-            if num_partitions == Some(0) || num_partitions.is_some_and(|partitions| partitions < -1)
-            {
+            // -1 (broker default) was already replaced above, so anything
+            // below 1 is invalid.
+            if num_partitions.is_some_and(|partitions| partitions < 1) {
                 topics.push(error_result(
                     name,
                     num_partitions,
