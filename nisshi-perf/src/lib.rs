@@ -421,7 +421,7 @@ impl Producer {
         }
 
         batch
-            .last_offset_delta(self.batch_size.get() as i32)
+            .last_offset_delta(self.batch_size.get() as i32 - 1)
             .build()
             .map(|batch| inflated::Frame {
                 batches: vec![batch],

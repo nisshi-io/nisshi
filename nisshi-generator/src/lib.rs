@@ -181,7 +181,7 @@ fn frame(name: String, index: i32, schema: Schema, batch_size: i32) -> Result<de
     }
 
     batch
-        .last_offset_delta(batch_size)
+        .last_offset_delta(batch_size - 1)
         .build()
         .map(|batch| inflated::Frame {
             batches: vec![batch],

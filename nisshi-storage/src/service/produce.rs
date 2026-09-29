@@ -19,11 +19,25 @@ use nisshi_sans_io::{
     TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
+    record::deflated,
 };
 use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
+
+/// A batch header must agree with the records it carries: at least one
+/// record, and `last_offset_delta + 1 == record_count`. Every backend uses
+/// `last_offset_delta` to advance the high watermark, so a mismatch corrupts
+/// or wedges the partition. Kafka rejects the same batch with
+/// `INVALID_RECORD`. `record_count` is an int32 on the wire, so values above
+/// `i32::MAX` are rejected too.
+fn is_consistent(batch: &deflated::Batch) -> bool {
+    let record_count = i64::from(batch.record_count);
+    let last_offset_delta = i64::from(batch.last_offset_delta);
+
+    (1..=i64::from(i32::MAX)).contains(&record_count) && last_offset_delta + 1 == record_count
+}
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
@@ -158,6 +172,16 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
+            if let Some(inconsistent) = records.batches.iter().find(|batch| !is_consistent(batch)) {
+                debug!(
+                    record_count = inconsistent.record_count,
+                    last_offset_delta = inconsistent.last_offset_delta,
+                    "batch header inconsistent: last_offset_delta + 1 must equal record_count",
+                );
+
+                return self.error(partition.index, ErrorCode::InvalidRecord);
+            }
+
             let mut base_offset = None;
 
             for mut batch in records.batches {
