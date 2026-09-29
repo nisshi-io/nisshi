@@ -630,7 +630,7 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error>
                         .records
                         .into_iter()
                         .map(|record| Record {
-                            offset_delta: record.offset_delta + sink.last_offset_delta,
+                            offset_delta: record.offset_delta + sink.last_offset_delta + 1,
                             timestamp_delta: record.timestamp_delta
                                 + (sink.base_timestamp - batch.base_timestamp),
                             ..record
@@ -638,7 +638,7 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error>
                         .collect::<Vec<_>>(),
                 );
 
-                sink.last_offset_delta += batch.last_offset_delta;
+                sink.last_offset_delta += batch.last_offset_delta + 1;
                 sink.max_timestamp = sink.max_timestamp.max(batch.max_timestamp);
             }
 
@@ -818,6 +818,52 @@ mod tests {
             .build()
             .and_then(deflated::Batch::try_from)
             .map_err(Into::into)
+    }
+
+    fn multi_record_batch(values: &[&'static [u8]]) -> Result<deflated::Batch, Error> {
+        values
+            .iter()
+            .enumerate()
+            .fold(
+                inflated::Batch::builder()
+                    .base_timestamp(1_234_567_890 * 1_000)
+                    .max_timestamp(1_234_567_890 * 1_000)
+                    .last_offset_delta(i32::try_from(values.len() - 1).expect("last offset delta")),
+                |builder, (delta, value)| {
+                    builder.record(
+                        Record::builder()
+                            .offset_delta(i32::try_from(delta).expect("offset delta"))
+                            .value(Bytes::from_static(value).into()),
+                    )
+                },
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn combine_keeps_offset_deltas_contiguous() -> Result<(), Error> {
+        let combined = combine(vec![
+            multi_record_batch(&[b"a", b"b"])?,
+            multi_record_batch(&[b"c", b"d", b"e"])?,
+        ])?;
+
+        assert_eq!(1, combined.len());
+        assert_eq!(5, combined[0].record_count);
+        assert_eq!(4, combined[0].last_offset_delta);
+
+        let inflated = inflated::Batch::try_from(combined[0].clone())?;
+        assert_eq!(
+            vec![0, 1, 2, 3, 4],
+            inflated
+                .records
+                .iter()
+                .map(|record| record.offset_delta)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
     }
 
     fn produce_request(topic: &str, record_data: &'static [u8]) -> Result<ProduceRequest, Error> {
@@ -1261,9 +1307,9 @@ mod tests {
                                             batch_length: 69,
                                             partition_leader_epoch: -1,
                                             magic: 2,
-                                            crc: 2619797409,
+                                            crc: 2530424301,
                                             attributes: 0,
-                                            last_offset_delta: 0,
+                                            last_offset_delta: 1,
                                             base_timestamp: 1234567890000,
                                             max_timestamp: 1234567890000,
                                             producer_id: -1,
@@ -1271,7 +1317,7 @@ mod tests {
                                             base_sequence: 0,
                                             record_count: 2,
                                             record_data: Bytes::from_static(
-                                                b"\x12\0\0\0\x01\x06foo\0\x12\0\0\0\x01\x06bar\0"
+                                                b"\x12\0\0\0\x01\x06foo\0\x12\0\0\x02\x01\x06bar\0"
                                             )
                                         }]
                                         .into()

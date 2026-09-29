@@ -243,6 +243,7 @@ impl Produce {
             }
 
             batch
+                .last_offset_delta(offset_delta - 1)
                 .build()
                 .map(|batch| inflated::Frame {
                     batches: vec![batch],

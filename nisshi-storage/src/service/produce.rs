@@ -19,11 +19,33 @@ use nisshi_sans_io::{
     TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
+    record::deflated,
 };
 use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
+
+/// Why a batch header disagrees with the records it carries, or `None` if it
+/// agrees. A consistent header has at least one record and
+/// `last_offset_delta + 1 == record_count`. Every backend uses
+/// `last_offset_delta` to advance the high watermark, so a mismatch corrupts
+/// or wedges the partition. Kafka rejects the same batch with
+/// `INVALID_RECORD`. `record_count` is an int32 on the wire, so a value above
+/// `i32::MAX` is rejected too.
+fn inconsistency(batch: &deflated::Batch) -> Option<&'static str> {
+    let Ok(record_count) = i32::try_from(batch.record_count) else {
+        return Some("record_count exceeds i32::MAX");
+    };
+
+    if record_count < 1 {
+        Some("batch has no records")
+    } else if batch.last_offset_delta.checked_add(1) != Some(record_count) {
+        Some("last_offset_delta + 1 does not equal record_count")
+    } else {
+        None
+    }
+}
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
@@ -158,6 +180,25 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
+            if let Some((inconsistent, reason)) = records
+                .batches
+                .iter()
+                .find_map(|batch| inconsistency(batch).map(|reason| (batch, reason)))
+            {
+                warn!(
+                    topic = name,
+                    partition = partition.index,
+                    record_count = inconsistent.record_count,
+                    last_offset_delta = inconsistent.last_offset_delta,
+                    reason,
+                    "rejecting produce batch with inconsistent header",
+                );
+
+                return self
+                    .error(partition.index, ErrorCode::InvalidRecord)
+                    .error_message(Some(reason.into()));
+            }
+
             let mut base_offset = None;
 
             for mut batch in records.batches {

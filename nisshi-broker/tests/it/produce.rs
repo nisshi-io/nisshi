@@ -880,6 +880,240 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
     Ok(())
 }
 
+/// Every storage backend trusted the batch
+/// header's `last_offset_delta` to advance the high watermark, without
+/// checking it against the number of records actually decoded from the
+/// batch. A mismatched batch (or a negative `last_offset_delta`) must be
+/// rejected with `INVALID_RECORD` before anything is written, and must not
+/// wedge the partition for subsequent well-formed produces.
+async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clone) -> Result<()> {
+    let topic = &alphanumeric_string(15)[..];
+
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    {
+        let response = create_topic
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(topic.into())
+                            .num_partitions(1)
+                            .replication_factor(0)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let index = 0;
+
+    let produce = ProduceService {
+        storage: storage.clone(),
+    };
+
+    let list_offsets = ListOffsetsService {
+        storage: storage.clone(),
+    };
+
+    // Five records, but `last_offset_delta` left at its builder default of
+    // 0: `last_offset_delta + 1 == record_count` is violated (0 + 1 != 5).
+    // Must be rejected, and nothing from it written.
+    let mismatched = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(topic_data(
+                topic,
+                index,
+                inflated::Batch::builder()
+                    .record(Record::builder().value(Bytes::from_static(b"a").into()))
+                    .record(Record::builder().value(Bytes::from_static(b"b").into()))
+                    .record(Record::builder().value(Bytes::from_static(b"c").into()))
+                    .record(Record::builder().value(Bytes::from_static(b"d").into()))
+                    .record(Record::builder().value(Bytes::from_static(b"e").into())),
+            )?),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    {
+        let topics = mismatched.responses.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::InvalidRecord,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(-1, partitions[0].base_offset);
+    }
+
+    // A negative `last_offset_delta` must also be rejected.
+    let negative = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(topic_data(
+                topic,
+                index,
+                inflated::Batch::builder()
+                    .record(Record::builder().value(Bytes::from_static(b"a").into()))
+                    .last_offset_delta(-1),
+            )?),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    {
+        let topics = negative.responses.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::InvalidRecord,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(-1, partitions[0].base_offset);
+    }
+
+    // A `last_offset_delta` that is too large must also be rejected: two
+    // records claiming a delta of 2 is the off-by-one the generator and perf
+    // tools used to send.
+    let too_large = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(topic_data(
+                topic,
+                index,
+                inflated::Batch::builder()
+                    .record(Record::builder().value(Bytes::from_static(b"a").into()))
+                    .record(Record::builder().value(Bytes::from_static(b"b").into()))
+                    .last_offset_delta(2),
+            )?),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    {
+        let topics = too_large.responses.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::InvalidRecord,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(-1, partitions[0].base_offset);
+    }
+
+    // An empty batch (no records at all) must also be rejected. This is a
+    // distinct condition from the count/delta mismatch above: zero records
+    // with `last_offset_delta(-1)` actually satisfies
+    // `last_offset_delta + 1 == record_count` (-1 + 1 == 0), so
+    // `record_count >= 1` has to be checked on its own to catch it.
+    let empty = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(topic_data(
+                topic,
+                index,
+                inflated::Batch::builder().last_offset_delta(-1),
+            )?),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    {
+        let topics = empty.responses.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::InvalidRecord,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(-1, partitions[0].base_offset);
+    }
+
+    // The partition must not be wedged: a well-formed batch to the same
+    // topic/partition afterwards must still succeed, landing at offset 0 --
+    // proving none of the four rejected batches above wrote or advanced
+    // anything (on Postgres/libSQL, a partial write from any of them would
+    // instead make this insert collide with an existing primary key).
+    let well_formed = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(topic_data(
+                topic,
+                index,
+                inflated::Batch::builder()
+                    .record(Record::builder().value(Bytes::from_static(b"well formed").into())),
+            )?),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    {
+        let topics = well_formed.responses.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(0, partitions[0].base_offset);
+    }
+
+    // Confirm via ListOffsets(latest) that the high watermark only moved
+    // past the one well-formed record -- if any rejected batch above had
+    // moved it too, this would be something other than 1. (That none of
+    // them left partial rows behind is what the offset-0 produce above
+    // already proved.)
+    let response = list_offsets
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
+                .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                .topics(Some(
+                    [ListOffsetsTopic::default()
+                        .name(topic.into())
+                        .partitions(Some(
+                            [ListOffsetsPartition::default()
+                                .partition_index(index)
+                                .timestamp(ListOffset::Latest.try_into()?)]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(Some(1), partitions[0].offset);
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -957,6 +1191,20 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::list_offsets(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_last_offset_delta_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_last_offset_delta_mismatch(storage).await?;
 
         Ok(())
     }
@@ -1042,6 +1290,20 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn produce_rejects_last_offset_delta_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_last_offset_delta_mismatch(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -1124,6 +1386,20 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn produce_rejects_last_offset_delta_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_last_offset_delta_mismatch(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -1203,6 +1479,20 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::list_offsets(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_last_offset_delta_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_last_offset_delta_mismatch(storage).await?;
 
         Ok(())
     }
