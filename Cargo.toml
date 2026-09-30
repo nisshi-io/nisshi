@@ -118,7 +118,7 @@ libsql = { version = "0.9.18", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
 nanoid = "0.4.0"
 nonzero_ext = "0.3.0"
-num-bigint = "0.4"
+num-bigint = "0.5"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 opentelemetry = "0.32.0"
 opentelemetry-otlp = "0.32.0"
