@@ -75,3 +75,4 @@ pretty_assertions.workspace = true
 slatedb.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage.workspace = true
+traceforge.workspace = true

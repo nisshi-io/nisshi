@@ -88,7 +88,7 @@ mod tests;
 const APPLICATION_JSON: &str = "application/json";
 
 #[derive(Clone, Debug)]
-pub(crate) struct DynoStore {
+pub struct DynoStore {
     cluster: String,
     node: i32,
     advertised_listener: Url,
@@ -369,7 +369,7 @@ fn json_content_type() -> Attributes {
 }
 
 impl DynoStore {
-    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
+    pub fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
         Self {
             cluster: cluster.into(),
             node,
@@ -387,18 +387,18 @@ impl DynoStore {
         }
     }
 
-    pub(crate) fn advertised_listener(self, advertised_listener: Url) -> Self {
+    pub fn advertised_listener(self, advertised_listener: Url) -> Self {
         Self {
             advertised_listener,
             ..self
         }
     }
 
-    pub(crate) fn schemas(self, schemas: Option<Registry>) -> Self {
+    pub fn schemas(self, schemas: Option<Registry>) -> Self {
         Self { schemas, ..self }
     }
 
-    pub(crate) fn lake(self, lake: Option<House>) -> Self {
+    pub fn lake(self, lake: Option<House>) -> Self {
         Self { lake, ..self }
     }
 
@@ -641,13 +641,20 @@ impl Storage for DynoStore {
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         if let Some(metadata) = self.topic_metadata(topic).await? {
-            self.meta
-                .with_mut(&self.object_store, |meta| {
-                    _ = meta.topics.remove(metadata.topic.name.as_str());
-                    Ok(())
-                })
-                .await?;
-
+            // Metadata is removed *last*, only once both cleanups below
+            // have actually succeeded. Storage paths are keyed by topic
+            // name, not a UUID, so if metadata were removed first (as it
+            // used to be) and a later step then failed, a retry would find
+            // no metadata, report `UnknownTopicOrPartition` without
+            // retrying anything, and leave the partition's record objects
+            // orphaned at that name-keyed path forever - permanently
+            // blocking any topic later recreated with the same name
+            // (`PutMode::Create` colliding with the orphan). Leaving
+            // metadata in place until cleanup is confirmed done means a
+            // retry after a transient failure here finds the topic again
+            // and finishes the job; `delete_stream` over an
+            // already-emptied prefix is a no-op, so retrying the whole
+            // sequence is safe.
             let prefix = Path::from(format!(
                 "clusters/{}/topics/{}/",
                 self.cluster, metadata.topic.name,
@@ -705,6 +712,14 @@ impl Storage for DynoStore {
                 .delete_stream(locations)
                 .try_collect::<Vec<Path>>()
                 .await?;
+
+            self.meta
+                .with_mut(&self.object_store, |meta| {
+                    _ = meta.topics.remove(metadata.topic.name.as_str());
+                    Ok(())
+                })
+                .await?;
+
             Ok(ErrorCode::None)
         } else {
             Ok(ErrorCode::UnknownTopicOrPartition)
@@ -821,62 +836,67 @@ impl Storage for DynoStore {
 
             Ok(offset)
         } else {
+            // Idempotent sequence numbers are checked here but only
+            // *advanced* after the record write below succeeds (see the
+            // second check further down). Checking first, without
+            // mutating, still rejects a duplicate or out-of-order batch
+            // before any watermark bump or write happens below - but
+            // durably advancing the sequence only after the write means a
+            // failure writing the record can never be mistaken, on the
+            // client's mandatory retry, for a duplicate of a batch that
+            // was never actually written.
             if deflated.is_idempotent() {
                 self.meta
-                .with_mut(&self.object_store, |meta| {
-                    let Some(pd) = meta.producers.get_mut(&deflated.producer_id) else {
-                        debug!(producer_id = deflated.producer_id, ?meta.producers);
-                        return Err(Error::Api(ErrorCode::UnknownProducerId));
-                    };
+                    .with(&self.object_store, |meta| {
+                        let Some(pd) = meta.producers.get(&deflated.producer_id) else {
+                            debug!(producer_id = deflated.producer_id, ?meta.producers);
+                            return Err(Error::Api(ErrorCode::UnknownProducerId));
+                        };
 
-                    let Some(mut current) = pd.sequences.last_entry() else {
-                        debug!(last_entry = ?pd.sequences.last_entry());
-                        return Err(Error::Api(ErrorCode::UnknownServerError));
-                    };
+                        let Some((current_epoch, sequences)) = pd.sequences.last_key_value() else {
+                            debug!(last_entry = ?pd.sequences.last_key_value());
+                            return Err(Error::Api(ErrorCode::UnknownServerError));
+                        };
 
-                    if current.key() != &deflated.producer_epoch {
-                        debug!(current = ?current.key(), producer_epoch = deflated.producer_epoch);
-                        return Err(Error::Api(ErrorCode::ProducerFenced));
-                    }
-
-                    let sequences = current.get_mut();
-                    debug!(?sequences);
-
-                    match sequences
-                        .entry(topition.topic.clone())
-                        .or_default()
-                        .entry(topition.partition)
-                        .or_default()
-                    {
-                        sequence if *sequence < deflated.base_sequence => {
-                            debug!(?sequence, base_sequence = deflated.base_sequence);
-
-                            Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+                        if current_epoch != &deflated.producer_epoch {
+                            debug!(?current_epoch, producer_epoch = deflated.producer_epoch);
+                            return Err(Error::Api(ErrorCode::ProducerFenced));
                         }
 
-                        sequence if *sequence > deflated.base_sequence => {
-                            debug!(?sequence, base_sequence = deflated.base_sequence);
+                        let sequence = sequences
+                            .get(&topition.topic)
+                            .and_then(|partitions| partitions.get(&topition.partition))
+                            .copied()
+                            .unwrap_or_default();
 
-                            Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
+                        match sequence {
+                            sequence if sequence < deflated.base_sequence => {
+                                debug!(?sequence, base_sequence = deflated.base_sequence);
+
+                                Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+                            }
+
+                            sequence if sequence > deflated.base_sequence => {
+                                debug!(?sequence, base_sequence = deflated.base_sequence);
+
+                                Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
+                            }
+
+                            _ => Ok(()),
+                        }
+                    })
+                    .await
+                    .inspect_err(|err| {
+                        if matches!(
+                            err,
+                            Error::Api(ErrorCode::OutOfOrderSequenceNumber)
+                                | Error::Api(ErrorCode::DuplicateSequenceNumber)
+                        ) {
+                            return;
                         }
 
-                        sequence => {
-                            debug!(?sequence, delta = deflated.last_offset_delta + 1);
-
-                            *sequence += deflated.last_offset_delta + 1;
-                            Ok(())
-                        }
-                    }
-                })
-                .await
-                .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
-                .inspect_err(|err| {
-                    if matches!(err, Error::Api(ErrorCode::OutOfOrderSequenceNumber) | Error::Api(ErrorCode::DuplicateSequenceNumber)) {
-                        return
-                    }
-
-                    error!(?err, transaction_id, ?topition);
-                })?;
+                        error!(?err, transaction_id, ?topition);
+                    })?;
             }
 
             if let Some(ref registry) = self.schemas {
@@ -991,6 +1011,15 @@ impl Storage for DynoStore {
                 self.cluster, topition.topic, topition.partition, offset,
             ));
 
+            // `deflated` is moved into `encode`, so the fields the
+            // post-write sequence advance below needs are copied out
+            // first.
+            let is_idempotent = deflated.is_idempotent();
+            let producer_id = deflated.producer_id;
+            let producer_epoch = deflated.producer_epoch;
+            let base_sequence = deflated.base_sequence;
+            let last_offset_delta = deflated.last_offset_delta;
+
             let payload = self.encode(deflated).inspect_err(|err| debug!(?err))?;
 
             _ = self
@@ -1007,6 +1036,82 @@ impl Storage for DynoStore {
                 .await
                 .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
                 .inspect_err(|error| error!(?error, transaction_id, ?topition))?;
+
+            // The record is now durably written; only now is it safe to
+            // durably advance the idempotent sequence number. This
+            // re-checks (not just re-applies) because the pre-check above
+            // and this commit are not atomic with each other - a
+            // concurrent request for the same producer/epoch/partition
+            // could have advanced the sequence in between, in which case
+            // this reports the same rejection it would have anyway, after
+            // a record has already been written for what turned out to be
+            // a fenced/racing request. That's a narrow, pre-existing risk
+            // for two genuinely concurrent requests on the same producer
+            // epoch (already out of contract for a well-behaved idempotent
+            // producer, which serializes its own sends per partition);
+            // it's a substantial improvement over unconditionally losing
+            // data on any transient failure of the write above.
+            if is_idempotent {
+                self.meta
+                    .with_mut(&self.object_store, |meta| {
+                        let Some(pd) = meta.producers.get_mut(&producer_id) else {
+                            debug!(producer_id, ?meta.producers);
+                            return Err(Error::Api(ErrorCode::UnknownProducerId));
+                        };
+
+                        let Some(mut current) = pd.sequences.last_entry() else {
+                            debug!(last_entry = ?pd.sequences.last_entry());
+                            return Err(Error::Api(ErrorCode::UnknownServerError));
+                        };
+
+                        if current.key() != &producer_epoch {
+                            debug!(current = ?current.key(), producer_epoch);
+                            return Err(Error::Api(ErrorCode::ProducerFenced));
+                        }
+
+                        let sequences = current.get_mut();
+                        debug!(?sequences);
+
+                        match sequences
+                            .entry(topition.topic.clone())
+                            .or_default()
+                            .entry(topition.partition)
+                            .or_default()
+                        {
+                            sequence if *sequence < base_sequence => {
+                                debug!(?sequence, base_sequence);
+
+                                Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+                            }
+
+                            sequence if *sequence > base_sequence => {
+                                debug!(?sequence, base_sequence);
+
+                                Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
+                            }
+
+                            sequence => {
+                                debug!(?sequence, delta = last_offset_delta + 1);
+
+                                *sequence += last_offset_delta + 1;
+                                Ok(())
+                            }
+                        }
+                    })
+                    .await
+                    .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
+                    .inspect_err(|err| {
+                        if matches!(
+                            err,
+                            Error::Api(ErrorCode::OutOfOrderSequenceNumber)
+                                | Error::Api(ErrorCode::DuplicateSequenceNumber)
+                        ) {
+                            return;
+                        }
+
+                        error!(?err, transaction_id, ?topition);
+                    })?;
+            }
 
             Ok(offset)
         }
@@ -2459,8 +2564,6 @@ impl Storage for DynoStore {
 
                 let txn_detail = current_epoch.get_mut();
 
-                let mut produced = vec![];
-
                 if txn_detail.state == Some(TxnState::Begin) {
                     assert_eq!(
                         Some(TxnState::Begin),
@@ -2470,7 +2573,28 @@ impl Storage for DynoStore {
                             TxnState::PrepareAbort
                         })
                     );
+                }
 
+                let mut produced = vec![];
+
+                // Recomputed from whatever is still in `produces` whenever
+                // we're in (freshly, or already) a `Prepare*` state, not
+                // only on a fresh transition out of `Begin`: `produces`
+                // isn't cleared until every marker below has been written
+                // and the transaction moves past `Prepare*` (further down
+                // in `txn_end`), so a retry after a partial failure here
+                // (some partitions' end-of-transaction marker written,
+                // others not) recomputes the same set and retries the
+                // missing ones, rather than computing an empty set and
+                // silently completing the transaction with some partitions
+                // never marked. Retrying a partition whose marker already
+                // landed just writes a second, harmless marker at a new
+                // offset - strictly better than one that's missing
+                // forever.
+                if matches!(
+                    txn_detail.state,
+                    Some(TxnState::PrepareCommit) | Some(TxnState::PrepareAbort)
+                ) {
                     for (topic, partitions) in &txn_detail.produces {
                         for (partition, offset_range) in partitions {
                             debug!(?topic, partition, ?offset_range);

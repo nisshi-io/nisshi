@@ -16,6 +16,9 @@ mod dynostore;
 mod factory;
 mod gcs;
 
-pub use factory::GoogleCloudStorageEngineFactory;
-pub use factory::MemoryEngineFactory;
-pub use factory::S3OptimisticConcurrencyEngineFactory;
+pub use {
+    dynostore::DynoStore,
+    factory::{
+        GoogleCloudStorageEngineFactory, MemoryEngineFactory, S3OptimisticConcurrencyEngineFactory,
+    },
+};
