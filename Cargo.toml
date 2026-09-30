@@ -120,11 +120,11 @@ nanoid = "0.4.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
-opentelemetry = "0.31.0"
-opentelemetry-otlp = "0.31.0"
-opentelemetry-semantic-conventions = "0.31.0"
-opentelemetry-stdout = "0.31.0"
-opentelemetry_sdk = { version = "0.31.0", features = ["testing"] }
+opentelemetry = "0.32.0"
+opentelemetry-otlp = "0.32.0"
+opentelemetry-semantic-conventions = "0.32.0"
+opentelemetry-stdout = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
 ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
 parquet = {version = "57", features = ["async"]}
@@ -185,7 +185,7 @@ tokio-rustls = "0.26.4"
 tokio-util = { version = "0.7", features = ["full"] }
 tracing = "0.1"
 tracing-core = { version = "0.1" }
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 turso = "0.7.1"
 url = { version = "2.5.4", features = ["serde"] }
