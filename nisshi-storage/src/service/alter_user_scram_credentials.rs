@@ -49,7 +49,21 @@ where
 
         if let Some(deletions) = input.request.deletions {
             for deletion in deletions {
-                let mechanism = ScramMechanism::try_from(deletion.mechanism)?;
+                let mechanism = match ScramMechanism::try_from(deletion.mechanism) {
+                    Ok(mechanism) => mechanism,
+                    Err(error) => {
+                        debug!(?error, "invalid scram mechanism");
+
+                        results.push(
+                            AlterUserScramCredentialsResult::default()
+                                .user(deletion.name.clone())
+                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
+                                .error_message(Some("".into())),
+                        );
+
+                        continue;
+                    }
+                };
 
                 results.push(
                     self.storage
@@ -73,30 +87,41 @@ where
 
         if let Some(upsertions) = input.request.upsertions {
             for upsertion in upsertions {
-                let (mechanism, stored_key, server_key) =
-                    ScramMechanism::try_from(upsertion.mechanism)
-                        .inspect(|mechanism| debug!(?mechanism))
-                        .map(|mechanism| {
-                            if mechanism == ScramMechanism::Scram256 {
-                                let (client_key, server_key) =
-                                    derive_keys::<Sha256>(&upsertion.salted_password);
+                let mechanism = match ScramMechanism::try_from(upsertion.mechanism)
+                    .inspect(|mechanism| debug!(?mechanism))
+                {
+                    Ok(mechanism) => mechanism,
+                    Err(error) => {
+                        debug!(?error, "invalid scram mechanism");
 
-                                (
-                                    mechanism,
-                                    Bytes::copy_from_slice(&Sha256::digest(client_key)[..]),
-                                    Bytes::copy_from_slice(&server_key[..]),
-                                )
-                            } else {
-                                let (client_key, server_key) =
-                                    derive_keys::<Sha512>(&upsertion.salted_password);
+                        results.push(
+                            AlterUserScramCredentialsResult::default()
+                                .user(upsertion.name.clone())
+                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
+                                .error_message(Some("".into())),
+                        );
 
-                                (
-                                    mechanism,
-                                    Bytes::copy_from_slice(&Sha512::digest(client_key)[..]),
-                                    Bytes::copy_from_slice(&server_key[..]),
-                                )
-                            }
-                        })?;
+                        continue;
+                    }
+                };
+
+                let (stored_key, server_key) = if mechanism == ScramMechanism::Scram256 {
+                    let (client_key, server_key) =
+                        derive_keys::<Sha256>(&upsertion.salted_password);
+
+                    (
+                        Bytes::copy_from_slice(&Sha256::digest(client_key)[..]),
+                        Bytes::copy_from_slice(&server_key[..]),
+                    )
+                } else {
+                    let (client_key, server_key) =
+                        derive_keys::<Sha512>(&upsertion.salted_password);
+
+                    (
+                        Bytes::copy_from_slice(&Sha512::digest(client_key)[..]),
+                        Bytes::copy_from_slice(&server_key[..]),
+                    )
+                };
 
                 let credential = ScramCredential {
                     salt: upsertion.salt,

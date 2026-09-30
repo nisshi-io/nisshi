@@ -11,7 +11,12 @@ cargo-fuzz = true
 [dependencies]
 bytes.workspace = true
 libfuzzer-sys.workspace = true
-nisshi-sans-io.workspace = true
+nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
+nisshi-storage-dynostore.workspace = true
+nisshi-storage.workspace = true
+rama.workspace = true
+tokio.workspace = true
+url.workspace = true
 
 [[bin]]
 name = "generate_seeds"
@@ -48,6 +53,167 @@ bench = false
 [[bin]]
 name = "fuzz_varint"
 path = "fuzz_targets/fuzz_varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_create_topics_storage"
+path = "fuzz_targets/fuzz_create_topics_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_alter_user_scram_credentials_storage"
+path = "fuzz_targets/fuzz_alter_user_scram_credentials_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_describe_user_scram_credentials_storage"
+path = "fuzz_targets/fuzz_describe_user_scram_credentials_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_create_acls_storage"
+path = "fuzz_targets/fuzz_create_acls_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_describe_acls_storage"
+path = "fuzz_targets/fuzz_describe_acls_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_consumer_group_describe_storage"
+path = "fuzz_targets/fuzz_consumer_group_describe_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_delete_groups_storage"
+path = "fuzz_targets/fuzz_delete_groups_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_delete_records_storage"
+path = "fuzz_targets/fuzz_delete_records_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_delete_topics_storage"
+path = "fuzz_targets/fuzz_delete_topics_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_describe_cluster_storage"
+path = "fuzz_targets/fuzz_describe_cluster_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_describe_configs_storage"
+path = "fuzz_targets/fuzz_describe_configs_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_describe_groups_storage"
+path = "fuzz_targets/fuzz_describe_groups_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_describe_topic_partitions_storage"
+path = "fuzz_targets/fuzz_describe_topic_partitions_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_fetch_storage"
+path = "fuzz_targets/fuzz_fetch_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_find_coordinator_storage"
+path = "fuzz_targets/fuzz_find_coordinator_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_get_telemetry_subscriptions_storage"
+path = "fuzz_targets/fuzz_get_telemetry_subscriptions_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_incremental_alter_configs_storage"
+path = "fuzz_targets/fuzz_incremental_alter_configs_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_init_producer_id_storage"
+path = "fuzz_targets/fuzz_init_producer_id_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_list_groups_storage"
+path = "fuzz_targets/fuzz_list_groups_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_list_offsets_storage"
+path = "fuzz_targets/fuzz_list_offsets_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_list_partition_reassignments_storage"
+path = "fuzz_targets/fuzz_list_partition_reassignments_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_metadata_storage"
+path = "fuzz_targets/fuzz_metadata_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_produce_storage"
+path = "fuzz_targets/fuzz_produce_storage.rs"
 test = false
 doc = false
 bench = false

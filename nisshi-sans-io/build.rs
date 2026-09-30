@@ -166,6 +166,63 @@ fn kind(
     }
 }
 
+/// Whether a field's generated type is `Option`-wrapped, mirroring the
+/// branching in [`kind`] above (needed to pick the right `arbitrary(with =
+/// ..)` helper for a scalar field, since that helper must return exactly the
+/// field's generated type).
+fn is_optional(parent: Option<&Field>, f: &Field) -> bool {
+    f.tag().is_some()
+        || f.kind().is_sequence()
+        || !(f.nullable().is_none() && f.versions().is_mandatory(parent.map(Field::versions)))
+}
+
+/// An `#[arbitrary(..)]` field attribute for Kafka kinds the `arbitrary`
+/// crate can't derive support for on its own:
+///
+/// - `bytes` maps to `bytes::Bytes`, a foreign type the orphan rule stops us
+///   implementing `Arbitrary` for here, so fuzzed fields are instead built
+///   from an arbitrary `Vec<u8>` via `nisshi-sans-io/src/arbitrary_support.rs`.
+/// - `records` maps to `crate::RecordBatch`, whose `crc`/`batch_length`
+///   fields are checksums/lengths over the rest of the batch that a naive
+///   derive would produce inconsistent, invalid values for; `Default`
+///   (an empty batch) is used instead.
+///
+/// Every other kind already has a native `Arbitrary` impl (or, for a nested
+/// message struct, one this generator also derives), so no attribute is
+/// needed and derive's own field-by-field generation is used as-is.
+///
+/// Neither `bytes` nor `records` occurs as a sequence in the upstream Kafka
+/// message descriptors (only as a scalar or `tag`/nullable-optional scalar),
+/// so only those two shapes are handled here.
+fn arbitrary_field_attribute(parent: Option<&Field>, field: &Field) -> TokenStream {
+    match field.kind().name() {
+        "bytes" => {
+            // Only `crate::arbitrary_support::bytes` is checked in (rather than
+            // also a hand-written `bytes_option` counterpart) because no
+            // broker-listened message currently has a nullable `bytes` field;
+            // a hand-written function nothing generates a call to would be
+            // dead code. Should that change, this inline closure calls it.
+            let with = if is_optional(parent, field) {
+                quote! {
+                    |u: &mut arbitrary::Unstructured<'_>| crate::arbitrary_support::bytes(u).map(Some)
+                }
+            } else {
+                quote!(crate::arbitrary_support::bytes)
+            };
+
+            quote! {
+                #[cfg_attr(feature = "arbitrary", arbitrary(with = #with))]
+            }
+        }
+
+        "records" => quote! {
+            #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+        },
+
+        _ => quote!(),
+    }
+}
+
 fn tag_kind(
     _parent: Option<&Field>,
     module: &syn::Path,
@@ -265,6 +322,7 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
         quote! {
             #[non_exhaustive]
             #[derive(Clone, Debug, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
+            #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
             #[serde(from = "mezzanine::Body")]
             #[serde(into = "mezzanine::Body")]
             #[doc = "A Kafka API request or response message body."]
@@ -326,9 +384,11 @@ fn visibility_field_kind(
         .map(|field| {
             let ident = field.ident();
             let kind = kind(parent, module, field, dependencies);
+            let arbitrary_attr = include_tag.then(|| arbitrary_field_attribute(parent, field));
 
             field.about().map_or(
                 quote! {
+                    #arbitrary_attr
                     #visibility #ident: #kind
                 },
                 |about| {
@@ -336,6 +396,7 @@ fn visibility_field_kind(
 
                     quote! {
                         #[doc = #about]
+                        #arbitrary_attr
                         #visibility #ident: #kind
                     }
                 },
@@ -632,6 +693,7 @@ fn message_struct(
         quote! {
             #[non_exhaustive]
             #derived
+            #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
             #visibility struct #name {
                 #(#vfk,)*
             }
@@ -896,6 +958,7 @@ fn common_struct(
         quote! {
             #[non_exhaustive]
             #derived
+            #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
             #visibility struct #name {
                 #(#vfk,)*
             }

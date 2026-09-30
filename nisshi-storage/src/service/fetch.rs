@@ -413,27 +413,45 @@ where
         let input = input.into();
 
         let responses = Some(if let Some(topics) = input.request.topics {
-            let isolation_level = input
-                .request
-                .isolation_level
-                .map_or(Ok(IsolationLevel::ReadUncommitted), |isolation| {
-                    IsolationLevel::try_from(isolation)
-                })?;
+            // These fields apply to the whole request, and (unlike e.g.
+            // ListOffsets) `FetchResponse` has a top-level `error_code` for
+            // exactly this: a malformed value here reports `INVALID_REQUEST`
+            // once, rather than leaking the low-level parse error.
+            let isolation_level = input.request.isolation_level.map_or(
+                Ok(IsolationLevel::ReadUncommitted),
+                IsolationLevel::try_from,
+            );
 
-            let max_wait_ms =
-                u64::try_from(input.request.max_wait_ms).map(Duration::from_millis)?;
+            let max_wait_ms = u64::try_from(input.request.max_wait_ms).map(Duration::from_millis);
 
-            let min_bytes = u32::try_from(input.request.min_bytes)?;
+            let min_bytes = u32::try_from(input.request.min_bytes);
 
             const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
 
-            let mut max_bytes =
-                input
-                    .request
-                    .max_bytes
-                    .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
-                        u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
-                    })?;
+            let max_bytes = input
+                .request
+                .max_bytes
+                .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
+                    u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
+                });
+
+            let (isolation_level, max_wait_ms, min_bytes, mut max_bytes) =
+                match (isolation_level, max_wait_ms, min_bytes, max_bytes) {
+                    (Ok(isolation_level), Ok(max_wait_ms), Ok(min_bytes), Ok(max_bytes)) => {
+                        (isolation_level, max_wait_ms, min_bytes, max_bytes)
+                    }
+
+                    malformed => {
+                        debug!(?malformed, "malformed fetch request");
+
+                        return Ok(FetchResponse::default()
+                            .throttle_time_ms(Some(0))
+                            .error_code(Some(ErrorCode::InvalidRequest.into()))
+                            .session_id(Some(0))
+                            .node_endpoints(Some([].into()))
+                            .responses(None));
+                    }
+                };
 
             self.fetch(
                 max_wait_ms,
