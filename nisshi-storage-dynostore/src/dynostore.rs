@@ -1863,6 +1863,17 @@ impl Storage for DynoStore {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
+                if group_id.split('/').any(str::is_empty) {
+                    // `Path::from` drops empty segments, so "", "/", "a/" etc.
+                    // would widen the prefix delete below to every group.
+                    results.push(
+                        DeletableGroupResult::default()
+                            .group_id(group_id.into())
+                            .error_code(ErrorCode::InvalidGroupId.into()),
+                    );
+                    continue;
+                }
+
                 let location = Path::from(format!(
                     "clusters/{}/groups/consumers/{}.json",
                     self.cluster, group_id,
