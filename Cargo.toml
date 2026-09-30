@@ -114,7 +114,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
 iceberg-datafusion = "0.10.1"
-iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3"] }
+iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3", "opendal-fs", "opendal-memory"] }
 indicatif = "0.18.3"
 jsonschema = "0.45.0"
 lazy_static = "1.4.0"

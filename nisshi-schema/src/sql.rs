@@ -265,6 +265,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mysql_array_cast_form() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // sqlparser 0.61 accepts a trailing ARRAY in every dialect, not
+        // just MySQL's: `cast(... as date array)`. This isn't a data type
+        // nisshi supports for this feature, so it must still be rejected.
+        assert!(parse_generated_expr("cast(meta.timestamp as date array)").is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn rejects_garbage_without_panicking() -> Result<()> {
         let _guard = init_tracing()?;
 

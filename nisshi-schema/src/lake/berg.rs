@@ -27,7 +27,10 @@ use async_trait::async_trait;
 use iceberg::memory::MemoryCatalogBuilder;
 use iceberg::{
     Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
-    io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY},
+    io::{
+        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+        S3_SESSION_TOKEN,
+    },
     spec::{DataFileFormat, Schema, TableMetadataBuilder},
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
@@ -44,7 +47,7 @@ use iceberg::{
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use nisshi_sans_io::{describe_configs_response::DescribeConfigsResult, record::inflated::Batch};
 use parquet::file::properties::WriterProperties;
 use tracing::{debug, error};
@@ -57,10 +60,23 @@ fn env_mapping(k: &str) -> Option<&str> {
     match k {
         "AWS_ACCESS_KEY_ID" => Some(S3_ACCESS_KEY_ID),
         "AWS_SECRET_ACCESS_KEY" => Some(S3_SECRET_ACCESS_KEY),
+        "AWS_SESSION_TOKEN" => Some(S3_SESSION_TOKEN),
         "AWS_DEFAULT_REGION" => Some(S3_REGION),
         "AWS_ENDPOINT" => Some(S3_ENDPOINT),
         _ => None,
     }
+}
+
+/// Parses an env var the same way `object_store`'s own `ConfigValue<bool>`
+/// does, so `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` means the same thing here as
+/// it does for nisshi's own S3 clients.
+fn env_var_is_truthy(name: &str) -> bool {
+    vars().find(|(k, _)| k == name).is_some_and(|(_, v)| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "y"
+        )
+    })
 }
 
 pub fn env_s3_props() -> impl Iterator<Item = (String, String)> {
@@ -171,18 +187,28 @@ pub async fn iceberg_catalog(catalog: &Url, warehouse: Option<String>) -> Result
             // iceberg-storage-opendal defaults to virtual-host-style S3
             // addressing. The storage built into iceberg 0.8 used
             // path-style, so keep path-style as the default rather than
-            // change addressing as a side effect of this upgrade. Catalog
-            // server and per-table config still override it.
-            _ = props
-                .entry(S3_PATH_STYLE_ACCESS.to_string())
-                .or_insert_with(|| "true".to_string());
+            // change addressing as a side effect of this upgrade. This is
+            // a client prop, and iceberg-catalog-rest 0.10 applies client
+            // props last in both create_table and load_table, so it wins
+            // over catalog server and per-table config, not the other way
+            // around. An endpoint that only accepts virtual-host addressing
+            // (S3 Express directory buckets, access points, some
+            // S3-compatible stores) needs a way to opt out, so honour the
+            // same env var nisshi's own object_store S3 clients already
+            // read via `from_env()`.
+            if !env_var_is_truthy("AWS_VIRTUAL_HOSTED_STYLE_REQUEST") {
+                _ = props
+                    .entry(S3_PATH_STYLE_ACCESS.to_string())
+                    .or_insert_with(|| "true".to_string());
+            }
 
-            // iceberg 0.10 no longer bundles S3 storage, so the catalog
-            // needs an explicit storage factory.
+            // iceberg 0.10 no longer bundles storage backends into the
+            // catalog; it needs an explicit factory. Resolve by URL scheme
+            // (s3, file, memory) the way iceberg 0.8's FileIO::from_path
+            // did, rather than hardcoding S3 and breaking file:// and
+            // other non-S3 warehouse locations.
             let catalog = RestCatalogBuilder::default()
-                .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-                    customized_credential_load: None,
-                }))
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
                 .load("rest", props)
                 .await
                 .map_err(|e| Error::Iceberg(Box::new(e)))?;
