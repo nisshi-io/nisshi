@@ -20,7 +20,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use cached::stores::ExpiringSizedCache;
+use cached::{Cached as _, stores::TtlSortedCache};
 use futures::stream::BoxStream;
 use governor::{DefaultDirectRateLimiter, Jitter, Quota, RateLimiter};
 use nisshi_storage::Result;
@@ -34,7 +34,7 @@ const DEFAULT_JITTER: Duration = Duration::from_millis(0);
 
 #[derive(Clone)]
 pub(crate) struct PutRateLimiter<O> {
-    entries: Arc<Mutex<ExpiringSizedCache<Path, Arc<DefaultDirectRateLimiter>>>>,
+    entries: Arc<Mutex<TtlSortedCache<Path, Arc<DefaultDirectRateLimiter>>>>,
     rate_per_second: Option<NonZero<u32>>,
     jitter: Option<Duration>,
     object_store: O,
@@ -56,7 +56,12 @@ impl<O> PutRateLimiter<O> {
     pub(crate) fn new(object_store: O, ttl: Duration) -> Self {
         Self {
             object_store,
-            entries: Arc::new(Mutex::new(ExpiringSizedCache::new(ttl))),
+            entries: Arc::new(Mutex::new(
+                TtlSortedCache::builder()
+                    .ttl(ttl)
+                    .build()
+                    .expect("rate limiter ttl must be non-zero"),
+            )),
             rate_per_second: Default::default(),
             jitter: Default::default(),
         }
@@ -228,6 +233,35 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    /// Inserting sweeps rate limiters that have already expired, so paths
+    /// that are never written again don't accumulate.
+    #[tokio::test]
+    async fn sweep_evicts_expired_entries_on_insert() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let ttl = Duration::from_millis(100);
+        let prl =
+            PutRateLimiter::new(InMemory::new(), ttl).with_rate_per_second(NonZeroU32::new(1_000));
+
+        for (i, id) in ["a", "b"].into_iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(ttl * 2).await;
+            }
+
+            _ = prl
+                .put_opts(
+                    &Path::from(id),
+                    PutPayload::from(Bytes::from_static(b"12321")),
+                    PutOptions::default(),
+                )
+                .await?;
+
+            assert_eq!(1, prl.entries.lock().map(|guard| guard.len())?);
+        }
+
+        Ok(())
     }
 
     #[tokio::test]
