@@ -1718,44 +1718,93 @@ impl From<Compression> for i16 {
     }
 }
 
+/// Wraps a decompressing [`Read`] and errors instead of reading past `limit`
+/// total bytes, so a small compressed payload can never decompress into an
+/// unbounded amount of memory. Deliberately errors rather than silently
+/// behaving like end of stream (unlike [`Read::take`]), so a batch that
+/// exceeds the limit is rejected, not misread as a short, valid one.
+struct LimitedRead<R> {
+    inner: R,
+    remaining: usize,
+}
+
+impl<R: Read> Read for LimitedRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if self.remaining == 0 {
+            // At budget. Probe for one more byte rather than erroring
+            // outright: a stream that ends exactly at the limit must still
+            // read as a clean EOF, not a violation.
+            let mut probe = [0u8; 1];
+            return if self.inner.read(&mut probe)? == 0 {
+                Ok(0)
+            } else {
+                Err(io::Error::other(
+                    "decompressed batch exceeds the maximum allowed size",
+                ))
+            };
+        }
+
+        let cap = buf.len().min(self.remaining);
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= n;
+        Ok(n)
+    }
+}
+
 impl Compression {
-    fn inflator(&self, mut deflated: impl BufRead + 'static) -> Result<Box<dyn Read>> {
+    fn inflator(
+        &self,
+        mut deflated: impl BufRead + 'static,
+        limit: usize,
+    ) -> Result<Box<dyn Read>> {
         match self {
             Compression::None => Ok(Box::new(deflated)),
-            Compression::Gzip => Ok(Box::new(GzDecoder::new(deflated))),
+            Compression::Gzip => Ok(Box::new(LimitedRead {
+                inner: GzDecoder::new(deflated),
+                remaining: limit,
+            })),
             Compression::Snappy => {
                 let mut input = vec![];
                 _ = deflated.read_to_end(&mut input)?;
                 debug!(?input);
 
+                // https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
+                let payload = if input.starts_with(b"\x82SNAPPY\0") {
+                    if let (b"\x82SNAPPY\0", remainder) = input.split_at(8) {
+                        let (version, remainder) = remainder.split_at(4);
+                        let version: i32 = version.try_into().map(i32::from_be_bytes)?;
+
+                        let (compatible_version, remainder) = remainder.split_at(4);
+                        let compatible_version: i32 =
+                            compatible_version.try_into().map(i32::from_be_bytes)?;
+
+                        let (block_size, _) = remainder.split_at(4);
+                        let block_size: i32 = block_size.try_into().map(i32::from_be_bytes)?;
+
+                        debug!(version, compatible_version, block_size);
+                    }
+
+                    let skip_header = &input[20..];
+                    debug!(?skip_header);
+                    skip_header
+                } else {
+                    &input[..]
+                };
+
+                let claimed_len = snap::raw::decompress_len(payload)?;
+
+                if claimed_len > limit {
+                    return Err(Error::MessageMaxSizeExceeded(claimed_len));
+                }
+
                 let mut decoder = snap::raw::Decoder::new();
 
                 decoder
-                    .decompress_vec(
-                        // https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
-                        if input.starts_with(b"\x82SNAPPY\0") {
-                            if let (b"\x82SNAPPY\0", remainder) = input.split_at(8) {
-                                let (version, remainder) = remainder.split_at(4);
-                                let version: i32 = version.try_into().map(i32::from_be_bytes)?;
-
-                                let (compatible_version, remainder) = remainder.split_at(4);
-                                let compatible_version: i32 =
-                                    compatible_version.try_into().map(i32::from_be_bytes)?;
-
-                                let (block_size, _) = remainder.split_at(4);
-                                let block_size: i32 =
-                                    block_size.try_into().map(i32::from_be_bytes)?;
-
-                                debug!(version, compatible_version, block_size);
-                            }
-
-                            let skip_header = &input[20..];
-                            debug!(?skip_header);
-                            skip_header
-                        } else {
-                            &input[..]
-                        },
-                    )
+                    .decompress_vec(payload)
                     .map_err(Into::into)
                     .map(Bytes::from)
                     .map(|bytes| bytes.reader())
@@ -1764,10 +1813,18 @@ impl Compression {
                     .inspect_err(|err| error!(?err))
             }
             Compression::Lz4 => lz4::Decoder::new(deflated)
+                .map(|inner| LimitedRead {
+                    inner,
+                    remaining: limit,
+                })
                 .map(Box::new)
                 .map(|boxed| boxed as Box<dyn Read>)
                 .map_err(Into::into),
             Compression::Zstd => zstd::stream::read::Decoder::with_buffer(deflated)
+                .map(|inner| LimitedRead {
+                    inner,
+                    remaining: limit,
+                })
                 .map(Box::new)
                 .map(|boxed| boxed as Box<dyn Read>)
                 .map_err(Into::into),
@@ -2311,6 +2368,70 @@ mod tests {
     use std::thread::sleep;
 
     use super::*;
+
+    #[test]
+    fn limited_read_allows_up_to_the_limit() -> Result<()> {
+        let data = vec![7u8; 16];
+        let mut reader = LimitedRead {
+            inner: Cursor::new(data.clone()),
+            remaining: data.len(),
+        };
+
+        let mut out = Vec::new();
+        _ = reader.read_to_end(&mut out)?;
+        assert_eq!(data, out);
+
+        Ok(())
+    }
+
+    #[test]
+    fn limited_read_errors_past_the_limit() {
+        let data = vec![7u8; 17];
+        let mut reader = LimitedRead {
+            inner: Cursor::new(data),
+            remaining: 16,
+        };
+
+        let mut out = Vec::new();
+        assert!(reader.read_to_end(&mut out).is_err());
+    }
+
+    #[test]
+    fn snappy_header_claiming_oversized_length_is_rejected() {
+        // A minimal snappy block is just the uncompressed-length varint
+        // (little-endian base-128, continuation bit set on all but the last
+        // byte); `decompress_len` reads only that, so no compressed body is
+        // needed to exercise the pre-check.
+        fn varint(mut value: usize) -> Vec<u8> {
+            let mut buf = Vec::new();
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                buf.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+            buf
+        }
+
+        let claimed = 2_000_000_000usize; // < u32::MAX, well over the 100 MiB limit
+        let header = varint(claimed);
+        assert!(header.len() <= 5, "a u32 claim fits in 5 bytes");
+
+        let err = Compression::Snappy
+            .inflator(
+                Cursor::new(header),
+                crate::record::codec::MAX_DECOMPRESSED_BATCH_BYTES,
+            )
+            .err()
+            .expect("a claimed length over the limit must be rejected before decompressing");
+
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(len) if len == claimed));
+    }
 
     #[test]
     fn frame_elapsed_millis() {

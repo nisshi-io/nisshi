@@ -35,6 +35,15 @@ use tracing::{debug, instrument};
 /// it just grows the buffer past this point as elements are pushed.
 pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 
+/// Upper bound on how many bytes a produce batch is allowed to decompress to.
+/// Without this, a few KB of zstd/gzip/lz4 input representing a long run of
+/// repeated bytes can decompress into gigabytes, and a Snappy block's header
+/// claims its decompressed length before any data is read. Matches
+/// `nisshi-service`'s `DEFAULT_MAXIMUM_FRAME_SIZE` in value only — kept as its
+/// own constant since this crate is sans-I/O and has no access to that
+/// connection-level setting.
+pub(crate) const MAX_DECOMPRESSED_BATCH_BYTES: usize = 100 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Octets(pub Option<Bytes>);
 
