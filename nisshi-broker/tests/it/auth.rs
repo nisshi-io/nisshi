@@ -645,10 +645,21 @@ async fn not_authenticated() -> Result<()> {
 
 /// `not_authenticated` proves a disallowed api_key is rejected, but not that
 /// it's rejected *before* the body is decoded -- a well-formed request would
-/// pass either way. This corrupts everything after the 4 byte size prefix and
-/// 2 byte api_key: if the peek in `BytesFrameService::serve` didn't actually
-/// skip the body decode and reject first, this would surface as a decode
-/// error instead of `NotAuthenticated`.
+/// pass either way. Truncates the frame right after `correlation_id` and
+/// appends a `client_id` length of `0x7FFF` with no bytes behind it at all
+/// (`client_id` is always a classic 2-byte-length string in the header, even
+/// under a flexible API version, so this doesn't depend on `API_VERSION`): a
+/// real decode attempt must fail trying to read client_id, either with
+/// `MessageMaxSizeExceeded` or an EOF-style decode error, never
+/// `NotAuthenticated`. If the peek in `BytesFrameService::serve` didn't
+/// actually skip the body decode and reject first, this surfaces as one of
+/// those instead.
+///
+/// (An earlier version of this test corrupted every byte after api_key with
+/// `0xFF` instead, which happened to decode as a well-formed request anyway
+/// -- `0xFFFF` reads as a nullable string/array length of `-1`, i.e. "null"
+/// -- so it passed even with the peek disabled and proved nothing. Verified
+/// by disabling the peek and confirming this version goes red.)
 #[tokio::test]
 async fn not_authenticated_rejected_before_body_is_decoded() -> Result<()> {
     let _guard = init_tracing()?;
@@ -665,7 +676,7 @@ async fn not_authenticated_rejected_before_body_is_decoded() -> Result<()> {
 
     let extensions = Extensions::default();
 
-    let mut bytes = Frame::request(
+    let bytes = Frame::request(
         Header::Request {
             api_key: DescribeGroupsRequest::KEY,
             api_version: API_VERSION,
@@ -676,12 +687,10 @@ async fn not_authenticated_rejected_before_body_is_decoded() -> Result<()> {
     )?
     .to_vec();
 
-    // Leave the size prefix (bytes 0..4) and api_key (bytes 4..6) intact --
-    // that's exactly what the peek reads -- and corrupt everything a real
-    // decode would otherwise have to parse.
-    for byte in bytes.iter_mut().skip(6) {
-        *byte = 0xFF;
-    }
+    // size(4) + api_key(2) + api_version(2) + correlation_id(4) = 12 bytes,
+    // then a claimed client_id length of 32767 with nothing behind it.
+    let mut bytes = bytes[..12].to_vec();
+    bytes.extend_from_slice(&0x7FFFi16.to_be_bytes());
 
     assert!(matches!(
         broker

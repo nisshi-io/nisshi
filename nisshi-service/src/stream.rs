@@ -758,10 +758,19 @@ struct ConnectionLimits {
 /// [`TcpContext::pre_authentication_maximum_frame_size`] (clamping, not
 /// substituting, so configuring the full limit below the pre-authentication
 /// one can only tighten what an unauthenticated client may send, never loosen
-/// it). Once [`AuthenticationExtension::is_authenticated`] reports `true` —
-/// or no [`AuthenticationExtension`] is present at all, meaning this listener
-/// has no authentication configured — the full limit alone applies, matching
-/// today's behavior exactly.
+/// it). Once [`AuthenticationExtension::is_authenticated`] reports `true`, the
+/// full limit alone applies, matching today's behavior exactly.
+///
+/// An *absent* [`AuthenticationExtension`] is treated the same as one present
+/// but not yet authenticated, not as "authenticated" -- `BytesFrameService`
+/// only inserts it after a request has already passed the auth check, so the
+/// very first frame on every connection (SASL or not) sees no
+/// `AuthenticationExtension` at all. Whether "no authentication configured"
+/// applies at all is a separate question, answered by whether
+/// [`PreAuthenticationMaximumFrameSizeExtension`] is present (see the `match`
+/// below): a listener with no SASL configured never has that extension
+/// either, so it falls through to the full limit regardless of
+/// `AuthenticationExtension`'s presence.
 fn effective_maximum_frame_size(extensions: &Extensions) -> Option<usize> {
     let full = extensions
         .get_ref::<MaximumFrameSizeExtension>()
@@ -769,7 +778,7 @@ fn effective_maximum_frame_size(extensions: &Extensions) -> Option<usize> {
 
     let authenticated = extensions
         .get_ref::<AuthenticationExtension>()
-        .is_none_or(|authentication| authentication.is_authenticated());
+        .is_some_and(|authentication| authentication.is_authenticated());
 
     if authenticated {
         return full;
@@ -1288,6 +1297,47 @@ mod tests {
         let outcome = timeout(Duration::from_secs(5), handle)
             .await
             .expect("frame over the pre-authentication limit was admitted")?;
+
+        assert!(
+            matches!(outcome, Err(Error::FrameTooBig(s)) if s == size),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// The very first frame on a SASL-configured connection has no
+    /// `AuthenticationExtension` at all yet -- `BytesFrameService` only
+    /// inserts one after a request has already passed the auth check, which
+    /// happens strictly after this frame's size has already been checked.
+    /// This is the actual attack this ticket closes: one frame per
+    /// connection, no prior authenticated request needed. Deliberately does
+    /// *not* insert an `AuthenticationExtension` at all, unlike the other
+    /// tests in this module.
+    #[tokio::test]
+    async fn pre_authentication_limit_applies_to_the_first_frame_with_no_authentication_extension_yet()
+    -> Result<(), Error> {
+        let (mut client, server) = duplex(64);
+
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(MaximumFrameSizeExtension(DEFAULT_MAXIMUM_FRAME_SIZE));
+            _ = extensions.insert(PreAuthenticationMaximumFrameSizeExtension(
+                DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
+            ));
+            // No `AuthenticationExtension` inserted at all.
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        let size = DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE + 1;
+
+        client.write_all(&header(size as i32)).await?;
+
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the first frame on a SASL connection was admitted over the pre-authentication limit -- an attacker needs only one frame per connection")?;
 
         assert!(
             matches!(outcome, Err(Error::FrameTooBig(s)) if s == size),
