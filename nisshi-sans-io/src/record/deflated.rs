@@ -25,7 +25,10 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     ByteSize, Compression, Decode as _, Decoder, Encode, Error, Result,
-    record::{Record, codec::MAX_PREALLOCATED_ELEMENTS},
+    record::{
+        Record,
+        codec::{MAX_DECOMPRESSED_BATCH_BYTES, MAX_PREALLOCATED_ELEMENTS},
+    },
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -442,6 +445,10 @@ impl TryFrom<Batch> for Vec<Record> {
         debug!(?record_count);
         debug!(?batch.record_data);
 
+        if record_count > MAX_DECOMPRESSED_BATCH_BYTES / 7 {
+            return Err(Error::MessageMaxSizeExceeded(record_count));
+        }
+
         if batch
             .compression()
             .is_ok_and(|compression| compression == Compression::None)
@@ -455,9 +462,9 @@ impl TryFrom<Batch> for Vec<Record> {
 
             Ok(records)
         } else {
-            let mut reader = batch
-                .compression()
-                .and_then(|compression| compression.inflator(batch.record_data.reader()))?;
+            let mut reader = batch.compression().and_then(|compression| {
+                compression.inflator(batch.record_data.reader(), MAX_DECOMPRESSED_BATCH_BYTES)
+            })?;
 
             let mut decoder = Decoder::new(&mut reader);
             let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
@@ -481,9 +488,16 @@ impl TryFrom<&Batch> for Vec<Record> {
         debug!(?record_count);
         debug!(?batch.record_data);
 
-        let mut reader = batch
-            .compression()
-            .and_then(|compression| compression.inflator(batch.record_data.clone().reader()))?;
+        if record_count > MAX_DECOMPRESSED_BATCH_BYTES / 7 {
+            return Err(Error::MessageMaxSizeExceeded(record_count));
+        }
+
+        let mut reader = batch.compression().and_then(|compression| {
+            compression.inflator(
+                batch.record_data.clone().reader(),
+                MAX_DECOMPRESSED_BATCH_BYTES,
+            )
+        })?;
 
         let mut decoder = Decoder::new(&mut reader);
         let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
@@ -601,6 +615,30 @@ mod tests {
     reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla \
     pariatur. Excepteur sint occaecat cupidatat non proident, sunt in \
     culpa qui officia deserunt mollit anim id est laborum.";
+
+    #[test]
+    fn record_count_beyond_decompressed_limit_is_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::Zstd)
+                .into(),
+            record_count: u32::MAX,
+            record_data: Bytes::new(),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch.clone())
+            .expect_err("a record_count this large must be rejected before decompressing");
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(_)));
+
+        let err = Vec::<Record>::try_from(&batch)
+            .expect_err("a record_count this large must be rejected before decompressing");
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(_)));
+
+        Ok(())
+    }
 
     #[test]
     fn decode_gzip() -> Result<()> {
