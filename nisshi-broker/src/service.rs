@@ -15,8 +15,9 @@
 use std::sync::Arc;
 
 use nisshi_service::{
-    BytesFrameLayer, BytesFrameService, FrameRouteService, TcpBytesLayer, TcpBytesService,
-    TcpContext, TcpContextLayer, TcpContextService,
+    BytesFrameLayer, BytesFrameService, DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
+    FrameRouteService, TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer,
+    TcpContextService,
 };
 use nisshi_storage::Storage;
 use rama::Layer;
@@ -50,8 +51,18 @@ where
         .and_then(auth::services)
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|route| {
+            let pre_authentication_maximum_frame_size = sasl_config
+                .is_some()
+                .then_some(DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE);
+
             (
-                TcpContextLayer::new(TcpContext::default().cluster_id(Some(cluster_id.into()))),
+                TcpContextLayer::new(
+                    TcpContext::default()
+                        .cluster_id(Some(cluster_id.into()))
+                        .pre_authentication_maximum_frame_size(
+                            pre_authentication_maximum_frame_size,
+                        ),
+                ),
                 TcpBytesLayer,
                 BytesFrameLayer::default().with_sasl_config(sasl_config),
             )

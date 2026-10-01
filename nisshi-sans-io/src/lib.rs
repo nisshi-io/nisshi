@@ -593,8 +593,13 @@ impl Frame {
     pub fn request_from_bytes(encoded: impl Buf) -> Result<Frame> {
         let start = SystemTime::now();
 
+        // No length-prefixed field can claim more than the frame actually
+        // holds: the decoder is bounded to exactly what's left in `encoded`,
+        // not the much larger `MESSAGE_MAX_SIZE` fallback.
+        let message_max_size = encoded.remaining();
+
         let mut reader = encoded.reader();
-        let mut deserializer = Decoder::request(&mut reader);
+        let mut deserializer = Decoder::request(&mut reader, Some(message_max_size));
         Frame::deserialize(&mut deserializer)
             .inspect(|frame| debug!(?frame, elapsed_millis = Self::elapsed_millis(start)))
     }

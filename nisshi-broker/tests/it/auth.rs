@@ -26,9 +26,9 @@ use nisshi_broker::{
     service::{auth, storage},
 };
 use nisshi_sans_io::{
-    ApiKey, Body, BytesInput, ConfigResource, CreateTopicsRequest, ErrorCode, Frame, Header,
-    IsolationLevel, ListOffset, SaslAuthenticateRequest, SaslAuthenticateResponse,
-    SaslHandshakeRequest, SaslHandshakeResponse, ScramMechanism,
+    ApiKey, Body, BytesInput, ConfigResource, CreateTopicsRequest, DescribeGroupsRequest,
+    ErrorCode, Frame, Header, IsolationLevel, ListOffset, SaslAuthenticateRequest,
+    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, ScramMechanism,
     create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
@@ -632,6 +632,61 @@ async fn not_authenticated() -> Result<()> {
                             )),
                     ),
                 )?,
+                extensions
+            })
+            .await,
+        Err(Error::KafkaProtocol(
+            nisshi_sans_io::Error::NotAuthenticated
+        )),
+    ));
+
+    Ok(())
+}
+
+/// `not_authenticated` proves a disallowed api_key is rejected, but not that
+/// it's rejected *before* the body is decoded -- a well-formed request would
+/// pass either way. This corrupts everything after the 4 byte size prefix and
+/// 2 byte api_key: if the peek in `BytesFrameService::serve` didn't actually
+/// skip the body decode and reject first, this would surface as a decode
+/// error instead of `NotAuthenticated`.
+#[tokio::test]
+async fn not_authenticated_rejected_before_body_is_decoded() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let engine = Engine::default();
+
+    let broker = nisshi_auth::configuration(engine.clone())
+        .map_err(Into::into)
+        .map(Some)
+        .and_then(|sasl_config| broker(engine, sasl_config))?;
+
+    const CLIENT_ID: &str = "client";
+    const API_VERSION: i16 = 0;
+
+    let extensions = Extensions::default();
+
+    let mut bytes = Frame::request(
+        Header::Request {
+            api_key: DescribeGroupsRequest::KEY,
+            api_version: API_VERSION,
+            correlation_id: 1,
+            client_id: Some(CLIENT_ID.into()),
+        },
+        Body::DescribeGroupsRequest(DescribeGroupsRequest::default()),
+    )?
+    .to_vec();
+
+    // Leave the size prefix (bytes 0..4) and api_key (bytes 4..6) intact --
+    // that's exactly what the peek reads -- and corrupt everything a real
+    // decode would otherwise have to parse.
+    for byte in bytes.iter_mut().skip(6) {
+        *byte = 0xFF;
+    }
+
+    assert!(matches!(
+        broker
+            .serve(BytesInput {
+                bytes: bytes.into(),
                 extensions
             })
             .await,
