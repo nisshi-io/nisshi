@@ -2372,6 +2372,17 @@ mod tests {
     // allocation throughout, so a *enforced* lower limit here would abort
     // the whole test binary via handle_alloc_error rather than fail the one
     // test cleanly).
+    //
+    // This one-test-per-process isolation is load-bearing, not incidental:
+    // `max_allocated()` below is a whole-process high-water mark with no way
+    // to reset it mid-run, so it only means "peak for this one test" because
+    // nextest gives it a fresh process. Under plain `cargo test --lib`
+    // (all tests in one process, often concurrently), a test running near
+    // `batch_just_under_the_decompressed_limit_round_trips` (which legitimately
+    // allocates ~100 MiB) could read a false-positive high-water mark here.
+    // This repo's CI and `just test` both use nextest (see justfile), so this
+    // is the supported way to run this suite; it is not guaranteed under a
+    // bare `cargo test`.
     #[global_allocator]
     static ALLOCATOR: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, usize::MAX);
 
