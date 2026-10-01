@@ -233,6 +233,21 @@ impl Batch {
     pub fn is_idempotent(&self) -> bool {
         self.producer_id != -1 && self.base_sequence != -1
     }
+
+    /// True if `record_count` alone implies more decoded memory than
+    /// [`MAX_DECOMPRESSED_BATCH_BYTES`] allows, without attempting any
+    /// decompression. A cheap, public pre-check so a caller that wants to
+    /// reject a batch before invoking storage (and before paying for
+    /// decompression) can do so with a specific, client-facing error rather
+    /// than waiting for the full decode's generic failure — see
+    /// `nisshi-storage`'s produce-path rejection, which uses this the same
+    /// way it already uses `record_count < 1` and the `last_offset_delta`
+    /// mismatch check.
+    pub fn exceeds_decoded_record_count_limit(&self) -> bool {
+        usize::try_from(self.record_count)
+            .map(|record_count| record_count > MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>())
+            .unwrap_or(true)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -445,7 +460,7 @@ impl TryFrom<Batch> for Vec<Record> {
         debug!(?record_count);
         debug!(?batch.record_data);
 
-        if record_count > MAX_DECOMPRESSED_BATCH_BYTES / 7 {
+        if batch.exceeds_decoded_record_count_limit() {
             return Err(Error::MessageMaxSizeExceeded(record_count));
         }
 
@@ -488,7 +503,7 @@ impl TryFrom<&Batch> for Vec<Record> {
         debug!(?record_count);
         debug!(?batch.record_data);
 
-        if record_count > MAX_DECOMPRESSED_BATCH_BYTES / 7 {
+        if batch.exceeds_decoded_record_count_limit() {
             return Err(Error::MessageMaxSizeExceeded(record_count));
         }
 
@@ -636,6 +651,81 @@ mod tests {
         let err = Vec::<Record>::try_from(&batch)
             .expect_err("a record_count this large must be rejected before decompressing");
         assert!(matches!(err, Error::MessageMaxSizeExceeded(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn record_count_bound_reflects_decoded_struct_size_not_minimum_wire_size() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // A record_count bounded only by the minimum *encoded* record size (7
+        // bytes) does not bound the memory actually allocated: each record
+        // costs size_of::<Record>() (112 bytes) once decoded into a
+        // Vec<Record>, regardless of how little of that came from the wire.
+        // 1,000,000 is comfortably under the old (wrong) bound
+        // (MAX_DECOMPRESSED_BATCH_BYTES / 7 ~= 14,979,656) but must be
+        // rejected under the correct one
+        // (MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>() ~= 936,864),
+        // since 1,000,000 * size_of::<Record>() alone is already ~105 MiB.
+        assert!(
+            size_of::<Record>() > 7,
+            "test assumes the struct outgrew the minimum wire size"
+        );
+        let record_count = 1_000_000;
+        assert!(record_count < MAX_DECOMPRESSED_BATCH_BYTES / 7);
+        assert!(record_count > MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>());
+
+        let batch = Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::Zstd)
+                .into(),
+            record_count: u32::try_from(record_count)?,
+            record_data: Bytes::new(),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch).expect_err(
+            "a record_count whose decoded struct cost alone exceeds the limit must be rejected",
+        );
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(_)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_just_under_the_decompressed_limit_round_trips() -> Result<()> {
+        // Deliberately no init_tracing() here: with it on, `debug!(?...)`
+        // calls elsewhere in this path fully Debug-format the ~100 MiB
+        // buffer on every call, which is not a cost real production tracing
+        // would pay (nobody runs with DEBUG-level + ACTIVE span events in
+        // production) but turns this one test from sub-second to ~30
+        // minutes — comfortably over the CI nextest profile's 5 minute
+        // per-test timeout.
+
+        // Comfortable headroom under the limit for the record's other
+        // fields (length/attributes/timestamp/offset/headers overhead), so
+        // this stays a "just under the limit" case rather than brushing
+        // against it.
+        let size = MAX_DECOMPRESSED_BATCH_BYTES - 1024 * 1024;
+        let value = Bytes::from(vec![0u8; size]);
+
+        let mut inflated = inflated::Batch {
+            records: vec![Record {
+                value: Some(value.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        inflated.attributes = BatchAttribute::try_from(inflated.attributes)
+            .map(|attribute| attribute.compression(Compression::Zstd).into())?;
+
+        let deflated = Batch::try_from(inflated)?;
+        let records: Vec<Record> = deflated.try_into()?;
+
+        assert_eq!(1, records.len());
+        assert_eq!(Some(value), records[0].value);
 
         Ok(())
     }
