@@ -26,8 +26,11 @@ use tracing::{debug, error, instrument};
 use crate::{
     ByteSize, Compression, Decode as _, Decoder, Encode, Error, Result,
     record::{
-        Record,
-        codec::{MAX_DECOMPRESSED_BATCH_BYTES, MAX_PREALLOCATED_ELEMENTS},
+        Header, Record,
+        codec::{
+            DecodeBudget, MAX_DECODED_BATCH_BYTES, MAX_PREALLOCATED_ELEMENTS,
+            exceeds_decoded_batch_limit,
+        },
     },
 };
 
@@ -235,17 +238,16 @@ impl Batch {
     }
 
     /// True if `record_count` alone implies more decoded memory than
-    /// [`MAX_DECOMPRESSED_BATCH_BYTES`] allows, without attempting any
+    /// [`MAX_DECODED_BATCH_BYTES`] allows, without attempting any
     /// decompression. A cheap, public pre-check so a caller that wants to
     /// reject a batch before invoking storage (and before paying for
     /// decompression) can do so with a specific, client-facing error rather
-    /// than waiting for the full decode's generic failure — see
-    /// `nisshi-storage`'s produce-path rejection, which uses this the same
-    /// way it already uses `record_count < 1` and the `last_offset_delta`
-    /// mismatch check.
+    /// than waiting for the full decode's failure; see `nisshi-storage`'s
+    /// produce-path rejection, which uses this the same way it already uses
+    /// `record_count < 1` and the `last_offset_delta` mismatch check.
     pub fn exceeds_decoded_record_count_limit(&self) -> bool {
         usize::try_from(self.record_count)
-            .map(|record_count| record_count > MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>())
+            .map(|record_count| exceeds_decoded_batch_limit(record_count, size_of::<Record>()))
             .unwrap_or(true)
     }
 }
@@ -461,30 +463,36 @@ impl TryFrom<Batch> for Vec<Record> {
         debug!(?batch.record_data);
 
         if batch.exceeds_decoded_record_count_limit() {
-            return Err(Error::MessageMaxSizeExceeded(record_count));
+            return Err(Error::MessageMaxSizeExceeded(
+                record_count.saturating_mul(size_of::<Record>()),
+            ));
         }
 
         if batch
             .compression()
             .is_ok_and(|compression| compression == Compression::None)
         {
+            let mut budget = DecodeBudget::new(MAX_DECODED_BATCH_BYTES);
             let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
             for _ in 0..record_count {
                 let record = Record::decode(&mut batch.record_data)?;
+                budget.charge(allocated_size(&record))?;
                 records.push(record);
             }
 
             Ok(records)
         } else {
             let mut reader = batch.compression().and_then(|compression| {
-                compression.inflator(batch.record_data.reader(), MAX_DECOMPRESSED_BATCH_BYTES)
+                compression.inflator(batch.record_data.reader(), MAX_DECODED_BATCH_BYTES)
             })?;
 
-            let mut decoder = Decoder::new(&mut reader);
+            let mut decoder =
+                Decoder::new(&mut reader).with_budget(DecodeBudget::new(MAX_DECODED_BATCH_BYTES));
             let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
             for _ in 0..record_count {
+                decoder.charge(size_of::<Record>())?;
                 let record = Record::deserialize(&mut decoder)?;
                 records.push(record);
             }
@@ -492,6 +500,16 @@ impl TryFrom<Batch> for Vec<Record> {
             Ok(records)
         }
     }
+}
+
+/// What decoding an uncompressed record allocates beyond the record data it
+/// was decoded from: the `Record` itself and its `Vec<Header>`. Keys and
+/// values are zero-copy slices of the record data on this path, which the
+/// frame size already bounds, so they are not charged twice. (The compressed
+/// path copies every byte out of the decompressing reader, so there the
+/// `Decoder`'s budget charges them.)
+fn allocated_size(record: &Record) -> usize {
+    size_of::<Record>() + record.headers.len() * size_of::<Header>()
 }
 
 impl TryFrom<&Batch> for Vec<Record> {
@@ -504,20 +522,21 @@ impl TryFrom<&Batch> for Vec<Record> {
         debug!(?batch.record_data);
 
         if batch.exceeds_decoded_record_count_limit() {
-            return Err(Error::MessageMaxSizeExceeded(record_count));
+            return Err(Error::MessageMaxSizeExceeded(
+                record_count.saturating_mul(size_of::<Record>()),
+            ));
         }
 
         let mut reader = batch.compression().and_then(|compression| {
-            compression.inflator(
-                batch.record_data.clone().reader(),
-                MAX_DECOMPRESSED_BATCH_BYTES,
-            )
+            compression.inflator(batch.record_data.clone().reader(), MAX_DECODED_BATCH_BYTES)
         })?;
 
-        let mut decoder = Decoder::new(&mut reader);
+        let mut decoder =
+            Decoder::new(&mut reader).with_budget(DecodeBudget::new(MAX_DECODED_BATCH_BYTES));
         let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
         for _ in 0..record_count {
+            decoder.charge(size_of::<Record>())?;
             let record = Record::deserialize(&mut decoder)?;
             records.push(record);
         }
@@ -631,6 +650,116 @@ mod tests {
     pariatur. Excepteur sint occaecat cupidatat non proident, sunt in \
     culpa qui officia deserunt mollit anim id est laborum.";
 
+    /// One record whose value alone is a byte over the decoded limit, deflated
+    /// with `compression`. Compresses to almost nothing for every codec, so
+    /// the only thing that can reject it is the limit on the decoded side.
+    fn batch_just_over_the_decoded_limit(compression: Compression) -> Result<Batch> {
+        let mut inflated = inflated::Batch {
+            records: vec![Record {
+                value: Some(Bytes::from(vec![0u8; MAX_DECODED_BATCH_BYTES + 1])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        inflated.attributes = BatchAttribute::try_from(inflated.attributes)
+            .map(|attribute| attribute.compression(compression).into())?;
+
+        Batch::try_from(inflated)
+    }
+
+    /// Both decode paths must reject the batch with the typed error, not a
+    /// generic I/O failure: that is what lets the broker answer
+    /// `MESSAGE_TOO_LARGE` rather than `UNKNOWN_SERVER_ERROR`. One test per
+    /// codec and path: each decodes ~100 MiB byte by byte before the limit
+    /// trips, so they are kept separate to stay well inside the CI per-test
+    /// timeout.
+    fn assert_rejected_by_reference(batch: &Batch) {
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a batch over the decoded limit must be rejected (by reference)");
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(_)),
+            "by reference: {err:?}"
+        );
+    }
+
+    fn assert_rejected_by_value(batch: Batch) {
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a batch over the decoded limit must be rejected (by value)");
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(_)),
+            "by value: {err:?}"
+        );
+    }
+
+    // Deliberately no init_tracing() in the just-over-the-limit tests: see
+    // batch_just_under_the_decompressed_limit_round_trips.
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_gzip_by_value() -> Result<()> {
+        batch_just_over_the_decoded_limit(Compression::Gzip).map(assert_rejected_by_value)
+    }
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_gzip_by_reference() -> Result<()> {
+        batch_just_over_the_decoded_limit(Compression::Gzip)
+            .map(|batch| assert_rejected_by_reference(&batch))
+    }
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_lz4_by_value() -> Result<()> {
+        batch_just_over_the_decoded_limit(Compression::Lz4).map(assert_rejected_by_value)
+    }
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_lz4_by_reference() -> Result<()> {
+        batch_just_over_the_decoded_limit(Compression::Lz4)
+            .map(|batch| assert_rejected_by_reference(&batch))
+    }
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_zstd_by_value() -> Result<()> {
+        batch_just_over_the_decoded_limit(Compression::Zstd).map(assert_rejected_by_value)
+    }
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_zstd_by_reference() -> Result<()> {
+        batch_just_over_the_decoded_limit(Compression::Zstd)
+            .map(|batch| assert_rejected_by_reference(&batch))
+    }
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_snappy_raw() -> Result<()> {
+        // Rejected on the block's claimed length before any decompression,
+        // so both paths are cheap enough for one test.
+        let batch = batch_just_over_the_decoded_limit(Compression::Snappy)?;
+        assert_rejected_by_reference(&batch);
+        assert_rejected_by_value(batch);
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_just_over_the_decoded_limit_is_rejected_snappy_xerial() -> Result<()> {
+        let mut batch = batch_just_over_the_decoded_limit(Compression::Snappy)?;
+
+        // Wrap the raw block in xerial framing: magic, version, compatible
+        // version, block size, then the block, the form snappy-java produces.
+        let block = batch.record_data.clone();
+        let mut framed = BytesMut::new();
+        framed.put_slice(b"\x82SNAPPY\0");
+        framed.put_i32(1);
+        framed.put_i32(1);
+        framed.put_i32(i32::try_from(block.len())?);
+        framed.put(block);
+        batch.record_data = framed.freeze();
+
+        assert_rejected_by_reference(&batch);
+        assert_rejected_by_value(batch);
+
+        Ok(())
+    }
+
     #[test]
     fn record_count_beyond_decompressed_limit_is_rejected() -> Result<()> {
         let _guard = init_tracing()?;
@@ -664,17 +793,17 @@ mod tests {
         // costs size_of::<Record>() (112 bytes) once decoded into a
         // Vec<Record>, regardless of how little of that came from the wire.
         // 1,000,000 is comfortably under the old (wrong) bound
-        // (MAX_DECOMPRESSED_BATCH_BYTES / 7 ~= 14,979,656) but must be
+        // (MAX_DECODED_BATCH_BYTES / 7 ~= 14,979,656) but must be
         // rejected under the correct one
-        // (MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>() ~= 936,864),
+        // (MAX_DECODED_BATCH_BYTES / size_of::<Record>() ~= 936,864),
         // since 1,000,000 * size_of::<Record>() alone is already ~105 MiB.
         assert!(
             size_of::<Record>() > 7,
             "test assumes the struct outgrew the minimum wire size"
         );
         let record_count = 1_000_000;
-        assert!(record_count < MAX_DECOMPRESSED_BATCH_BYTES / 7);
-        assert!(record_count > MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>());
+        assert!(record_count < MAX_DECODED_BATCH_BYTES / 7);
+        assert!(record_count > MAX_DECODED_BATCH_BYTES / size_of::<Record>());
 
         let batch = Batch {
             attributes: BatchAttribute::default()
@@ -707,7 +836,7 @@ mod tests {
         // fields (length/attributes/timestamp/offset/headers overhead), so
         // this stays a "just under the limit" case rather than brushing
         // against it.
-        let size = MAX_DECOMPRESSED_BATCH_BYTES - 1024 * 1024;
+        let size = MAX_DECODED_BATCH_BYTES - 1024 * 1024;
         let value = Bytes::from(vec![0u8; size]);
 
         let mut inflated = inflated::Batch {
