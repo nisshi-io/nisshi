@@ -208,6 +208,21 @@ where
             .await
             .inspect_err(|error| error!(?error, ?tp))?;
 
+        // Real Kafka only reports aborted ranges for read_committed -- a read_uncommitted
+        // client is supposed to see everything, aborted or not, so there's nothing to flag.
+        let aborted_transactions = if isolation == IsolationLevel::ReadCommitted {
+            self.storage
+                .aborted_transactions(
+                    &tp,
+                    fetch_partition.fetch_offset,
+                    offset_stage.last_stable(),
+                )
+                .await
+                .inspect_err(|error| error!(?error, ?tp))?
+        } else {
+            vec![]
+        };
+
         Ok(PartitionData::default()
             .partition_index(partition_index)
             .error_code(ErrorCode::None.into())
@@ -217,7 +232,7 @@ where
             .diverging_epoch(None)
             .current_leader(None)
             .snapshot_id(None)
-            .aborted_transactions(Some([].into()))
+            .aborted_transactions(Some(aborted_transactions))
             .preferred_read_replica(Some(-1))
             .records(if batches.is_empty() {
                 None

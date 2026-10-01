@@ -45,4 +45,13 @@ and cg.name = $3
 and p.id = $4
 and pe.epoch = $5
 and t.name = $6
-and tp.partition = $7;
+and tp.partition = $7
+
+-- Kafka semantics: the latest staged offset for a partition wins within
+-- the transaction, so a repeat commit overwrites rather than errors
+on conflict (offset_commit, topition)
+do update set
+committed_offset = excluded.committed_offset,
+leader_epoch = excluded.leader_epoch,
+metadata = excluded.metadata,
+last_updated = current_timestamp;

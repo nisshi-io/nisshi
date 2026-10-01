@@ -97,6 +97,17 @@ where
     assert!(offsets.contains_key(&topition));
     assert_eq!(Some(&-1), offsets.get(&topition));
 
+    assert_eq!(
+        ErrorCode::None,
+        sc.txn_add_offsets(
+            transaction_id.as_str(),
+            producer.id,
+            producer.epoch,
+            group_id.as_str(),
+        )
+        .await?
+    );
+
     let committed_offset = 32123;
 
     let result = sc
@@ -234,6 +245,17 @@ where
 
     assert!(offsets.contains_key(&topition));
     assert_eq!(Some(&-1), offsets.get(&topition));
+
+    assert_eq!(
+        ErrorCode::None,
+        sc.txn_add_offsets(
+            transaction_id.as_str(),
+            producer.id,
+            producer.epoch,
+            group_id.as_str(),
+        )
+        .await?
+    );
 
     let committed_offset = 32123;
 

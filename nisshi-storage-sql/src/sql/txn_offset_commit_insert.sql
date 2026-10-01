@@ -37,4 +37,13 @@ c.name = $1
 and txn.name = $2
 and cg.name = $3
 and p.id = $4
-and pe.epoch = $5;
+and pe.epoch = $5
+
+-- a retried TxnOffsetCommit (lost response) or a second
+-- sendOffsetsToTransaction within the same transaction must refresh the
+-- staging row, not violate its unique constraint
+on conflict (txn_detail, consumer_group)
+do update set
+generation_id = excluded.generation_id,
+member_id = excluded.member_id,
+last_updated = current_timestamp;
