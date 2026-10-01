@@ -39,6 +39,14 @@ use crate::{Error, Result, Storage, Topition};
 ///   `last_offset_delta` to advance the high watermark, so a mismatch corrupts
 ///   or wedges the partition. `record_count` is an int32 on the wire, so a
 ///   value above `i32::MAX` is rejected too.
+/// - `record_count` alone must not imply more decoded memory than the
+///   decompressed-size limit allows. Without this check here, the same
+///   batch is still rejected (`nisshi-sans-io` enforces the limit
+///   unconditionally during decode), but only after `storage.produce()` is
+///   called: the error surfaces as a generic, non-`Api` error, so the client
+///   gets `UNKNOWN_SERVER_ERROR` instead of a specific code, and every such
+///   request is logged at `error!` as if it were an unexpected internal
+///   failure rather than an expected, untrusted-input rejection.
 fn rejection(batch: &deflated::Batch) -> Option<&'static str> {
     if batch.is_control() {
         return Some("clients may not write control batches");
@@ -52,8 +60,40 @@ fn rejection(batch: &deflated::Batch) -> Option<&'static str> {
         Some("batch has no records")
     } else if batch.last_offset_delta.checked_add(1) != Some(record_count) {
         Some("last_offset_delta + 1 does not equal record_count")
+    } else if batch.exceeds_decoded_record_count_limit() {
+        Some("record_count exceeds the maximum decoded batch size")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_record_count_is_rejected_before_storage_is_called() {
+        let batch = deflated::Batch {
+            record_count: 1_000_000,
+            last_offset_delta: 999_999,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            Some("record_count exceeds the maximum decoded batch size"),
+            rejection(&batch)
+        );
+    }
+
+    #[test]
+    fn a_record_count_within_the_limit_is_not_rejected_for_this_reason() {
+        let batch = deflated::Batch {
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(None, rejection(&batch));
     }
 }
 

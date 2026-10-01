@@ -42,6 +42,14 @@ pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 /// `nisshi-service`'s `DEFAULT_MAXIMUM_FRAME_SIZE` in value only — kept as its
 /// own constant since this crate is sans-I/O and has no access to that
 /// connection-level setting.
+///
+/// Used two ways, and both matter: as a byte budget for the decompressing
+/// reader (bounds the variable-length content — keys, values, headers), and
+/// divided by `size_of::<Record>()` as a cap on `record_count` itself (bounds
+/// the fixed per-record struct cost — a record's *minimum encoded size* is
+/// far smaller than `size_of::<Record>()`, so a record_count limit derived
+/// from the minimum wire size does not bound the memory a `Vec<Record>`
+/// actually costs once decoded).
 pub(crate) const MAX_DECOMPRESSED_BATCH_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

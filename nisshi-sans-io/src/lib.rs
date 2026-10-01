@@ -2363,6 +2363,78 @@ mod tests {
 
     use super::*;
 
+    // cargo-nextest runs each test as its own process, so this tracks
+    // allocations for exactly one test at a time (plus negligible runtime
+    // startup overhead) - no cross-test interference. The limit is
+    // deliberately unenforced (usize::MAX): this is for measuring peak
+    // allocation, not for aborting the process if production code happens
+    // to allocate past some threshold (our own code uses infallible
+    // allocation throughout, so a *enforced* lower limit here would abort
+    // the whole test binary via handle_alloc_error rather than fail the one
+    // test cleanly).
+    #[global_allocator]
+    static ALLOCATOR: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, usize::MAX);
+
+    #[test]
+    fn record_count_rejection_keeps_peak_allocation_bounded() -> Result<()> {
+        use crate::record::{Record, codec::MAX_DECOMPRESSED_BATCH_BYTES, deflated::Batch};
+
+        // Must be real, decodable data: a record_count this large paired
+        // with empty/invalid record_data would fail for an unrelated reason
+        // (no data to decompress) under both the old and new bound, which
+        // would not actually prove anything about which bound is active.
+        // Build a real stream of `record_count` minimal records so a
+        // regression back to the old bound (divided by the minimum encoded
+        // record size, 7 bytes, rather than size_of::<Record>()) would
+        // genuinely decode them all and allocate accordingly.
+        let minimal_record = (&[Record::default()][..]).encode()?;
+        assert_eq!(
+            7,
+            minimal_record.len(),
+            "test assumes the 7-byte minimal record size"
+        );
+
+        // Comfortably over the correct bound (MAX_DECOMPRESSED_BATCH_BYTES /
+        // size_of::<Record>() ~= 936,864) and comfortably under the old,
+        // wrong one (MAX_DECOMPRESSED_BATCH_BYTES / 7 ~= 14,979,657) - the
+        // exact gap the reviewer's repro landed in, just smaller so this
+        // test's setup stays in the low megabytes rather than gigabytes.
+        let record_count = 1_000_000_u32;
+        assert!((record_count as usize) < MAX_DECOMPRESSED_BATCH_BYTES / 7);
+        assert!((record_count as usize) > MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>());
+
+        let uncompressed = minimal_record.repeat(record_count as usize);
+        let compressed = zstd::stream::encode_all(&uncompressed[..], 0)?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::Zstd)
+                .into(),
+            record_count,
+            record_data: Bytes::from(compressed),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("this record_count must be rejected before decoding, not partway through");
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(_)));
+
+        // Under the old (wire-size-derived) bound, this record_count would
+        // have decoded successfully, allocating a Vec<Record> of roughly
+        // record_count * size_of::<Record>() ~= 107 MB - this is the actual
+        // bug the reviewer caught, reproduced and bounded here rather than
+        // just asserted away.
+        let peak = ALLOCATOR.max_allocated();
+        assert!(
+            peak < 50 * 1024 * 1024,
+            "rejecting an oversized record_count must not approach the ~107 MB the old, \
+             wire-size-derived bound would have allocated for this exact input; peaked at \
+             {peak} bytes"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn limited_read_allows_up_to_the_limit() -> Result<()> {
         let data = vec![7u8; 16];
