@@ -2359,7 +2359,7 @@ pub trait Decode: Sized {
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
+    use std::{io::Write, thread::sleep};
 
     use super::*;
 
@@ -2425,6 +2425,56 @@ mod tests {
             .expect("a claimed length over the limit must be rejected before decompressing");
 
         assert!(matches!(err, Error::MessageMaxSizeExceeded(len) if len == claimed));
+    }
+
+    #[test]
+    fn inflator_enforces_the_limit_for_every_decompressing_variant() -> Result<()> {
+        let payload = b"the quick brown fox jumps over the lazy dog".repeat(4);
+        let exact = payload.len();
+
+        let gzip = {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&payload)?;
+            encoder.finish()?
+        };
+
+        let lz4 = {
+            let mut encoder = lz4::EncoderBuilder::new().build(Vec::new())?;
+            encoder.write_all(&payload)?;
+            let (buf, result) = encoder.finish();
+            result?;
+            buf
+        };
+
+        let zstd = zstd::stream::encode_all(&payload[..], 0)?;
+
+        for (name, compression, encoded) in [
+            ("gzip", Compression::Gzip, gzip),
+            ("lz4", Compression::Lz4, lz4),
+            ("zstd", Compression::Zstd, zstd),
+        ] {
+            // Exactly at the true decompressed length still decodes in full.
+            let mut reader = compression.inflator(Cursor::new(encoded.clone()), exact)?;
+            let mut out = Vec::new();
+            _ = reader.read_to_end(&mut out)?;
+            assert_eq!(
+                payload, out,
+                "{name}: a limit at the true size must still decode fully"
+            );
+
+            // One byte under the true decompressed length must error, proving
+            // LimitedRead is actually wired into this variant's reader, not
+            // just exercised in isolation.
+            let mut reader = compression.inflator(Cursor::new(encoded), exact - 1)?;
+            let mut out = Vec::new();
+            assert!(
+                reader.read_to_end(&mut out).is_err(),
+                "{name}: a limit one byte under the true size must be rejected"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
