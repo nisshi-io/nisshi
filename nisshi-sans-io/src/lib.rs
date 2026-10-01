@@ -375,6 +375,9 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Error::Message(e) => f.write_str(e),
+            Error::MessageMaxSizeExceeded(size) => {
+                write!(f, "message of {size} bytes exceeds the maximum size")
+            }
             e => write!(f, "{e:?}"),
         }
     }
@@ -400,6 +403,17 @@ impl serde::de::Error for Error {
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
+        // A `Read` implementation can only fail with an `io::Error`, so one
+        // of ours (`LimitedRead`'s size limit) travels inside it. Unwrap it
+        // rather than nesting it, so the typed error reaches the caller and
+        // can be mapped to a specific response code.
+        if let Some(inner) = value
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Error>())
+        {
+            return inner.clone();
+        }
+
         Self::Io(Arc::new(value))
     }
 }
@@ -1723,9 +1737,23 @@ impl From<Compression> for i16 {
 /// unbounded amount of memory. Deliberately errors rather than silently
 /// behaving like end of stream (unlike [`Read::take`]), so a batch that
 /// exceeds the limit is rejected, not misread as a short, valid one.
+///
+/// The error is [`Error::MessageMaxSizeExceeded`] carried inside the
+/// `io::Error` the [`Read`] contract requires; `From<io::Error>` unwraps it.
 struct LimitedRead<R> {
     inner: R,
+    limit: usize,
     remaining: usize,
+}
+
+impl<R> LimitedRead<R> {
+    fn new(inner: R, limit: usize) -> Self {
+        Self {
+            inner,
+            limit,
+            remaining: limit,
+        }
+    }
 }
 
 impl<R: Read> Read for LimitedRead<R> {
@@ -1742,9 +1770,9 @@ impl<R: Read> Read for LimitedRead<R> {
             return if self.inner.read(&mut probe)? == 0 {
                 Ok(0)
             } else {
-                Err(io::Error::other(
-                    "decompressed batch exceeds the maximum allowed size",
-                ))
+                Err(io::Error::other(Error::MessageMaxSizeExceeded(
+                    self.limit.saturating_add(1),
+                )))
             };
         }
 
@@ -1763,34 +1791,32 @@ impl Compression {
     ) -> Result<Box<dyn Read>> {
         match self {
             Compression::None => Ok(Box::new(deflated)),
-            Compression::Gzip => Ok(Box::new(LimitedRead {
-                inner: GzDecoder::new(deflated),
-                remaining: limit,
-            })),
+            Compression::Gzip => Ok(Box::new(LimitedRead::new(GzDecoder::new(deflated), limit))),
             Compression::Snappy => {
                 let mut input = vec![];
                 _ = deflated.read_to_end(&mut input)?;
                 debug!(?input);
 
                 // https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
-                let payload = if input.starts_with(b"\x82SNAPPY\0") {
-                    if let (b"\x82SNAPPY\0", remainder) = input.split_at(8) {
-                        let (version, remainder) = remainder.split_at(4);
-                        let version: i32 = version.try_into().map(i32::from_be_bytes)?;
+                let payload = if let Some(framed) = input.strip_prefix(b"\x82SNAPPY\0") {
+                    // The magic is followed by version, compatible version
+                    // and block size, 4 bytes each. Untrusted input: a
+                    // batch that stops short of those 12 bytes is an error,
+                    // not a slice panic.
+                    let Some((header, block)) = framed.split_at_checked(12) else {
+                        return Err(Error::Overflow);
+                    };
 
-                        let (compatible_version, remainder) = remainder.split_at(4);
-                        let compatible_version: i32 =
-                            compatible_version.try_into().map(i32::from_be_bytes)?;
+                    let (version, header) = header.split_at(4);
+                    let version: i32 = version.try_into().map(i32::from_be_bytes)?;
 
-                        let (block_size, _) = remainder.split_at(4);
-                        let block_size: i32 = block_size.try_into().map(i32::from_be_bytes)?;
+                    let (compatible_version, block_size) = header.split_at(4);
+                    let compatible_version: i32 =
+                        compatible_version.try_into().map(i32::from_be_bytes)?;
+                    let block_size: i32 = block_size.try_into().map(i32::from_be_bytes)?;
 
-                        debug!(version, compatible_version, block_size);
-                    }
-
-                    let skip_header = &input[20..];
-                    debug!(?skip_header);
-                    skip_header
+                    debug!(version, compatible_version, block_size, ?block);
+                    block
                 } else {
                     &input[..]
                 };
@@ -1813,18 +1839,12 @@ impl Compression {
                     .inspect_err(|err| error!(?err))
             }
             Compression::Lz4 => lz4::Decoder::new(deflated)
-                .map(|inner| LimitedRead {
-                    inner,
-                    remaining: limit,
-                })
+                .map(|inner| LimitedRead::new(inner, limit))
                 .map(Box::new)
                 .map(|boxed| boxed as Box<dyn Read>)
                 .map_err(Into::into),
             Compression::Zstd => zstd::stream::read::Decoder::with_buffer(deflated)
-                .map(|inner| LimitedRead {
-                    inner,
-                    remaining: limit,
-                })
+                .map(|inner| LimitedRead::new(inner, limit))
                 .map(Box::new)
                 .map(|boxed| boxed as Box<dyn Read>)
                 .map_err(Into::into),
@@ -2394,7 +2414,7 @@ mod tests {
 
     #[test]
     fn record_count_rejection_keeps_peak_allocation_bounded() -> Result<()> {
-        use crate::record::{Record, codec::MAX_DECOMPRESSED_BATCH_BYTES, deflated::Batch};
+        use crate::record::{Record, codec::MAX_DECODED_BATCH_BYTES, deflated::Batch};
 
         // Must be real, decodable data: a record_count this large paired
         // with empty/invalid record_data would fail for an unrelated reason
@@ -2411,14 +2431,14 @@ mod tests {
             "test assumes the 7-byte minimal record size"
         );
 
-        // Comfortably over the correct bound (MAX_DECOMPRESSED_BATCH_BYTES /
+        // Comfortably over the correct bound (MAX_DECODED_BATCH_BYTES /
         // size_of::<Record>() ~= 936,864) and comfortably under the old,
-        // wrong one (MAX_DECOMPRESSED_BATCH_BYTES / 7 ~= 14,979,657) - the
+        // wrong one (MAX_DECODED_BATCH_BYTES / 7 ~= 14,979,657) - the
         // exact gap the reviewer's repro landed in, just smaller so this
         // test's setup stays in the low megabytes rather than gigabytes.
         let record_count = 1_000_000_u32;
-        assert!((record_count as usize) < MAX_DECOMPRESSED_BATCH_BYTES / 7);
-        assert!((record_count as usize) > MAX_DECOMPRESSED_BATCH_BYTES / size_of::<Record>());
+        assert!((record_count as usize) < MAX_DECODED_BATCH_BYTES / 7);
+        assert!((record_count as usize) > MAX_DECODED_BATCH_BYTES / size_of::<Record>());
 
         let uncompressed = minimal_record.repeat(record_count as usize);
         let compressed = zstd::stream::encode_all(&uncompressed[..], 0)?;
@@ -2455,10 +2475,7 @@ mod tests {
     #[test]
     fn limited_read_allows_up_to_the_limit() -> Result<()> {
         let data = vec![7u8; 16];
-        let mut reader = LimitedRead {
-            inner: Cursor::new(data.clone()),
-            remaining: data.len(),
-        };
+        let mut reader = LimitedRead::new(Cursor::new(data.clone()), data.len());
 
         let mut out = Vec::new();
         _ = reader.read_to_end(&mut out)?;
@@ -2470,10 +2487,7 @@ mod tests {
     #[test]
     fn limited_read_errors_past_the_limit() {
         let data = vec![7u8; 17];
-        let mut reader = LimitedRead {
-            inner: Cursor::new(data),
-            remaining: 16,
-        };
+        let mut reader = LimitedRead::new(Cursor::new(data), 16);
 
         let mut out = Vec::new();
         assert!(reader.read_to_end(&mut out).is_err());
@@ -2508,7 +2522,7 @@ mod tests {
         let err = Compression::Snappy
             .inflator(
                 Cursor::new(header),
-                crate::record::codec::MAX_DECOMPRESSED_BATCH_BYTES,
+                crate::record::codec::MAX_DECODED_BATCH_BYTES,
             )
             .err()
             .expect("a claimed length over the limit must be rejected before decompressing");
@@ -2564,6 +2578,118 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// `records` records of `headers` null/null headers each, encoded. A
+    /// null/null header is 2 bytes on the wire and `size_of::<Header>()`
+    /// (64) once decoded: the 32x amplification a header bomb relies on.
+    fn records_of_empty_headers(records: usize, headers: usize) -> Result<Vec<u8>> {
+        use crate::record::{Header, Record};
+
+        let record = Record {
+            headers: vec![Header::default(); headers],
+            ..Default::default()
+        }
+        .encode()?;
+
+        Ok(record.repeat(records))
+    }
+
+    // 20 records of 500k headers: 20 MB on the wire, 640 MiB decoded. Each
+    // record alone (32 MiB of headers) fits the budget, so this exercises
+    // the running total across records, not a per-record cap.
+    const BOMB_RECORDS: usize = 20;
+    const BOMB_HEADERS_PER_RECORD: usize = 500_000;
+
+    // The budget bounds live decoded data at MAX_DECODED_BATCH_BYTES. On top
+    // of that, Vec doubling transiently holds the old and new buffer while a
+    // record's headers grow, and the test's own 20 MB input is live. 256 MiB
+    // leaves room for both, against the 640 MiB+ this batch decodes into
+    // unbounded.
+    const BOUNDED_PEAK: usize = 256 * 1024 * 1024;
+
+    #[test]
+    fn header_bomb_in_a_compressed_batch_is_rejected_within_the_budget() -> Result<()> {
+        use crate::record::{Record, deflated::Batch};
+
+        let uncompressed = records_of_empty_headers(BOMB_RECORDS, BOMB_HEADERS_PER_RECORD)?;
+        let compressed = zstd::stream::encode_all(&uncompressed[..], 0)?;
+        drop(uncompressed);
+
+        let batch = Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::Zstd)
+                .into(),
+            record_count: u32::try_from(BOMB_RECORDS)?,
+            record_data: Bytes::from(compressed),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a batch whose headers decode past the budget must be rejected");
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(_)), "{err:?}");
+
+        let peak = ALLOCATOR.max_allocated();
+        assert!(
+            peak < BOUNDED_PEAK,
+            "decoding must stop within the budget, not allocate every header; peaked at \
+             {peak} bytes"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn header_bomb_in_an_uncompressed_batch_is_rejected_within_the_budget() -> Result<()> {
+        use crate::record::{Record, deflated::Batch};
+
+        // Compression::None is bounded only by the frame size on the wire,
+        // and the same 32x applies on decode.
+        let uncompressed = records_of_empty_headers(BOMB_RECORDS, BOMB_HEADERS_PER_RECORD)?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::None)
+                .into(),
+            record_count: u32::try_from(BOMB_RECORDS)?,
+            record_data: Bytes::from(uncompressed),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a batch whose headers decode past the budget must be rejected");
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(_)), "{err:?}");
+
+        let peak = ALLOCATOR.max_allocated();
+        assert!(
+            peak < BOUNDED_PEAK,
+            "decoding must stop within the budget, not allocate every header; peaked at \
+             {peak} bytes"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn snappy_truncated_xerial_header_is_an_error_not_a_panic() {
+        // The magic followed by fewer than the 12 header bytes (version,
+        // compatible version, block size) used to panic on a slice. Each of
+        // those lengths must come back as an error. (A full header followed
+        // by `[0]` is a valid, empty block, so longer inputs are not errors.)
+        for short in 0..12 {
+            let mut input = b"\x82SNAPPY\0".to_vec();
+            input.extend(std::iter::repeat_n(0u8, short));
+
+            let result = Compression::Snappy.inflator(
+                Cursor::new(input),
+                crate::record::codec::MAX_DECODED_BATCH_BYTES,
+            );
+
+            assert!(
+                matches!(result, Err(Error::Overflow)),
+                "{short} bytes after the xerial magic must be rejected as truncated"
+            );
+        }
     }
 
     #[test]

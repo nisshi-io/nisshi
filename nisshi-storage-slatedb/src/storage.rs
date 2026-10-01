@@ -56,7 +56,7 @@ use nisshi_storage::{
     TxnOffsetCommitRequest, TxnState, UpdateError, Version,
 };
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::engine::Engine;
@@ -283,7 +283,25 @@ impl Engine {
                 let mut removed_records = 0;
 
                 for (raw_key, offset, deflated) in batches.iter().rev() {
-                    let inflated = InflatedBatch::try_from(deflated.clone())?;
+                    // A stored batch that cannot be inflated (malformed, or
+                    // over the decoded-size limit) is left as it is rather
+                    // than failing the whole pass. Its keys are unknown, so
+                    // older records it may supersede are kept: the
+                    // conservative outcome, and every other batch is still
+                    // compacted.
+                    let inflated = match InflatedBatch::try_from(deflated.clone()) {
+                        Ok(inflated) => inflated,
+                        Err(error) => {
+                            warn!(
+                                topic = %metadata.topic.name,
+                                partition,
+                                offset,
+                                ?error,
+                                "compaction is skipping a batch it cannot inflate"
+                            );
+                            continue;
+                        }
+                    };
 
                     if BatchAttribute::try_from(inflated.attributes)?.control {
                         continue;
