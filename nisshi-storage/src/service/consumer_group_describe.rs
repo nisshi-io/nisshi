@@ -21,7 +21,7 @@ use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ConsumerGroupDescribeRequest`] returning [`ConsumerGroupDescribeResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ConsumerGroupDescribeRequest`] returning [`ConsumerGroupDescribeResponse`].
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};

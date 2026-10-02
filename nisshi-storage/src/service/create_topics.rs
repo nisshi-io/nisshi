@@ -42,7 +42,7 @@ fn error_result(
         .configs(Some([].into()))
 }
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{NULL_TOPIC_ID, CreateTopicsRequest,

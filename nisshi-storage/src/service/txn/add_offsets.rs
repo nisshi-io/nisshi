@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`AddOffsetsToTxnRequest`] returning [`AddOffsetsToTxnResponse`].
+/// A [`Service`] using its [`Storage`] taking [`AddOffsetsToTxnRequest`] returning [`AddOffsetsToTxnResponse`].
 #[derive(Clone, Debug)]
 pub struct AddOffsetsService<G> {
     pub storage: G,
