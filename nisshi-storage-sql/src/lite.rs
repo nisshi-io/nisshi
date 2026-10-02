@@ -2681,7 +2681,11 @@ impl Storage for Delegate {
                 debug!(after_produce_in_tx = elapsed_millis(start));
             })
             .inspect_err(|err| match err {
-                Error::Api(_) => debug!(?err),
+                // A rejection the client caused: ProduceService logs it once,
+                // at warn, with the topic and partition.
+                Error::Api(_) | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
+                    debug!(?err)
+                }
                 err => error!(?err),
             })?;
 
