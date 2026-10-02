@@ -238,7 +238,7 @@ impl Batch {
     }
 
     /// True if `record_count` alone implies more decoded memory than
-    /// [`MAX_DECODED_BATCH_BYTES`] allows, without attempting any
+    /// `MAX_DECODED_BATCH_BYTES` allows, without attempting any
     /// decompression. A cheap, public pre-check so a caller that wants to
     /// reject a batch before invoking storage (and before paying for
     /// decompression) can do so with a specific, client-facing error rather
