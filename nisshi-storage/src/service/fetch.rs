@@ -17,9 +17,7 @@ use std::{cmp::min, time::SystemTime};
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput,
     fetch_request::{FetchPartition, FetchTopic},
-    fetch_response::{
-        EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
-    },
+    fetch_response::{EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId},
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
@@ -278,9 +276,10 @@ where
                             .diverging_epoch(Some(
                                 EpochEndOffset::default().epoch(-1).end_offset(-1),
                             ))
-                            .current_leader(Some(
-                                LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
-                            ))
+                            // Kafka sends a leader hint only with a leadership
+                            // error; librdkafka acts on one here, and its
+                            // consumer close then hangs on a deleted topic
+                            .current_leader(None)
                             .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
                             .aborted_transactions(Some([].into()))
                             .preferred_read_replica(Some(-1))

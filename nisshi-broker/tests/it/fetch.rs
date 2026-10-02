@@ -1192,6 +1192,63 @@ where
     Ok(())
 }
 
+/// A fetch by the id of a topic that does not exist (for example, one
+/// deleted under an assigned consumer, which fetches by topic id) is
+/// answered straight away, and without a leader hint: Kafka sends one only
+/// with a leadership error, and librdkafka acts on one here, after which
+/// its consumer close hangs.
+pub async fn unknown_topic_id<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let started_at = SystemTime::now();
+
+    let response = FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: FetchRequest::default()
+            .max_wait_ms(10_000)
+            .min_bytes(1)
+            .max_bytes(Some(50 * 1024))
+            .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+            .topics(Some(
+                [FetchTopic::default()
+                    .topic(None)
+                    .topic_id(Some(Uuid::now_v7().into_bytes()))
+                    .partitions(Some(
+                        [FetchPartition::default()
+                            .partition(0)
+                            .current_leader_epoch(Some(-1))
+                            .fetch_offset(0)
+                            .last_fetched_epoch(Some(-1))
+                            .log_start_offset(Some(-1))
+                            .partition_max_bytes(50 * 1024)]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+        extensions: Extensions::default(),
+    })
+    .await?;
+
+    let elapsed = started_at.elapsed()?;
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+
+    let partitions = partition_data(response);
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(None, partitions[0].current_leader);
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use super::*;
@@ -1294,6 +1351,21 @@ mod pg {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::offset_out_of_range(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_id(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1404,6 +1476,21 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::offset_out_of_range(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_id(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1535,6 +1622,21 @@ mod lite {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn unknown_topic_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_id(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -1654,6 +1756,21 @@ mod slatedb {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::below_log_start(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_id(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
