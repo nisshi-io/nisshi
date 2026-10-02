@@ -499,6 +499,19 @@ impl Serializer for &mut Encoder {
             } else {
                 Ok(())
             }
+        } else if self.is_valid() && self.is_sequence() {
+            // Every sequence field is `Option<Vec<T>>` regardless of
+            // whether it's actually nullable on the wire (see build.rs's
+            // `kind()`), so a *mandatory* array left at its `None` default
+            // must still encode as an empty array, not be skipped outright
+            // (which desyncs every field written after it). A genuinely
+            // nullable sequence never reaches this branch: it's caught by
+            // `is_nullable()` above and null is written instead.
+            if self.is_flexible() {
+                self.unsigned_varint(1)
+            } else {
+                self.serialize_i32(0)
+            }
         } else {
             Ok(())
         }
