@@ -585,6 +585,24 @@ impl Serializer for &mut Encoder {
             );
 
             Ok(())
+        } else if self.is_valid()
+            && self.is_nullable()
+            && self.is_structure()
+            && !self.is_sequence()
+        {
+            // KIP-893 requires a presence marker before a non-null
+            // nullable struct's own fields too, mirroring the -1/0 marker
+            // `serialize_none` already writes for this same field shape
+            // when the value is null. This branch used to fall straight
+            // through to the plain `value.serialize(self)` below with no
+            // marker at all, desyncing every byte written after it.
+            if self.is_flexible() {
+                self.unsigned_varint(1)?;
+            } else {
+                self.serialize_i8(1)?;
+            }
+
+            value.serialize(self)
         } else {
             value.serialize(self)
         }
