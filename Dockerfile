@@ -12,30 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
+# Packages a prebuilt static binary: nothing is compiled here. CI's release
+# job (or `just docker-dist` locally) places one per platform at
+# dist/<os>/<arch>/nisshi, e.g. dist/linux/arm64/nisshi.
 
-FROM --platform=$BUILDPLATFORM rust:1.88-alpine AS builder
-COPY --from=xx / /
-RUN apk add clang cmake lld
-RUN rustup target add $(xx-cargo --print-target-triple)
-
-WORKDIR /usr/src
-ADD / /usr/src/
-
-ARG TARGETPLATFORM
-RUN xx-apk add --no-cache musl-dev zlib-dev zlib-static gcc
-RUN xx-cargo build --bin tansu --all-features --release --target-dir ./build
-RUN xx-verify --static ./build/$(xx-cargo --print-target-triple)/release/tansu
-
-RUN <<EOF
-mkdir -p /image/schema /image/data /image/tmp /image/etc/ssl
-cp -v build/$(xx-cargo --print-target-triple)/release/tansu /image
-cp -v LICENSE /image
-cp -rv /etc/ssl /image/etc
-EOF
+# CA certs are architecture-independent, so this stage runs on the build
+# host for every target platform and a multi-platform build needs no QEMU.
+FROM --platform=$BUILDPLATFORM alpine:3 AS base
+RUN mkdir -p /image/schema /image/data /image/tmp /image/etc && cp -r /etc/ssl /image/etc/
 
 FROM scratch
-COPY --from=builder /image /
+ARG TARGETPLATFORM
+COPY --from=base /image /
+# --chmod: the binary arrives via an Actions artifact, which drops the exec bit.
+COPY --chmod=755 dist/${TARGETPLATFORM}/nisshi /nisshi
+COPY LICENSE /LICENSE
 ENV TMP=/tmp
-ENTRYPOINT ["/tansu"]
+ENTRYPOINT ["/nisshi"]
 CMD ["broker"]

@@ -1,0 +1,41 @@
+[package]
+name = "nisshi-storage-dynostore"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+authors.workspace = true
+include.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+cached.workspace = true
+dotenv.workspace = true
+futures.workspace = true
+governor.workspace = true
+human-units.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-schema.workspace = true
+nisshi-storage = {workspace = true, features = ["dynostore"]}
+object_store.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+opentelemetry.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rama.workspace = true
+tracing-subscriber.workspace = true
+
+
+[lints]
+workspace = true
