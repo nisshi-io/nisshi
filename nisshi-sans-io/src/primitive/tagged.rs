@@ -33,6 +33,15 @@ use tracing::{debug, instrument};
 
 const MAXIMUM_TAGGED_FIELDS: usize = 128;
 
+/// Caps the up-front allocation for a single tagged field's data. The real
+/// length is an attacker-controlled varint read straight off the wire
+/// (`fuzz_request_decode` found a ~3.5GB claim aborting the process via
+/// `Vec::with_capacity` before a single data byte was read), so it must not
+/// be trusted directly for a pre-allocation size. A legitimate payload
+/// larger than this still decodes correctly, just via a few extra
+/// reallocations as the vec grows one `push` at a time.
+const MAXIMUM_PREALLOCATED_TAG_DATA: usize = 4096;
+
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TagField(pub u32, pub Vec<u8>);
 
@@ -118,14 +127,17 @@ impl<'de> Deserialize<'de> for TagField {
                     .into();
 
                 (0..length)
-                    .try_fold(Vec::with_capacity(length), |mut acc, _| {
-                        seq.next_element::<u8>()?
-                            .ok_or_else(|| serde::de::Error::custom("byte"))
-                            .map(|byte| {
-                                acc.push(byte);
-                                acc
-                            })
-                    })
+                    .try_fold(
+                        Vec::with_capacity(length.min(MAXIMUM_PREALLOCATED_TAG_DATA)),
+                        |mut acc, _| {
+                            seq.next_element::<u8>()?
+                                .ok_or_else(|| serde::de::Error::custom("byte"))
+                                .map(|byte| {
+                                    acc.push(byte);
+                                    acc
+                                })
+                        },
+                    )
                     .inspect(|data| debug!(?tag, ?data))
                     .map(|data| TagField(tag, data))
             }
