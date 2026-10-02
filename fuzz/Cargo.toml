@@ -12,6 +12,7 @@ cargo-fuzz = true
 bytes.workspace = true
 libfuzzer-sys.workspace = true
 nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
+nisshi-service.workspace = true
 nisshi-storage-dynostore.workspace = true
 nisshi-storage.workspace = true
 rama.workspace = true
@@ -217,3 +218,5 @@ path = "fuzz_targets/fuzz_produce_storage.rs"
 test = false
 doc = false
 bench = false
+
+[lints]

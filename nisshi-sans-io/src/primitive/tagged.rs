@@ -117,12 +117,6 @@ impl<'de> Deserialize<'de> for TagField {
                     .ok_or_else(|| serde::de::Error::custom("length"))?
                     .into();
 
-                if length > MAXIMUM_TAGGED_FIELDS {
-                    return Err(serde::de::Error::custom(format!(
-                        "maximum tagged fields exceeded {length}"
-                    )));
-                }
-
                 (0..length)
                     .try_fold(Vec::with_capacity(length), |mut acc, _| {
                         seq.next_element::<u8>()?

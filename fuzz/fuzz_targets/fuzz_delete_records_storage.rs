@@ -35,9 +35,10 @@
 
 use std::sync::{Arc, LazyLock};
 
+use fuzz::{check_request, check_response};
 use libfuzzer_sys::fuzz_target;
 use nisshi_sans_io::DeleteRecordsRequest;
-use nisshi_storage::{DeleteRecordsService, Error, StorageContainer};
+use nisshi_storage::{DeleteRecordsService, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
 use tokio::runtime::Runtime;
@@ -47,6 +48,8 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("toki
 
 fuzz_target!(|request: DeleteRecordsRequest| {
     RUNTIME.block_on(async {
+        check_request(request.clone()).expect("encode/decode request");
+
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")
             .node_id(111)
@@ -55,19 +58,17 @@ fuzz_target!(|request: DeleteRecordsRequest| {
 
         let storage = builder
             .storage(Url::parse("memory://fuzz").expect("static url"))
+            .silent(true)
             .build()
             .await
             .expect("in-memory storage always builds");
 
         let service = DeleteRecordsService { storage };
 
-        // A `Error::Api` is a well-formed Kafka error response and is
-        // expected/uninteresting; any other error means something went
-        // wrong internally (not just "client sent a bad request"), so it's
-        // treated as a fuzz failure alongside panics.
-        match service.serve(request).await {
-            Ok(_) | Err(Error::Api(_)) => {}
-            Err(error) => panic!("non-API error from DeleteRecordsService: {error:?}"),
-        }
+        service
+            .serve(request)
+            .await
+            .and_then(|response| check_response(response).map_err(Into::into))
+            .expect("served and decoded")
     });
 });

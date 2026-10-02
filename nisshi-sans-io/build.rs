@@ -176,25 +176,57 @@ fn is_optional(parent: Option<&Field>, f: &Field) -> bool {
         || !(f.nullable().is_none() && f.versions().is_mandatory(parent.map(Field::versions)))
 }
 
-/// An `#[arbitrary(..)]` field attribute for Kafka kinds the `arbitrary`
-/// crate can't derive support for on its own:
+/// An `#[arbitrary(..)]` field attribute that makes a fuzzed struct match the
+/// shape a real request/response can actually have at `latest` (the
+/// containing message's highest `validVersions` entry) — the version that
+/// `fuzz/src/lib.rs::api_version` and every fuzz target implicitly target.
+///
+/// A field whose Rust type is `Option`-wrapped only because it isn't present
+/// in every version (see [`kind`]) is otherwise filled in by the derive with
+/// no regard for versioning: it can come back `Some` for a field that
+/// doesn't exist at version `latest` at all, or `None` for one that is
+/// mandatory there, combinations no real encoder/decoder pair would ever
+/// produce or accept for that version (e.g. `FetchTopic` getting neither of
+/// its version-gated `topic`/`topic_id` fields, or both at once). This
+/// function closes that gap:
+///
+/// - Not present in `latest`'s version range at all: always `None`, via
+///   `#[arbitrary(default)]` (sound regardless of kind, since `Option<T>`'s
+///   `Default` is `None` for every `T`).
+/// - Present in `latest`'s range, untagged, and not nullable there: a
+///   wire-valid message at `latest` always carries a value, so only the
+///   `Some` arm is ever generated.
+/// - Otherwise (tagged, or nullable at `latest`): both arms are legitimate
+///   wire shapes at `latest`, so the derive's own `Option` generation is left
+///   alone.
+///
+/// Two kinds need a hand-written generator regardless of the above, since
+/// `arbitrary` can't derive them on its own:
 ///
 /// - `bytes` maps to `bytes::Bytes`, a foreign type the orphan rule stops us
 ///   implementing `Arbitrary` for here, so fuzzed fields are instead built
 ///   from an arbitrary `Vec<u8>` via `nisshi-sans-io/src/arbitrary_support.rs`.
 /// - `records` maps to `crate::RecordBatch`, whose `crc`/`batch_length`
 ///   fields are checksums/lengths over the rest of the batch that a naive
-///   derive would produce inconsistent, invalid values for; `Default`
-///   (an empty batch) is used instead.
-///
-/// Every other kind already has a native `Arbitrary` impl (or, for a nested
-/// message struct, one this generator also derives), so no attribute is
-/// needed and derive's own field-by-field generation is used as-is.
+///   derive would produce inconsistent, invalid values for; `Default` (an
+///   empty batch, i.e. `None` when `Option`-wrapped) is used instead. This is
+///   sound under the same "nullable at `latest`" rule above: every `records`
+///   field in the upstream descriptors declares `nullableVersions` covering
+///   its whole `versions` range, so `None` is always a legitimate value
+///   wherever the field exists.
 ///
 /// Neither `bytes` nor `records` occurs as a sequence in the upstream Kafka
 /// message descriptors (only as a scalar or `tag`/nullable-optional scalar),
 /// so only those two shapes are handled here.
-fn arbitrary_field_attribute(parent: Option<&Field>, field: &Field) -> TokenStream {
+fn arbitrary_field_attribute(parent: Option<&Field>, latest: i16, field: &Field) -> TokenStream {
+    let is_opt = is_optional(parent, field);
+
+    if is_opt && !field.versions().within(latest) {
+        return quote! {
+            #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+        };
+    }
+
     match field.kind().name() {
         "bytes" => {
             // Only `crate::arbitrary_support::bytes` is checked in (rather than
@@ -202,7 +234,7 @@ fn arbitrary_field_attribute(parent: Option<&Field>, field: &Field) -> TokenStre
             // broker-listened message currently has a nullable `bytes` field;
             // a hand-written function nothing generates a call to would be
             // dead code. Should that change, this inline closure calls it.
-            let with = if is_optional(parent, field) {
+            let with = if is_opt {
                 quote! {
                     |u: &mut arbitrary::Unstructured<'_>| crate::arbitrary_support::bytes(u).map(Some)
                 }
@@ -218,6 +250,27 @@ fn arbitrary_field_attribute(parent: Option<&Field>, field: &Field) -> TokenStre
         "records" => quote! {
             #[cfg_attr(feature = "arbitrary", arbitrary(default))]
         },
+
+        _ if is_opt
+            && field.tag().is_none()
+            && !field.nullable().is_some_and(|range| range.within(latest)) =>
+        {
+            let t = field.kind().type_name();
+
+            let with = if field.kind().is_sequence() {
+                quote! {
+                    |u: &mut arbitrary::Unstructured<'_>| u.arbitrary::<Vec<#t>>().map(Some)
+                }
+            } else {
+                quote! {
+                    |u: &mut arbitrary::Unstructured<'_>| u.arbitrary::<#t>().map(Some)
+                }
+            };
+
+            quote! {
+                #[cfg_attr(feature = "arbitrary", arbitrary(with = #with))]
+            }
+        }
 
         _ => quote!(),
     }
@@ -377,6 +430,7 @@ fn visibility_field_kind(
     module: &syn::Path,
     dependencies: &[Type],
     include_tag: bool,
+    latest: i16,
 ) -> Vec<TokenStream> {
     fields
         .iter()
@@ -384,7 +438,8 @@ fn visibility_field_kind(
         .map(|field| {
             let ident = field.ident();
             let kind = kind(parent, module, field, dependencies);
-            let arbitrary_attr = include_tag.then(|| arbitrary_field_attribute(parent, field));
+            let arbitrary_attr =
+                include_tag.then(|| arbitrary_field_attribute(parent, latest, field));
 
             field.about().map_or(
                 quote! {
@@ -416,7 +471,17 @@ fn root_message_struct(message: &Message, include_tag: bool) -> TokenStream {
         syn::parse_str::<syn::Path>(&name.to_token_stream().to_string().to_case(Case::Snake))
             .unwrap();
 
-    let tokens = message_struct(&module, None, name, fields, common_structs, include_tag);
+    let latest = message.version().valid().end;
+
+    let tokens = message_struct(
+        &module,
+        None,
+        name,
+        fields,
+        common_structs,
+        include_tag,
+        latest,
+    );
 
     if include_tag {
         quote! {
@@ -506,6 +571,7 @@ fn message_struct(
     fields: &[Field],
     common_structs: Option<&[CommonStruct]>,
     include_tag: bool,
+    latest: i16,
 ) -> TokenStream {
     let dependencies: Vec<Type> = fields
         .iter()
@@ -530,15 +596,20 @@ fn message_struct(
                     children,
                     None,
                     include_tag,
+                    latest,
                 )
             })
         })
-        .chain(
-            common_structs
-                .unwrap_or(&[][..])
-                .iter()
-                .map(|cs| common_struct(parent, module, &cs.type_name(), cs.fields(), include_tag)),
-        )
+        .chain(common_structs.unwrap_or(&[][..]).iter().map(|cs| {
+            common_struct(
+                parent,
+                module,
+                &cs.type_name(),
+                cs.fields(),
+                include_tag,
+                latest,
+            )
+        }))
         .collect();
 
     let vfk = visibility_field_kind(
@@ -548,6 +619,7 @@ fn message_struct(
         module,
         &dependencies,
         include_tag,
+        latest,
     );
 
     let maximum_allocation_size = maximum_allocation_size(name, fields, include_tag);
@@ -885,9 +957,10 @@ fn common_struct(
     name: &Type,
     fields: &[Field],
     include_tag: bool,
+    latest: i16,
 ) -> TokenStream {
     let vis = quote!(pub);
-    let vfk = visibility_field_kind(parent, Some(&vis), fields, module, &[], include_tag);
+    let vfk = visibility_field_kind(parent, Some(&vis), fields, module, &[], include_tag, latest);
     let maximum_allocation_size = maximum_allocation_size(name, fields, include_tag);
 
     if include_tag {

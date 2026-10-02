@@ -31,3 +31,4 @@ tmp
 .ua/intermediate/
 .ua/diff-overlay.json
 .ua/.trash-*/
+fuzz/artifacts/fuzz_alter_user_scram_credentials_storage/

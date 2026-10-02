@@ -23,6 +23,7 @@ use nisshi_sans_io::{
     JoinGroupRequest, JoinGroupResponse, ListGroupsRequest, ListOffsetsResponse,
     ListPartitionReassignmentsRequest, MaximumAllocationSize, MetadataRequest, MetadataResponse,
     OffsetFetchRequest, OffsetForLeaderEpochRequest, ProduceRequest, ProduceResponse, Result,
+    fetch_request::{FetchPartition, FetchTopic},
     fetch_response::NodeEndpoint,
     join_group_request::JoinGroupRequestProtocol,
     join_group_response::JoinGroupResponseMember,
@@ -31,7 +32,6 @@ use nisshi_sans_io::{
         inflated::{self, Batch},
     },
 };
-use pretty_assertions::assert_eq;
 use tracing::debug;
 
 #[test]
@@ -2370,6 +2370,160 @@ fn fetch_request_v16_000() -> Result<()> {
         ],
         Frame::request(header, body)?,
     );
+
+    Ok(())
+}
+
+#[test]
+fn fetch_request_v17_fuzz_000() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let header = Header::Request {
+        api_key: 1,
+        api_version: 17,
+        correlation_id: 12,
+        client_id: Some("console-consumer".into()),
+    };
+
+    let body = FetchRequest::default()
+        .cluster_id(Some(
+            "\0\u{6}uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu\0\0\0\0\u{6}\0".into()
+        ))
+        .replica_id(None)
+        .replica_state(None)
+        .max_wait_ms(603980776)
+        .min_bytes(605416440)
+        .max_bytes(Some(930559488))
+        .isolation_level(Some(0))
+        .session_id(Some(605416440))
+        .session_epoch(Some(922812031))
+        .topics(Some([
+            FetchTopic::default()
+                .topic(None)
+                .topic_id(Some([
+                    55, 127, 127, 254, 255, 255, 127, 127, 222, 255, 255, 255, 255, 255, 127, 255,
+                ]))
+                .partitions(Some([].into()))
+            ,
+            FetchTopic::default()
+                .topic(None)
+                .topic_id(Some([
+                    190, 0, 0, 0, 6, 0, 248, 235, 21, 36, 255, 255, 255, 255, 43, 43,
+                ]))
+                .partitions(Some([].into()))
+            ,
+            FetchTopic::default()
+                .topic(None)
+                .topic_id(Some([
+                    43, 0, 248, 235, 21, 36, 0, 127, 21, 10, 12, 156, 144, 46, 96, 0,
+                ]))
+                .partitions(Some([].into()))
+            ,
+            FetchTopic::default()
+                .topic(None)
+                .topic_id(Some([
+                    255, 127, 255, 61, 190, 0, 0, 0, 6, 0, 248, 235, 21, 36, 255, 255,
+                ]))
+                .partitions(Some([FetchPartition::default()
+                    .partition(-1613442047)
+                    .current_leader_epoch(Some(134206676))
+                    .fetch_offset(-2021827061141964821)
+                    .last_fetched_epoch(Some(21))
+                    .log_start_offset(Some(0))
+                    .partition_max_bytes(0)
+                    .replica_directory_id(None)
+                ].into()))
+
+            ].into()))
+        .forgotten_topics_data(Some([].into()))
+        .rack_id(Some("".into()))
+        .into();
+
+    assert_eq!(
+        &[
+            0, 0, 1, 35, 0, 1, 0, 17, 0, 0, 0, 12, 0, 16, 99, 111, 110, 115, 111, 108, 101, 45, 99,
+            111, 110, 115, 117, 109, 101, 114, 0, 36, 0, 3, 232, 36, 21, 235, 248, 55, 119, 54, 0,
+            0, 36, 21, 235, 248, 55, 0, 254, 127, 5, 55, 127, 127, 254, 255, 255, 127, 127, 222,
+            255, 255, 255, 255, 255, 127, 255, 1, 0, 190, 0, 0, 0, 6, 0, 248, 235, 21, 36, 255,
+            255, 255, 255, 43, 43, 1, 0, 43, 0, 248, 235, 21, 36, 0, 127, 21, 10, 12, 156, 144, 46,
+            96, 0, 1, 0, 255, 127, 255, 61, 190, 0, 0, 0, 6, 0, 248, 235, 21, 36, 255, 255, 2, 159,
+            212, 212, 1, 7, 255, 212, 212, 227, 241, 6, 255, 255, 92, 119, 235, 0, 0, 0, 21, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 131, 1, 130, 1, 0, 6, 117, 117, 117,
+            117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117,
+            117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117,
+            117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117,
+            117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117,
+            117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117,
+            117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117,
+            117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 117, 0, 0,
+            0, 0, 6, 0,
+        ],
+        &Frame::request(header, body)?[..],
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fetch_request_v17_fuzz_001() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let header = Header::Request {
+        api_key: 1,
+        api_version: 17,
+        correlation_id: 12,
+        client_id: Some("console-consumer".into()),
+    };
+
+    let body: Body = FetchRequest::default()
+        .cluster_id(None)
+        .replica_id(None)
+        .replica_state(None)
+        .max_wait_ms(5632)
+        .min_bytes(33024)
+        .max_bytes(Some(0))
+        .isolation_level(Some(25))
+        .session_id(Some(926351396))
+        .session_epoch(Some(3618615))
+        .topics(Some(
+            [
+                FetchTopic::default()
+                    .topic(None)
+                    .topic_id(Some([
+                        55, 55, 55, 55, 55, 55, 55, 0, 0, 0, 0, 0, 0, 235, 21, 36,
+                    ]))
+                    .partitions(Some([].into())),
+                FetchTopic::default()
+                    .topic(None)
+                    .topic_id(Some([
+                        162, 55, 55, 55, 0, 0, 0, 0, 0, 251, 251, 251, 251, 251, 251, 251,
+                    ]))
+                    .partitions(Some(
+                        [FetchPartition::default()
+                            .partition(-67372037)
+                            .current_leader_epoch(Some(-67372037))
+                            .fetch_offset(-289360691352306693)
+                            .last_fetched_epoch(Some(-67372037))
+                            .log_start_offset(Some(-289360691352306693))
+                            .partition_max_bytes(-67372037)
+                            .replica_directory_id(Some([
+                                251, 251, 251, 251, 251, 251, 251, 251, 251, 0, 235, 21, 36, 0, 55,
+                                162,
+                            ]))]
+                        .into(),
+                    )),
+            ]
+            .into(),
+        ))
+        .forgotten_topics_data(Some([].into()))
+        .rack_id(Some("".into()))
+        .into();
+
+    let round_trip = Frame::request(header, body.clone())
+        .and_then(Frame::request_from_bytes)
+        .map(|frame| frame.body)?;
+
+    assert_eq!(body, round_trip);
 
     Ok(())
 }
