@@ -36,8 +36,9 @@ nextest *args:
 test-doc:
     cargo test --workspace --doc --all-features
 
-doc:
-    cargo doc --all-features --open
+# check the doc comments of every library and binary; pass --open to browse them
+doc *args:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items {{ args }}
 
 cargo-fuzz +args:
     cargo +nightly fuzz {{ args }}

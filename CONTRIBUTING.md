@@ -37,7 +37,8 @@ architecture overview.
 
 1. Fork the repo and create a branch off `main`.
 2. Make your change. Match the existing code style; `just fmt` and
-   `just clippy` will catch most of it.
+   `just clippy` will catch most of it. Write comments by the
+   [comment rules](.claude/rules/comments.md).
 3. Add or update tests. `just test` runs the full suite.
 4. Open a pull request against `main`. Fill in the PR template — it's short
    on purpose. Merging requires an approval from a code owner and all

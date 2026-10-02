@@ -21,7 +21,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, TopicId};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`MetadataRequest`] returning [`MetadataRequest`].
+/// A [`Service`] using its [`Storage`] taking [`MetadataRequest`] returning [`MetadataResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::MetadataRequest;

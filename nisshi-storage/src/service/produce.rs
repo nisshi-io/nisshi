@@ -57,7 +57,7 @@ fn rejection(batch: &deflated::Batch) -> Option<&'static str> {
     }
 }
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
 /// use bytes::Bytes;
 /// use rama::Service as _;

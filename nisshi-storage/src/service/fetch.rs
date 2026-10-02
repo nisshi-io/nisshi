@@ -29,7 +29,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, Topition};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
+/// A [`Service`] using its [`Storage`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{

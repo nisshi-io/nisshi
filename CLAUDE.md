@@ -21,6 +21,7 @@ just build-all       # build every target (bins, examples, tests, benches) with 
 just test            # nextest + doc tests - use this to rerun the full test suite after a change
 just test-workspace  # cargo nextest run --workspace --all-targets --all-features
 just test-doc        # cargo test --workspace --doc --all-features
+just doc             # rustdoc, warnings denied, private items too; pass --open to browse
 just clippy          # cargo clippy --workspace --all-features --all-targets -- -D warnings
 just fmt             # cargo fmt --all --check
 just check           # cargo check --workspace --all-features --all-targets
@@ -125,13 +126,14 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 - Tests load `.env` via `dotenv().ok()`
 - Tests in `nisshi-broker` run against multiple backends: InMemory, Lite (libSQL), Postgres, SlateDb
 - `nisshi-broker`, `nisshi-sans-io` and `nisshi-service` each build one integration-test binary, `it`. To add a test file, create `tests/it/<name>.rs` and declare it with `pub mod <name>;` in `tests/it/main.rs`; Cargo ignores undeclared files, and the `every_test_file_is_declared` test fails if one is missed. Gate backend-specific tests with `#[cfg(feature = "...")]` on a module, not `required-features`. Run one file's tests with a name filter, e.g. `cargo nextest run -p nisshi-broker --all-features -E 'test(/^fetch::/)'`
+- Give each feature its own test file. Put the tests of one feature or one Kafka API in one file under `tests/it/`, named after it. Tests for a new feature go in a new file, not at the end of a file about another subject. A reader then finds them by name, and a name filter on the module selects them.
 - Single-file test targets with specific feature requirements (e.g. `nisshi-schema`'s `berg`) use `required-features` in their `Cargo.toml`
 
 ## CI Pipeline
 
 GitHub Actions (`.github/workflows/ci.yml`) runs in two tiers, gated by `ci-gate`, the single required check that fans in every other job:
 
-- **Tier A, every pull_request push:** `fmt`, `clippy`, `typos`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
+- **Tier A, every pull_request push:** `fmt`, `clippy` (which also runs `just doc`), `typos`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
 - **Tier B, once per merge-queue entry (`merge_group`) and on push to `main`:** the full `build-storage` / `build-storage-lake` feature matrix, `test` on postgres:16/17/18, the experimental compat legs, `cargo-publish-dry-run`, `src`, `release`, `package`, `smoke` (Java Kafka client, Kafka 3.7/3.8/3.9).
 
 Merging goes through a merge queue: "Merge when ready" queues the PR, the queue re-runs CI on it against the current tip of `main`, and merges with a merge commit if everything is green. Tier B is skipped on PRs only while the `MERGE_QUEUE` repository variable is `on`; with it unset, PRs run everything. The other required checks come from `codeql.yml`, `workflow-lint.yml` and `dependencies.yml`.
@@ -150,4 +152,4 @@ Merging goes through a merge queue: "Merge when ready" queues the PR, the queue 
 
 ## Lint Configuration
 
-Workspace-level in `Cargo.toml`: `clippy::all = warn`, `unsafe_code = forbid`, `non_ascii_idents = forbid`, `rust_2018_idioms = deny`, `unreachable_pub = warn`, `broken_intra_doc_links = deny`. CI runs `clippy -- -D warnings` (all warnings are errors).
+Workspace-level in `Cargo.toml`: `clippy::all = warn`, `unsafe_code = forbid`, `non_ascii_idents = forbid`, `rust_2018_idioms = deny`, `unreachable_pub = warn`, `broken_intra_doc_links = deny`, `private_intra_doc_links = deny`. CI runs `clippy -- -D warnings` (all warnings are errors) and `just doc`, which runs rustdoc with warnings denied.
