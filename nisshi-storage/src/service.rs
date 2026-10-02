@@ -16,6 +16,7 @@ mod alter_user_scram_credentials;
 mod consumer_group_describe;
 mod create_acls;
 mod create_topics;
+mod deadline;
 mod delete_groups;
 mod delete_records;
 mod delete_topics;
