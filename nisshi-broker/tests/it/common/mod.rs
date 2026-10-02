@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #![allow(dead_code)]
+
+pub(crate) mod wire;
+
 use bytes::Bytes;
 use glob::glob;
 use nisshi_broker::{
