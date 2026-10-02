@@ -499,6 +499,19 @@ impl Serializer for &mut Encoder {
             } else {
                 Ok(())
             }
+        } else if self.is_valid() && self.is_sequence() {
+            // Every sequence field is `Option<Vec<T>>` regardless of
+            // whether it's actually nullable on the wire (see build.rs's
+            // `kind()`), so a *mandatory* array left at its `None` default
+            // must still encode as an empty array, not be skipped outright
+            // (which desyncs every field written after it). A genuinely
+            // nullable sequence never reaches this branch: it's caught by
+            // `is_nullable()` above and null is written instead.
+            if self.is_flexible() {
+                self.unsigned_varint(1)
+            } else {
+                self.serialize_i32(0)
+            }
         } else {
             Ok(())
         }
@@ -572,6 +585,24 @@ impl Serializer for &mut Encoder {
             );
 
             Ok(())
+        } else if self.is_valid()
+            && self.is_nullable()
+            && self.is_structure()
+            && !self.is_sequence()
+        {
+            // KIP-893 requires a presence marker before a non-null
+            // nullable struct's own fields too, mirroring the -1/0 marker
+            // `serialize_none` already writes for this same field shape
+            // when the value is null. This branch used to fall straight
+            // through to the plain `value.serialize(self)` below with no
+            // marker at all, desyncing every byte written after it.
+            if self.is_flexible() {
+                self.unsigned_varint(1)?;
+            } else {
+                self.serialize_i8(1)?;
+            }
+
+            value.serialize(self)
         } else {
             value.serialize(self)
         }

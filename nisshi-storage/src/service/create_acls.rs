@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, CreateAclsRequest, CreateAclsResponse, RequestInput};
+use nisshi_sans_io::{
+    ApiKey, CreateAclsRequest, CreateAclsResponse, ErrorCode, RequestInput,
+    create_acls_response::AclCreationResult,
+};
 use rama::Service;
 use tracing::instrument;
 
@@ -35,9 +38,27 @@ where
     type Output = CreateAclsResponse;
     type Error = Error;
 
+    // ACLs have no backing storage yet, so every creation is reported as
+    // `SecurityDisabled` (the same error a real broker returns when no
+    // authorizer is configured), one result per requested creation, in
+    // order, as the protocol requires.
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
-        let _ = input;
-        Ok(CreateAclsResponse::default())
+        Ok(CreateAclsResponse::default()
+            .throttle_time_ms(0)
+            .results(Some(
+                input
+                    .into()
+                    .request
+                    .creations
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|_| {
+                        AclCreationResult::default()
+                            .error_code(ErrorCode::SecurityDisabled.into())
+                            .error_message(Some(ErrorCode::SecurityDisabled.to_string()))
+                    })
+                    .collect(),
+            )))
     }
 }

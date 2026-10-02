@@ -15,13 +15,14 @@
 use std::{collections::BTreeSet, ops::Deref as _};
 
 use nisshi_sans_io::{
-    ApiKey, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse, RequestInput,
+    ApiKey, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse,
+    RequestInput,
     list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
 };
 use rama::Service;
 use tracing::{debug, error, instrument};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, ListOffsetResponse, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
 /// ```no_run
@@ -112,72 +113,128 @@ where
         let input = input.into();
         let throttle_time_ms = Some(0);
 
-        let isolation_level = input
-            .request
-            .isolation_level
-            .map_or(Ok(IsolationLevel::ReadUncommitted), |isolation_level| {
-                IsolationLevel::try_from(isolation_level)
-            })?;
+        // `isolation_level` applies to the whole request, and the wire response has no
+        // top-level error code (only per-partition ones), so an out of range value is
+        // reported by marking every requested partition `INVALID_REQUEST`, mirroring how
+        // real Kafka brokers surface whole-request validation failures on this API.
+        let isolation_level = match input.request.isolation_level.map_or(
+            Ok(IsolationLevel::ReadUncommitted),
+            IsolationLevel::try_from,
+        ) {
+            Ok(isolation_level) => isolation_level,
+
+            Err(error) => {
+                debug!(?error, "invalid isolation level");
+
+                return Ok(ListOffsetsResponse::default()
+                    .throttle_time_ms(throttle_time_ms)
+                    .topics(input.request.topics.map(|topics| {
+                        topics
+                            .into_iter()
+                            .map(|topic| {
+                                ListOffsetsTopicResponse::default()
+                                    .name(topic.name)
+                                    .partitions(topic.partitions.map(|partitions| {
+                                        partitions
+                                            .into_iter()
+                                            .map(|partition| {
+                                                ListOffsetsPartitionResponse::default()
+                                                    .partition_index(partition.partition_index)
+                                                    .error_code(ErrorCode::InvalidRequest.into())
+                                                    .old_style_offsets(None)
+                                                    .timestamp(Some(-1))
+                                                    .offset(Some(0))
+                                                    .leader_epoch(Some(0))
+                                            })
+                                            .collect()
+                                    }))
+                            })
+                            .collect()
+                    })));
+            }
+        };
 
         let topics = if let Some(topics) = input.request.topics {
             let mut offsets = vec![];
+
+            // An out of range `timestamp` is scoped to its own partition (unlike
+            // `isolation_level` above), so only that partition is marked
+            // `INVALID_TIMESTAMP`; every other requested partition still resolves
+            // normally through storage.
+            let mut invalid_timestamps = vec![];
 
             for topic in topics {
                 if let Some(ref partitions) = topic.partitions {
                     for partition in partitions {
                         let tp = Topition::new(topic.name.clone(), partition.partition_index);
-                        let offset = ListOffset::try_from(partition.timestamp)?;
 
-                        offsets.push((tp, offset));
+                        match ListOffset::try_from(partition.timestamp) {
+                            Ok(offset) => offsets.push((tp, offset)),
+
+                            Err(error) => {
+                                debug!(?error, ?tp, "invalid timestamp");
+
+                                invalid_timestamps.push((
+                                    tp,
+                                    ListOffsetResponse {
+                                        error_code: ErrorCode::InvalidTimestamp,
+                                        ..Default::default()
+                                    },
+                                ));
+                            }
+                        }
                     }
                 }
             }
 
-            self.storage
+            let mut offsets = self
+                .storage
                 .list_offsets(isolation_level, offsets.deref())
                 .await
                 .inspect(|r| debug!(?r, ?offsets))
-                .inspect_err(|err| error!(?err, ?offsets))
-                .map(|offsets| {
-                    offsets
-                        .iter()
-                        .fold(BTreeSet::new(), |mut topics, (topition, _)| {
-                            _ = topics.insert(topition.topic());
-                            topics
-                        })
-                        .iter()
-                        .map(|topic_name| {
-                            ListOffsetsTopicResponse::default()
-                                .name((*topic_name).into())
-                                .partitions(Some(
-                                    offsets
-                                        .iter()
-                                        .filter_map(|(topition, offset)| {
-                                            if topition.topic() == *topic_name {
-                                                Some(
-                                                    ListOffsetsPartitionResponse::default()
-                                                        .partition_index(topition.partition())
-                                                        .error_code(offset.error_code().into())
-                                                        .old_style_offsets(None)
-                                                        .timestamp(
-                                                            offset
-                                                                .timestamp()
-                                                                .unwrap_or(Some(-1))
-                                                                .or(Some(-1)),
-                                                        )
-                                                        .offset(offset.offset().or(Some(0)))
-                                                        .leader_epoch(Some(0)),
-                                                )
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect(),
-                                ))
-                        })
-                        .collect()
-                })
-                .map(Some)?
+                .inspect_err(|err| error!(?err, ?offsets))?;
+
+            offsets.extend(invalid_timestamps);
+
+            Some(
+                offsets
+                    .iter()
+                    .fold(BTreeSet::new(), |mut topics, (topition, _)| {
+                        _ = topics.insert(topition.topic());
+                        topics
+                    })
+                    .iter()
+                    .map(|topic_name| {
+                        ListOffsetsTopicResponse::default()
+                            .name((*topic_name).into())
+                            .partitions(Some(
+                                offsets
+                                    .iter()
+                                    .filter_map(|(topition, offset)| {
+                                        if topition.topic() == *topic_name {
+                                            Some(
+                                                ListOffsetsPartitionResponse::default()
+                                                    .partition_index(topition.partition())
+                                                    .error_code(offset.error_code().into())
+                                                    .old_style_offsets(None)
+                                                    .timestamp(
+                                                        offset
+                                                            .timestamp()
+                                                            .unwrap_or(Some(-1))
+                                                            .or(Some(-1)),
+                                                    )
+                                                    .offset(offset.offset().or(Some(0)))
+                                                    .leader_epoch(Some(0)),
+                                            )
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect(),
+                            ))
+                    })
+                    .collect(),
+            )
         } else {
             None
         };

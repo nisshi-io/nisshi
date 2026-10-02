@@ -348,3 +348,22 @@ fn request_negative_api_key() -> Result<()> {
     assert!(result.is_err(), "negative api_key should fail");
     Ok(())
 }
+
+// ===========================================================================
+// 12. Tagged field data length lies about its size
+// ===========================================================================
+
+#[test]
+fn request_tagged_field_oversized_length_does_not_abort() -> Result<()> {
+    // `fuzz_request_decode` found this exact input (minimized) aborting the
+    // process: a tagged field's byte-length varint claims ~3.5GB, and
+    // `TagField`'s decoder pre-allocated a `Vec` of that size before reading
+    // a single byte, well before the truncated buffer could fail the read.
+    // It must now fail gracefully (`Err`) instead of aborting.
+    let bytes = Bytes::from_static(&[
+        148, 239, 1, 8, 0, 0, 7, 1, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 210, 255, 255, 255, 108, 230,
+    ]);
+    let result = Frame::request_from_bytes(bytes);
+    assert!(result.is_err(), "oversized tagged field length should fail");
+    Ok(())
+}
