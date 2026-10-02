@@ -305,6 +305,12 @@ pub enum Error {
     Message(String),
     OneshotRecv(oneshot::error::RecvError),
     Poison,
+    /// A connection that has not authenticated declared a frame larger than
+    /// [`TcpContext::pre_authentication_maximum_frame_size`] allows.
+    PreAuthenticationFrameTooBig {
+        size: usize,
+        limit: usize,
+    },
     Parse(#[from] url::ParseError),
     Protocol(#[from] nisshi_sans_io::Error),
     UnableToSend(Box<Frame>),
@@ -458,6 +464,15 @@ pub(crate) static BYTES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_bytes_sent")
         .with_description("The number of bytes sent")
+        .build()
+});
+
+pub(crate) static FRAMES_REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_frames_rejected")
+        .with_description(
+            "The number of frames a listener rejected for their declared size, by limit",
+        )
         .build()
 });
 
