@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, RootMessageMeta};
+use crate::{Error, Result, RootMessageMeta, record::codec::DecodeBudget};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nisshi_model::{FieldMeta, MessageMeta};
 use serde::{
@@ -73,6 +73,7 @@ pub struct Decoder<'de> {
     path: VecDeque<&'static str>,
     in_records: bool,
     message_max_size: Option<usize>,
+    budget: Option<DecodeBudget>,
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -128,6 +129,7 @@ impl<'de> Decoder<'de> {
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
             message_max_size: None,
+            budget: None,
         }
     }
 
@@ -145,6 +147,7 @@ impl<'de> Decoder<'de> {
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
             message_max_size: None,
+            budget: None,
         }
     }
 
@@ -175,7 +178,28 @@ impl<'de> Decoder<'de> {
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
             message_max_size: None,
+            budget: None,
         }
+    }
+
+    /// Charge every element this decoder produces inside a sequence (each
+    /// `Header`, each copied byte of a key or value, ...) to `budget`, so a
+    /// batch whose decoded form outgrows the budget is rejected as it is
+    /// decoded rather than after it has been allocated. A decoder without a
+    /// budget is unbounded, as before: only record data is decoded under one.
+    #[must_use]
+    pub(crate) fn with_budget(self, budget: DecodeBudget) -> Self {
+        Self {
+            budget: Some(budget),
+            ..self
+        }
+    }
+
+    /// Charge `cost` decoded bytes to the budget, if there is one.
+    pub(crate) fn charge(&mut self, cost: usize) -> Result<()> {
+        self.budget
+            .as_mut()
+            .map_or(Ok(()), |budget| budget.charge(cost))
     }
 
     #[must_use]
@@ -1385,10 +1409,18 @@ impl<'de> SeqAccess<'de> for Seq<'de, '_> {
 
             Some(length) => {
                 _ = self.length.replace(length - 1);
+                // Charged by the element's decoded size, not its wire size:
+                // that is what bounds the memory a batch decodes into,
+                // whatever the element type (a `Header`, a byte of a key or
+                // value, a sequence added later).
+                self.de.charge(size_of::<T::Value>())?;
                 seed.deserialize(&mut *self.de).map(Some)
             }
 
-            None => seed.deserialize(&mut *self.de).map(Some),
+            None => {
+                self.de.charge(size_of::<T::Value>())?;
+                seed.deserialize(&mut *self.de).map(Some)
+            }
         }
     }
 }
