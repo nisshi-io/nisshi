@@ -154,12 +154,21 @@ impl VarInt {
                         .next_element::<u8>()?
                         .ok_or_else(|| de::Error::custom("u8"))?;
 
+                    let overflow = || de::Error::custom("overflow");
+
                     if byte & CONTINUATION == CONTINUATION {
-                        let intermediate = u32::from(byte & MASK);
-                        accumulator += intermediate << shift;
-                        shift += 7;
+                        accumulator = u32::from(byte & MASK)
+                            .checked_shl(u32::from(shift))
+                            .and_then(|intermediate| accumulator.checked_add(intermediate))
+                            .ok_or_else(overflow)?;
+
+                        shift = shift.checked_add(7).ok_or_else(overflow)?;
                     } else {
-                        accumulator += u32::from(byte) << shift;
+                        accumulator = u32::from(byte)
+                            .checked_shl(u32::from(shift))
+                            .and_then(|intermediate| accumulator.checked_add(intermediate))
+                            .ok_or_else(overflow)?;
+
                         done = true;
                     }
                 }
@@ -349,12 +358,21 @@ impl LongVarInt {
                         .next_element::<u8>()?
                         .ok_or_else(|| de::Error::custom("u8"))?;
 
+                    let overflow = || de::Error::custom("overflow");
+
                     if byte & CONTINUATION == CONTINUATION {
-                        let intermediate = u64::from(byte & MASK);
-                        accumulator += intermediate << shift;
-                        shift += 7;
+                        accumulator = u64::from(byte & MASK)
+                            .checked_shl(u32::from(shift))
+                            .and_then(|intermediate| accumulator.checked_add(intermediate))
+                            .ok_or_else(overflow)?;
+
+                        shift = shift.checked_add(7).ok_or_else(overflow)?;
                     } else {
-                        accumulator += u64::from(byte) << shift;
+                        accumulator = u64::from(byte)
+                            .checked_shl(u32::from(shift))
+                            .and_then(|intermediate| accumulator.checked_add(intermediate))
+                            .ok_or_else(overflow)?;
+
                         done = true;
                     }
                 }
@@ -635,6 +653,28 @@ mod tests {
     //     check(&UnsignedVarInt(u32::MAX))?;
     //     Ok(())
     // }
+
+    // Untrusted record data: a varint with more continuation bytes than its
+    // type can hold must be an error, not an arithmetic overflow panic.
+    fn overlong(continuation_bytes: usize) -> std::io::Cursor<Vec<u8>> {
+        let mut encoded = vec![0xffu8; continuation_bytes];
+        encoded.push(0x01);
+        std::io::Cursor::new(encoded)
+    }
+
+    #[test]
+    fn deserialize_overlong_varint_is_an_error() {
+        let mut reader = overlong(6);
+        let mut decoder = crate::de::Decoder::new(&mut reader);
+        assert!(VarInt::deserialize(&mut decoder).is_err());
+    }
+
+    #[test]
+    fn deserialize_overlong_long_varint_is_an_error() {
+        let mut reader = overlong(11);
+        let mut decoder = crate::de::Decoder::new(&mut reader);
+        assert!(LongVarInt::deserialize(&mut decoder).is_err());
+    }
 
     #[test]
     fn encode_decode() -> Result<()> {
