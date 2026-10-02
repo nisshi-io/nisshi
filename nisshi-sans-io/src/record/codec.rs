@@ -50,6 +50,13 @@ pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 /// (`record_count`, a sequence length) before anything is decoded, and as a
 /// running [`DecodeBudget`] that every allocation made while decoding a batch
 /// is charged to.
+///
+/// The real peak per batch is a small multiple of this, not this exactly: an
+/// uncompressed record's headers are charged after they are allocated (the
+/// sequence-length pre-check compares one record against the whole limit,
+/// not what is left of the budget), a Snappy batch's decompressed block is
+/// live alongside the records decoded from it, and the zstd decoder's window
+/// (up to 128 MiB by default) is not charged.
 pub(crate) const MAX_DECODED_BATCH_BYTES: usize = 100 * 1024 * 1024;
 
 /// The decoded-memory budget of one batch. Each `Record`, each `Header` and
