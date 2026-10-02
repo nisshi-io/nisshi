@@ -15,8 +15,12 @@
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use nisshi_sans_io::record::deflated;
+use nisshi_sans_io::record::{Record, deflated};
 
 fuzz_target!(|data: &[u8]| {
-    let _ = deflated::Batch::try_from(Bytes::copy_from_slice(data));
+    // A parsed header carries the codec in its attribute bits, so this also
+    // drives the record decoder end to end from the wire bytes.
+    if let Ok(batch) = deflated::Batch::try_from(Bytes::copy_from_slice(data)) {
+        let _ = Vec::<Record>::try_from(&batch);
+    }
 });
