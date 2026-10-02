@@ -13,7 +13,11 @@
 // limitations under the License.
 //
 //! Deflated (compressed) Kafka Records
-use std::{fmt::Formatter, io::Write, result};
+use std::{
+    fmt::Formatter,
+    io::{BufRead, Write},
+    result,
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flate2::write::GzEncoder;
@@ -483,23 +487,44 @@ impl TryFrom<Batch> for Vec<Record> {
 
             Ok(records)
         } else {
-            let mut reader = batch.compression().and_then(|compression| {
-                compression.inflator(batch.record_data.reader(), MAX_DECODED_BATCH_BYTES)
-            })?;
-
-            let mut decoder =
-                Decoder::new(&mut reader).with_budget(DecodeBudget::new(MAX_DECODED_BATCH_BYTES));
-            let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
-
-            for _ in 0..record_count {
-                decoder.charge(size_of::<Record>())?;
-                let record = Record::deserialize(&mut decoder)?;
-                records.push(record);
-            }
-
-            Ok(records)
+            batch.compression().and_then(|compression| {
+                inflate_records(
+                    compression,
+                    batch.record_data.reader(),
+                    record_count,
+                    MAX_DECODED_BATCH_BYTES,
+                    MAX_DECODED_BATCH_BYTES,
+                )
+            })
         }
     }
+}
+
+/// Decode `record_count` records from `record_data` through `compression`'s
+/// decompressing reader. `inflated_limit` caps the bytes that reader may
+/// produce (`LimitedRead`); `decoded_limit` is the `DecodeBudget` the
+/// decoded records are charged to. Production passes
+/// `MAX_DECODED_BATCH_BYTES` for both; they are separate so a test can
+/// exercise each limit on its own.
+fn inflate_records(
+    compression: Compression,
+    record_data: impl BufRead + 'static,
+    record_count: usize,
+    inflated_limit: usize,
+    decoded_limit: usize,
+) -> Result<Vec<Record>> {
+    let mut reader = compression.inflator(record_data, inflated_limit)?;
+
+    let mut decoder = Decoder::new(&mut reader).with_budget(DecodeBudget::new(decoded_limit));
+    let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
+
+    for _ in 0..record_count {
+        decoder.charge(size_of::<Record>())?;
+        let record = Record::deserialize(&mut decoder)?;
+        records.push(record);
+    }
+
+    Ok(records)
 }
 
 /// What decoding an uncompressed record allocates beyond the record data it
@@ -527,21 +552,15 @@ impl TryFrom<&Batch> for Vec<Record> {
             ));
         }
 
-        let mut reader = batch.compression().and_then(|compression| {
-            compression.inflator(batch.record_data.clone().reader(), MAX_DECODED_BATCH_BYTES)
-        })?;
-
-        let mut decoder =
-            Decoder::new(&mut reader).with_budget(DecodeBudget::new(MAX_DECODED_BATCH_BYTES));
-        let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
-
-        for _ in 0..record_count {
-            decoder.charge(size_of::<Record>())?;
-            let record = Record::deserialize(&mut decoder)?;
-            records.push(record);
-        }
-
-        Ok(records)
+        batch.compression().and_then(|compression| {
+            inflate_records(
+                compression,
+                batch.record_data.clone().reader(),
+                record_count,
+                MAX_DECODED_BATCH_BYTES,
+                MAX_DECODED_BATCH_BYTES,
+            )
+        })
     }
 }
 
@@ -670,10 +689,7 @@ mod tests {
 
     /// Both decode paths must reject the batch with the typed error, not a
     /// generic I/O failure: that is what lets the broker answer
-    /// `MESSAGE_TOO_LARGE` rather than `UNKNOWN_SERVER_ERROR`. One test per
-    /// codec and path: each decodes ~100 MiB byte by byte before the limit
-    /// trips, so they are kept separate to stay well inside the CI per-test
-    /// timeout.
+    /// `MESSAGE_TOO_LARGE` rather than `UNKNOWN_SERVER_ERROR`.
     fn assert_rejected_by_reference(batch: &Batch) {
         let err = Vec::<Record>::try_from(batch)
             .expect_err("a batch over the decoded limit must be rejected (by reference)");
@@ -692,40 +708,60 @@ mod tests {
         );
     }
 
-    // Deliberately no init_tracing() in the just-over-the-limit tests: see
-    // batch_just_under_the_decompressed_limit_round_trips.
-
+    /// `LimitedRead` on its own, through the record decode both `TryFrom`
+    /// impls share. The `DecodeBudget` charges at least one byte for every
+    /// byte the decoder reads, so at equal limits it always trips first and a
+    /// test at `MAX_DECODED_BATCH_BYTES` cannot tell whether `LimitedRead` is
+    /// there. Here the budget is unlimited, so only `LimitedRead` can reject
+    /// the batch, and its error (`limit + 1`) must come through typed.
     #[test]
-    fn batch_just_over_the_decoded_limit_is_rejected_gzip_by_value() -> Result<()> {
-        batch_just_over_the_decoded_limit(Compression::Gzip).map(assert_rejected_by_value)
-    }
+    fn limited_read_rejects_a_batch_the_budget_would_allow() -> Result<()> {
+        const VALUE_LEN: usize = 64 * 1024;
 
-    #[test]
-    fn batch_just_over_the_decoded_limit_is_rejected_gzip_by_reference() -> Result<()> {
-        batch_just_over_the_decoded_limit(Compression::Gzip)
-            .map(|batch| assert_rejected_by_reference(&batch))
-    }
+        for compression in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
+            let mut inflated = inflated::Batch {
+                records: vec![Record {
+                    value: Some(Bytes::from(vec![0u8; VALUE_LEN])),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
 
-    #[test]
-    fn batch_just_over_the_decoded_limit_is_rejected_lz4_by_value() -> Result<()> {
-        batch_just_over_the_decoded_limit(Compression::Lz4).map(assert_rejected_by_value)
-    }
+            inflated.attributes = BatchAttribute::try_from(inflated.attributes)
+                .map(|attribute| attribute.compression(compression.clone()).into())?;
 
-    #[test]
-    fn batch_just_over_the_decoded_limit_is_rejected_lz4_by_reference() -> Result<()> {
-        batch_just_over_the_decoded_limit(Compression::Lz4)
-            .map(|batch| assert_rejected_by_reference(&batch))
-    }
+            let batch = Batch::try_from(inflated)?;
+            let record_count = usize::try_from(batch.record_count)?;
 
-    #[test]
-    fn batch_just_over_the_decoded_limit_is_rejected_zstd_by_value() -> Result<()> {
-        batch_just_over_the_decoded_limit(Compression::Zstd).map(assert_rejected_by_value)
-    }
+            // Control: with room for the whole record, it decodes.
+            let records = inflate_records(
+                compression.clone(),
+                batch.record_data.clone().reader(),
+                record_count,
+                2 * VALUE_LEN,
+                usize::MAX,
+            )?;
+            assert_eq!(Some(VALUE_LEN), records[0].value.as_ref().map(Bytes::len));
 
-    #[test]
-    fn batch_just_over_the_decoded_limit_is_rejected_zstd_by_reference() -> Result<()> {
-        batch_just_over_the_decoded_limit(Compression::Zstd)
-            .map(|batch| assert_rejected_by_reference(&batch))
+            // A decompressed-byte limit inside the value is rejected by
+            // LimitedRead alone.
+            let limit = VALUE_LEN / 2;
+            let err = inflate_records(
+                compression.clone(),
+                batch.record_data.clone().reader(),
+                record_count,
+                limit,
+                usize::MAX,
+            )
+            .expect_err("a batch over the decompressed-byte limit must be rejected");
+
+            assert!(
+                matches!(err, Error::MessageMaxSizeExceeded(size) if size == limit + 1),
+                "{compression:?}: {err:?}"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
