@@ -49,6 +49,7 @@ Note: when running nisshi directly (not via docker compose), set `AWS_ENDPOINT="
 ### Worktrees
 
 - **Build output stays per worktree.** Each worktree builds into its own `target/`. Don't point worktrees at a shared one (`CARGO_TARGET_DIR`, `build.target-dir`). Cargo gives a workspace crate the same artifact names in every checkout and decides whether to rebuild by comparing file modification times, so a checkout whose sources are older than another checkout's last build reuses that build, and `cargo test` runs the other worktree's code.
+- **Seed a new worktree with `just seed-target` before its first build.** The recipe clones the main checkout's `target/` copy-on-write, so the clone takes no extra disk until cargo rewrites a file. It then runs `cargo clean --workspace`, so only dependency artifacts carry over and the workspace crates rebuild from this worktree's sources. The recipe does nothing when `target/` already exists. Don't run it while the main checkout builds. Don't bring `target/` into a worktree any other way (`.worktreeinclude`, `worktree.symlinkDirectories`, a plain copy): those carry workspace-crate artifacts over, and cargo then reuses another checkout's code as the previous bullet describes.
 - **`.env` is copied into Claude Code worktrees.** `.worktreeinclude` lists `.env`, so `claude --worktree` and subagent worktrees get a copy. For a worktree created any other way, copy `.env` yourself.
 
 ## Architecture

@@ -11,6 +11,39 @@ cargo-build +args:
 clean-workspace:
     cargo clean --workspace
 
+# seed a new worktree's target/ from the main checkout's, so dependencies don't rebuild
+seed-target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(git rev-parse --path-format=absolute --git-dir)" == "$(git rev-parse --path-format=absolute --git-common-dir)" ]]; then
+        echo "seed-target: this is the main checkout; nothing to seed" >&2
+        exit 0
+    fi
+    if [[ -e target ]]; then
+        echo "seed-target: target/ already exists; not seeding" >&2
+        exit 0
+    fi
+    main=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+    if [[ ! -d "$main/target" ]]; then
+        echo "seed-target: $main/target doesn't exist; nothing to seed from" >&2
+        exit 0
+    fi
+    # We clone copy-on-write, so the clone shares the main checkout's disk blocks
+    # until cargo rewrites a file.
+    if [[ "$(uname)" == Darwin ]]; then
+        cp -cRp "$main/target" target
+    else
+        # --reflink=always fails on a filesystem without copy-on-write, instead of
+        # making a full copy of the main checkout's target/.
+        cp -R --reflink=always --preserve=timestamps "$main/target" target
+    fi
+    # Cargo reuses a workspace crate's artifact when the artifact is newer than the
+    # crate's sources. A cloned artifact can be newer than this checkout's sources
+    # and still hold the main checkout's code, so we clean every workspace member
+    # and cargo reuses only dependency artifacts.
+    cargo clean --workspace --quiet
+    echo "seed-target: seeded target/ from $main/target" >&2
+
 license:
     cargo about generate about.hbs > license.html
 
