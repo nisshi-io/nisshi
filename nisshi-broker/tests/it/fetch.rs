@@ -24,6 +24,7 @@ use nisshi_sans_io::{
     BatchAttribute, Compression, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
     ListOffset, NULL_TOPIC_ID, RequestInput,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
+    delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     fetch_request::{FetchPartition, FetchTopic},
     record::{Header, Record, inflated},
 };
@@ -888,6 +889,309 @@ where
     Ok(())
 }
 
+/// Produce `count` single record batches to `topition`.
+async fn produce_single_record_batches<G>(sc: &G, topition: &Topition, count: usize) -> Result<()>
+where
+    G: Storage,
+{
+    for _ in 0..count {
+        let batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::copy_from_slice(
+                alphanumeric_string(15).as_bytes(),
+            ))))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = sc
+            .produce(None, topition, batch)
+            .await
+            .inspect(|offset| debug!(offset))?;
+    }
+
+    Ok(())
+}
+
+/// Fetch through [`FetchService`], one entry per `(partition, fetch_offset)`.
+async fn fetch_offsets<G>(
+    sc: &G,
+    topic: &str,
+    partitions: &[(i32, i64)],
+    max_wait_ms: i32,
+) -> Result<FetchResponse>
+where
+    G: Storage + Clone,
+{
+    FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: FetchRequest::default()
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(1)
+            .max_bytes(Some(50 * 1024))
+            .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+            .topics(Some(
+                [FetchTopic::default()
+                    .topic(Some(topic.into()))
+                    .topic_id(Some(NULL_TOPIC_ID))
+                    .partitions(Some(
+                        partitions
+                            .iter()
+                            .map(|(partition, fetch_offset)| {
+                                FetchPartition::default()
+                                    .partition(*partition)
+                                    .current_leader_epoch(Some(-1))
+                                    .fetch_offset(*fetch_offset)
+                                    .last_fetched_epoch(Some(-1))
+                                    .log_start_offset(Some(-1))
+                                    .partition_max_bytes(50 * 1024)
+                            })
+                            .collect(),
+                    ))]
+                .into(),
+            )),
+        extensions: Extensions::default(),
+    })
+    .await
+    .map_err(Into::into)
+}
+
+/// The partition answers in a fetch response, in request order.
+fn partition_data(response: FetchResponse) -> Vec<nisshi_sans_io::fetch_response::PartitionData> {
+    response
+        .responses
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|topic| topic.partitions.unwrap_or_default())
+        .collect()
+}
+
+/// The offsets of the records in a partition answer, skipping the empty
+/// placeholder batch that the pg and lite engines return.
+fn record_offsets(partition: &nisshi_sans_io::fetch_response::PartitionData) -> Result<Vec<i64>> {
+    let mut offsets = vec![];
+
+    for batch in partition
+        .records
+        .as_ref()
+        .map(|frame| frame.batches.clone())
+        .unwrap_or_default()
+    {
+        if batch.record_count == 0 {
+            continue;
+        }
+
+        let batch = inflated::Batch::try_from(batch)?;
+
+        offsets.extend(
+            batch
+                .records
+                .iter()
+                .map(|record| batch.base_offset + i64::from(record.offset_delta)),
+        );
+    }
+
+    Ok(offsets)
+}
+
+fn assert_offset_out_of_range(
+    partition: &nisshi_sans_io::fetch_response::PartitionData,
+    fetch_offset: i64,
+) -> Result<()> {
+    assert_eq!(
+        ErrorCode::OffsetOutOfRange,
+        ErrorCode::try_from(partition.error_code)?,
+        "fetch at {fetch_offset}"
+    );
+
+    // Kafka sends unknown offsets with this error
+    assert_eq!(-1, partition.high_watermark, "fetch at {fetch_offset}");
+    assert_eq!(
+        Some(-1),
+        partition.last_stable_offset,
+        "fetch at {fetch_offset}"
+    );
+    assert_eq!(
+        Some(-1),
+        partition.log_start_offset,
+        "fetch at {fetch_offset}"
+    );
+    assert!(partition.records.is_none(), "fetch at {fetch_offset}");
+
+    Ok(())
+}
+
+/// A fetch offset outside the partition is answered with
+/// `OFFSET_OUT_OF_RANGE` straight away (not after `max_wait`), without
+/// disturbing another partition in the same request, and the service keeps
+/// answering valid fetches afterwards.
+pub async fn offset_out_of_range<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(2)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let records = 3;
+
+    for partition in 0..2 {
+        produce_single_record_batches(&sc, &Topition::new(topic_name.clone(), partition), records)
+            .await?;
+    }
+
+    let high_watermark = records as i64;
+
+    // long enough that waiting it out would fail the elapsed check
+    let max_wait_ms = 10_000;
+    let answered_within = Duration::from_secs(5);
+
+    for fetch_offset in [-5, i64::MIN, high_watermark + 1, i64::MAX] {
+        let started_at = SystemTime::now();
+        let response = fetch_offsets(&sc, &topic_name, &[(0, fetch_offset)], max_wait_ms).await?;
+        let elapsed = started_at.elapsed()?;
+
+        assert!(
+            elapsed < answered_within,
+            "fetch at {fetch_offset} took {elapsed:?}"
+        );
+
+        let partitions = partition_data(response);
+        assert_eq!(1, partitions.len());
+        assert_offset_out_of_range(&partitions[0], fetch_offset)?;
+    }
+
+    // one partition out of range, the other holding records
+    {
+        let started_at = SystemTime::now();
+        let response = fetch_offsets(&sc, &topic_name, &[(0, -5), (1, 0)], max_wait_ms).await?;
+        let elapsed = started_at.elapsed()?;
+
+        assert!(elapsed < answered_within, "took {elapsed:?}");
+
+        let partitions = partition_data(response);
+        assert_eq!(2, partitions.len());
+
+        assert_eq!(0, partitions[0].partition_index);
+        assert_offset_out_of_range(&partitions[0], -5)?;
+
+        assert_eq!(1, partitions[1].partition_index);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+        assert_eq!(high_watermark, partitions[1].high_watermark);
+        assert_eq!(vec![0, 1, 2], record_offsets(&partitions[1])?);
+    }
+
+    // the high watermark is in range: a caught-up consumer waits there
+    {
+        let response = fetch_offsets(&sc, &topic_name, &[(0, high_watermark)], 500).await?;
+        let partitions = partition_data(response);
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(high_watermark, partitions[0].high_watermark);
+        assert!(record_offsets(&partitions[0])?.is_empty());
+    }
+
+    // and the service still answers a valid fetch
+    {
+        let response = fetch_offsets(&sc, &topic_name, &[(0, 0)], max_wait_ms).await?;
+        let partitions = partition_data(response);
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(vec![0, 1, 2], record_offsets(&partitions[0])?);
+    }
+
+    Ok(())
+}
+
+/// After DeleteRecords moves the log start offset, a fetch below it is out
+/// of range and a fetch at it returns the surviving records. Only engines
+/// that advance the log start offset can run this.
+pub async fn below_log_start<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let topition = Topition::new(topic_name.clone(), 0);
+    produce_single_record_batches(&sc, &topition, 5).await?;
+
+    let log_start = 3;
+
+    let deleted = sc
+        .delete_records(&[DeleteRecordsTopic::default()
+            .name(topic_name.clone())
+            .partitions(Some(
+                [DeleteRecordsPartition::default()
+                    .partition_index(0)
+                    .offset(log_start)]
+                .into(),
+            ))])
+        .await?;
+    debug!(?deleted);
+
+    assert_eq!(log_start, sc.offset_stage(&topition).await?.log_start());
+
+    {
+        let response = fetch_offsets(&sc, &topic_name, &[(0, log_start - 1)], 10_000).await?;
+        let partitions = partition_data(response);
+        assert_eq!(1, partitions.len());
+        assert_offset_out_of_range(&partitions[0], log_start - 1)?;
+    }
+
+    {
+        let response = fetch_offsets(&sc, &topic_name, &[(0, log_start)], 10_000).await?;
+        let partitions = partition_data(response);
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(Some(log_start), partitions[0].log_start_offset);
+        assert_eq!(vec![3, 4], record_offsets(&partitions[0])?);
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use super::*;
@@ -975,6 +1279,21 @@ mod pg {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::mid_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn offset_out_of_range() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::offset_out_of_range(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1070,6 +1389,21 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::mid_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn offset_out_of_range() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::offset_out_of_range(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1186,6 +1520,21 @@ mod lite {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn offset_out_of_range() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::offset_out_of_range(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -1275,6 +1624,36 @@ mod slatedb {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::mid_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn offset_out_of_range() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::offset_out_of_range(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn below_log_start() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::below_log_start(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
