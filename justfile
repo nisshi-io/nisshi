@@ -19,30 +19,42 @@ seed-target:
         echo "seed-target: this is the main checkout; nothing to seed" >&2
         exit 0
     fi
-    if [[ -e target ]]; then
-        echo "seed-target: target/ already exists; not seeding" >&2
+    if [[ -e target/debug ]]; then
+        echo "seed-target: target/debug already exists; not seeding" >&2
         exit 0
     fi
     main=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
-    if [[ ! -d "$main/target" ]]; then
-        echo "seed-target: $main/target doesn't exist; nothing to seed from" >&2
+    # We seed only target/debug, because `cargo clean --workspace` cleans only the dev
+    # profile. A release, profiling or cross-target directory would keep the main
+    # checkout's workspace-crate artifacts, and cargo would reuse them.
+    if [[ ! -d "$main/target/debug" ]]; then
+        echo "seed-target: $main/target/debug doesn't exist; nothing to seed from" >&2
         exit 0
     fi
+    # We build the seed in target/.seed and move it to target/debug last, so an
+    # interrupted or failed seed leaves no target/debug for cargo to reuse. A rerun
+    # starts again from here.
+    rm -rf target/.seed
+    mkdir -p target/.seed
+    # cargo clean refuses a target directory without a CACHEDIR.TAG file.
+    cp "$main/target/CACHEDIR.TAG" target/.seed/
     # We clone copy-on-write, so the clone shares the main checkout's disk blocks
     # until cargo rewrites a file.
     if [[ "$(uname)" == Darwin ]]; then
-        cp -cRp "$main/target" target
+        cp -cRp "$main/target/debug" target/.seed/debug
     else
         # --reflink=always fails on a filesystem without copy-on-write, instead of
-        # making a full copy of the main checkout's target/.
-        cp -R --reflink=always --preserve=timestamps "$main/target" target
+        # making a full copy of the main checkout's target/debug.
+        cp -R --reflink=always --preserve=timestamps "$main/target/debug" target/.seed/debug
     fi
     # Cargo reuses a workspace crate's artifact when the artifact is newer than the
     # crate's sources. A cloned artifact can be newer than this checkout's sources
     # and still hold the main checkout's code, so we clean every workspace member
     # and cargo reuses only dependency artifacts.
-    cargo clean --workspace --quiet
-    echo "seed-target: seeded target/ from $main/target" >&2
+    cargo clean --workspace --quiet --target-dir target/.seed
+    mv target/.seed/debug target/debug
+    rm -rf target/.seed
+    echo "seed-target: seeded target/debug from $main/target/debug" >&2
 
 license:
     cargo about generate about.hbs > license.html
