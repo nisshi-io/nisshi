@@ -31,6 +31,7 @@ pub mod describe_groups;
 pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;
 pub mod fetch;
+pub mod fetch_wire;
 pub mod find_coordinator;
 pub mod get_telemetry_subscriptions;
 pub mod group_cache_miss;

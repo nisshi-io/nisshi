@@ -17,9 +17,7 @@ use std::{cmp::min, time::SystemTime};
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput,
     fetch_request::{FetchPartition, FetchTopic},
-    fetch_response::{
-        EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
-    },
+    fetch_response::{EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId},
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
@@ -145,6 +143,23 @@ where
         let partition_index = fetch_partition.partition;
         let tp = Topition::new(topic, partition_index);
 
+        // The fetch offset comes from the client: check it against the
+        // partition before it reaches storage, which may build a key range
+        // from it. As in Kafka, the valid range is the log start offset up
+        // to and including the high watermark, whatever the isolation level.
+        let offset_stage = self
+            .storage
+            .offset_stage(&tp)
+            .await
+            .inspect_err(|error| error!(?error, ?tp))?;
+
+        if !(offset_stage.log_start()..=offset_stage.high_watermark())
+            .contains(&fetch_partition.fetch_offset)
+        {
+            debug!(fetch_offset = fetch_partition.fetch_offset, ?offset_stage);
+            return Ok(Self::offset_out_of_range(partition_index));
+        }
+
         let mut batches = Vec::new();
 
         let mut offset = fetch_partition.fetch_offset;
@@ -227,6 +242,23 @@ where
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 
+    /// The partition answer for a fetch offset outside the partition, with
+    /// the unknown (-1) offsets that Kafka sends alongside this error.
+    fn offset_out_of_range(partition_index: i32) -> PartitionData {
+        PartitionData::default()
+            .partition_index(partition_index)
+            .error_code(ErrorCode::OffsetOutOfRange.into())
+            .high_watermark(-1)
+            .last_stable_offset(Some(-1))
+            .log_start_offset(Some(-1))
+            .diverging_epoch(None)
+            .current_leader(None)
+            .snapshot_id(None)
+            .aborted_transactions(Some([].into()))
+            .preferred_read_replica(Some(-1))
+            .records(None)
+    }
+
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
         Ok(FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
@@ -244,9 +276,10 @@ where
                             .diverging_epoch(Some(
                                 EpochEndOffset::default().epoch(-1).end_offset(-1),
                             ))
-                            .current_leader(Some(
-                                LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
-                            ))
+                            // Kafka sends a leader hint only with a leadership
+                            // error; librdkafka acts on one here, and its
+                            // consumer close then hangs on a deleted topic
+                            .current_leader(None)
                             .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
                             .aborted_transactions(Some([].into()))
                             .preferred_read_replica(Some(-1))
@@ -376,6 +409,13 @@ where
                     break;
                 }
 
+                // as in Kafka, an error in any partition answers now: waiting
+                // cannot clear it, and the client acts on it
+                if responses.iter().any(has_partition_error) {
+                    debug!(?iteration, "partition error, not waiting for min_bytes");
+                    break;
+                }
+
                 {
                     let fetch_elapsed = fetch_started_at.elapsed()?;
 
@@ -457,6 +497,15 @@ where
     }
 }
 
+fn has_partition_error(topic: &FetchableTopicResponse) -> bool {
+    topic
+        .partitions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|partition| partition.error_code != i16::from(ErrorCode::None))
+}
+
 trait ByteSize {
     fn byte_size(&self) -> u64;
 }
@@ -534,6 +583,8 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
+    use nisshi_sans_io::fetch_response::PartitionData;
+
     use super::FetchService;
     use crate::{
         BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
@@ -572,6 +623,7 @@ mod tests {
         responses: Arc<Mutex<Vec<Vec<deflated::Batch>>>>,
         calls: Arc<Mutex<Vec<(i64, Duration)>>>,
         consume_budget_on_first_call: Option<Duration>,
+        offset_stage: OffsetStage,
     }
 
     impl Scripted {
@@ -619,11 +671,7 @@ mod tests {
         }
 
         async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
-            Ok(OffsetStage {
-                last_stable: 1_000,
-                high_watermark: 1_000,
-                log_start: 0,
-            })
+            Ok(self.offset_stage)
         }
 
         async fn register_broker(
@@ -854,11 +902,18 @@ mod tests {
         }
     }
 
-    async fn fetch_partition(
+    const OFFSET_STAGE: OffsetStage = OffsetStage {
+        last_stable: 1_000,
+        high_watermark: 1_000,
+        log_start: 0,
+    };
+
+    async fn fetch_partition_at(
         storage: Scripted,
         max_wait: Duration,
         max_bytes: u32,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetch_offset: i64,
+    ) -> Result<PartitionData> {
         let mut remaining = max_bytes;
 
         FetchService { storage }
@@ -870,9 +925,18 @@ mod tests {
                 "abc",
                 &FetchPartition::default()
                     .partition(0)
-                    .fetch_offset(0)
+                    .fetch_offset(fetch_offset)
                     .partition_max_bytes(max_bytes as i32),
             )
+            .await
+    }
+
+    async fn fetch_partition(
+        storage: Scripted,
+        max_wait: Duration,
+        max_bytes: u32,
+    ) -> Result<Vec<deflated::Batch>> {
+        fetch_partition_at(storage, max_wait, max_bytes, 0)
             .await
             .map(|partition| {
                 partition
@@ -901,6 +965,7 @@ mod tests {
             responses: Arc::new(Mutex::new(responses)),
             calls: Arc::new(Mutex::new(vec![])),
             consume_budget_on_first_call: Some(max_wait),
+            offset_stage: OFFSET_STAGE,
         };
 
         let batches = fetch_partition(storage.clone(), max_wait, 1024 * 1024).await?;
@@ -930,6 +995,7 @@ mod tests {
             responses: Arc::new(Mutex::new(responses)),
             calls: Arc::new(Mutex::new(vec![])),
             consume_budget_on_first_call: None,
+            offset_stage: OFFSET_STAGE,
         };
 
         let batches = fetch_partition(storage.clone(), max_wait, 1024 * 1024).await?;
@@ -943,6 +1009,101 @@ mod tests {
                 .map(|(offset, _)| offset)
                 .collect::<Vec<_>>()
         );
+
+        Ok(())
+    }
+
+    /// A partition whose log starts at 100 and ends at 1,000.
+    fn bounded() -> Scripted {
+        Scripted {
+            responses: Arc::new(Mutex::new(vec![])),
+            calls: Arc::new(Mutex::new(vec![])),
+            consume_budget_on_first_call: None,
+            offset_stage: OffsetStage {
+                last_stable: 1_000,
+                high_watermark: 1_000,
+                log_start: 100,
+            },
+        }
+    }
+
+    /// A fetch offset below the log start or above the high watermark is
+    /// answered with `OFFSET_OUT_OF_RANGE` and never reaches storage, which
+    /// may build an invalid key range from it (a negative offset, or
+    /// `i64::MAX`, as a big-endian key).
+    #[tokio::test(start_paused = true)]
+    async fn out_of_range_offsets_never_reach_storage() -> Result<()> {
+        for fetch_offset in [i64::MIN, -5, -1, 0, 99, 1_001, i64::MAX] {
+            let storage = bounded();
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::OffsetOutOfRange,
+                ErrorCode::try_from(partition.error_code)?,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(-1, partition.high_watermark, "fetch at {fetch_offset}");
+            assert_eq!(
+                Some(-1),
+                partition.last_stable_offset,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(
+                Some(-1),
+                partition.log_start_offset,
+                "fetch at {fetch_offset}"
+            );
+            assert!(partition.records.is_none(), "fetch at {fetch_offset}");
+            assert!(
+                storage.calls().is_empty(),
+                "fetch at {fetch_offset} reached storage: {:?}",
+                storage.calls()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The log start offset and the high watermark are both valid fetch
+    /// offsets: the first is the oldest record, the second the next one to
+    /// be written, where a caught-up consumer waits.
+    #[tokio::test(start_paused = true)]
+    async fn boundary_offsets_reach_storage() -> Result<()> {
+        for fetch_offset in [100, 1_000] {
+            let storage = bounded();
+            storage.responses.lock()?.push(vec![]);
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(partition.error_code)?,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(1_000, partition.high_watermark);
+            assert_eq!(Some(100), partition.log_start_offset);
+            assert_eq!(
+                vec![fetch_offset],
+                storage
+                    .calls()
+                    .into_iter()
+                    .map(|(offset, _)| offset)
+                    .collect::<Vec<_>>()
+            );
+        }
 
         Ok(())
     }
