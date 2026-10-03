@@ -1613,7 +1613,7 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test for SOL-155077: combining batches with *different*
+    /// Regression test: combining batches with *different*
     /// `base_timestamp` values must preserve each record's absolute
     /// timestamp (`batch.base_timestamp + record.timestamp_delta`).
     ///
@@ -1691,6 +1691,12 @@ mod tests {
         let combined = inflated::Batch::try_from(combine(vec![first, second])?.expect("a batch"))?;
 
         assert_eq!(4, combined.records.len());
+
+        // The header fields should stay consistent with the records they
+        // describe: base_timestamp is carried over unchanged from the
+        // first (sink) batch, and max_timestamp is the max across both.
+        assert_eq!(1_000, combined.base_timestamp);
+        assert_eq!(1_013, combined.max_timestamp);
 
         for record in &combined.records {
             let value = record.value.as_deref().expect("value");
