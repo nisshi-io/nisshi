@@ -65,7 +65,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, delete_records_cutoff,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -1925,22 +1925,8 @@ impl Storage for Postgres {
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(cluster = self.cluster, ?topics);
 
-        let c = self.connection().await?;
-
-        let delete_records = c
-            .prepare(concat!(
-                "delete from record",
-                " using topic, cluster",
-                " where",
-                " cluster.name=$1",
-                " and topic.name = $2",
-                " and record.partition = $3",
-                " and record.id >= $4",
-                " and topic.cluster = cluster.id",
-                " and record.topic = topic.id",
-            ))
-            .await
-            .inspect_err(|err| error!(?err, ?topics))?;
+        let mut c = self.connection().await?;
+        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
         let mut responses = vec![];
 
@@ -1949,92 +1935,91 @@ impl Storage for Postgres {
 
             if let Some(ref partitions) = topic.partitions {
                 for partition in partitions {
-                    _ = c
-                        .execute(
-                            &delete_records,
-                            &[
-                                &self.cluster,
-                                &topic.name,
-                                &partition.partition_index,
-                                &partition.offset,
-                            ],
-                        )
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
+                    let topition = Topition::new(topic.name.as_str(), partition.partition_index);
 
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })?;
+                    let (error_code, low_watermark) =
+                        match self.watermark_select_for_update(&topition, &tx).await {
+                            Err(Error::Api(error_code)) => (error_code, 0),
+                            Err(err) => return Err(err),
 
-                    let prepared = c
-                        .prepare(concat!(
-                            "select",
-                            " id as offset",
-                            " from",
-                            " record",
-                            " join (",
-                            " select",
-                            " coalesce(min(record.id), (select last_value from record_id_seq)) as offset",
-                            " from record, topic, cluster",
-                            " where",
-                            " topic.cluster = cluster.id",
-                            " and cluster.name = $1",
-                            " and topic.name = $2",
-                            " and record.partition = $3",
-                            " and record.topic = topic.id) as minimum",
-                            " on record.id = minimum.offset",
-                        ))
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
+                            Ok((low, high)) => {
+                                let stage = OffsetStage {
+                                    last_stable: high.unwrap_or_default(),
+                                    high_watermark: high.unwrap_or_default(),
+                                    log_start: low.unwrap_or_default(),
+                                };
 
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })?;
+                                match delete_records_cutoff(partition.offset, &stage) {
+                                    Err(error_code) => (error_code, stage.log_start),
 
-                    let partition_result = c
-                        .query_opt(
-                            &prepared,
-                            &[&self.cluster, &topic.name, &partition.partition_index],
-                        )
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
+                                    Ok(cutoff) => {
+                                        // Physically delete at most up to
+                                        // `high_watermark - 1`: the row holding
+                                        // the last committed offset is Kafka's
+                                        // active segment and must survive even a
+                                        // `cutoff == high_watermark` ("delete
+                                        // everything") request, or `ListOffsets`
+                                        // (Latest) would regress once nothing is
+                                        // left to derive it from. The logical
+                                        // watermark below is still set to the
+                                        // full `cutoff`.
+                                        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
 
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })
-                        .map_or(
-                            Ok(DeleteRecordsPartitionResult::default()
-                                .partition_index(partition.partition_index)
-                                .low_watermark(0)
-                                .error_code(ErrorCode::UnknownServerError.into())),
-                            |row| {
-                                row.map_or(
-                                    Ok(DeleteRecordsPartitionResult::default()
-                                        .partition_index(partition.partition_index)
-                                        .low_watermark(0)
-                                        .error_code(ErrorCode::UnknownServerError.into())),
-                                    |row| {
-                                        row.try_get::<_, i64>(0).map(|low_watermark| {
-                                            DeleteRecordsPartitionResult::default()
-                                                .partition_index(partition.partition_index)
-                                                .low_watermark(low_watermark)
-                                                .error_code(ErrorCode::None.into())
-                                        })
-                                    },
-                                )
-                            },
-                        )?;
+                                        if physical_cutoff > stage.log_start {
+                                            _ = self
+                                                .tx_prepare_execute(
+                                                    &tx,
+                                                    "record_delete_by_offset.sql",
+                                                    &[
+                                                        &self.cluster,
+                                                        &topic.name,
+                                                        &partition.partition_index,
+                                                        &physical_cutoff,
+                                                    ],
+                                                )
+                                                .await
+                                                .inspect_err(|err| {
+                                                    let cluster = self.cluster.as_str();
+                                                    let topic = topic.name.as_str();
+                                                    let partition_index = partition.partition_index;
 
-                    partition_responses.push(partition_result);
+                                                    error!(
+                                                        ?err,
+                                                        ?cluster,
+                                                        ?topic,
+                                                        ?partition_index,
+                                                        physical_cutoff
+                                                    )
+                                                })?;
+                                        }
+
+                                        _ = self
+                                            .tx_prepare_execute(
+                                                &tx,
+                                                "watermark_update.sql",
+                                                &[
+                                                    &self.cluster,
+                                                    &topic.name,
+                                                    &partition.partition_index,
+                                                    &cutoff,
+                                                    &high.unwrap_or_default(),
+                                                ],
+                                            )
+                                            .await
+                                            .inspect_err(|err| error!(?err))?;
+
+                                        (ErrorCode::None, cutoff)
+                                    }
+                                }
+                            }
+                        };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
                 }
             }
 
@@ -2044,6 +2029,9 @@ impl Storage for Postgres {
                     .partitions(Some(partition_responses)),
             );
         }
+
+        tx.commit().await.inspect_err(|err| error!(?err))?;
+
         Ok(responses)
     }
 

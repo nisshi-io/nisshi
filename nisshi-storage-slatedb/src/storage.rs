@@ -53,7 +53,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, delete_records_cutoff,
 };
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -517,40 +517,6 @@ impl Storage for Engine {
                         {
                             (ErrorCode::UnknownTopicOrPartition, 0)
                         } else {
-                            // Delete batches below the specified offset
-                            let batch_prefix = postcard::to_stdvec(&BatchKeyPrefix::new(
-                                metadata.id,
-                                partition.partition_index,
-                            ))?;
-                            let scan_start = postcard::to_stdvec(&BatchKey::scan_from(
-                                metadata.id,
-                                partition.partition_index,
-                                0,
-                            ))?;
-
-                            let mut scan = self.db.scan(scan_start..).await?;
-                            while let Some(kv) = scan.next().await? {
-                                if !kv.key.starts_with(&batch_prefix) {
-                                    break;
-                                }
-
-                                let batch_key: BatchKey = match postcard::from_bytes(&kv.key) {
-                                    Ok(key) => key,
-                                    Err(_) => continue,
-                                };
-
-                                // Delete batches with offset < specified offset
-                                if batch_key.offset >= partition.offset {
-                                    break;
-                                }
-
-                                tx.delete(&kv.key)?;
-                            }
-
-                            // The new low watermark is the requested offset
-                            let new_low_watermark = partition.offset;
-
-                            // Update the watermark
                             let watermark_key = postcard::to_stdvec(&WatermarkKey::new(
                                 metadata.id,
                                 partition.partition_index,
@@ -565,17 +531,104 @@ impl Storage for Engine {
                                     },
                                 )?;
 
-                            watermark.low = Some(new_low_watermark);
+                            let high_watermark = watermark.high.unwrap_or(0);
+                            let log_start = watermark.low.unwrap_or(0);
 
-                            // Remove timestamps before the new low watermark
-                            if let Some(ref mut timestamps) = watermark.timestamps {
-                                timestamps.retain(|_, offset| *offset >= new_low_watermark);
+                            let stage = OffsetStage {
+                                last_stable: high_watermark,
+                                high_watermark,
+                                log_start,
+                            };
+
+                            match delete_records_cutoff(partition.offset, &stage) {
+                                Err(error_code) => (error_code, log_start),
+
+                                Ok(cutoff) => {
+                                    if cutoff > log_start {
+                                        // Delete batches entirely below the cutoff. A
+                                        // batch is identified by its *base* offset, so a
+                                        // batch is only safe to remove once its *end*
+                                        // offset (base + last_offset_delta) is below the
+                                        // cutoff too -- otherwise a batch that starts
+                                        // before the cutoff but extends past it would be
+                                        // removed whole, taking still-visible records
+                                        // with it.
+                                        //
+                                        // When the cutoff is the high watermark itself
+                                        // (the common `offset == -1`, "delete everything"
+                                        // request), every stored batch's end offset is
+                                        // below the cutoff, including the active batch
+                                        // holding `high_watermark - 1`. Kafka never
+                                        // removes its active segment, so that one batch
+                                        // is kept regardless.
+                                        let protect_active_batch = cutoff == high_watermark;
+
+                                        let batch_prefix =
+                                            postcard::to_stdvec(&BatchKeyPrefix::new(
+                                                metadata.id,
+                                                partition.partition_index,
+                                            ))?;
+                                        let scan_start =
+                                            postcard::to_stdvec(&BatchKey::scan_from(
+                                                metadata.id,
+                                                partition.partition_index,
+                                                0,
+                                            ))?;
+
+                                        let mut candidates = vec![];
+
+                                        let mut scan = self.db.scan(scan_start..).await?;
+                                        while let Some(kv) = scan.next().await? {
+                                            if !kv.key.starts_with(&batch_prefix) {
+                                                break;
+                                            }
+
+                                            let batch_key: BatchKey =
+                                                match postcard::from_bytes(&kv.key) {
+                                                    Ok(key) => key,
+                                                    Err(_) => continue,
+                                                };
+
+                                            if batch_key.offset >= cutoff {
+                                                break;
+                                            }
+
+                                            let batch = self.decode(kv.value.clone())?;
+                                            let end = batch_key.offset
+                                                + i64::from(batch.last_offset_delta);
+
+                                            candidates.push((kv.key, batch_key.offset, end));
+                                        }
+
+                                        let active_base = if protect_active_batch {
+                                            candidates.iter().map(|(_, base, _)| *base).max()
+                                        } else {
+                                            None
+                                        };
+
+                                        for (key, base, end) in candidates {
+                                            let is_active_batch =
+                                                protect_active_batch && Some(base) == active_base;
+
+                                            if end < cutoff && !is_active_batch {
+                                                tx.delete(&key)?;
+                                            }
+                                        }
+                                    }
+
+                                    watermark.low = Some(cutoff);
+
+                                    // Remove timestamps before the new low watermark
+                                    if let Some(ref mut timestamps) = watermark.timestamps {
+                                        timestamps.retain(|_, offset| *offset >= cutoff);
+                                    }
+
+                                    let watermark_value = postcard::to_stdvec(&watermark)?;
+                                    tx.put(&watermark_key, watermark_value)?;
+
+                                    (ErrorCode::None, cutoff)
+                                }
                             }
-
-                            let watermark_value = postcard::to_stdvec(&watermark)?;
-                            tx.put(&watermark_key, watermark_value)?;
-
-                            (ErrorCode::None, new_low_watermark)
                         }
                     } else {
                         (ErrorCode::UnknownTopicOrPartition, 0)

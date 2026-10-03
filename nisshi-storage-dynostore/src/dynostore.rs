@@ -38,7 +38,7 @@ use nisshi_sans_io::{
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
+    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::{
@@ -60,7 +60,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, delete_records_cutoff,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -430,6 +430,73 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
+    /// Best-effort physical reclaim for `DeleteRecords`: removes batch
+    /// objects in one partition that are now entirely below `cutoff`.
+    ///
+    /// Batches are stored one object per batch, named by their *base*
+    /// offset (the same layout `fetch` reads). A batch's end offset isn't
+    /// part of its key, so rather than decoding every candidate batch just
+    /// to check its span, this uses the next batch's base offset as the
+    /// exclusive upper bound: batches are produced back-to-back with no
+    /// gaps, so batch N's last offset is `objects[N + 1].base - 1`. The
+    /// last object in the partition has no successor, so its end can't be
+    /// bounded this way -- and it always holds `high_watermark - 1`,
+    /// Kafka's active segment, which must never be removed -- so it is
+    /// simply never a deletion candidate here.
+    ///
+    /// Scoped to exactly this one partition's `records/` prefix, never the
+    /// whole topic: the broader a prefix delete, the more it can take out
+    /// by mistake.
+    async fn delete_records_batches(&self, topition: &Topition, cutoff: i64) -> Result<()> {
+        if cutoff <= 0 {
+            return Ok(());
+        }
+
+        let prefix = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition
+        ));
+
+        let mut objects = vec![];
+
+        let mut list_stream = self.object_store.list(Some(&prefix));
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|error| error!(?error, ?topition, cutoff))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let Ok(base_offset) = i64::from_str(&name.as_ref()[0..20]) else {
+                continue;
+            };
+
+            objects.push((meta.location, base_offset));
+        }
+
+        objects.sort_by_key(|(_, base_offset)| *base_offset);
+
+        for window in objects.windows(2) {
+            let (location, base_offset) = &window[0];
+            let (_, next_base_offset) = &window[1];
+
+            if *base_offset < cutoff && *next_base_offset <= cutoff {
+                _ = self
+                    .object_store
+                    .delete(location)
+                    .await
+                    .inspect_err(|error| error!(?error, ?topition, ?location, cutoff));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
     where
         V: DeserializeOwned,
@@ -634,9 +701,105 @@ impl Storage for DynoStore {
 
     async fn delete_records(
         &self,
-        _topics: &[DeleteRecordsTopic],
+        topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        todo!()
+        debug!(?topics);
+
+        let mut responses = vec![];
+
+        for topic in topics {
+            let mut partition_responses = vec![];
+
+            if let Some(ref partitions) = topic.partitions {
+                let metadata = self
+                    .topic_metadata(&TopicId::Name(topic.name.clone()))
+                    .await?;
+
+                for partition in partitions {
+                    let (error_code, low_watermark) = match &metadata {
+                        None => (ErrorCode::UnknownTopicOrPartition, 0),
+
+                        Some(metadata)
+                            if partition.partition_index < 0
+                                || partition.partition_index >= metadata.topic.num_partitions =>
+                        {
+                            (ErrorCode::UnknownTopicOrPartition, 0)
+                        }
+
+                        Some(_) => {
+                            let topition =
+                                Topition::new(topic.name.as_str(), partition.partition_index);
+
+                            let watermark = self.watermarks.lock().map(|mut locked| {
+                                locked
+                                    .entry(topition.to_owned())
+                                    .or_insert_with(|| {
+                                        OptiCon::<Watermark>::new(self.cluster.as_str(), &topition)
+                                    })
+                                    .to_owned()
+                            })?;
+
+                            // Resolve and validate the requested offset against the
+                            // *current* watermark, and commit it atomically: `with_mut`
+                            // re-runs this closure against the latest value on a
+                            // concurrent-write conflict (e.g. a produce racing this
+                            // delete), so the cutoff is always computed from the value
+                            // actually being persisted.
+                            let (error_code, cutoff) = watermark
+                                .with_mut(&self.object_store, |w| {
+                                    let stage = OffsetStage {
+                                        last_stable: w.high.unwrap_or(0),
+                                        high_watermark: w.high.unwrap_or(0),
+                                        log_start: w.low.unwrap_or(0),
+                                    };
+
+                                    match delete_records_cutoff(partition.offset, &stage) {
+                                        Err(error_code) => Ok((error_code, stage.log_start)),
+
+                                        Ok(cutoff) => {
+                                            w.low = Some(cutoff);
+
+                                            if let Some(ref mut timestamps) = w.timestamps {
+                                                timestamps.retain(|_, offset| *offset >= cutoff);
+                                            }
+
+                                            Ok((ErrorCode::None, cutoff))
+                                        }
+                                    }
+                                })
+                                .await?;
+
+                            if error_code == ErrorCode::None {
+                                // Best-effort physical cleanup of batches now fully
+                                // below the new low watermark. Failing to reclaim
+                                // storage here does not undo the watermark advance
+                                // above: the logical delete has already taken effect,
+                                // same as Kafka's own segment reclaim lagging behind
+                                // a logStartOffset bump.
+                                self.delete_records_batches(&topition, cutoff).await?;
+                            }
+
+                            (error_code, cutoff)
+                        }
+                    };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
+                }
+            }
+
+            responses.push(
+                DeleteRecordsTopicResult::default()
+                    .name(topic.name.clone())
+                    .partitions(Some(partition_responses)),
+            );
+        }
+
+        Ok(responses)
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
