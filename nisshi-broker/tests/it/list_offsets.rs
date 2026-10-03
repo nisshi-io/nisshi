@@ -707,7 +707,14 @@ where
             .inspect(|offset| debug!(?offset))?
     );
 
-    let after = SystemTime::now();
+    // Strictly later than any produced record's millisecond timestamp: the
+    // record's stored timestamp is captured just before `produce` as
+    // `to_timestamp(&SystemTime::now())` (integer milliseconds). Taking
+    // `after` immediately after `produce` returns can land in the same
+    // millisecond, which makes lite's `r.timestamp >= $4` lookup match at
+    // offset 0 instead of returning no match, flaking this assertion under
+    // load (observed ~5-10% under concurrent test load, 0/30 isolated).
+    let after = SystemTime::now() + Duration::from_secs(1);
     debug!(after = to_timestamp(&after)?);
 
     let offsets = [(topition.clone(), ListOffset::Latest)];
