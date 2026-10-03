@@ -386,3 +386,44 @@ async fn new_partition_first_produce_marks_index_complete() -> Result<()> {
 
     Ok(())
 }
+
+/// Pins the ticket's two remaining named scenarios, both inside one
+/// multi-record batch: a target equal to a record's own timestamp (the
+/// inclusive boundary) and a target that falls strictly between two records'
+/// timestamps (a genuine mid-batch match). One batch, offsets 0/1/2 at
+/// T0/T0+50/T0+100, is indexed under a single `time_index` entry keyed by its
+/// `max_timestamp` (T0+100), so every assertion here is answered by the
+/// sequential scan walking records inside that one batch, not by a ceiling
+/// lookup landing on a different batch. See SOL-155076.
+#[tokio::test]
+async fn equal_and_mid_batch_timestamps_match_inside_a_batch() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage();
+    let topic = "boundary";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+
+    let timestamps = [T0, T0 + 50, T0 + 100];
+    let offset = produce(&storage, &topition, &timestamps).await?;
+    assert_eq!(0, offset);
+
+    // Inclusive boundary: target equals offset 1's own timestamp exactly.
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(1), offset);
+    assert_eq!(Some(T0 + 50), timestamp);
+
+    // Mid-batch match: target falls strictly between offset 0's and offset
+    // 1's timestamps, so the first record at or after it is offset 1.
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 25).await?;
+    assert_eq!(Some(1), offset);
+    assert_eq!(Some(T0 + 50), timestamp);
+
+    // Mid-batch match on the last record: target falls strictly between
+    // offset 1's and offset 2's timestamps.
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 51).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+
+    Ok(())
+}
