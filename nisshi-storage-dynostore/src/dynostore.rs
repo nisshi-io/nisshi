@@ -50,6 +50,7 @@ use nisshi_sans_io::{
     list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
     record::{Record, deflated, inflated},
+    to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
@@ -343,11 +344,38 @@ struct TopicMetadata {
     topic: CreatableTopic,
 }
 
+/// Kafka's own `NO_TIMESTAMP` sentinel: a batch whose `max_timestamp` is at
+/// or below this is never indexed (see [`Watermark::time_index`]).
+const NO_TIMESTAMP: i64 = -1;
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Watermark {
     low: Option<i64>,
     high: Option<i64>,
-    timestamps: Option<BTreeMap<i64, i64>>,
+    /// Time index for `ListOffsets(Timestamp)`: `max_timestamp -> base_offset`
+    /// of every batch appended so far, maintained by Kafka's own
+    /// `TimeIndex.maybeAppend` rule - an entry is kept only when its
+    /// `max_timestamp` is strictly greater than every one appended before it
+    /// for this partition, floored at [`NO_TIMESTAMP`] so a negative
+    /// timestamp is never indexed. `None`/empty means nothing has been
+    /// indexed yet for this partition, either because it's genuinely empty
+    /// or because `time_index_complete` is still `false` and a backfill from
+    /// `records/` hasn't run yet (see `DynoStore::collect_time_index_candidate`).
+    ///
+    /// The JSON key stays `timestamps`: every watermark document ever
+    /// written has this key as `null`, which decodes identically under this
+    /// type with no migration (see `dynostore::tests::schema_change`).
+    #[serde(rename = "timestamps")]
+    time_index: Option<BTreeMap<i64, i64>>,
+    /// Whether `time_index` covers this partition from offset 0 onward.
+    /// Set `true` the moment a produce first creates the partition (nothing
+    /// to backfill), and on a successful backfill commit. `#[serde(default)]`
+    /// is required, not cosmetic: a document written before this field
+    /// existed lacks the JSON key entirely, and a bare `bool` fails to
+    /// deserialize such a document ("missing field") instead of defaulting
+    /// to `false` the way `Option` fields do.
+    #[serde(default)]
+    time_index_complete: bool,
 }
 
 impl OptiCon<Watermark> {
@@ -428,6 +456,296 @@ impl DynoStore {
         deflated::Batch::try_from(encoded)
             .inspect_err(|err| debug!(?err))
             .map_err(Into::into)
+    }
+
+    fn records_prefix(&self, topition: &Topition) -> Path {
+        Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition,
+        ))
+    }
+
+    fn batch_path(&self, topition: &Topition, base_offset: i64) -> Path {
+        Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+            self.cluster, topition.topic, topition.partition, base_offset,
+        ))
+    }
+
+    /// Returns the (cached, shared) `OptiCon` handle for `topition`'s
+    /// watermark document, inserting one if this is the first time this
+    /// partition has been touched in this process.
+    fn watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
+        self.watermarks
+            .lock()
+            .map(|mut locked| {
+                locked
+                    .entry(topition.to_owned())
+                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                    .to_owned()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Lists every real batch object in `topition` and replays Kafka's own
+    /// monotonic `TimeIndex.maybeAppend` rule (floored at [`NO_TIMESTAMP`])
+    /// over their headers, in offset order, to reconstruct a from-scratch
+    /// time index. Pure read: never writes anything. Pairs with
+    /// [`DynoStore::commit_time_index_backfill`], which does the actual CAS
+    /// write - split this way so a concurrent produce landing between the
+    /// two steps can never be lost (see [`DynoStore::merge_time_index`] and
+    /// SOL-155076).
+    ///
+    /// Returns an empty map, not an error, when the partition has no real
+    /// batch objects (an empty partition, or one written only through the
+    /// lake-sink produce path, which never creates `records/*.batch`
+    /// objects).
+    async fn collect_time_index_candidate(
+        &self,
+        topition: &Topition,
+    ) -> Result<BTreeMap<i64, i64>> {
+        let prefix = self.records_prefix(topition);
+
+        let mut offsets = BTreeSet::new();
+        let mut list_stream = self.object_store.list(Some(&prefix));
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|error| error!(?error, ?topition, "time index backfill: listing records"))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+        {
+            if let Some(name) = meta.location.parts().next_back()
+                && let Ok(base_offset) = i64::from_str(&name.as_ref()[0..20])
+            {
+                _ = offsets.insert(base_offset);
+            }
+        }
+
+        let mut candidate = BTreeMap::new();
+        let mut running_max = NO_TIMESTAMP;
+
+        for base_offset in offsets {
+            let path = self.batch_path(topition, base_offset);
+
+            let batch = match self.object_store.get(&path).await {
+                Ok(get_result) => get_result.bytes().await.map_err(Error::from),
+                Err(error) => Err(Error::from(error)),
+            }
+            .and_then(|encoded| self.decode(encoded));
+
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        ?topition,
+                        base_offset,
+                        "skipping unreadable/undecodable batch during time index backfill"
+                    );
+                    continue;
+                }
+            };
+
+            if batch.max_timestamp > running_max {
+                running_max = batch.max_timestamp;
+                _ = candidate.insert(batch.max_timestamp, base_offset);
+            }
+        }
+
+        Ok(candidate)
+    }
+
+    /// Correct merge of a backfill `candidate` with whatever `time_index` is
+    /// live right now. Deliberately NOT a plain `BTreeMap` union: a plain
+    /// union of two independently-maintained running-max maps can let a
+    /// lower, more-recently-inserted entry outrank an already-established
+    /// higher one and corrupt the ceiling lookup `ListOffsets(Timestamp)`
+    /// depends on. Instead this reduces both sides to `(offset, timestamp)`
+    /// pairs, sorts by offset - batches are always appended in strictly
+    /// increasing offset order, the one ordering both `candidate` and `live`
+    /// agree on regardless of when either was actually computed - and
+    /// replays the monotonic rule over the union from scratch. See
+    /// SOL-155076.
+    fn merge_time_index(
+        candidate: BTreeMap<i64, i64>,
+        live: Option<&BTreeMap<i64, i64>>,
+    ) -> BTreeMap<i64, i64> {
+        let mut by_offset: BTreeMap<i64, i64> = candidate
+            .into_iter()
+            .map(|(timestamp, offset)| (offset, timestamp))
+            .collect();
+
+        if let Some(live) = live {
+            for (&timestamp, &offset) in live {
+                _ = by_offset.insert(offset, timestamp);
+            }
+        }
+
+        let mut merged = BTreeMap::new();
+        let mut running_max = NO_TIMESTAMP;
+
+        for (offset, timestamp) in by_offset {
+            if timestamp > running_max {
+                running_max = timestamp;
+                _ = merged.insert(timestamp, offset);
+            }
+        }
+
+        merged
+    }
+
+    /// Commits a backfill `candidate` (from
+    /// [`DynoStore::collect_time_index_candidate`]) via a CAS write that
+    /// merges it with whatever is live at write time (see
+    /// [`DynoStore::merge_time_index`]), and marks the index complete.
+    /// Returns the merged index actually persisted.
+    async fn commit_time_index_backfill(
+        &self,
+        topition: &Topition,
+        candidate: &BTreeMap<i64, i64>,
+    ) -> Result<BTreeMap<i64, i64>> {
+        let watermark = self.watermark_for(topition)?;
+
+        watermark
+            .with_mut(&self.object_store, |w| {
+                let merged = Self::merge_time_index(candidate.clone(), w.time_index.as_ref());
+                w.time_index = Some(merged.clone());
+                w.time_index_complete = true;
+                Ok(merged)
+            })
+            .await
+    }
+
+    /// Returns this partition's complete time index and log start (`low`),
+    /// running a backfill first if the index isn't complete yet (see
+    /// [`Watermark::time_index_complete`]).
+    async fn ensure_time_index_complete(
+        &self,
+        topition: &Topition,
+    ) -> Result<(BTreeMap<i64, i64>, i64)> {
+        let watermark = self.watermark_for(topition)?;
+
+        let (complete, time_index, low) = watermark
+            .with(&self.object_store, |w| {
+                Ok((
+                    w.time_index_complete,
+                    w.time_index.clone(),
+                    w.low.unwrap_or(0),
+                ))
+            })
+            .await?;
+
+        if complete {
+            return Ok((time_index.unwrap_or_default(), low));
+        }
+
+        let candidate = self.collect_time_index_candidate(topition).await?;
+        let merged = self
+            .commit_time_index_backfill(topition, &candidate)
+            .await?;
+
+        // `low` can have moved (e.g. a concurrent DeleteRecords) between the
+        // read above and the backfill commit; re-read it fresh rather than
+        // answer with a value that might already be stale.
+        let low = watermark
+            .with(&self.object_store, |w| Ok(w.low.unwrap_or(0)))
+            .await?;
+
+        Ok((merged, low))
+    }
+
+    /// Forward sequential scan of real batch objects in `topition`, starting
+    /// at `start_offset`, for the first logical record - one whose offset is
+    /// `>= low`, so a record `DeleteRecords` has logically removed is never
+    /// answered as a match even if its batch object hasn't been physically
+    /// reclaimed yet (see SOL-155076) - whose timestamp is `>= target`.
+    /// Decodes individual records rather than
+    /// trusting a batch header's `max_timestamp` alone, since that header is
+    /// only ever a ceiling hint and can be stale/overstated once anything
+    /// prunes or compacts a partition's batches.
+    ///
+    /// Returns `Ok(None)` - not an error - when nothing qualifies: an empty
+    /// partition, a `start_offset` past every real batch (the lake-sink
+    /// produce path never writes a `.batch` object, see `DynoStore::produce`),
+    /// or every surviving record's timestamp below `target`.
+    async fn sequential_timestamp_scan(
+        &self,
+        topition: &Topition,
+        start_offset: i64,
+        target: i64,
+        low: i64,
+    ) -> Result<Option<(i64, i64)>> {
+        let prefix = self.records_prefix(topition);
+
+        let mut offsets = BTreeSet::new();
+        let mut list_stream = self.object_store.list(Some(&prefix));
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|error| error!(?error, ?topition, "timestamp scan: listing records"))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+        {
+            if let Some(name) = meta.location.parts().next_back()
+                && let Ok(base_offset) = i64::from_str(&name.as_ref()[0..20])
+                && base_offset >= start_offset
+            {
+                _ = offsets.insert(base_offset);
+            }
+        }
+
+        for base_offset in offsets {
+            let path = self.batch_path(topition, base_offset);
+
+            let deflated = match self.object_store.get(&path).await {
+                Ok(get_result) => get_result.bytes().await.map_err(Error::from),
+                Err(error) => Err(Error::from(error)),
+            }
+            .and_then(|encoded| self.decode(encoded));
+
+            let deflated = match deflated {
+                Ok(deflated) => deflated,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        ?topition,
+                        base_offset,
+                        "skipping unreadable/undecodable batch during timestamp scan"
+                    );
+                    continue;
+                }
+            };
+
+            let inflated = match inflated::Batch::try_from(&deflated) {
+                Ok(inflated) => inflated,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        ?topition,
+                        base_offset,
+                        "skipping uninflatable batch during timestamp scan"
+                    );
+                    continue;
+                }
+            };
+
+            for record in &inflated.records {
+                let offset = base_offset + i64::from(record.offset_delta);
+                if offset < low {
+                    continue;
+                }
+
+                let timestamp = inflated.base_timestamp + record.timestamp_delta;
+                if timestamp >= target {
+                    return Ok(Some((offset, timestamp)));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
@@ -608,17 +926,17 @@ impl Storage for DynoStore {
                 for partition in 0..topic.num_partitions {
                     let topition = Topition::new(topic.name.as_str(), partition);
 
-                    let watermark = self.watermarks.lock().map(|mut locked| {
-                        locked
-                            .entry(topition.to_owned())
-                            .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition))
-                            .to_owned()
-                    })?;
+                    let watermark = self.watermark_for(&topition)?;
 
                     watermark
                         .with_mut(&self.object_store, |watermark| {
                             _ = watermark.high.take();
                             _ = watermark.low.take();
+                            _ = watermark.time_index.take();
+                            // A freshly (re)created partition has nothing to
+                            // backfill: it's complete from offset 0 by
+                            // definition.
+                            watermark.time_index_complete = true;
 
                             Ok(())
                         })
@@ -761,12 +1079,7 @@ impl Storage for DynoStore {
                 .unwrap_or(false)
         {
             // Get watermark to calculate proper offset for lake sink
-            let watermark = self.watermarks.lock().map(|mut locked| {
-                locked
-                    .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                    .to_owned()
-            })?;
+            let watermark = self.watermark_for(topition)?;
 
             let offset = watermark
                 .with_mut(&self.object_store, |watermark| {
@@ -778,7 +1091,13 @@ impl Storage for DynoStore {
                         |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
                     );
 
-                    watermark.timestamps = None;
+                    // Deliberately not touched: this branch (tansu.lake.sink)
+                    // never writes a `records/*.batch` object, so there is
+                    // nothing for a `time_index` entry here to point at. A
+                    // sequential scan starting from such an entry would list
+                    // nothing and must handle that cleanly (see
+                    // `DynoStore::sequential_timestamp_scan`), but the
+                    // simpler fix is to just never create the entry.
 
                     debug!(?watermark);
 
@@ -894,24 +1213,48 @@ impl Storage for DynoStore {
                 }
             }
 
-            let watermark = self.watermarks.lock().map(|mut locked| {
-                locked
-                    .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                    .to_owned()
-            })?;
+            let watermark = self.watermark_for(topition)?;
 
             let offset = watermark
                 .with_mut(&self.object_store, |watermark| {
                     debug!(?watermark);
 
                     let offset = watermark.high.unwrap_or_default();
+                    let is_new_partition = watermark.high.is_none();
+
                     watermark.high = watermark.high.map_or_else(
                         || Some(deflated.last_offset_delta as i64 + 1i64),
                         |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
                     );
 
-                    watermark.timestamps = None;
+                    // Always insert under Kafka's own monotonic
+                    // `TimeIndex.maybeAppend` rule, with no guard for a
+                    // legacy or still-backfilling index: deferring this
+                    // insert until a concurrent backfill catches up would
+                    // create a permanent index gap, since the backfill can
+                    // read `time_index` while it's still absent, merge
+                    // nothing in, and never pick up this entry on either
+                    // side. See SOL-155076.
+                    if deflated.max_timestamp > NO_TIMESTAMP {
+                        let running_max = watermark
+                            .time_index
+                            .as_ref()
+                            .and_then(|index| index.keys().next_back().copied())
+                            .unwrap_or(NO_TIMESTAMP);
+
+                        if deflated.max_timestamp > running_max {
+                            _ = watermark
+                                .time_index
+                                .get_or_insert_with(BTreeMap::new)
+                                .insert(deflated.max_timestamp, offset);
+                        }
+                    }
+
+                    if is_new_partition {
+                        // Nothing predates offset 0: the index is complete
+                        // immediately, no backfill ever needed.
+                        watermark.time_index_complete = true;
+                    }
 
                     debug!(?watermark);
 
@@ -1176,12 +1519,7 @@ impl Storage for DynoStore {
 
         debug!(?stable);
 
-        let watermark = self.watermarks.lock().map(|mut locked| {
-            locked
-                .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                .to_owned()
-        })?;
+        let watermark = self.watermark_for(topition)?;
 
         watermark
             .with(&self.object_store, |watermark| {
@@ -1246,6 +1584,65 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
+            if let ListOffset::Timestamp(system_time) = offset_request {
+                let target = to_timestamp(system_time)?;
+                let (time_index, low) = self.ensure_time_index_complete(topition).await?;
+
+                // An empty index is "ceiling absent" in the sense that there
+                // is nothing to take a ceiling of - not "ceiling above
+                // every entry" (see below). This is dead today (nothing in
+                // this codebase prunes `time_index` entries yet), but is the
+                // defensive path a future backfill-coverage gap or a
+                // delete_records that prunes time_index (see SOL-155296) would
+                // need: fall back to scanning everything still physically
+                // present from `low` forward, rather than wrongly reporting
+                // "no match".
+                let start_offset = if time_index.is_empty() {
+                    Some(low)
+                } else {
+                    // A ceiling entry exists (smallest indexed timestamp
+                    // `>= target`): start the real scan at its offset. If no
+                    // entry reaches `target`, every real record's timestamp
+                    // is below it (the index is complete and monotonic in
+                    // both offset and timestamp), so there is definitely no
+                    // match - no scan needed.
+                    time_index.range(target..).next().map(|(_, &offset)| offset)
+                };
+
+                let Some(start_offset) = start_offset else {
+                    responses.push((
+                        topition.to_owned(),
+                        ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            offset: None,
+                            ..Default::default()
+                        },
+                    ));
+                    continue;
+                };
+
+                responses.push((
+                    topition.to_owned(),
+                    match self
+                        .sequential_timestamp_scan(topition, start_offset, target, low)
+                        .await?
+                    {
+                        Some((offset, timestamp)) => ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            offset: Some(offset),
+                            timestamp: Some(to_system_time(timestamp)?),
+                        },
+                        None => ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            offset: None,
+                            ..Default::default()
+                        },
+                    },
+                ));
+
+                continue;
+            }
+
             let location = Path::from(format!(
                 "clusters/{}/topics/{}/partitions/{:0>10}/records",
                 self.cluster, topition.topic, topition.partition,
@@ -1304,14 +1701,6 @@ impl Storage for DynoStore {
                             _ = candidate.replace(meta);
                         }
 
-                        ListOffset::Timestamp(system_time)
-                            if SystemTime::from(meta.last_modified) > *system_time
-                                && candidate.as_ref().is_none_or(|found| {
-                                    found.last_modified > meta.last_modified
-                                }) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
                         _ => continue,
                     }
                 }
