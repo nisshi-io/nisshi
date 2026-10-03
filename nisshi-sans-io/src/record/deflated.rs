@@ -25,7 +25,10 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     ByteSize, Compression, Decode as _, Decoder, Encode, Error, Result,
-    record::{Record, codec::MAX_PREALLOCATED_ELEMENTS},
+    record::{
+        Record,
+        codec::{MAX_PREALLOCATED_ELEMENTS, MIN_ENCODED_RECORD_SIZE},
+    },
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -446,6 +449,17 @@ impl TryFrom<Batch> for Vec<Record> {
             .compression()
             .is_ok_and(|compression| compression == Compression::None)
         {
+            // On this path `record_data` is the real, uncompressed byte
+            // stream the records are decoded from, so its length is a
+            // sound upper bound: no real record is smaller than
+            // `MIN_ENCODED_RECORD_SIZE`, so a `record_count` that could
+            // not possibly fit is rejected before attempting to decode
+            // anything, rather than relying on `Record::decode` to fail
+            // (eventually, and only once) partway through the loop.
+            if record_count > batch.record_data.len() / MIN_ENCODED_RECORD_SIZE {
+                return Err(Error::Overflow);
+            }
+
             let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
             for _ in 0..record_count {
@@ -1273,6 +1287,60 @@ mod tests {
             assert!(Vec::<Record>::try_from(batch.clone()).is_err());
             assert!(Vec::<Record>::try_from(&batch).is_err());
         }
+
+        Ok(())
+    }
+
+    /// Before the length-prefix fix, a header count that outruns this
+    /// record's own declared length reads into whatever bytes happen to
+    /// follow it in the batch -- here, two bytes that belong to no record
+    /// at all -- instead of failing at the true per-record boundary.
+    /// `record_count: 1` so only this one record's own `Record::decode`
+    /// call is exercised (the uncompressed by-value path).
+    #[test]
+    fn header_count_reads_past_record_boundary_is_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // record: length=6, body=[attributes=0, timestamp_delta=0,
+        // offset_delta=0, null key, null value, header_count=1], followed
+        // by two bytes that belong to no record -- a phantom null/null
+        // header a pre-fix decode would happily consume as this record's
+        // one declared header.
+        let record_data = Bytes::from_static(&[12, 0, 0, 0, 1, 1, 2, 1, 1]);
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 1,
+            record_data,
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a header count outrunning this record's declared length must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// `record_count` claims more records than the 10 bytes of
+    /// `record_data` present could possibly hold -- every real record is
+    /// at least `MIN_ENCODED_RECORD_SIZE` bytes -- and must be rejected
+    /// before any decode is attempted.
+    #[test]
+    fn record_count_inconsistent_with_remaining_data_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 5,
+            record_data: Bytes::from_static(&[0u8; 10]),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch).expect_err(
+            "a record_count inconsistent with the remaining record_data must be rejected",
+        );
+        assert!(matches!(err, Error::Overflow), "{err:?}");
 
         Ok(())
     }
