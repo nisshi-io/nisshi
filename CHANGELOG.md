@@ -69,6 +69,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Snappy batch with a truncated xerial header is rejected with an error
   instead of panicking the decoder.
 - CreateTopics rejects a `replication_factor` of 0 or below -1 with `INVALID_REPLICATION_FACTOR` (38), as Apache Kafka does. -1 still selects the default (1).
+- `DeleteGroups` refuses a group that still has members or a rebalance in
+  progress with `NON_EMPTY_GROUP` (68), instead of deleting its state and
+  committed offsets out from under a live consumer. The check runs through
+  the group coordinator rather than storage alone, so a member whose
+  session has expired (no `LeaveGroup` ever sent) is still correctly
+  evicted first and the group remains deletable once genuinely empty; a
+  group actually deleted has its coordinator-cached state forgotten too,
+  so a new member joining under the same, just-freed group name starts a
+  real new group instead of reusing stale state. `DescribeGroups` and
+  `DeleteGroups` on the PostgreSQL and libSQL (including Turso) storage
+  engines no longer error for a group that only ever committed offsets and
+  never ran `JoinGroup` (a group row with no detail row); that case is now
+  correctly reported as an empty group.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
 - DeleteTopics on the object-store backends (`s3://`, `gs://`, `memory://`) no longer deletes other topics' data or committed offsets when the deleted topic's name is empty or contains `/`. Such a topic is removed from metadata and the request answers `NONE`, but its data objects stay in the bucket, and so do its committed offsets when the name has an empty segment (`a/`, `/a`, `a//b`, or empty). The broker logs each kept location at `warn` with the topic id. Do not delete those objects by key prefix: for several of these names they share keys with a live topic of the plain name, and must stay while it exists. Creating a topic whose name collapses onto such kept objects (`a` after `a/` was deleted) finds them in place and its first produce fails; delete `a` and create it again.
