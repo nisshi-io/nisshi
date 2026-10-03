@@ -200,6 +200,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         ),
         ("record_copy.sql", include_sql!("sql/record_copy.sql")),
         (
+            "record_delete_by_offset.sql",
+            include_sql!("sql/record_delete_by_offset.sql"),
+        ),
+        (
             "record_delete_by_topic.sql",
             include_sql!("sql/record_delete_by_topic.sql"),
         ),
