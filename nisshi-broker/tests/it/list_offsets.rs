@@ -442,9 +442,12 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
             .is_some_and(|timestamp| timestamp > 0)
     );
 
+    // Other partitions are empty: no record matches this timestamp, so this is
+    // a not-found result, not an empty-partition result. Offset is -1, matching
+    // Kafka's buildErrorResponse default.
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(Some(-1), partition.offset);
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -492,9 +495,12 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
             .is_some_and(|timestamp| timestamp > 0)
     );
 
+    // Other partitions are empty: no record matches this timestamp, so this is
+    // a not-found result, not an empty-partition result. Offset is -1, matching
+    // Kafka's buildErrorResponse default.
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(Some(-1), partition.offset);
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -542,9 +548,12 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
             .is_some_and(|timestamp| timestamp > 0)
     );
 
+    // Other partitions are empty: no record matches this timestamp, so this is
+    // a not-found result, not an empty-partition result. Offset is -1, matching
+    // Kafka's buildErrorResponse default.
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(Some(-1), partition.offset);
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -638,8 +647,11 @@ where
 
     assert!(!items.is_empty());
 
+    // The topic has no records at all, so no record matches this timestamp:
+    // it's a not-found result at the raw storage layer (the -1 default is
+    // applied by the broker service, not the storage backend itself).
     for (_toptition, response) in items {
-        assert_eq!(Some(0), response.offset);
+        assert_eq!(None, response.offset);
         assert_eq!(None, response.timestamp);
     }
 
@@ -733,8 +745,11 @@ where
         .list_offsets(IsolationLevel::ReadUncommitted, &offsets[..])
         .await?;
 
+    // No record's timestamp is >= `after`: not-found at the raw storage layer
+    // (the -1 default is applied by the broker service, not the storage
+    // backend itself).
     assert_eq!(1, responses.len());
-    assert_eq!(Some(0), responses[0].1.offset);
+    assert_eq!(None, responses[0].1.offset);
 
     Ok(())
 }
@@ -915,6 +930,73 @@ mod lite {
         .await
     }
 
+    #[tokio::test]
+    async fn single_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::single_record(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+    use nisshi_storage::ArcDynStorage;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(
+            StorageType::Turso,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn multiple_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        let broker = broker(sc)?;
+        super::multiple_record(broker).await
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn new_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::new_topic(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[ignore]
     #[tokio::test]
     async fn single_record() -> Result<()> {
         let _guard = init_tracing()?;
