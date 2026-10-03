@@ -396,6 +396,101 @@ async fn test_delete_records() {
     assert_eq!(3, stage.log_start);
 }
 
+/// `offset == -1` ("delete everything up to the high watermark") must never
+/// physically remove the batch holding `high_watermark - 1`: it's Kafka's
+/// active segment. The public API can't observe this directly -- `Latest`
+/// is read straight from the stored watermark, not by scanning batches, so
+/// every public-API test still passes even with that protection deleted
+/// entirely. This test builds the `Engine` from a `Db` handle it keeps for
+/// itself, so it can scan the batch-key prefix directly afterward and
+/// confirm the one physical object that must survive actually does.
+#[tokio::test]
+async fn test_delete_records_to_high_watermark_keeps_one_physical_batch() {
+    use super::types::{BatchKey, BatchKeyPrefix};
+    use nisshi_sans_io::delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic};
+
+    let object_store = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("test.slatedb", object_store)
+            .await
+            .expect("Failed to open SlateDB"),
+    );
+
+    let engine = Engine::new(
+        "test-cluster",
+        1,
+        Url::parse("tcp://localhost:9092").unwrap(),
+        db.clone(),
+    );
+
+    let topic = CreatableTopic::default()
+        .name("protect-active-batch-topic".into())
+        .num_partitions(1)
+        .replication_factor(1);
+    let topic_id = engine.create_topic(topic, false).await.unwrap();
+
+    let topition = Topition::new("protect-active-batch-topic", 0);
+
+    // Five single-record batches: offsets 0..=4, each its own physical
+    // batch object (unlike `test_delete_records` above, which only needs
+    // log_start/low_watermark to move, not an exact physical object count).
+    for _ in 0..5 {
+        let batch = simple_batch();
+        let _ = engine.produce(None, &topition, batch).await.unwrap();
+    }
+
+    async fn count_batches(db: &Db, topic_id: uuid::Uuid, partition: i32) -> usize {
+        let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic_id, partition)).unwrap();
+        let scan_start = postcard::to_stdvec(&BatchKey::scan_from(topic_id, partition, 0)).unwrap();
+
+        let mut scan = db.scan(scan_start..).await.unwrap();
+        let mut count = 0;
+
+        while let Some(kv) = scan.next().await.unwrap() {
+            if !kv.key.starts_with(&prefix) {
+                break;
+            }
+            count += 1;
+        }
+
+        count
+    }
+
+    assert_eq!(
+        5,
+        count_batches(&db, topic_id, 0).await,
+        "setup: expected one physical batch object per produced record"
+    );
+
+    let delete_request = vec![
+        DeleteRecordsTopic::default()
+            .name("protect-active-batch-topic".into())
+            .partitions(Some(vec![
+                DeleteRecordsPartition::default()
+                    .partition_index(0)
+                    .offset(-1),
+            ])),
+    ];
+
+    let results = engine.delete_records(&delete_request).await.unwrap();
+    let partitions = results[0].partitions.as_ref().unwrap();
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code).unwrap()
+    );
+    assert_eq!(5, partitions[0].low_watermark);
+
+    // Exactly one physical batch -- the one holding high_watermark - 1 --
+    // must remain. If `protect_active_batch` were ever removed, this would
+    // be 0: every batch's end offset is below the cutoff when the cutoff
+    // is the high watermark itself.
+    assert_eq!(
+        1,
+        count_batches(&db, topic_id, 0).await,
+        "the active batch holding high_watermark - 1 must survive a -1 delete"
+    );
+}
+
 #[tokio::test]
 async fn test_fetch_with_min_bytes() {
     let engine = create_test_engine().await;
