@@ -30,7 +30,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
+    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::{
@@ -56,7 +56,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
     ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel,
+    bounded_channel, delete_records_cutoff,
 };
 use opentelemetry::{
     KeyValue,
@@ -2494,7 +2494,105 @@ impl Storage for Delegate {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(?topics);
-        todo!()
+
+        let pc = self.connection().await?;
+        let tx = pc.transaction().await?;
+
+        let mut responses = vec![];
+
+        for topic in topics {
+            let mut partition_responses = vec![];
+
+            if let Some(ref partitions) = topic.partitions {
+                for partition in partitions {
+                    let topition = Topition::new(topic.name.as_str(), partition.partition_index);
+
+                    let (error_code, low_watermark) =
+                        match self.watermark_select_for_update(&topition, &pc).await {
+                            Err(Error::Api(error_code)) => (error_code, 0),
+                            Err(err) => return Err(err),
+
+                            Ok((low, high)) => {
+                                let stage = OffsetStage {
+                                    last_stable: high.unwrap_or_default(),
+                                    high_watermark: high.unwrap_or_default(),
+                                    log_start: low.unwrap_or_default(),
+                                };
+
+                                match delete_records_cutoff(partition.offset, &stage) {
+                                    Err(error_code) => (error_code, stage.log_start),
+
+                                    Ok(cutoff) => {
+                                        // Physically delete at most up to
+                                        // `high_watermark - 1`: the row
+                                        // holding the last committed offset
+                                        // is Kafka's active segment and must
+                                        // survive even a `cutoff ==
+                                        // high_watermark` ("delete
+                                        // everything") request, or
+                                        // `ListOffsets` (Latest) would
+                                        // regress once nothing is left to
+                                        // derive it from. The logical
+                                        // watermark below is still set to
+                                        // the full `cutoff`.
+                                        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
+
+                                        if physical_cutoff > stage.log_start {
+                                            _ = pc
+                                                .execute(
+                                                    "record_delete_by_offset.sql",
+                                                    (
+                                                        self.cluster.as_str(),
+                                                        topic.name.as_str(),
+                                                        partition.partition_index,
+                                                        physical_cutoff,
+                                                    ),
+                                                )
+                                                .await
+                                                .inspect_err(|err| {
+                                                    error!(?err, ?topition, physical_cutoff)
+                                                })?;
+                                        }
+
+                                        _ = pc
+                                            .execute(
+                                                "watermark_update.sql",
+                                                (
+                                                    self.cluster.as_str(),
+                                                    topic.name.as_str(),
+                                                    partition.partition_index,
+                                                    cutoff,
+                                                    high.unwrap_or_default(),
+                                                ),
+                                            )
+                                            .await
+                                            .inspect_err(|err| error!(?err, ?topition))?;
+
+                                        (ErrorCode::None, cutoff)
+                                    }
+                                }
+                            }
+                        };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
+                }
+            }
+
+            responses.push(
+                DeleteRecordsTopicResult::default()
+                    .name(topic.name.clone())
+                    .partitions(Some(partition_responses)),
+            );
+        }
+
+        pc.commit(tx).await.inspect_err(|err| error!(?err))?;
+
+        Ok(responses)
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
