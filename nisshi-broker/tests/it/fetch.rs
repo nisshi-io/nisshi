@@ -948,9 +948,12 @@ where
     let elapsed = started_at.elapsed()?;
     assert!(elapsed < answered_within, "took {elapsed:?}");
 
-    let partitions = response
-        .responses
-        .unwrap_or_default()
+    let topics = response.responses.unwrap_or_default();
+
+    assert_eq!(1, topics.len());
+    assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+
+    let partitions = topics
         .into_iter()
         .flat_map(|topic| topic.partitions.unwrap_or_default())
         .collect::<Vec<_>>();
