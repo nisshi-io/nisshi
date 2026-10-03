@@ -29,6 +29,7 @@
 //! | `b/` | Batch data | `b/{topic_uuid}/{partition:be32}/{offset:be64}` |
 //! | `c/` | Consumer group commits | `c/{group}/{topic}/{partition:be32}` |
 //! | `g/` | Group state | `g/{group_id}` |
+//! | `t/` | Time index | `t/{topic_uuid}/{partition:be32}/{max_timestamp:be64}` |
 //! | `u/` | SCRAM credentials | `u/{user}/{mechanism:be32}` |
 //! | `w/` | Watermarks | `w/{topic_uuid}/{partition:be32}` |
 //!
@@ -93,8 +94,42 @@ pub(super) struct TopicMetadata {
 }
 
 /// Watermark for a topic partition
+///
+/// `timestamps` is a deprecated field, kept at its original (3rd) position
+/// purely so that decoding legacy (pre-time-index) bytes can be detected: a
+/// postcard decode of this (now 5-field) shape against legacy 3-field bytes
+/// fails, which is the signal `Engine::partition_watermark`/`decode_watermark`
+/// use to fall back to [`WatermarkLegacy`] and (on a write path) backfill the
+/// time index. Nothing writes to `timestamps` any more; the time index lives
+/// in the `t/` keyspace (see [`TimeIndexKey`]), keyed correctly by
+/// `max_timestamp` rather than this field's old (and buggy) `base_timestamp`
+/// keying.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct Watermark {
+    pub low: Option<i64>,
+    pub high: Option<i64>,
+    pub timestamps: Option<BTreeMap<i64, i64>>,
+    /// The greatest `max_timestamp` ever appended to the `t/` time index for
+    /// this partition, via the monotonic "maybeAppend" rule matching Kafka's
+    /// own `TimeIndex` (floored at `NO_TIMESTAMP = -1`, so a negative
+    /// timestamp is never indexed/never advances this). `None` means the
+    /// index holds nothing for this partition: either it is genuinely empty,
+    /// or every batch so far had a `max_timestamp <= -1`.
+    pub latest_indexed_timestamp: Option<i64>,
+    /// The `max_timestamp` header of the most recently appended batch,
+    /// unconditionally (not floored, not gated by the monotonic rule above).
+    /// Lets `ListOffsets(Latest)` answer its timestamp in O(1) from the
+    /// watermark alone, instead of a `batch_base_at_or_before` binary search
+    /// on every call (`ListOffsets(Latest)` is a consumer hot path).
+    pub last_batch_max_timestamp: Option<i64>,
+}
+
+/// The pre-time-index, 3-field shape of [`Watermark`]. A stored watermark
+/// that fails to decode as the current shape is re-parsed as this shape
+/// (ANY decode error, not just a specific error kind: any shape mismatch
+/// means "not the current format"). See [`Watermark`] for why this works.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub(super) struct WatermarkLegacy {
     pub low: Option<i64>,
     pub high: Option<i64>,
     pub timestamps: Option<BTreeMap<i64, i64>>,
@@ -250,6 +285,74 @@ impl BatchKeyPrefix {
     pub(super) fn new(topic: Uuid, partition: Partition) -> Self {
         Self {
             prefix: 'b',
+            topic,
+            partition,
+        }
+    }
+}
+
+/// Key for the time index: `t/{topic_uuid}/{partition:be32}/{max_timestamp:be64}`
+///
+/// Maps a batch's `max_timestamp` to its `base_offset` (the value, a plain
+/// postcard-encoded `i64`). Maintained by the monotonic "maybeAppend" rule
+/// from Kafka's own `TimeIndex`: an entry is appended only when its
+/// `max_timestamp` is strictly greater than every one appended so far for
+/// the partition (see `Engine::append_time_index`). A negative timestamp is
+/// never indexed (floored at Kafka's `NO_TIMESTAMP = -1`): with raw
+/// `fixint::be` two's-complement encoding, a negative i64 sorts AFTER every
+/// positive i64 in byte order, so indexing one would corrupt the ceiling
+/// range-scan that `ListOffsets(Timestamp)` depends on.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub(super) struct TimeIndexKey {
+    /// Type prefix 't' for time index
+    pub prefix: char,
+    /// Topic UUID (16 bytes, fixed)
+    pub topic: Uuid,
+    /// Partition number (big-endian for correct ordering)
+    #[serde(with = "postcard::fixint::be")]
+    pub partition: Partition,
+    /// Batch max_timestamp (big-endian for correct ordering)
+    #[serde(with = "postcard::fixint::be")]
+    pub timestamp: i64,
+}
+
+impl TimeIndexKey {
+    pub(super) fn new(topic: Uuid, partition: Partition, timestamp: i64) -> Self {
+        Self {
+            prefix: 't',
+            topic,
+            partition,
+            timestamp,
+        }
+    }
+
+    /// Create a key for range scan starting from this timestamp
+    pub(super) fn scan_from(topic: Uuid, partition: Partition, timestamp: i64) -> Self {
+        Self::new(topic, partition, timestamp)
+    }
+}
+
+/// Prefix key for scanning all time index entries in a topic partition:
+/// `t/{topic_uuid}/{partition}`
+///
+/// Separate from `TimeIndexKey` for the same reason as `BatchKeyPrefix`: a
+/// scanned key must be checked against this prefix before being decoded as
+/// a full `TimeIndexKey`.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub(super) struct TimeIndexKeyPrefix {
+    /// Type prefix 't' for time index
+    pub prefix: char,
+    /// Topic UUID (16 bytes, fixed)
+    pub topic: Uuid,
+    /// Partition number (big-endian for correct ordering)
+    #[serde(with = "postcard::fixint::be")]
+    pub partition: Partition,
+}
+
+impl TimeIndexKeyPrefix {
+    pub(super) fn new(topic: Uuid, partition: Partition) -> Self {
+        Self {
+            prefix: 't',
             topic,
             partition,
         }
