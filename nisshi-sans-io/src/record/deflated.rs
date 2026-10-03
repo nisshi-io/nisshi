@@ -230,6 +230,30 @@ impl Batch {
     pub fn is_idempotent(&self) -> bool {
         self.producer_id != -1 && self.base_sequence != -1
     }
+
+    /// The CRC-32C of this batch's current contents, as Kafka's own encoder
+    /// would compute it: everything from `attributes` through `record_data`.
+    pub fn computed_crc(&self) -> Result<u32> {
+        CrcData::from(self).crc()
+    }
+
+    /// Whether `crc` matches a CRC computed from this batch's current
+    /// contents.
+    pub fn is_crc_valid(&self) -> Result<bool> {
+        self.computed_crc().map(|computed| computed == self.crc)
+    }
+
+    /// Recomputes `crc` from this batch's current contents.
+    ///
+    /// Anything that mutates a field covered by the CRC after the batch was
+    /// built (for example, rewriting `base_timestamp`/`max_timestamp` for a
+    /// `LogAppendTime` batch) must call this afterwards, or `crc` goes stale
+    /// and a later [`Batch::is_crc_valid`] check, or a client re-decoding the
+    /// stored bytes, sees a corrupted batch.
+    pub fn recompute_crc(&mut self) -> Result<()> {
+        self.crc = self.computed_crc()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1273,6 +1297,70 @@ mod tests {
             assert!(Vec::<Record>::try_from(batch.clone()).is_err());
             assert!(Vec::<Record>::try_from(&batch).is_err());
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn computed_crc_matches_a_freshly_built_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        assert_eq!(batch.crc, batch.computed_crc()?);
+        assert!(batch.is_crc_valid()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn is_crc_valid_detects_a_corrupted_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut batch: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        assert!(batch.is_crc_valid()?);
+
+        // Flip a byte inside the record's own value bytes, not a varint
+        // length prefix elsewhere in `record_data`.
+        let mut record_data = batch.record_data.to_vec();
+        let pos = record_data
+            .windows(LOREM.len())
+            .position(|window| window == LOREM)
+            .expect("value bytes present in record_data");
+        record_data[pos] ^= 0xff;
+        batch.record_data = Bytes::from(record_data);
+
+        assert_ne!(batch.crc, batch.computed_crc()?);
+        assert!(!batch.is_crc_valid()?);
+
+        Ok(())
+    }
+
+    /// Rewriting a field the CRC covers (here `base_timestamp`, the way
+    /// `ProduceService` rewrites it for a `LogAppendTime` batch) must go
+    /// stale without a [`Batch::recompute_crc`] call afterwards, and must
+    /// become valid again once it's made.
+    #[test]
+    fn recompute_crc_fixes_a_rewritten_field() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut batch: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        batch.base_timestamp += 1;
+        assert!(!batch.is_crc_valid()?);
+
+        batch.recompute_crc()?;
+        assert!(batch.is_crc_valid()?);
 
         Ok(())
     }

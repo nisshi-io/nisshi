@@ -26,9 +26,21 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
 
-/// Why a client batch must be rejected with `INVALID_RECORD` before anything
-/// is written, or `None` if it may be stored. Kafka's `LogValidator` rejects
-/// the same batches.
+/// Why a client batch must be rejected before anything is written, as an
+/// `(error_code, reason)` pair, or `None` if it may be stored. Kafka's
+/// `LogValidator` rejects the same batches with the same error codes.
+///
+/// A batch whose stored `crc` doesn't match its contents is checked first
+/// and rejected with `CORRUPT_MESSAGE`, ahead of every other check below.
+/// This matches Kafka's own validation order (`analyzeAndValidateRecords`'s
+/// CRC check runs before `LogValidator.validateBatch`'s header checks in
+/// `UnifiedLog`), and the two error codes aren't interchangeable to a
+/// client: `CORRUPT_MESSAGE` is retriable, `INVALID_RECORD` is not. A batch
+/// that fails the CRC check is exactly the one whose header fields (checked
+/// below) can no longer be trusted, so there's nothing to gain by checking
+/// them first.
+///
+/// Every other rejection below is `INVALID_RECORD`:
 ///
 /// - Only the broker writes control batches (transaction commit/abort
 ///   markers), and those go directly to storage rather than through
@@ -39,19 +51,38 @@ use crate::{Error, Result, Storage, Topition};
 ///   `last_offset_delta` to advance the high watermark, so a mismatch corrupts
 ///   or wedges the partition. `record_count` is an int32 on the wire, so a
 ///   value above `i32::MAX` is rejected too.
-fn rejection(batch: &deflated::Batch) -> Option<&'static str> {
+fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
+    match batch.is_crc_valid() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Some((
+                ErrorCode::CorruptMessage,
+                "batch crc does not match its contents",
+            ));
+        }
+        Err(_) => {
+            return Some((ErrorCode::CorruptMessage, "batch crc could not be computed"));
+        }
+    }
+
     if batch.is_control() {
-        return Some("clients may not write control batches");
+        return Some((
+            ErrorCode::InvalidRecord,
+            "clients may not write control batches",
+        ));
     }
 
     let Ok(record_count) = i32::try_from(batch.record_count) else {
-        return Some("record_count exceeds i32::MAX");
+        return Some((ErrorCode::InvalidRecord, "record_count exceeds i32::MAX"));
     };
 
     if record_count < 1 {
-        Some("batch has no records")
+        Some((ErrorCode::InvalidRecord, "batch has no records"))
     } else if batch.last_offset_delta.checked_add(1) != Some(record_count) {
-        Some("last_offset_delta + 1 does not equal record_count")
+        Some((
+            ErrorCode::InvalidRecord,
+            "last_offset_delta + 1 does not equal record_count",
+        ))
     } else {
         None
     }
@@ -190,22 +221,21 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
-            if let Some((rejected, reason)) = records
-                .batches
-                .iter()
-                .find_map(|batch| rejection(batch).map(|reason| (batch, reason)))
-            {
+            if let Some((rejected, error_code, reason)) = records.batches.iter().find_map(|batch| {
+                rejection(batch).map(|(error_code, reason)| (batch, error_code, reason))
+            }) {
                 warn!(
                     topic = name,
                     partition = partition.index,
                     record_count = rejected.record_count,
                     last_offset_delta = rejected.last_offset_delta,
+                    ?error_code,
                     reason,
                     "rejecting produce batch",
                 );
 
                 return self
-                    .error(partition.index, ErrorCode::InvalidRecord)
+                    .error(partition.index, error_code)
                     .error_message(Some(reason.into()));
             }
 
@@ -225,6 +255,11 @@ where
 
                     batch.base_timestamp = base_timestamp;
                     batch.max_timestamp = base_timestamp;
+
+                    if let Err(err) = batch.recompute_crc() {
+                        error!(?err);
+                        return self.error(partition.index, ErrorCode::UnknownServerError);
+                    }
                 }
 
                 match self

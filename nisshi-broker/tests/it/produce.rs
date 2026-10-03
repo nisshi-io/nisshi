@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
+
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
@@ -21,6 +23,7 @@ use nisshi_broker::Result;
 use nisshi_sans_io::{
     BatchAttribute, CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest,
     IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse, RequestInput,
+    TimestampType,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -33,7 +36,7 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, DeleteTopicsService, InitProducerIdService,
-    ListOffsetsService, ProduceService, Storage,
+    ListOffsetsService, ProduceService, Storage, Topition,
 };
 use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -1307,6 +1310,356 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
     Ok(())
 }
 
+/// A batch whose stored `crc` no longer matches its contents must be
+/// rejected with `CORRUPT_MESSAGE` before anything is written, ahead of
+/// every other check in `rejection()` -- Kafka's own `analyzeAndValidateRecords`
+/// checks CRC before `LogValidator.validateBatch`'s header checks, and the
+/// two error codes aren't interchangeable to a client: `CORRUPT_MESSAGE` is
+/// retriable, `INVALID_RECORD` is not.
+///
+/// The corrupted byte sits inside the record's own value bytes, not in a
+/// varint length prefix. Nothing between `ProduceService::serve` and
+/// `rejection()` decodes `record_data` today, so flipping any byte reaches
+/// the same CRC check, but a length byte is fragile against a future change
+/// that decodes records earlier in the pipeline -- that would turn this into
+/// a decode error instead of `CORRUPT_MESSAGE`, failing the test for the
+/// wrong reason.
+async fn produce_rejects_crc_mismatch(storage: impl Storage + Clone) -> Result<()> {
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let produce = ProduceService {
+        storage: storage.clone(),
+    };
+
+    let list_offsets = ListOffsetsService {
+        storage: storage.clone(),
+    };
+
+    let name = &alphanumeric_string(15)[..];
+
+    let num_partitions = rng().random_range(2..64);
+    let replication_factor = rng().random_range(0..64);
+
+    {
+        let response = create_topic
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(name.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let corrupted_partition = rng().random_range(0..num_partitions);
+    let sibling_partition = (corrupted_partition + 1) % num_partitions;
+
+    // A legitimate batch ahead of the corrupted one in the same partition:
+    // the whole partition must be rejected before anything is written, not
+    // just the offending batch.
+    let legit = inflated::Batch::builder()
+        .record(Record::builder().value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()))
+        .build()
+        .and_then(TryInto::try_into)
+        .inspect(|deflated| debug!(?deflated))?;
+
+    let value = Bytes::from_static(b"consectetur adipiscing elit");
+
+    let corrupted: deflated::Batch = {
+        let mut batch: deflated::Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(value.clone())))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let mut record_data = batch.record_data.to_vec();
+        let pos = record_data
+            .windows(value.len())
+            .position(|window| window == value.as_ref())
+            .expect("value bytes present in record_data");
+        record_data[pos] ^= 0xff;
+        batch.record_data = Bytes::from(record_data);
+
+        batch
+    };
+
+    let sibling = inflated::Batch::builder()
+        .record(Record::builder().value(Bytes::from_static(b"sed do eiusmod tempor").into()))
+        .build()
+        .and_then(TryInto::try_into)
+        .inspect(|deflated| debug!(?deflated))?;
+
+    let response = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(Some(
+                [TopicProduceData::default()
+                    .name(name.into())
+                    .partition_data(Some(
+                        [
+                            PartitionProduceData::default()
+                                .index(corrupted_partition)
+                                .records(Some(Frame {
+                                    batches: vec![legit, corrupted],
+                                })),
+                            PartitionProduceData::default()
+                                .index(sibling_partition)
+                                .records(Some(Frame {
+                                    batches: vec![sibling],
+                                })),
+                        ]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let topics = response.responses.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+    assert_eq!(2, partitions.len());
+
+    // Match the sibling's response by its `index`, not by vector position:
+    // `topic()` does preserve request order today, but this test shouldn't
+    // rely on that implicitly.
+    let corrupted_response = partitions
+        .iter()
+        .find(|partition| partition.index == corrupted_partition)
+        .expect("response for the corrupted partition");
+    assert_eq!(
+        ErrorCode::CorruptMessage,
+        ErrorCode::try_from(corrupted_response.error_code)?
+    );
+    assert_eq!(-1, corrupted_response.base_offset);
+    assert_eq!(
+        Some("batch crc does not match its contents".into()),
+        corrupted_response.error_message
+    );
+
+    let sibling_response = partitions
+        .iter()
+        .find(|partition| partition.index == sibling_partition)
+        .expect("response for the sibling partition");
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(sibling_response.error_code)?
+    );
+    assert_eq!(0, sibling_response.base_offset);
+
+    // Nothing was written to the corrupted partition: the latest offset is
+    // still the topic's initial offset.
+    let latest = {
+        let response = list_offsets
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
+                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                    .topics(Some(
+                        [ListOffsetsTopic::default()
+                            .name(name.into())
+                            .partitions(Some(
+                                [ListOffsetsPartition::default()
+                                    .partition_index(corrupted_partition)
+                                    .timestamp(ListOffset::Latest.try_into()?)]
+                                .into(),
+                            ))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+
+        partitions[0].offset
+    };
+
+    assert_eq!(Some(0), latest);
+
+    // A well-formed produce to the same partition afterwards still lands at
+    // offset 0: the rejected batches consumed nothing.
+    let ordinary = inflated::Batch::builder()
+        .record(Record::builder().value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()))
+        .build()
+        .and_then(TryInto::try_into)
+        .inspect(|deflated| debug!(?deflated))?;
+
+    let response = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(Some(
+                [TopicProduceData::default()
+                    .name(name.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(corrupted_partition)
+                            .records(Some(Frame {
+                                batches: vec![ordinary],
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let topics = response.responses.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(0, partitions[0].base_offset);
+
+    Ok(())
+}
+
+/// A `LogAppendTime` batch has its `base_timestamp`/`max_timestamp`
+/// overwritten by [`ProduceService`] after the stored `crc` already covers
+/// them. The write path must recompute `crc` afterwards, or the batch
+/// written to storage is internally inconsistent: its own `crc` no longer
+/// matches its contents, the same condition `produce_rejects_crc_mismatch`
+/// above rejects on the way in.
+///
+/// Postgres and libSQL (`nisshi-storage-sql/src/pg.rs`,
+/// `nisshi-storage-sql/src/lite.rs`) decode every record on fetch and
+/// rebuild a fresh batch from the stored rows, which recomputes `crc` as a
+/// side effect. So `fetched.computed_crc()? == fetched.crc` passes there with
+/// or without the fix in `ProduceService`; this test is a real regression
+/// test only on `in_memory` and `slatedb`, which persist (and return) the
+/// deflated bytes the broker wrote, unchanged. It still runs on all four
+/// backends for parity with the rest of this file -- a green run on pg/lite
+/// is coverage, not proof.
+async fn produce_rewrites_log_append_time_crc(storage: impl Storage + Clone) -> Result<()> {
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let produce = ProduceService {
+        storage: storage.clone(),
+    };
+
+    let name = &alphanumeric_string(15)[..];
+
+    {
+        let response = create_topic
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(name.into())
+                            .num_partitions(1)
+                            .replication_factor(0)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let index = 0;
+
+    let batch: deflated::Batch = inflated::Batch::builder()
+        .record(Record::builder().value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()))
+        .attributes(
+            BatchAttribute::default()
+                .timestamp(TimestampType::LogAppendTime)
+                .into(),
+        )
+        .build()
+        .and_then(TryInto::try_into)
+        .inspect(|deflated| debug!(?deflated))?;
+
+    let response = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(Some(
+                [TopicProduceData::default()
+                    .name(name.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(index)
+                            .records(Some(Frame {
+                                batches: vec![batch],
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let topics = response.responses.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+
+    let offset = partitions[0].base_offset;
+
+    let topition = Topition::new(name, index);
+
+    let fetched = storage
+        .fetch(
+            &topition,
+            offset,
+            1,
+            1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(500),
+        )
+        .await?;
+
+    assert_eq!(1, fetched.len());
+    assert_eq!(
+        fetched[0].computed_crc()?,
+        fetched[0].crc,
+        "stored batch crc does not match its contents"
+    );
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -1412,6 +1765,34 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::produce_rejects_control_batch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_crc_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_crc_mismatch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_log_append_time_crc() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_log_append_time_crc(storage).await?;
 
         Ok(())
     }
@@ -1525,6 +1906,34 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn produce_rejects_crc_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_crc_mismatch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_log_append_time_crc() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_log_append_time_crc(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -1635,6 +2044,34 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn produce_rejects_crc_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_crc_mismatch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_log_append_time_crc() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_log_append_time_crc(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -1742,6 +2179,34 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::produce_rejects_control_batch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_crc_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_crc_mismatch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_log_append_time_crc() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_log_append_time_crc(storage).await?;
 
         Ok(())
     }
