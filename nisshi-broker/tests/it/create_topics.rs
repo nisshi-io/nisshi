@@ -427,6 +427,104 @@ async fn mixed_batch_partial_success(storage: impl Storage + Clone) -> Result<()
     Ok(())
 }
 
+/// Kafka caps the sum of partitions requested across every topic in one
+/// `CreateTopics` call at 10,000, and rejects the whole request, not just
+/// the offending topic, before any per-topic validation (including the
+/// name check) runs. This pins the boundary using invalid topic names so
+/// neither case has to touch storage: exactly the cap lets the request
+/// through the total-partitions check and on to per-topic validation,
+/// which then rejects both topics for their bad names; one more partition
+/// over the cap is rejected as a whole with `PolicyViolation`, including
+/// the second topic, whose name is otherwise valid.
+async fn total_partitions_cap_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let service = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let replication_factor = 1;
+    let assignments = Some([].into());
+    let configs = Some([].into());
+    let invalid_name = "a/b";
+
+    // Exactly the cap (9,999 + 1 = 10,000): the total-partitions check
+    // lets the request through, so both topics are rejected for their
+    // invalid name instead, proving the cap did not fire here.
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(invalid_name.into())
+                        .num_partitions(9_999)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                    CreatableTopic::default()
+                        .name(invalid_name.into())
+                        .num_partitions(1)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(2, topics.len());
+    for topic in &topics {
+        assert_eq!(
+            ErrorCode::InvalidTopicException,
+            ErrorCode::try_from(topic.error_code)?,
+            "at the cap (10,000 total): expected the request to reach \
+             per-topic validation, not be rejected by the cap itself"
+        );
+    }
+
+    // One more partition over the cap (10,000 + 1 = 10,001): the whole
+    // request is rejected with `PolicyViolation`, including the second
+    // topic, whose name is otherwise valid and would succeed on its own.
+    let valid_name = alphanumeric_string(15);
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(invalid_name.into())
+                        .num_partitions(10_000)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                    CreatableTopic::default()
+                        .name(valid_name.clone())
+                        .num_partitions(1)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments)
+                        .configs(configs),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(2, topics.len());
+    assert_eq!(valid_name, topics[1].name.as_str());
+    for topic in &topics {
+        assert_eq!(Some(NULL_TOPIC_ID), topic.topic_id);
+        assert_eq!(
+            ErrorCode::PolicyViolation,
+            ErrorCode::try_from(topic.error_code)?,
+            "name = {:?}: one partition over the cap must reject the whole request",
+            topic.name
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use nisshi_broker::Result;
@@ -525,6 +623,82 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn total_partitions_cap_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::total_partitions_cap_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    /// Extra confidence beyond `total_partitions_cap_rejected`: exactly the
+    /// cap, split across two topics with valid names, actually creates both
+    /// topics rather than merely reaching per-topic validation. Runs on the
+    /// in-memory backend only -- materializing 10,000 real partitions is
+    /// cheap here, but not worth paying four times over across every
+    /// backend.
+    #[tokio::test]
+    async fn total_partitions_cap_creates_at_the_boundary() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+        let service = CreateTopicsService {
+            storage: storage.clone(),
+        };
+
+        let replication_factor = 1;
+        let assignments = Some([].into());
+        let configs = Some([].into());
+
+        let name_a = alphanumeric_string(15);
+        let name_b = alphanumeric_string(15);
+
+        let response = service
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .topics(Some(vec![
+                        CreatableTopic::default()
+                            .name(name_a.clone())
+                            .num_partitions(9_999)
+                            .replication_factor(replication_factor)
+                            .assignments(assignments.clone())
+                            .configs(configs.clone()),
+                        CreatableTopic::default()
+                            .name(name_b.clone())
+                            .num_partitions(1)
+                            .replication_factor(replication_factor)
+                            .assignments(assignments)
+                            .configs(configs),
+                    ]))
+                    .validate_only(Some(false)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(2, topics.len());
+        for topic in &topics {
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(topic.error_code)?,
+                "name = {:?}: exactly the cap (10,000 total) must succeed",
+                topic.name
+            );
+            assert_ne!(Some(NULL_TOPIC_ID), topic.topic_id);
+        }
 
         Ok(())
     }
@@ -630,6 +804,20 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn total_partitions_cap_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::total_partitions_cap_rejected(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -732,6 +920,20 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn total_partitions_cap_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::total_partitions_cap_rejected(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -831,6 +1033,20 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn total_partitions_cap_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::total_partitions_cap_rejected(storage).await?;
 
         Ok(())
     }

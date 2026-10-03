@@ -42,6 +42,55 @@ fn error_result(
         .configs(Some([].into()))
 }
 
+/// Kafka ships `MAX_PARTITIONS_PER_BATCH = 10_000` hardcoded in every
+/// release (`ReplicationControlManager`, `metadata/.../controller/`), with
+/// no public config to raise or lower it: a request whose topics add up to
+/// more than this many partitions is rejected as a whole, before any
+/// per-topic validation runs (`validateTotalNumberOfPartitions`, called
+/// before the topic-name check; see KAFKA-17870 / apache/kafka#17604).
+/// Kafka trunk has since turned the same number into an *internal*,
+/// undocumented `controller.max.records.per.batch` config (added in
+/// KAFKA-20976 / apache/kafka#23245), but that config caps a different,
+/// broader concept ("metadata records per batch") that nisshi has no
+/// equivalent of, and every shipped release (4.0 through 4.4 at the time
+/// of writing) still hardcodes the 10,000 partition figure with zero
+/// public knob. nisshi mirrors the shipped default as a constant; a CLI
+/// flag can be added later if a deployment ever needs to tune it.
+const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
+
+/// Partitions created for a topic whose `num_partitions` is `-1` (the
+/// "use the broker default" sentinel). Shared between the per-topic
+/// substitution in [`CreateTopicsService::serve`] and
+/// [`total_requested_partitions`], which must count a `-1` topic the same
+/// way the substitution below will.
+const BROKER_DEFAULT_NUM_PARTITIONS: i32 = 3;
+
+/// Sum of partitions this request would create, computed before any
+/// per-topic validation runs. Mirrors Kafka's
+/// `validateTotalNumberOfPartitions`: a topic requesting the broker
+/// default (`-1`) counts as [`BROKER_DEFAULT_NUM_PARTITIONS`]; a topic
+/// whose `num_partitions` is already invalid (`0`, or some other negative
+/// value) counts as zero here, since it will be rejected on its own merits
+/// by the per-topic check further down in `serve`, not double-counted.
+///
+/// Unlike upstream Kafka, this ignores `assignments` (manual partition
+/// placement): every nisshi storage backend sizes a topic from
+/// `num_partitions` alone (`nisshi-storage-dynostore`, `-sql`'s `pg.rs`
+/// and `limbo.rs`, `-slatedb`), so `assignments` can never be used to
+/// create more partitions than `num_partitions` already accounts for.
+fn total_requested_partitions(
+    topics: &[nisshi_sans_io::create_topics_request::CreatableTopic],
+) -> i64 {
+    topics
+        .iter()
+        .map(|topic| match topic.num_partitions {
+            -1 => i64::from(BROKER_DEFAULT_NUM_PARTITIONS),
+            n if n > 0 => i64::from(n),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// A [`Service`] using its [`Storage`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
 /// ```no_run
 /// use rama::Service as _;
@@ -111,6 +160,30 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
+        let requested = input.request.topics.as_deref().unwrap_or(&[]);
+
+        // Reject the whole request, before any per-topic validation or
+        // storage call, when the partitions requested across every topic
+        // exceed Kafka's cap, matching upstream, which throws here before
+        // even checking topic names.
+        if total_requested_partitions(requested) > MAX_PARTITIONS_PER_REQUEST {
+            let topics = requested
+                .iter()
+                .map(|topic| {
+                    error_result(
+                        topic.name.clone(),
+                        Some(topic.num_partitions),
+                        Some(topic.replication_factor),
+                        ErrorCode::PolicyViolation,
+                    )
+                })
+                .collect();
+
+            return Ok(CreateTopicsResponse::default()
+                .topics(Some(topics))
+                .throttle_time_ms(Some(0)));
+        }
+
         let mut topics = vec![];
 
         for mut topic in input.request.topics.unwrap_or_default() {
@@ -118,7 +191,7 @@ where
 
             let num_partitions = Some(match topic.num_partitions {
                 -1 => {
-                    topic.num_partitions = 3;
+                    topic.num_partitions = BROKER_DEFAULT_NUM_PARTITIONS;
                     topic.num_partitions
                 }
                 otherwise => otherwise,
