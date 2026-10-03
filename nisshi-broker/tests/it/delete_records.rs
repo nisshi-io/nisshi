@@ -27,6 +27,7 @@ use nisshi_sans_io::{
 use nisshi_storage::{DeleteRecordsService, FetchService, ListOffsetResponse, Storage, Topition};
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
+use std::time::Duration;
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
@@ -235,6 +236,118 @@ where
     assert_eq!(
         record_count - cutoff,
         fetch_record_count(&sc, &topition, cutoff).await?
+    );
+
+    Ok(())
+}
+
+/// A cutoff that falls strictly inside a multi-record batch's range must
+/// not take the whole batch with it.
+///
+/// Every other scenario in this file produces single-record batches, so a
+/// cutoff always lands exactly on a batch boundary. Here one batch holds
+/// four records (offsets 0..=3) and the cutoff is 2: strictly above the
+/// batch's base offset (0) and strictly below its end offset (3). The
+/// correct rule deletes a batch only once its *end* offset is below the
+/// cutoff; a backend that instead checks only a batch's *start* offset
+/// would delete this whole batch -- including offsets 2 and 3, which must
+/// still be visible -- because its base (0) is below the cutoff (2).
+///
+/// A second, standalone record follows the batch so the straddled batch is
+/// never the active segment: this test is purely about the end-vs-start
+/// deletion rule, independent of the `high_watermark - 1` guard covered by
+/// `delete_to_high_watermark_keeps_latest`.
+pub async fn delete_offset_inside_a_batch_keeps_the_whole_batch<G>(
+    cluster_id: Uuid,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name = create_topic(&sc, 1).await?;
+    let topition = Topition::new(topic_name.clone(), 0);
+
+    let batch_record_count = 4i32;
+
+    let mut builder = inflated::Batch::builder().last_offset_delta(batch_record_count - 1);
+
+    for delta in 0..batch_record_count {
+        builder = builder.record(
+            Record::builder()
+                .offset_delta(delta)
+                .value(Some(Bytes::from(format!("record-{delta}")))),
+        );
+    }
+
+    let batch = builder.build().and_then(TryInto::try_into)?;
+    _ = sc.produce(None, &topition, batch).await?;
+
+    // A standalone record at offset 4, after the batch.
+    _ = produce_one(&sc, &topition).await?;
+
+    let record_count = i64::from(batch_record_count) + 1;
+    let cutoff = 2;
+
+    let result = delete_records_partition(&sc, &topic_name, 0, cutoff).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(result.error_code)?);
+    assert_eq!(cutoff, result.low_watermark);
+
+    let stage = sc.offset_stage(&topition).await?;
+    assert_eq!(cutoff, stage.log_start());
+    assert_eq!(record_count, stage.high_watermark());
+
+    // Every record at or after the cutoff must still be reachable, in
+    // order and without gaps. Fetching at an offset that falls inside a
+    // batch returns that batch whole (the client skips the records below
+    // the fetch offset) -- so on a batch-granular backend this legitimately
+    // hands back offsets 0 and 1 too, folded in with the batch that
+    // survived them. What it must never do is lose offsets 2 or 3: a
+    // start-based mutant deletes this whole batch merely because it
+    // *starts* (at 0) before the cutoff, which would leave only the
+    // standalone record at offset 4 -- a gap this loop catches.
+    let batches = sc
+        .fetch(
+            &topition,
+            cutoff,
+            1,
+            50 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(500),
+        )
+        .await?
+        .into_iter()
+        .try_fold(Vec::new(), |mut acc, batch| {
+            inflated::Batch::try_from(batch)
+                .map(|inflated| {
+                    acc.push(inflated);
+                    acc
+                })
+                .map_err(nisshi_broker::Error::from)
+        })?;
+
+    let mut expected = cutoff;
+
+    for batch in &batches {
+        for record in &batch.records {
+            let offset = batch.base_offset + i64::from(record.offset_delta);
+
+            // a whole batch can begin before the fetch offset on a
+            // batch-granular backend: the client skips the records below it
+            if offset < cutoff {
+                continue;
+            }
+
+            assert_eq!(expected, offset, "fetch at cutoff {cutoff}");
+            expected += 1;
+        }
+    }
+
+    assert_eq!(
+        record_count, expected,
+        "fetch at cutoff {cutoff} is missing records"
     );
 
     Ok(())
@@ -518,6 +631,19 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn delete_offset_inside_a_batch_keeps_the_whole_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_offset_inside_a_batch_keeps_the_whole_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn delete_to_high_watermark_keeps_latest() -> Result<()> {
         let _guard = init_tracing()?;
         let cluster_id = Uuid::now_v7();
@@ -608,6 +734,19 @@ mod in_memory {
         let cluster_id = Uuid::now_v7();
         let broker_id = rng().random_range(0..i32::MAX);
         super::delete_up_to_offset(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_offset_inside_a_batch_keeps_the_whole_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_offset_inside_a_batch_keeps_the_whole_batch(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -714,6 +853,19 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn delete_offset_inside_a_batch_keeps_the_whole_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_offset_inside_a_batch_keeps_the_whole_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn delete_to_high_watermark_keeps_latest() -> Result<()> {
         let _guard = init_tracing()?;
         let cluster_id = Uuid::now_v7();
@@ -804,6 +956,19 @@ mod slatedb {
         let cluster_id = Uuid::now_v7();
         let broker_id = rng().random_range(0..i32::MAX);
         super::delete_up_to_offset(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_offset_inside_a_batch_keeps_the_whole_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_offset_inside_a_batch_keeps_the_whole_batch(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
