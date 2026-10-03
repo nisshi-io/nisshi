@@ -14,7 +14,7 @@
 
 use nisshi_sans_io::{
     ApiKey, ErrorCode, MetadataRequest, MetadataResponse, RequestInput,
-    create_topics_request::CreatableTopic,
+    create_topics_request::CreatableTopic, topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::{debug, error, instrument};
@@ -72,18 +72,6 @@ pub struct MetadataService<G> {
 /// `num.partitions` that the Apache Kafka client test suites assume.
 const AUTO_CREATE_NUM_PARTITIONS: i32 = 4;
 const AUTO_CREATE_REPLICATION_FACTOR: i16 = 1;
-
-/// The Apache Kafka topic name rules: 1 to 249 characters from
-/// `[a-zA-Z0-9._-]`, and not "." or "..".
-pub(super) fn is_valid_topic_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name.len() <= 249
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
-}
 
 impl<G> ApiKey for MetadataService<G> {
     const KEY: i16 = MetadataRequest::KEY;
