@@ -66,7 +66,7 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
 
     let timeout = 5_000;
     let num_partitions = 6;
-    let replication_factor = 0;
+    let replication_factor = 1;
 
     let extensions = Extensions::default();
 

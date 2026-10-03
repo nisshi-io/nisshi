@@ -158,6 +158,18 @@ where
                 continue;
             }
 
+            // -1 (broker default) was already replaced above, so anything
+            // below 1 is invalid.
+            if replication_factor.is_some_and(|factor| factor < 1) {
+                topics.push(error_result(
+                    name,
+                    num_partitions,
+                    replication_factor,
+                    ErrorCode::InvalidReplicationFactor,
+                ));
+                continue;
+            }
+
             match self
                 .storage
                 .create_topic(topic, input.request.validate_only.unwrap_or_default())
