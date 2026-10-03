@@ -4109,12 +4109,21 @@ impl Storage for Delegate {
                     .await
                     .inspect_err(|err| error!(?err, group_id))?
                 {
-                    let current = row
-                        .get_str(1)
+                    // A group row with no detail row (e.g. a group that only ever
+                    // committed offsets, never a JoinGroup) joins to a NULL
+                    // `detail` column here: that group exists and is empty, not
+                    // an error.
+                    let current = match row
+                        .get::<Option<String>>(1)
                         .map_err(Error::from)
-                        .and_then(|s| serde_json::from_str::<GroupDetail>(s).map_err(Into::into))
-                        .inspect(|current| debug!(?current))
-                        .inspect_err(|err| error!(?err, group_id))?;
+                        .inspect_err(|err| error!(?err, group_id))?
+                    {
+                        Some(s) => serde_json::from_str::<GroupDetail>(&s)
+                            .map_err(Error::from)
+                            .inspect(|current| debug!(?current))
+                            .inspect_err(|err| error!(?err, group_id))?,
+                        None => GroupDetail::default(),
+                    };
 
                     results.push(NamedGroupDetail::found(group_id.into(), current));
                 } else {

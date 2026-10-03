@@ -18,15 +18,22 @@ use glob::glob;
 use nisshi_broker::{
     Error, Result,
     coordinator::group::{Coordinator, administrator::Controller},
+    service::coordinator::services,
 };
 use nisshi_sans_io::{
-    ErrorCode, HeartbeatResponse, JoinGroupResponse, LeaveGroupResponse, OffsetFetchResponse,
-    SyncGroupResponse, join_group_request::JoinGroupRequestProtocol,
-    join_group_response::JoinGroupResponseMember, leave_group_request::MemberIdentity,
-    offset_fetch_request::OffsetFetchRequestTopic, sync_group_request::SyncGroupRequestAssignment,
+    Body, ErrorCode, HeartbeatResponse, JoinGroupResponse, LeaveGroupResponse, MetadataResponse,
+    OffsetFetchResponse, SyncGroupResponse,
+    join_group_request::JoinGroupRequestProtocol,
+    join_group_response::JoinGroupResponseMember,
+    leave_group_request::MemberIdentity,
+    metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
+    offset_fetch_request::OffsetFetchRequestTopic,
+    sync_group_request::SyncGroupRequestAssignment,
 };
 use nisshi_schema::Registry;
+use nisshi_service::{BytesFrameLayer, ConsumerGroupLayer, FrameBytesLayer, FrameRouteService};
 use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
+use rama::{Layer as _, Service};
 use rand::{
     distr::{Alphanumeric, StandardUniform},
     prelude::*,
@@ -587,4 +594,77 @@ pub(crate) async fn register_broker(
     sc.register_broker(broker_registration)
         .await
         .map_err(Into::into)
+}
+
+async fn serve<S>(service: &S, input: Option<Body>) -> anyhow::Result<Body>
+where
+    S: Service<Option<Body>, Output = Body>,
+    S::Error: Into<anyhow::Error>,
+{
+    service.serve(input).await.map_err(Into::into)
+}
+
+/// A group with one member, formed through a coordinator: member id required,
+/// join, sync.
+pub(crate) struct Formed {
+    pub group: String,
+    pub generation_id: i32,
+    pub member_id: String,
+}
+
+pub(crate) async fn form_group<S>(coordinator: &Controller<S>) -> anyhow::Result<Formed>
+where
+    S: Storage + Clone,
+{
+    use anyhow::anyhow;
+
+    let group = alphanumeric_string(15);
+
+    let metadata = MetadataResponse::default().topics(Some(vec![
+        MetadataResponseTopic::default()
+            .name(Some("t".into()))
+            .partitions(Some(
+                (0..3)
+                    .map(|partition_index| {
+                        MetadataResponsePartition::default().partition_index(partition_index)
+                    })
+                    .collect(),
+            )),
+    ]));
+
+    let route = services(FrameRouteService::<Error>::builder(), coordinator.clone())
+        .and_then(|builder| builder.build().map_err(Into::into))?;
+
+    let consumer = (
+        ConsumerGroupLayer::new(group.clone(), ["t"], metadata),
+        FrameBytesLayer,
+        BytesFrameLayer::default(),
+    )
+        .into_layer(route);
+
+    // join (member id required), join, sync: a formed group with one member
+    //
+    let member_id_required = serve(&consumer, None).await?;
+    let joined = serve(&consumer, Some(member_id_required)).await?;
+
+    let Body::JoinGroupResponse(JoinGroupResponse {
+        error_code,
+        generation_id,
+        ref member_id,
+        ..
+    }) = joined
+    else {
+        return Err(anyhow!("expecting join response: {joined:?}"));
+    };
+    assert_eq!(i16::from(ErrorCode::None), error_code);
+    let member_id = member_id.clone();
+
+    let synced = serve(&consumer, Some(joined)).await?;
+    assert!(matches!(synced, Body::SyncGroupResponse(_)), "{synced:?}");
+
+    Ok(Formed {
+        group,
+        generation_id,
+        member_id,
+    })
 }

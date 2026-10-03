@@ -25,8 +25,9 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use nisshi_sans_io::{
-    Body, ErrorCode,
+    Body, DeleteGroupsResponse, ErrorCode,
     consumer::{MemberAssignment, MemberMetadata},
+    delete_groups_response::DeletableGroupResult,
     heartbeat_response::HeartbeatResponse,
     join_group_request::JoinGroupRequestProtocol,
     join_group_response::{JoinGroupResponse, JoinGroupResponseMember},
@@ -44,8 +45,8 @@ use nisshi_sans_io::{
     sync_group_response::SyncGroupResponse,
 };
 use nisshi_storage::{
-    GroupDetail, GroupMember, GroupState, OffsetCommitRequest, Storage, Topition, UpdateError,
-    Version,
+    GroupDetail, GroupDetailResponse, GroupMember, GroupState, OffsetCommitRequest, Storage,
+    Topition, UpdateError, Version,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::time::{Duration, sleep};
@@ -1458,6 +1459,94 @@ where
                 }
             }
         }
+    }
+
+    /// Deletes every named group that has no members and no rebalance in
+    /// progress, refusing the rest with `NON_EMPTY_GROUP`.
+    ///
+    /// Checking a group's cached wrapper out of `wrappers` for the duration
+    /// of this call (same as `join`/`sync`/`heartbeat`/`leave` already do)
+    /// serializes this against a concurrent request for the same group on
+    /// this broker: a `join`/`sync`/`heartbeat`/`leave` that lands while a
+    /// group is being considered here sees a cache miss and self-heals via
+    /// the usual `UpdateError::Outdated` retry path, the same way a cache
+    /// miss after a restart already does (see `group_cache_miss.rs`). A
+    /// group deleted here is deliberately not reinserted into the cache:
+    /// nothing should resurrect it from a stale cached version on the next
+    /// heartbeat for it.
+    #[instrument(skip(self))]
+    async fn delete_groups(&self, group_ids: &[String]) -> Result<Body> {
+        debug!(?group_ids);
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "delete_groups")]);
+
+        let mut results = Vec::with_capacity(group_ids.len());
+        let mut deletable = Vec::with_capacity(group_ids.len());
+
+        for group_id in group_ids {
+            let now = SystemTime::now();
+
+            let cached = self
+                .wrappers
+                .lock()
+                .map(|mut wrappers| wrappers.remove(group_id))?;
+
+            let checked_out = match cached {
+                Some(cached) => Some(cached),
+
+                // Nothing cached for this group on this broker (never
+                // joined here, or a cache miss after a restart): fall back
+                // to whatever is actually stored.
+                None => self
+                    .storage
+                    .describe_groups(Some(std::slice::from_ref(group_id)), false)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .and_then(|named| match named.response {
+                        GroupDetailResponse::Found(detail) => Some((
+                            Wrapper::with_storage_group_detail(self.storage.clone(), detail),
+                            None,
+                        )),
+                        GroupDetailResponse::ErrorCode(_) => None,
+                    }),
+            };
+
+            match checked_out {
+                // No group_detail anywhere for this id (never joined, never
+                // committed an offset): nothing to check here, let
+                // `Storage::delete_groups` answer `GroupIdNotFound` /
+                // `InvalidGroupId` exactly as it does today.
+                None => deletable.push(group_id.to_owned()),
+
+                Some((wrapper, version)) => {
+                    let wrapper = wrapper.missed_heartbeat(group_id, "", now);
+
+                    if wrapper.members().is_empty() {
+                        deletable.push(group_id.to_owned());
+                    } else {
+                        _ = self.wrappers.lock().map(|mut wrappers| {
+                            wrappers.insert(group_id.to_owned(), (wrapper, version))
+                        })?;
+
+                        results.push(
+                            DeletableGroupResult::default()
+                                .group_id(group_id.to_owned())
+                                .error_code(ErrorCode::NonEmptyGroup.into()),
+                        );
+                    }
+                }
+            }
+        }
+
+        if !deletable.is_empty() {
+            results.extend(self.storage.delete_groups(Some(&deletable)).await?);
+        }
+
+        Ok(Body::DeleteGroupsResponse(
+            DeleteGroupsResponse::default()
+                .throttle_time_ms(0)
+                .results(Some(results)),
+        ))
     }
 }
 
