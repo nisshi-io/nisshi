@@ -35,6 +35,17 @@ use tracing::{debug, instrument};
 /// it just grows the buffer past this point as elements are pushed.
 pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 
+/// The smallest a real, wire-encoded [`crate::record::Record`] can be: a
+/// 1-byte length prefix, a 1-byte attributes field, 1-byte (zero-valued)
+/// varints for the timestamp and offset deltas, and 1-byte null-sentinel
+/// varints for the key, value, and header count. `Record::builder().build()`
+/// with no key, value, or headers encodes to exactly 7 bytes, confirming
+/// this against the real encoder rather than Kafka's own
+/// `DefaultRecord`/`DefaultRecordBatch` source, which has no equivalent
+/// constant (it streams records lazily rather than bounding a count
+/// against it up front).
+pub(crate) const MIN_ENCODED_RECORD_SIZE: usize = 7;
+
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Octets(pub Option<Bytes>);
 
@@ -306,6 +317,17 @@ where
         let length = VarInt::decode(encoded)
             .and_then(|length| usize::try_from(length.0).map_err(|_| Error::Overflow))
             .inspect(|length| debug!(length))?;
+
+        // Matches Kafka's own bound in `DefaultRecord.readFrom`
+        // (`numHeaders > buffer.remaining()`): a real element needs at
+        // least one byte to encode, so a count that exceeds the bytes
+        // actually left can never be satisfied without reading past this
+        // buffer's true end. Deliberately undivided -- a record can pack
+        // several null/null headers into very few bytes each, so dividing
+        // by anything larger than 1 here would reject real, valid batches.
+        if length > encoded.len() {
+            return Err(Error::Overflow);
+        }
 
         let mut items = Vec::with_capacity(length.min(MAX_PREALLOCATED_ELEMENTS));
         for _ in 0..length {
