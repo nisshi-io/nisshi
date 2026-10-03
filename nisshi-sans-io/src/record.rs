@@ -153,7 +153,7 @@ pub mod header;
 pub mod inflated;
 
 use crate::{
-    ByteSize, Decode, Encode, Result,
+    ByteSize, Decode, Encode, Error, Result,
     primitive::varint::{LongVarInt, VarInt},
 };
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
@@ -256,13 +256,32 @@ impl Decode for Record {
     fn decode(encoded: &mut Bytes) -> Result<Self> {
         debug!(encoded = ?encoded[..]);
 
-        let length = VarInt::decode(encoded).map(Into::into)?;
-        let attributes = encoded.try_get_u8()?;
-        let timestamp_delta = LongVarInt::decode(encoded).map(Into::into)?;
-        let offset_delta = VarInt::decode(encoded).map(Into::into)?;
-        let key = Octets::decode(encoded).map(Into::into)?;
-        let value = Octets::decode(encoded).map(Into::into)?;
-        let headers = VarIntSequence::decode(encoded).map(Into::into)?;
+        let length: i32 = VarInt::decode(encoded).map(Into::into)?;
+
+        // `length` bounds everything that follows it in this record
+        // (attributes through headers). Scope every subsequent read to
+        // exactly that many bytes, split off the front of `encoded`, so a
+        // corrupt or adversarial length can never read into the next
+        // record's bytes: a header/key/value count that claims too little
+        // leaves `body` non-empty afterward, one that claims too much runs
+        // `body` dry -- both fail here, at this record's true boundary,
+        // instead of bleeding into whatever is next in the batch.
+        let body_len = usize::try_from(length).map_err(|_| Error::Overflow)?;
+        if body_len > encoded.len() {
+            return Err(Error::Overflow);
+        }
+        let mut body = encoded.split_to(body_len);
+
+        let attributes = body.try_get_u8()?;
+        let timestamp_delta = LongVarInt::decode(&mut body).map(Into::into)?;
+        let offset_delta = VarInt::decode(&mut body).map(Into::into)?;
+        let key = Octets::decode(&mut body).map(Into::into)?;
+        let value = Octets::decode(&mut body).map(Into::into)?;
+        let headers = VarIntSequence::decode(&mut body).map(Into::into)?;
+
+        if !body.is_empty() {
+            return Err(Error::Overflow);
+        }
 
         Ok(Self {
             length,
@@ -578,6 +597,67 @@ mod tests {
         ]);
 
         assert_eq!(1_126_819_645, digester.finalize());
+
+        Ok(())
+    }
+
+    /// A declared record length with no room left for the key payload its
+    /// own key-length byte claims: body = [attributes=0, timestamp_delta=0,
+    /// offset_delta=0, key_length=5], declared length 4 -- exactly enough
+    /// for those four bytes and nothing more. Without a length-prefix
+    /// bound, `Octets::decode` would read the 5 "key" bytes from whatever
+    /// follows in the wider buffer (here, deliberately distinct filler)
+    /// instead of failing at this record's true boundary.
+    #[test]
+    fn decode_length_shorter_than_fields_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(4).encode()?); // declared length: body only
+        encoded.put_u8(0); // attributes
+        encoded.put(LongVarInt(0).encode()?); // timestamp_delta
+        encoded.put(VarInt(0).encode()?); // offset_delta
+        encoded.put(VarInt(5).encode()?); // key length: claims 5 bytes
+
+        // Filler that belongs to no record. A pre-fix decode has enough
+        // bytes left in the *whole* buffer to read this as the key,
+        // reaching across this record's declared boundary.
+        encoded.put_slice(&[0u8; 10]);
+
+        let mut encoded = encoded.freeze();
+
+        let err = Record::decode(&mut encoded)
+            .expect_err("a key length outrunning the declared record length must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// A declared record length one byte longer than the fields it
+    /// actually contains: a fully empty record body is 6 bytes (attributes,
+    /// zero timestamp/offset deltas, null key, null value, zero headers),
+    /// but this record declares 7, with one padding byte tacked on inside
+    /// its own declared span. Honoring the length prefix means that extra
+    /// byte is detected, not silently folded into the next record's bytes.
+    #[test]
+    fn decode_length_longer_than_fields_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(7).encode()?); // declared length: one byte too many
+        encoded.put_u8(0); // attributes
+        encoded.put(LongVarInt(0).encode()?); // timestamp_delta
+        encoded.put(VarInt(0).encode()?); // offset_delta
+        encoded.put(VarInt(-1).encode()?); // null key
+        encoded.put(VarInt(-1).encode()?); // null value
+        encoded.put(VarInt(0).encode()?); // header count: 0
+        encoded.put_u8(0xFF); // padding inside the declared length
+
+        let mut encoded = encoded.freeze();
+
+        let err = Record::decode(&mut encoded)
+            .expect_err("a declared length longer than the record's fields must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
 
         Ok(())
     }

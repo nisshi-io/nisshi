@@ -33,7 +33,7 @@ use crate::{
         Header, Record,
         codec::{
             DecodeBudget, MAX_DECODED_BATCH_BYTES, MAX_PREALLOCATED_ELEMENTS,
-            exceeds_decoded_batch_limit,
+            MIN_ENCODED_RECORD_SIZE, exceeds_decoded_batch_limit,
         },
     },
 };
@@ -466,16 +466,26 @@ impl TryFrom<Batch> for Vec<Record> {
         debug!(?record_count);
         debug!(?batch.record_data);
 
+        let uncompressed = batch
+            .compression()
+            .is_ok_and(|compression| compression == Compression::None);
+
+        // On the uncompressed path `record_data` is the byte stream the
+        // records are decoded from, and no record encodes in fewer than
+        // `MIN_ENCODED_RECORD_SIZE` bytes, so a larger `record_count` means
+        // the batch is corrupt. This runs ahead of the decoded-size check so
+        // that such a batch is reported as corrupt, not as too large.
+        if uncompressed && record_count > batch.record_data.len() / MIN_ENCODED_RECORD_SIZE {
+            return Err(Error::Overflow);
+        }
+
         if batch.exceeds_decoded_record_count_limit() {
             return Err(Error::MessageMaxSizeExceeded(
                 record_count.saturating_mul(size_of::<Record>()),
             ));
         }
 
-        if batch
-            .compression()
-            .is_ok_and(|compression| compression == Compression::None)
-        {
+        if uncompressed {
             let mut budget = DecodeBudget::new(MAX_DECODED_BATCH_BYTES);
             let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
@@ -1566,6 +1576,60 @@ mod tests {
             assert!(Vec::<Record>::try_from(batch.clone()).is_err());
             assert!(Vec::<Record>::try_from(&batch).is_err());
         }
+
+        Ok(())
+    }
+
+    /// Before the length-prefix fix, a header count that outruns this
+    /// record's own declared length reads into whatever bytes happen to
+    /// follow it in the batch -- here, two bytes that belong to no record
+    /// at all -- instead of failing at the true per-record boundary.
+    /// `record_count: 1` so only this one record's own `Record::decode`
+    /// call is exercised (the uncompressed by-value path).
+    #[test]
+    fn header_count_reads_past_record_boundary_is_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // record: length=6, body=[attributes=0, timestamp_delta=0,
+        // offset_delta=0, null key, null value, header_count=1], followed
+        // by two bytes that belong to no record -- a phantom null/null
+        // header a pre-fix decode would happily consume as this record's
+        // one declared header.
+        let record_data = Bytes::from_static(&[12, 0, 0, 0, 1, 1, 2, 1, 1]);
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 1,
+            record_data,
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a header count outrunning this record's declared length must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// `record_count` claims more records than the 10 bytes of
+    /// `record_data` present could possibly hold -- every real record is
+    /// at least `MIN_ENCODED_RECORD_SIZE` bytes -- and must be rejected
+    /// before any decode is attempted.
+    #[test]
+    fn record_count_inconsistent_with_remaining_data_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 5,
+            record_data: Bytes::from_static(&[0u8; 10]),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch).expect_err(
+            "a record_count inconsistent with the remaining record_data must be rejected",
+        );
+        assert!(matches!(err, Error::Overflow), "{err:?}");
 
         Ok(())
     }
