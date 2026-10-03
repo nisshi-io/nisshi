@@ -1272,6 +1272,21 @@ mod cleanup_policy {
             .unwrap();
         assert_eq!(Some(2), responses[0].1.offset);
 
+        // The partition is now fully empty (log_start == high_watermark):
+        // Latest's cached `last_batch_max_timestamp` fast path must have
+        // been cleared along with it, not keep answering with the pruned
+        // batch's stale timestamp (SOL-155074 review round 1 required
+        // change 3).
+        let responses = engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), ListOffset::Latest)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(Some(2), responses[0].1.offset);
+        assert!(responses[0].1.timestamp.is_none());
+
         // The next produce continues from the high watermark
         let offset = engine
             .produce(None, &topition, keyed_batch(b"a", b"three", None))
@@ -1624,6 +1639,82 @@ mod time_index {
         assert_eq!(110, millis_since_epoch(response.timestamp.unwrap()));
     }
 
+    /// Discriminates the real full-rebuild-from-survivors logic (change D)
+    /// from a naive per-entry prune (delete the `t/` entries whose
+    /// `base_offset` is in the removed set). `compaction_rebuild_finds_correct_entry_after_removal`
+    /// above does NOT discriminate this: its removed batch happens to sit
+    /// at the head of the index, so rule C's "nothing indexed below
+    /// target -> start at low" masks the gap either way. This scenario
+    /// removes an entry from the MIDDLE of the index instead, which a
+    /// naive prune answers wrong and the real rebuild answers right
+    /// (reviewer-confirmed repro, SOL-155074 review round 1).
+    #[tokio::test]
+    async fn compaction_rebuild_depends_on_full_replay_not_naive_prune() {
+        let engine = create_test_engine().await;
+        let topition = topic_with_policy(
+            &engine,
+            "time-index-compact-naive-prune-gap",
+            &[("cleanup.policy", "compact")],
+        )
+        .await;
+
+        // offset0: key "a", ts=100 -> indexed 100->0.
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"a", b"v", 100))
+            .await
+            .unwrap();
+        // offset1: key "b", ts=150 -> indexed 150->1. Superseded below by
+        // offset4 (same key "b" again), so compaction removes this batch.
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"b", b"v1", 150))
+            .await
+            .unwrap();
+        // offset2: key "c", ts=140 -> 140<=150, NOT indexed under the
+        // pre-compaction index. This is the entry a naive prune can never
+        // recover, because nothing ever named it in the first place.
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"c", b"v", 140))
+            .await
+            .unwrap();
+        // offset3: key "d", ts=200 -> indexed 200->3.
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"d", b"v", 200))
+            .await
+            .unwrap();
+        // offset4: key "b" again, ts=210 -> indexed 210->4; supersedes
+        // offset1's record.
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"b", b"v2", 210))
+            .await
+            .unwrap();
+
+        engine.maintain(SystemTime::now()).await.unwrap();
+
+        // offset1 (the superseded "b") is gone; offset0, offset2, offset3,
+        // offset4 survive.
+        assert!(
+            fetch_all(&engine, &topition)
+                .await
+                .iter()
+                .all(|batch| batch.base_offset != 1)
+        );
+
+        // Real code (full replay over survivors) rebuilds the index as
+        // {100->0, 140->2, 200->3, 210->4} and a query for 120 correctly
+        // answers offset2@140.
+        //
+        // A naive per-entry prune, by contrast, would only delete the
+        // entry naming the removed base_offset (1, i.e. 150->1) from the
+        // PRE-compaction index {100->0, 150->1, 200->3, 210->4}, leaving
+        // {100->0, 200->3, 210->4} - which has no entry for offset2 at
+        // all, so a query for 120 wrongly lands on the ceiling entry
+        // 200->3 and answers offset3@200 instead.
+        let response = list_offsets_timestamp(&engine, &topition, 120).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(2), response.offset);
+        assert_eq!(140, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
     #[tokio::test]
     async fn compaction_stale_header_does_not_cause_false_match() {
         let engine = create_test_engine().await;
@@ -1732,7 +1823,10 @@ mod time_index {
         // Seed two real batches directly into the `b/` keyspace, bypassing
         // produce() entirely, to simulate data written before this
         // feature existed: no time index was ever maintained for it.
-        for (offset, timestamp) in [(0i64, 100i64), (1, 200)] {
+        // offset1's timestamp (300) is deliberately HIGHER than the
+        // post-migration produce below (250): this is what makes the
+        // scenario discriminating (see the final query's comment).
+        for (offset, timestamp) in [(0i64, 100i64), (1, 300)] {
             let batch: Batch = inflated::Batch::builder()
                 .record(
                     Record::builder()
@@ -1777,23 +1871,36 @@ mod time_index {
         let response = list_offsets_timestamp(&engine, &topition, 150).await;
         assert_eq!(ErrorCode::None, response.error_code);
         assert_eq!(Some(1), response.offset);
-        assert_eq!(200, millis_since_epoch(response.timestamp.unwrap()));
+        assert_eq!(300, millis_since_epoch(response.timestamp.unwrap()));
 
-        // A write now backfills the index from the b/ batch headers.
+        // A write (the cold-start migration trigger) appends a THIRD batch
+        // at offset2, timestamp=250 - lower than the legacy offset1's 300.
         let _ = engine
             .produce(None, &topition, keyed_batch(b"a", b"v", 250))
             .await
             .unwrap();
 
-        // The same lookup must still give the correct answer, now via the
-        // freshly backfilled index.
-        let response = list_offsets_timestamp(&engine, &topition, 150).await;
+        // Both legacy batches must have been backfilled as real `t/`
+        // entries (100->0, 300->1), not just the new produce's own
+        // (250->2, which the monotonic rule doesn't even index, since
+        // 250 <= the backfilled 300). Without backfill this count would be
+        // 1 (only the new produce's entry).
+        assert_eq!(2, time_index_count(&engine, topic, 0).await);
+
+        // The discriminating check: query a timestamp (280) that is
+        // beyond the new produce's own timestamp (250) but still covered
+        // by backfilled legacy data (offset1@300). Without backfill,
+        // `latest_indexed_timestamp` would only reflect the new produce
+        // (250), and rule 1's O(1) shortcut (`target > latest_indexed`)
+        // would wrongly answer "no match" for 280 even though offset1@300
+        // is real, present data.
+        let response = list_offsets_timestamp(&engine, &topition, 280).await;
         assert_eq!(ErrorCode::None, response.error_code);
         assert_eq!(Some(1), response.offset);
-        assert_eq!(200, millis_since_epoch(response.timestamp.unwrap()));
+        assert_eq!(300, millis_since_epoch(response.timestamp.unwrap()));
 
         let watermark = watermark_of(&engine, topic, 0).await;
-        assert_eq!(Some(250), watermark.latest_indexed_timestamp);
+        assert_eq!(Some(300), watermark.latest_indexed_timestamp);
     }
 
     #[tokio::test]
@@ -1825,6 +1932,156 @@ mod time_index {
 
         assert_eq!(0, time_index_count(&engine, topic1, 0).await);
         assert_eq!(1, time_index_count(&engine, topic2, 0).await);
+    }
+
+    async fn list_offsets_latest(engine: &Engine, topition: &Topition) -> ListOffsetResponse {
+        engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), ListOffset::Latest)],
+            )
+            .await
+            .unwrap()
+            .remove(0)
+            .1
+    }
+
+    #[tokio::test]
+    async fn latest_timestamp_cleared_after_delete_records_empties_partition() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-latest-empty").await;
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"a", b"v", 1000))
+            .await
+            .unwrap();
+
+        let delete_request = vec![
+            DeleteRecordsTopic::default()
+                .name("time-index-latest-empty".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(1),
+                ])),
+        ];
+        let _ = engine.delete_records(&delete_request).await.unwrap();
+
+        // The partition is now fully empty (low == high == 1).
+        // `last_batch_max_timestamp` was set to 1000 by the original
+        // produce and is never touched by `append_time_index` again, so
+        // without clearing it on full-prune it would keep answering
+        // Latest with the pruned batch's stale timestamp. On `main`
+        // (before this change's map-based watermark), Latest naturally
+        // answered `None` here because the map emptied along with the
+        // data - this must match (SOL-155074 review round 1 required
+        // change 3).
+        let response = list_offsets_latest(&engine, &topition).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(1), response.offset);
+        assert!(response.timestamp.is_none());
+    }
+
+    /// The ticket's own worked example (SOL-155074), as a real regression
+    /// test: 5 batches of 10 records each, with out-of-order/overlapping
+    /// timestamps across batches, exercising the ceiling-then-scan lookup
+    /// and the post-`delete_records` behavior together.
+    #[tokio::test]
+    async fn ticket_worked_example() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-ticket-example").await;
+
+        // B0: offsets 0-9, timestamps 91-100.
+        // B1: offsets 10-19, timestamps 91-100 (same range as B0).
+        // B2: offsets 20-29, timestamps 71-80 (earlier than B0/B1).
+        // B3: offsets 30-39, timestamps 141-150.
+        // B4: offsets 40-49, timestamps 111-120.
+        let batches: [[i64; 10]; 5] = [
+            [91, 92, 93, 94, 95, 96, 97, 98, 99, 100],
+            [91, 92, 93, 94, 95, 96, 97, 98, 99, 100],
+            [71, 72, 73, 74, 75, 76, 77, 78, 79, 80],
+            [141, 142, 143, 144, 145, 146, 147, 148, 149, 150],
+            [111, 112, 113, 114, 115, 116, 117, 118, 119, 120],
+        ];
+
+        for timestamps in batches {
+            let base_timestamp = timestamps[0];
+            let max_timestamp = *timestamps.last().unwrap();
+
+            let mut builder = inflated::Batch::builder()
+                .base_timestamp(base_timestamp)
+                .max_timestamp(max_timestamp)
+                .last_offset_delta(9);
+
+            for (delta_index, timestamp) in timestamps.into_iter().enumerate() {
+                builder = builder.record(
+                    Record::builder()
+                        .key(None)
+                        .value(Some(Bytes::from_static(b"v")))
+                        .offset_delta(delta_index as i32)
+                        .timestamp_delta(timestamp - base_timestamp),
+                );
+            }
+
+            let batch = builder.build().and_then(Batch::try_from).unwrap();
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        // Timestamp(70): before everything -> the earliest record, offset
+        // 0 @ 91 (B2's 71-80 starts at offset 20, but the monotonic index
+        // only ever ceiling-scans forward from the first entry >= target,
+        // which for 70 is B0's 91->0 - the earliest absolute entry in the
+        // index; the sequential scan then finds the true first record
+        // whose timestamp >= 70, which is offset0@91, since nothing
+        // before it qualifies either).
+        let response = list_offsets_timestamp(&engine, &topition, 70).await;
+        assert_eq!(Some(0), response.offset);
+        assert_eq!(91, millis_since_epoch(response.timestamp.unwrap()));
+
+        // Timestamp(95): first record with timestamp >= 95 is offset4@95
+        // (within B0).
+        let response = list_offsets_timestamp(&engine, &topition, 95).await;
+        assert_eq!(Some(4), response.offset);
+        assert_eq!(95, millis_since_epoch(response.timestamp.unwrap()));
+
+        // Timestamp(101): first record with timestamp >= 101 is offset30
+        // @141 (B3), since B4's 111-120 sits in offset order AFTER B3 but
+        // its own timestamps are lower - the scan only skips a batch
+        // whose header rules it out entirely, so it still inspects B3
+        // (base_offset 30) before ever reaching B4.
+        let response = list_offsets_timestamp(&engine, &topition, 101).await;
+        assert_eq!(Some(30), response.offset);
+        assert_eq!(141, millis_since_epoch(response.timestamp.unwrap()));
+
+        // Timestamp(151): beyond everything ever indexed -> no match.
+        let response = list_offsets_timestamp(&engine, &topition, 151).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(0), response.offset);
+        assert!(response.timestamp.is_none());
+
+        // delete_records(10) removes B0 (offsets 0-9) only.
+        let delete_request = vec![
+            DeleteRecordsTopic::default()
+                .name("time-index-ticket-example".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(10),
+                ])),
+        ];
+        let _ = engine.delete_records(&delete_request).await.unwrap();
+
+        // Timestamp(95): now answered from B1 (offsets 10-19, same
+        // timestamps 91-100 as the deleted B0) -> offset14@95.
+        let response = list_offsets_timestamp(&engine, &topition, 95).await;
+        assert_eq!(Some(14), response.offset);
+        assert_eq!(95, millis_since_epoch(response.timestamp.unwrap()));
+
+        // Timestamp(70): the new low watermark is 10, so the earliest
+        // answer is now offset10@91.
+        let response = list_offsets_timestamp(&engine, &topition, 70).await;
+        assert_eq!(Some(10), response.offset);
+        assert_eq!(91, millis_since_epoch(response.timestamp.unwrap()));
     }
 }
 

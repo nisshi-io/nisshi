@@ -201,6 +201,19 @@ impl Engine {
     /// `watermark` before replaying, so this is safe to call against a
     /// `watermark` that already has entries in the index (the caller is
     /// expected to have deleted them first via `Self::delete_time_index`).
+    ///
+    /// Reads via `self.db.scan` rather than `tx.scan`, so a cold-start
+    /// migration triggered from inside `delete_records`/`policy_delete`
+    /// (which issue their `b/` deletes on `tx` *before* calling
+    /// `Self::partition_watermark`) sees the pre-delete, still-committed
+    /// state: it can backfill a `t/` entry for a `base_offset` that this
+    /// same transaction is about to delete, so after commit the index
+    /// transiently names an offset with no batch behind it. This is
+    /// harmless: every lookup through it (`Self::list_offset_for_timestamp`)
+    /// only uses an entry's offset as a *starting point* for the forward
+    /// scan, never requires an exact match there, so at worst it starts a
+    /// little earlier than strictly necessary - and the next compaction
+    /// rebuilds the index from survivors anyway (SOL-155074 review round 1).
     async fn backfill_time_index(
         &self,
         tx: &slatedb::DbTransaction,
@@ -227,6 +240,12 @@ impl Engine {
             // best-effort basis, and one unreadable batch should not take
             // down every other partition's migration in the same write.
             let Ok(batch) = self.decode(kv.value) else {
+                tracing::warn!(
+                    ?topic,
+                    partition,
+                    offset = key.offset,
+                    "skipping undecodable batch during time index backfill"
+                );
                 continue;
             };
 
@@ -241,6 +260,24 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    /// Clear `last_batch_max_timestamp` once pruning (`delete_records`/
+    /// `policy_delete`) has left `partition` fully empty (`low >= high`).
+    ///
+    /// `last_batch_max_timestamp` is always the highest-offset batch's own
+    /// header, so it only goes stale when that batch itself is gone - i.e.
+    /// exactly when the partition is now empty, never on a partial prefix
+    /// prune. Without this, `ListOffsets(Latest)`'s O(1) fast path
+    /// (`Storage::list_offsets`) keeps answering with a timestamp for a
+    /// batch that no longer exists; `main`'s pre-time-index, map-based
+    /// watermark didn't have this problem because the map naturally
+    /// emptied along with the data. `policy_compact` doesn't need this
+    /// helper: it always fully resets-and-replays the index already.
+    fn clear_latest_if_partition_empty(watermark: &mut Watermark) {
+        if watermark.low.unwrap_or(0) >= watermark.high.unwrap_or(0) {
+            watermark.last_batch_max_timestamp = None;
+        }
     }
 
     /// Delete every `t/` entry for `partition`. Used before replaying the
@@ -417,6 +454,12 @@ impl Engine {
             let key: BatchKey = postcard::from_bytes(&kv.key)?;
 
             let Ok(deflated) = self.decode(kv.value) else {
+                tracing::warn!(
+                    ?topic,
+                    partition,
+                    offset = key.offset,
+                    "skipping undecodable batch during timestamp scan"
+                );
                 continue;
             };
 
@@ -425,6 +468,12 @@ impl Engine {
             }
 
             let Ok(inflated) = InflatedBatch::try_from(deflated.clone()) else {
+                tracing::warn!(
+                    ?topic,
+                    partition,
+                    offset = key.offset,
+                    "skipping un-inflatable batch during timestamp scan"
+                );
                 continue;
             };
 
@@ -486,11 +535,23 @@ impl Engine {
         }
 
         let Ok(mut deflated) = self.decode(kv.value) else {
+            tracing::warn!(
+                ?topic,
+                partition,
+                offset = base,
+                "skipping undecodable batch while locating offset timestamp"
+            );
             return Ok(None);
         };
         deflated.base_offset = base;
 
         let Ok(inflated) = InflatedBatch::try_from(deflated.clone()) else {
+            tracing::warn!(
+                ?topic,
+                partition,
+                offset = base,
+                "skipping un-inflatable batch while locating offset timestamp"
+            );
             return Ok(None);
         };
 
@@ -626,6 +687,7 @@ impl Engine {
 
                 self.prune_time_index_below(&tx, metadata.id, partition, low)
                     .await?;
+                Self::clear_latest_if_partition_empty(&mut watermark);
 
                 let watermark_key =
                     postcard::to_stdvec(&WatermarkKey::new(metadata.id, partition))?;
@@ -984,6 +1046,7 @@ impl Storage for Engine {
                                 new_low_watermark,
                             )
                             .await?;
+                            Self::clear_latest_if_partition_empty(&mut watermark);
 
                             let watermark_key = postcard::to_stdvec(&WatermarkKey::new(
                                 metadata.id,
