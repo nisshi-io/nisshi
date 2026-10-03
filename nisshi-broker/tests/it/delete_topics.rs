@@ -202,16 +202,30 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
 
 /// A DeleteTopics request naming a topic whose name fails Kafka's topic-name
 /// rule must reject only that name with INVALID_TOPIC_EXCEPTION, and must
-/// never touch a topic that was not named. On dynostore, deleting a topic
-/// whose name is empty or contains "/" used to widen the delete's key prefix
-/// to every topic, or to a topic whose name happens to start with this one's,
-/// wiping their data too.
+/// never touch a topic that was not named. On dynostore, `Path::from`
+/// collapses an empty path segment, so an empty name, or a name with a
+/// leading, trailing, or doubled "/", widens the delete's key prefix: an
+/// empty name's prefix matches every topic's own data, and a trailing "/"
+/// makes the second pass (deleting a topic's consumer-group offsets) match
+/// another topic's offsets instead of its own.
 async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<(), Error> {
     let good_name = alphanumeric_string(15);
-    let bad_name = format!("{}/b", alphanumeric_string(10));
+    let empty_name = String::new();
+    let trailing_slash_name = format!("{good_name}/");
     let doomed_name = alphanumeric_string(15);
 
-    for name in [good_name.clone(), bad_name.clone(), doomed_name.clone()] {
+    // Every topic is created before any of them is produced to.
+    // create_topic resets its own partitions' watermarks to none, and
+    // trailing_slash_name's watermark path collapses onto good_name's own
+    // (object_store drops the empty segment the trailing "/" leaves before
+    // "/partitions/..."), so creating it after producing to good_name would
+    // reset good_name's watermark back to none.
+    for name in [
+        good_name.clone(),
+        empty_name.clone(),
+        trailing_slash_name.clone(),
+        doomed_name.clone(),
+    ] {
         _ = storage
             .create_topic(
                 CreatableTopic::default()
@@ -223,7 +237,11 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
                 false,
             )
             .await?;
+    }
 
+    // trailing_slash_name is never produced to: producing would land on
+    // good_name's own object path for the same reason, and collide with it.
+    for name in [good_name.clone(), empty_name.clone(), doomed_name.clone()] {
         let topition = Topition::new(name.as_str(), 0);
         let value = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
 
@@ -256,25 +274,38 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         storage: storage.clone(),
     };
 
-    // good_name is never named: only bad_name and doomed_name are in the request.
+    // good_name is never named: only the two invalid names and doomed_name
+    // are in the request.
     let response = delete_topics
         .serve(RequestInput {
-            request: DeleteTopicsRequest::default()
-                .topic_names(Some(vec![bad_name.clone(), doomed_name.clone()])),
+            request: DeleteTopicsRequest::default().topic_names(Some(vec![
+                empty_name.clone(),
+                trailing_slash_name.clone(),
+                doomed_name.clone(),
+            ])),
             extensions: Extensions::default(),
         })
         .await?;
 
     let responses = response.responses.unwrap_or_default();
-    assert_eq!(2, responses.len());
+    assert_eq!(3, responses.len());
 
-    let bad_result = responses
+    let empty_result = responses
         .iter()
-        .find(|result| result.name.as_deref() == Some(bad_name.as_str()))
-        .expect("missing result for the invalid topic name");
+        .find(|result| result.name.as_deref() == Some(empty_name.as_str()))
+        .expect("missing result for the empty topic name");
     assert_eq!(
         ErrorCode::InvalidTopicException,
-        ErrorCode::try_from(bad_result.error_code)?
+        ErrorCode::try_from(empty_result.error_code)?
+    );
+
+    let trailing_slash_result = responses
+        .iter()
+        .find(|result| result.name.as_deref() == Some(trailing_slash_name.as_str()))
+        .expect("missing result for the trailing-slash topic name");
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(trailing_slash_result.error_code)?
     );
 
     let doomed_result = responses
@@ -307,13 +338,20 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         .await?;
     assert_eq!(Some(&offset), offset_fetch.get(&good_topition));
 
-    // bad_name was rejected before anything was deleted, so its own data
+    // empty_name was rejected before anything was deleted, so its own data
     // must still be there too.
-    let bad_topition = Topition::new(bad_name.clone(), 0);
-    let bad_fetch = storage
-        .fetch(&bad_topition, 0, min_bytes, max_bytes, isolation, max_wait)
+    let empty_topition = Topition::new(empty_name.as_str(), 0);
+    let empty_fetch = storage
+        .fetch(
+            &empty_topition,
+            0,
+            min_bytes,
+            max_bytes,
+            isolation,
+            max_wait,
+        )
         .await?;
-    assert!(!bad_fetch.is_empty());
+    assert!(!empty_fetch.is_empty());
 
     Ok(())
 }
