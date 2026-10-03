@@ -116,13 +116,22 @@ async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(),
     Ok(())
 }
 
-/// Deleting a group must forget whatever the coordinator cached for it: a
-/// brand-new member joining under the same, just-deleted group name must
-/// succeed cleanly rather than tripping over a stale cached version that
-/// still points at the now-gone storage row. (`common::join`'s own
-/// assertions are the proof here: they panic on anything but a clean
-/// `ErrorCode::None` solo-leader join.)
-async fn delete_evicts_coordinator_cache(storage: impl Storage + Clone) -> Result<(), Error> {
+/// Deleting a group must forget whatever the coordinator cached for it, or
+/// a brand-new member joining under the same, just-deleted group name would
+/// silently reuse the deleted group's stale state instead of starting a
+/// genuinely new one. On Postgres and libSQL this isn't hypothetical: the
+/// conditional group-detail write is an upsert whose `where e_tag = ...`
+/// guard only applies to the UPDATE arm, so once the row is gone a stale
+/// cached version doesn't fail the write, it just inserts - the rejoin
+/// succeeds either way, with or without this fix, so a bare "the join call
+/// didn't error" assertion proves nothing on those two backends. The
+/// reliable signal is whether the rejoin actually started a fresh
+/// generation or continued the deleted group's: compare it against a
+/// genuinely new control group joined the same way.
+async fn delete_evicts_coordinator_cache(
+    storage: impl Storage + Clone,
+    after_delete_not_found: Option<ErrorCode>,
+) -> Result<(), Error> {
     let mut coordinator = Controller::with_storage(storage.clone())?;
 
     let Formed {
@@ -143,16 +152,57 @@ async fn delete_evicts_coordinator_cache(storage: impl Storage + Clone) -> Resul
     assert_eq!(1, results.len());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
 
-    _ = common::join(
+    // On dynostore and SlateDB a missing group fails open to
+    // `Found(GroupDetail::default())` (pre-existing, accepted elsewhere in
+    // this file): only Postgres and libSQL actually report `GroupIdNotFound`
+    // here, so this check only applies to them.
+    if let Some(expected) = after_delete_not_found {
+        let described = storage
+            .describe_groups(Some(slice::from_ref(&group)), false)
+            .await?;
+        assert_eq!(1, described.len());
+        assert!(
+            matches!(described[0].response, GroupDetailResponse::ErrorCode(code) if code == expected),
+            "expected {expected:?}, got {:?}",
+            described[0].response
+        );
+    }
+
+    // A short timeout: the coordinator's own join-rebalance wait sleeps
+    // until half the session timeout has elapsed before closing a solo
+    // dynamic join (see `administrator.rs`'s `join` loop), and this test
+    // doesn't need to exercise that wait.
+    let session_timeout_ms = 1_000;
+
+    let rejoined = common::join(
         &mut coordinator,
         &group,
         None,
         None,
         None,
-        45_000,
+        session_timeout_ms,
         Some(300_000),
     )
     .await?;
+
+    let control_group = alphanumeric_string(15);
+    let control = common::join(
+        &mut coordinator,
+        &control_group,
+        None,
+        None,
+        None,
+        session_timeout_ms,
+        Some(300_000),
+    )
+    .await?;
+
+    assert_eq!(
+        control.generation(),
+        rejoined.generation(),
+        "rejoin under a just-deleted group name must start the same first \
+         generation as a brand-new group, not continue the deleted group's"
+    );
 
     Ok(())
 }
@@ -542,7 +592,7 @@ mod in_memory {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::delete_evicts_coordinator_cache(storage).await?;
+        super::delete_evicts_coordinator_cache(storage, None).await?;
 
         Ok(())
     }
@@ -643,7 +693,7 @@ mod lite {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::delete_evicts_coordinator_cache(storage).await?;
+        super::delete_evicts_coordinator_cache(storage, Some(ErrorCode::GroupIdNotFound)).await?;
 
         Ok(())
     }
@@ -744,7 +794,7 @@ mod slatedb {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::delete_evicts_coordinator_cache(storage).await?;
+        super::delete_evicts_coordinator_cache(storage, None).await?;
 
         Ok(())
     }
@@ -845,7 +895,7 @@ mod pg {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::delete_evicts_coordinator_cache(storage).await?;
+        super::delete_evicts_coordinator_cache(storage, Some(ErrorCode::GroupIdNotFound)).await?;
 
         Ok(())
     }
