@@ -91,3 +91,45 @@ fn schema_change() -> Result<()> {
 
     Ok(())
 }
+
+/// Checked-in version of the serde-compatibility claim in
+/// [`super::Watermark::time_index`]'s doc comment: every shape of
+/// pre-time-index watermark document on disk decodes cleanly into the
+/// current [`super::Watermark`], and `time_index_complete` (added after all
+/// of these were written) defaults to `false` on every one of them.
+#[test]
+fn watermark_decodes_pre_time_index_documents() -> Result<()> {
+    use super::Watermark;
+
+    // Every watermark document written by this PR's own code has
+    // `timestamps` explicitly `null`.
+    let null_timestamps: Watermark =
+        serde_json::from_str(r#"{"low":6,"high":66,"timestamps":null}"#)?;
+    assert_eq!(Some(6), null_timestamps.low);
+    assert_eq!(Some(66), null_timestamps.high);
+    assert!(null_timestamps.time_index.is_none());
+    assert!(!null_timestamps.time_index_complete);
+
+    // Documents written before the `timestamps` key existed at all lack it
+    // entirely.
+    let key_omitted: Watermark = serde_json::from_str(r#"{"low":6,"high":66}"#)?;
+    assert_eq!(Some(6), key_omitted.low);
+    assert_eq!(Some(66), key_omitted.high);
+    assert!(key_omitted.time_index.is_none());
+    assert!(!key_omitted.time_index_complete);
+
+    // A document that somehow carries real old data under `timestamps`
+    // still decodes, into the renamed `time_index` field, under the same
+    // JSON key.
+    let with_data: Watermark =
+        serde_json::from_str(r#"{"low":6,"high":66,"timestamps":{"100":0,"200":3}}"#)?;
+    assert_eq!(Some(6), with_data.low);
+    assert_eq!(Some(66), with_data.high);
+    assert_eq!(
+        Some(BTreeMap::from([(100, 0), (200, 3)])),
+        with_data.time_index
+    );
+    assert!(!with_data.time_index_complete);
+
+    Ok(())
+}

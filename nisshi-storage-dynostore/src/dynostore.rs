@@ -364,7 +364,8 @@ struct Watermark {
     ///
     /// The JSON key stays `timestamps`: every watermark document ever
     /// written has this key as `null`, which decodes identically under this
-    /// type with no migration (see `dynostore::tests::schema_change`).
+    /// type with no migration (see
+    /// `dynostore::tests::watermark_decodes_pre_time_index_documents`).
     #[serde(rename = "timestamps")]
     time_index: Option<BTreeMap<i64, i64>>,
     /// Whether `time_index` covers this partition from offset 0 onward.
@@ -1590,15 +1591,43 @@ impl Storage for DynoStore {
 
                 // An empty index is "ceiling absent" in the sense that there
                 // is nothing to take a ceiling of - not "ceiling above
-                // every entry" (see below). This is dead today (nothing in
-                // this codebase prunes `time_index` entries yet), but is the
-                // defensive path a future backfill-coverage gap or a
-                // delete_records that prunes time_index (see SOL-155296) would
-                // need: fall back to scanning everything still physically
-                // present from `low` forward, rather than wrongly reporting
-                // "no match".
+                // every entry" (see below).
+                //
+                // `time_index` entries are NEVER pruned: every entry this
+                // code (or a future backfill) ever inserts stays in the map
+                // forever. The index stays correct *because* of this -
+                // logical deletion is handled entirely by the per-record
+                // `low` filter in the sequential scan below, not by removing
+                // index entries. A pruned index gives WRONG answers, in both
+                // of the shapes pruning can leave behind:
+                //
+                // - Pruned but non-empty: a ceiling lookup can skip straight
+                //   over a surviving, matching record whose own index entry
+                //   was the one pruned, landing on a later offset/timestamp
+                //   pair instead of the earliest matching one.
+                // - Pruned to fully empty: falling back to `start_offset =
+                //   low` would make the listing filter below
+                //   (`base_offset >= start_offset`) wrongly exclude a batch
+                //   that straddles `low` - one whose base offset is below
+                //   `low` but that still holds a surviving, matching record
+                //   at a higher offset - reporting "no match" when a match
+                //   exists.
+                //
+                // SOL-155296/#835 must not resurrect pruning against this
+                // field (see the coordinating comment left on that PR's
+                // `timestamps.retain(...)` line). Under "never prune", an
+                // empty index here can only mean "genuinely nothing ever
+                // indexed" (e.g. every batch produced so far had
+                // `NO_TIMESTAMP`/negative timestamps) - never "pruned to
+                // empty" - and `empty_partition_no_match` exercises exactly
+                // this branch, so it is live, not dead, code. Scan from 0
+                // rather than from `low`: the two coincide for any partition
+                // whose index can actually be empty under "never prune", and
+                // scanning from 0 costs nothing extra in that rare case
+                // while staying correct even if that assumption is ever
+                // violated.
                 let start_offset = if time_index.is_empty() {
-                    Some(low)
+                    Some(0)
                 } else {
                     // A ceiling entry exists (smallest indexed timestamp
                     // `>= target`): start the real scan at its offset. If no
