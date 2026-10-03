@@ -50,6 +50,20 @@ async fn create_test_engine() -> Engine {
     )
 }
 
+/// A single-record batch, built through the real encode path (unlike a hand
+/// constructed [`Batch`] literal with an empty `record_data`, this decodes
+/// back correctly -- `DeleteRecords`' batch-span check now decodes every
+/// candidate batch to find its end offset).
+fn simple_batch() -> Batch {
+    use nisshi_sans_io::record::{Record, inflated};
+
+    inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from_static(b"value"))))
+        .build()
+        .and_then(Batch::try_from)
+        .unwrap()
+}
+
 // ========== Unique Error Case Tests ==========
 
 #[tokio::test]
@@ -341,22 +355,7 @@ async fn test_delete_records() {
     let topition = Topition::new("delete-records-topic", 0);
 
     // Produce some data
-    let batch = Batch {
-        base_offset: 0,
-        batch_length: 0,
-        partition_leader_epoch: 0,
-        magic: 2,
-        crc: 0,
-        attributes: 0,
-        last_offset_delta: 0,
-        base_timestamp: 1000,
-        max_timestamp: 1000,
-        producer_id: -1,
-        producer_epoch: -1,
-        base_sequence: -1,
-        record_count: 1,
-        record_data: Bytes::new(),
-    };
+    let batch = simple_batch();
 
     for _ in 0..5 {
         let _ = engine
@@ -938,22 +937,7 @@ async fn test_list_offsets_earliest_after_delete_records() {
 
     let topition = Topition::new("earliest-topic", 0);
 
-    let batch = Batch {
-        base_offset: 0,
-        batch_length: 0,
-        partition_leader_epoch: 0,
-        magic: 2,
-        crc: 0,
-        attributes: 0,
-        last_offset_delta: 0,
-        base_timestamp: 1000,
-        max_timestamp: 1000,
-        producer_id: -1,
-        producer_epoch: -1,
-        base_sequence: -1,
-        record_count: 1,
-        record_data: Bytes::new(),
-    };
+    let batch = simple_batch();
 
     for _ in 0..5 {
         let _ = engine
