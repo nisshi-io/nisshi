@@ -498,7 +498,7 @@ impl Engine {
     /// inflate (corrupt/malformed data; see `Self::sequential_timestamp_scan`
     /// for why this degrades gracefully rather than failing the call). Used
     /// for `ListOffsets(Earliest)`'s timestamp, decoupled from the old
-    /// (lossy, mis-keyed) `timestamps` map via the same
+    /// (lossy, wrongly keyed) `timestamps` map via the same
     /// `batch_base_at_or_after`/`batch_base_at_or_before` helpers `fetch`
     /// uses to locate the batch covering an arbitrary offset.
     async fn timestamp_at_offset(
