@@ -14,14 +14,12 @@
 
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, NULL_TOPIC_ID, RequestInput,
-    create_topics_response::CreatableTopicResult,
+    create_topics_response::CreatableTopicResult, topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
-
-use super::metadata::is_valid_topic_name;
 
 /// Build the [`CreatableTopicResult`] for a topic that was rejected, either
 /// by storage or by validation performed before storage is ever consulted.
