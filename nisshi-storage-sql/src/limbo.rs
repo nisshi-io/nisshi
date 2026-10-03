@@ -2931,18 +2931,28 @@ impl Storage for Engine {
                     .await
                     .inspect_err(|err| error!(?err, group_id))?
                 {
-                    let current = row
+                    // A group row with no detail row (e.g. a group that only ever
+                    // committed offsets, never a JoinGroup) joins to a NULL
+                    // `detail` column here: that group exists and is empty, not
+                    // an error.
+                    let value = row
                         .get_value(1)
                         .map_err(Error::from)
-                        .and_then(|value| {
-                            value
-                                .as_text()
-                                .cloned()
-                                .ok_or(Error::UnexpectedValue(value.clone()))
-                        })
-                        .and_then(|s| serde_json::from_str::<GroupDetail>(&s).map_err(Into::into))
-                        .inspect(|current| debug!(?current))
                         .inspect_err(|err| error!(?err, group_id))?;
+
+                    let current = if value.is_null() {
+                        GroupDetail::default()
+                    } else {
+                        value
+                            .as_text()
+                            .cloned()
+                            .ok_or(Error::UnexpectedValue(value.clone()))
+                            .and_then(|s| {
+                                serde_json::from_str::<GroupDetail>(&s).map_err(Into::into)
+                            })
+                            .inspect(|current| debug!(?current))
+                            .inspect_err(|err| error!(?err, group_id))?
+                    };
 
                     results.push(NamedGroupDetail::found(group_id.into(), current));
                 } else {
