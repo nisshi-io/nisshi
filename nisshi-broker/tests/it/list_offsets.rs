@@ -551,7 +551,17 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     Ok(())
 }
 
-pub async fn new_topic<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
+pub async fn new_topic<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    sc: G,
+    // The correct answer for a Timestamp lookup against an empty partition
+    // is "not found" (`None`), matched today only by backends SOL-155076 et
+    // al have fixed; the rest still fall back to a shared, pre-existing
+    // `Some(0)` default this parametrizes rather than papers over. See
+    // SOL-155076/SOL-155073.
+    timestamp_no_match_offset: Option<i64>,
+) -> Result<()>
 where
     G: Storage + Clone,
 {
@@ -639,14 +649,20 @@ where
     assert!(!items.is_empty());
 
     for (_toptition, response) in items {
-        assert_eq!(Some(0), response.offset);
+        assert_eq!(timestamp_no_match_offset, response.offset);
         assert_eq!(None, response.timestamp);
     }
 
     Ok(())
 }
 
-pub async fn single_record<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
+pub async fn single_record<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    sc: G,
+    // See `new_topic`'s parameter of the same name.
+    timestamp_no_match_offset: Option<i64>,
+) -> Result<()>
 where
     G: Storage + Clone,
 {
@@ -734,7 +750,7 @@ where
         .await?;
 
     assert_eq!(1, responses.len());
-    assert_eq!(Some(0), responses[0].1.offset);
+    assert_eq!(timestamp_no_match_offset, responses[0].1.offset);
 
     Ok(())
 }
@@ -783,6 +799,7 @@ mod pg {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            Some(0),
         )
         .await
     }
@@ -798,6 +815,7 @@ mod pg {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            Some(0),
         )
         .await
     }
@@ -847,6 +865,7 @@ mod in_memory {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            None,
         )
         .await
     }
@@ -862,6 +881,7 @@ mod in_memory {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            None,
         )
         .await
     }
@@ -911,6 +931,7 @@ mod lite {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            Some(0),
         )
         .await
     }
@@ -926,6 +947,7 @@ mod lite {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            Some(0),
         )
         .await
     }
@@ -975,6 +997,7 @@ mod slatedb {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            Some(0),
         )
         .await
     }
@@ -990,6 +1013,7 @@ mod slatedb {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            Some(0),
         )
         .await
     }
