@@ -888,6 +888,119 @@ where
     Ok(())
 }
 
+/// A fetch for a topic name that was never created is answered with
+/// `UNKNOWN_TOPIC_OR_PARTITION` immediately, on an open connection. Before
+/// this fix, pg, lite and slatedb instead returned an `Err` from
+/// `fetch_topic`, which closed the connection (the only mechanism that
+/// does: the `?` in `nisshi-service/src/stream.rs`'s request loop), and the
+/// in-memory backend silently waited out the full `max_wait` before
+/// answering `NONE`. No leader hint is sent either: Kafka sends one only
+/// with a leadership error.
+pub async fn unknown_topic_name<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    // long enough that waiting it out would fail the elapsed check
+    let max_wait_ms = 10_000;
+    let answered_within = Duration::from_secs(5);
+
+    let fetch_request = |topic_name: &str| {
+        FetchRequest::default()
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(1)
+            .max_bytes(Some(50 * 1024))
+            .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+            .topics(Some(
+                [FetchTopic::default()
+                    .topic(Some(topic_name.into()))
+                    .topic_id(Some(NULL_TOPIC_ID))
+                    .partitions(Some(
+                        [FetchPartition::default()
+                            .partition(0)
+                            .current_leader_epoch(Some(-1))
+                            .fetch_offset(0)
+                            .last_fetched_epoch(Some(-1))
+                            .log_start_offset(Some(-1))
+                            .partition_max_bytes(50 * 1024)]
+                        .into(),
+                    ))]
+                .into(),
+            ))
+    };
+
+    let started_at = SystemTime::now();
+
+    let response = FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: fetch_request(&topic_name),
+        extensions: Extensions::default(),
+    })
+    .await?;
+
+    let elapsed = started_at.elapsed()?;
+    assert!(elapsed < answered_within, "took {elapsed:?}");
+
+    let partitions = response
+        .responses
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|topic| topic.partitions.unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(None, partitions[0].current_leader);
+
+    // the service still answers a normal fetch afterwards: no regression to
+    // the working path. A short max_wait keeps this quick, since an empty,
+    // existing topic otherwise waits out max_wait for more data that will
+    // never come.
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let response = FetchService { storage: sc }
+        .serve(RequestInput {
+            request: fetch_request(&topic_name).max_wait_ms(200),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let partitions = response
+        .responses
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|topic| topic.partitions.unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use super::*;
@@ -975,6 +1088,21 @@ mod pg {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::mid_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_name(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1070,6 +1198,21 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::mid_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_name(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1186,6 +1329,21 @@ mod lite {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn unknown_topic_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_name(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -1275,6 +1433,21 @@ mod slatedb {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::mid_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_name(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,

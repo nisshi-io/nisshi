@@ -17,9 +17,7 @@ use std::{cmp::min, time::SystemTime};
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput,
     fetch_request::{FetchPartition, FetchTopic},
-    fetch_response::{
-        EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
-    },
+    fetch_response::{EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId},
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
@@ -244,9 +242,10 @@ where
                             .diverging_epoch(Some(
                                 EpochEndOffset::default().epoch(-1).end_offset(-1),
                             ))
-                            .current_leader(Some(
-                                LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
-                            ))
+                            // Kafka sends a leader hint only with a leadership
+                            // error; librdkafka acts on one here, and its
+                            // consumer close then hangs on a deleted topic
+                            .current_leader(None)
                             .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
                             .aborted_transactions(Some([].into()))
                             .preferred_read_replica(Some(-1))
@@ -274,8 +273,10 @@ where
         if let Some(MetadataResponseTopic {
             topic_id,
             name: Some(name),
+            error_code,
             ..
         }) = metadata.topics().first()
+            && *error_code == i16::from(ErrorCode::None)
         {
             let mut partitions = Vec::new();
 
@@ -376,6 +377,13 @@ where
                     break;
                 }
 
+                // as in Kafka, an error in any partition answers now: waiting
+                // cannot clear it, and the client acts on it
+                if responses.iter().any(has_partition_error) {
+                    debug!(?iteration, "partition error, not waiting for min_bytes");
+                    break;
+                }
+
                 {
                     let fetch_elapsed = fetch_started_at.elapsed()?;
 
@@ -455,6 +463,15 @@ where
             .responses(responses))
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed().ok()))
     }
+}
+
+fn has_partition_error(topic: &FetchableTopicResponse) -> bool {
+    topic
+        .partitions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|partition| partition.error_code != i16::from(ErrorCode::None))
 }
 
 trait ByteSize {
