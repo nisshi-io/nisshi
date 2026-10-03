@@ -375,6 +375,76 @@ async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<()
     Ok(())
 }
 
+/// `replication_factor` of `0` or less than `-1` must be rejected with
+/// `InvalidReplicationFactor`; `-1` (the "use the default" sentinel) must
+/// still succeed.
+async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let service = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let num_partitions = 3;
+    let assignments = Some([].into());
+    let configs = Some([].into());
+
+    for replication_factor in [0, -2] {
+        let name = alphanumeric_string(15);
+
+        let response = service
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .topics(Some(vec![
+                        CreatableTopic::default()
+                            .name(name.clone())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(assignments.clone())
+                            .configs(configs.clone()),
+                    ]))
+                    .validate_only(Some(false)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(name, topics[0].name.as_str());
+        assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+        assert_eq!(
+            ErrorCode::InvalidReplicationFactor,
+            ErrorCode::try_from(topics[0].error_code)?,
+            "replication_factor = {replication_factor}"
+        );
+    }
+
+    // -1 still means "use the broker default".
+    let name = alphanumeric_string(15);
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(name.clone())
+                        .num_partitions(-1)
+                        .replication_factor(-1)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(name, topics[0].name.as_str());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    assert_eq!(Some(1), topics[0].replication_factor);
+
+    Ok(())
+}
+
 /// One invalid topic in a batch must not affect the others: the invalid
 /// entry is rejected, the valid one is still created.
 async fn mixed_batch_partial_success(storage: impl Storage + Clone) -> Result<(), Error> {
@@ -416,6 +486,63 @@ async fn mixed_batch_partial_success(storage: impl Storage + Clone) -> Result<()
     assert_eq!("", topics[0].name.as_str());
     assert_eq!(
         ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+
+    assert_eq!(valid_name, topics[1].name.as_str());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[1].error_code)?);
+    assert_ne!(Some(NULL_TOPIC_ID), topics[1].topic_id);
+
+    Ok(())
+}
+
+/// One invalid topic in a batch must not affect the others: the topic with
+/// an invalid `replication_factor` is rejected, the valid one is still
+/// created. The rejected topic's name must itself be valid, so that
+/// `InvalidReplicationFactor` is what rejects it rather than the name check
+/// (which runs first) firing on a bad name instead.
+async fn mixed_batch_partial_success_replication_factor(
+    storage: impl Storage + Clone,
+) -> Result<(), Error> {
+    let service = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let invalid_name = alphanumeric_string(15);
+    let valid_name = alphanumeric_string(15);
+    let num_partitions = 3;
+    let assignments = Some([].into());
+    let configs = Some([].into());
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(invalid_name.clone())
+                        .num_partitions(num_partitions)
+                        .replication_factor(0)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                    CreatableTopic::default()
+                        .name(valid_name.clone())
+                        .num_partitions(num_partitions)
+                        .replication_factor(1)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(2, topics.len());
+
+    assert_eq!(invalid_name, topics[0].name.as_str());
+    assert_eq!(
+        ErrorCode::InvalidReplicationFactor,
         ErrorCode::try_from(topics[0].error_code)?
     );
     assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
@@ -528,6 +655,34 @@ mod in_memory {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_replication_factor_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_replication_factor_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success_replication_factor() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success_replication_factor(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -627,6 +782,34 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_replication_factor_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_replication_factor_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success_replication_factor() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success_replication_factor(storage).await?;
 
         Ok(())
     }
@@ -732,6 +915,34 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_replication_factor_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_replication_factor_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success_replication_factor() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success_replication_factor(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -831,6 +1042,34 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_replication_factor_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_replication_factor_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success_replication_factor() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success_replication_factor(storage).await?;
 
         Ok(())
     }
