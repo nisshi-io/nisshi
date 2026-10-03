@@ -727,7 +727,7 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
                 .map(|record| Record {
                     offset_delta: record.offset_delta + sink.last_offset_delta + 1,
                     timestamp_delta: record.timestamp_delta
-                        + (sink.base_timestamp - batch.base_timestamp),
+                        + (batch.base_timestamp - sink.base_timestamp),
                     ..record
                 })
                 .collect::<Vec<_>>(),
@@ -1609,6 +1609,104 @@ mod tests {
         assert_eq!(None, combined.records[index].key);
         assert_eq!(Some(batches[5][3].clone()), combined.records[index].value);
         assert_eq!(index, combined.records[index].offset_delta as usize);
+
+        Ok(())
+    }
+
+    /// Regression test: combining batches with *different*
+    /// `base_timestamp` values must preserve each record's absolute
+    /// timestamp (`batch.base_timestamp + record.timestamp_delta`).
+    ///
+    /// The existing `combine_batches` test above only checks offsets and
+    /// values, and every batch it builds happens to share (within the same
+    /// millisecond) the same default `base_timestamp` (`SystemTime::now()`
+    /// at `Builder::default()` time). With `batch.base_timestamp ==
+    /// sink.base_timestamp`, the correction term is zero regardless of its
+    /// sign, so that test cannot catch a sign error in the delta
+    /// adjustment. This test pins distinct base timestamps so the
+    /// correction term is non-zero and the sign actually matters.
+    #[test]
+    fn combine_batches_preserves_timestamps_across_different_base_timestamps() -> Result<()> {
+        // Ticket's own worked example: a combined batch starting at base
+        // time 1000, and a second batch with base time 1010 and a record
+        // at delta 0 (absolute time 1010). After combination that record's
+        // absolute time must still be 1010, not 990.
+        let first = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(0)
+            .last_offset_delta(1)
+            .base_sequence(0)
+            .base_timestamp(1_000)
+            .max_timestamp(1_005)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1)
+                    .timestamp_delta(5),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let second = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(2)
+            .last_offset_delta(1)
+            .base_sequence(2)
+            .base_timestamp(1_010)
+            .max_timestamp(1_013)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"c").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"d").into())
+                    .offset_delta(1)
+                    .timestamp_delta(3),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        // The original, pre-combination absolute time of every record,
+        // keyed by its value, so we can check each survives combination
+        // unchanged regardless of which side of the combined batch it
+        // lands on.
+        let original_times: BTreeMap<&'static [u8], i64> = BTreeMap::from([
+            (&b"a"[..], 1_000),
+            (&b"b"[..], 1_005),
+            (&b"c"[..], 1_010),
+            (&b"d"[..], 1_013),
+        ]);
+
+        let combined = inflated::Batch::try_from(combine(vec![first, second])?.expect("a batch"))?;
+
+        assert_eq!(4, combined.records.len());
+
+        // The header fields should stay consistent with the records they
+        // describe: base_timestamp is carried over unchanged from the
+        // first (sink) batch, and max_timestamp is the max across both.
+        assert_eq!(1_000, combined.base_timestamp);
+        assert_eq!(1_013, combined.max_timestamp);
+
+        for record in &combined.records {
+            let value = record.value.as_deref().expect("value");
+            let expected = original_times[value];
+            let actual = combined.base_timestamp + record.timestamp_delta;
+            assert_eq!(
+                expected, actual,
+                "record {value:?} should keep its original absolute timestamp"
+            );
+        }
 
         Ok(())
     }
