@@ -525,6 +525,23 @@ impl DynoStore {
     }
 }
 
+/// Returns whether `name` is a legal Kafka topic name: 1 to 249 characters
+/// from `[a-zA-Z0-9._-]`, and not `.` or `..`.
+///
+/// Must stay equal to `nisshi_storage`'s private copy of this rule, which
+/// this crate cannot import directly.
+// TODO(SOL-155175 / nisshi#828): replace with
+// nisshi_sans_io::topic::is_valid_topic_name once that PR lands.
+fn is_valid_topic_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 249
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
 #[async_trait]
 impl Storage for DynoStore {
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
@@ -641,6 +658,25 @@ impl Storage for DynoStore {
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         if let Some(metadata) = self.topic_metadata(topic).await? {
+            // Validate the name storage resolved via `topic_metadata`, not
+            // the input `topic: &TopicId`: a delete by `TopicId::Id(uuid)`
+            // carries no name at all until this lookup resolves it, so
+            // checking the input instead would skip this guard for every
+            // delete-by-id.
+            if !is_valid_topic_name(&metadata.topic.name) {
+                // The prefix below is built directly from this name, and
+                // object_store collapses empty segments and treats "/" as a
+                // path separator. Deleting by that prefix for an empty name
+                // would delete every topic's objects; for a name containing
+                // "/" it would delete a sibling topic's objects. Refuse
+                // instead of risking either.
+                warn!(
+                    name = metadata.topic.name.as_str(),
+                    "refusing to delete a topic with an invalid name"
+                );
+                return Ok(ErrorCode::InvalidTopicException);
+            }
+
             self.meta
                 .with_mut(&self.object_store, |meta| {
                     _ = meta.topics.remove(metadata.topic.name.as_str());
