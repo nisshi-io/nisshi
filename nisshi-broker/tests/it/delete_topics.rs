@@ -12,19 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::{slice, time::Duration};
+
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
 };
 use assert_matches::assert_matches;
+use bytes::Bytes;
 use nisshi_broker::Error;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
     CreateTopicsRequest, CreateTopicsResponse, DeleteTopicsRequest, DeleteTopicsResponse,
-    ErrorCode, NULL_TOPIC_ID, RequestInput, create_topics_request::CreatableTopic,
-    delete_topics_request::DeleteTopicState, delete_topics_response::DeletableTopicResult,
+    ErrorCode, IsolationLevel, NULL_TOPIC_ID, RequestInput,
+    create_topics_request::CreatableTopic,
+    delete_topics_request::DeleteTopicState,
+    delete_topics_response::DeletableTopicResult,
+    record::{Record, inflated},
 };
-use nisshi_storage::{ArcDynStorage, CreateTopicsService, DeleteTopicsService, Storage};
+use nisshi_storage::{
+    ArcDynStorage, CreateTopicsService, DeleteTopicsService, OffsetCommitRequest, Storage, Topition,
+};
 use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
@@ -192,6 +200,162 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
     Ok(())
 }
 
+/// A DeleteTopics request naming a topic whose name fails Kafka's topic-name
+/// rule must reject only that name with INVALID_TOPIC_EXCEPTION, and must
+/// never touch a topic that was not named. On dynostore, `Path::from`
+/// collapses an empty path segment, so an empty name, or a name with a
+/// leading, trailing, or doubled "/", widens the delete's key prefix: an
+/// empty name's prefix matches every topic's own data, and a trailing "/"
+/// makes the second pass (deleting a topic's consumer-group offsets) match
+/// another topic's offsets instead of its own.
+async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<(), Error> {
+    let good_name = alphanumeric_string(15);
+    let empty_name = String::new();
+    let trailing_slash_name = format!("{good_name}/");
+    let doomed_name = alphanumeric_string(15);
+
+    // Every topic is created before any of them is produced to.
+    // create_topic resets its own partitions' watermarks to none, and
+    // trailing_slash_name's watermark path collapses onto good_name's own
+    // (object_store drops the empty segment the trailing "/" leaves before
+    // "/partitions/..."), so creating it after producing to good_name would
+    // reset good_name's watermark back to none.
+    for name in [
+        good_name.clone(),
+        empty_name.clone(),
+        trailing_slash_name.clone(),
+        doomed_name.clone(),
+    ] {
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+    }
+
+    // trailing_slash_name is never produced to: producing would land on
+    // good_name's own object path for the same reason, and collide with it.
+    for name in [good_name.clone(), empty_name.clone(), doomed_name.clone()] {
+        let topition = Topition::new(name.as_str(), 0);
+        let value = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
+
+        let batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(value)))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+    }
+
+    let good_topition = Topition::new(good_name.clone(), 0);
+    let group_id = alphanumeric_string(15);
+    let offset = rng().random_range(0..i64::MAX);
+
+    let commit = storage
+        .offset_commit(
+            group_id.as_str(),
+            None,
+            &[(
+                good_topition.clone(),
+                OffsetCommitRequest::default().offset(offset),
+            )],
+        )
+        .await?;
+    assert_eq!(1, commit.len());
+    assert_eq!(ErrorCode::None, commit[0].1);
+
+    let delete_topics = DeleteTopicsService {
+        storage: storage.clone(),
+    };
+
+    // good_name is never named: only the two invalid names and doomed_name
+    // are in the request.
+    let response = delete_topics
+        .serve(RequestInput {
+            request: DeleteTopicsRequest::default().topic_names(Some(vec![
+                empty_name.clone(),
+                trailing_slash_name.clone(),
+                doomed_name.clone(),
+            ])),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let responses = response.responses.unwrap_or_default();
+    assert_eq!(3, responses.len());
+
+    let empty_result = responses
+        .iter()
+        .find(|result| result.name.as_deref() == Some(empty_name.as_str()))
+        .expect("missing result for the empty topic name");
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(empty_result.error_code)?
+    );
+
+    let trailing_slash_result = responses
+        .iter()
+        .find(|result| result.name.as_deref() == Some(trailing_slash_name.as_str()))
+        .expect("missing result for the trailing-slash topic name");
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(trailing_slash_result.error_code)?
+    );
+
+    let doomed_result = responses
+        .iter()
+        .find(|result| result.name.as_deref() == Some(doomed_name.as_str()))
+        .expect("missing result for doomed_name");
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(doomed_result.error_code)?
+    );
+
+    let min_bytes = 1;
+    let max_bytes = 50 * 1024;
+    let isolation = IsolationLevel::ReadUncommitted;
+    let max_wait = Duration::from_millis(500);
+
+    // good_name was never named in the request, so its data and committed
+    // offset must still be there, exactly as produced/committed above.
+    let good_fetch = storage
+        .fetch(&good_topition, 0, min_bytes, max_bytes, isolation, max_wait)
+        .await?;
+    assert!(!good_fetch.is_empty());
+
+    let offset_fetch = storage
+        .offset_fetch(
+            Some(group_id.as_str()),
+            slice::from_ref(&good_topition),
+            None,
+        )
+        .await?;
+    assert_eq!(Some(&offset), offset_fetch.get(&good_topition));
+
+    // empty_name was rejected before anything was deleted, so its own data
+    // must still be there too.
+    let empty_topition = Topition::new(empty_name.as_str(), 0);
+    let empty_fetch = storage
+        .fetch(
+            &empty_topition,
+            0,
+            min_bytes,
+            max_bytes,
+            isolation,
+            max_wait,
+        )
+        .await?;
+    assert!(!empty_fetch.is_empty());
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -241,6 +405,20 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::create_delete_create_by_name(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_topic_name_mixed_list() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_topic_name_mixed_list(storage).await?;
 
         Ok(())
     }
