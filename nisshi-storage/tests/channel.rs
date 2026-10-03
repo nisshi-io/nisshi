@@ -157,6 +157,49 @@ async fn dropped_response_receiver_does_not_end_server_loop() -> Result<(), Test
     Ok(())
 }
 
+/// Dropping every [`RequestSender`](nisshi_storage::RequestSender) (no cancellation)
+/// must end the supervisor loop with `Ok(())`, instead of parking forever on
+/// `cancellation.cancelled()` once the channel has closed.
+#[tokio::test]
+async fn dropping_every_sender_ends_server_loop() -> Result<(), TestError> {
+    let _guard = init_tracing()?;
+
+    let (sender, receiver) = bounded_channel(10);
+    let cancellation = CancellationToken::new();
+    let mut join = JoinSet::new();
+
+    {
+        let cancellation = cancellation.clone();
+        let server = FlakyService::benign();
+
+        let _ = join.spawn(async move {
+            ChannelRequestLayer::new(cancellation)
+                .into_layer(server)
+                .serve(receiver)
+                .await
+        });
+    }
+
+    let client = RequestChannelService::new(sender);
+    client.ping().await?;
+    drop(client);
+
+    let joined = tokio::time::timeout(Duration::from_secs(2), join.join_next())
+        .await
+        .map_err(|_elapsed| {
+            TestError::Message(String::from(
+                "supervisor loop did not end after the channel closed (leaked)",
+            ))
+        })?;
+
+    assert!(
+        matches!(joined, Some(Ok(Ok(())))),
+        "supervisor loop ended, but not with Ok(()): {joined:?}"
+    );
+
+    Ok(())
+}
+
 /// F1: a panic while handling one request must not end the shared supervisor loop -
 /// a second, well-behaved request on the same channel must still succeed.
 #[tokio::test]
