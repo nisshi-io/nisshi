@@ -221,13 +221,23 @@ impl Storage for Engine {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         Ok(offsets
             .iter()
-            .map(|(topition, _)| {
+            .map(|(topition, list_offset)| {
+                // Earliest/Latest on an empty (here: nonexistent) partition is
+                // offset 0. A Timestamp lookup never matches a record in this
+                // backend, so it's "not found": leave offset as None so the
+                // caller applies Kafka's not-found default (-1), matching
+                // KafkaApis.scala's buildErrorResponse.
+                let offset = match list_offset {
+                    ListOffset::Earliest | ListOffset::Latest => Some(0),
+                    ListOffset::Timestamp(_) => None,
+                };
+
                 (
                     topition.to_owned(),
                     ListOffsetResponse {
                         error_code: ErrorCode::None,
                         timestamp: None,
-                        offset: Some(0),
+                        offset,
                     },
                 )
             })

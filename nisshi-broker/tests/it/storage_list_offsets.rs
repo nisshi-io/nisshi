@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::SystemTime;
+
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
@@ -107,6 +109,91 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     Ok(())
 }
 
+/// A Timestamp lookup that matches no record (here: an empty topic) is a
+/// not-found result, not an empty-partition result. At the wire level, Kafka's
+/// `buildErrorResponse` (KafkaApis.scala) sends offset=-1/timestamp=-1 with
+/// error_code=NONE for this case, and `ListOffsetsService` must apply that
+/// default rather than the Earliest/Latest empty-partition default of 0.
+async fn timestamp_no_match(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let topic = &alphanumeric_string(15)[..];
+
+    let num_partitions = 1;
+    let replication_factor = 0;
+
+    {
+        let response = create_topic
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(topic.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let service = ListOffsetsService {
+        storage: storage.clone(),
+    };
+
+    let response = service
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
+                .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                .replica_id(broker_id)
+                .topics(Some(
+                    [ListOffsetsTopic::default()
+                        .name(topic.into())
+                        .partitions(Some(
+                            [ListOffsetsPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .max_num_offsets(Some(3))
+                                .partition_index(0)
+                                .timestamp(ListOffset::Timestamp(SystemTime::now()).try_into()?)]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(topic, topics[0].name);
+
+    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+    assert_eq!(0, partitions[0].partition_index);
+    assert!(partitions[0].old_style_offsets.is_none());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
+    assert_eq!(Some(-1), partitions[0].offset);
+    assert_eq!(Some(0), partitions[0].leader_epoch);
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -128,6 +215,20 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::simple(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timestamp_no_match() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::timestamp_no_match(storage, broker_id).await?;
 
         Ok(())
     }
@@ -157,6 +258,20 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn timestamp_no_match() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::timestamp_no_match(storage, broker_id).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -183,6 +298,20 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn timestamp_no_match() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::timestamp_no_match(storage, broker_id).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -206,6 +335,20 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::simple(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timestamp_no_match() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::timestamp_no_match(storage, broker_id).await?;
 
         Ok(())
     }
