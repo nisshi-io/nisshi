@@ -581,6 +581,10 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.length
             .ok_or(Error::StringWithoutLength)
             .and_then(|length| {
+                if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+                    return Err(Error::MessageMaxSizeExceeded(length));
+                }
+
                 let mut buf = vec![0u8; length];
                 self.reader.read_exact(&mut buf)?;
                 from_utf8(buf.as_slice())
@@ -634,13 +638,18 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
 
         let length = if self.is_flexible() {
             self.unsigned_varint()
-                .and_then(|length| usize::try_from(length - 1).map_err(Into::into))?
+                .and_then(|length| usize::try_from(length).map_err(Into::into))
+                .and_then(|length| length.checked_sub(1).ok_or(Error::Overflow))?
         } else {
             let mut buf = [0u8; 4];
 
             self.reader.read_exact(&mut buf)?;
             usize::try_from(u32::from_be_bytes(buf))?
         };
+
+        if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+            return Err(Error::MessageMaxSizeExceeded(length));
+        }
 
         let mut buf = vec![0u8; length];
         self.reader.read_exact(&mut buf)?;
@@ -1513,7 +1522,8 @@ impl<'de> VariantAccess<'de> for Enum<'de, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::marker::PhantomData;
+    use serde::de::IgnoredAny;
+    use std::{io::Cursor, marker::PhantomData};
 
     /// A negative `batch_length` must be rejected before it sizes an
     /// allocation. Cast straight to `usize` it becomes `usize::MAX`, and
@@ -1527,5 +1537,61 @@ mod tests {
 
         let result = seq.next_element_seed(PhantomData::<crate::record::deflated::Batch>);
         assert!(result.is_err());
+    }
+
+    /// A declared length wildly exceeding the configured message size must
+    /// be rejected before it sizes an allocation, matching the guard
+    /// already present in `deserialize_byte_buf` and `deserialize_string`.
+    /// Asserting the specific `MessageMaxSizeExceeded` variant (not just
+    /// `is_err()`) matters: without the guard this same input still
+    /// returns an `Err`, just a different one (`Error::Io`, from
+    /// `read_exact` hitting an empty cursor after a huge allocation
+    /// attempt), so only the specific variant proves the allocation was
+    /// never attempted.
+    #[test]
+    fn deserialize_bytes_length_exceeding_max_size_returns_err_not_huge_allocation() {
+        let mut encoded = BytesMut::new();
+        encoded.put_u32(u32::try_from(MESSAGE_MAX_SIZE).unwrap() + 1); // wire lie, no data behind it
+
+        let mut cursor = Cursor::new(encoded.freeze());
+        let mut decoder = Decoder::new(&mut cursor);
+
+        let result = (&mut decoder).deserialize_bytes(IgnoredAny);
+
+        assert!(matches!(result, Err(Error::MessageMaxSizeExceeded(_))));
+    }
+
+    /// A flexible-format length prefix of `0` must be rejected with
+    /// `Error::Overflow`, not underflow the `u32` subtraction into
+    /// `u32::MAX` and size an allocation from the wrapped value.
+    #[test]
+    fn deserialize_bytes_flexible_zero_length_does_not_underflow() {
+        let mut encoded = BytesMut::new();
+        encoded.put_u8(0); // unsigned varint encoding of 0: no continuation bit
+
+        let mut cursor = Cursor::new(encoded.freeze());
+        // ApiVersionsResponse (api_key 18) is flexible from v3+.
+        let mut decoder = Decoder::response(&mut cursor, 18, 3);
+
+        let result = (&mut decoder).deserialize_bytes(IgnoredAny);
+
+        assert!(matches!(result, Err(Error::Overflow)));
+    }
+
+    /// `deserialize_str` has the identical missing-guard shape as
+    /// `deserialize_bytes` did: a declared length wildly exceeding the
+    /// configured message size must be rejected before it sizes an
+    /// allocation.
+    #[test]
+    fn deserialize_str_length_exceeding_max_size_returns_err_not_huge_allocation() {
+        let mut encoded = BytesMut::new();
+        encoded.put_i32(i32::try_from(MESSAGE_MAX_SIZE).unwrap() + 1); // wire lie, no data behind it
+
+        let mut cursor = Cursor::new(encoded.freeze());
+        let mut decoder = Decoder::new(&mut cursor);
+
+        let result = (&mut decoder).deserialize_str(IgnoredAny);
+
+        assert!(matches!(result, Err(Error::MessageMaxSizeExceeded(_))));
     }
 }
