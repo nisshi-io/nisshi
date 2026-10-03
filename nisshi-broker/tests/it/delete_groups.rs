@@ -12,18 +12,244 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{assert_matches, slice};
+use std::{assert_matches, slice, time::Duration};
 
-use crate::common::alphanumeric_string;
-use nisshi_broker::Error;
+use crate::common::{self, Formed, alphanumeric_string, form_group};
+use nisshi_broker::{
+    Error,
+    coordinator::group::{Coordinator as _, administrator::Controller},
+};
 use nisshi_sans_io::{
-    DeleteGroupsRequest, ErrorCode, RequestInput, create_topics_request::CreatableTopic,
+    DeleteGroupsRequest, DeleteGroupsResponse, ErrorCode, RequestInput,
+    create_topics_request::CreatableTopic,
 };
 use nisshi_storage::{
     DeleteGroupsService, GroupDetail, GroupDetailResponse, OffsetCommitRequest, Storage, Topition,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
+use tokio::time::sleep;
+
+/// A consumer joined to a group blocks its deletion (`NON_EMPTY_GROUP`), and
+/// the group's committed offsets survive the refused attempt; once the
+/// consumer leaves, the now-empty group deletes cleanly and its offsets are
+/// gone. This exercises the coordinator-level route
+/// (`Coordinator::delete_groups`), not the raw storage primitive the other
+/// tests in this file use.
+async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(), Error> {
+    let mut coordinator = Controller::with_storage(storage.clone())?;
+
+    let Formed {
+        group, member_id, ..
+    } = form_group(&coordinator)
+        .await
+        .map_err(|err| Error::Message(err.to_string()))?;
+
+    let topic_name = alphanumeric_string(15);
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let topition = Topition::new(topic_name, 0);
+    let offset = rng().random_range(0..i64::MAX);
+
+    let commit = storage
+        .offset_commit(
+            &group,
+            None,
+            &[(
+                topition.clone(),
+                OffsetCommitRequest::default().offset(offset),
+            )],
+        )
+        .await?;
+    assert_eq!(1, commit.len());
+    assert_eq!(ErrorCode::None, commit[0].1);
+
+    let response: DeleteGroupsResponse =
+        coordinator
+            .delete_groups(slice::from_ref(&group))
+            .await
+            .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+
+    let results = response.results.unwrap_or_default();
+    assert_eq!(1, results.len());
+    assert_eq!(group, results[0].group_id);
+    assert_eq!(
+        ErrorCode::NonEmptyGroup,
+        ErrorCode::try_from(results[0].error_code)?
+    );
+
+    // refused delete must not have touched storage: the offset is still
+    // there.
+    let offset_fetch = storage
+        .offset_fetch(Some(&group), slice::from_ref(&topition), None)
+        .await?;
+    assert_eq!(Some(&offset), offset_fetch.get(&topition));
+
+    _ = common::leave(&mut coordinator, &group, &member_id, None).await?;
+
+    let response: DeleteGroupsResponse =
+        coordinator
+            .delete_groups(slice::from_ref(&group))
+            .await
+            .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+
+    let results = response.results.unwrap_or_default();
+    assert_eq!(1, results.len());
+    assert_eq!(group, results[0].group_id);
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+
+    let offset_fetch = storage
+        .offset_fetch(Some(&group), slice::from_ref(&topition), None)
+        .await?;
+    assert_ne!(Some(&offset), offset_fetch.get(&topition));
+
+    Ok(())
+}
+
+/// Deleting a group must forget whatever the coordinator cached for it: a
+/// brand-new member joining under the same, just-deleted group name must
+/// succeed cleanly rather than tripping over a stale cached version that
+/// still points at the now-gone storage row. (`common::join`'s own
+/// assertions are the proof here: they panic on anything but a clean
+/// `ErrorCode::None` solo-leader join.)
+async fn delete_evicts_coordinator_cache(storage: impl Storage + Clone) -> Result<(), Error> {
+    let mut coordinator = Controller::with_storage(storage.clone())?;
+
+    let Formed {
+        group, member_id, ..
+    } = form_group(&coordinator)
+        .await
+        .map_err(|err| Error::Message(err.to_string()))?;
+
+    _ = common::leave(&mut coordinator, &group, &member_id, None).await?;
+
+    let response: DeleteGroupsResponse =
+        coordinator
+            .delete_groups(slice::from_ref(&group))
+            .await
+            .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+
+    let results = response.results.unwrap_or_default();
+    assert_eq!(1, results.len());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+
+    _ = common::join(
+        &mut coordinator,
+        &group,
+        None,
+        None,
+        None,
+        45_000,
+        Some(300_000),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Member expiry in this codebase is lazy: a member that misses its
+/// heartbeat is only evicted when some other request for the same group
+/// happens to arrive. `DeleteGroups` must apply that same eviction itself
+/// (via `missed_heartbeat`) before deciding a group is non-empty, or a
+/// consumer that died without `LeaveGroup` would make its group
+/// permanently undeletable.
+async fn delete_after_session_expiry(storage: impl Storage + Clone) -> Result<(), Error> {
+    let mut coordinator = Controller::with_storage(storage.clone())?;
+
+    let group_id = alphanumeric_string(15);
+    let session_timeout_ms = 500;
+
+    let joined = common::join(
+        &mut coordinator,
+        &group_id,
+        None,
+        None,
+        None,
+        session_timeout_ms,
+        Some(300_000),
+    )
+    .await
+    .map_err(|err| Error::Message(err.to_string()))?;
+    assert!(joined.is_leader());
+
+    sleep(Duration::from_millis(
+        u64::try_from(session_timeout_ms).unwrap_or(500) + 200,
+    ))
+    .await;
+
+    let response: DeleteGroupsResponse = coordinator
+        .delete_groups(slice::from_ref(&group_id))
+        .await
+        .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+
+    let results = response.results.unwrap_or_default();
+    assert_eq!(1, results.len());
+    assert_eq!(group_id, results[0].group_id);
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+
+    Ok(())
+}
+
+/// A group that only ever committed offsets (no `JoinGroup` ever happened)
+/// is a cache miss on every coordinator: `delete_groups` has to fall back to
+/// `Storage::describe_groups`, which used to error on this group's NULL
+/// `detail` column on the SQL backends (a group row with no detail row)
+/// instead of treating it as empty.
+async fn delete_offsets_only_group(storage: impl Storage + Clone) -> Result<(), Error> {
+    let coordinator = Controller::with_storage(storage.clone())?;
+
+    let topic_name = alphanumeric_string(15);
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let topition = Topition::new(topic_name, 0);
+    let group_id = alphanumeric_string(15);
+    let offset = rng().random_range(0..i64::MAX);
+
+    let commit = storage
+        .offset_commit(
+            &group_id,
+            None,
+            &[(
+                topition.clone(),
+                OffsetCommitRequest::default().offset(offset),
+            )],
+        )
+        .await?;
+    assert_eq!(1, commit.len());
+    assert_eq!(ErrorCode::None, commit[0].1);
+
+    let response: DeleteGroupsResponse = coordinator
+        .delete_groups(slice::from_ref(&group_id))
+        .await
+        .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+
+    let results = response.results.unwrap_or_default();
+    assert_eq!(1, results.len());
+    assert_eq!(group_id, results[0].group_id);
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+
+    Ok(())
+}
 
 async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = DeleteGroupsService {
@@ -292,6 +518,62 @@ mod in_memory {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn non_empty_group_then_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_empty_group_then_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_evicts_coordinator_cache() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_evicts_coordinator_cache(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_after_session_expiry() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_after_session_expiry(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_offsets_only_group() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_offsets_only_group(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -334,6 +616,62 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_empty_group_then_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_empty_group_then_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_evicts_coordinator_cache() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_evicts_coordinator_cache(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_after_session_expiry() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_after_session_expiry(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_offsets_only_group() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_offsets_only_group(storage).await?;
 
         Ok(())
     }
@@ -382,6 +720,62 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn non_empty_group_then_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_empty_group_then_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_evicts_coordinator_cache() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_evicts_coordinator_cache(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_after_session_expiry() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_after_session_expiry(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_offsets_only_group() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_offsets_only_group(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -424,6 +818,62 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_empty_group_then_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_empty_group_then_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_evicts_coordinator_cache() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_evicts_coordinator_cache(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_after_session_expiry() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_after_session_expiry(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_offsets_only_group() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_offsets_only_group(storage).await?;
 
         Ok(())
     }

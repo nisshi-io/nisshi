@@ -3473,12 +3473,18 @@ impl Storage for Postgres {
                     .await
                     .inspect_err(|err| error!(?err, group_id))?
                 {
-                    let value = row
-                        .try_get::<_, Value>(1)
-                        .inspect_err(|err| error!(?err, group_id))?;
-
-                    let current = serde_json::from_value::<GroupDetail>(value)
-                        .inspect(|current| debug!(?current))?;
+                    // A group row with no detail row (e.g. a group that only ever
+                    // committed offsets, never a JoinGroup) joins to a NULL
+                    // `detail` column here: that group exists and is empty, not
+                    // an error.
+                    let current = match row
+                        .try_get::<_, Option<Value>>(1)
+                        .inspect_err(|err| error!(?err, group_id))?
+                    {
+                        Some(value) => serde_json::from_value::<GroupDetail>(value)
+                            .inspect(|current| debug!(?current))?,
+                        None => GroupDetail::default(),
+                    };
 
                     results.push(NamedGroupDetail::found(group_id.into(), current));
                 } else {
