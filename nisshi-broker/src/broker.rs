@@ -34,10 +34,11 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    io::ErrorKind,
+    io::{self, ErrorKind},
     marker::PhantomData,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -66,7 +67,7 @@ pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// EOF and reset. Anything else is a client that spoke but could not
 /// negotiate: almost always a plaintext client or one that does not trust
 /// the broker certificate, so the warning says so.
-fn handshake_failed(addr: SocketAddr, err: &std::io::Error) {
+fn handshake_failed(addr: SocketAddr, err: &io::Error) {
     match err.kind() {
         ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
             debug!(%addr, ?err, "peer closed during tls handshake");
@@ -80,6 +81,53 @@ fn handshake_failed(addr: SocketAddr, err: &std::io::Error) {
             );
         }
     }
+}
+
+/// Pending-connection backlog passed to `listen(2)`.
+///
+/// Matches the value `tokio::net::TcpListener::bind` uses internally (via `mio`), so this
+/// socket behaves the same as the one it replaces.
+const LISTEN_BACKLOG: i32 = 1024;
+
+/// Builds, binds and arms a listening socket for `addr`, ready for
+/// [`TcpListener::from_std`](tokio::net::TcpListener::from_std).
+///
+/// macOS and Linux both default a new IPv6 socket to dual-stack (it also accepts
+/// IPv4-mapped connections), but that default is a tunable OS setting
+/// (`net.inet6.ip6.v6only` on macOS, `bindv6only` on Linux) a host can override. Clearing
+/// `IPV6_V6ONLY` here removes the dependency on that tuning, so an IPv6 `addr` always
+/// binds dual-stack. Setting `IPV6_V6ONLY` on an IPv4 socket fails, so this is skipped for
+/// an IPv4 `addr`.
+///
+/// A host with IPv6 unavailable (disabled in the kernel, or compiled out of it) fails to
+/// create the socket at all, before `IPV6_V6ONLY` is relevant. This is not handled here: it
+/// surfaces as a bind failure, and an operator on such a host must pass an IPv4
+/// `--kafka-listener-url` explicitly (for example `tcp://0.0.0.0:9092`).
+fn configure_listener(addr: SocketAddr) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+
+    // `TcpListener::bind` sets this on Unix by default; a bare `socket2::Socket` does not,
+    // so a restart while a prior connection is in `TIME_WAIT` would otherwise fail with
+    // `EADDRINUSE`.
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+
+    // `tokio::net::TcpListener::from_std` requires a non-blocking, already-listening
+    // socket.
+    socket.set_nonblocking(true)?;
+
+    Ok(socket)
+}
+
+/// Binds a listening, non-blocking, standard-library socket for `addr`. See
+/// [`configure_listener`] for the dual-stack behaviour.
+fn bind_dual_stack(addr: SocketAddr) -> io::Result<StdTcpListener> {
+    configure_listener(addr).map(StdTcpListener::from)
 }
 
 #[derive(Clone, Debug)]
@@ -270,7 +318,7 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
-        let listener = TcpListener::bind(self.listener.host().map_or_else(
+        let addr = self.listener.host().map_or_else(
             || {
                 SocketAddr::from((
                     IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -288,10 +336,12 @@ where
                     url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
                 }
             },
-        ))
-        .await
-        .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
-        .inspect_err(|err| error!(?err, %self.advertised_listener))?;
+        );
+
+        let listener = bind_dual_stack(addr)
+            .and_then(TcpListener::from_std)
+            .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
+            .inspect_err(|err| error!(?err, %self.advertised_listener))?;
 
         let mut interval =
             time::interval(self.maintenance_interval.unwrap_or(Duration::from_mins(10)));
@@ -864,5 +914,47 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             cancellation: self.cancellation,
             meter_provider,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_listener;
+    use std::net::{Ipv6Addr, SocketAddr};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Binding `[::]:0` without clearing `IPV6_V6ONLY` would make this listener IPv6-only:
+    /// a `127.0.0.1` connection would be refused, exactly the regression this socket2 bind
+    /// exists to prevent regardless of a host's `bindv6only`/`IPV6_V6ONLY` tuning.
+    #[tokio::test]
+    async fn dual_stack_listener_accepts_v4_and_v6_clients() {
+        let unspecified = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+
+        let socket = configure_listener(unspecified).expect("configure dual-stack listener");
+        assert_eq!(
+            Some(false),
+            socket.only_v6().ok(),
+            "IPV6_V6ONLY must be cleared on the dual-stack listener"
+        );
+
+        let port = socket
+            .local_addr()
+            .expect("local_addr")
+            .as_socket()
+            .expect("socket address")
+            .port();
+
+        let listener =
+            TcpListener::from_std(socket.into()).expect("hand the bound socket to tokio");
+
+        _ = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("a dual-stack listener must accept an IPv4 client");
+
+        _ = TcpStream::connect(("::1", port))
+            .await
+            .expect("a dual-stack listener must accept an IPv6 client");
+
+        drop(listener);
     }
 }

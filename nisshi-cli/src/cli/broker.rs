@@ -60,10 +60,16 @@ pub(super) struct Arg {
     cluster_id: String,
 
     /// The broker will listen on this address
+    //
+    // `[::]`, not `0.0.0.0`: the broker binds this with `IPV6_V6ONLY` cleared (see
+    // `nisshi_broker::broker::configure_listener`), so an IPv6 unspecified address still
+    // accepts IPv4 connections, and the default listens on every interface either way.
+    // `nisshi-proxy`'s own listener keeps its own `0.0.0.0` default: its bind path goes
+    // through `host_port`, which resolves and filters to IPv4 only (tracked separately).
     #[arg(
         long,
         env = "LISTENER_URL",
-        default_value = "tcp://0.0.0.0:9092",
+        default_value = "tcp://[::]:9092",
         visible_alias = "kafka-listener-url"
     )]
     listener_url: EnvVarExp<Url>,
@@ -556,6 +562,31 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Arg, clap::Error> {
         Arg::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
+    }
+
+    /// With neither flag nor environment variable overriding them, the listener binds
+    /// every interface dual-stack and the advertised listener resolves to the IPv4
+    /// loopback address, not `localhost`: a client whose resolver returns `::1` first
+    /// must not be sent back to an address this build cannot always serve.
+    ///
+    /// `LISTENER_URL` and `ADVERTISED_LISTENER_URL` are unset for the duration of this
+    /// test because CI and a developer's own `.env` both set `ADVERTISED_LISTENER_URL`,
+    /// which would otherwise mask the default this test exists to pin.
+    #[test]
+    fn defaults_resolve_listener_and_advertised_listener() {
+        temp_env::with_vars_unset(["LISTENER_URL", "ADVERTISED_LISTENER_URL"], || {
+            let arg = parse(&[]).expect("defaults parse");
+
+            assert_eq!(
+                Some(url::Host::Ipv6(std::net::Ipv6Addr::UNSPECIFIED)),
+                arg.listener_url.into_inner().host(),
+            );
+
+            assert_eq!(
+                Some("127.0.0.1"),
+                arg.advertised_listener_url.into_inner().host_str(),
+            );
+        });
     }
 
     #[test]

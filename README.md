@@ -74,7 +74,7 @@ Options:
       --kafka-listener-url <KAFKA_LISTENER_URL>
           The broker will listen on this address [env: LISTENER_URL=] [default: tcp://[::]:9092]
       --kafka-advertised-listener-url <KAFKA_ADVERTISED_LISTENER_URL>
-          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=tcp://localhost:9092] [default: tcp://localhost:9092]
+          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=tcp://127.0.0.1:9092] [default: tcp://127.0.0.1:9092]
       --storage-engine <STORAGE_ENGINE>
           Storage engine examples are: postgres://postgres:postgres@localhost, memory://nisshi/ or s3://nisshi/ [env: STORAGE_ENGINE=s3://nisshi/] [default: memory://nisshi/]
       --schema-registry <SCHEMA_REGISTRY>

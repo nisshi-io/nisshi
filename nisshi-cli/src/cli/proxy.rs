@@ -40,3 +40,52 @@ pub(super) struct Arg {
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     pub(super) otlp_endpoint_url: Option<EnvVarExp<Url>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Arg;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        inner: Arg,
+    }
+
+    fn parse() -> Arg {
+        temp_env::with_vars_unset(
+            ["LISTENER_URL", "ADVERTISED_LISTENER_URL", "ORIGIN_URL"],
+            || {
+                Wrapper::try_parse_from(["proxy"])
+                    .expect("defaults parse")
+                    .inner
+            },
+        )
+    }
+
+    /// The proxy's advertised listener and origin share `DEFAULT_BROKER` with the
+    /// broker's own advertised listener, so they resolve to the same IPv4 loopback
+    /// address, not `localhost`.
+    ///
+    /// The proxy's own listener keeps its own `0.0.0.0` default rather than following
+    /// suit: its bind path goes through `nisshi_service::host_port`, which resolves and
+    /// filters to IPv4 only, so it cannot bind an IPv6 address regardless.
+    #[test]
+    fn advertised_defaults_resolve_to_loopback() {
+        let arg = parse();
+
+        assert_eq!(
+            Some("127.0.0.1"),
+            arg.advertised_listener_url.into_inner().host_str(),
+        );
+
+        assert_eq!(Some("127.0.0.1"), arg.origin_url.into_inner().host_str(),);
+    }
+
+    #[test]
+    fn listener_default_stays_ipv4_unspecified() {
+        let arg = parse();
+
+        assert_eq!(Some("0.0.0.0"), arg.listener_url.into_inner().host_str(),);
+    }
+}
