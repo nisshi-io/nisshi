@@ -33,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # Installed directly (not via a reporting wrapper action) so the job's
       # own exit code is what gates the merge; a wrapper that posts to the
       # Checks API would need `checks: write`, which this workflow doesn't
@@ -45,13 +47,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: zizmor
+          tool: zizmor@1.30.1
       # GH_TOKEN enables zizmor's online audits (e.g. known-vulnerable-actions,
       # which checks pinned SHAs against GHSA) - the complement to SHA-pinning
       # below: pinning stops tag mutation, this catches a pin that's already
       # bad. contents:read is sufficient; no extra permission needed.
+      #
+      # The medium/medium filter below hides two finding classes entirely:
+      # `artipacked` (low confidence) and `cache-poisoning` (high severity,
+      # 0 medium). Every checkout in this repo now sets
+      # `persist-credentials: false`, so artipacked is fixed at the source
+      # and filtered out regardless of the threshold. cache-poisoning is
+      # still open (6 cache steps across test/fmt/clippy/compat-franz-go/
+      # cargo-publish-dry-run/third-party-license - tracked as SOL-155352)
+      # and stays filtered on purpose: confidence/severity
+      # thresholds are global zizmor CLI flags with no per-rule equivalent
+      # (confirmed against zizmor v1.30.1's own docs), so there is no way to
+      # loosen the filter to surface artipacked alone without also surfacing
+      # cache-poisoning, which is out of scope for this change.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor --min-confidence medium --min-severity medium .github/workflows/

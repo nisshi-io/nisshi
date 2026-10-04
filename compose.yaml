@@ -79,7 +79,11 @@ services:
       - 9092:9092
       - 9100:9100
   jaeger:
-    image: jaegertracing/all-in-one
+    # v1 line (jaegertracing/all-in-one) is effectively EOL - v2 ships under
+    # a different image name (jaegertracing/jaeger). Migrating is a separate
+    # task; this just stops riding an unpinned `latest`, matching the
+    # tag-only convention this file already uses for grafana/prometheus.
+    image: jaegertracing/all-in-one:1.76.0
     ports:
       - 16686:16686
       - 4317:4317
