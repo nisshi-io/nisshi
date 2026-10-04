@@ -23,6 +23,7 @@ nisshi-storage = {workspace = true, features = ["dynostore"]}
 object_store.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
+percent-encoding.workspace = true
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true

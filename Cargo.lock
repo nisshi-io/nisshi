@@ -6163,6 +6163,7 @@ dependencies = [
  "object_store 0.14.1",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
+ "percent-encoding",
  "rama",
  "rand 0.10.2",
  "regex",
