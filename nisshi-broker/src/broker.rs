@@ -920,7 +920,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 #[cfg(test)]
 mod tests {
     use super::configure_listener;
-    use std::net::{Ipv6Addr, SocketAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::net::{TcpListener, TcpStream};
 
     /// Binding `[::]:0` without clearing `IPV6_V6ONLY` would make this listener IPv6-only:
@@ -954,6 +954,34 @@ mod tests {
         _ = TcpStream::connect(("::1", port))
             .await
             .expect("a dual-stack listener must accept an IPv6 client");
+
+        drop(listener);
+    }
+
+    /// Guards the `if addr.is_ipv6()` gate in [`configure_listener`]: on macOS, calling
+    /// `set_only_v6` on an IPv4 socket fails with `EINVAL`, so an IPv4-literal bind (the path
+    /// `compose.yaml`'s explicit `--kafka-listener-url tcp://0.0.0.0:9092/` override uses) must
+    /// skip that call. If the gate were ever removed, this test fails on macOS with
+    /// `Os { code: 22, kind: InvalidInput }` where the dual-stack test above would not catch it.
+    #[tokio::test]
+    async fn ipv4_literal_listener_accepts_v4_clients() {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+
+        let socket = configure_listener(loopback).expect("configure IPv4-literal listener");
+
+        let port = socket
+            .local_addr()
+            .expect("local_addr")
+            .as_socket()
+            .expect("socket address")
+            .port();
+
+        let listener =
+            TcpListener::from_std(socket.into()).expect("hand the bound socket to tokio");
+
+        _ = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("an IPv4-literal listener must accept an IPv4 client");
 
         drop(listener);
     }
