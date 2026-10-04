@@ -95,10 +95,18 @@ const APPLICATION_JSON: &str = "application/json";
 /// becomes its own distinct, independently addressable group.
 ///
 /// The empty group id is the one case `PathPart`'s own encoding can't carry:
-/// percent-encoding `""` still produces an empty string, and appending an
-/// empty segment to a `Path` leaves a trailing delimiter that collapses back
-/// onto the parent `consumers/` prefix, colliding with every other group.
-/// `EMPTY_GROUP_SENTINEL` stands in for it instead.
+/// percent-encoding `""` still produces an empty string, and joining an empty
+/// segment onto a `Path` produces a key containing an empty path segment
+/// (e.g. `consumers//offsets/...`). Plain prefix-based operations
+/// (`list`/`delete`, used everywhere else in this module) happen to still
+/// treat that key as its own, correctly isolated group, because
+/// `object_store`'s prefix-match semantics require the byte right after the
+/// matched prefix to be a delimiter, and the doubled slash supplies it.
+/// `list_groups` is the exception: it lists via `list_with_delimiter`, whose
+/// common-prefix computation normalizes the doubled slash away, which
+/// surfaces a phantom group under the wrong name instead of the empty-id
+/// group. `EMPTY_GROUP_SENTINEL` stands in for the empty id instead, so
+/// `list_groups` never has to see a double slash in the first place.
 ///
 /// This sentinel can never collide with another group's real, encoded path
 /// segment:
