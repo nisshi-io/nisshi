@@ -269,6 +269,14 @@ pub enum Error {
     #[cfg(any(feature = "dynostore", feature = "slatedb"))]
     ObjectStore(Arc<object_store::Error>),
 
+    /// No AWS credential source (static keys, a profile, web identity, a task
+    /// role, or the EC2/ECS instance metadata service) could be resolved at
+    /// all. Distinct from [`Error::ObjectStore`], which covers every other
+    /// storage startup or request failure, including credentials that
+    /// resolved but turned out to be wrong.
+    #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+    NoCredentials(Arc<object_store::Error>),
+
     ParseFilter(Arc<ParseError>),
     Pattern(Arc<PatternError>),
     ParseInt(#[from] ParseIntError),

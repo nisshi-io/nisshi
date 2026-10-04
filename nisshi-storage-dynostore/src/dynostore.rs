@@ -2744,8 +2744,18 @@ impl Storage for DynoStore {
 
     #[instrument(skip_all)]
     async fn ping(&self) -> Result<()> {
-        // Verify connectivity by listing objects at the root
-        let _ = self.object_store.list(Some(&Path::from("/"))).next().await;
+        // Verify connectivity by listing objects at the root, propagating any
+        // error from the underlying object store instead of silently discarding
+        // it: a `list()` failure here (e.g. no usable credentials, an
+        // unreachable endpoint, a missing bucket) means storage isn't usable,
+        // and the broker should fail to start rather than discover this later
+        // as a confusing mid-request error.
+        let _ = self
+            .object_store
+            .list(Some(&Path::from("/")))
+            .next()
+            .await
+            .transpose()?;
         Ok(())
     }
 }

@@ -101,28 +101,39 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
 
         debug!(?minimum_size, ?maximum_delay);
 
-        AmazonS3Builder::from_env()
+        let object_store = AmazonS3Builder::from_env()
             .with_bucket_name(bucket_name)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
             .build()
-            .map(|object_store| {
-                DynoStore::new(
-                    configuration.cluster.as_str(),
-                    configuration.node_id,
-                    object_store,
-                )
-                .advertised_listener(configuration.advertised_listener.clone())
-                .schemas(configuration.schema_registry)
-                .lake(configuration.lake_house.clone())
-            })
-            .map(|storage| {
-                ProduceRequestBatcher::new(storage)
-                    .with_minimum_size(minimum_size)
-                    .with_maximum_delay(maximum_delay)
-            })
-            .map(Box::new)
-            .map(|storage| Arc::new(storage) as ArcDynStorage)
-            .map_err(Into::into)
+            .map_err(nisshi_storage::Error::from)?;
+
+        // Resolve AWS credentials now, before any request is attempted. A failure
+        // here is unambiguous: no credential source (static keys, a profile, web
+        // identity, a task role, or finally the EC2/ECS instance metadata service)
+        // could be resolved at all, as distinct from a later request failure (wrong
+        // bucket, wrong endpoint, credentials that resolved but are wrong, ...).
+        // `object_store` caches the resolved credential, so the `ping()` startup
+        // check that follows doesn't pay a second IMDS round trip for this.
+        let _ = object_store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(|source| nisshi_storage::Error::NoCredentials(Arc::new(source)))?;
+
+        let storage = DynoStore::new(
+            configuration.cluster.as_str(),
+            configuration.node_id,
+            object_store,
+        )
+        .advertised_listener(configuration.advertised_listener.clone())
+        .schemas(configuration.schema_registry)
+        .lake(configuration.lake_house.clone());
+
+        let storage = ProduceRequestBatcher::new(storage)
+            .with_minimum_size(minimum_size)
+            .with_maximum_delay(maximum_delay);
+
+        Ok(Arc::new(Box::new(storage)) as ArcDynStorage)
     }
 }
 

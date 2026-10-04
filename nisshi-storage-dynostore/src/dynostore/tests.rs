@@ -20,6 +20,7 @@ use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
 mod latency;
+mod ping;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();

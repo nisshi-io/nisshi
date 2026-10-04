@@ -60,6 +60,17 @@ async fn main() -> Result<ErrorCode> {
                 nisshi_topic::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
                 _ => error!("Unknown error occurred during command: {}", error),
             },
+            nisshi_cli::Error::Server(error) => match &**error {
+                #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+                nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
+                    error!("no AWS credentials found: {source}")
+                }
+                #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+                nisshi_broker::Error::Storage(nisshi_storage::Error::ObjectStore(source)) => error!(
+                    "storage failed its startup check: {source}. If this looks like a credentials problem, this build checks (in order): static AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, a web identity token (AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN), an ECS/EKS task credential endpoint, and finally the EC2 instance metadata service (IMDS)."
+                ),
+                _ => error!("Unknown error occurred during command: {}", error),
+            },
             nisshi_cli::Error::TlsCertificate { path, source } => error!(
                 "TLS certificate {} could not be loaded: {source}. Expected one or more PEM certificates (--cert).",
                 path.display()
