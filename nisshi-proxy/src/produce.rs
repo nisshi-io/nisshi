@@ -24,7 +24,7 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    ProduceRequest, ProduceResponse, RequestInput,
+    Ack, ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::{
@@ -563,6 +563,7 @@ fn produce_request(requests: Vec<BatchRequest>) -> ProduceRequest {
     }
 
     ProduceRequest::default()
+        .acks(Ack::Leader.into())
         .topic_data(Some(run.into_iter().collect::<Vec<_>>()))
         .timeout_ms(5_000)
 }
@@ -952,7 +953,7 @@ mod tests {
             vec![
                 ProduceRequest::default()
                     .transactional_id(None)
-                    .acks(0)
+                    .acks(1)
                     .timeout_ms(5000)
                     .topic_data(Some(
                         [TopicProduceData::default()
@@ -1096,7 +1097,7 @@ mod tests {
             vec![
                 ProduceRequest::default()
                     .transactional_id(None)
-                    .acks(0)
+                    .acks(1)
                     .timeout_ms(5000)
                     .topic_data(Some(
                         [
@@ -1313,7 +1314,7 @@ mod tests {
             vec![
                 ProduceRequest::default()
                     .transactional_id(None)
-                    .acks(0)
+                    .acks(1)
                     .timeout_ms(5000)
                     .topic_data(Some(
                         [TopicProduceData::default()

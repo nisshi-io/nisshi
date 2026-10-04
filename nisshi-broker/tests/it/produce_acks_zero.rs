@@ -266,6 +266,37 @@ fn invalid_produce_body(topic: &str, partition: i32, acks: i16) -> Result<Body> 
         .into())
 }
 
+/// An idempotent produce with a `producer_id` that was never registered via
+/// `InitProducerId`: rejected inside `storage.produce()` itself (`UnknownProducerId`),
+/// not by `ProduceService::partition`'s pre-storage `rejection()` check, the
+/// same pattern `produce.rs::non_txn_idempotent_unknown_producer_id` already
+/// proves is backend-uniform.
+fn unknown_producer_id_produce_body(topic: &str, partition: i32, acks: i16) -> Result<Body> {
+    let batch = inflated::Batch::builder()
+        .producer_id(54345)
+        .record(Record::builder().value(Some(Bytes::from_static(b"lorem"))))
+        .build()
+        .and_then(deflated::Batch::try_from)?;
+
+    Ok(ProduceRequest::default()
+        .acks(acks)
+        .timeout_ms(5_000)
+        .topic_data(Some(
+            [TopicProduceData::default()
+                .name(topic.into())
+                .partition_data(Some(
+                    [PartitionProduceData::default()
+                        .index(partition)
+                        .records(Some(deflated::Frame {
+                            batches: vec![batch],
+                        }))]
+                    .into(),
+                ))]
+            .into(),
+        ))
+        .into())
+}
+
 /// Confirms via `ListOffsets(Latest)` that the partition's high watermark
 /// moved, i.e. storage actually happened even though no Produce response did.
 async fn latest_offset<S>(stream: &mut S, topic: &str, partition: i32) -> Result<Option<i64>>
@@ -407,6 +438,46 @@ async fn acks_zero_failure_closes_connection(storage: Url) -> Result<()> {
     .await?
 }
 
+/// An `acks=0` Produce that fails inside `storage.produce()` itself (an
+/// idempotent producer id never registered via `InitProducerId`, giving
+/// `UnknownProducerId`) must also close the connection: the genuine
+/// storage/protocol-layer failure case this ticket exists for, distinct from
+/// `acks_zero_failure_closes_connection`'s pre-storage validation rejection.
+async fn acks_zero_storage_failure_closes_connection(storage: Url) -> Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        let broker = spawn_broker(storage).await?;
+        let mut stream = TcpStream::connect(broker.addr).await?;
+
+        let topic = &alphanumeric_string(15)[..];
+
+        create_topic(&mut stream, topic).await?;
+
+        write_request(
+            &mut stream,
+            ProduceRequest::KEY,
+            9,
+            1,
+            unknown_producer_id_produce_body(topic, 0, i16::from(Ack::None))?,
+        )
+        .await?;
+
+        let mut buf = [0u8; 1];
+        let outcome = timeout(Duration::from_secs(5), stream.read_exact(&mut buf)).await?;
+
+        assert!(
+            outcome.as_ref().is_err_and(|err| matches!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            )),
+            "an acks=0 produce failure at the storage layer (unknown producer id) \
+             must close the connection, got {outcome:?}"
+        );
+
+        Ok(())
+    })
+    .await?
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -421,6 +492,12 @@ mod in_memory {
     async fn failure_closes_connection() -> Result<()> {
         let _guard = init_tracing()?;
         acks_zero_failure_closes_connection(Url::parse("memory://")?).await
+    }
+
+    #[tokio::test]
+    async fn storage_failure_closes_connection() -> Result<()> {
+        let _guard = init_tracing()?;
+        acks_zero_storage_failure_closes_connection(Url::parse("memory://")?).await
     }
 }
 
@@ -438,6 +515,12 @@ mod slatedb {
     async fn failure_closes_connection() -> Result<()> {
         let _guard = init_tracing()?;
         acks_zero_failure_closes_connection(Url::parse("slatedb://memory")?).await
+    }
+
+    #[tokio::test]
+    async fn storage_failure_closes_connection() -> Result<()> {
+        let _guard = init_tracing()?;
+        acks_zero_storage_failure_closes_connection(Url::parse("slatedb://memory")?).await
     }
 }
 
@@ -457,6 +540,15 @@ mod pg {
         let _guard = init_tracing()?;
         acks_zero_failure_closes_connection(Url::parse("postgres://postgres:postgres@localhost")?)
             .await
+    }
+
+    #[tokio::test]
+    async fn storage_failure_closes_connection() -> Result<()> {
+        let _guard = init_tracing()?;
+        acks_zero_storage_failure_closes_connection(Url::parse(
+            "postgres://postgres:postgres@localhost",
+        )?)
+        .await
     }
 }
 
@@ -500,5 +592,15 @@ mod lite {
             .ok_or_else(|| anyhow!("unnamed thread"))?
             .to_owned();
         acks_zero_failure_closes_connection(sqlite_url(&name).await?).await
+    }
+
+    #[tokio::test]
+    async fn storage_failure_closes_connection() -> Result<()> {
+        let _guard = init_tracing()?;
+        let name = thread::current()
+            .name()
+            .ok_or_else(|| anyhow!("unnamed thread"))?
+            .to_owned();
+        acks_zero_storage_failure_closes_connection(sqlite_url(&name).await?).await
     }
 }
