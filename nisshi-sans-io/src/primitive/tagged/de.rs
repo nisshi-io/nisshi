@@ -243,6 +243,10 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                 Ok,
             )
             .and_then(|length| {
+                if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+                    return Err(Error::MessageMaxSizeExceeded(length));
+                }
+
                 let mut buf = vec![0u8; length];
                 self.reader.read_exact(&mut buf)?;
                 std::str::from_utf8(buf.as_slice())
@@ -485,5 +489,41 @@ impl<'de> SeqAccess<'de> for Struct<'de, '_> {
     {
         debug!("seed: {}", type_name_of_val(&seed));
         seed.deserialize(&mut *self.de).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Encode, primitive::varint::UnsignedVarInt};
+    use serde::de::IgnoredAny;
+    use std::io::Cursor;
+
+    /// `deserialize_str` has the identical missing-guard shape SOL-155177
+    /// closed in the sibling `de.rs` decoder's `deserialize_bytes` and
+    /// `deserialize_str`: a declared length wildly exceeding the
+    /// configured message size must be rejected before it sizes an
+    /// allocation, matching the guard already present on this same file's
+    /// `deserialize_string`. Asserting the specific
+    /// `MessageMaxSizeExceeded` variant (not just `is_err()`) matters:
+    /// without the guard this same input still returns an `Err`, just a
+    /// different one (`Error::Io`, from `read_exact` hitting an empty
+    /// cursor after a huge allocation attempt), so only the specific
+    /// variant proves the allocation was never attempted.
+    #[test]
+    fn deserialize_str_length_exceeding_max_size_returns_err_not_huge_allocation() {
+        // Tagged-field string lengths are varint-encoded as length + 1 (0
+        // means null); encode MESSAGE_MAX_SIZE + 2 so the decoded length,
+        // after the mandatory `- 1`, is MESSAGE_MAX_SIZE + 1 - just past
+        // the guard, with no data behind it on the wire.
+        let declared = u32::try_from(MESSAGE_MAX_SIZE).unwrap() + 2;
+        let encoded = UnsignedVarInt(declared).encode().unwrap();
+
+        let mut cursor = Cursor::new(encoded);
+        let mut decoder = Decoder::new(&mut cursor);
+
+        let result = (&mut decoder).deserialize_str(IgnoredAny);
+
+        assert!(matches!(result, Err(Error::MessageMaxSizeExceeded(_))));
     }
 }
