@@ -14,10 +14,13 @@
 
 use dotenv::dotenv;
 use nisshi_storage::{Error, Result};
+use object_store::path::PathPart;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::File, sync::Arc, thread};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+
+use super::{EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
 mod latency;
 
@@ -89,4 +92,58 @@ fn schema_change() -> Result<()> {
     assert!(x1.timestamps.is_none());
 
     Ok(())
+}
+
+// A group id that is the literal string "%empty" is non-empty, so it goes
+// through ordinary `PathPart` encoding rather than the sentinel. `%` is in
+// `object_store`'s reserved/escaped character set, so the leading `%` gets
+// escaped to `%25`, producing a segment distinct from `EMPTY_GROUP_SENTINEL`
+// itself. This is the empirical fact `EMPTY_GROUP_SENTINEL`'s safety argument
+// depends on, confirmed directly here rather than just inferred.
+#[test]
+fn percent_empty_literal_is_escaped_as_percent25empty() {
+    let part: PathPart<'_> = "%empty".into();
+    assert_eq!("%25empty", part.as_ref());
+}
+
+#[test]
+fn empty_group_id_encodes_as_sentinel() {
+    assert_eq!(EMPTY_GROUP_SENTINEL, group_path_part("").as_ref());
+}
+
+#[test]
+fn literal_percent_empty_group_id_does_not_collide_with_sentinel() {
+    let sentinel_segment = group_path_part("");
+    let literal_segment = group_path_part("%empty");
+
+    assert_ne!(sentinel_segment.as_ref(), literal_segment.as_ref());
+    assert_eq!(EMPTY_GROUP_SENTINEL, sentinel_segment.as_ref());
+    assert_eq!("%25empty", literal_segment.as_ref());
+}
+
+#[test]
+fn group_path_part_round_trips_through_decode_group_segment() {
+    for group_id in ["", "a", "a/b", "/", "//", "a/", "%empty", ".", ".."] {
+        let encoded = group_path_part(group_id);
+        let decoded = decode_group_segment(encoded.as_ref()).expect("encoded segment must decode");
+        assert_eq!(group_id, decoded, "round trip failed for {group_id:?}");
+    }
+}
+
+#[test]
+fn group_path_part_gives_every_id_a_distinct_segment() {
+    let ids = ["", "a", "/", "//", "a/", "%empty", ".", ".."];
+
+    for (i, a) in ids.iter().enumerate() {
+        for (j, b) in ids.iter().enumerate() {
+            let segments_equal = group_path_part(a).as_ref() == group_path_part(b).as_ref();
+            assert_eq!(i == j, segments_equal, "{a:?} vs {b:?}");
+        }
+    }
+}
+
+#[test]
+fn decode_group_segment_rejects_invalid_utf8() {
+    // 0x80 alone is not valid UTF-8, and is not the percent-encoded sentinel.
+    assert_eq!(None, decode_group_segment("%80"));
 }
