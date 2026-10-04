@@ -93,6 +93,18 @@ where
     })
 }
 
+/// Kafka's wire sentinel for "no timestamp", also the fold-start value
+/// `LogValidator` uses for a batch's running maximum.
+const NO_TIMESTAMP: i64 = -1;
+
+/// Kafka's own `log.message.timestamp.after.max.ms` default: how far ahead of
+/// the broker's clock a `CreateTime` record may claim to be.
+const TIMESTAMP_AFTER_MAX_MS: i64 = 3_600_000;
+
+/// Kafka's own `log.message.timestamp.before.max.ms` default
+/// (`Long.MAX_VALUE`): no lower bound.
+const TIMESTAMP_BEFORE_MAX_MS: i64 = i64::MAX;
+
 /// Why a client batch must be rejected before anything is written, with the
 /// error code to send, or `None` if it may be stored. Kafka's `LogValidator`
 /// rejects the same batches.
@@ -309,6 +321,63 @@ fn first_error(responses: &[TopicProduceResponse]) -> Option<(String, i32, Error
     })
 }
 
+/// Rewrites a `CreateTime` batch's `max_timestamp` to its records' actual
+/// maximum absolute timestamp when it differs from the header's claimed
+/// value, recomputing the CRC when it does, and rejects a record whose
+/// absolute timestamp falls outside the window Kafka's own
+/// `log.message.timestamp.{before,after}.max.ms` defaults allow.
+///
+/// Kafka's `LogValidator` exempts a record timestamped [`NO_TIMESTAMP`] from
+/// the bounds check, though such a record still folds into the batch's
+/// actual maximum like any other.
+///
+/// Returns `Ok(Some((error_code, reason)))` for a client-caused rejection --
+/// an out-of-bounds or overflowing timestamp, or a batch that cannot be
+/// decoded -- or `Ok(None)` once the batch is valid and, if needed,
+/// rewritten. `Err` means the CRC recompute itself failed: a broker-side
+/// failure, not anything the client sent.
+fn rewrite_create_time(
+    batch: &mut deflated::Batch,
+    now: i64,
+) -> Result<Option<(ErrorCode, &'static str)>> {
+    let Ok(inflated) = inflated::Batch::try_from(&*batch) else {
+        return Ok(Some((
+            ErrorCode::InvalidRecord,
+            "batch could not be decoded",
+        )));
+    };
+
+    let mut actual_max = NO_TIMESTAMP;
+
+    for record in &inflated.records {
+        let Some(absolute) = batch.base_timestamp.checked_add(record.timestamp_delta) else {
+            return Ok(Some((
+                ErrorCode::InvalidRecord,
+                "record timestamp overflows i64",
+            )));
+        };
+
+        if absolute != NO_TIMESTAMP
+            && (absolute > now.saturating_add(TIMESTAMP_AFTER_MAX_MS)
+                || absolute < now.saturating_sub(TIMESTAMP_BEFORE_MAX_MS))
+        {
+            return Ok(Some((
+                ErrorCode::InvalidTimestamp,
+                "record timestamp is outside the allowed window",
+            )));
+        }
+
+        actual_max = actual_max.max(absolute);
+    }
+
+    if actual_max != batch.max_timestamp {
+        batch.max_timestamp = actual_max;
+        batch.recompute_crc()?;
+    }
+
+    Ok(None)
+}
+
 /// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
 /// use bytes::Bytes;
@@ -434,6 +503,29 @@ where
             .current_leader(None)
     }
 
+    fn reject(
+        &self,
+        name: &str,
+        index: i32,
+        batch: &deflated::Batch,
+        error_code: ErrorCode,
+        reason: &'static str,
+    ) -> PartitionProduceResponse {
+        warn!(
+            topic = name,
+            partition = index,
+            producer_id = batch.producer_id,
+            record_count = batch.record_count,
+            last_offset_delta = batch.last_offset_delta,
+            ?error_code,
+            reason,
+            "rejecting produce batch",
+        );
+
+        self.error(index, error_code)
+            .error_message(Some(reason.into()))
+    }
+
     #[instrument(skip_all)]
     async fn partition(
         &self,
@@ -472,33 +564,36 @@ where
         };
 
         if let Some((error_code, reason)) = rejection(&batch) {
-            warn!(
-                topic = name,
-                partition = partition.index,
-                producer_id = batch.producer_id,
-                record_count = batch.record_count,
-                last_offset_delta = batch.last_offset_delta,
-                ?error_code,
-                reason,
-                "rejecting produce batch",
-            );
-
-            return self
-                .error(partition.index, error_code)
-                .error_message(Some(reason.into()));
+            return self.reject(name, partition.index, &batch, error_code, reason);
         }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
 
         if BatchAttribute::try_from(batch.attributes)
             .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
             .unwrap_or_default()
         {
-            let base_timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as i64)
-                .unwrap_or_default();
+            batch.base_timestamp = now;
+            batch.max_timestamp = now;
 
-            batch.base_timestamp = base_timestamp;
-            batch.max_timestamp = base_timestamp;
+            if let Err(err) = batch.recompute_crc() {
+                error!(?err);
+                return self.error(partition.index, ErrorCode::UnknownServerError);
+            }
+        } else {
+            match rewrite_create_time(&mut batch, now) {
+                Ok(Some((error_code, reason))) => {
+                    return self.reject(name, partition.index, &batch, error_code, reason);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    error!(?err);
+                    return self.error(partition.index, ErrorCode::UnknownServerError);
+                }
+            }
         }
 
         let tp = Topition::new(name, partition.index);
