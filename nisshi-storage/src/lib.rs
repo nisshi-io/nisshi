@@ -221,6 +221,17 @@ pub enum Error {
 
     Api(ErrorCode),
 
+    /// An `acks=0` Produce request had at least one non-`None` error code
+    /// among its partition responses. The client reads no response either
+    /// way under `acks=0`, so the caller closes the connection instead of
+    /// silently dropping the batch, carrying the first failing partition's
+    /// context for an operator reading the log.
+    AcksZeroProduceFailed {
+        topic: String,
+        partition: i32,
+        error_code: ErrorCode,
+    },
+
     ChronoParse(#[from] chrono::ParseError),
 
     #[cfg(any(feature = "postgres", feature = "libsql"))]

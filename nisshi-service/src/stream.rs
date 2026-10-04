@@ -24,7 +24,7 @@ use std::{
 use bytes::Bytes;
 use nanoid::nanoid;
 use nisshi_auth::AuthenticationExtension;
-use nisshi_sans_io::BytesInput;
+use nisshi_sans_io::{BytesInput, SuppressResponseExtension};
 use opentelemetry::KeyValue;
 use rama::{
     Layer, Service,
@@ -1031,6 +1031,16 @@ where
         let response = self
             .process(attributes, request, req.extensions().clone())
             .await?;
+
+        // An `acks=0` Produce response is suppressed here, after it's already been
+        // assembled and metered by `process`: `RESPONSE_SIZE`/`API_REQUESTS` count a
+        // response that is never actually written to the peer. That's a known, accepted
+        // minor inaccuracy rather than one worth threading a "don't record this" signal
+        // through every layer for.
+        if SuppressResponseExtension::take(req.extensions()) {
+            return Ok(());
+        }
+
         self.write(req, response, limits).await
     }
 }

@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use bytes::Bytes;
 use rama::{
     ServiceInput,
-    extensions::{Extensions, ExtensionsRef},
+    extensions::{Extension, Extensions, ExtensionsRef},
 };
 
 use crate::{Body, Frame, Request};
@@ -152,5 +157,42 @@ impl From<ServiceInput<Bytes>> for BytesInput {
             bytes: value.input,
             extensions: value.extensions,
         }
+    }
+}
+
+/// Marks that the response currently being assembled for a connection's
+/// in-flight request must not be written to the peer.
+///
+/// A connection's request/response loop processes one request at a time and
+/// shares one [`Extensions`] store across every request on it. `Extensions`
+/// has no way to remove an entry once inserted, so a plain one-shot insert
+/// would leak: every later request on the same connection would also find it
+/// present and be wrongly suppressed. Wrapping the flag in an [`AtomicBool`]
+/// lets [`Self::take`] read and clear it in one atomic step, so only the
+/// request that set it is ever suppressed.
+#[derive(Clone, Debug, Extension)]
+pub struct SuppressResponseExtension(Arc<AtomicBool>);
+
+impl SuppressResponseExtension {
+    /// Marks the in-flight request's response for suppression, inserting this
+    /// extension into `extensions` if this is the first request on the
+    /// connection to need it.
+    pub fn mark(extensions: &Extensions) {
+        if let Some(marker) = extensions.get_ref::<Self>() {
+            marker.0.store(true, Ordering::Release);
+        } else {
+            _ = extensions.insert(Self(Arc::new(AtomicBool::new(true))));
+        }
+    }
+
+    /// Reads and clears the marker, reporting whether it was set.
+    ///
+    /// A connection that never carries a suppressed response never gets this
+    /// extension inserted, so absence counts as unset.
+    #[must_use]
+    pub fn take(extensions: &Extensions) -> bool {
+        extensions
+            .get_ref::<Self>()
+            .is_some_and(|marker| marker.0.swap(false, Ordering::AcqRel))
     }
 }

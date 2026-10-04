@@ -19,8 +19,9 @@ use crate::common::{
 use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    BatchAttribute, CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest,
-    IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse, RequestInput,
+    Ack, BatchAttribute, CreateTopicsRequest, DeleteTopicsRequest, ErrorCode,
+    InitProducerIdRequest, IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest,
+    ProduceResponse, RequestInput,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -103,7 +104,10 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
     let index = rng().random_range(0..num_partitions);
 
     let transactional_id = None;
-    let acks = 0;
+    // Non-zero: acks=0 now closes the connection on any partition error
+    // instead of returning it in the response, which would break this
+    // test's assertion on the embedded error code.
+    let acks = i16::from(Ack::Leader);
     let timeout_ms = 0;
 
     let produce = ProduceService {
@@ -405,7 +409,10 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
         .await?;
 
     let transactional_id = None;
-    let acks = 0;
+    // Non-zero: acks=0 now closes the connection on any partition error
+    // instead of returning it in the response, which would break this
+    // test's assertion on the embedded error code.
+    let acks = i16::from(Ack::Leader);
     let timeout_ms = 0;
 
     let response = produce
@@ -552,7 +559,10 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
         .await?;
 
     let transactional_id = None;
-    let acks = 0;
+    // Non-zero: acks=0 now closes the connection on any partition error
+    // instead of returning it in the response, which would break this
+    // test's assertion on the embedded error code.
+    let acks = i16::from(Ack::Leader);
     let timeout_ms = 0;
 
     let response = produce
@@ -933,16 +943,18 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
     // Must be rejected, and nothing from it written.
     let mismatched = produce
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder()
-                    .record(Record::builder().value(Bytes::from_static(b"a").into()))
-                    .record(Record::builder().value(Bytes::from_static(b"b").into()))
-                    .record(Record::builder().value(Bytes::from_static(b"c").into()))
-                    .record(Record::builder().value(Bytes::from_static(b"d").into()))
-                    .record(Record::builder().value(Bytes::from_static(b"e").into())),
-            )?),
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(topic_data(
+                    topic,
+                    index,
+                    inflated::Batch::builder()
+                        .record(Record::builder().value(Bytes::from_static(b"a").into()))
+                        .record(Record::builder().value(Bytes::from_static(b"b").into()))
+                        .record(Record::builder().value(Bytes::from_static(b"c").into()))
+                        .record(Record::builder().value(Bytes::from_static(b"d").into()))
+                        .record(Record::builder().value(Bytes::from_static(b"e").into())),
+                )?),
             extensions: extensions.clone(),
         })
         .await?;
@@ -963,13 +975,15 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
     // A negative `last_offset_delta` must also be rejected.
     let negative = produce
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder()
-                    .record(Record::builder().value(Bytes::from_static(b"a").into()))
-                    .last_offset_delta(-1),
-            )?),
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(topic_data(
+                    topic,
+                    index,
+                    inflated::Batch::builder()
+                        .record(Record::builder().value(Bytes::from_static(b"a").into()))
+                        .last_offset_delta(-1),
+                )?),
             extensions: extensions.clone(),
         })
         .await?;
@@ -992,14 +1006,16 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
     // tools used to send.
     let too_large = produce
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder()
-                    .record(Record::builder().value(Bytes::from_static(b"a").into()))
-                    .record(Record::builder().value(Bytes::from_static(b"b").into()))
-                    .last_offset_delta(2),
-            )?),
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(topic_data(
+                    topic,
+                    index,
+                    inflated::Batch::builder()
+                        .record(Record::builder().value(Bytes::from_static(b"a").into()))
+                        .record(Record::builder().value(Bytes::from_static(b"b").into()))
+                        .last_offset_delta(2),
+                )?),
             extensions: extensions.clone(),
         })
         .await?;
@@ -1024,11 +1040,13 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
     // `record_count >= 1` has to be checked on its own to catch it.
     let empty = produce
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder().last_offset_delta(-1),
-            )?),
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(topic_data(
+                    topic,
+                    index,
+                    inflated::Batch::builder().last_offset_delta(-1),
+                )?),
             extensions: extensions.clone(),
         })
         .await?;
@@ -1053,12 +1071,14 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
     // instead make this insert collide with an existing primary key).
     let well_formed = produce
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder()
-                    .record(Record::builder().value(Bytes::from_static(b"well formed").into())),
-            )?),
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(topic_data(
+                    topic,
+                    index,
+                    inflated::Batch::builder()
+                        .record(Record::builder().value(Bytes::from_static(b"well formed").into())),
+                )?),
             extensions: extensions.clone(),
         })
         .await?;
@@ -1192,19 +1212,21 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
 
     let response = produce
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(Some(
-                [TopicProduceData::default()
-                    .name(name.into())
-                    .partition_data(Some(
-                        [PartitionProduceData::default()
-                            .index(partition)
-                            .records(Some(Frame {
-                                batches: vec![legit, forged],
-                            }))]
-                        .into(),
-                    ))]
-                .into(),
-            )),
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(name.into())
+                        .partition_data(Some(
+                            [PartitionProduceData::default()
+                                .index(partition)
+                                .records(Some(Frame {
+                                    batches: vec![legit, forged],
+                                }))]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
             extensions: extensions.clone(),
         })
         .await?;
@@ -1276,19 +1298,21 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
 
     let response = produce
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(Some(
-                [TopicProduceData::default()
-                    .name(name.into())
-                    .partition_data(Some(
-                        [PartitionProduceData::default()
-                            .index(partition)
-                            .records(Some(Frame {
-                                batches: vec![ordinary],
-                            }))]
-                        .into(),
-                    ))]
-                .into(),
-            )),
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(name.into())
+                        .partition_data(Some(
+                            [PartitionProduceData::default()
+                                .index(partition)
+                                .records(Some(Frame {
+                                    batches: vec![ordinary],
+                                }))]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
             extensions: extensions.clone(),
         })
         .await?;

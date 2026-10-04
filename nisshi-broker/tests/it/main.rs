@@ -48,6 +48,7 @@ pub mod policy_compact_delete;
 #[cfg(feature = "libsql")]
 pub mod pre_authentication_frame_size;
 pub mod produce;
+pub mod produce_acks_zero;
 pub mod produce_fetch;
 pub mod sasl_scram_enforcement;
 pub mod storage_describe_cluster;

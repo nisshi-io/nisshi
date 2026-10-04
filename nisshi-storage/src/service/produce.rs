@@ -15,8 +15,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nisshi_sans_io::{
-    ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
-    TimestampType,
+    Ack, ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
+    SuppressResponseExtension, TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::deflated,
@@ -165,6 +165,29 @@ mod rejection_tests {
             storage_error_code(&Error::SansIo(nisshi_sans_io::Error::Overflow))
         );
     }
+}
+
+/// The first partition in `responses` carrying a non-[`ErrorCode::None`]
+/// error code, for the message an `acks=0` closed connection logs: the
+/// client gets no response at all, so an operator needs to know which
+/// partition actually failed.
+fn first_error(responses: &[TopicProduceResponse]) -> Option<(String, i32, ErrorCode)> {
+    responses.iter().find_map(|topic| {
+        topic
+            .partition_responses
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|partition| partition.error_code != i16::from(ErrorCode::None))
+            .map(|partition| {
+                (
+                    topic.name.clone(),
+                    partition.index,
+                    ErrorCode::try_from(partition.error_code)
+                        .unwrap_or(ErrorCode::UnknownServerError),
+                )
+            })
+    })
 }
 
 /// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
@@ -432,6 +455,26 @@ where
                         .await,
                 )
             }
+        }
+
+        // Kafka's `KafkaApis.handleProduceRequest` closes the connection for an
+        // `acks=0` request whenever any partition in the assembled response map
+        // carries an error, not only a storage failure: `unauthorizedTopicResponses`,
+        // `nonExistingTopicResponses` and `invalidRequestResponses` are merged into
+        // that map before the check runs. The client reads no response under
+        // `acks=0` regardless, so closing on any error (rather than silently
+        // dropping the batch) matches that behaviour and gives a real Kafka
+        // producer a retriable `NetworkException` instead of nothing at all.
+        if input.request.acks == i16::from(Ack::None) {
+            if let Some((topic, partition, error_code)) = first_error(&responses) {
+                return Err(Error::AcksZeroProduceFailed {
+                    topic,
+                    partition,
+                    error_code,
+                });
+            }
+
+            SuppressResponseExtension::mark(&input.extensions);
         }
 
         Ok(ProduceResponse::default()
