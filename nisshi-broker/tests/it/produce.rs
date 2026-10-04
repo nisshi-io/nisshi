@@ -1648,7 +1648,18 @@ async fn produce_rewrites_header_max_timestamp(
 /// record timestamped far enough in the future to fail the new check must
 /// still be accepted, because the `LogAppendTime` bit routes the batch past
 /// it entirely.
-async fn produce_log_append_time_ignores_bounds_check(storage: impl Storage + Clone) -> Result<()> {
+///
+/// It also guards the pre-existing `recompute_crc()` call on this
+/// `LogAppendTime` rewrite path: without it, a byte-preserving backend would
+/// hand a consumer back a batch whose header no longer matches its stored
+/// CRC. `assert_stored_header` gates this the same way
+/// [`produce_rewrites_header_max_timestamp`] does, since only a
+/// byte-preserving backend's fetch returns the exact bytes
+/// [`ProduceService`] wrote.
+async fn produce_log_append_time_ignores_bounds_check(
+    storage: impl Storage + Clone,
+    assert_stored_header: bool,
+) -> Result<()> {
     let topic = &alphanumeric_string(15)[..];
 
     let extensions = Extensions::default();
@@ -1719,6 +1730,12 @@ async fn produce_log_append_time_ignores_bounds_check(storage: impl Storage + Cl
         ErrorCode::try_from(partitions[0].error_code)?
     );
     assert_eq!(0, partitions[0].base_offset);
+
+    if assert_stored_header {
+        let fetched = fetch_batches(storage.clone(), topic, index).await?;
+        assert_eq!(1, fetched.len());
+        assert_eq!(fetched[0].computed_crc()?, fetched[0].crc);
+    }
 
     Ok(())
 }
@@ -1874,7 +1891,7 @@ mod in_memory {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_log_append_time_ignores_bounds_check(storage).await?;
+            super::produce_log_append_time_ignores_bounds_check(storage, true).await?;
 
             Ok(())
         }
@@ -2032,7 +2049,7 @@ mod lite {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_log_append_time_ignores_bounds_check(storage).await?;
+            super::produce_log_append_time_ignores_bounds_check(storage, false).await?;
 
             Ok(())
         }
@@ -2190,7 +2207,7 @@ mod slatedb {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_log_append_time_ignores_bounds_check(storage).await?;
+            super::produce_log_append_time_ignores_bounds_check(storage, true).await?;
 
             Ok(())
         }
@@ -2348,7 +2365,7 @@ mod pg {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_log_append_time_ignores_bounds_check(storage).await?;
+            super::produce_log_append_time_ignores_bounds_check(storage, false).await?;
 
             Ok(())
         }
