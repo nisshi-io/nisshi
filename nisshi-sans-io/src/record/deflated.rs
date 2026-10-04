@@ -254,6 +254,24 @@ impl Batch {
             .map(|record_count| exceeds_decoded_batch_limit(record_count, size_of::<Record>()))
             .unwrap_or(true)
     }
+
+    /// The CRC-32C of this batch's current contents, as Kafka's own encoder
+    /// would compute it: everything from `attributes` through `record_data`.
+    pub fn computed_crc(&self) -> Result<u32> {
+        CrcData::from(self).crc()
+    }
+
+    /// Recomputes `crc` from this batch's current contents.
+    ///
+    /// Anything that mutates a field covered by the CRC after the batch was
+    /// built (for example, rewriting `max_timestamp` to match its records'
+    /// actual maximum, or rewriting `base_timestamp`/`max_timestamp` for a
+    /// `LogAppendTime` batch) must call this afterwards, or `crc` goes stale
+    /// and a client re-decoding the stored bytes sees a corrupted batch.
+    pub fn recompute_crc(&mut self) -> Result<()> {
+        self.crc = self.computed_crc()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1566,6 +1584,44 @@ mod tests {
             assert!(Vec::<Record>::try_from(batch.clone()).is_err());
             assert!(Vec::<Record>::try_from(&batch).is_err());
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn computed_crc_matches_a_freshly_built_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        assert_eq!(batch.crc, batch.computed_crc()?);
+
+        Ok(())
+    }
+
+    /// Rewriting a field the CRC covers (here `base_timestamp`, the way
+    /// `ProduceService` rewrites it) must leave the stored `crc` stale until
+    /// [`Batch::recompute_crc`] is called.
+    #[test]
+    fn recompute_crc_fixes_a_rewritten_field() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut batch: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let original_crc = batch.crc;
+
+        batch.base_timestamp += 1;
+        assert_eq!(original_crc, batch.crc);
+        assert_ne!(batch.computed_crc()?, batch.crc);
+
+        batch.recompute_crc()?;
+        assert_eq!(batch.computed_crc()?, batch.crc);
 
         Ok(())
     }
