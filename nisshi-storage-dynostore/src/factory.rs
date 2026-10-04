@@ -108,10 +108,11 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             .map_err(nisshi_storage::Error::from)?;
 
         // Resolve AWS credentials now, before any request is attempted. A failure
-        // here is unambiguous: no credential source (static keys, a profile, web
-        // identity, a task role, or finally the EC2/ECS instance metadata service)
-        // could be resolved at all, as distinct from a later request failure (wrong
-        // bucket, wrong endpoint, credentials that resolved but are wrong, ...).
+        // here is unambiguous: no credential source (static keys, web identity, a
+        // task role, or finally the EC2 instance metadata service or the ECS task
+        // credential endpoint) could be resolved at all, as distinct from a later
+        // request failure (wrong bucket, wrong endpoint, credentials that resolved
+        // but are wrong, ...).
         // `object_store` caches the resolved credential, so the `ping()` startup
         // check that follows doesn't pay a second IMDS round trip for this.
         let _ = object_store
@@ -209,3 +210,6 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
             .map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod tests;
