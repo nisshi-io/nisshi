@@ -182,7 +182,7 @@ use std::{
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTime, SystemTimeError},
 };
-use tokio::sync::AcquireError;
+use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing_subscriber::filter::ParseError;
@@ -190,11 +190,13 @@ use url::Url;
 use uuid::Uuid;
 
 mod batch;
+mod inflate;
 mod latency;
 mod proxy;
 mod service;
 
 pub use batch::ProduceRequestBatcher;
+pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use proxy::SemaphoreProxy;
 
@@ -238,6 +240,9 @@ pub enum Error {
     Glob(Arc<GlobError>),
     InsufficientCapacity(#[from] InsufficientCapacity),
     Io(Arc<io::Error>),
+
+    /// An [`offload`]ed task panicked or was cancelled.
+    Join(Arc<JoinError>),
 
     LessThanBaseOffset {
         offset: i64,
@@ -348,6 +353,12 @@ impl From<TryGetError> for Error {
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
+    }
+}
+
+impl From<JoinError> for Error {
+    fn from(value: JoinError) -> Self {
+        Self::Join(Arc::new(value))
     }
 }
 
