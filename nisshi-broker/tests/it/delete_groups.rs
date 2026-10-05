@@ -57,7 +57,7 @@ async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error>
 /// committed offsets.
 ///
 /// Kafka still accepts `""` in DeleteGroups for backwards compatibility.
-/// Every backend - SQL, SlateDB, and dynostore alike - now treats it like any
+/// Every backend - SQL, SlateDB, and dynostore alike - treats it like any
 /// other opaque group id that nothing was ever committed under: SQL and
 /// SlateDB answer `GROUP_ID_NOT_FOUND`. Dynostore's object store layer
 /// treats `delete` as idempotent (deleting an absent key still succeeds, the
@@ -292,15 +292,13 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
     Ok(())
 }
 
-/// Free regression coverage for a side effect of the same fix: before it, a
-/// group id containing `/` was already partially broken on dynostore,
-/// independent of delete_groups. `committed_offset_topitions`'s positional
-/// path-segment parsing (`.parts().nth(6)`, `.nth(8)`) assumed the group id
-/// was exactly one path segment; a group id like `"a/b"` split into two,
+/// Regression coverage for `committed_offset_topitions`'s positional
+/// path-segment parsing (`.parts().nth(6)`, `.nth(8)`), independent of
+/// `delete_groups`: that parsing assumes the group id is exactly one path
+/// segment. A group id like `"a/b"` would otherwise split into two segments,
 /// shifting every later segment and turning the partition-number parse into
-/// a `ParseIntError`. Encoding the whole group id as one opaque segment fixes
-/// this as a side effect. This test fails on current `main` and passes after
-/// the fix.
+/// a `ParseIntError`. Encoding the whole group id as one opaque segment keeps
+/// that assumption true for every group id.
 #[cfg(feature = "dynostore")]
 async fn slash_in_group_id_does_not_break_committed_offset_topitions(
     storage: impl Storage + Clone,

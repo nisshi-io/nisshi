@@ -51,8 +51,7 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
 /// key containing a doubled slash (`consumers//offsets/...`), and
 /// `list_with_delimiter`'s common-prefix computation normalizes that doubled
 /// slash away - surfacing a phantom group under the wrong name instead of
-/// the real empty-id group, the same "phantom group literally named
-/// something wrong" failure mode the ticket started from.
+/// the real empty-id group.
 ///
 /// This commits an offset under group id `""`, then asserts `list_groups`
 /// reports a group with id exactly `""` and does not report any phantom

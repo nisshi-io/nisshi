@@ -95,12 +95,12 @@ fn schema_change() -> Result<()> {
     Ok(())
 }
 
-// A group id that is the literal string "%empty" is non-empty, so it goes
-// through ordinary `PathPart` encoding rather than the sentinel. `%` is in
-// `object_store`'s reserved/escaped character set, so the leading `%` gets
-// escaped to `%25`, producing a segment distinct from `EMPTY_GROUP_SENTINEL`
-// itself. This is the empirical fact `EMPTY_GROUP_SENTINEL`'s safety argument
-// depends on, confirmed directly here rather than just inferred.
+/// A group id that is the literal string "%empty" is non-empty, so it goes
+/// through ordinary `PathPart` encoding rather than the sentinel. `%` is in
+/// `object_store`'s reserved/escaped character set, so the leading `%` gets
+/// escaped to `%25`, producing a segment distinct from `EMPTY_GROUP_SENTINEL`
+/// itself. This is the empirical fact `EMPTY_GROUP_SENTINEL`'s safety argument
+/// depends on, confirmed directly here rather than just inferred.
 #[test]
 fn percent_empty_literal_is_escaped_as_percent25empty() {
     let part: PathPart<'_> = "%empty".into();
