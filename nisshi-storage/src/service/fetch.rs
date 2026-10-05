@@ -228,6 +228,14 @@ where
     }
 
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
+        self.topic_error_response(fetch, ErrorCode::UnknownTopicOrPartition)
+    }
+
+    fn topic_error_response(
+        &self,
+        fetch: &FetchTopic,
+        error_code: ErrorCode,
+    ) -> Result<FetchableTopicResponse> {
         Ok(FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
             .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
@@ -237,7 +245,7 @@ where
                     .map(|partition| {
                         PartitionData::default()
                             .partition_index(partition.partition)
-                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                            .error_code(error_code.into())
                             .high_watermark(0)
                             .last_stable_offset(Some(0))
                             .log_start_offset(Some(-1))
@@ -416,7 +424,9 @@ where
             // These fields apply to the whole request, and (unlike e.g.
             // ListOffsets) `FetchResponse` has a top-level `error_code` for
             // exactly this: a malformed value here reports `INVALID_REQUEST`
-            // once, rather than leaking the low-level parse error.
+            // there, rather than leaking the low-level parse error. That
+            // field is `versions: 7+` though, so it's also mirrored onto
+            // every requested partition for clients on earlier versions.
             let isolation_level = input.request.isolation_level.map_or(
                 Ok(IsolationLevel::ReadUncommitted),
                 IsolationLevel::try_from,
@@ -444,12 +454,23 @@ where
                     malformed => {
                         debug!(?malformed, "malformed fetch request");
 
+                        // pre-v7 clients can't see the top-level error code
+                        // above (it's `versions: 7+`, absent on the wire for
+                        // them), so the same error has to also show up per
+                        // partition or those clients see no error at all
+                        let responses = topics
+                            .iter()
+                            .map(|topic| {
+                                self.topic_error_response(topic, ErrorCode::InvalidRequest)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
                         return Ok(FetchResponse::default()
                             .throttle_time_ms(Some(0))
                             .error_code(Some(ErrorCode::InvalidRequest.into()))
                             .session_id(Some(0))
                             .node_endpoints(Some([].into()))
-                            .responses(Some([].into())));
+                            .responses(Some(responses)));
                     }
                 };
 
