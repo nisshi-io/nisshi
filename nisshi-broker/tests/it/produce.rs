@@ -1485,7 +1485,7 @@ async fn produce_rejects_future_timestamp(storage: impl Storage + Clone) -> Resu
 /// only there does the fetched batch carry back the exact bytes
 /// [`ProduceService`] wrote. A SQL backend's fetch reconstructs a fresh
 /// batch from its flat record storage rather than returning the stored
-/// bytes, and (a separate, pre-existing gap from this ticket) never derives
+/// bytes, and (a separate, pre-existing gap) never derives
 /// that reconstructed batch's `max_timestamp` from the records it just read,
 /// so neither its `max_timestamp` nor its `crc` says anything about what
 /// [`ProduceService`] wrote here.
