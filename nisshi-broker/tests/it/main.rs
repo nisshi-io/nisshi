@@ -61,7 +61,6 @@ pub mod traceforge_group_join;
 pub mod traceforge_offset_commit;
 pub mod traceforge_produce_idempotent;
 pub mod traceforge_produce_object_store_fault;
-pub mod traceforge_spike;
 pub mod txn;
 pub mod update_group_conditional;
 
