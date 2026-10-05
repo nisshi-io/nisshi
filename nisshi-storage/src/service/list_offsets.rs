@@ -128,8 +128,8 @@ where
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         let deadline = Instant::now() + LIST_OFFSETS_READ_DEADLINE;
 
-        // the reads are built up front (but not started) rather than in a
-        // `StreamExt::map` closure, whose lifetimes keep `serve` from being `Send`
+        // The reads are built up front (but not started) rather than in a
+        // `StreamExt::map` closure, whose lifetimes keep `serve` from being `Send`.
         let reads = offsets
             .iter()
             .enumerate()
