@@ -1580,12 +1580,12 @@ mod tests {
         Ok(())
     }
 
-    /// Before the length-prefix fix, a header count that outruns this
-    /// record's own declared length reads into whatever bytes happen to
-    /// follow it in the batch -- here, two bytes that belong to no record
-    /// at all -- instead of failing at the true per-record boundary.
-    /// `record_count: 1` so only this one record's own `Record::decode`
-    /// call is exercised (the uncompressed by-value path).
+    /// A header count that outruns this record's own declared length is
+    /// rejected at the true per-record boundary, instead of reading into
+    /// whatever bytes happen to follow it in the batch -- here, two bytes
+    /// that belong to no record at all. `record_count: 1` so only this
+    /// one record's own `Record::decode` call is exercised (the
+    /// uncompressed by-value path).
     #[test]
     fn header_count_reads_past_record_boundary_is_rejected() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1593,8 +1593,8 @@ mod tests {
         // record: length=6, body=[attributes=0, timestamp_delta=0,
         // offset_delta=0, null key, null value, header_count=1], followed
         // by two bytes that belong to no record -- a phantom null/null
-        // header a pre-fix decode would happily consume as this record's
-        // one declared header.
+        // header that decode must not consume as this record's one
+        // declared header.
         let record_data = Bytes::from_static(&[12, 0, 0, 0, 1, 1, 2, 1, 1]);
 
         let batch = Batch {

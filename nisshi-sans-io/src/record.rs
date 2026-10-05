@@ -604,10 +604,10 @@ mod tests {
     /// A declared record length with no room left for the key payload its
     /// own key-length byte claims: body = [attributes=0, timestamp_delta=0,
     /// offset_delta=0, key_length=5], declared length 4 -- exactly enough
-    /// for those four bytes and nothing more. Without a length-prefix
-    /// bound, `Octets::decode` would read the 5 "key" bytes from whatever
-    /// follows in the wider buffer (here, deliberately distinct filler)
-    /// instead of failing at this record's true boundary.
+    /// for those four bytes and nothing more. `Octets::decode` rejects a
+    /// key length that reaches past this record's declared boundary,
+    /// rather than reading from whatever follows in the wider buffer
+    /// (here, deliberately distinct filler).
     #[test]
     fn decode_length_shorter_than_fields_returns_overflow() -> Result<()> {
         let _guard = init_tracing()?;
@@ -619,9 +619,10 @@ mod tests {
         encoded.put(VarInt(0).encode()?); // offset_delta
         encoded.put(VarInt(5).encode()?); // key length: claims 5 bytes
 
-        // Filler that belongs to no record. A pre-fix decode has enough
-        // bytes left in the *whole* buffer to read this as the key,
-        // reaching across this record's declared boundary.
+        // Filler that belongs to no record. Decode stops at this record's
+        // declared boundary instead of reading these bytes as the key,
+        // even though the wider buffer has enough bytes left to satisfy
+        // the claimed key length.
         encoded.put_slice(&[0u8; 10]);
 
         let mut encoded = encoded.freeze();
