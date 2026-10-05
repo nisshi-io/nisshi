@@ -167,11 +167,9 @@ where
                                                         )
                                                         // Kafka's buildErrorResponse (KafkaApis.scala)
                                                         // sends offset=-1 on every error path, not just
-                                                        // when a Timestamp lookup finds no match. This
-                                                        // default fires today: SlateDb's storage.rs
-                                                        // leaves offset: None on its "topic not found" and
-                                                        // "partition out of range" paths, both returning
-                                                        // UnknownTopicOrPartition.
+                                                        // when a Timestamp lookup finds no match, so a
+                                                        // backend that leaves offset: None on any
+                                                        // not-found path gets the same default here.
                                                         .offset(offset.offset().or(Some(-1)))
                                                         .leader_epoch(Some(0)),
                                                 )
