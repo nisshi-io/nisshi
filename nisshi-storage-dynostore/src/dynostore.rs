@@ -2858,7 +2858,7 @@ impl Storage for DynoStore {
             }
 
             TxnAddPartitionsRequest::VersionFourPlus { .. } => {
-                todo!()
+                Err(Error::UnsupportedTxnAddPartitionsVersion)
             }
         }
     }

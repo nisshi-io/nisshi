@@ -34,7 +34,6 @@ pub mod describe_topic_partitions;
 pub mod fetch;
 pub mod fetch_wire;
 pub mod find_coordinator;
-pub mod get_telemetry_subscriptions;
 pub mod group_cache_miss;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;
@@ -76,6 +75,7 @@ pub mod traceforge_produce_object_store_fault;
 pub mod txn;
 pub mod unauthenticated;
 pub mod update_group_conditional;
+pub mod version_gate;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a
 // `pub mod` line would never compile or run. Fail instead of skipping it silently.

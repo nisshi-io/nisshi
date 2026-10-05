@@ -3625,7 +3625,7 @@ impl Storage for Engine {
             }
 
             TxnAddPartitionsRequest::VersionFourPlus { .. } => {
-                todo!()
+                Err(Error::UnsupportedTxnAddPartitionsVersion)
             }
         }
     }
