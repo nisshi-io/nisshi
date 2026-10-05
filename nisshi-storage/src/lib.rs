@@ -203,12 +203,13 @@ pub use service::{
     ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DeleteGroupsService,
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
-    DescribeUserScramCredentialsService, FetchService, FindCoordinatorService,
-    GetTelemetrySubscriptionsService, IncrementalAlterConfigsService, InitProducerIdService,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, bounded_channel,
+    DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
+    FetchValidationService, FindCoordinatorService, GetTelemetrySubscriptionsService,
+    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MetadataService, ProduceService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService, bounded_channel,
 };
 
 #[cfg(feature = "dynostore")]

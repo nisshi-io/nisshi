@@ -227,43 +227,6 @@ where
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 
-    fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
-        self.topic_error_response(fetch, ErrorCode::UnknownTopicOrPartition)
-    }
-
-    fn topic_error_response(
-        &self,
-        fetch: &FetchTopic,
-        error_code: ErrorCode,
-    ) -> Result<FetchableTopicResponse> {
-        Ok(FetchableTopicResponse::default()
-            .topic(fetch.topic.clone())
-            .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
-            .partitions(fetch.partitions.as_ref().map(|partitions| {
-                partitions
-                    .iter()
-                    .map(|partition| {
-                        PartitionData::default()
-                            .partition_index(partition.partition)
-                            .error_code(error_code.into())
-                            .high_watermark(0)
-                            .last_stable_offset(Some(0))
-                            .log_start_offset(Some(-1))
-                            .diverging_epoch(Some(
-                                EpochEndOffset::default().epoch(-1).end_offset(-1),
-                            ))
-                            .current_leader(Some(
-                                LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
-                            ))
-                            .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
-                            .aborted_transactions(Some([].into()))
-                            .preferred_read_replica(Some(-1))
-                            .records(None)
-                    })
-                    .collect()
-            })))
-    }
-
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, min_bytes, isolation, fetch))]
     async fn fetch_topic(
@@ -329,7 +292,7 @@ where
                 .topic_id(topic_id.to_owned())
                 .partitions(Some(partitions)))
         } else {
-            self.unknown_topic_response(fetch)
+            unknown_topic_response(fetch)
         }
     }
 
@@ -406,6 +369,74 @@ where
     }
 }
 
+fn unknown_topic_response(fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
+    topic_error_response(fetch, ErrorCode::UnknownTopicOrPartition)
+}
+
+/// Parses `request`'s whole-request fields (`isolation_level`, `max_wait_ms`, `min_bytes`,
+/// `max_bytes`), or `Err` if any of them fails to decode to a valid value.
+///
+/// [`FetchValidationService`](super::fetch_validation::FetchValidationService) calls this to
+/// decide whether to short-circuit before this module re-parses the same fields to use them.
+pub(super) fn parse_fetch_fields(
+    request: &FetchRequest,
+) -> Result<(IsolationLevel, Duration, u32, u32), ()> {
+    let isolation_level = request.isolation_level.map_or(
+        Ok(IsolationLevel::ReadUncommitted),
+        IsolationLevel::try_from,
+    );
+
+    let max_wait_ms = u64::try_from(request.max_wait_ms).map(Duration::from_millis);
+
+    let min_bytes = u32::try_from(request.min_bytes);
+
+    const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
+
+    let max_bytes = request
+        .max_bytes
+        .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
+            u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
+        });
+
+    match (isolation_level, max_wait_ms, min_bytes, max_bytes) {
+        (Ok(isolation_level), Ok(max_wait_ms), Ok(min_bytes), Ok(max_bytes)) => {
+            Ok((isolation_level, max_wait_ms, min_bytes, max_bytes))
+        }
+        _ => Err(()),
+    }
+}
+
+/// Builds a [`FetchableTopicResponse`] reporting `error_code` on every partition `fetch` requested.
+pub(super) fn topic_error_response(
+    fetch: &FetchTopic,
+    error_code: ErrorCode,
+) -> Result<FetchableTopicResponse> {
+    Ok(FetchableTopicResponse::default()
+        .topic(fetch.topic.clone())
+        .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+        .partitions(fetch.partitions.as_ref().map(|partitions| {
+            partitions
+                .iter()
+                .map(|partition| {
+                    PartitionData::default()
+                        .partition_index(partition.partition)
+                        .error_code(error_code.into())
+                        .high_watermark(0)
+                        .last_stable_offset(Some(0))
+                        .log_start_offset(Some(-1))
+                        .diverging_epoch(Some(EpochEndOffset::default().epoch(-1).end_offset(-1)))
+                        .current_leader(Some(
+                            LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
+                        ))
+                        .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
+                        .aborted_transactions(Some([].into()))
+                        .preferred_read_replica(Some(-1))
+                        .records(None)
+                })
+                .collect()
+        })))
+}
+
 impl<G, I> Service<I> for FetchService<G>
 where
     G: Storage,
@@ -420,39 +451,19 @@ where
 
         let input = input.into();
 
-        let responses = Some(if let Some(topics) = input.request.topics {
+        let responses = Some(if let Some(ref topics) = input.request.topics {
             // These fields apply to the whole request, and (unlike e.g.
             // ListOffsets) `FetchResponse` has a top-level `error_code` for
             // exactly this: a malformed value here reports `INVALID_REQUEST`
             // there, rather than leaking the low-level parse error. That
             // field is `versions: 7+` though, so it's also mirrored onto
             // every requested partition for clients on earlier versions.
-            let isolation_level = input.request.isolation_level.map_or(
-                Ok(IsolationLevel::ReadUncommitted),
-                IsolationLevel::try_from,
-            );
-
-            let max_wait_ms = u64::try_from(input.request.max_wait_ms).map(Duration::from_millis);
-
-            let min_bytes = u32::try_from(input.request.min_bytes);
-
-            const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
-
-            let max_bytes = input
-                .request
-                .max_bytes
-                .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
-                    u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
-                });
-
             let (isolation_level, max_wait_ms, min_bytes, mut max_bytes) =
-                match (isolation_level, max_wait_ms, min_bytes, max_bytes) {
-                    (Ok(isolation_level), Ok(max_wait_ms), Ok(min_bytes), Ok(max_bytes)) => {
-                        (isolation_level, max_wait_ms, min_bytes, max_bytes)
-                    }
+                match parse_fetch_fields(&input.request) {
+                    Ok(parsed) => parsed,
 
-                    malformed => {
-                        debug!(?malformed, "malformed fetch request");
+                    Err(()) => {
+                        debug!(request = ?input.request, "malformed fetch request");
 
                         // pre-v7 clients can't see the top-level error code
                         // above (it's `versions: 7+`, absent on the wire for
@@ -460,9 +471,7 @@ where
                         // partition or those clients see no error at all
                         let responses = topics
                             .iter()
-                            .map(|topic| {
-                                self.topic_error_response(topic, ErrorCode::InvalidRequest)
-                            })
+                            .map(|topic| topic_error_response(topic, ErrorCode::InvalidRequest))
                             .collect::<Result<Vec<_>>>()?;
 
                         return Ok(FetchResponse::default()

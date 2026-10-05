@@ -28,8 +28,8 @@ use nisshi_storage::{
     CreateTopicsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
     DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
+    FetchValidationLayer, FindCoordinatorService, GetTelemetrySubscriptionsService,
+    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
     TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
@@ -352,6 +352,7 @@ where
             (
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<FetchRequest>::new(),
+                FetchValidationLayer::new(),
             )
                 .into_layer(FetchService { storage })
                 .boxed(),

@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fuzzes [`FetchService`] end-to-end against the in-memory storage backend,
-//! bypassing the wire protocol entirely: fuzzed bytes are turned directly
-//! into a [`FetchRequest`] via `nisshi-sans-io`'s `arbitrary` feature, then run
-//! through the same service the broker routes `Fetch` requests to. This
-//! targets bugs in the storage/business logic (panics, mismatched
-//! invariants) rather than the wire decoder, which `fuzz_request_decode`
-//! already covers.
+//! Fuzzes [`FetchValidationLayer`] wrapping [`FetchService`] end-to-end against
+//! the in-memory storage backend, bypassing the wire protocol entirely: fuzzed
+//! bytes are turned directly into a [`FetchRequest`] via `nisshi-sans-io`'s
+//! `arbitrary` feature, then run through the same layering the broker routes
+//! `Fetch` requests to. This targets bugs in the validation, storage, and
+//! business logic (panics, mismatched invariants) rather than the wire
+//! decoder, which `fuzz_request_decode` already covers.
 //!
 //! Storage starts empty for every execution (no topics/groups/ACLs are
 //! pre-seeded), so this mainly exercises not-found/empty-state handling;
@@ -37,10 +37,10 @@ use std::sync::{Arc, LazyLock};
 
 use fuzz::{check_request, check_response};
 use libfuzzer_sys::fuzz_target;
-use nisshi_sans_io::FetchRequest;
-use nisshi_storage::{FetchService, StorageContainer};
+use nisshi_sans_io::{FetchRequest, RequestInput};
+use nisshi_storage::{FetchService, FetchValidationLayer, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
-use rama::Service as _;
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use tokio::runtime::Runtime;
 use url::Url;
 
@@ -66,10 +66,13 @@ fuzz_target!(|request: FetchRequest| {
             .await
             .expect("in-memory storage always builds");
 
-        let service = FetchService { storage };
+        let service = FetchValidationLayer::new().layer(FetchService { storage });
 
         service
-            .serve(request)
+            .serve(RequestInput {
+                request,
+                extensions: Extensions::default(),
+            })
             .await
             .and_then(|response| check_response(response).map_err(Into::into))
             .expect("served and decoded")
