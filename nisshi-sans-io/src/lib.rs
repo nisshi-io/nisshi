@@ -2625,6 +2625,14 @@ mod tests {
             ..Default::default()
         };
 
+        let err_by_ref = Vec::<Record>::try_from(&batch).expect_err(
+            "a batch whose headers decode past the budget must be rejected by reference too",
+        );
+        assert!(
+            matches!(err_by_ref, Error::MessageMaxSizeExceeded(_)),
+            "{err_by_ref:?}"
+        );
+
         let err = Vec::<Record>::try_from(batch)
             .expect_err("a batch whose headers decode past the budget must be rejected");
         assert!(matches!(err, Error::MessageMaxSizeExceeded(_)), "{err:?}");
@@ -2655,6 +2663,17 @@ mod tests {
             record_data: Bytes::from(uncompressed),
             ..Default::default()
         };
+
+        // Compression::None by reference goes through `inflate_records` and
+        // `Decoder`, not the zero-copy loop the compressed case above uses -
+        // a separate path the by-value assertion below doesn't exercise.
+        let err_by_ref = Vec::<Record>::try_from(&batch).expect_err(
+            "a batch whose headers decode past the budget must be rejected by reference too",
+        );
+        assert!(
+            matches!(err_by_ref, Error::MessageMaxSizeExceeded(_)),
+            "{err_by_ref:?}"
+        );
 
         let err = Vec::<Record>::try_from(batch)
             .expect_err("a batch whose headers decode past the budget must be rejected");
