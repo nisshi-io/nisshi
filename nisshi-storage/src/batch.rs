@@ -1627,7 +1627,7 @@ mod tests {
     /// correction term is non-zero and the sign actually matters.
     #[test]
     fn combine_batches_preserves_timestamps_across_different_base_timestamps() -> Result<()> {
-        // Ticket's own worked example: a combined batch starting at base
+        // A worked example: a combined batch starting at base
         // time 1000, and a second batch with base time 1010 and a record
         // at delta 0 (absolute time 1010). After combination that record's
         // absolute time must still be 1010, not 990.
