@@ -119,8 +119,8 @@ async fn full_route_table_has_the_expected_route_count() -> Result<()> {
     let coordinator = Controller::with_storage(storage.clone())?;
 
     let with_storage_routes = storage::services(FrameRouteService::<Error>::builder(), storage)?;
-    // storage.rs no longer registers GetTelemetrySubscriptions (SOL-155187 removed it), so this
-    // is 26, not the 27 it was while that route existed.
+    // storage.rs does not register a route for GetTelemetrySubscriptions: nisshi has no real
+    // telemetry sink behind it, so the broker does not advertise the API at all.
     assert_eq!(26, with_storage_routes.len());
 
     let with_coordinator_routes = coordinator::services(with_storage_routes, coordinator)?;

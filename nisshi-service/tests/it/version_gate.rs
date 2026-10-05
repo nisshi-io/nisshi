@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A mutation test against `ProduceRequest::unsupported_version` (returning an empty default
-//! response instead of echoing the real request's partitions) found that no existing test
-//! caught it -- every test still passed. These tests close that hole: they route a real
-//! `FrameInput` through `capped_service` for each of the 3 capped APIs at an out-of-range
-//! version and assert the response genuinely echoes the request's real topics/partitions with
-//! `UnsupportedVersion`, plus the separate acks=0 case that drops the connection instead of
-//! building a response at all.
+//! These tests route a real `FrameInput` through `capped_service` for each of the 3 capped
+//! APIs at an out-of-range version and assert the response genuinely echoes the request's real
+//! topics/partitions with `UnsupportedVersion`, plus the separate acks=0 case that drops the
+//! connection instead of building a response at all. An `unsupported_version` impl that
+//! returns an empty default response instead of echoing the real request's partitions would
+//! still satisfy a check that only looks at the error code, so these tests check the response
+//! content itself.
 
 use bytes::Bytes;
 use nisshi_sans_io::{

@@ -181,11 +181,10 @@ where
 ///
 /// An internal caller that builds a request directly (`RequestFrameService`, the consumer-group
 /// frame path in `nisshi-client`) has no negotiated version to use, because it is not acting as
-/// a real client responding to its own `ApiVersions` round trip -- it has traditionally used the
-/// protocol's own maximum instead. For the 3 APIs capped below that protocol maximum, sending
-/// that maximum is exactly the version `VersionGateLayer` now rejects, so this returns each
-/// one's own `SupportedApiVersions::SUPPORTED` maximum instead; every other `api_key` keeps the
-/// protocol maximum, unaffected by any cap.
+/// a real client responding to its own `ApiVersions` round trip. For the 3 APIs capped below
+/// the protocol's own maximum, that protocol maximum is a version `VersionGateLayer` rejects, so
+/// this returns each one's own `SupportedApiVersions::SUPPORTED` maximum instead; every other
+/// `api_key` keeps the protocol maximum, unaffected by any cap.
 #[must_use]
 pub fn routable_max_version(api_key: i16) -> Option<i16> {
     if api_key == ProduceRequest::KEY {
@@ -232,10 +231,10 @@ impl SupportedApiVersions for ProduceRequest {
     // format that Produce v3 introduced; versions 0-2 use the older message-set formats this
     // broker has never implemented. In practice a v0-2 request carrying a real legacy
     // MessageSet fails even earlier than this gate, at the raw bytes-layer record decoder
-    // (a CRC/size mismatch against the v2 shape it expects) -- identical to `main`'s behaviour
-    // today, and Kafka-realistic (a wire format this broker structurally can't parse has no
-    // meaningful typed rejection to send). Only a trivial/empty v0-2 payload that happens to
-    // decode without a protocol error actually reaches `unsupported_version` below.
+    // (a CRC/size mismatch against the v2 shape it expects), matching this broker's existing
+    // handling of a wire format it structurally can't parse: there is no meaningful typed
+    // rejection to send for it. Only a trivial/empty v0-2 payload that happens to decode
+    // without a protocol error actually reaches `unsupported_version` below.
     const SUPPORTED: RangeInclusive<i16> = 3..=11;
 
     fn unsupported_version(request: Self) -> Self::Response {
@@ -277,12 +276,11 @@ impl SupportedApiVersions for ListOffsetsRequest {
     // (`ListOffset::try_from` rejects them with `UnsupportedListOffsetTimestamp` regardless of
     // version, as defense in depth, but the version itself is still unimplemented).
     //
-    // v0 is deliberately included: the ticket for this cap (SOL-155187) classifies v0's
-    // `OldStyleOffsets`-never-populated bug as out of scope for version-capping -- raising the
-    // floor to exclude it would hide a small response-shape bug behind a version rejection and
-    // drop support for old clients that are otherwise fully compatible with this broker's
-    // request-side decoding. `ListOffsetsService` now populates `OldStyleOffsets` for v0
-    // responses instead.
+    // v0 is deliberately included: its `OldStyleOffsets`-never-populated gap is a response-shape
+    // bug to fix, not a reason to cap the version -- raising the floor to exclude it would hide
+    // that bug behind a version rejection and drop support for old clients that are otherwise
+    // fully compatible with this broker's request-side decoding. `ListOffsetsService` populates
+    // `OldStyleOffsets` for v0 responses instead of leaving it unset.
     const SUPPORTED: RangeInclusive<i16> = 0..=6;
 
     fn unsupported_version(request: Self) -> Self::Response {
