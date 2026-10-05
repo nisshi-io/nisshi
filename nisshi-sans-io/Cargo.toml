@@ -61,6 +61,7 @@ nisshi-model.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+cap = { version = "0.1.2", features = ["stats"] }
 criterion.workspace = true
 pretty_assertions.workspace = true
 proptest.workspace = true

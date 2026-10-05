@@ -1575,6 +1575,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26cf465651fa6ad902a2d327ba60c3a6bc61c6a2f4ad70d091cf20dfda0074ef"
 
 [[package]]
+name = "cap"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f125eb85b84a24c36b02ed1d22c9dd8632f53b3cde6e4d23512f94021030003"
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5988,6 +5994,7 @@ name = "nisshi-sans-io"
 version = "0.7.0-pre.2"
 dependencies = [
  "bytes",
+ "cap",
  "clap",
  "convert_case 0.11.0",
  "crc-fast",
