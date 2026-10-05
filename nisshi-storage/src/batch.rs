@@ -35,7 +35,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    record::{Record, deflated, inflated},
+    record::{Record, deflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::{
@@ -51,7 +51,7 @@ use crate::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    TxnOffsetCommitRequest, UpdateError, Version, inflate_produced,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -706,14 +706,14 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
         return Ok(None);
     };
 
-    let mut sink = inflated::Batch::try_from(first)?;
+    let mut sink = inflate_produced(first)?;
     debug!(
         sink.base_offset,
         sink.last_offset_delta, sink.base_sequence, sink.max_timestamp
     );
 
     for batch in i {
-        let batch = inflated::Batch::try_from(batch)?;
+        let batch = inflate_produced(batch)?;
 
         debug!(
             sink.last_offset_delta,
@@ -1463,6 +1463,32 @@ mod tests {
     #[test]
     fn combine_empty() -> Result<()> {
         assert_eq!(None, combine(vec![])?);
+        Ok(())
+    }
+
+    #[test]
+    fn combine_rejects_an_undecodable_batch() -> Result<()> {
+        let attributes: i16 = BatchAttribute::default().into();
+
+        let mut batches = into_batches(
+            attributes,
+            54345,
+            32123,
+            0,
+            &[
+                vec![Bytes::from_static(b"a")],
+                vec![Bytes::from_static(b"b")],
+            ],
+        )?;
+
+        let len = batches[1].record_data.len();
+        batches[1].record_data = batches[1].record_data.slice(0..len / 2);
+
+        assert!(matches!(
+            combine(batches),
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        ));
+
         Ok(())
     }
 
