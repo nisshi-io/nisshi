@@ -53,7 +53,7 @@ Note: when running nisshi directly (not via docker compose), set `AWS_ENDPOINT="
 
 ## Architecture
 
-Cargo workspace with 15 member crates, producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `generator`, `perf`, `proxy`.
+Cargo workspace with 22 member crates (including the dev-only `fuzz` crate), producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `generator`, `perf`, `proxy`.
 
 ### Key Crates
 
@@ -73,6 +73,8 @@ Cargo workspace with 15 member crates, producing a single binary (`nisshi`) with
 ### Sans-I/O Code Generation (`nisshi-sans-io`)
 
 `nisshi-sans-io/build.rs` reads ~185 official Kafka JSON message descriptors from `nisshi-sans-io/message/*.json` and generates typed Rust structs for every request/response pair. **Do not manually edit generated files.** The message JSON files are from upstream Apache Kafka.
+
+The generator also emits `#[derive(arbitrary::Arbitrary)]` on every generated type, gated behind the `arbitrary` feature flag (`dep:arbitrary`, see `fn arbitrary_field_attribute` in `build.rs`) — this is what lets the `fuzz` crate construct arbitrary `Request`/`Response` values directly from fuzzer bytes instead of fuzzing only the wire decoder. A handful of fields need a hand-written `#[arbitrary(with = ...)]`/`#[arbitrary(default)]` attribute to stay sound (e.g. raw-byte fields route through `nisshi-sans-io/src/arbitrary_support.rs` rather than deriving); see the doc comment on `arbitrary_field_attribute` for the full list and why each one is needed.
 
 ### Service Layer Pattern (`nisshi-service`)
 
@@ -127,6 +129,31 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 - `nisshi-broker`, `nisshi-sans-io` and `nisshi-service` each build one integration-test binary, `it`. To add a test file, create `tests/it/<name>.rs` and declare it with `pub mod <name>;` in `tests/it/main.rs`; Cargo ignores undeclared files, and the `every_test_file_is_declared` test fails if one is missed. Gate backend-specific tests with `#[cfg(feature = "...")]` on a module, not `required-features`. Run one file's tests with a name filter, e.g. `cargo nextest run -p nisshi-broker --all-features -E 'test(/^fetch::/)'`
 - Single-file test targets with specific feature requirements (e.g. `nisshi-schema`'s `berg`) use `required-features` in their `Cargo.toml`
 
+## Fuzz Testing (`fuzz`)
+
+The `fuzz` crate (`cargo-fuzz` + `libfuzzer-sys`) is a dev-only workspace member, excluded from `just test-workspace` and not run in CI — it's a local/manual tool. It requires the nightly toolchain, which `just` targets invoke explicitly (`cargo +nightly fuzz ...`); you don't need to switch your default toolchain.
+
+```shell
+just cargo-fuzz +args        # thin wrapper: cargo +nightly fuzz {{args}}
+just fuzz-request-decode     # fuzz_request_decode, 60s
+just fuzz-member-metadata    # fuzz_member_metadata, 60s
+just fuzz-generate-seed      # (re)generate the corpus seed files, see below
+just fuzz-all seconds="60"   # every target in turn, {{seconds}} each, stops at the first crash
+
+cargo +nightly fuzz list                             # list all targets
+cargo +nightly fuzz run <target> -- -max_total_time=60   # fuzz one target
+cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>  # replay a saved crash
+```
+
+Three target shapes, all in `fuzz/fuzz_targets/`:
+- **`fuzz_request_decode` / `fuzz_response_decode` / `fuzz_varint` / `fuzz_deflated_batch` / `fuzz_member_metadata`** — fuzz raw bytes straight through the wire decoder/encoder, no `Storage` involved.
+- **`fuzz_<api>_storage`** (the majority, ~23 targets, one per Kafka API like `fuzz_fetch_storage`, `fuzz_create_topics_storage`) — build an arbitrary typed request (via `nisshi-sans-io`'s `arbitrary` feature) and run it end-to-end through the real `*Service` against an in-memory `StorageContainer` (storage starts empty every execution), to catch panics/invariant violations in service and storage logic rather than the decoder. One known exception: `fuzz_delete_records_storage` is excluded from `fuzz-all` because `nisshi-storage-dynostore`'s `delete_records` is currently an unconditional `todo!()`, so it panics on its first execution — a known pre-existing gap, kept for parity and ready to start finding real bugs once that stub is filled in.
+- **`generate_seeds`** (plain `fn main`, not a fuzz target) — writes hand-built binary seed files into `fuzz/corpus/<target>/`; rerun it after adding a new seed case.
+
+`fuzz/src/lib.rs` provides the shared `check_request`/`check_response` helpers used by most storage targets: they encode a value at its API's latest version, decode it, re-encode the decoded value, and decode again — then assert the two decodes are equal. They deliberately do **not** assert the first decode equals the original fuzzed value: a sans-io codec is not required to be lossless against an arbitrary in-memory value (e.g. every generated sequence field is `Option<Vec<T>>` regardless of wire nullability, so a mandatory array left at `None` is wire-equivalent to `Some(vec![])` but not `PartialEq`). The round-trip property that must hold is that re-encoding an already-decoded (version-normalized) value decodes back to exactly the same thing.
+
+`fuzz/corpus/`, `fuzz/artifacts/` (crash reproducers) and `fuzz/.gitignore`'s `target`/`coverage` are all untracked — rebuild the corpus locally with `just fuzz-generate-seed` plus whatever `cargo +nightly fuzz run` accumulates. If you fix a bug found by fuzzing, replay every existing artifact for that target (`cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>`) to confirm the fix, not just the one input that was being worked on.
+
 ## CI Pipeline
 
 GitHub Actions (`.github/workflows/ci.yml`) runs in two tiers, gated by `ci-gate`, the single required check that fans in every other job:
@@ -147,6 +174,7 @@ Merging goes through a merge queue: "Merge when ready" queues the PR, the queue 
 | `etc/schema/` | Sample schemas: `.avsc` (Avro), `.json` (JSON Schema), `.proto` (Protobuf) |
 | `nisshi-sans-io/message/` | Kafka JSON protocol descriptors (upstream, ~185 files) |
 | `nisshi-sans-io/build.rs` | Code generator: JSON descriptors -> Rust types |
+| `fuzz/` | `cargo-fuzz` targets exercising the sans-io codec and storage services (see Fuzz Testing) |
 
 ## Lint Configuration
 
