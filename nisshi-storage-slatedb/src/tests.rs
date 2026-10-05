@@ -52,7 +52,7 @@ async fn create_test_engine() -> Engine {
 
 /// A single-record batch, built through the real encode path (unlike a hand
 /// constructed [`Batch`] literal with an empty `record_data`, this decodes
-/// back correctly -- `DeleteRecords`' batch-span check now decodes every
+/// back correctly -- `DeleteRecords`' batch-span check decodes every
 /// candidate batch to find its end offset).
 fn simple_batch() -> Batch {
     use nisshi_sans_io::record::{Record, inflated};
