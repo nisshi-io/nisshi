@@ -37,10 +37,10 @@ updates:
         versions: [">0.10.9"]
     cooldown:
       default-days: 7
-  # Pinned in SOL-155138 (Dockerfile's alpine base, .devcontainer's rust
-  # base). A digest pin only stays current if something deliberately bumps
-  # it, so both get the same Dependabot coverage the other ecosystems above
-  # already have, rather than freezing in place indefinitely.
+  # The Dockerfile's alpine base and .devcontainer's rust base are pinned to
+  # exact digests. A digest pin only stays current if something deliberately
+  # bumps it, so both get the same Dependabot coverage the other ecosystems
+  # above already have, rather than freezing in place indefinitely.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
