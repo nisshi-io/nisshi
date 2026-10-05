@@ -20,7 +20,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage, TxnAddPartitionsRequest, TxnAddPartitionsResponse};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`AddPartitionsToTxnRequest`] returning [`AddPartitionsToTxnResponse`].
+/// A [`Service`] using its [`Storage`] taking [`AddPartitionsToTxnRequest`] returning [`AddPartitionsToTxnResponse`].
 #[derive(Clone, Debug)]
 pub struct AddPartitionService<G> {
     pub storage: G,

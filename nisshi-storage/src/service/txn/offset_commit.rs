@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`nisshi_sans_io::TxnOffsetCommitRequest`] returning [`TxnOffsetCommitResponse`].
+/// A [`Service`] using its [`Storage`] taking [`nisshi_sans_io::TxnOffsetCommitRequest`] returning [`TxnOffsetCommitResponse`].
 #[derive(Clone, Debug)]
 pub struct OffsetCommitService<G> {
     pub storage: G,

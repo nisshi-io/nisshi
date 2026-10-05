@@ -20,7 +20,7 @@ use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeClusterRequest`] returning [`DescribeClusterResponse`].
+/// A [`Service`] using its [`Storage`] taking [`DescribeClusterRequest`] returning [`DescribeClusterResponse`].
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{DescribeClusterRequest, EndpointType, ErrorCode};

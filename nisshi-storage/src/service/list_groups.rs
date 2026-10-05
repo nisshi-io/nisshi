@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::{ErrorCode, ListGroupsRequest};

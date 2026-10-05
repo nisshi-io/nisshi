@@ -257,7 +257,7 @@ impl Decode for Record {
         debug!(encoded = ?encoded[..]);
 
         let length = VarInt::decode(encoded).map(Into::into)?;
-        let attributes = encoded.get_u8();
+        let attributes = encoded.try_get_u8()?;
         let timestamp_delta = LongVarInt::decode(encoded).map(Into::into)?;
         let offset_delta = VarInt::decode(encoded).map(Into::into)?;
         let key = Octets::decode(encoded).map(Into::into)?;
@@ -518,6 +518,19 @@ mod tests {
             .build()?;
 
         assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    /// Only the varint record length is present; the `attributes` byte that
+    /// unconditionally follows it is missing. The raw `get_u8` this used to
+    /// call panics on a truncated buffer instead of returning `Err`.
+    #[test]
+    fn decode_truncated_after_length_returns_err_not_panic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = VarInt(0).encode()?;
+        assert!(Record::decode(&mut encoded).is_err());
 
         Ok(())
     }

@@ -116,9 +116,8 @@
 //!
 //! ### Servicing
 //!
-//! We construct a default [`service context`][`rama::Context`] and a
-//! [`MetadataRequest`][`nisshi_sans_io::MetadataRequest`] to initiate a request
-//! on the `service`. The request passes through the protocol stack
+//! We construct a [`MetadataRequest`][`nisshi_sans_io::MetadataRequest`] to
+//! initiate a request on the `service`. The request passes through the protocol stack
 //! and routed into our service. The service responds with a
 //! [`MetadataResponse`][`nisshi_sans_io::MetadataResponse`], so that we can
 //! verify the expected `response.cluster_id`:

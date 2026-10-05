@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use nisshi_storage::{ArcDynStorage, Error, Result, StorageFactory, StorageFactoryConfiguration};
 use regex::Regex;
 use slatedb::{
-    Db,
+    Db, Settings,
     object_store::{
         ObjectStore,
         aws::{AmazonS3Builder, S3ConditionalPut},
@@ -27,6 +27,16 @@ use slatedb::{
 };
 
 use crate::Engine;
+
+/// slatedb 0.14 runs a background garbage collector by default (0.10 had
+/// it off). Keep it off until enabling it is a deliberate, separately
+/// tested change.
+fn db_settings() -> Settings {
+    Settings {
+        garbage_collector_options: None,
+        ..Settings::default()
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineFactory;
@@ -54,7 +64,9 @@ impl StorageFactory for EngineFactory {
                 .map_err(|e| Error::Message(e.to_string()))?
         };
 
-        Db::open(db_path, object_store)
+        Db::builder(db_path, object_store)
+            .with_settings(db_settings())
+            .build()
             .await
             .map(Arc::new)
             .map(|db| {
@@ -70,5 +82,16 @@ impl StorageFactory for EngineFactory {
             .map(Box::new)
             .map(|storage| Arc::new(storage) as ArcDynStorage)
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn garbage_collector_is_off() {
+        assert!(Settings::default().garbage_collector_options.is_some());
+        assert!(db_settings().garbage_collector_options.is_none());
     }
 }

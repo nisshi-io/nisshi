@@ -20,7 +20,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage, TopicId};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeTopicPartitionsRequest`] returning [`DescribeTopicPartitionsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`DescribeTopicPartitionsRequest`] returning [`DescribeTopicPartitionsResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::{

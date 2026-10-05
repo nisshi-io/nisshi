@@ -213,6 +213,220 @@ async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
     Ok(())
 }
 
+/// Topics with an invalid name must be rejected with `InvalidTopicException`,
+/// and must never actually reach storage. `DescribeTopicPartitions` never
+/// auto-creates (only `Metadata` does), so if the rejected name shows up as
+/// `UnknownTopicOrPartition` there, `CreateTopics` genuinely never called
+/// `Storage::create_topic` for it.
+async fn invalid_name_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let create = CreateTopicsService {
+        storage: storage.clone(),
+    };
+    let describe = DescribeTopicPartitionsService {
+        storage: storage.clone(),
+    };
+
+    let num_partitions = 3;
+    let replication_factor = 1;
+    let assignments = Some([].into());
+    let configs = Some([].into());
+
+    let too_long: String = "a".repeat(250);
+    let invalid_names: [&str; 5] = ["", "a/b", ".", "..", too_long.as_str()];
+
+    for name in invalid_names {
+        let response = create
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .topics(Some(vec![
+                        CreatableTopic::default()
+                            .name(name.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(assignments.clone())
+                            .configs(configs.clone()),
+                    ]))
+                    .validate_only(Some(false)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(name, topics[0].name.as_str());
+        assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+        assert_eq!(
+            ErrorCode::InvalidTopicException,
+            ErrorCode::try_from(topics[0].error_code)?,
+            "name = {name:?}"
+        );
+
+        let describe_response = describe
+            .serve(RequestInput {
+                request: DescribeTopicPartitionsRequest::default()
+                    .topics(Some([TopicRequest::default().name(name.into())].into())),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let describe_topics = describe_response.topics.unwrap_or_default();
+        assert_eq!(1, describe_topics.len());
+        assert_eq!(
+            ErrorCode::UnknownTopicOrPartition,
+            ErrorCode::try_from(describe_topics[0].error_code)?,
+            "name = {name:?} must never have reached storage"
+        );
+    }
+
+    // boundary: 249 characters is the longest valid name, and must succeed.
+    let boundary_name: String = "a".repeat(249);
+
+    let response = create
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(boundary_name.clone())
+                        .num_partitions(num_partitions)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(boundary_name, topics[0].name.as_str());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    Ok(())
+}
+
+/// `num_partitions` of `0` or less than `-1` must be rejected with
+/// `InvalidPartitions`; `-1` (the "use the default" sentinel) must still
+/// succeed.
+async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let service = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let replication_factor = 1;
+    let assignments = Some([].into());
+    let configs = Some([].into());
+
+    for num_partitions in [0, -2] {
+        let name = alphanumeric_string(15);
+
+        let response = service
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .topics(Some(vec![
+                        CreatableTopic::default()
+                            .name(name.clone())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(assignments.clone())
+                            .configs(configs.clone()),
+                    ]))
+                    .validate_only(Some(false)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(name, topics[0].name.as_str());
+        assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+        assert_eq!(
+            ErrorCode::InvalidPartitions,
+            ErrorCode::try_from(topics[0].error_code)?,
+            "num_partitions = {num_partitions}"
+        );
+    }
+
+    // -1 still means "use the broker default".
+    let name = alphanumeric_string(15);
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(name.clone())
+                        .num_partitions(-1)
+                        .replication_factor(-1)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(name, topics[0].name.as_str());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    assert_eq!(Some(3), topics[0].num_partitions);
+
+    Ok(())
+}
+
+/// One invalid topic in a batch must not affect the others: the invalid
+/// entry is rejected, the valid one is still created.
+async fn mixed_batch_partial_success(storage: impl Storage + Clone) -> Result<(), Error> {
+    let service = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let valid_name = alphanumeric_string(15);
+    let num_partitions = 3;
+    let replication_factor = 1;
+    let assignments = Some([].into());
+    let configs = Some([].into());
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name("".into())
+                        .num_partitions(num_partitions)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                    CreatableTopic::default()
+                        .name(valid_name.clone())
+                        .num_partitions(num_partitions)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(2, topics.len());
+
+    assert_eq!("", topics[0].name.as_str());
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+
+    assert_eq!(valid_name, topics[1].name.as_str());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[1].error_code)?);
+    assert_ne!(Some(NULL_TOPIC_ID), topics[1].topic_id);
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use nisshi_broker::Result;
@@ -269,6 +483,48 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::duplicate(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_name_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_partitions_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_partitions_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success(storage).await?;
 
         Ok(())
     }
@@ -332,6 +588,48 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_name_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_partitions_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_partitions_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -392,6 +690,48 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_name_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_partitions_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_partitions_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -449,6 +789,48 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::duplicate(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_name_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_partitions_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_partitions_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success(storage).await?;
 
         Ok(())
     }

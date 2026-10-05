@@ -26,14 +26,24 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
 
-/// Why a batch header disagrees with the records it carries, or `None` if it
-/// agrees. A consistent header has at least one record and
-/// `last_offset_delta + 1 == record_count`. Every backend uses
-/// `last_offset_delta` to advance the high watermark, so a mismatch corrupts
-/// or wedges the partition. Kafka rejects the same batch with
-/// `INVALID_RECORD`. `record_count` is an int32 on the wire, so a value above
-/// `i32::MAX` is rejected too.
-fn inconsistency(batch: &deflated::Batch) -> Option<&'static str> {
+/// Why a client batch must be rejected with `INVALID_RECORD` before anything
+/// is written, or `None` if it may be stored. Kafka's `LogValidator` rejects
+/// the same batches.
+///
+/// - Only the broker writes control batches (transaction commit/abort
+///   markers), and those go directly to storage rather than through
+///   [`ProduceService`]. Every backend skips schema validation and lake
+///   writes for a control batch, so a client must not be able to set the bit.
+/// - A consistent header has at least one record and
+///   `last_offset_delta + 1 == record_count`. Every backend uses
+///   `last_offset_delta` to advance the high watermark, so a mismatch corrupts
+///   or wedges the partition. `record_count` is an int32 on the wire, so a
+///   value above `i32::MAX` is rejected too.
+fn rejection(batch: &deflated::Batch) -> Option<&'static str> {
+    if batch.is_control() {
+        return Some("clients may not write control batches");
+    }
+
     let Ok(record_count) = i32::try_from(batch.record_count) else {
         return Some("record_count exceeds i32::MAX");
     };
@@ -47,7 +57,7 @@ fn inconsistency(batch: &deflated::Batch) -> Option<&'static str> {
     }
 }
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
 /// use bytes::Bytes;
 /// use rama::Service as _;
@@ -180,18 +190,18 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
-            if let Some((inconsistent, reason)) = records
+            if let Some((rejected, reason)) = records
                 .batches
                 .iter()
-                .find_map(|batch| inconsistency(batch).map(|reason| (batch, reason)))
+                .find_map(|batch| rejection(batch).map(|reason| (batch, reason)))
             {
                 warn!(
                     topic = name,
                     partition = partition.index,
-                    record_count = inconsistent.record_count,
-                    last_offset_delta = inconsistent.last_offset_delta,
+                    record_count = rejected.record_count,
+                    last_offset_delta = rejected.last_offset_delta,
                     reason,
-                    "rejecting produce batch with inconsistent header",
+                    "rejecting produce batch",
                 );
 
                 return self

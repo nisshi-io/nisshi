@@ -380,7 +380,7 @@ impl Builder {
     }
 }
 
-/// Inject the [`Pool`][`Pool`] into the [`Service`] [`Context`] of this [`Layer`] using [`FramePoolService`]
+/// Inject the [`Pool`] into each request of this [`Layer`], as a [`FramePool`], using [`FramePoolService`]
 #[derive(Clone, Debug)]
 pub struct FramePoolLayer {
     pool: Pool,
@@ -416,7 +416,7 @@ impl ExtensionsRef for FramePool {
     }
 }
 
-/// Inject the [`Pool`][`Pool`] into the [`Service`] [`Context`] of the inner [`Service`]
+/// Inject the [`Pool`] into each request to the inner [`Service`], as a [`FramePool`]
 #[derive(Clone, Debug)]
 pub struct FramePoolService<S> {
     pool: Pool,
@@ -441,7 +441,7 @@ where
     }
 }
 
-/// Inject the [`Pool`][`Pool`] into the [`Service`] [`Context`] of this [`Layer`] using [`RequestPoolService`]
+/// Inject the [`Pool`] into each request of this [`Layer`], as a [`RequestPool`], using [`RequestPoolService`]
 #[derive(Clone, Debug)]
 pub struct RequestPoolLayer {
     pool: Pool,
@@ -477,7 +477,7 @@ impl<Q> ExtensionsRef for RequestPool<Q> {
     }
 }
 
-/// Inject the [`Pool`][`Pool`] into the [`Service`] [`Context`] of the inner [`Service`]
+/// Inject the [`Pool`] into each request to the inner [`Service`], as a [`RequestPool`]
 #[derive(Clone, Debug)]
 pub struct RequestPoolService<S> {
     pool: Pool,
@@ -492,7 +492,7 @@ where
     type Output = S::Output;
     type Error = S::Error;
 
-    /// serve the request, injecting the pool into the context of the inner service
+    /// serve the request, injecting the pool into the request to the inner service
     async fn serve(&self, req: Q) -> Result<Self::Output, Self::Error> {
         self.inner
             .serve(RequestPool {
@@ -529,7 +529,7 @@ impl Client {
     }
 }
 
-/// A [`Layer`] that takes a [`Connection`] from the [`Pool`] calling an inner [`Service`] with that [`Connection`] as [`Context`]
+/// A [`Layer`] that takes a [`Connection`] from the [`Pool`] calling an inner [`Service`] with that [`Connection`] in a [`BytesConnection`]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FrameConnectionLayer;
 
@@ -554,7 +554,7 @@ impl ExtensionsRef for FrameConnection {
     }
 }
 
-/// A [`Service`] that takes a [`Connection`] from the [`Pool`] calling an inner [`Service`] with that [`Connection`] as [`Context`]
+/// A [`Service`] that takes a [`Connection`] from the [`Pool`] calling an inner [`Service`] with that [`Connection`] in a [`BytesConnection`]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FrameConnectionService<S> {
     inner: S,
@@ -629,7 +629,7 @@ impl<S> Layer<S> for RequestConnectionLayer {
 
 /// Take a [`Connection`] from the [`Pool`]. Enclose the [`Request`]
 /// in a [`Frame`] using latest API version supported by the broker. Call the
-/// inner service with the [`Frame`] using the [`Connection`] as [`Context`].
+/// inner service with the encoded [`Frame`] and the [`Connection`] in a [`BytesConnection`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RequestConnectionService<S> {
     inner: S,
@@ -708,7 +708,7 @@ impl ExtensionsRef for BytesConnection {
     }
 }
 
-/// A [`Service`] that writes a frame represented by [`Bytes`] to a [`Connection`] [`Context`], returning the [`Bytes`] frame response.
+/// A [`Service`] that writes a frame represented by [`Bytes`] to the [`Connection`] in a [`BytesConnection`], returning the [`Bytes`] frame response.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BytesConnectionService;
 

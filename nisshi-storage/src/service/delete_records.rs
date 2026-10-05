@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteRecordsRequest`] returning [`DeleteRecordsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`DeleteRecordsRequest`] returning [`DeleteRecordsResponse`].
 #[derive(Clone, Debug)]
 pub struct DeleteRecordsService<G> {
     pub storage: G,

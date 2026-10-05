@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`GetTelemetrySubscriptionsRequest`] returning [`GetTelemetrySubscriptionsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`GetTelemetrySubscriptionsRequest`] returning [`GetTelemetrySubscriptionsResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::{ErrorCode, GetTelemetrySubscriptionsRequest};

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    ByteSize, Decode, Encode, Result,
+    ByteSize, Decode, Encode, Error, Result,
     primitive::varint::{UnsignedVarInt, VarInt},
 };
 use bytes::{BufMut, Bytes, BytesMut};
@@ -27,6 +27,13 @@ use std::{
     marker::PhantomData,
 };
 use tracing::{debug, instrument};
+
+/// Upper bound on how eagerly we preallocate for a wire-supplied count or
+/// length (record count, header count, octet length, ...). Those values are
+/// untrusted input and must never be trusted at face value for sizing an
+/// allocation; a real, larger batch still decodes correctly,
+/// it just grows the buffer past this point as elements are pushed.
+pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Octets(pub Option<Bytes>);
@@ -70,7 +77,13 @@ impl Decode for Octets {
         if length == -1 {
             Ok(Self(None))
         } else {
-            Ok(Self(Some(encoded.split_to(length as usize))))
+            let length = usize::try_from(length).map_err(|_| Error::Overflow)?;
+
+            if length > encoded.len() {
+                return Err(Error::Overflow);
+            }
+
+            Ok(Self(Some(encoded.split_to(length))))
         }
     }
 }
@@ -133,7 +146,9 @@ impl Octets {
                     Ok(None)
                 } else {
                     let mut r = usize::try_from(length)
-                        .map(BytesMut::with_capacity)
+                        .map(|length| {
+                            BytesMut::with_capacity(length.min(MAX_PREALLOCATED_ELEMENTS))
+                        })
                         .map_err(|error| de::Error::custom(format!("{error:?}")))?;
 
                     while length >= 1 {
@@ -289,10 +304,10 @@ where
         debug!(encoded = ?encoded[..]);
 
         let length = VarInt::decode(encoded)
-            .map(|length| length.0 as usize)
+            .and_then(|length| usize::try_from(length.0).map_err(|_| Error::Overflow))
             .inspect(|length| debug!(length))?;
 
-        let mut items = Vec::with_capacity(length);
+        let mut items = Vec::with_capacity(length.min(MAX_PREALLOCATED_ELEMENTS));
         for _ in 0..length {
             items.push(T::decode(encoded)?);
         }
@@ -351,12 +366,14 @@ where
                     .map(|v| v.0)
                     .inspect(|length| debug!("length: {length}"))
                     .and_then(|length| {
+                        let capacity: usize = length.try_into().map_err(|e| {
+                            <A::Error as de::Error>::custom(format!(
+                                "length: {length}, caused: {e:?}"
+                            ))
+                        })?;
+
                         (0..length).try_fold(
-                            Vec::with_capacity(length.try_into().map_err(|e| {
-                                <A::Error as de::Error>::custom(format!(
-                                    "length: {length}, caused: {e:?}"
-                                ))
-                            })?),
+                            Vec::with_capacity(capacity.min(MAX_PREALLOCATED_ELEMENTS)),
                             |mut acc, _| {
                                 seq.next_element::<T>()?
                                     .ok_or_else(|| <A::Error as de::Error>::custom("item"))
@@ -620,5 +637,47 @@ mod tests {
         ]);
         assert_eq!(13, expected.size_in_bytes()?);
         encode_decode(expected)
+    }
+
+    /// -2 is not the -1 "no value" sentinel: casting it straight to `usize`
+    /// sign-extends to a value near `usize::MAX`, which then fails
+    /// `split_to`'s own bounds assertion (`at <= len`), panicking instead of
+    /// returning `Err`.
+    #[test]
+    fn octets_decode_length_below_negative_one_sentinel_returns_err() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = VarInt(-2).encode()?;
+        assert!(Octets::decode(&mut encoded).is_err());
+
+        Ok(())
+    }
+
+    /// A length that is a plausible, positive value, but larger than the
+    /// bytes actually remaining: `split_to` panics rather than erroring.
+    #[test]
+    fn octets_decode_length_exceeding_remaining_returns_err() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(100).encode()?);
+        encoded.put_slice(&[1, 2]);
+        let mut encoded = encoded.freeze();
+
+        assert!(Octets::decode(&mut encoded).is_err());
+
+        Ok(())
+    }
+
+    /// The same negative-count defect as `octets_decode_...`, but for the
+    /// header-count-driven `Vec::with_capacity` in `VarIntSequence::decode`.
+    #[test]
+    fn var_int_sequence_decode_negative_length_returns_err() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = VarInt(-2).encode()?;
+        assert!(VarIntSequence::<Octets>::decode(&mut encoded).is_err());
+
+        Ok(())
     }
 }

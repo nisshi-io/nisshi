@@ -350,7 +350,7 @@ where
     }
 }
 
-/// A [context state][`Context#method.state`] state used by [`TcpContextLayer`] and [`TcpContextService`]
+/// The connection settings that [`TcpContextLayer`] and [`TcpContextService`] insert into each stream's [`Extensions`]
 #[non_exhaustive]
 #[derive(Clone, Debug, Extension)]
 pub struct TcpContext {
@@ -436,7 +436,7 @@ impl TcpContext {
     }
 }
 
-/// A [`Layer`] that injects the [`TcpContext`] into the service [`Context`] state
+/// A [`Layer`] that inserts the [`TcpContext`] settings into each stream's [`Extensions`]
 #[derive(Clone, Debug, Default)]
 pub struct TcpContextLayer {
     state: TcpContext,
@@ -551,10 +551,10 @@ impl Service<TcpStream> for ReadHalfService {
     }
 }
 
-/// A [`Service`] that requires the [`TcpContext`] as the service [`Context`] state
+/// A [`Service`] that inserts the [`TcpContext`] settings into each stream's [`Extensions`]
 ///
 /// The connection may be any stream type, for example a [`TcpStream`] or a TLS
-/// stream wrapping one: this service only swaps the context state and passes
+/// stream wrapping one: this service only inserts the extensions and passes
 /// the stream through to the inner service.
 #[derive(Clone)]
 pub struct TcpContextService<S> {
