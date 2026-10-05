@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phase 3 item 8 of `docs/traceforge-test-plan.md`: dynostore's
+//! Phase 3: dynostore's
 //! `offset_commit` writes with `PutMode::Overwrite`
 //! (`nisshi-storage-dynostore/src/dynostore.rs:1356-1400`) — unlike
 //! `update_group`'s CAS or `produce`'s `OptiCon`-guarded watermark bump,
