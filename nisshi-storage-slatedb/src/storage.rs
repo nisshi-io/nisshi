@@ -53,8 +53,8 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    inflate_produced, producer_claim,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op, inflate,
+    producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::sleep;
@@ -837,7 +837,7 @@ impl Storage for Engine {
 
         // Schema validation (if schemas registry is configured)
         if let Some(ref schemas) = self.schemas {
-            let inflated = inflate_produced(deflated.clone())?;
+            let inflated = inflate(deflated.clone()).await?;
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             // Only validate non-control batches
@@ -978,7 +978,7 @@ impl Storage for Engine {
 
         // Store to data lake if configured
         if let Some(ref lake) = self.lake {
-            let inflated = inflate_produced(deflated.clone())?;
+            let inflated = inflate(deflated.clone()).await?;
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             if !attributes.control {

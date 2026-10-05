@@ -62,7 +62,7 @@ use nisshi_storage::{
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    inflate_produced, producer_claim,
+    inflate_produced, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -979,9 +979,13 @@ impl Storage for DynoStore {
                 if batch_attribute.control {
                     None
                 } else {
-                    let inflated = inflate_produced(&deflated)
-                        .inspect(|inflated| debug!(?inflated))
-                        .inspect_err(|err| debug!(?err))?;
+                    let inflated = {
+                        let deflated = deflated.clone();
+                        offload(move || inflate_produced(&deflated))
+                    }
+                    .await
+                    .inspect(|inflated| debug!(?inflated))
+                    .inspect_err(|err| debug!(?err))?;
 
                     registry
                         .validate(topition.topic(), &inflated)
@@ -1051,7 +1055,12 @@ impl Storage for DynoStore {
             // although nothing was stored.
             let inflated = if !attributes.control && (self.schemas.is_some() || self.lake.is_some())
             {
-                let inflated = inflate_produced(&deflated).inspect_err(|err| debug!(?err))?;
+                let inflated = {
+                    let deflated = deflated.clone();
+                    offload(move || inflate_produced(&deflated))
+                }
+                .await
+                .inspect_err(|err| debug!(?err))?;
 
                 if let Some(ref registry) = self.schemas {
                     registry
