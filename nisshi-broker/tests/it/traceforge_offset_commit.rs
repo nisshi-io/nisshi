@@ -23,12 +23,12 @@
 //! Real, well-behaved clients only submit strictly increasing offsets for a
 //! partition they own, and the group coordinator's generation fencing
 //! (`Inner::offset_commit_fence`) is supposed to keep a superseded
-//! generation's commits from ever reaching storage - so this isn't
-//! expected to surface a logic bug the way Phase 1/2 did. What it does
-//! check, exhaustively rather than by spot-check, is that the *unconditional*
-//! write path is still safe to race: no cross-partition contamination (a
-//! commit for one partition never affects another's stored value), no
-//! commit silently dropped or duplicated, and - because
+//! generation's commits from ever reaching storage - so this isn't expected
+//! to surface a logic bug. What it does check, exhaustively rather than by
+//! spot-check, is that the *unconditional* write path is still safe to race:
+//! no cross-partition contamination (a commit for one partition never
+//! affects another's stored value), no commit silently dropped or
+//! duplicated, and - because
 //! `committed_offset_topitions` recovers topic/partition names by parsing
 //! object-store paths (`dynostore.rs:1422-1441`) rather than reading them
 //! back structurally - that this listing-based lookup always agrees with
