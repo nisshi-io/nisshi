@@ -405,9 +405,7 @@ mod tests {
 
     // A real client negotiates a version from what `ApiVersions` advertises, so a capped
     // route's advertised range must be its declared `SUPPORTED` range, never the protocol's
-    // wider one -- otherwise a client picks a version `VersionGateLayer` then rejects, exactly
-    // the regression a live librdkafka run against this cap caught (every negotiated
-    // ListOffsets request came back `UnsupportedVersion` until this was fixed).
+    // wider one -- otherwise a client picks a version `VersionGateLayer` then rejects.
     #[tokio::test]
     async fn api_versions_response_uses_capped_range_for_a_capped_api() {
         let service = ApiVersionsService::<Error> {
