@@ -369,7 +369,21 @@ fn json_content_type() -> Attributes {
 }
 
 impl DynoStore {
+    /// Only `factory` constructs a [`DynoStore`] outside tests; everywhere else goes through
+    /// [`nisshi_storage::StorageFactory::build`] and a configured URL, so this (and the builder
+    /// methods below) is `pub` only under `test-support`, for `nisshi-broker`'s
+    /// fault-injection tests to supply their own [`ObjectStore`].
+    #[cfg(feature = "test-support")]
     pub fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
+        Self::new_with(cluster, node, object_store)
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
+        Self::new_with(cluster, node, object_store)
+    }
+
+    fn new_with(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
         Self {
             cluster: cluster.into(),
             node,
@@ -387,6 +401,7 @@ impl DynoStore {
         }
     }
 
+    #[cfg(feature = "test-support")]
     pub fn advertised_listener(self, advertised_listener: Url) -> Self {
         Self {
             advertised_listener,
@@ -394,11 +409,31 @@ impl DynoStore {
         }
     }
 
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn advertised_listener(self, advertised_listener: Url) -> Self {
+        Self {
+            advertised_listener,
+            ..self
+        }
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn schemas(self, schemas: Option<Registry>) -> Self {
         Self { schemas, ..self }
     }
 
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn schemas(self, schemas: Option<Registry>) -> Self {
+        Self { schemas, ..self }
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn lake(self, lake: Option<House>) -> Self {
+        Self { lake, ..self }
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn lake(self, lake: Option<House>) -> Self {
         Self { lake, ..self }
     }
 

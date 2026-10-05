@@ -9,6 +9,9 @@ keywords.workspace = true
 authors.workspace = true
 include.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
