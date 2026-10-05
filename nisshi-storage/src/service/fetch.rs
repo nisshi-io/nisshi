@@ -401,7 +401,7 @@ where
 
             batches.append(&mut fetched);
 
-            // the budget bounds the response: engines that assemble
+            // The budget bounds the response: engines that assemble
             // batches from rows stop at the budget but return what they
             // have, so another round now would return one record per round
             // trip until max_bytes is spent
@@ -672,7 +672,7 @@ where
 
                 responses.clear();
 
-                // every round reads every partition again
+                // Every round reads every partition again
                 let mut left = topics
                     .iter()
                     .map(|topic| topic.partitions.as_ref().map_or(0, Vec::len))
@@ -1971,7 +1971,7 @@ mod tests {
 
         let (partitions, elapsed) = fetch(storage, &[0, 1]).await?;
 
-        // the first round finds nothing, and the long poll waits half of
+        // The first round finds nothing, and the long poll waits half of
         // max_wait before the second
         let second_round = MAX_WAIT / 2;
         assert_eq!(second_round + (READ_DEADLINE - second_round) / 2, elapsed);
