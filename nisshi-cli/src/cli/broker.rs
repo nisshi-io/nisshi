@@ -398,7 +398,11 @@ impl Arg {
                 nisshi_schema::lake::House::iceberg()
                     .location(location.into_inner())
                     .catalog(catalog.into_inner())
-                    .schema_registry(schema_registry.clone().unwrap())
+                    .schema_registry(
+                        schema_registry
+                            .clone()
+                            .ok_or(Error::LakeSchemaRegistryRequired)?,
+                    )
                     .namespace(namespace)
                     .warehouse(warehouse)
                     .build()
@@ -413,7 +417,11 @@ impl Arg {
             }) => Some(
                 nisshi_schema::lake::House::delta()
                     .location(location.into_inner())
-                    .schema_registry(schema_registry.clone().unwrap())
+                    .schema_registry(
+                        schema_registry
+                            .clone()
+                            .ok_or(Error::LakeSchemaRegistryRequired)?,
+                    )
                     .database(database)
                     .records_per_second(records_per_second)
                     .build()?,
@@ -423,7 +431,11 @@ impl Arg {
             Some(Lake::Parquet { location }) => Some(
                 nisshi_schema::lake::House::parquet()
                     .location(location.into_inner())
-                    .schema_registry(schema_registry.clone().unwrap())
+                    .schema_registry(
+                        schema_registry
+                            .clone()
+                            .ok_or(Error::LakeSchemaRegistryRequired)?,
+                    )
                     .build()?,
             ),
 

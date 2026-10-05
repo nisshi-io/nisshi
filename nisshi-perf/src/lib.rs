@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use core::{
     fmt::{self, Debug, Display},
     result,
@@ -275,10 +276,10 @@ impl Perf {
             meter_provider
         };
 
-        let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+        let mut interrupt_signal = signal(SignalKind::interrupt())?;
         debug!(?interrupt_signal);
 
-        let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+        let mut terminate_signal = signal(SignalKind::terminate())?;
         debug!(?terminate_signal);
 
         let rate_limiter = self
@@ -571,7 +572,7 @@ impl Info {
                 self.previous
                     .map_or(self.started_at, |previous| previous.observation.taken_at),
             )
-            .expect("duration")
+            .unwrap_or_default()
     }
 
     fn bytes_sent(&self) -> u64 {
@@ -597,8 +598,9 @@ impl Info {
     fn bandwidth(&self) -> Byte {
         self.bytes_sent()
             .checked_div(self.elapsed().as_secs())
-            .map(|throughput| Byte::with_iec_prefix(throughput, Prefix::None))
-            .expect("throughput")
+            .map_or(Byte::with_iec_prefix(0, Prefix::None), |throughput| {
+                Byte::with_iec_prefix(throughput, Prefix::None)
+            })
     }
 }
 
@@ -615,13 +617,13 @@ impl Display for Info {
                 .latency
                 .min
                 .map(|min| min.format_duration())
-                .expect("minimum"),
-            self.current.latency.mean.expect("mean"),
+                .ok_or(fmt::Error)?,
+            self.current.latency.mean.ok_or(fmt::Error)?,
             self.current
                 .latency
                 .max
                 .map(|max| max.format_duration())
-                .expect("max")
+                .ok_or(fmt::Error)?
         )
     }
 }
@@ -724,14 +726,21 @@ impl PushMetricExporter for MetricExporter {
         let cancelled = self.cancellation.is_cancelled();
 
         if cancelled {
-            if let Some(previous) = *self.previous.lock().expect("previous") {
+            if let Some(previous) = *self
+                .previous
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
                 let mut info = Info::new(self.started_at);
                 info.current = previous;
 
                 println!("{}", info);
             }
         } else {
-            let mut previous = self.previous.lock().expect("previous");
+            let mut previous = self
+                .previous
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             let mut info = Info::new(self.started_at).with_previous(previous.take());
 

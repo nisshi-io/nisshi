@@ -162,10 +162,10 @@ where
 
         let mut set = JoinSet::new();
 
-        let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+        let mut interrupt_signal = signal(SignalKind::interrupt())?;
         debug!(?interrupt_signal);
 
-        let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+        let mut terminate_signal = signal(SignalKind::terminate())?;
         debug!(?terminate_signal);
 
         let silent = self.silent;
@@ -175,10 +175,9 @@ where
         let meter_provider = self.meter_provider.take();
 
         _ = set.spawn(async move {
-            self.serve(started)
-                .await
-                .inspect_err(|err| error!(?err))
-                .unwrap();
+            if let Err(err) = self.serve(started).await {
+                error!(?err);
+            }
         });
 
         let kind = tokio::select! {
@@ -315,8 +314,7 @@ where
 
         let m = MultiProgress::new();
 
-        let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}")
-            .unwrap()
+        let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}")?
             .tick_chars("⠁⠂⠄⡀⢀⠠⠐");
 
         let ls = if self.silent {

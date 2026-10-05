@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::{collections::HashMap, env::vars, fmt, path::PathBuf, result, str::FromStr};
 
 mod cli;
@@ -27,6 +28,8 @@ pub enum Error {
     DotEnv(#[from] dotenv::Error),
     Generate(#[from] nisshi_generator::Error),
     InvalidLength(#[from] sha2::digest::InvalidLength),
+    /// A `Lake` subcommand was given without `--schema-registry`.
+    LakeSchemaRegistryRequired,
     Perf(#[from] nisshi_perf::Error),
     Proxy(#[from] nisshi_proxy::Error),
     Regex(#[from] regex::Error),

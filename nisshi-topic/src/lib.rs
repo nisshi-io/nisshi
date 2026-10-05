@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::{fmt, io, result};
 
 use create::Create;
@@ -33,6 +34,7 @@ pub enum Error {
     Api(ErrorCode),
     Client(#[from] nisshi_client::Error),
     Io(Arc<io::Error>),
+    Message(String),
     Protocol(#[from] nisshi_sans_io::Error),
     SerdeJson(Arc<serde_json::Error>),
 }

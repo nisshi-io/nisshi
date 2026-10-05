@@ -101,8 +101,9 @@ impl Delete {
         let responses = responses.unwrap_or_default();
         assert_eq!(1, responses.len());
 
-        let DeletableTopicResult { error_code, .. } =
-            responses.first().expect("responses: {responses:?}");
+        let DeletableTopicResult { error_code, .. } = responses.first().ok_or_else(|| {
+            Error::Message(format!("expected exactly one response: {responses:?}"))
+        })?;
 
         ErrorCode::try_from(error_code).map_err(Into::into)
     }

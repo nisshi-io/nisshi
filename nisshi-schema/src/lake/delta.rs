@@ -2397,7 +2397,7 @@ mod tests {
                         ("f", f64::MAX.into()),
                         ("h", "pqr".into()),
                     ],
-                )];
+                )?];
 
                 for value in values {
                     batch =

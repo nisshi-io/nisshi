@@ -3444,17 +3444,27 @@ impl Storage for Delegate {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
+                                    if broker_ids.is_empty() {
+                                        return Err(Error::Message(
+                                            "no brokers available for partition assignment".into(),
+                                        ));
+                                    }
+
+                                    let per_partition = 1 + replication_factor as usize;
 
                                     let partitions = Some(
                                         (0..partitions)
                                             .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
+                                                let base = partition_index as usize * per_partition;
+                                                let leader_id = broker_ids[base % broker_ids.len()];
 
                                                 let replica_nodes = Some(
                                                     (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
+                                                        .map(|replica| {
+                                                            broker_ids[(base
+                                                                + 1
+                                                                + replica as usize)
+                                                                % broker_ids.len()]
                                                         })
                                                         .collect(),
                                                 );
@@ -3539,17 +3549,27 @@ impl Storage for Delegate {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
+                                    if broker_ids.is_empty() {
+                                        return Err(Error::Message(
+                                            "no brokers available for partition assignment".into(),
+                                        ));
+                                    }
+
+                                    let per_partition = 1 + replication_factor as usize;
 
                                     let partitions = Some(
                                         (0..partitions)
                                             .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
+                                                let base = partition_index as usize * per_partition;
+                                                let leader_id = broker_ids[base % broker_ids.len()];
 
                                                 let replica_nodes = Some(
                                                     (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
+                                                        .map(|replica| {
+                                                            broker_ids[(base
+                                                                + 1
+                                                                + replica as usize)
+                                                                % broker_ids.len()]
                                                         })
                                                         .collect(),
                                                 );
@@ -3634,16 +3654,26 @@ impl Storage for Delegate {
                         brokers.iter().map(|broker| broker.node_id).collect();
                     broker_ids.shuffle(&mut rng);
 
-                    let mut brokers = broker_ids.into_iter().cycle();
+                    if broker_ids.is_empty() {
+                        return Err(Error::Message(
+                            "no brokers available for partition assignment".into(),
+                        ));
+                    }
+
+                    let per_partition = 1 + replication_factor as usize;
 
                     let partitions = Some(
                         (0..partitions)
                             .map(|partition_index| {
-                                let leader_id = brokers.next().expect("cycling");
+                                let base = partition_index as usize * per_partition;
+                                let leader_id = broker_ids[base % broker_ids.len()];
 
                                 let replica_nodes = Some(
                                     (0..replication_factor)
-                                        .map(|_replica| brokers.next().expect("cycling"))
+                                        .map(|replica| {
+                                            broker_ids
+                                                [(base + 1 + replica as usize) % broker_ids.len()]
+                                        })
                                         .collect(),
                                 );
                                 let isr_nodes = replica_nodes.clone();

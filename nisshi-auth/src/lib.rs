@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use nisshi_sans_io::ScramMechanism;
 use nisshi_storage::Storage;
 use rama::extensions::Extension;

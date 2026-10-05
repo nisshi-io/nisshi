@@ -2364,6 +2364,32 @@ where
             .map(|assignment| (assignment.member_id.clone(), assignment.assignment.clone()))
             .collect::<BTreeMap<_, _>>();
 
+        let Some(protocol_type) = self.state.protocol_type.clone() else {
+            debug!(sync_outcome = ?ErrorCode::InconsistentGroupProtocol);
+
+            let sync_group_response = SyncGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::InconsistentGroupProtocol.into())
+                .protocol_type(self.state.protocol_type.clone())
+                .protocol_name(self.state.protocol_name.clone())
+                .assignment(Bytes::from_static(b""));
+
+            return (self.into(), sync_group_response.into());
+        };
+
+        let Some(protocol_name) = self.state.protocol_name.clone() else {
+            debug!(sync_outcome = ?ErrorCode::InconsistentGroupProtocol);
+
+            let sync_group_response = SyncGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::InconsistentGroupProtocol.into())
+                .protocol_type(self.state.protocol_type.clone())
+                .protocol_name(self.state.protocol_name.clone())
+                .assignment(Bytes::from_static(b""));
+
+            return (self.into(), sync_group_response.into());
+        };
+
         let sync_group_response = SyncGroupResponse::default()
             .throttle_time_ms(Some(0))
             .error_code(ErrorCode::None.into())
@@ -2385,8 +2411,8 @@ where
             members: self.members,
             generation_id: self.generation_id,
             state: Formed {
-                protocol_name: self.state.protocol_name.expect("protocol_name"),
-                protocol_type: self.state.protocol_type.expect("protocol_type"),
+                protocol_name,
+                protocol_type,
                 leader: member_id.to_owned(),
                 assignments,
             },
