@@ -195,7 +195,7 @@ impl Engine {
     /// individual records). Used both to migrate a legacy watermark on
     /// first write (`Self::partition_watermark`) and to rebuild the index
     /// after compaction (`Self::policy_compact`), where pruning individual
-    /// `t/` entries would leave the coverage gap described in SOL-155074.
+    /// `t/` entries would leave a coverage gap.
     ///
     /// Resets `latest_indexed_timestamp`/`last_batch_max_timestamp` on
     /// `watermark` before replaying, so this is safe to call against a
@@ -213,7 +213,7 @@ impl Engine {
     /// only uses an entry's offset as a *starting point* for the forward
     /// scan, never requires an exact match there, so at worst it starts a
     /// little earlier than strictly necessary - and the next compaction
-    /// rebuilds the index from survivors anyway (SOL-155074 review round 1).
+    /// rebuilds the index from survivors anyway.
     async fn backfill_time_index(
         &self,
         tx: &slatedb::DbTransaction,
@@ -342,7 +342,7 @@ impl Engine {
     }
 
     /// `ListOffsets(Timestamp)`: the offset of the first record with an
-    /// absolute timestamp `>= target_millis`, per SOL-155074's lookup
+    /// absolute timestamp `>= target_millis`, found by this lookup
     /// algorithm:
     ///
     /// 1. `target_millis` beyond everything ever indexed means no match,
@@ -425,8 +425,8 @@ impl Engine {
     /// Scan `b/` batches forward from `start_offset`, skipping a batch
     /// whose header `max_timestamp` rules it out, and inspecting records
     /// otherwise. A header can overstate - but never understate - the
-    /// true max after compaction leaves it stale (SOL-155074 change B), so
-    /// a qualifying header is a reason to look, not a match by itself:
+    /// true max after compaction leaves it stale, so a qualifying header is
+    /// a reason to look, not a match by itself:
     /// skipping straight to a batch's own `base_offset` without checking
     /// its records would be the exact bug this scan exists to avoid.
     ///
@@ -813,7 +813,7 @@ impl Engine {
                 // simply wrong. Rebuild from scratch instead, replaying the
                 // monotonic rule over the survivors in offset order - the
                 // same full-rebuild Kafka's own LogCleaner does on segment
-                // compaction (SOL-155074 change D).
+                // compaction.
                 self.delete_time_index(&tx, metadata.id, partition).await?;
                 watermark.latest_indexed_timestamp = None;
                 watermark.last_batch_max_timestamp = None;
@@ -1036,9 +1036,9 @@ impl Storage for Engine {
                             watermark.low = Some(new_low_watermark);
 
                             // Remove time index entries before the new low
-                            // watermark (SOL-155074 change D: this is the
-                            // simple prefix-pruning case, unlike compaction,
-                            // and does not touch latest_indexed_timestamp).
+                            // watermark: this is the simple prefix-pruning
+                            // case, unlike compaction, and does not touch
+                            // latest_indexed_timestamp.
                             self.prune_time_index_below(
                                 &tx,
                                 metadata.id,
@@ -1132,7 +1132,7 @@ impl Storage for Engine {
         // 2. Delete all time index entries for this topic. This keyspace is
         // enumerated explicitly like every other one here (nothing
         // wildcard-deletes by topic uuid), so it needs its own step or it
-        // leaks forever (SOL-155074).
+        // leaks forever.
         for partition in 0..topic_metadata.topic.num_partitions {
             self.delete_time_index(&tx, topic_metadata.id, partition)
                 .await?;
@@ -1829,8 +1829,8 @@ impl Storage for Engine {
                     // The most recently appended batch's own max_timestamp,
                     // kept unconditionally on the watermark so this answers
                     // in O(1) rather than a batch_base_at_or_before binary
-                    // search on every call (ListOffsets(Latest) is a
-                    // consumer hot path - SOL-155074).
+                    // search on every call: ListOffsets(Latest) is a
+                    // consumer hot path.
                     let timestamp = watermark
                         .last_batch_max_timestamp
                         .and_then(|ts| to_system_time(ts).ok());

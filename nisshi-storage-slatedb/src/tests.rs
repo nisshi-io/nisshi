@@ -1275,8 +1275,7 @@ mod cleanup_policy {
         // The partition is now fully empty (log_start == high_watermark):
         // Latest's cached `last_batch_max_timestamp` fast path must have
         // been cleared along with it, not keep answering with the pruned
-        // batch's stale timestamp (SOL-155074 review round 1 required
-        // change 3).
+        // batch's stale timestamp.
         let responses = engine
             .list_offsets(
                 IsolationLevel::ReadUncommitted,
@@ -1318,7 +1317,7 @@ mod cleanup_policy {
     }
 }
 
-// ========== Time Index Tests (SOL-155074) ==========
+// ========== Time Index Tests ==========
 //
 // These exercise the `t/` time index directly: the monotonic maybeAppend
 // rule (floored at -1 so a negative timestamp is never indexed), the
@@ -1575,7 +1574,7 @@ mod time_index {
         // batch B (base_offset 3) and C survive whole. The index's 100->0
         // entry is pruned, leaving only 150->8: a gap below the new low
         // watermark (3) that a naive "ceiling or nothing" lookup can't see
-        // into (SOL-155074 change C's worked example).
+        // into.
         let delete_request = vec![
             DeleteRecordsTopic::default()
                 .name("time-index-gap".into())
@@ -1639,15 +1638,14 @@ mod time_index {
         assert_eq!(110, millis_since_epoch(response.timestamp.unwrap()));
     }
 
-    /// Discriminates the real full-rebuild-from-survivors logic (change D)
-    /// from a naive per-entry prune (delete the `t/` entries whose
-    /// `base_offset` is in the removed set). `compaction_rebuild_finds_correct_entry_after_removal`
-    /// above does NOT discriminate this: its removed batch happens to sit
-    /// at the head of the index, so rule C's "nothing indexed below
-    /// target -> start at low" masks the gap either way. This scenario
-    /// removes an entry from the MIDDLE of the index instead, which a
-    /// naive prune answers wrong and the real rebuild answers right
-    /// (reviewer-confirmed repro, SOL-155074 review round 1).
+    /// Discriminates the real full-rebuild-from-survivors logic from a
+    /// naive per-entry prune (delete the `t/` entries whose `base_offset`
+    /// is in the removed set). `compaction_rebuild_finds_correct_entry_after_removal`
+    /// above does not discriminate this: its removed batch happens to sit
+    /// at the head of the index, so the "nothing indexed below target ->
+    /// start at low" fallback masks the gap either way. This scenario
+    /// removes an entry from the middle of the index instead, which a
+    /// naive prune answers wrong and the real rebuild answers right.
     #[tokio::test]
     async fn compaction_rebuild_depends_on_full_replay_not_naive_prune() {
         let engine = create_test_engine().await;
@@ -1768,7 +1766,7 @@ mod time_index {
         // (80) and the stale header's claimed max (100): a correct scan
         // must look inside the batch at offset 0, find nothing >= 90, and
         // fall through to the next batch - not wrongly trust the header as
-        // a match by itself (SOL-155074 change B).
+        // a match by itself.
         let response = list_offsets_timestamp(&engine, &topition, 90).await;
         assert_eq!(ErrorCode::None, response.error_code);
         assert_eq!(Some(2), response.offset);
@@ -1781,10 +1779,9 @@ mod time_index {
         let topition = create_topic(&engine, "time-index-negative").await;
 
         // First and only batch so far: a negative max_timestamp, as an
-        // untrusted wire header could claim (Nisshi does not validate it -
-        // SOL-155074 change A). Flooring the monotonic check at -1
-        // (Kafka's own NO_TIMESTAMP sentinel) must keep this from ever
-        // being indexed.
+        // untrusted wire header could claim (Nisshi does not validate it).
+        // Flooring the monotonic check at -1 (Kafka's own NO_TIMESTAMP
+        // sentinel) must keep this from ever being indexed.
         let _ = engine
             .produce(None, &topition, fake_batch(0, -5, -5))
             .await
@@ -1865,9 +1862,8 @@ mod time_index {
 
         // Before any write, list_offsets must still give the correct
         // answer: just via the read-only "index empty -> scan from low"
-        // fallback (slower, since it can't use the O(1) future-check
-        // shortcut either - see SOL-155074's decision on backfilling),
-        // not a populated index.
+        // fallback (slower, since an unbackfilled index can't use the O(1)
+        // future-check shortcut either), not a populated index.
         let response = list_offsets_timestamp(&engine, &topition, 150).await;
         assert_eq!(ErrorCode::None, response.error_code);
         assert_eq!(Some(1), response.offset);
@@ -1971,23 +1967,19 @@ mod time_index {
         // `last_batch_max_timestamp` was set to 1000 by the original
         // produce and is never touched by `append_time_index` again, so
         // without clearing it on full-prune it would keep answering
-        // Latest with the pruned batch's stale timestamp. On `main`
-        // (before this change's map-based watermark), Latest naturally
-        // answered `None` here because the map emptied along with the
-        // data - this must match (SOL-155074 review round 1 required
-        // change 3).
+        // Latest with the pruned batch's stale timestamp instead of
+        // `None`, which is what an empty partition must answer.
         let response = list_offsets_latest(&engine, &topition).await;
         assert_eq!(ErrorCode::None, response.error_code);
         assert_eq!(Some(1), response.offset);
         assert!(response.timestamp.is_none());
     }
 
-    /// The ticket's own worked example (SOL-155074), as a real regression
-    /// test: 5 batches of 10 records each, with out-of-order/overlapping
-    /// timestamps across batches, exercising the ceiling-then-scan lookup
-    /// and the post-`delete_records` behavior together.
+    /// A worked example exercising the ceiling-then-scan lookup and the
+    /// post-`delete_records` behavior together: 5 batches of 10 records
+    /// each, with out-of-order/overlapping timestamps across batches.
     #[tokio::test]
-    async fn ticket_worked_example() {
+    async fn overlapping_batches_ceiling_then_scan_with_delete_records() {
         let engine = create_test_engine().await;
         let topition = create_topic(&engine, "time-index-ticket-example").await;
 
