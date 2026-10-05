@@ -234,7 +234,7 @@ impl Engine {
                 }
 
                 tx.put(&watermark_key, postcard::to_stdvec(&watermark)?)?;
-                tx.commit().await.map_err(Error::from)?;
+                _ = tx.commit().await.map_err(Error::from)?;
 
                 deleted += removed;
             }
@@ -339,7 +339,7 @@ impl Engine {
                 }
 
                 tx.put(&watermark_key, postcard::to_stdvec(&watermark)?)?;
-                tx.commit().await.map_err(Error::from)?;
+                _ = tx.commit().await.map_err(Error::from)?;
 
                 compacted += removed_records;
             }
@@ -387,7 +387,7 @@ impl Storage for Engine {
         _ = brokers.insert(self.node, broker_info);
         self.save_metadata(&tx, Self::BROKERS, &brokers)?;
 
-        tx.commit().await.map_err(Error::from)?;
+        _ = tx.commit().await.map_err(Error::from)?;
 
         Ok(())
     }
@@ -579,7 +579,7 @@ impl Storage for Engine {
             );
         }
 
-        tx.commit().await.map_err(Error::from)?;
+        _ = tx.commit().await.map_err(Error::from)?;
 
         Ok(results)
     }
@@ -680,7 +680,7 @@ impl Storage for Engine {
         _ = topics.remove(&topic_name);
         self.save_metadata(&tx, Self::TOPICS, &topics)?;
 
-        tx.commit().await.map_err(Error::from)?;
+        _ = tx.commit().await.map_err(Error::from)?;
 
         Ok(ErrorCode::None)
     }
@@ -742,7 +742,7 @@ impl Storage for Engine {
                     );
 
                     self.save_metadata(&tx, Self::TOPICS, &topics)?;
-                    tx.commit().await.map_err(Error::from)?;
+                    _ = tx.commit().await.map_err(Error::from)?;
                 }
 
                 Ok(AlterConfigsResourceResponse::default()
@@ -1187,7 +1187,7 @@ impl Storage for Engine {
             responses.push((topition.clone(), ErrorCode::None));
         }
 
-        tx.commit().await.map_err(Error::from)?;
+        _ = tx.commit().await.map_err(Error::from)?;
 
         Ok(responses)
     }
@@ -1749,7 +1749,7 @@ impl Storage for Engine {
                 );
             }
 
-            tx.commit().await.map_err(Error::from)?;
+            _ = tx.commit().await.map_err(Error::from)?;
         }
 
         Ok(results)
@@ -1849,7 +1849,8 @@ impl Storage for Engine {
             .map_err(UpdateError::Error)?;
 
         match tx.commit().await {
-            Ok(()) => Ok(updated_version),
+            // `commit` now returns the write handle; nothing here needs it.
+            Ok(_) => Ok(updated_version),
 
             // Another update to this group committed while this transaction
             // was open: report the group as outdated, so that the caller
@@ -2016,7 +2017,7 @@ impl Storage for Engine {
                 self.save_metadata(&tx, Self::TRANSACTIONS, &transactions)?;
                 self.save_metadata(&tx, Self::PRODUCERS, &producers)?;
 
-                tx.commit().await.map_err(Error::from)?;
+                _ = tx.commit().await.map_err(Error::from)?;
 
                 return Ok(ProducerIdResponse {
                     id: producer_id,
@@ -2051,7 +2052,7 @@ impl Storage for Engine {
             self.save_metadata(&tx, Self::PRODUCERS, &producers)?;
             self.save_metadata(&tx, Self::TRANSACTIONS, &transactions)?;
 
-            tx.commit().await.map_err(Error::from)?;
+            _ = tx.commit().await.map_err(Error::from)?;
 
             Ok(ProducerIdResponse {
                 id: new_producer_id,
@@ -2219,7 +2220,7 @@ impl Storage for Engine {
 
                 self.save_metadata(&tx, Self::TRANSACTIONS, &transactions)?;
 
-                tx.commit().await.map_err(Error::from)?;
+                _ = tx.commit().await.map_err(Error::from)?;
 
                 Ok(TxnAddPartitionsResponse::VersionZeroToThree(results))
             }
@@ -2324,7 +2325,7 @@ impl Storage for Engine {
 
                 self.save_metadata(&tx, Self::TRANSACTIONS, &stored_transactions)?;
 
-                tx.commit().await.map_err(Error::from)?;
+                _ = tx.commit().await.map_err(Error::from)?;
 
                 Ok(TxnAddPartitionsResponse::VersionFourPlus(results))
             }
@@ -2425,7 +2426,7 @@ impl Storage for Engine {
             .map_err(Error::from)
             .and_then(|encoded| tx.put(Self::TRANSACTIONS, encoded).map_err(Into::into))?;
 
-        tx.commit().await.map_err(Error::from)?;
+        _ = tx.commit().await.map_err(Error::from)?;
 
         Ok(responses)
     }
@@ -2686,7 +2687,7 @@ impl Storage for Engine {
 
         self.save_metadata(&tx, Self::TRANSACTIONS, &transactions)?;
 
-        tx.commit().await.map_err(Error::from)?;
+        _ = tx.commit().await.map_err(Error::from)?;
 
         Ok(ErrorCode::None)
     }
@@ -2741,7 +2742,7 @@ impl Storage for Engine {
         mechanism: ScramMechanism,
     ) -> Result<()> {
         let key = postcard::to_stdvec(&UserScramCredentialKey::new(user, mechanism))?;
-        self.db.delete(key).await.map_err(Into::into)
+        self.db.delete(key).await.map(|_| ()).map_err(Into::into)
     }
 
     async fn upsert_user_scram_credential(
@@ -2752,7 +2753,11 @@ impl Storage for Engine {
     ) -> Result<()> {
         let key = postcard::to_stdvec(&UserScramCredentialKey::new(user, mechanism))?;
         let value = postcard::to_stdvec(&StoredScramCredential::from(credential))?;
-        self.db.put(key, value).await.map_err(Into::into)
+        self.db
+            .put(key, value)
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     async fn user_scram_credential(

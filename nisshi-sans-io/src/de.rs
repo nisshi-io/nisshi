@@ -1077,15 +1077,16 @@ impl<'de> SeqAccess<'de> for Batch {
             let batch_length = self.encoded.try_get_i32()?;
             debug!(base_offset, batch_length);
 
-            let mut batch = BytesMut::with_capacity(batch_length as usize);
-            batch.put_i64(base_offset);
-            batch.put_i32(batch_length);
+            let batch_length_usize = usize::try_from(batch_length).map_err(|_| Error::Overflow)?;
 
-            if (batch_length as usize) > self.encoded.len() {
+            if batch_length_usize > self.encoded.len() {
                 return Err(Error::Overflow);
             }
 
-            batch.put(self.encoded.split_to(batch_length as usize));
+            let mut batch = BytesMut::with_capacity(batch_length_usize);
+            batch.put_i64(base_offset);
+            batch.put_i32(batch_length);
+            batch.put(self.encoded.split_to(batch_length_usize));
 
             let decoder = BatchDecoder {
                 encoded: batch.freeze(),
@@ -1512,5 +1513,25 @@ impl<'de> VariantAccess<'de> for Enum<'de, '_> {
             visitor = type_name_of_val(&visitor)
         );
         Deserializer::deserialize_struct(self.de, self.name, fields, visitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::marker::PhantomData;
+
+    /// A negative `batch_length` must be rejected before it sizes an
+    /// allocation. Cast straight to `usize` it becomes `usize::MAX`, and
+    /// `BytesMut::with_capacity` panicked with "capacity overflow".
+    #[test]
+    fn negative_batch_length_returns_err_not_huge_allocation() {
+        let mut encoded = BytesMut::new();
+        encoded.put_i64(0); // base_offset
+        encoded.put_i32(-1); // batch_length: a wire lie
+        let mut seq = Batch::new(encoded.freeze());
+
+        let result = seq.next_element_seed(PhantomData::<crate::record::deflated::Batch>);
+        assert!(result.is_err());
     }
 }

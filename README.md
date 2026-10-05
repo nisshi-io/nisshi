@@ -461,6 +461,13 @@ Consumer:
 
 Please [raise an issue][nisshi-issues] if you encounter a problem.
 
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING][nisshi-contributing] for how to get started,
+and [GOVERNANCE][nisshi-governance] for how decisions get made. Everyone participating is
+expected to follow our [Code of Conduct][nisshi-code-of-conduct]. To report a security
+vulnerability, see [SECURITY][nisshi-security].
+
 ## License
 
 Nisshi is licensed under [Apache 2.0][apache-license].
@@ -484,4 +491,8 @@ Nisshi is licensed under [Apache 2.0][apache-license].
 [raft-consensus]: https://raft.github.io
 [rust-lang-org]: https://www.rust-lang.org
 [nisshi-issues]: https://github.com/nisshi-io/nisshi/issues
+[nisshi-contributing]: CONTRIBUTING.md
+[nisshi-code-of-conduct]: CODE_OF_CONDUCT.md
+[nisshi-security]: SECURITY.md
+[nisshi-governance]: GOVERNANCE.md
 [tigris-conditional-writes]: https://www.tigrisdata.com/blog/s3-conditional-writes/

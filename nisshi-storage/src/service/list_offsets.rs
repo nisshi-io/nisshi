@@ -24,7 +24,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{Error, ListOffsetResponse, Result, Storage, Topition};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::{

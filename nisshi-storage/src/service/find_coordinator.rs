@@ -21,7 +21,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`FindCoordinatorRequest`] returning [`FindCoordinatorResponse`].
+/// A [`Service`] using its [`Storage`] taking [`FindCoordinatorRequest`] returning [`FindCoordinatorResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::{ErrorCode, FindCoordinatorRequest};

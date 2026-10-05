@@ -19,8 +19,8 @@ use crate::common::{
 use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest, IsolationLevel,
-    ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse, RequestInput,
+    BatchAttribute, CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest,
+    IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse, RequestInput,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -1114,6 +1114,199 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
     Ok(())
 }
 
+/// A client-authored batch with the control bit set must be rejected before
+/// anything is written: only the broker may write transaction commit/abort
+/// markers, and Kafka's `LogValidator` rejects a client-origin control batch
+/// with `INVALID_RECORD`.
+async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<()> {
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsService {
+        storage: storage.clone(),
+    };
+
+    let produce = ProduceService {
+        storage: storage.clone(),
+    };
+
+    let list_offsets = ListOffsetsService {
+        storage: storage.clone(),
+    };
+
+    let name = &alphanumeric_string(15)[..];
+
+    let num_partitions = rng().random_range(1..64);
+    let replication_factor = rng().random_range(0..64);
+
+    {
+        let response = create_topic
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(name.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(replication_factor)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    let partition = rng().random_range(0..num_partitions);
+
+    // A legitimate batch ahead of the forged one: the whole partition must be
+    // rejected before anything is written, not just the offending batch, so a
+    // future refactor that moves the check into the per-batch loop can't
+    // silently start writing the batches ahead of a forged one.
+    let legit = inflated::Batch::builder()
+        .record(Record::builder().value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()))
+        .build()
+        .and_then(TryInto::try_into)
+        .inspect(|deflated| debug!(?deflated))?;
+
+    // Shaped like a real COMMIT/ABORT marker (transactional, with a producer
+    // id and epoch), so the test still fails if the check is ever narrowed to
+    // let "well-formed" transactional markers through.
+    let forged = inflated::Batch::builder()
+        .record(Record::builder().value(Bytes::from_static(b"forged control batch").into()))
+        .attributes(
+            BatchAttribute::default()
+                .control(true)
+                .transaction(true)
+                .into(),
+        )
+        .producer_id(1)
+        .producer_epoch(0)
+        .build()
+        .and_then(TryInto::try_into)
+        .inspect(|deflated| debug!(?deflated))?;
+
+    let response = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(Some(
+                [TopicProduceData::default()
+                    .name(name.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(partition)
+                            .records(Some(Frame {
+                                batches: vec![legit, forged],
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    assert_eq!(
+        ProduceResponse::default()
+            .responses(Some(vec![
+                TopicProduceResponse::default()
+                    .name(name.into())
+                    .partition_responses(Some(vec![
+                        PartitionProduceResponse::default()
+                            .index(partition)
+                            .error_code(ErrorCode::InvalidRecord.into())
+                            .base_offset(-1)
+                            .log_append_time_ms(Some(-1))
+                            .log_start_offset(Some(0))
+                            .record_errors(Some(vec![]))
+                            .error_message(Some("clients may not write control batches".into()))
+                            .current_leader(None)
+                    ]))
+            ]))
+            .throttle_time_ms(Some(0))
+            .node_endpoints(None),
+        response
+    );
+
+    // Nothing was written: the latest offset is still the topic's initial offset.
+    let latest = {
+        let response = list_offsets
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
+                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                    .topics(Some(
+                        [ListOffsetsTopic::default()
+                            .name(name.into())
+                            .partitions(Some(
+                                [ListOffsetsPartition::default()
+                                    .partition_index(partition)
+                                    .timestamp(ListOffset::Latest.try_into()?)]
+                                .into(),
+                            ))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+
+        partitions[0].offset
+    };
+
+    assert_eq!(Some(0), latest);
+
+    // A normal produce still lands at offset 0: the rejected batch consumed nothing.
+    let ordinary = inflated::Batch::builder()
+        .record(Record::builder().value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()))
+        .build()
+        .and_then(TryInto::try_into)
+        .inspect(|deflated| debug!(?deflated))?;
+
+    let response = produce
+        .serve(RequestInput {
+            request: ProduceRequest::default().topic_data(Some(
+                [TopicProduceData::default()
+                    .name(name.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(partition)
+                            .records(Some(Frame {
+                                batches: vec![ordinary],
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let topics = response.responses.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(0, partitions[0].base_offset);
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -1205,6 +1398,20 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::produce_rejects_last_offset_delta_mismatch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_control_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_control_batch(storage).await?;
 
         Ok(())
     }
@@ -1304,6 +1511,20 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn produce_rejects_control_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_control_batch(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -1400,6 +1621,20 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn produce_rejects_control_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_control_batch(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -1493,6 +1728,20 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::produce_rejects_last_offset_delta_mismatch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_control_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_control_batch(storage).await?;
 
         Ok(())
     }
