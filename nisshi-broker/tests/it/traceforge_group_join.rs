@@ -18,8 +18,8 @@
 //! condition, against the real `Wrapper`/`Inner` group state machine and the
 //! real dynostore `Storage::update_group`.
 //!
-//! This is the harness pattern Phase 0 established, applied where it earns
-//! its keep: with 3 members there are `3! = 6` join orders and 2 independent
+//! This applies the same nondet()-sequencing technique where it earns its
+//! keep: with 3 members there are `3! = 6` join orders and 2 independent
 //! cache-hit/miss decisions per member (`2^3 = 8`), 48 combinations in total.
 //! Hand-writing a test per combination the way
 //! `update_group_conditional::concurrent_same_version` does for 2 writers
