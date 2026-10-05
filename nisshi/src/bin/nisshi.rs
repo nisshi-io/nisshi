@@ -94,6 +94,9 @@ async fn main() -> Result<ErrorCode> {
             nisshi_cli::Error::TlsRequiresCertAndKey => {
                 error!("TLS requires both --cert and --key.")
             }
+            nisshi_cli::Error::LakeRequiresSchemaRegistry { lake } => error!(
+                "{lake} requires --schema-registry: a data lake writer validates every record against a schema."
+            ),
             _ => error!("Unknown error occurred during command: {}", err),
         })
 }

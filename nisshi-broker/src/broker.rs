@@ -455,6 +455,11 @@ where
                                     // not an anomaly worth an `error!` on every occurrence.
                                     || io.kind() == ErrorKind::TimedOut => {}
 
+                            // Already reported, with the request's api_key and api_name,
+                            // by the `warn!` in `BytesFrameService::serve` where the
+                            // rejection happens: this catch-all must not report it again.
+                            Err(Error::KafkaProtocol(nisshi_sans_io::Error::NotAuthenticated)) => {}
+
                             Err(error) => {
                                 error!(?error);
                             },
@@ -572,9 +577,6 @@ type PhantomBuilder = Builder<
 >;
 
 impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
-    const MAINTENANCE_INTERVAL: &str = "maintenance_interval";
-    const TRANSACTION_MAINTENANCE_INTERVAL: &str = "transaction_maintenance_interval";
-
     pub fn node_id(self, node_id: i32) -> Builder<i32, C, I, A, S, L> {
         Builder {
             node_id,
@@ -661,27 +663,21 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
         }
     }
 
-    pub fn storage(self, mut storage: Url) -> Builder<N, C, I, A, Url, L> {
-        let maintenance_interval = storage.query_pairs().find_map(|(k, v)| {
-            if k == Self::MAINTENANCE_INTERVAL {
-                v.parse::<humantime::Duration>().map(Into::into).ok()
-            } else {
-                None
-            }
-        });
+    pub fn storage(self, mut storage: Url) -> Result<Builder<N, C, I, A, Url, L>> {
+        let maintenance_interval =
+            nisshi_storage::parse_duration_option(&storage, nisshi_storage::MAINTENANCE_INTERVAL)?;
 
-        let transaction_maintenance_interval = storage.query_pairs().find_map(|(k, v)| {
-            if k == Self::TRANSACTION_MAINTENANCE_INTERVAL {
-                v.parse::<humantime::Duration>().map(Into::into).ok()
-            } else {
-                None
-            }
-        });
+        let transaction_maintenance_interval = nisshi_storage::parse_duration_option(
+            &storage,
+            nisshi_storage::TRANSACTION_MAINTENANCE_INTERVAL,
+        )?;
 
         let pairs = storage
             .query_pairs()
             .filter_map(|(k, v)| {
-                if k == Self::MAINTENANCE_INTERVAL || k == Self::TRANSACTION_MAINTENANCE_INTERVAL {
+                if k == nisshi_storage::MAINTENANCE_INTERVAL
+                    || k == nisshi_storage::TRANSACTION_MAINTENANCE_INTERVAL
+                {
                     None
                 } else {
                     Some((k.to_string(), v.to_string()))
@@ -701,7 +697,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             storage = %redact_url(&storage)
         );
 
-        Builder {
+        Ok(Builder {
             node_id: self.node_id,
             cluster_id: self.cluster_id,
             incarnation_id: self.incarnation_id,
@@ -718,7 +714,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             transaction_maintenance_interval,
 
             cancellation: self.cancellation,
-        }
+        })
     }
 
     pub fn listener(self, listener: Url) -> Builder<N, C, I, A, S, Url> {
@@ -832,7 +828,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .advertised_listener(self.advertised_listener.clone())
             .schema_registry(self.schema_registry.clone())
             .lake_house(self.lake_house.clone())
-            .storage(self.storage.clone())
+            .storage(self.storage.clone())?
             .cancellation(self.cancellation.clone())
             .silent(self.silent)
             .build()

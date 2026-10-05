@@ -139,7 +139,7 @@ async fn spawn_broker(tls: Option<ServerConfig>) -> Result<RunningBroker> {
         .cluster_id(format!("tls-{}", Uuid::now_v7()))
         .incarnation_id(Uuid::now_v7())
         .advertised_listener(listener.clone())
-        .storage(Url::parse("memory://")?)
+        .storage(Url::parse("memory://")?)?
         .listener(listener)
         .tls_server_config(tls)
         .silent(true)

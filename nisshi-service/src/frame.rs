@@ -335,6 +335,12 @@ where
         let api_key = req.api_key()?;
 
         if !self.is_authenticated(api_key) {
+            warn!(
+                api_key,
+                api_name = %req.api_name(),
+                "closing connection: request before authentication"
+            );
+
             return Err(Into::into(nisshi_sans_io::Error::NotAuthenticated));
         }
 

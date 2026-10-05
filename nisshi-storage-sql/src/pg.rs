@@ -4189,6 +4189,21 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test for SOL-155256: a storage URL query option this
+    /// engine does not recognise (`vacuum_into` belongs to the sqlite
+    /// engine, not Postgres) must stop the broker with a clear error
+    /// instead of being silently ignored. `Config::from_str` already
+    /// rejects it, before any connection is attempted, same as
+    /// `pool_builds_with_configured_timeouts` above: this confirms
+    /// existing behaviour, it is not a code change.
+    #[test]
+    fn unrecognized_query_option_rejected_without_connecting() {
+        _ = Postgres::builder(&format!("{CONNECTION}?vacuum_into=/tmp/does-not-matter"))
+            .expect_err(
+                "an option tokio-postgres does not recognise must be rejected, not silently ignored",
+            );
+    }
+
     #[test]
     fn pool_error_timeout_maps_to_retriable_error_code() {
         let error = Error::from(PoolError::Timeout(TimeoutType::Wait));

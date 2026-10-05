@@ -59,6 +59,7 @@ pub mod tls;
 pub mod topic;
 pub mod topic_lifecycle;
 pub mod txn;
+pub mod unauthenticated;
 pub mod update_group_conditional;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a

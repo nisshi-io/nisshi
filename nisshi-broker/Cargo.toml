@@ -29,7 +29,6 @@ console.workspace = true
 futures.workspace = true
 glob.workspace = true
 http-body-util.workspace = true
-humantime.workspace = true
 hyper-util.workspace = true
 hyper.workspace = true
 indicatif.workspace = true

@@ -31,7 +31,7 @@
 //!     .cluster_id("nisshi")
 //!     .node_id(111)
 //!     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-//!     .storage(Url::parse("memory://nisshi/")?)
+//!     .storage(Url::parse("memory://nisshi/")?)?
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -49,7 +49,7 @@
 //!     .cluster_id("nisshi")
 //!     .node_id(111)
 //!     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-//!     .storage(Url::parse("s3://nisshi/")?)
+//!     .storage(Url::parse("s3://nisshi/")?)?
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -67,7 +67,7 @@
 //!     .cluster_id("nisshi")
 //!     .node_id(111)
 //!     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-//!     .storage(Url::parse("postgres://postgres:postgres@localhost")?)
+//!     .storage(Url::parse("postgres://postgres:postgres@localhost")?)?
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -85,7 +85,7 @@
 //!     .cluster_id("nisshi")
 //!     .node_id(111)
 //!     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-//!     .storage(Url::parse("sqlite://nisshi.db")?)
+//!     .storage(Url::parse("sqlite://nisshi.db")?)?
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -103,7 +103,7 @@
 //!     .cluster_id("nisshi")
 //!     .node_id(111)
 //!     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-//!     .storage(Url::parse("turso://nisshi.db")?)
+//!     .storage(Url::parse("turso://nisshi.db")?)?
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -322,7 +322,23 @@ pub enum Error {
 
     UnknownCacheKey(String),
 
-    UnsupportedStorageUrl(Url),
+    /// A storage URL's query string gave a recognised option (`maintenance_interval`,
+    /// `transaction_maintenance_interval`) a value that does not parse, or that
+    /// parses to a period of zero: `tokio::time::interval` panics on a zero
+    /// duration, so a zero period must never reach a periodic sweep.
+    InvalidStorageOptionValue {
+        option: String,
+        value: String,
+    },
+
+    /// A storage URL named a query option that scheme's engine does not
+    /// recognise (for example a typo, or an option that belongs to a
+    /// different engine).
+    UnrecognizedStorageOption {
+        scheme: String,
+        option: String,
+    },
+
     UnexpectedAddPartitionsToTxnRequest(Box<AddPartitionsToTxnRequest>),
     Url(#[from] url::ParseError),
     UnknownTxnState(String),
@@ -2194,6 +2210,55 @@ pub struct Builder<N, C, A, S> {
 type PhantomBuilder =
     Builder<PhantomData<i32>, PhantomData<String>, PhantomData<Url>, PhantomData<Url>>;
 
+/// A storage URL query option naming a periodic sweep interval: recognised
+/// by every engine (stripped before the broker ever starts one), rather
+/// than belonging to a particular engine.
+pub const MAINTENANCE_INTERVAL: &str = "maintenance_interval";
+
+/// See [`MAINTENANCE_INTERVAL`]; names the transaction sweep's own interval.
+pub const TRANSACTION_MAINTENANCE_INTERVAL: &str = "transaction_maintenance_interval";
+
+/// The value of `key` in `storage`'s query string, parsed as a duration.
+///
+/// `Err` when `key` is present but its value does not parse, or parses to a
+/// period of zero: `tokio::time::interval` panics on a zero duration, so a
+/// zero period must never reach a periodic sweep.
+pub fn parse_duration_option(storage: &Url, key: &str) -> Result<Option<Duration>> {
+    storage
+        .query_pairs()
+        .find_map(|(k, v)| (k == key).then(|| v.into_owned()))
+        .map(|value| {
+            human_units::Duration::from_str(value.as_str())
+                .map(|duration| duration.0)
+                .ok()
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| Error::InvalidStorageOptionValue {
+                    option: key.to_owned(),
+                    value: value.clone(),
+                })
+        })
+        .transpose()
+}
+
+/// Rejects any of `storage`'s query keys that is not in `recognized`, naming
+/// the first offending key and `storage`'s scheme.
+///
+/// Called by each [`StorageFactory::build`] with the options that engine
+/// understands, so a typo (`maintainance_interval`) or an option meant for
+/// a different engine (`vacuum_into` on Postgres) fails the broker at
+/// startup instead of being silently ignored.
+pub fn reject_unrecognized_options(storage: &Url, recognized: &[&str]) -> Result<()> {
+    storage
+        .query_pairs()
+        .find(|(k, _)| !recognized.contains(&k.as_ref()))
+        .map_or(Ok(()), |(k, _)| {
+            Err(Error::UnrecognizedStorageOption {
+                scheme: storage.scheme().to_owned(),
+                option: k.into_owned(),
+            })
+        })
+}
+
 impl<N, C, A, S> Builder<N, C, A, S> {
     pub fn node_id(self, node_id: i32) -> Builder<i32, C, A, S> {
         Builder {
@@ -2237,10 +2302,13 @@ impl<N, C, A, S> Builder<N, C, A, S> {
         }
     }
 
-    pub fn storage(self, storage: Url) -> Builder<N, C, A, Url> {
+    pub fn storage(self, storage: Url) -> Result<Builder<N, C, A, Url>> {
+        _ = parse_duration_option(&storage, MAINTENANCE_INTERVAL)?;
+        _ = parse_duration_option(&storage, TRANSACTION_MAINTENANCE_INTERVAL)?;
+
         debug!(storage = %redact_url(&storage));
 
-        Builder {
+        Ok(Builder {
             node_id: self.node_id,
             cluster_id: self.cluster_id,
             advertised_listener: self.advertised_listener,
@@ -2250,7 +2318,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             silent: self.silent,
             cancellation: self.cancellation,
             factories: self.factories,
-        }
+        })
     }
 
     pub fn schema_registry(self, schema_registry: Option<Registry>) -> Self {
@@ -2446,7 +2514,7 @@ mod tests {
 
         // Exercises `Builder::storage`, which used to `debug!(%storage)`
         // the raw URL (nisshi-storage/src/lib.rs).
-        _ = StorageContainer::builder().storage(Url::parse("postgres://user:secret@host/db")?);
+        _ = StorageContainer::builder().storage(Url::parse("postgres://user:secret@host/db")?)?;
 
         let log = std::fs::read_to_string(log_file_path()?)?;
         assert!(!log.contains("secret"));
@@ -2466,7 +2534,7 @@ mod tests {
             .node_id(1)
             .cluster_id("test")
             .advertised_listener(Url::parse("tcp://localhost:9092")?)
-            .storage(Url::parse("postgres://user:secret@host/db")?)
+            .storage(Url::parse("postgres://user:secret@host/db")?)?
             .build()
             .await
             .unwrap_err();

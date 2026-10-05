@@ -46,7 +46,7 @@ mod doctest_template {
             .cluster_id(CLUSTER_ID)
             .node_id(NODE_ID)
             .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-            .storage(Url::parse("memory://nisshi/")?)
+            .storage(Url::parse("memory://nisshi/")?)?
             .build()
             .await?;
 
