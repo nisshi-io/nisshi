@@ -593,8 +593,13 @@ impl Frame {
     pub fn request_from_bytes(encoded: impl Buf) -> Result<Frame> {
         let start = SystemTime::now();
 
+        // No length-prefixed field can claim more than the frame actually
+        // holds: the decoder is bounded to exactly what's left in `encoded`,
+        // not the much larger `MESSAGE_MAX_SIZE` fallback.
+        let message_max_size = encoded.remaining();
+
         let mut reader = encoded.reader();
-        let mut deserializer = Decoder::request(&mut reader);
+        let mut deserializer = Decoder::request(&mut reader, Some(message_max_size));
         Frame::deserialize(&mut deserializer)
             .inspect(|frame| debug!(?frame, elapsed_millis = Self::elapsed_millis(start)))
     }
@@ -2313,6 +2318,36 @@ mod tests {
         sleep(Duration::from_millis(pause));
 
         assert!(Frame::elapsed_millis(now) >= pause);
+    }
+
+    /// `Frame::request_from_bytes` must bound every length-prefixed field to
+    /// what's actually left in the frame, not the much larger 1GiB fallback.
+    /// A small, otherwise well-formed `SaslAuthenticate` frame (allowed
+    /// before authentication) whose `auth_bytes` length claims ~1GiB, with no
+    /// bytes behind it at all, must be rejected with `MessageMaxSizeExceeded`
+    /// specifically -- not just `is_err()`, since without the bound in place
+    /// `read_exact` still fails (there's nothing to read), so a bare
+    /// `is_err()` assertion would pass either way and prove nothing about the
+    /// bound actually being wired in.
+    #[test]
+    fn request_from_bytes_rejects_a_length_claim_beyond_the_frame() {
+        const CLAIMED_AUTH_BYTES_LENGTH: i32 = 1_000_000_000;
+
+        let mut encoded = BytesMut::new();
+        encoded.put_i32(0); // size: unused by Frame::deserialize itself
+        encoded.put_i16(SaslAuthenticateRequest::KEY); // api_key
+        encoded.put_i16(0); // api_version: 0, non-flexible
+        encoded.put_i32(1); // correlation_id
+        encoded.put_i16(-1); // client_id: null
+        encoded.put_i32(CLAIMED_AUTH_BYTES_LENGTH); // auth_bytes length, no bytes behind it
+
+        let err = Frame::request_from_bytes(encoded.freeze())
+            .expect_err("a claimed length far beyond the frame's actual size must be rejected");
+
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(length) if length == CLAIMED_AUTH_BYTES_LENGTH as usize),
+            "{err:?}"
+        );
     }
 
     #[test]

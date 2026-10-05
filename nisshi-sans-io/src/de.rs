@@ -131,7 +131,7 @@ impl<'de> Decoder<'de> {
         }
     }
 
-    pub(crate) fn request(reader: &'de mut dyn Read) -> Self {
+    pub(crate) fn request(reader: &'de mut dyn Read, message_max_size: Option<usize>) -> Self {
         Self {
             reader,
             containers: VecDeque::with_capacity(PARSE_DEPTH),
@@ -144,7 +144,7 @@ impl<'de> Decoder<'de> {
             in_seq_of_primitive: false,
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
-            message_max_size: None,
+            message_max_size,
         }
     }
 
@@ -581,6 +581,10 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.length
             .ok_or(Error::StringWithoutLength)
             .and_then(|length| {
+                if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+                    return Err(Error::MessageMaxSizeExceeded(length));
+                }
+
                 let mut buf = vec![0u8; length];
                 self.reader.read_exact(&mut buf)?;
                 from_utf8(buf.as_slice())
@@ -634,13 +638,18 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
 
         let length = if self.is_flexible() {
             self.unsigned_varint()
-                .and_then(|length| usize::try_from(length - 1).map_err(Into::into))?
+                .and_then(|length| usize::try_from(length).map_err(Into::into))
+                .and_then(|length| length.checked_sub(1).ok_or(Error::Overflow))?
         } else {
             let mut buf = [0u8; 4];
 
             self.reader.read_exact(&mut buf)?;
             usize::try_from(u32::from_be_bytes(buf))?
         };
+
+        if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+            return Err(Error::MessageMaxSizeExceeded(length));
+        }
 
         let mut buf = vec![0u8; length];
         self.reader.read_exact(&mut buf)?;
@@ -1527,5 +1536,56 @@ mod tests {
 
         let result = seq.next_element_seed(PhantomData::<crate::record::deflated::Batch>);
         assert!(result.is_err());
+    }
+
+    /// A [`Visitor`] that is never actually invoked: every test below expects
+    /// the size check to short-circuit before the visitor would be called, so
+    /// only `expecting` needs an implementation.
+    struct UnreachableVisitor;
+
+    impl<'de> Visitor<'de> for UnreachableVisitor {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a value (this visitor should never be invoked)")
+        }
+    }
+
+    /// `deserialize_str` had no `message_max_size` check at all: a claimed
+    /// length over the limit must be rejected before the body is read, the
+    /// same way `deserialize_string` already does.
+    #[test]
+    fn deserialize_str_rejects_length_over_message_max_size() {
+        let declared_length = 1_000_000i32;
+        let mut encoded: Vec<u8> = declared_length.to_be_bytes().to_vec();
+        let mut reader: &[u8] = &mut encoded;
+        let mut decoder = Decoder::request(&mut reader, Some(10));
+
+        let err = Deserializer::deserialize_str(&mut decoder, UnreachableVisitor)
+            .expect_err("a length over message_max_size must be rejected");
+
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(length) if length == declared_length as usize),
+            "{err:?}"
+        );
+    }
+
+    /// `deserialize_bytes` had no `message_max_size` check on either the
+    /// flexible or non-flexible length-read branch, unlike its sibling
+    /// `deserialize_byte_buf`.
+    #[test]
+    fn deserialize_bytes_rejects_length_over_message_max_size() {
+        let declared_length = 1_000_000i32;
+        let mut encoded: Vec<u8> = declared_length.to_be_bytes().to_vec();
+        let mut reader: &[u8] = &mut encoded;
+        let mut decoder = Decoder::request(&mut reader, Some(10));
+
+        let err = Deserializer::deserialize_bytes(&mut decoder, UnreachableVisitor)
+            .expect_err("a length over message_max_size must be rejected");
+
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(length) if length == declared_length as usize),
+            "{err:?}"
+        );
     }
 }
