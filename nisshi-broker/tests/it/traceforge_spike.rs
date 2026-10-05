@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phase 0 feasibility spike for the `traceforge` crate, see
-//! `docs/traceforge-test-plan.md`.
+//! Phase 0 feasibility spike for the `traceforge` crate.
 //!
 //! This models the race in `update_group_conditional::concurrent_same_version`
 //! against the real in-memory (dynostore) storage engine: two writers racing
@@ -47,7 +46,8 @@
 //! that's no more than a hand-written test for each order would give you. The
 //! payoff shows up once there are enough independent decision points that
 //! hand-enumeration stops being practical (e.g. the 3-member join/sync/
-//! heartbeat interleavings in the test plan's Phase 1) — `nondet()` and
+//! heartbeat interleavings in `traceforge_group_join.rs`'s Phase 1) —
+//! `nondet()` and
 //! TraceForge's search handle the combinatorics automatically, provided each
 //! contended decision is exposed to it explicitly like `write_two_first`
 //! below. TraceForge only explores what it can see: it will not find a race

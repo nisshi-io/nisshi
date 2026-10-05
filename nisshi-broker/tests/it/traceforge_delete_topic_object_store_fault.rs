@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phase 3 of `docs/traceforge-test-plan.md`: fault injection at the
+//! Phase 3: fault injection at the
 //! `object_store::ObjectStore` layer under `delete_topic`
 //! (`nisshi-storage-dynostore/src/dynostore.rs:642-712`), the same
 //! technique as `traceforge_produce_object_store_fault.rs` applied to a

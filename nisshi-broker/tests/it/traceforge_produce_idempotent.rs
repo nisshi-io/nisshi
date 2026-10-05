@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phase 2 of `docs/traceforge-test-plan.md`: idempotent-producer sequence
+//! Phase 2: idempotent-producer sequence
 //! dedup (`nisshi-storage-dynostore/src/dynostore.rs:824-880`) under every
 //! delivery order and duplicate-redelivery combination of 3 single-record
 //! batches from one producer/epoch.
@@ -29,9 +29,10 @@
 //! already retries its own conflicts internally, so each `produce.serve(..)`
 //! call is a single, final, self-contained answer.
 //!
-//! The race being explored is delivery order, not concurrent execution (see
-//! "What TraceForge actually is" in the plan doc: real concurrent calls
-//! aren't discovered automatically) — `nondet()` picks one of the `3! = 6`
+//! The race being explored is delivery order, not concurrent execution —
+//! TraceForge only discovers a race through choices made explicit via
+//! `nondet()`, not by exploring real concurrent calls on its own — so
+//! `nondet()` picks one of the `3! = 6`
 //! delivery orders for the 3 batches, and independently, for each batch,
 //! whether it is also immediately redelivered as a duplicate (`2^3 = 8`),
 //! modeling a producer retry or network-level reordering/resend. That's

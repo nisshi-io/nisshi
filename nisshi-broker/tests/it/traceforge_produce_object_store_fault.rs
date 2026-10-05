@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phase 3 of `docs/traceforge-test-plan.md`: fault injection at the
+//! Phase 3: fault injection at the
 //! `object_store::ObjectStore` layer underneath dynostore, one level below
 //! `traceforge_produce_idempotent.rs`'s `Storage`-level fault injection.
 //! `nisshi_storage_dynostore::DynoStore` and its `new(cluster, node,

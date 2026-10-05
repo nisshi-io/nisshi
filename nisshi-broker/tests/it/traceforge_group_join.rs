@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phase 1 of `docs/traceforge-test-plan.md`: three consumer-group members
+//! Phase 1: three consumer-group members
 //! joining a fresh group, in every order, each independently racing a
 //! simulated "another concurrent request already emptied the local cache"
 //! condition, against the real `Wrapper`/`Inner` group state machine and the
@@ -31,11 +31,12 @@
 //! What's modeled and what isn't: this drives `Wrapper<O>::join` and
 //! `Storage::update_group` directly, skipping `Controller::join`'s outer
 //! request-handler loop (rebalance-timeout polling with real
-//! `tokio::time::sleep`s — see `docs/traceforge-test-plan.md`'s "Implication"
-//! section for why that loop can't run under exhaustive `verify()`). Each
-//! member is pre-assigned a member id, so the separate empty-member-id round
-//! trip (`MemberIdRequired`) isn't exercised here; that path has no shared
-//! mutable state and isn't part of this hazard.
+//! `tokio::time::sleep`s, which TraceForge cannot fork the search on, so
+//! exhaustive `verify()` would just run the loop to completion instead of
+//! exploring its interleavings). Each member is pre-assigned a member id, so
+//! the separate empty-member-id round trip (`MemberIdRequired`) isn't
+//! exercised here; that path has no shared mutable state and isn't part of
+//! this hazard.
 //!
 //! The invariant checked is not just "exactly one leader" (the code trivially
 //! enforces that per call) but "the leader is always whichever member's join
