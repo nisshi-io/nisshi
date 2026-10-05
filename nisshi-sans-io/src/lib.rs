@@ -124,6 +124,7 @@ pub mod primitive;
 pub mod record;
 pub mod resource;
 pub mod ser;
+pub mod topic;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 pub use de::Decoder;
