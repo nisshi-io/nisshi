@@ -104,9 +104,10 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
     let index = rng().random_range(0..num_partitions);
 
     let transactional_id = None;
-    // Non-zero: acks=0 now closes the connection on any partition error
-    // instead of returning it in the response, which would break this
-    // test's assertion on the embedded error code.
+    // This test uses a non-zero acks because an acks=0 produce closes the
+    // connection on any partition error instead of returning it in the
+    // response, which would break this test's assertion on the embedded
+    // error code.
     let acks = i16::from(Ack::Leader);
     let timeout_ms = 0;
 
@@ -409,9 +410,10 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
         .await?;
 
     let transactional_id = None;
-    // Non-zero: acks=0 now closes the connection on any partition error
-    // instead of returning it in the response, which would break this
-    // test's assertion on the embedded error code.
+    // This test uses a non-zero acks because an acks=0 produce closes the
+    // connection on any partition error instead of returning it in the
+    // response, which would break this test's assertion on the embedded
+    // error code.
     let acks = i16::from(Ack::Leader);
     let timeout_ms = 0;
 
@@ -559,9 +561,10 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
         .await?;
 
     let transactional_id = None;
-    // Non-zero: acks=0 now closes the connection on any partition error
-    // instead of returning it in the response, which would break this
-    // test's assertion on the embedded error code.
+    // This test uses a non-zero acks because an acks=0 produce closes the
+    // connection on any partition error instead of returning it in the
+    // response, which would break this test's assertion on the embedded
+    // error code.
     let acks = i16::from(Ack::Leader);
     let timeout_ms = 0;
 
