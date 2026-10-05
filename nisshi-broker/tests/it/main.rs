@@ -32,7 +32,6 @@ pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;
 pub mod fetch;
 pub mod find_coordinator;
-pub mod get_telemetry_subscriptions;
 pub mod group_cache_miss;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;
@@ -60,6 +59,7 @@ pub mod topic;
 pub mod topic_lifecycle;
 pub mod txn;
 pub mod update_group_conditional;
+pub mod version_gate;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a
 // `pub mod` line would never compile or run. Fail instead of skipping it silently.

@@ -79,7 +79,7 @@ use crate::{Error, Result, Storage, Topition};
 /// let partitions = topics[0].partitions.as_deref().unwrap_or_default();
 /// assert_eq!(1, partitions.len());
 /// assert_eq!(0, partitions[0].partition_index);
-/// assert!(partitions[0].old_style_offsets.is_none());
+/// assert_eq!(Some(vec![0]), partitions[0].old_style_offsets);
 /// assert_eq!(
 ///     ErrorCode::None,
 ///     ErrorCode::try_from(partitions[0].error_code)?
@@ -158,7 +158,17 @@ where
                                                     ListOffsetsPartitionResponse::default()
                                                         .partition_index(topition.partition())
                                                         .error_code(offset.error_code().into())
-                                                        .old_style_offsets(None)
+                                                        // Only present on the wire for a v0
+                                                        // request (`OldStyleOffsets` is
+                                                        // `"versions": "0"` in
+                                                        // `ListOffsetsResponse.json`); the
+                                                        // encoder drops this field for any
+                                                        // later version based on the request's
+                                                        // own negotiated version, so populating
+                                                        // it unconditionally is safe for v1+.
+                                                        .old_style_offsets(Some(
+                                                            offset.offset().into_iter().collect(),
+                                                        ))
                                                         .timestamp(
                                                             offset
                                                                 .timestamp()

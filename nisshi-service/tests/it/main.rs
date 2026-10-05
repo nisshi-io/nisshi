@@ -18,6 +18,7 @@ mod common;
 pub mod ch;
 pub mod route;
 pub mod tcp;
+pub mod version_gate;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a
 // `pub mod` line would never compile or run. Fail instead of skipping it silently.

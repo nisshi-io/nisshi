@@ -18,9 +18,9 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use nisshi_sans_io::{
     Ack, ApiKey as _, BatchAttribute, Body, Compression, ConfigResource, ConfigSource, ConfigType,
-    ControlBatch, CoordinatorType, EndTransactionMarker, EndpointType, ErrorCode, FetchRequest,
-    FetchResponse, Frame, Header, IsolationLevel, ListOffset, MaximumAllocationSize, OpType,
-    Result, TimestampType, to_system_time, to_timestamp,
+    ControlBatch, CoordinatorType, EndTransactionMarker, EndpointType, Error, ErrorCode,
+    FetchRequest, FetchResponse, Frame, Header, IsolationLevel, ListOffset, MaximumAllocationSize,
+    OpType, Result, TimestampType, to_system_time, to_timestamp,
 };
 
 #[test]
@@ -380,8 +380,15 @@ fn list_offset() -> Result<()> {
     );
     assert_eq!(millis, i64::try_from(offset)?);
 
-    // negative values other than -1 and -2 are errors (can't convert to SystemTime)
-    assert!(ListOffset::try_from(-3i64).is_err());
+    // MAX_TIMESTAMP (-3), EARLIEST_LOCAL_TIMESTAMP (-4) and LATEST_TIERED_TIMESTAMP (-5) are
+    // named sentinels nisshi does not implement, and are rejected with a dedicated error
+    // rather than an incidental one.
+    for sentinel in [-3i64, -4, -5] {
+        assert!(matches!(
+            ListOffset::try_from(sentinel),
+            Err(Error::UnsupportedListOffsetTimestamp(timestamp)) if timestamp == sentinel
+        ));
+    }
 
     Ok(())
 }

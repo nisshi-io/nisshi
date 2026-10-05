@@ -366,6 +366,16 @@ pub enum Error {
     UnknownCompressionType(i16),
     UnknownScramMechanism(i8),
     UnknownContainer,
+    UnsupportedListOffsetTimestamp(i64),
+    /// No route exists for `api_key` that can accept `api_version`: the version falls outside
+    /// the protocol's own valid range for every registered route, or outside a route's
+    /// narrower, broker-advertised cap with no typed rejection available for it. The caller
+    /// closes the connection on this error, matching how real Kafka handles a request it
+    /// cannot parse into any known version.
+    UnsupportedVersion {
+        api_key: i16,
+        api_version: i16,
+    },
     Utf8(str::Utf8Error),
 }
 
@@ -2301,6 +2311,12 @@ pub enum ListOffset {
 impl ListOffset {
     const EARLIEST_OFFSET: i64 = -2;
     const LATEST_OFFSET: i64 = -1;
+    /// Requests the offset of the record with the highest timestamp (KIP-734). Not implemented.
+    const MAX_TIMESTAMP: i64 = -3;
+    /// Requests the earliest offset still in local storage (KIP-405 tiered storage). Not implemented.
+    const EARLIEST_LOCAL_TIMESTAMP: i64 = -4;
+    /// Requests the latest offset moved to tiered storage (KIP-405). Not implemented.
+    const LATEST_TIERED_TIMESTAMP: i64 = -5;
 }
 
 impl TryFrom<ListOffset> for i64 {
@@ -2322,6 +2338,10 @@ impl TryFrom<i64> for ListOffset {
         match value {
             Self::EARLIEST_OFFSET => Ok(Self::Earliest),
             Self::LATEST_OFFSET => Ok(Self::Latest),
+            Self::MAX_TIMESTAMP
+            | Self::EARLIEST_LOCAL_TIMESTAMP
+            | Self::LATEST_TIERED_TIMESTAMP => Err(Error::UnsupportedListOffsetTimestamp(value)),
+            timestamp if timestamp < 0 => Err(Error::UnsupportedListOffsetTimestamp(timestamp)),
             timestamp => to_system_time(timestamp).map(Self::Timestamp),
         }
     }

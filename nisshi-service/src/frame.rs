@@ -22,7 +22,7 @@ use bytes::{BufMut as _, Bytes, BytesMut};
 use nisshi_auth::AuthenticationExtension;
 use nisshi_sans_io::{
     ApiKey, ApiVersionsRequest, Body, BodyInput, BytesInput, Frame, FrameInput, Header, Request,
-    RequestInput, Response, RootMessageMeta, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    RequestInput, Response, SaslAuthenticateRequest, SaslAuthenticateResponse,
     SaslHandshakeRequest,
 };
 use opentelemetry::KeyValue;
@@ -409,12 +409,26 @@ where
                 *v0 = Some(true)
             }
 
+            // `FrameRouteService` answers an out-of-range `ApiVersions` request rather than
+            // closing the connection (see its `ApiVersionsRequest::KEY` exemption), matching
+            // real Kafka's own handling of an unparseable `ApiVersions` version -- but real
+            // Kafka's fallback reply is itself always encoded at v0, regardless of what the
+            // client actually sent, so a client is never asked to decode a response shaped for
+            // a version its own descriptors don't recognise. Encode this one case at v0 too.
+            let encode_version = if api_key == ApiVersionsRequest::KEY
+                && !crate::api::is_within_protocol_range(api_key, api_version)
+            {
+                0
+            } else {
+                api_version
+            };
+
             spawn_blocking(move || {
                 Frame::response(
                     Header::Response { correlation_id },
                     body,
                     api_key,
-                    api_version,
+                    encode_version,
                 )
             })
             .await?
@@ -621,11 +635,12 @@ where
         debug!(?req);
 
         let api_key = Q::KEY;
-        let api_version = RootMessageMeta::messages()
-            .requests()
-            .get(&api_key)
-            .map(|message_meta| message_meta.version.valid().end)
-            .unwrap_or_default();
+        // This service has no `ApiVersions` round trip of its own to negotiate a version
+        // against, because it issues an internal request rather than serving one from a real
+        // client, so it stamps the highest version it can safely send instead: the protocol's
+        // own maximum for most APIs, or a capped API's own narrower
+        // `SupportedApiVersions::SUPPORTED` maximum where one applies.
+        let api_version = crate::routable_max_version(api_key).unwrap_or_default();
         let correlation_id = 0;
         let client_id = Some(env!("CARGO_CRATE_NAME").into());
 
