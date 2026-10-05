@@ -227,7 +227,7 @@ fn committed_offset_key_keeps_the_topic_segment_rule() -> Result<()> {
 fn watermark_decodes_pre_time_index_documents() -> Result<()> {
     use super::Watermark;
 
-    // Every watermark document written by this PR's own code has
+    // Every watermark document the current code writes has
     // `timestamps` explicitly `null`.
     let null_timestamps: Watermark =
         serde_json::from_str(r#"{"low":6,"high":66,"timestamps":null}"#)?;

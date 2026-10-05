@@ -1766,43 +1766,20 @@ impl Storage for DynoStore {
                 let target = to_timestamp(system_time)?;
                 let (time_index, low) = self.ensure_time_index_complete(topition).await?;
 
-                // An empty index is "ceiling absent" in the sense that there
-                // is nothing to take a ceiling of - not "ceiling above
-                // every entry" (see below).
+                // `time_index` is never pruned: every entry this code (or a
+                // future backfill) inserts stays in the map, and logical
+                // deletion is handled entirely by the per-record `low`
+                // filter in the sequential scan below. The ceiling lookup
+                // below relies on that: a pruned entry could make it skip
+                // past a surviving, matching record and land on a later
+                // offset/timestamp pair instead of the earliest match
+                // (SOL-155076: any future change to pruning on this field
+                // must preserve this guarantee).
                 //
-                // `time_index` entries are NEVER pruned: every entry this
-                // code (or a future backfill) ever inserts stays in the map
-                // forever. The index stays correct *because* of this -
-                // logical deletion is handled entirely by the per-record
-                // `low` filter in the sequential scan below, not by removing
-                // index entries. A pruned index gives WRONG answers, in both
-                // of the shapes pruning can leave behind:
-                //
-                // - Pruned but non-empty: a ceiling lookup can skip straight
-                //   over a surviving, matching record whose own index entry
-                //   was the one pruned, landing on a later offset/timestamp
-                //   pair instead of the earliest matching one.
-                // - Pruned to fully empty: falling back to `start_offset =
-                //   low` would make the listing filter below
-                //   (`base_offset >= start_offset`) wrongly exclude a batch
-                //   that straddles `low` - one whose base offset is below
-                //   `low` but that still holds a surviving, matching record
-                //   at a higher offset - reporting "no match" when a match
-                //   exists.
-                //
-                // SOL-155296/#835 must not resurrect pruning against this
-                // field (see the coordinating comment left on that PR's
-                // `timestamps.retain(...)` line). Under "never prune", an
-                // empty index here can only mean "genuinely nothing ever
-                // indexed" (e.g. every batch produced so far had
-                // `NO_TIMESTAMP`/negative timestamps) - never "pruned to
-                // empty" - and `empty_partition_no_match` exercises exactly
-                // this branch, so it is live, not dead, code. Scan from 0
-                // rather than from `low`: the two coincide for any partition
-                // whose index can actually be empty under "never prune", and
-                // scanning from 0 costs nothing extra in that rare case
-                // while staying correct even if that assumption is ever
-                // violated.
+                // An empty index therefore means nothing has ever been
+                // indexed, never "pruned to empty", so scanning from offset
+                // 0 instead of `low` is both correct and free: the two
+                // coincide whenever the index can be empty at all.
                 let start_offset = if time_index.is_empty() {
                     Some(0)
                 } else {
