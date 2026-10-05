@@ -89,7 +89,7 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
         require_stable: Option<bool>,
     ) -> Result<Body>;
 
-    /// Delete one or more groups, refusing any that still have members or a
+    /// Deletes one or more groups, refusing any that still have members or a
     /// rebalance in progress (`NON_EMPTY_GROUP`), and forgetting whatever
     /// in-memory state this coordinator held for each group it actually
     /// deletes.

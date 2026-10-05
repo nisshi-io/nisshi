@@ -1470,13 +1470,13 @@ where
     /// the same group on this broker: a `join`/`sync`/`heartbeat`/`leave`
     /// that lands while a group is being considered here sees a cache miss
     /// and self-heals via the usual `UpdateError::Outdated` retry path, the
-    /// same way a cache miss after a restart already does (see
-    /// `group_cache_miss.rs`) - but that self-heal reinserts a fresh,
-    /// versioned cache entry, and if it lands between this removing the
-    /// group from the cache and the storage delete actually completing, the
-    /// delete still goes ahead and that freshly-reinserted entry is left
-    /// stale, the same problem this method exists to prevent, just
-    /// re-opened by a narrower window. A group deleted here is deliberately
+    /// same way a cache miss after a restart already does - but that
+    /// self-heal reinserts a fresh, versioned cache entry, and if it lands
+    /// between this removing the group from the cache and the storage
+    /// delete actually completing, the delete still goes ahead and that
+    /// freshly-reinserted entry is left stale, the same problem this method
+    /// exists to prevent, just re-opened by a narrower window. A group
+    /// deleted here is deliberately
     /// not reinserted into the cache: nothing should resurrect it from a
     /// stale cached version on the next heartbeat for it. Closing the
     /// window fully needs a version-guarded delete in the `Storage` trait

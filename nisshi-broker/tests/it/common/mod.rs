@@ -642,8 +642,6 @@ where
     )
         .into_layer(route);
 
-    // join (member id required), join, sync: a formed group with one member
-    //
     let member_id_required = serve(&consumer, None).await?;
     let joined = serve(&consumer, Some(member_id_required)).await?;
 

@@ -88,7 +88,7 @@ async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(),
         ErrorCode::try_from(results[0].error_code)?
     );
 
-    // refused delete must not have touched storage: the offset is still
+    // Refused delete must not have touched storage: the offset is still
     // there.
     let offset_fetch = storage
         .offset_fetch(Some(&group), slice::from_ref(&topition), None)
@@ -252,9 +252,9 @@ async fn delete_after_session_expiry(storage: impl Storage + Clone) -> Result<()
 
 /// A group that only ever committed offsets (no `JoinGroup` ever happened)
 /// is a cache miss on every coordinator: `delete_groups` has to fall back to
-/// `Storage::describe_groups`, which used to error on this group's NULL
-/// `detail` column on the SQL backends (a group row with no detail row)
-/// instead of treating it as empty.
+/// `Storage::describe_groups`, which must treat this group's NULL `detail`
+/// column on the SQL backends (a group row with no detail row) as empty,
+/// not an error.
 async fn delete_offsets_only_group(storage: impl Storage + Clone) -> Result<(), Error> {
     let coordinator = Controller::with_storage(storage.clone())?;
 
