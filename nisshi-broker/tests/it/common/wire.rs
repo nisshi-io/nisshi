@@ -79,7 +79,6 @@ pub(crate) async fn spawn_broker(tls: Option<ServerConfig>) -> Result<RunningBro
         }
     });
 
-    // Wait until the listener accepts connections.
     let deadline = Instant::now() + Duration::from_secs(10);
 
     loop {
