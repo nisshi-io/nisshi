@@ -23,7 +23,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::instrument;
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ListPartitionReassignmentsRequest`] returning [`ListPartitionReassignmentsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ListPartitionReassignmentsRequest`] returning [`ListPartitionReassignmentsResponse`].
 #[derive(Clone, Debug)]
 pub struct ListPartitionReassignmentsService<G> {
     pub storage: G,

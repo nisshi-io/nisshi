@@ -1382,6 +1382,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>>;
 
     /// Produce a deflated batch to this storage.
+    ///
+    /// Trusts the batch attributes as given: a batch with the control bit set
+    /// is written as a transaction marker, skipping schema validation and lake
+    /// writes. Only the broker may write control batches, so client Produce
+    /// batches must reach storage through [`ProduceService`], which rejects
+    /// them.
     async fn produce(
         &self,
         transaction_id: Option<&str>,

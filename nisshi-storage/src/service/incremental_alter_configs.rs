@@ -20,7 +20,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::{

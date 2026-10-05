@@ -46,18 +46,25 @@ impl From<i8> for Permission {
 /// Represents an operation which an ACL grants or denies permission to perform.
 ///
 /// Some operations imply other operations:
-/// <ul>
-/// <li>[`Allow`] [`All`] implies [`Allow`] everything
-/// <li>[`Deny`] [`All`] implies [`Deny`] everything
 ///
-/// <li>[`Allow`] [`Read`] implies [`Allow`] [`Describe`]
-/// <li>[`Allow`] [`Write`] implies [`Allow`] [`Describe`]
-/// <li>[`Allow`] [`Delete`] implies [`Allow`] [`Describe`]
+/// - [`Allow`] [`All`] implies [`Allow`] everything
+/// - [`Deny`] [`All`] implies [`Deny`] everything
+/// - [`Allow`] [`Read`] implies [`Allow`] [`Describe`]
+/// - [`Allow`] [`Write`] implies [`Allow`] [`Describe`]
+/// - [`Allow`] [`Delete`] implies [`Allow`] [`Describe`]
+/// - [`Allow`] [`Alter`] implies [`Allow`] [`Describe`]
+/// - [`Allow`] [`AlterConfigs`] implies [`Allow`] [`DescribeConfigs`]
 ///
-/// <li>[`Allow`] [`Alter`] implies [`Allow`] [`Describe`]
-///
-/// <li>[`Allow`] [`AlterConfigs`] implies [`Allow`] [`DescribeConfigs`]
-/// </ul>
+/// [`Allow`]: Permission::Allow
+/// [`Deny`]: Permission::Deny
+/// [`All`]: Self::All
+/// [`Read`]: Self::Read
+/// [`Write`]: Self::Write
+/// [`Delete`]: Self::Delete
+/// [`Alter`]: Self::Alter
+/// [`Describe`]: Self::Describe
+/// [`AlterConfigs`]: Self::AlterConfigs
+/// [`DescribeConfigs`]: Self::DescribeConfigs
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(i8)]
 pub enum Operation {

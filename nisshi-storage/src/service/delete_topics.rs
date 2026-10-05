@@ -21,7 +21,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteTopicsRequest`] returning [`DeleteTopicsResponse`].
+/// A [`Service`] using its [`Storage`] taking [`DeleteTopicsRequest`] returning [`DeleteTopicsResponse`].
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{DeleteTopicsRequest, DeleteTopicsResponse,

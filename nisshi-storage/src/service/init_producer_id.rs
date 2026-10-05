@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use crate::{Error, Result, Storage};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`InitProducerIdRequest`] returning [`InitProducerIdResponse`].
+/// A [`Service`] using its [`Storage`] taking [`InitProducerIdRequest`] returning [`InitProducerIdResponse`].
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{ErrorCode, InitProducerIdRequest, InitProducerIdResponse};
