@@ -18,10 +18,6 @@ use bytes::Bytes;
 use common::init_tracing;
 use datafusion::prelude::SessionContext;
 use dotenv::dotenv;
-use iceberg::CatalogBuilder;
-use iceberg_catalog_rest::{
-    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
-};
 use iceberg_datafusion::IcebergCatalogProvider;
 use nisshi_sans_io::{
     ConfigResource, ErrorCode,
@@ -30,11 +26,10 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::{
     Registry, Result,
-    lake::{House, LakeHouse, berg::env_s3_props},
+    lake::{House, LakeHouse, berg::iceberg_catalog},
 };
 use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path};
 use serde_json::{Value as JsonValue, json};
-use std::collections::HashMap;
 use std::{env::var, sync::Arc};
 use tracing::debug;
 use url::Url;
@@ -72,12 +67,10 @@ pub async fn lake_store(
         .inspect(|result| debug!(?result))
         .inspect_err(|err| debug!(?err))?;
 
-    let mut props: HashMap<String, String> = env_s3_props().collect();
-    _ = props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_uri.to_string());
-    if let Some(wh) = warehouse.clone() {
-        _ = props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), wh);
-    }
-    let catalog = Arc::new(RestCatalogBuilder::default().load("rest", props).await?);
+    // Build the same catalog (storage factory, path-style pin and all)
+    // that nisshi itself uses, rather than re-deriving a `RestCatalogBuilder`
+    // call here that could drift from `iceberg_catalog`'s.
+    let catalog = iceberg_catalog(&Url::parse(catalog_uri)?, warehouse.clone()).await?;
 
     let catalog_provider = IcebergCatalogProvider::try_new(catalog).await?;
 
