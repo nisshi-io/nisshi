@@ -530,8 +530,8 @@ impl DynoStore {
 ///
 /// Must stay equal to `nisshi_storage`'s private copy of this rule, which
 /// this crate cannot import directly.
-// TODO(SOL-155175 / nisshi#828): replace with
-// nisshi_sans_io::topic::is_valid_topic_name once that PR lands.
+// TODO(SOL-155175): replace with nisshi_sans_io::topic::is_valid_topic_name
+// once it exists.
 fn is_valid_topic_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."

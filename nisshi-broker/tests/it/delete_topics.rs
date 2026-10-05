@@ -274,8 +274,6 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         storage: storage.clone(),
     };
 
-    // good_name is never named: only the two invalid names and doomed_name
-    // are in the request.
     let response = delete_topics
         .serve(RequestInput {
             request: DeleteTopicsRequest::default().topic_names(Some(vec![
