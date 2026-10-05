@@ -8550,11 +8550,11 @@ dependencies = [
 
 [[package]]
 name = "rhai-rand"
-version = "0.1.7"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b844396aeafaba8b3a65cb5606ebda37ea490a33f2e70dbaa636bcae4837a14"
+checksum = "16bc5c7f508eb16d40c2b5aa37b9620493a02f645488c0bc0ef09a6c007f6ca8"
 dependencies = [
- "rand 0.8.8",
+ "rand 0.9.5",
  "rhai",
  "serde",
  "serde_json",
