@@ -27,14 +27,12 @@ use tokio::{runtime::Handle, sync::Semaphore, task};
 
 use crate::{Error, Result};
 
-/// Bounds how many offloaded decodes run at once.
+/// Bounds how many offloaded decodes run at once, to at most one per runtime
+/// worker thread.
 ///
-/// Before decoding moved to the blocking pool, it ran on the runtime's worker
-/// threads, so at most one decode per worker ran at a time. The blocking pool
-/// allows up to 512 threads by default, so without this bound a burst of
-/// large produce requests would start one decode thread each. Sizing the
-/// semaphore from the worker count keeps the old ceiling on decode
-/// concurrency.
+/// The blocking pool allows up to 512 threads by default, so without this
+/// bound a burst of large produce requests would start one decode thread
+/// each.
 ///
 /// The semaphore is created once per process, sized from the runtime that
 /// first calls [`offload`]. The broker runs a single runtime, so that is its
