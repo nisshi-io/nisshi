@@ -243,8 +243,9 @@ where
                                 EpochEndOffset::default().epoch(-1).end_offset(-1),
                             ))
                             // Kafka sends a leader hint only with a leadership
-                            // error; librdkafka acts on one here, and its
-                            // consumer close then hangs on a deleted topic
+                            // error, not with `UNKNOWN_TOPIC_OR_PARTITION`.
+                            // librdkafka honors a hint here regardless, and
+                            // consumer close then hangs on a deleted topic.
                             .current_leader(None)
                             .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
                             .aborted_transactions(Some([].into()))

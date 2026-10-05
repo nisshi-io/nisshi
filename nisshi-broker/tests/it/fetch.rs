@@ -888,14 +888,13 @@ where
     Ok(())
 }
 
-/// A fetch for a topic name that was never created is answered with
-/// `UNKNOWN_TOPIC_OR_PARTITION` immediately, on an open connection. Before
-/// this fix, pg, lite and slatedb instead returned an `Err` from
-/// `fetch_topic`, which closed the connection (the only mechanism that
-/// does: the `?` in `nisshi-service/src/stream.rs`'s request loop), and the
-/// in-memory backend silently waited out the full `max_wait` before
-/// answering `NONE`. No leader hint is sent either: Kafka sends one only
-/// with a leadership error.
+/// A fetch for a topic name that was never created must be answered with
+/// `UNKNOWN_TOPIC_OR_PARTITION` immediately, on an open connection.
+/// `fetch_topic` returning `Err` would close the connection instead (the
+/// only mechanism that does: the `?` in `nisshi-service/src/stream.rs`'s
+/// request loop), and waiting out the full `max_wait` before answering
+/// `NONE` would silently stall the client. No leader hint is sent either:
+/// Kafka sends one only with a leadership error.
 pub async fn unknown_topic_name<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
 where
     C: Into<String>,
