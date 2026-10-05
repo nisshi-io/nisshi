@@ -305,6 +305,10 @@ pub(super) enum Lake {
         /// Iceberg warehouse
         #[arg(long, env = "ICEBERG_WAREHOUSE")]
         warehouse: Option<String>,
+
+        /// Bearer token that authenticates Iceberg REST catalog requests
+        #[arg(long, env = "ICEBERG_CATALOG_TOKEN", hide_env_values = true)]
+        catalog_token: Option<RedactedToken>,
     },
 
     /// Schema topics are written as Delta Lake tables
@@ -330,6 +334,33 @@ pub(super) enum Lake {
         #[arg(long, env = "DATA_LAKE")]
         location: EnvVarExp<Url>,
     },
+}
+
+#[cfg(feature = "iceberg")]
+#[derive(Clone)]
+pub(super) struct RedactedToken(String);
+
+#[cfg(feature = "iceberg")]
+impl RedactedToken {
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+#[cfg(feature = "iceberg")]
+impl std::fmt::Debug for RedactedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+#[cfg(feature = "iceberg")]
+impl std::str::FromStr for RedactedToken {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_owned()))
+    }
 }
 
 impl Arg {
@@ -394,6 +425,7 @@ impl Arg {
                 catalog,
                 namespace,
                 warehouse,
+                catalog_token,
             }) => Some(
                 nisshi_schema::lake::House::iceberg()
                     .location(location.into_inner())
@@ -401,6 +433,7 @@ impl Arg {
                     .schema_registry(schema_registry.clone().unwrap())
                     .namespace(namespace)
                     .warehouse(warehouse)
+                    .catalog_token(catalog_token.map(RedactedToken::into_inner))
                     .build()
                     .await?,
             ),
@@ -1047,5 +1080,188 @@ mod tests {
             .build()
             .await
             .expect("build with an encrypted cert and key bundle");
+    }
+
+    #[cfg(feature = "iceberg")]
+    mod catalog_token {
+        use std::{env, process::Command};
+
+        use clap::{CommandFactory as _, Parser as _};
+
+        use super::super::{Arg, Lake, RedactedToken};
+
+        /// Re-executes the current test so clap can observe `ICEBERG_CATALOG_TOKEN`.
+        /// `std::env::set_var` is unsafe, and `unsafe_code` is forbidden.
+        fn probe_child() {
+            let Ok(mode) = env::var("NISSHI_CATALOG_TOKEN_PROBE") else {
+                return;
+            };
+
+            match mode.as_str() {
+                "parse" => {
+                    let flag = env::var("NISSHI_CATALOG_TOKEN_FLAG").ok();
+                    let parsed = catalog_token(&iceberg_args(flag.as_deref()));
+                    println!("NISSHI_PROBE_RESULT={parsed:?}");
+                }
+                "help" => println!("{}", iceberg_help()),
+                other => panic!("unknown catalog token probe mode: {other}"),
+            }
+
+            std::process::exit(0);
+        }
+
+        fn iceberg_args(token: Option<&str>) -> Vec<String> {
+            let mut args = vec![
+                String::from("nisshi"),
+                String::from("iceberg"),
+                String::from("--location"),
+                String::from("file://./lake"),
+                String::from("--catalog"),
+                String::from("http://localhost:8181/"),
+            ];
+            if let Some(token) = token {
+                args.push(String::from("--catalog-token"));
+                args.push(token.to_owned());
+            }
+            args
+        }
+
+        fn catalog_token(args: &[String]) -> Option<String> {
+            let parsed = Arg::try_parse_from(args).unwrap_or_else(|error| panic!("parse: {error}"));
+            match parsed.command {
+                Some(Lake::Iceberg { catalog_token, .. }) => {
+                    catalog_token.map(RedactedToken::into_inner)
+                }
+                other => panic!("expected iceberg command, got {other:?}"),
+            }
+        }
+
+        fn iceberg_help() -> String {
+            let mut command = Arg::command();
+            let Some(iceberg) = command.find_subcommand_mut("iceberg") else {
+                let names: Vec<_> = command
+                    .get_subcommands()
+                    .map(|subcommand| subcommand.get_name())
+                    .collect();
+                panic!("iceberg subcommand missing, found {names:?}");
+            };
+            iceberg.render_long_help().to_string()
+        }
+
+        fn spawn_probe(
+            mode: &str,
+            token_env: Option<&str>,
+            flag: Option<&str>,
+        ) -> std::process::Output {
+            let test_name = std::thread::current()
+                .name()
+                .expect("test thread name")
+                .to_owned();
+            let mut command = Command::new(env::current_exe().expect("current executable"));
+            _ = command
+                .arg("--exact")
+                .arg(&test_name)
+                .arg("--nocapture")
+                .env("NISSHI_CATALOG_TOKEN_PROBE", mode)
+                .env_remove("ICEBERG_CATALOG_TOKEN")
+                .env_remove("NISSHI_CATALOG_TOKEN_FLAG");
+            if let Some(token) = token_env {
+                _ = command.env("ICEBERG_CATALOG_TOKEN", token);
+            }
+            if let Some(flag) = flag {
+                _ = command.env("NISSHI_CATALOG_TOKEN_FLAG", flag);
+            }
+            command.output().expect("spawn catalog token probe")
+        }
+
+        fn probe_parse(token_env: Option<&str>, flag: Option<&str>) -> String {
+            let output = spawn_probe("parse", token_env, flag);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("NISSHI_PROBE_RESULT="))
+                .unwrap_or_else(|| panic!("missing probe result\n{stdout}\n{stderr}"))
+                .to_owned()
+        }
+
+        #[test]
+        fn iceberg_catalog_token_flag_sets_the_token() {
+            assert_eq!(
+                catalog_token(&iceberg_args(Some("cli-token"))).as_deref(),
+                Some("cli-token")
+            );
+        }
+
+        #[test]
+        fn empty_iceberg_catalog_token_flag_is_preserved() {
+            assert_eq!(catalog_token(&iceberg_args(Some(""))).as_deref(), Some(""));
+        }
+
+        #[test]
+        fn iceberg_catalog_token_debug_redacts_the_configured_value() {
+            let secret = "catalog-token-debug-secret";
+            let parsed = Arg::try_parse_from(iceberg_args(Some(secret)))
+                .unwrap_or_else(|error| panic!("parse: {error}"));
+            let rendered = format!("{parsed:?}");
+            if rendered.contains(secret) {
+                panic!("catalog token leaked into cli debug output");
+            }
+            assert!(rendered.contains("[redacted]"));
+        }
+
+        #[test]
+        fn iceberg_help_names_the_catalog_token_without_a_value() {
+            let help = iceberg_help();
+            assert!(help.contains("--catalog-token"), "{help}");
+            assert!(help.contains("ICEBERG_CATALOG_TOKEN"), "{help}");
+            assert!(!help.contains("--iceberg-catalog-token"), "{help}");
+            assert!(!help.contains("ICEBERG_CATALOG_TOKEN="), "{help}");
+        }
+
+        #[test]
+        fn environment_iceberg_catalog_token_is_used_when_the_flag_is_absent() {
+            probe_child();
+            assert_eq!(probe_parse(Some("env-token"), None), r#"Some("env-token")"#);
+        }
+
+        #[test]
+        fn iceberg_catalog_token_flag_overrides_the_environment() {
+            probe_child();
+            assert_eq!(
+                probe_parse(Some("env-token"), Some("cli-token")),
+                r#"Some("cli-token")"#
+            );
+        }
+
+        #[test]
+        fn empty_iceberg_catalog_token_flag_overrides_the_environment() {
+            probe_child();
+            assert_eq!(probe_parse(Some("env-token"), Some("")), r#"Some("")"#);
+        }
+
+        #[test]
+        fn iceberg_help_hides_a_configured_catalog_token() {
+            probe_child();
+            let secret = "catalog-token-help-secret";
+            let output = spawn_probe("help", Some(secret), None);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "help probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            let combined = format!("{stdout}{stderr}");
+            if combined.contains(secret) {
+                panic!("catalog token leaked into help text");
+            }
+            assert!(combined.contains("--catalog-token"), "{combined}");
+            assert!(!combined.contains("--iceberg-catalog-token"), "{combined}");
+            assert!(combined.contains("ICEBERG_CATALOG_TOKEN"), "{combined}");
+        }
     }
 }
