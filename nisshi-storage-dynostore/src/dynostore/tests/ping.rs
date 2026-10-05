@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Regression coverage for `DynoStore::ping()`: SOL-155184 found that a
-//! `list()` failure from the underlying object store (e.g. no usable AWS
-//! credentials) was discarded with `let _ = ...`, so `ping()` always
-//! returned `Ok(())` even when the store was unusable, and the broker
-//! started successfully only to fail confusingly on the first real request.
+//! Regression coverage for `DynoStore::ping()`: when the underlying object
+//! store's `list()` fails (e.g. no usable AWS credentials), `ping()` must
+//! return that error rather than `Ok(())`, so the broker fails to start
+//! instead of failing confusingly on the first real request (SOL-155184).
 
 use std::fmt::{Debug, Display};
 

@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SOL-155184: the factory-level AWS credential pre-check added to
-//! [`S3OptimisticConcurrencyEngineFactory::build`] has no credential source
-//! configured, it should fail fast with [`Error::NoCredentials`] rather than
-//! starting successfully and failing later on the first real request.
+//! When the factory-level AWS credential pre-check in
+//! [`S3OptimisticConcurrencyEngineFactory::build`] finds no credential
+//! source configured, it must fail fast with [`Error::NoCredentials`]
+//! rather than starting successfully and failing later on the first real
+//! request (SOL-155184).
 //!
 //! A real integration test against local MinIO (both credential tiers, bad
-//! keys, a missing bucket, a wrong endpoint, zero credentials) was run by
-//! hand and is not reproduced here. Driving `object_store`'s real IMDS
-//! lookup in CI is what this test avoids: an unreachable `169.254.169.254`
-//! behaves differently depending on the host (some environments, notably
-//! Azure, answer that address with something other than "unreachable"),
-//! so a test that relies on IMDS being absent is not reliably deterministic.
+//! keys, a missing bucket, a wrong endpoint, zero credentials) exists only
+//! as a manual check, not reproduced here. This test avoids driving
+//! `object_store`'s real IMDS lookup in CI: an unreachable
+//! `169.254.169.254` behaves differently depending on the host (some
+//! environments, notably Azure, answer that address with something other
+//! than "unreachable"), so a test that relies on IMDS being absent is not
+//! reliably deterministic.
 //!
 //! `object_store` instead honors an `AWS_METADATA_ENDPOINT` config key
 //! (`object_store::aws::builder`), which redirects the IMDS lookup
