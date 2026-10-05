@@ -411,7 +411,7 @@ where
 
             // `FrameRouteService` answers an out-of-range `ApiVersions` request rather than
             // closing the connection (see its `ApiVersionsRequest::KEY` exemption), matching
-            // real Kafka's own handling of an unparseable `ApiVersions` version -- but real
+            // real Kafka's own handling of an unparsable `ApiVersions` version -- but real
             // Kafka's fallback reply is itself always encoded at v0, regardless of what the
             // client actually sent, so a client is never asked to decode a response shaped for
             // a version its own descriptors don't recognise. Encode this one case at v0 too.
