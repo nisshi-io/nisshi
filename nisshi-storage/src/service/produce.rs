@@ -19,12 +19,50 @@ use nisshi_sans_io::{
     TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
-    record::deflated,
+    record::{deflated, inflated},
 };
 use rama::Service;
 use tracing::{error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
+
+/// Inflate a batch that a client sent in a Produce request, mapping a
+/// decode failure to `INVALID_RECORD`.
+///
+/// Accepts both a `deflated::Batch` and a `&deflated::Batch`. The two
+/// conversions take different decode paths and fail with different
+/// [`nisshi_sans_io::Error`] variants for the same bytes: by value, an
+/// uncompressed batch is parsed directly and a short record fails with
+/// `Overflow` or `TryGet`. By reference, every batch goes through the serde
+/// decoder and the same record fails with `Io(UnexpectedEof)`. Mapping every
+/// error keeps the client-visible code the same on every backend, whichever
+/// path it uses.
+///
+/// Every error is safe to treat as the client's fault, because decoding only
+/// reads bytes already in memory: decompression, varints, lengths and record
+/// fields all come from the request. Retrying the same bytes fails the same
+/// way, so the client needs `INVALID_RECORD` rather than
+/// `UNKNOWN_SERVER_ERROR`.
+///
+/// A batch over the decoded-size limit keeps its
+/// [`nisshi_sans_io::Error::MessageMaxSizeExceeded`], so that
+/// [`storage_error_code`] answers `MESSAGE_TOO_LARGE`, which a producer can
+/// recover from by splitting the batch.
+///
+/// Only use this on a batch from a client Produce request. A stored batch
+/// that fails to decode is a broker fault, and must keep its own error.
+pub fn inflate_produced<B>(batch: B) -> Result<inflated::Batch>
+where
+    inflated::Batch: TryFrom<B, Error = nisshi_sans_io::Error>,
+{
+    inflated::Batch::try_from(batch).map_err(|err| match err {
+        nisshi_sans_io::Error::MessageMaxSizeExceeded(_) => Error::SansIo(err),
+        err => {
+            warn!(?err, "rejecting produce batch that does not decode");
+            Error::Api(ErrorCode::InvalidRecord)
+        }
+    })
+}
 
 /// Why a client batch must be rejected before anything is written, with the
 /// error code to send, or `None` if it may be stored. Kafka's `LogValidator`
@@ -35,6 +73,12 @@ use crate::{Error, Result, Storage, Topition};
 ///   [`ProduceService`]. Every backend skips schema validation and lake
 ///   writes for a control batch, so a client must not be able to set the bit.
 ///   `INVALID_RECORD`.
+/// - The compression codec in the attributes must be one Kafka defines. An
+///   unknown codec id is a defect in the client's batch header, like a bad
+///   record count. Kafka returns `UNKNOWN_SERVER_ERROR` for it only because
+///   its codec lookup throws an unchecked exception that reaches the generic
+///   handler. Checking here also stops a backend from advancing the high
+///   watermark before it parses the attributes. `INVALID_RECORD`.
 /// - A consistent header has at least one record and
 ///   `last_offset_delta + 1 == record_count`. Every backend uses
 ///   `last_offset_delta` to advance the high watermark, so a mismatch corrupts
@@ -51,6 +95,10 @@ fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
             ErrorCode::InvalidRecord,
             "clients may not write control batches",
         ));
+    }
+
+    if BatchAttribute::try_from(batch.attributes).is_err() {
+        return Some((ErrorCode::InvalidRecord, "unknown compression codec"));
     }
 
     let Ok(record_count) = i32::try_from(batch.record_count) else {
@@ -316,6 +364,29 @@ where
                 return self
                     .error(partition.index, error_code)
                     .error_message(Some(reason.into()));
+            }
+
+            // Kafka allows exactly one batch per partition from Produce v3,
+            // the first version that carries record batches, which is the
+            // only format this broker decodes (`ProduceRequest.validateRecords`).
+            // Each batch is stored on its own, so without this check an error
+            // on a later batch would report the whole partition as failed
+            // after the earlier batches were written.
+            if records.batches.len() != 1 {
+                const REASON: &str =
+                    "a produce request must contain exactly one record batch per partition";
+
+                warn!(
+                    topic = name,
+                    partition = partition.index,
+                    batches = records.batches.len(),
+                    reason = REASON,
+                    "rejecting produce request",
+                );
+
+                return self
+                    .error(partition.index, ErrorCode::InvalidRecord)
+                    .error_message(Some(REASON.into()));
             }
 
             let mut base_offset = None;

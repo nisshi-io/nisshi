@@ -53,7 +53,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, inflate_produced,
 };
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -802,7 +802,7 @@ impl Storage for Engine {
 
         // Schema validation (if schemas registry is configured)
         if let Some(ref schemas) = self.schemas {
-            let inflated = InflatedBatch::try_from(deflated.clone())?;
+            let inflated = inflate_produced(deflated.clone())?;
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             // Only validate non-control batches
@@ -943,7 +943,7 @@ impl Storage for Engine {
 
         // Store to data lake if configured
         if let Some(ref lake) = self.lake {
-            let inflated = InflatedBatch::try_from(deflated.clone())?;
+            let inflated = inflate_produced(deflated.clone())?;
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             if !attributes.control {

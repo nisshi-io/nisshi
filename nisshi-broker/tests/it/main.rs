@@ -49,6 +49,7 @@ pub mod policy_compact_delete;
 pub mod pre_authentication_frame_size;
 pub mod produce;
 pub mod produce_fetch;
+pub mod produce_invalid_record;
 pub mod sasl_scram_enforcement;
 pub mod storage_describe_cluster;
 pub mod storage_describe_configs;

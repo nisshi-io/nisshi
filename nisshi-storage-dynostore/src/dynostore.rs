@@ -60,7 +60,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, inflate_produced,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -794,7 +794,7 @@ impl Storage for DynoStore {
                     .inspect_err(|err| debug!(?err))?;
 
                 if !batch_attribute.control {
-                    let inflated = inflated::Batch::try_from(&deflated)
+                    let inflated = inflate_produced(&deflated)
                         .inspect(|inflated| debug!(?inflated))
                         .inspect_err(|err| debug!(?err))?;
 
@@ -884,8 +884,7 @@ impl Storage for DynoStore {
                     .inspect_err(|err| debug!(?err))?;
 
                 if !batch_attribute.control {
-                    let inflated =
-                        inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
+                    let inflated = inflate_produced(&deflated).inspect_err(|err| debug!(?err))?;
 
                     registry
                         .validate(topition.topic(), &inflated)
@@ -927,8 +926,7 @@ impl Storage for DynoStore {
             if !attributes.control
                 && let Some(ref lake) = self.lake
             {
-                let inflated =
-                    inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
+                let inflated = inflate_produced(&deflated).inspect_err(|err| debug!(?err))?;
 
                 lake.store(
                     topition.topic(),

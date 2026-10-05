@@ -56,7 +56,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
     ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel,
+    bounded_channel, inflate_produced,
 };
 use opentelemetry::{
     KeyValue,
@@ -709,7 +709,7 @@ impl Delegate {
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
 
-        let inflated = inflated::Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
+        let inflated = inflate_produced(deflated)?;
 
         debug!(after_inflate = elapsed_millis(start));
 

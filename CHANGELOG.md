@@ -35,3 +35,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- A produced batch whose records do not decode now gets `INVALID_RECORD` instead of `UNKNOWN_SERVER_ERROR`, on every storage backend that decodes produced batches. So does a batch with an unknown compression codec id. A Produce request with other than exactly one record batch for a partition is now rejected with `INVALID_RECORD` before any batch is written, as Kafka does. Before, each batch was stored in turn, so a failure on a later batch reported the whole partition as failed while the earlier batches stayed in the log.
