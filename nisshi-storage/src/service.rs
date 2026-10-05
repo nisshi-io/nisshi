@@ -1017,10 +1017,9 @@ where
     /// there is caught by Tokio's own per-task unwind handling (surfaced as
     /// `JoinError::is_panic`) instead of unwinding this loop and ending storage for every
     /// other caller sharing this channel. `spawn` is immediately followed by `.await` on
-    /// the resulting `JoinHandle`, which keeps request processing exactly as sequential as
-    /// it was before this change - mpsc mode's single-writer discipline against the
-    /// underlying SQLite connection depends on staying sequential here, so this must not
-    /// become fire-and-forget.
+    /// the resulting `JoinHandle`, which keeps request processing strictly sequential:
+    /// mpsc mode's single-writer discipline against the underlying SQLite connection
+    /// depends on staying sequential here, so this must not become fire-and-forget.
     ///
     /// Note that aborting this task (e.g. by dropping a `JoinSet` that owns it) only
     /// cancels whichever child `JoinHandle` it happens to be awaiting at that moment; the

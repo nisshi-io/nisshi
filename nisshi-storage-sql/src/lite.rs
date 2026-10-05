@@ -2290,14 +2290,13 @@ impl Builder<String, i32, Url, Url> {
                     })
                 };
 
-                // The supervisor loop above now isolates each request's storage work in
-                // its own child task (see `ChannelRequestService::serve`), so a panic
-                // handling one request no longer ends this loop. Nothing should
-                // ordinarily end it either, since it now runs until the channel closes
-                // (every `RequestSender`, held by `Engine.inner`, is dropped) or
-                // `cancellation` fires. This JoinSet has exactly one task on it; rather
-                // than hold it (unread) for the life of `Engine`, as it was held before,
-                // watch it here and log if it ever ends - belt and braces for a future
+                // The supervisor loop above isolates each request's storage work in its
+                // own child task (see `ChannelRequestService::serve`), so a panic handling
+                // one request does not end this loop. Nothing should ordinarily end it
+                // either: it runs until the channel closes (every `RequestSender`, held by
+                // `Engine.inner`, is dropped) or `cancellation` fires. This JoinSet holds
+                // exactly one task; rather than leave it unread for the life of `Engine`,
+                // this watches it and logs if it ever ends - belt and braces for a future
                 // bug, not something this should ever observe in practice.
                 drop(tokio::spawn(async move {
                     match server.join_next().await {
@@ -5509,9 +5508,9 @@ mod tests {
     }
 
     /// Regression coverage for SOL-155270: `?mode=mpsc` wiring must still behave
-    /// correctly for the ordinary (non-panicking, non-cancelled) path after
-    /// `ChannelRequestService::serve` (`nisshi-storage/src/service.rs`) changed to
-    /// isolate each request in its own child task.
+    /// correctly for the ordinary (non-panicking, non-cancelled) path, given that
+    /// `ChannelRequestService::serve` (`nisshi-storage/src/service.rs`) isolates each
+    /// request in its own child task.
     #[tokio::test]
     async fn mpsc_mode_produce_and_fetch_round_trip() -> Result<()> {
         let _guard = init_tracing()?;
