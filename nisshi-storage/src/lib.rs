@@ -2244,9 +2244,9 @@ pub fn parse_duration_option(storage: &Url, key: &str) -> Result<Option<Duration
 /// the first offending key and `storage`'s scheme.
 ///
 /// Called by each [`StorageFactory::build`] with the options that engine
-/// understands, so a typo (`maintainance_interval`) or an option meant for
-/// a different engine (`vacuum_into` on Postgres) fails the broker at
-/// startup instead of being silently ignored.
+/// understands, so a misspelled option name or one meant for a different
+/// engine (`vacuum_into` on Postgres) fails the broker at startup instead
+/// of being silently ignored.
 pub fn reject_unrecognized_options(storage: &Url, recognized: &[&str]) -> Result<()> {
     storage
         .query_pairs()
