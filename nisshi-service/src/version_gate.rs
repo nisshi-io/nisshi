@@ -12,102 +12,138 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt, marker::PhantomData, ops::RangeInclusive};
+use std::{fmt, ops::RangeInclusive};
 
 use nisshi_sans_io::{
-    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, Body, ErrorCode, Frame,
-    FrameInput, Header, ListOffsetsRequest, ListOffsetsResponse, ProduceRequest, ProduceResponse,
-    Request, RequestInput, RootMessageMeta,
-    add_partitions_to_txn_response::{
-        AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult,
-    },
-    list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
-    produce_response::{PartitionProduceResponse, TopicProduceResponse},
+    AddPartitionsToTxnRequest, ApiKey as _, Body, Frame, FrameInput, ListOffsetsRequest,
+    ProduceRequest, Request, RequestInput, RootMessageMeta,
 };
-use rama::{Layer, Service, layer::MapErrLayer, service::BoxService};
-use tracing::instrument;
+use rama::{Layer, Service, layer::MapErrLayer};
+use tracing::{instrument, warn};
 
 use crate::{Error, FrameRequestLayer, FrameRouteBuilder};
 
-/// Implemented by a [`Request`] `Q` whose broker-advertised version range is narrower than the
-/// Kafka protocol's own range for `Q`'s API key, so a client that negotiated a version within
-/// the protocol's range (via `ApiVersions`) can still send a version nisshi does not route.
+/// The version range nisshi routes for each API whose handler implements only part of the
+/// Kafka protocol's own range for that API.
 ///
-/// [`VersionGateLayer`] rejects such a request before it reaches the route's real service,
-/// using [`unsupported_version`][Self::unsupported_version] to build a response that tells the
-/// client what failed, rather than an empty-but-wire-valid one it cannot act on.
-pub trait SupportedApiVersions: Request {
-    /// The version range nisshi routes for this request. [`FrameRouteBuilder::with_capped_route`]
-    /// fails at build time if this is not a subset of the protocol's own valid range.
-    const SUPPORTED: RangeInclusive<i16>;
+/// [`FrameRouteBuilder::with_capped_route`] reads its range from this table, and
+/// [`routable_max_version`] reads the highest version from it, so a new cap is one entry here.
+pub const CAPPED_API_VERSIONS: [(i16, RangeInclusive<i16>); 3] = [
+    // Kafka's Produce range is 0-11, and Kafka 3.9.1 advertises all of it. nisshi decodes only
+    // the `RecordBatch` (magic v2) format that Produce v3 introduced. Versions 0-2 carry the
+    // older message-set formats, which nisshi does not decode. A client that negotiates through
+    // `ApiVersions` picks the highest version both sides support, so this cap is stricter than
+    // Kafka, but a negotiating client does not send v0-2.
+    (ProduceRequest::KEY, 3..=11),
+    // Kafka's ListOffsets range is 0-9. Versions 7-9 add the MAX_TIMESTAMP,
+    // EARLIEST_LOCAL_TIMESTAMP and LATEST_TIERED_TIMESTAMP sentinel timestamps, which nisshi's
+    // storage backends do not look up. v0 is in range, and `ListOffsetsService` fills in its
+    // `OldStyleOffsets` field.
+    (ListOffsetsRequest::KEY, 0..=6),
+    // Kafka's AddPartitionsToTxn range is 0-5. Version 4 adds the multi-transaction request
+    // shape (`Transactions`), which only the SlateDB backend implements. Kafka 3.9.1 advertises
+    // 0-5 and protects v4+ with a `CLUSTER_ACTION` authorization check
+    // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2586-L2587),
+    // and the Java client limits itself to v3
+    // (https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/AddPartitionsToTxnRequest.java#L43-L59).
+    // So this cap is stricter than Kafka, but no client sends v4+.
+    (AddPartitionsToTxnRequest::KEY, 0..=3),
+];
 
-    /// Builds the response [`VersionGateLayer`] sends instead of routing `request` to its real
-    /// service, for a negotiated version outside [`Self::SUPPORTED`].
-    fn unsupported_version(request: Self) -> Self::Response;
+/// Returns the version range nisshi routes for `api_key`, when [`CAPPED_API_VERSIONS`] caps it.
+#[must_use]
+pub fn capped_range(api_key: i16) -> Option<RangeInclusive<i16>> {
+    CAPPED_API_VERSIONS
+        .iter()
+        .find(|(key, _)| *key == api_key)
+        .map(|(_, range)| range.clone())
+}
 
-    /// Whether [`VersionGateLayer`] drops the connection instead of sending
-    /// [`unsupported_version`][Self::unsupported_version]'s response for `request`.
-    ///
-    /// The default always sends a response. `ProduceRequest` overrides this for `acks == 0`: a
-    /// client that asked for no acknowledgment does not read a response to this request at all,
-    /// so sending one only queues bytes nobody reads. Real Kafka drops the connection on an
-    /// acks=0 produce error instead of responding, and this matches that.
-    fn drop_connection_instead(_request: &Self) -> bool {
-        false
+/// Returns the highest version an internal caller may send for `api_key` without an
+/// `ApiVersions` negotiation, or `None` for an `api_key` this build has no protocol metadata
+/// for.
+///
+/// An internal caller that builds a request directly has no negotiated version to use. The
+/// protocol maximum of a capped API is a version that [`VersionGateLayer`] rejects, so this
+/// returns the cap's maximum for such an API, and the protocol maximum for every other API.
+#[must_use]
+pub fn routable_max_version(api_key: i16) -> Option<i16> {
+    capped_range(api_key)
+        .map(|range| *range.end())
+        .or_else(|| protocol_range(api_key).map(|range| *range.end()))
+}
+
+fn protocol_range(api_key: i16) -> Option<RangeInclusive<i16>> {
+    RootMessageMeta::messages()
+        .requests()
+        .get(&api_key)
+        .map(|meta| meta.version.valid.start..=meta.version.valid.end)
+}
+
+/// Fails unless `declared` is a subset of the protocol's own valid range for `api_key`.
+fn validate_capped_range(api_key: i16, declared: RangeInclusive<i16>) -> Result<(), Error> {
+    let protocol = protocol_range(api_key);
+
+    if protocol.as_ref().is_some_and(|protocol| {
+        declared.start() >= protocol.start() && declared.end() <= protocol.end()
+    }) {
+        Ok(())
+    } else {
+        Err(Error::CapRangeExceedsProtocolRange {
+            api_key,
+            declared,
+            protocol,
+        })
     }
 }
 
-/// A [`Layer`] that rejects a [`SupportedApiVersions`] request whose negotiated version falls
-/// outside [`SupportedApiVersions::SUPPORTED`], before [`FrameRequestLayer`] decodes it.
-#[derive(Clone, Copy, Default)]
-pub struct VersionGateLayer<Q> {
-    request: PhantomData<Q>,
+/// A [`Layer`] that rejects a request whose version falls outside the range nisshi routes for
+/// its API, before [`FrameRequestLayer`] decodes the body into a handler's request type.
+#[derive(Clone, Debug)]
+pub struct VersionGateLayer {
+    api_key: i16,
+    supported: RangeInclusive<i16>,
 }
 
-impl<Q> VersionGateLayer<Q> {
-    pub fn new() -> Self {
-        Self {
-            request: PhantomData,
-        }
+impl VersionGateLayer {
+    pub fn new(api_key: i16, supported: RangeInclusive<i16>) -> Self {
+        Self { api_key, supported }
     }
 }
 
-impl<Q> fmt::Debug for VersionGateLayer<Q> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(VersionGateLayer)).finish()
-    }
-}
-
-impl<S, Q> Layer<S> for VersionGateLayer<Q> {
-    type Service = VersionGateService<S, Q>;
+impl<S> Layer<S> for VersionGateLayer {
+    type Service = VersionGateService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
         Self::Service {
             inner,
-            request: PhantomData,
+            api_key: self.api_key,
+            supported: self.supported.clone(),
         }
     }
 }
 
-/// A [`Service`] enforcing [`SupportedApiVersions::SUPPORTED`] for `Q`, built by
-/// [`VersionGateLayer`].
-#[derive(Clone, Copy, Default)]
-pub struct VersionGateService<S, Q> {
+/// A [`Service`] built by [`VersionGateLayer`].
+#[derive(Clone)]
+pub struct VersionGateService<S> {
     inner: S,
-    request: PhantomData<Q>,
+    api_key: i16,
+    supported: RangeInclusive<i16>,
 }
 
-impl<S, Q> fmt::Debug for VersionGateService<S, Q> {
+impl<S> fmt::Debug for VersionGateService<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(VersionGateService)).finish()
+        f.debug_struct(stringify!(VersionGateService))
+            .field("api_key", &self.api_key)
+            .field("supported", &self.supported)
+            .finish()
     }
 }
 
-impl<S, Q> Service<FrameInput> for VersionGateService<S, Q>
+impl<S> Service<FrameInput> for VersionGateService<S>
 where
     S: Service<FrameInput, Output = Frame>,
-    S::Error: From<nisshi_sans_io::Error> + From<<Q as TryFrom<Body>>::Error>,
-    Q: SupportedApiVersions,
+    S::Error: From<nisshi_sans_io::Error>,
 {
     type Output = Frame;
     type Error = S::Error;
@@ -116,252 +152,28 @@ where
     async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
         let api_version = req.frame.api_version()?;
 
-        if Q::SUPPORTED.contains(&api_version) {
+        if self.supported.contains(&api_version) {
             return self.inner.serve(req).await;
         }
 
-        let correlation_id = req.frame.correlation_id()?;
-        let request = Q::try_from(req.frame.body)?;
+        // The broker closes the connection, as Kafka 3.9.1 does for a version it has not
+        // enabled
+        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1119-L1125).
+        // `ApiVersions` advertises this range, so only a client that skips the negotiation
+        // sends such a version.
+        warn!(
+            api_key = self.api_key,
+            api_name = req.frame.api_name(),
+            api_version,
+            client_id = req.frame.client_id().ok().flatten(),
+            supported = ?self.supported,
+            "request version outside the supported range"
+        );
 
-        if Q::drop_connection_instead(&request) {
-            return Err(Self::Error::from(
-                nisshi_sans_io::Error::UnsupportedVersion {
-                    api_key: Q::KEY,
-                    api_version,
-                },
-            ));
-        }
-
-        Ok(Frame {
-            size: 0,
-            header: Header::Response { correlation_id },
-            body: Q::unsupported_version(request).into(),
-        })
-    }
-}
-
-/// A boxed route service for a capped API `Q`, producible only via [`capped_service`], which
-/// always wires in [`VersionGateLayer<Q>`] -- so a route registered through
-/// [`FrameRouteBuilder::with_capped_route`] can never skip the version gate.
-pub struct CappedService<E> {
-    inner: BoxService<FrameInput, Frame, E>,
-}
-
-impl<E> fmt::Debug for CappedService<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(CappedService)).finish()
-    }
-}
-
-/// Wraps `inner` with [`VersionGateLayer<Q>`] and [`FrameRequestLayer<Q>`], the same layer
-/// stack every other route uses with the version gate added in front, and converts its error
-/// type to `E`.
-pub fn capped_service<Q, S, E>(inner: S) -> CappedService<E>
-where
-    Q: SupportedApiVersions,
-    S: Service<RequestInput<Q>, Output = Q::Response> + Send + Sync + 'static,
-    S::Error:
-        From<nisshi_sans_io::Error> + From<<Q as TryFrom<Body>>::Error> + Send + Sync + 'static,
-    E: std::error::Error + From<nisshi_sans_io::Error> + From<S::Error> + Send + Sync + 'static,
-{
-    CappedService {
-        inner: (
-            MapErrLayer::new(E::from),
-            VersionGateLayer::<Q>::new(),
-            FrameRequestLayer::<Q>::new(),
-        )
-            .into_layer(inner)
-            .boxed(),
-    }
-}
-
-/// The highest version a request for `api_key` may be sent at without a real `ApiVersions`
-/// negotiation to fall back on, or `None` for an api_key this build has no protocol metadata
-/// for.
-///
-/// An internal caller that builds a request directly (`RequestFrameService`, the consumer-group
-/// frame path in `nisshi-client`) has no negotiated version to use, because it is not acting as
-/// a real client responding to its own `ApiVersions` round trip. For the 3 APIs capped below
-/// the protocol's own maximum, that protocol maximum is a version `VersionGateLayer` rejects, so
-/// this returns each one's own `SupportedApiVersions::SUPPORTED` maximum instead; every other
-/// `api_key` keeps the protocol maximum, unaffected by any cap.
-#[must_use]
-pub fn routable_max_version(api_key: i16) -> Option<i16> {
-    if api_key == ProduceRequest::KEY {
-        Some(*ProduceRequest::SUPPORTED.end())
-    } else if api_key == ListOffsetsRequest::KEY {
-        Some(*ListOffsetsRequest::SUPPORTED.end())
-    } else if api_key == AddPartitionsToTxnRequest::KEY {
-        Some(*AddPartitionsToTxnRequest::SUPPORTED.end())
-    } else {
-        RootMessageMeta::messages()
-            .requests()
-            .get(&api_key)
-            .map(|meta| meta.version.valid.end)
-    }
-}
-
-/// Fails unless `Q::SUPPORTED` is a subset of the protocol's own valid range for `Q::KEY`.
-fn validate_capped_range<Q>() -> Result<(), Error>
-where
-    Q: SupportedApiVersions,
-{
-    let protocol = RootMessageMeta::messages()
-        .requests()
-        .get(&Q::KEY)
-        .map(|meta| meta.version.valid);
-
-    let declared = Q::SUPPORTED;
-
-    if protocol.is_some_and(|protocol| {
-        *declared.start() >= protocol.start && *declared.end() <= protocol.end
-    }) {
-        Ok(())
-    } else {
-        Err(Error::CapRangeExceedsProtocolRange {
-            api_key: Q::KEY,
-            declared,
-            protocol: protocol.map(|protocol| protocol.start..=protocol.end),
-        })
-    }
-}
-
-impl SupportedApiVersions for ProduceRequest {
-    // Kafka's own Produce range is 0-11. nisshi only decodes the `RecordBatch` (magic v2)
-    // format that Produce v3 introduced; versions 0-2 use the older message-set formats this
-    // broker has never implemented. In practice a v0-2 request carrying a real legacy
-    // MessageSet fails even earlier than this gate, at the raw bytes-layer record decoder
-    // (a CRC/size mismatch against the v2 shape it expects), matching this broker's existing
-    // handling of a wire format it structurally can't parse: there is no meaningful typed
-    // rejection to send for it. Only a trivial/empty v0-2 payload that happens to decode
-    // without a protocol error actually reaches `unsupported_version` below.
-    const SUPPORTED: RangeInclusive<i16> = 3..=11;
-
-    fn unsupported_version(request: Self) -> Self::Response {
-        ProduceResponse::default()
-            .responses(request.topic_data.map(|topics| {
-                topics
-                    .into_iter()
-                    .map(|topic| {
-                        TopicProduceResponse::default()
-                            .name(topic.name)
-                            .partition_responses(topic.partition_data.map(|partitions| {
-                                partitions
-                                    .into_iter()
-                                    .map(|partition| {
-                                        PartitionProduceResponse::default()
-                                            .index(partition.index)
-                                            .error_code(ErrorCode::UnsupportedVersion.into())
-                                            .base_offset(-1)
-                                            .log_append_time_ms(Some(-1))
-                                            .log_start_offset(Some(-1))
-                                    })
-                                    .collect()
-                            }))
-                    })
-                    .collect()
-            }))
-            .throttle_time_ms(Some(0))
-    }
-
-    fn drop_connection_instead(request: &Self) -> bool {
-        request.acks == 0
-    }
-}
-
-impl SupportedApiVersions for ListOffsetsRequest {
-    // Kafka's own ListOffsets range is 0-9. Versions 7-9 introduce the MAX_TIMESTAMP
-    // (KIP-734), EARLIEST_LOCAL_TIMESTAMP and LATEST_TIERED_TIMESTAMP (KIP-405/KIP-1005)
-    // sentinel timestamps, none of which nisshi's storage backends look up
-    // (`ListOffset::try_from` rejects them with `UnsupportedListOffsetTimestamp` regardless of
-    // version, as defense in depth, but the version itself is still unimplemented).
-    //
-    // v0 is deliberately included: its `OldStyleOffsets`-never-populated gap is a response-shape
-    // bug to fix, not a reason to cap the version -- raising the floor to exclude it would hide
-    // that bug behind a version rejection and drop support for old clients that are otherwise
-    // fully compatible with this broker's request-side decoding. `ListOffsetsService` populates
-    // `OldStyleOffsets` for v0 responses instead of leaving it unset.
-    const SUPPORTED: RangeInclusive<i16> = 0..=6;
-
-    fn unsupported_version(request: Self) -> Self::Response {
-        ListOffsetsResponse::default()
-            .topics(request.topics.map(|topics| {
-                topics
-                    .into_iter()
-                    .map(|topic| {
-                        ListOffsetsTopicResponse::default()
-                            .name(topic.name)
-                            .partitions(topic.partitions.map(|partitions| {
-                                partitions
-                                    .into_iter()
-                                    .map(|partition| {
-                                        ListOffsetsPartitionResponse::default()
-                                            .partition_index(partition.partition_index)
-                                            .error_code(ErrorCode::UnsupportedVersion.into())
-                                            // A non-nullable array field: build `Some(vec![])`
-                                            // rather than `None` so a future capped API with a
-                                            // similar response shape doesn't copy a `None` here
-                                            // as a pattern. Moot for ListOffsets itself once the
-                                            // floor is 0 -- `OldStyleOffsets` only exists on the
-                                            // wire at v0, which this rejection path never runs
-                                            // for -- but real shape-correctness in general.
-                                            .old_style_offsets(Some(vec![]))
-                                            .timestamp(Some(-1))
-                                            .offset(Some(-1))
-                                            .leader_epoch(Some(-1))
-                                    })
-                                    .collect()
-                            }))
-                    })
-                    .collect()
-            }))
-            .throttle_time_ms(Some(0))
-    }
-}
-
-impl SupportedApiVersions for AddPartitionsToTxnRequest {
-    // Kafka's own AddPartitionsToTxn range is 0-5. Version 4 introduced the multi-transaction
-    // request shape (`Transactions`), which every nisshi storage backend's
-    // `txn_add_partitions` leaves unimplemented for that shape.
-    const SUPPORTED: RangeInclusive<i16> = 0..=3;
-
-    fn unsupported_version(request: Self) -> Self::Response {
-        AddPartitionsToTxnResponse::default()
-            .error_code(Some(ErrorCode::UnsupportedVersion.into()))
-            .results_by_transaction(request.transactions.map(|transactions| {
-                transactions
-                    .into_iter()
-                    .map(|transaction| {
-                        AddPartitionsToTxnResult::default()
-                            .transactional_id(transaction.transactional_id)
-                            .topic_results(transaction.topics.map(|topics| {
-                                topics
-                                    .into_iter()
-                                    .map(|topic| {
-                                        AddPartitionsToTxnTopicResult::default()
-                                            .name(topic.name)
-                                            .results_by_partition(topic.partitions.map(
-                                                |partitions| {
-                                                    partitions
-                                                    .into_iter()
-                                                    .map(|partition_index| {
-                                                        AddPartitionsToTxnPartitionResult::default()
-                                                            .partition_index(partition_index)
-                                                            .partition_error_code(
-                                                                ErrorCode::UnsupportedVersion
-                                                                    .into(),
-                                                            )
-                                                    })
-                                                    .collect()
-                                                },
-                                            ))
-                                    })
-                                    .collect()
-                            }))
-                    })
-                    .collect()
-            }))
-            .throttle_time_ms(0)
+        Err(S::Error::from(nisshi_sans_io::Error::UnsupportedVersion {
+            api_key: self.api_key,
+            api_version,
+        }))
     }
 }
 
@@ -369,45 +181,56 @@ impl<E> FrameRouteBuilder<E>
 where
     E: std::error::Error + From<nisshi_sans_io::Error> + Send + Sync + 'static,
 {
-    /// Registers `Q` as a route whose broker-supported version range
-    /// ([`SupportedApiVersions::SUPPORTED`]) is narrower than the protocol's own range for its
-    /// API key, via a [`CappedService`] built by [`capped_service`], and advertises that same
-    /// narrower range in `ApiVersions` (via `FrameRouteBuilder::with_capped_range`) so a real
-    /// client never negotiates a version this route then rejects.
+    /// Registers `handler` as the route for `Q`, behind a [`VersionGateLayer`] with `Q`'s range
+    /// from [`CAPPED_API_VERSIONS`], and advertises that range in `ApiVersions`, so a client
+    /// never negotiates a version that this route rejects.
     ///
-    /// Fails with [`Error::CapRangeExceedsProtocolRange`] if `Q::SUPPORTED` is not a subset of
-    /// the protocol's own valid range.
-    pub fn with_capped_route<Q>(self, service: CappedService<E>) -> Result<Self, Error>
+    /// # Errors
+    ///
+    /// Fails with [`Error::UncappedApi`] when [`CAPPED_API_VERSIONS`] has no entry for `Q`, and
+    /// with [`Error::CapRangeExceedsProtocolRange`] when that entry is not a subset of the
+    /// protocol's own valid range.
+    pub fn with_capped_route<Q, S>(self, handler: S) -> Result<Self, Error>
     where
-        Q: SupportedApiVersions,
+        Q: Request + TryFrom<Body>,
+        <Q as TryFrom<Body>>::Error: Into<S::Error>,
+        S: Service<RequestInput<Q>, Output = Q::Response>,
+        S::Error: From<nisshi_sans_io::Error>,
+        E: From<S::Error>,
     {
-        validate_capped_range::<Q>()?;
-        self.with_capped_range(Q::KEY, *Q::SUPPORTED.start(), *Q::SUPPORTED.end())
-            .with_route(Q::KEY, service.inner)
+        let supported = capped_range(Q::KEY).ok_or(Error::UncappedApi(Q::KEY))?;
+        validate_capped_range(Q::KEY, supported.clone())?;
+
+        let service = (
+            MapErrLayer::new(E::from),
+            VersionGateLayer::new(Q::KEY, supported.clone()),
+            FrameRequestLayer::<Q>::new(),
+        )
+            .into_layer(handler)
+            .boxed();
+
+        self.with_capped_range(Q::KEY, *supported.start(), *supported.end())
+            .with_route(Q::KEY, service)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nisshi_sans_io::{ApiKey, MetadataRequest};
+    use nisshi_sans_io::MetadataRequest;
 
     use super::*;
 
-    // `MetadataRequest` is not one of the 3 real capped APIs; this impl exists only so the
-    // test below has a `SupportedApiVersions` whose declared range it can set to something
-    // deliberately outside the protocol's own range (0-12) for `MetadataRequest`.
-    impl SupportedApiVersions for MetadataRequest {
-        const SUPPORTED: RangeInclusive<i16> = 0..=999;
-
-        fn unsupported_version(_request: Self) -> Self::Response {
-            Self::Response::default()
+    #[test]
+    fn every_capped_range_is_within_its_protocol_range() {
+        for (api_key, range) in CAPPED_API_VERSIONS {
+            validate_capped_range(api_key, range).expect("a cap within the protocol range");
         }
     }
 
     #[test]
     fn declared_range_wider_than_protocol_range_fails_validation() {
-        let err = validate_capped_range::<MetadataRequest>()
-            .expect_err("0..=999 exceeds MetadataRequest's real protocol range of 0-12");
+        let err = validate_capped_range(MetadataRequest::KEY, 0..=999)
+            .expect_err("0..=999 exceeds MetadataRequest's protocol range");
 
         assert!(matches!(
             err,
@@ -416,5 +239,18 @@ mod tests {
                 ..
             } if api_key == MetadataRequest::KEY
         ));
+    }
+
+    #[test]
+    fn routable_max_version_uses_the_cap_for_a_capped_api() {
+        assert_eq!(Some(6), routable_max_version(ListOffsetsRequest::KEY));
+    }
+
+    #[test]
+    fn routable_max_version_uses_the_protocol_maximum_for_an_uncapped_api() {
+        assert_eq!(
+            protocol_range(MetadataRequest::KEY).map(|range| *range.end()),
+            routable_max_version(MetadataRequest::KEY)
+        );
     }
 }

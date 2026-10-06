@@ -33,8 +33,8 @@ Sweeps of the librdkafka integration test suite against
    first Produce was a thread race: when it landed after, its response sat
    behind the 50 s delay and, because `max.in.flight` counts every request
    type, the second Produce was never sent (reproduced locally against
-   `memory://` at 5/25 under CPU load, ~3% in CI). SOL-155187 removed
-   nisshi's `GetTelemetrySubscriptions` route and its registration
+   `memory://` at 5/25 under CPU load, ~3% in CI). nisshi removed
+   its `GetTelemetrySubscriptions` route and its registration
    entirely (the service had no real telemetry sink behind it, and
    `PushTelemetry` was never routed either), so nisshi no longer
    advertises the telemetry APIs at all and this race can no longer

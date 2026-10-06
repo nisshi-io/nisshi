@@ -191,41 +191,15 @@ where
 /// Whether `api_version` falls inside the Kafka protocol's own declared range for `api_key`,
 /// per [`RootMessageMeta`].
 ///
-/// A route registered through [`FrameRouteBuilder::with_capped_route`] rejects a version
-/// outside its own, narrower [`SupportedApiVersions::SUPPORTED`][crate::SupportedApiVersions::SUPPORTED]
-/// with a typed, per-partition response; every other route has no such handler to build one,
-/// so [`Service::serve`] rejects a version this check fails with
-/// [`nisshi_sans_io::Error::UnsupportedVersion`] instead of dispatching it to a handler built
-/// for a different version's wire shape -- except `ApiVersionsRequest::KEY` itself, exempted
-/// in both `serve` impls below (see [`with_unsupported_version_error_code`]).
-///
-/// Shared by [`FrameRouteService`]'s two `serve` impls below and by
-/// [`crate::frame::BytesFrameService`], which needs the same check to pick the version an
-/// out-of-range `ApiVersions` response is encoded at.
+/// [`FrameRouteService`] closes the connection for a version outside this range instead of
+/// passing the frame to a handler, because the handler's request type has no wire shape for
+/// that version. `BytesFrameService` answers an `ApiVersions` request outside this range
+/// itself, before it decodes the body.
 pub(crate) fn is_within_protocol_range(api_key: i16, api_version: i16) -> bool {
     RootMessageMeta::messages()
         .requests()
         .get(&api_key)
         .is_some_and(|meta| meta.version.valid.within(api_version))
-}
-
-/// Overrides an `ApiVersionsResponse` frame's top-level `error_code` to `UnsupportedVersion`.
-///
-/// Used only for the out-of-range-`ApiVersions` exemption in [`FrameRouteService`]'s two
-/// `serve` impls: the route's own [`ApiVersionsService`] handler always answers with
-/// `error_code = None`, since from its perspective the request it was handed is a perfectly
-/// ordinary one -- only the caller here knows the negotiated version fell outside this
-/// build's protocol range for `ApiVersions` and that the reply should say so.
-fn with_unsupported_version_error_code(frame: Frame) -> Frame {
-    match frame.body {
-        Body::ApiVersionsResponse(response) => Frame {
-            body: Body::ApiVersionsResponse(
-                response.error_code(ErrorCode::UnsupportedVersion.into()),
-            ),
-            ..frame
-        },
-        body => Frame { body, ..frame },
-    }
 }
 
 impl<E> Service<FrameInput> for FrameRouteService<E>
@@ -246,17 +220,6 @@ where
 
         if is_within_protocol_range(api_key, api_version) {
             return service.serve(req).await;
-        }
-
-        if api_key == ApiVersionsRequest::KEY {
-            // See `with_unsupported_version_error_code` -- `ApiVersions` is exempt from the
-            // generic backstop below because it is the request a client uses to negotiate a
-            // version in the first place; closing the connection on it rather than answering
-            // would leave such a client with no way to discover it should retry lower.
-            return service
-                .serve(req)
-                .await
-                .map(with_unsupported_version_error_code);
         }
 
         Err(E::from(nisshi_sans_io::Error::UnsupportedVersion {
@@ -292,14 +255,6 @@ where
 
         if is_within_protocol_range(api_key, api_version) {
             return service.serve(req).await;
-        }
-
-        if api_key == ApiVersionsRequest::KEY {
-            // See `with_unsupported_version_error_code` and the matching exemption above.
-            return service
-                .serve(req)
-                .await
-                .map(with_unsupported_version_error_code);
         }
 
         Err(E::from(nisshi_sans_io::Error::UnsupportedVersion {
@@ -403,9 +358,9 @@ mod tests {
 
     use super::*;
 
-    // A real client negotiates a version from what `ApiVersions` advertises, so a capped
-    // route's advertised range must be its declared `SUPPORTED` range, never the protocol's
-    // wider one -- otherwise a client picks a version `VersionGateLayer` then rejects.
+    // A client negotiates a version from what `ApiVersions` advertises, so a capped route
+    // advertises its cap, not the protocol's wider range, or the client picks a version that
+    // `VersionGateLayer` rejects.
     #[tokio::test]
     async fn api_versions_response_uses_capped_range_for_a_capped_api() {
         let service = ApiVersionsService::<Error> {
@@ -449,40 +404,68 @@ mod tests {
         assert!(!is_within_protocol_range(i16::MAX, 0));
     }
 
-    // `ApiVersions`' own protocol range is 0-4 (see `ApiVersionsRequest.json`). A version
-    // outside it must still get an answer -- real Kafka's own v0 fallback mechanism -- rather
-    // than the generic backstop's connection close every other out-of-range API key gets.
-    #[tokio::test]
-    async fn out_of_range_api_versions_request_gets_a_fallback_response_not_a_closed_connection() {
-        let frame_route = FrameRouteService::<Error>::builder()
-            .build()
-            .expect("build always succeeds with no routes beyond the ApiVersions one it adds");
-
-        let frame = Frame {
+    fn api_versions_frame(api_version: i16) -> Frame {
+        Frame {
             size: 0,
             header: Header::Request {
                 api_key: ApiVersionsRequest::KEY,
-                api_version: 9,
+                api_version,
                 correlation_id: 0,
                 client_id: None,
             },
             body: ApiVersionsRequest::default().into(),
-        };
+        }
+    }
+
+    fn assert_unsupported_version(result: Result<Frame, Error>, expected_version: i16) {
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(nisshi_sans_io::Error::UnsupportedVersion {
+                api_key,
+                api_version,
+            })) if api_key == ApiVersionsRequest::KEY && api_version == expected_version
+        ));
+    }
+
+    // The `ApiVersions` route answers any request it is given, so a frame outside the protocol
+    // range (0-4) reaches the handler only if the backstop lets it through.
+    #[tokio::test]
+    async fn frame_input_outside_protocol_range_is_rejected() {
+        let frame_route = FrameRouteService::<Error>::builder()
+            .build()
+            .expect("a route table with only the ApiVersions route");
+
+        assert_unsupported_version(
+            frame_route
+                .serve(FrameInput {
+                    frame: api_versions_frame(9),
+                    extensions: Extensions::default(),
+                })
+                .await,
+            9,
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_outside_protocol_range_is_rejected() {
+        let frame_route = FrameRouteService::<Error>::builder()
+            .build()
+            .expect("a route table with only the ApiVersions route");
+
+        assert_unsupported_version(frame_route.serve(api_versions_frame(9)).await, 9);
+    }
+
+    #[tokio::test]
+    async fn frame_within_protocol_range_is_routed() {
+        let frame_route = FrameRouteService::<Error>::builder()
+            .build()
+            .expect("a route table with only the ApiVersions route");
 
         let response = frame_route
-            .serve(FrameInput {
-                frame,
-                extensions: Extensions::default(),
-            })
+            .serve(api_versions_frame(4))
             .await
-            .expect("an out-of-range ApiVersions request is answered, not rejected");
+            .expect("v4 is within the ApiVersions protocol range");
 
-        let body = ApiVersionsResponse::try_from(response.body)
-            .expect("the ApiVersions route always answers with an ApiVersionsResponse");
-
-        assert_eq!(
-            ErrorCode::UnsupportedVersion,
-            ErrorCode::try_from(body.error_code).expect("a valid error code")
-        );
+        assert!(ApiVersionsResponse::try_from(response.body).is_ok());
     }
 }

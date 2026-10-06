@@ -367,11 +367,10 @@ pub enum Error {
     UnknownScramMechanism(i8),
     UnknownContainer,
     UnsupportedListOffsetTimestamp(i64),
-    /// No route exists for `api_key` that can accept `api_version`: the version falls outside
-    /// the protocol's own valid range for every registered route, or outside a route's
-    /// narrower, broker-advertised cap with no typed rejection available for it. The caller
-    /// closes the connection on this error, matching how real Kafka handles a request it
-    /// cannot parse into any known version.
+    /// The broker does not route `api_version` for `api_key`, because the version is outside
+    /// the protocol's valid range or outside the range the broker advertises for that API.
+    /// The caller closes the connection on this error, as Kafka does for a version it has not
+    /// enabled.
     UnsupportedVersion {
         api_key: i16,
         api_version: i16,
