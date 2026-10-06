@@ -74,24 +74,28 @@ private_intra_doc_links = "deny"
 [workspace.dependencies]
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
-arrow = { version = "57" }
+arrow = { version = "58" }
 assert_matches = "1.5.0"
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}
 bytes = { version = "1", features = ["serde"] }
-cached = "2.0.2"
+cached = "4.0.1"
 chrono = "0.4"
 clap = { version = "4.5.57", features = ["derive", "env"] }
 condtype = "1.3.0"
 console = "0.16.2"
-convert_case = "0.11.0"
+convert_case = "0.12.0"
 crc-fast = "1.8.0"
 criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
-datafusion = "51"
+datafusion = "53"
 deadpool = "0.13.1"
 deadpool-postgres = "0.14.2"
-delta_kernel = { version = "0.20.0", default-features = false, features = ["arrow-57"] }
-deltalake = { version = "0.30", features = ["datafusion", "s3"] }
+# Pinned: buoyant_kernel 0.22.2 depends on "^1", which resolves to 1.2.0
+# by default, but 1.2.0 renamed the `parse_column_name` macro to
+# `column_name_segments`, breaking the version deltalake 0.32.4 actually
+# builds against. Pin to 1.1.0 until deltalake bumps its buoyant_kernel dep.
+buoyant_kernel_derive = "=1.1.0"
+deltalake = { version = "0.32", features = ["datafusion", "s3"] }
 digest = "0.11.3"
 dotenv = "0.15.0"
 fake = "5.1.0"
@@ -107,9 +111,10 @@ human-units = {version = "0.5.3", features = ["iec-units"]}
 humantime = "2.2.0"
 hyper = { version = "1.3", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-iceberg = "0.8"
-iceberg-catalog-rest = "0.8"
-iceberg-datafusion = "0.8"
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+iceberg-datafusion = "0.10.1"
+iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3", "opendal-fs", "opendal-memory"] }
 indicatif = "0.18.3"
 jsonschema = "0.45.0"
 lazy_static = "1.4.0"
@@ -127,7 +132,7 @@ opentelemetry-stdout = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
 ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
-parquet = {version = "57", features = ["async"]}
+parquet = {version = "58", features = ["async"]}
 pbkdf2 = "0.12.2"
 pkcs8 = { version = "0.10", default-features = false, features = ["encryption", "pem", "std", "3des"] }
 postcard = { version = "1.1.3", features = ["use-std"] }
@@ -144,7 +149,7 @@ rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex = "1.12.3"
 rhai = { version = "1.24.0", features = ["sync"] }
-rhai-rand = "0.1"
+rhai-rand = "0.2"
 rsasl = { version = "2.2.0", features = ["config_builder", "provider", "oauthbearer", "scram-sha-2"], default-features = false }
 rustls = "0.23.27"
 rustls-native-certs = "0.8.1"
@@ -186,7 +191,7 @@ tokio-util = { version = "0.7", features = ["full"] }
 traceforge = "0.2"
 tracing = "0.1"
 tracing-core = { version = "0.1" }
-tracing-opentelemetry = "0.33.0"
+tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 turso = "0.7.1"
 url = { version = "2.5.4", features = ["serde"] }

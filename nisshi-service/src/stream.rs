@@ -23,6 +23,7 @@ use std::{
 
 use bytes::Bytes;
 use nanoid::nanoid;
+use nisshi_auth::AuthenticationExtension;
 use nisshi_sans_io::BytesInput;
 use opentelemetry::KeyValue;
 use rama::{
@@ -41,8 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, Level, debug, error, instrument, span};
 
 use crate::{
-    BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
-    TcpListenerInput, frame_length, frame_size,
+    BYTES_RECEIVED, BYTES_SENT, Error, FRAMES_REJECTED, REQUEST_DURATION, REQUEST_SIZE,
+    RESPONSE_SIZE, TcpListenerInput, frame_length, frame_size,
 };
 
 /// The largest request payload a listener accepts unless [`TcpContext::maximum_frame_size`]
@@ -51,6 +52,18 @@ use crate::{
 /// The size prefix is read before authentication, so an unbounded listener lets
 /// a client make it allocate up to 2 GiB per connection by sending 4 bytes.
 pub const DEFAULT_MAXIMUM_FRAME_SIZE: usize = 100 * 1024 * 1024;
+
+/// The largest request payload an unauthenticated connection accepts unless
+/// [`TcpContext::pre_authentication_maximum_frame_size`] says otherwise,
+/// matching the Apache Kafka default for `sasl.server.max.receive.size`.
+///
+/// `None` (the [`TcpContext`] default) leaves [`DEFAULT_MAXIMUM_FRAME_SIZE`] in
+/// effect even before authentication, so a non-SASL listener's behavior is
+/// unchanged. Where this is `Some`, the effective limit before authentication
+/// is the smaller of this and [`TcpContext::maximum_frame_size`] — never the
+/// larger — so configuring the full limit below this can only tighten, not
+/// loosen, what an unauthenticated client may send.
+pub const DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE: usize = 512 * 1024;
 
 /// How long an otherwise-idle connection may wait for the next request to begin
 /// before it's closed, unless [`TcpContext::connection_idle_timeout`] says
@@ -356,6 +369,7 @@ where
 pub struct TcpContext {
     cluster_id: Option<String>,
     maximum_frame_size: Option<usize>,
+    pre_authentication_maximum_frame_size: Option<usize>,
     connection_idle_timeout: Option<Duration>,
     io_idle_timeout: Option<Duration>,
 }
@@ -365,6 +379,11 @@ impl Default for TcpContext {
         Self {
             cluster_id: Default::default(),
             maximum_frame_size: Some(DEFAULT_MAXIMUM_FRAME_SIZE),
+            // Not set by default: a listener with no SASL configured must not
+            // have its very first frame capped at 512KiB. Callers that do
+            // configure SASL are expected to also call
+            // `pre_authentication_maximum_frame_size`.
+            pre_authentication_maximum_frame_size: None,
             connection_idle_timeout: Some(DEFAULT_CONNECTION_IDLE_TIMEOUT),
             io_idle_timeout: Some(DEFAULT_IO_IDLE_TIMEOUT),
         }
@@ -389,6 +408,14 @@ impl From<&MaximumFrameSizeExtension> for usize {
     }
 }
 
+/// Per-connection [`TcpContext::pre_authentication_maximum_frame_size`],
+/// carried on the stream's [`Extensions`] like [`MaximumFrameSizeExtension`].
+/// Absent means no pre-authentication limit is configured, so
+/// [`MaximumFrameSizeExtension`] alone governs every frame, authenticated or
+/// not.
+#[derive(Clone, Debug, Extension)]
+struct PreAuthenticationMaximumFrameSizeExtension(usize);
+
 /// Per-connection [`TcpContext::connection_idle_timeout`], carried on the
 /// stream's [`Extensions`] like [`MaximumFrameSizeExtension`]. Absent means
 /// the timeout is disabled.
@@ -411,6 +438,20 @@ impl TcpContext {
     pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
         Self {
             maximum_frame_size,
+            ..self
+        }
+    }
+
+    /// Largest request payload an unauthenticated connection may send, or
+    /// `None` to leave [`maximum_frame_size`][Self::maximum_frame_size] in
+    /// effect before authentication too (the default). Where both are `Some`,
+    /// the effective pre-authentication limit is the smaller of the two.
+    pub fn pre_authentication_maximum_frame_size(
+        self,
+        pre_authentication_maximum_frame_size: Option<usize>,
+    ) -> Self {
+        Self {
+            pre_authentication_maximum_frame_size,
             ..self
         }
     }
@@ -589,6 +630,16 @@ where
                 .insert(MaximumFrameSizeExtension(maximum_frame_size));
         }
 
+        if let Some(pre_authentication_maximum_frame_size) =
+            self.state.pre_authentication_maximum_frame_size
+        {
+            _ = req
+                .extensions()
+                .insert(PreAuthenticationMaximumFrameSizeExtension(
+                    pre_authentication_maximum_frame_size,
+                ));
+        }
+
         if let Some(connection_idle_timeout) = self.state.connection_idle_timeout {
             _ = req
                 .extensions()
@@ -686,11 +737,104 @@ impl<S> TcpBytesService<S> {
 ///
 /// `None` in any field means that limit is disabled, either because the
 /// [`TcpContext`] said so or because no [`TcpContextLayer`] set one.
+///
+/// `maximum_frame_size` here is the full, post-authentication limit snapshotted
+/// once at the start of the connection. [`TcpBytesService::req`] re-derives the
+/// *effective* limit fresh on every request via [`effective_maximum_frame_size`]
+/// — which may be smaller while unauthenticated — and overrides this field with
+/// that value before calling [`TcpBytesService::wait`], since authentication
+/// state (unlike the other limits) can change over the life of a connection.
 #[derive(Clone, Copy, Debug, Default)]
 struct ConnectionLimits {
-    maximum_frame_size: Option<usize>,
+    maximum_frame_size: Option<FrameSizeLimit>,
     connection_idle_timeout: Option<Duration>,
     io_idle_timeout: Option<Duration>,
+}
+
+/// A frame-size limit, and the [`TcpContext`] setting that it comes from.
+///
+/// [`TcpBytesService::wait`] reports a rejection by each setting as a
+/// different [`Error`], so that an operator can tell the two limits apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameSizeLimit {
+    /// [`TcpContext::maximum_frame_size`].
+    Full(usize),
+    /// [`TcpContext::pre_authentication_maximum_frame_size`].
+    PreAuthentication(usize),
+}
+
+impl FrameSizeLimit {
+    fn size(self) -> usize {
+        match self {
+            Self::Full(size) | Self::PreAuthentication(size) => size,
+        }
+    }
+
+    fn rejection(self, frame_size: usize) -> Error {
+        match self {
+            Self::Full(_) => Error::FrameTooBig(frame_size),
+            Self::PreAuthentication(limit) => Error::PreAuthenticationFrameTooBig {
+                size: frame_size,
+                limit,
+            },
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Full(_) => "maximum_frame_size",
+            Self::PreAuthentication(_) => "pre_authentication_maximum_frame_size",
+        }
+    }
+}
+
+/// The frame-size limit in effect for the *next* frame on this connection.
+///
+/// Before authentication completes, this is the smaller of
+/// [`TcpContext::maximum_frame_size`] and
+/// [`TcpContext::pre_authentication_maximum_frame_size`] (clamping, not
+/// substituting, so configuring the full limit below the pre-authentication
+/// one can only tighten what an unauthenticated client may send, never loosen
+/// it). Once [`AuthenticationExtension::is_authenticated`] reports `true`, the
+/// full limit alone applies, matching today's behavior exactly.
+///
+/// An *absent* [`AuthenticationExtension`] is treated the same as one present
+/// but not yet authenticated, not as "authenticated" -- `BytesFrameService`
+/// only inserts it after a request has already passed the auth check, so the
+/// very first frame on every connection (SASL or not) sees no
+/// `AuthenticationExtension` at all. Whether "no authentication configured"
+/// applies at all is a separate question, answered by whether
+/// [`PreAuthenticationMaximumFrameSizeExtension`] is present (see the `match`
+/// below): a listener with no SASL configured never has that extension
+/// either, so it falls through to the full limit regardless of
+/// `AuthenticationExtension`'s presence.
+fn effective_maximum_frame_size(extensions: &Extensions) -> Option<FrameSizeLimit> {
+    let full = extensions
+        .get_ref::<MaximumFrameSizeExtension>()
+        .map(|maximum_frame_size| FrameSizeLimit::Full(maximum_frame_size.0));
+
+    let authenticated = extensions
+        .get_ref::<AuthenticationExtension>()
+        .is_some_and(|authentication| authentication.is_authenticated());
+
+    if authenticated {
+        return full;
+    }
+
+    match (
+        extensions
+            .get_ref::<PreAuthenticationMaximumFrameSizeExtension>()
+            .map(|pre_authentication_maximum_frame_size| pre_authentication_maximum_frame_size.0),
+        full,
+    ) {
+        // A full limit that is equal or smaller rejects the frame regardless
+        // of authentication, so the rejection names the full limit.
+        (Some(pre_authentication), Some(full)) if full.size() <= pre_authentication => Some(full),
+        (Some(pre_authentication), _) => {
+            Some(FrameSizeLimit::PreAuthentication(pre_authentication))
+        }
+        (None, full) => full,
+    }
 }
 
 impl ConnectionLimits {
@@ -698,7 +842,7 @@ impl ConnectionLimits {
         Self {
             maximum_frame_size: extensions
                 .get_ref::<MaximumFrameSizeExtension>()
-                .map(|maximum_frame_size| maximum_frame_size.0),
+                .map(|maximum_frame_size| FrameSizeLimit::Full(maximum_frame_size.0)),
             connection_idle_timeout: extensions
                 .get_ref::<ConnectionIdleTimeoutExtension>()
                 .map(|connection_idle_timeout| connection_idle_timeout.0),
@@ -737,11 +881,11 @@ where
 
         let frame_size = frame_size(size)?;
 
-        if limits
-            .maximum_frame_size
-            .is_some_and(|maximum_frame_size| frame_size > maximum_frame_size)
+        if let Some(limit) = limits.maximum_frame_size
+            && frame_size > limit.size()
         {
-            return Err(Into::into(Error::FrameTooBig(frame_size)));
+            FRAMES_REJECTED.add(1, &[KeyValue::new("reason", limit.reason())]);
+            return Err(Into::into(limit.rejection(frame_size)));
         }
 
         Ok(size)
@@ -866,6 +1010,11 @@ where
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin + ExtensionsRef,
     {
+        let limits = ConnectionLimits {
+            maximum_frame_size: effective_maximum_frame_size(req.extensions()),
+            ..limits
+        };
+
         let size = self.wait(req, limits).await?;
         let request = self.read(req, size, limits).await?;
         let response = self
@@ -994,7 +1143,7 @@ mod tests {
     /// disabled (`None`) so frame-size tests aren't sensitive to timing.
     fn limits(maximum_frame_size: Option<usize>) -> ConnectionLimits {
         ConnectionLimits {
-            maximum_frame_size,
+            maximum_frame_size: maximum_frame_size.map(FrameSizeLimit::Full),
             ..Default::default()
         }
     }
@@ -1141,6 +1290,185 @@ mod tests {
 
         assert!(
             matches!(outcome, Err(Error::FrameTooBig(SIZE))),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// A fresh, never-handshaken [`AuthenticationExtension`] reports
+    /// `is_authenticated() == false` — exactly the state of a connection that
+    /// has sent nothing yet. No real SASL exchange is driven; the point is
+    /// only to exercise the "present but not yet authenticated" branch of
+    /// [`effective_maximum_frame_size`].
+    fn unauthenticated_extension() -> AuthenticationExtension {
+        let config = rsasl::config::SASLConfig::with_credentials(
+            None,
+            "principal".into(),
+            "password".into(),
+        )
+        .expect("sasl config");
+
+        AuthenticationExtension::server(config)
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_frame_over_pre_authentication_limit_is_rejected() -> Result<(), Error>
+    {
+        let (mut client, server) = duplex(64);
+
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(MaximumFrameSizeExtension(DEFAULT_MAXIMUM_FRAME_SIZE));
+            _ = extensions.insert(PreAuthenticationMaximumFrameSizeExtension(
+                DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
+            ));
+            _ = extensions.insert(unauthenticated_extension());
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        let size = DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE + 1;
+
+        // Only the length prefix is sent, same reasoning as
+        // `serve_rejects_oversized_frame_without_reading_body`.
+        client.write_all(&header(size as i32)).await?;
+
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("frame over the pre-authentication limit was admitted")?;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::PreAuthenticationFrameTooBig { size: s, limit })
+                    if s == size && limit == DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE
+            ),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// The very first frame on a SASL-configured connection has no
+    /// `AuthenticationExtension` at all yet -- `BytesFrameService` only
+    /// inserts one after a request has already passed the auth check, which
+    /// happens strictly after this frame's size has already been checked.
+    /// This is the actual attack this ticket closes: one frame per
+    /// connection, no prior authenticated request needed. Deliberately does
+    /// *not* insert an `AuthenticationExtension` at all, unlike the other
+    /// tests in this module.
+    #[tokio::test]
+    async fn pre_authentication_limit_applies_to_the_first_frame_with_no_authentication_extension_yet()
+    -> Result<(), Error> {
+        let (mut client, server) = duplex(64);
+
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(MaximumFrameSizeExtension(DEFAULT_MAXIMUM_FRAME_SIZE));
+            _ = extensions.insert(PreAuthenticationMaximumFrameSizeExtension(
+                DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
+            ));
+            // No `AuthenticationExtension` inserted at all.
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        let size = DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE + 1;
+
+        client.write_all(&header(size as i32)).await?;
+
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the first frame on a SASL connection was admitted over the pre-authentication limit -- an attacker needs only one frame per connection")?;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::PreAuthenticationFrameTooBig { size: s, limit })
+                    if s == size && limit == DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE
+            ),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_authentication_limit_does_not_apply_without_sasl_configured() -> Result<(), Error>
+    {
+        let (mut client, server) = duplex(2 * 1024 * 1024);
+
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(MaximumFrameSizeExtension(DEFAULT_MAXIMUM_FRAME_SIZE));
+            // No `AuthenticationExtension` and no
+            // `PreAuthenticationMaximumFrameSizeExtension` at all: exactly the
+            // state of a listener with no SASL configured
+            // (`nisshi-broker/src/service.rs` only inserts the latter when
+            // `sasl_config` is `Some`).
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        let size = DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE + 1;
+        let mut frame = header(size as i32).to_vec();
+        frame.extend(vec![0u8; size]);
+
+        client.write_all(&frame).await?;
+
+        let mut echoed = vec![0u8; frame.len()];
+        _ = timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("a frame over the pre-authentication limit, but within the full limit, must be accepted when no pre-authentication limit is configured")?;
+
+        assert_eq!(frame, echoed);
+        drop(client);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_authentication_limit_clamps_to_the_lower_full_limit_not_substitutes()
+    -> Result<(), Error> {
+        let (mut client, server) = duplex(64);
+
+        // The full limit is configured *below* the pre-authentication default:
+        // the effective pre-authentication limit must be the smaller of the
+        // two (clamped), not the pre-authentication value on its own
+        // (substituted) -- substituting would let this frame through.
+        const LOWER_FULL_LIMIT: usize = 1_024;
+
+        let handle = spawn(async move {
+            let extensions = Extensions::default();
+            _ = extensions.insert(MaximumFrameSizeExtension(LOWER_FULL_LIMIT));
+            _ = extensions.insert(PreAuthenticationMaximumFrameSizeExtension(
+                DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
+            ));
+            _ = extensions.insert(unauthenticated_extension());
+
+            service()
+                .serve(DuplexStreamWithExtensions::new(server, extensions))
+                .await
+        });
+
+        let size = LOWER_FULL_LIMIT + 1;
+        assert!(
+            size < DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
+            "test is only meaningful below the pre-authentication default"
+        );
+
+        client.write_all(&header(size as i32)).await?;
+
+        let outcome = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("a frame over the full limit was admitted just because it's under the pre-authentication default: clamp, don't substitute")?;
+
+        assert!(
+            matches!(outcome, Err(Error::FrameTooBig(s)) if s == size),
             "{outcome:?}"
         );
         Ok(())
@@ -1459,6 +1787,55 @@ mod tests {
 
         assert!(
             matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::TimedOut),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// Same as above for the pre-authentication frame size: the stream starts
+    /// with empty extensions, so only a correctly wired
+    /// `pre_authentication_maximum_frame_size` can reject a frame that the
+    /// full limit admits.
+    #[tokio::test]
+    async fn tcp_context_layer_applies_pre_authentication_maximum_frame_size() -> Result<(), Error>
+    {
+        const LIMIT: usize = 1_024;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut client = TokioTcpStream::connect(listener.local_addr()?).await?;
+        let (accepted, _) = listener.accept().await?;
+
+        let service = (
+            TcpContextLayer::new(
+                TcpContext::default()
+                    .pre_authentication_maximum_frame_size(Some(LIMIT))
+                    .connection_idle_timeout(None)
+                    .io_idle_timeout(None),
+            ),
+            TcpBytesLayer,
+        )
+            .into_layer(Echo);
+
+        client.write_all(&header(LIMIT as i32 + 1)).await?;
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            service.serve(TcpStream::from_tokio_tcp_stream(
+                accepted,
+                Extensions::default(),
+            )),
+        )
+        .await
+        .expect(
+            "TcpContextService did not wire pre_authentication_maximum_frame_size into the stream",
+        );
+
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::PreAuthenticationFrameTooBig { size, limit })
+                    if size == LIMIT + 1 && limit == LIMIT
+            ),
             "{outcome:?}"
         );
         Ok(())

@@ -174,8 +174,14 @@ impl TagBuffer {
             .map_or_else(
                 || Ok(None),
                 |TagField(_, encoded)| {
+                    // `encoded` is already fully in memory (decoded earlier as
+                    // part of the parent record), so its own length — not the
+                    // 1GiB fallback — is the right bound for whatever it claims
+                    // to contain.
+                    let message_max_size = encoded.len();
                     let mut r = Cursor::new(encoded);
-                    let mut decoder = de::Decoder::new(&mut r);
+                    let mut decoder =
+                        de::Decoder::new(&mut r).with_message_max_size(message_max_size);
                     T::deserialize(&mut decoder).map(Some)
                 },
             )
@@ -312,6 +318,7 @@ impl<'de> Deserialize<'de> for TagBuffer {
 #[cfg(test)]
 mod tests {
     use super::{de::Decoder, ser::Encoder, *};
+    use crate::Error;
 
     #[ignore]
     #[test]
@@ -463,6 +470,44 @@ mod tests {
         assert_eq!(expected, Example::deserialize(&mut decoder)?);
 
         Ok(())
+    }
+
+    /// `TagBuffer::decode` constructs its decoder from the tag field's own
+    /// already-in-memory bytes, not a view onto remaining wire bytes, so the
+    /// bound must be the tag field's own length. A claimed length far larger
+    /// than the tag field's own encoded size, but still well under the 1GiB
+    /// `MESSAGE_MAX_SIZE` fallback, must still be rejected rather than
+    /// silently decoded up to that fallback.
+    #[test]
+    fn decode_rejects_tagged_field_claiming_more_than_its_own_encoded_size() {
+        let claimed_length: u32 = 1_000_000;
+
+        // The compact-string length prefix alone (claimed_length + 1, per the
+        // compact-string convention), with no string bytes behind it at all:
+        // a tiny tag field claiming a length far larger than itself.
+        let mut value = claimed_length + 1;
+        let mut raw = Vec::new();
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value == 0 {
+                raw.push(byte);
+                break;
+            }
+            raw.push(byte | 0x80);
+        }
+
+        let tag_id = 7;
+        let buffer = TagBuffer::builder().tag(tag_id, raw).build();
+
+        let err = buffer.decode::<String>(&tag_id).expect_err(
+            "a tagged field claiming far more than its own encoded size must be rejected",
+        );
+
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(length) if length == claimed_length as usize),
+            "{err:?}"
+        );
     }
 
     #[test]

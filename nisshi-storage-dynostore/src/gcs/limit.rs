@@ -20,7 +20,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use cached::{Cached as _, stores::TtlSortedCache};
+use cached::{CachedExt as _, stores::TtlSortedCache};
 use futures::stream::BoxStream;
 use governor::{DefaultDirectRateLimiter, Jitter, Quota, RateLimiter};
 use nisshi_storage::Result;
@@ -92,11 +92,11 @@ impl<O> PutRateLimiter<O> {
                 .get(location)
                 .cloned()
                 .or_else(|| self.rate_limiter())
-                .and_then(|rate_limiter| {
-                    entries
-                        .insert_evict(location.to_owned(), rate_limiter.clone(), true)
-                        .ok()
-                        .map(|_| rate_limiter)
+                .inspect(|rate_limiter| {
+                    _ = entries
+                        .set_with(location.to_owned(), rate_limiter.clone())
+                        .evict()
+                        .set();
                 })
         })
     }

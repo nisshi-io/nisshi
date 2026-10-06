@@ -35,6 +35,67 @@ use tracing::{debug, instrument};
 /// it just grows the buffer past this point as elements are pushed.
 pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 
+/// Upper bound on the memory one produce batch may occupy once decoded.
+/// Without it, a few KB of zstd/gzip/lz4 input representing a long run of
+/// repeated bytes can decompress into gigabytes, a Snappy block's header
+/// claims its decompressed length before any data is read, and the wire
+/// encoding amplifies on decode: a null/null header is 2 bytes on the wire
+/// and `size_of::<Header>()` (64) decoded, a minimal record 7 bytes on the
+/// wire and `size_of::<Record>()` (112) decoded. Matches `nisshi-service`'s
+/// `DEFAULT_MAXIMUM_FRAME_SIZE` in value only, kept as its own constant since
+/// this crate is sans-I/O and has no access to that connection-level setting.
+///
+/// Enforced three ways against the same number: as the byte limit on the
+/// decompressing reader, as a pre-check on every wire-supplied count
+/// (`record_count`, a sequence length) before anything is decoded, and as a
+/// running [`DecodeBudget`] that every allocation made while decoding a batch
+/// is charged to.
+///
+/// The real peak per batch is a small multiple of this, not this exactly: an
+/// uncompressed record's headers are charged after they are allocated (the
+/// sequence-length pre-check compares one record against the whole limit,
+/// not what is left of the budget), a Snappy batch's decompressed block is
+/// live alongside the records decoded from it, and the zstd decoder's window
+/// (up to 128 MiB by default) is not charged.
+pub(crate) const MAX_DECODED_BATCH_BYTES: usize = 100 * 1024 * 1024;
+
+/// The decoded-memory budget of one batch. Each `Record`, each `Header` and
+/// each copied byte of key or value is charged as it is decoded, and the
+/// batch is rejected once the budget is spent, so the memory a batch decodes
+/// into is bounded by the budget however small its wire encoding is.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DecodeBudget {
+    limit: usize,
+    remaining: usize,
+}
+
+impl DecodeBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            remaining: limit,
+        }
+    }
+
+    /// Charge `cost` bytes. The error carries the decoded size reached at
+    /// the point the budget ran out.
+    pub(crate) fn charge(&mut self, cost: usize) -> Result<()> {
+        self.remaining = self.remaining.checked_sub(cost).ok_or_else(|| {
+            Error::MessageMaxSizeExceeded((self.limit - self.remaining).saturating_add(cost))
+        })?;
+
+        Ok(())
+    }
+}
+
+/// True if `count` elements of `size` bytes each would on their own exceed
+/// [`MAX_DECODED_BATCH_BYTES`]. A cheap check on a wire-supplied count
+/// before any element is decoded; the [`DecodeBudget`] then bounds the real
+/// total as elements are produced.
+pub(crate) fn exceeds_decoded_batch_limit(count: usize, size: usize) -> bool {
+    count.saturating_mul(size) > MAX_DECODED_BATCH_BYTES
+}
+
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Octets(pub Option<Bytes>);
 
@@ -307,6 +368,12 @@ where
             .and_then(|length| usize::try_from(length.0).map_err(|_| Error::Overflow))
             .inspect(|length| debug!(length))?;
 
+        if exceeds_decoded_batch_limit(length, size_of::<T>()) {
+            return Err(Error::MessageMaxSizeExceeded(
+                length.saturating_mul(size_of::<T>()),
+            ));
+        }
+
         let mut items = Vec::with_capacity(length.min(MAX_PREALLOCATED_ELEMENTS));
         for _ in 0..length {
             items.push(T::decode(encoded)?);
@@ -372,6 +439,11 @@ where
                             ))
                         })?;
 
+                        // No claimed-length pre-check here: `A::Error` can
+                        // only be built through `de::Error::custom`, which
+                        // would stringify the typed error. The `Decoder`'s
+                        // `DecodeBudget` charges each element as it is
+                        // produced and returns the typed error directly.
                         (0..length).try_fold(
                             Vec::with_capacity(capacity.min(MAX_PREALLOCATED_ELEMENTS)),
                             |mut acc, _| {
@@ -540,6 +612,30 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn decode_budget_rejects_the_charge_that_overspends_it() {
+        let mut budget = super::DecodeBudget::new(10);
+
+        assert!(budget.charge(4).is_ok());
+        assert!(budget.charge(6).is_ok());
+
+        // The error carries the decoded size reached, not the limit.
+        assert!(matches!(
+            budget.charge(1),
+            Err(crate::Error::MessageMaxSizeExceeded(11))
+        ));
+    }
+
+    #[test]
+    fn claimed_count_check_saturates_rather_than_overflowing() {
+        use super::{MAX_DECODED_BATCH_BYTES, exceeds_decoded_batch_limit};
+
+        assert!(exceeds_decoded_batch_limit(usize::MAX, 64));
+        assert!(!exceeds_decoded_batch_limit(0, usize::MAX));
+        assert!(!exceeds_decoded_batch_limit(MAX_DECODED_BATCH_BYTES, 1));
+        assert!(exceeds_decoded_batch_limit(MAX_DECODED_BATCH_BYTES + 1, 1));
+    }
     use std::{fmt::Debug, fs::File, sync::Arc, thread};
 
     use tracing::subscriber::DefaultGuard;

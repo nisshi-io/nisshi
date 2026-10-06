@@ -26,9 +26,9 @@ use nisshi_broker::{
     service::{auth, storage},
 };
 use nisshi_sans_io::{
-    ApiKey, Body, BytesInput, ConfigResource, CreateTopicsRequest, ErrorCode, Frame, Header,
-    IsolationLevel, ListOffset, SaslAuthenticateRequest, SaslAuthenticateResponse,
-    SaslHandshakeRequest, SaslHandshakeResponse, ScramMechanism,
+    ApiKey, Body, BytesInput, ConfigResource, CreateTopicsRequest, DescribeGroupsRequest,
+    ErrorCode, Frame, Header, IsolationLevel, ListOffset, SaslAuthenticateRequest,
+    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, ScramMechanism,
     create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
@@ -632,6 +632,70 @@ async fn not_authenticated() -> Result<()> {
                             )),
                     ),
                 )?,
+                extensions
+            })
+            .await,
+        Err(Error::KafkaProtocol(
+            nisshi_sans_io::Error::NotAuthenticated
+        )),
+    ));
+
+    Ok(())
+}
+
+/// `not_authenticated` proves a disallowed api_key is rejected, but not that
+/// it's rejected *before* the body is decoded -- a well-formed request would
+/// pass either way. Truncates the frame right after `correlation_id` and
+/// appends a `client_id` length of `0x7FFF` with no bytes behind it at all
+/// (`client_id` is always a classic 2-byte-length string in the header, even
+/// under a flexible API version, so this doesn't depend on `API_VERSION`): a
+/// real decode attempt must fail trying to read client_id, either with
+/// `MessageMaxSizeExceeded` or an EOF-style decode error, never
+/// `NotAuthenticated`. If the peek in `BytesFrameService::serve` didn't
+/// actually skip the body decode and reject first, this surfaces as one of
+/// those instead.
+///
+/// (An earlier version of this test corrupted every byte after api_key with
+/// `0xFF` instead, which happened to decode as a well-formed request anyway
+/// -- `0xFFFF` reads as a nullable string/array length of `-1`, i.e. "null"
+/// -- so it passed even with the peek disabled and proved nothing. Verified
+/// by disabling the peek and confirming this version goes red.)
+#[tokio::test]
+async fn not_authenticated_rejected_before_body_is_decoded() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let engine = Engine::default();
+
+    let broker = nisshi_auth::configuration(engine.clone())
+        .map_err(Into::into)
+        .map(Some)
+        .and_then(|sasl_config| broker(engine, sasl_config))?;
+
+    const CLIENT_ID: &str = "client";
+    const API_VERSION: i16 = 0;
+
+    let extensions = Extensions::default();
+
+    let bytes = Frame::request(
+        Header::Request {
+            api_key: DescribeGroupsRequest::KEY,
+            api_version: API_VERSION,
+            correlation_id: 1,
+            client_id: Some(CLIENT_ID.into()),
+        },
+        Body::DescribeGroupsRequest(DescribeGroupsRequest::default()),
+    )?
+    .to_vec();
+
+    // size(4) + api_key(2) + api_version(2) + correlation_id(4) = 12 bytes,
+    // then a claimed client_id length of 32767 with nothing behind it.
+    let mut bytes = bytes[..12].to_vec();
+    bytes.extend_from_slice(&0x7FFFi16.to_be_bytes());
+
+    assert!(matches!(
+        broker
+            .serve(BytesInput {
+                bytes: bytes.into(),
                 extensions
             })
             .await,
