@@ -495,6 +495,10 @@ impl TryFrom<Batch> for Vec<Record> {
                 records.push(record);
             }
 
+            if !batch.record_data.is_empty() {
+                return Err(Error::Overflow);
+            }
+
             Ok(records)
         } else {
             batch.compression().and_then(|compression| {
@@ -1581,20 +1585,19 @@ mod tests {
     }
 
     /// A header count that outruns this record's own declared length is
-    /// rejected at the true per-record boundary, instead of reading into
-    /// whatever bytes happen to follow it in the batch -- here, two bytes
-    /// that belong to no record at all. `record_count: 1` so only this
-    /// one record's own `Record::decode` call is exercised (the
-    /// uncompressed by-value path).
+    /// rejected at the record's boundary, instead of reading into the bytes
+    /// that follow it in the batch (here, two bytes that belong to no
+    /// record). `record_count: 1` exercises one `Record::decode` call on the
+    /// uncompressed by-value path.
     #[test]
     fn header_count_reads_past_record_boundary_is_rejected() -> Result<()> {
         let _guard = init_tracing()?;
 
         // record: length=6, body=[attributes=0, timestamp_delta=0,
         // offset_delta=0, null key, null value, header_count=1], followed
-        // by two bytes that belong to no record -- a phantom null/null
-        // header that decode must not consume as this record's one
-        // declared header.
+        // by two bytes that belong to no record: a phantom null/null header
+        // that decode must not consume as this record's one declared
+        // header.
         let record_data = Bytes::from_static(&[12, 0, 0, 0, 1, 1, 2, 1, 1]);
 
         let batch = Batch {
@@ -1612,9 +1615,9 @@ mod tests {
     }
 
     /// `record_count` claims more records than the 10 bytes of
-    /// `record_data` present could possibly hold -- every real record is
-    /// at least `MIN_ENCODED_RECORD_SIZE` bytes -- and must be rejected
-    /// before any decode is attempted.
+    /// `record_data` could hold, since every record is at least
+    /// `MIN_ENCODED_RECORD_SIZE` bytes, so the batch is rejected before any
+    /// record is decoded.
     #[test]
     fn record_count_inconsistent_with_remaining_data_returns_overflow() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1629,6 +1632,54 @@ mod tests {
         let err = Vec::<Record>::try_from(batch).expect_err(
             "a record_count inconsistent with the remaining record_data must be rejected",
         );
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// A `record_count` the bytes cannot hold is reported as corrupt rather
+    /// than as too large, even when it is also past the decoded-size limit.
+    #[test]
+    fn record_count_inconsistent_with_data_wins_over_decoded_size_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: u32::MAX,
+            record_data: Bytes::from_static(&[0u8; 10]),
+            ..Default::default()
+        };
+
+        assert!(batch.exceeds_decoded_record_count_limit());
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a record_count the record_data cannot hold must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// Bytes left in `record_data` after `record_count` records mean the
+    /// batch's declared size and its records disagree, so the batch is
+    /// rejected, as Kafka's `DefaultRecordBatch` does ("Incorrect declared
+    /// batch size, records still remaining").
+    #[test]
+    fn bytes_after_last_record_are_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut record_data = BytesMut::new();
+        record_data.put(Record::builder().build()?.encode()?);
+        record_data.put(Record::builder().build()?.encode()?);
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 1,
+            record_data: record_data.freeze(),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("bytes after the last declared record must be rejected");
         assert!(matches!(err, Error::Overflow), "{err:?}");
 
         Ok(())
