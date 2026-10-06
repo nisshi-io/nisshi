@@ -34,7 +34,7 @@ use crate::{Error, Result, Storage};
 ///     .cluster_id("nisshi")
 ///     .node_id(111)
 ///     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-///     .storage(Url::parse("memory://nisshi/")?)?
+///     .storage(Url::parse("memory://nisshi/")?)
 ///     .build()
 ///     .await?;
 ///

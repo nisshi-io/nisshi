@@ -78,6 +78,14 @@ pub enum Error {
     ExpectedJoinGroupRequestProtocol(&'static str),
 
     Hyper(Arc<hyper::http::Error>),
+
+    /// A sweep interval option in the storage URL has a value that the broker
+    /// rejects.
+    InvalidStorageOptionValue {
+        option: String,
+        value: String,
+    },
+
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Json(Arc<serde_json::Error>),

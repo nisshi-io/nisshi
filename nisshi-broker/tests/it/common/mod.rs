@@ -120,7 +120,7 @@ pub(crate) async fn storage_container(
                 .node_id(node)
                 .advertised_listener(advertised_listener)
                 .schema_registry(schemas)
-                .storage(Url::parse("postgres://postgres:postgres@localhost")?)?
+                .storage(Url::parse("postgres://postgres:postgres@localhost")?)
                 .build()
                 .await
         }
@@ -131,7 +131,7 @@ pub(crate) async fn storage_container(
                 .node_id(node)
                 .advertised_listener(advertised_listener)
                 .schema_registry(schemas)
-                .storage(Url::parse("memory://")?)?
+                .storage(Url::parse("memory://")?)
                 .build()
                 .await
         }
@@ -166,7 +166,7 @@ pub(crate) async fn storage_container(
                         })
                         .inspect(|url| debug!(url))
                         .and_then(|url| Url::parse(&url).map_err(Into::into))?,
-                )?
+                )
                 .build()
                 .await
         }
@@ -205,7 +205,7 @@ pub(crate) async fn storage_container(
                         .map(|name| format!("turso://../logs/{}/{name}.db", env!("CARGO_PKG_NAME")))
                         .inspect(|url| debug!(url))
                         .and_then(|url| Url::parse(&url).map_err(Into::into))?,
-                )?
+                )
                 .build()
                 .await
         }
@@ -217,7 +217,7 @@ pub(crate) async fn storage_container(
                 .node_id(node)
                 .advertised_listener(advertised_listener)
                 .schema_registry(schemas)
-                .storage(Url::parse("slatedb://memory")?)?
+                .storage(Url::parse("slatedb://memory")?)
                 .build()
                 .await
         }

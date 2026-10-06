@@ -481,7 +481,7 @@ impl Arg {
             .advertised_listener(advertised_listener.clone())
             .otlp_endpoint_url(otlp_endpoint_url)
             .schema_registry(schema_registry.clone())
-            .storage(storage_engine.clone())?
+            .storage(storage_engine.clone())
             .listener(listener.clone())
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
@@ -1197,6 +1197,21 @@ mod tests {
             "file://./lake",
         ])
         .expect("--schema-registry given before the subcommand must still parse");
+
+        assert!(arg.schema_registry.is_some());
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn schema_registry_after_subcommand_parses() {
+        let arg = parse(&[
+            "parquet",
+            "--location",
+            "file://./lake",
+            "--schema-registry",
+            "file://./etc/schema",
+        ])
+        .expect("--schema-registry given after the subcommand must parse");
 
         assert!(arg.schema_registry.is_some());
     }

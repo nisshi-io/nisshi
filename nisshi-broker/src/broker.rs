@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod group;
+mod maintenance;
 
 use crate::{
     CancelKind, Error, Result,
@@ -455,10 +456,17 @@ where
                                     // not an anomaly worth an `error!` on every occurrence.
                                     || io.kind() == ErrorKind::TimedOut => {}
 
-                            // Already reported, with the request's api_key and api_name,
-                            // by the `warn!` in `BytesFrameService::serve` where the
-                            // rejection happens: this catch-all must not report it again.
-                            Err(Error::KafkaProtocol(nisshi_sans_io::Error::NotAuthenticated)) => {}
+                            // The broker closes the connection of a client that sends a
+                            // request other than ApiVersions or SASL before it
+                            // authenticates. This line names the peer at ERROR, the level
+                            // of the default filter, because that filter disables the
+                            // INFO `peer` span that carries the address.
+                            Err(Error::KafkaProtocol(nisshi_sans_io::Error::NotAuthenticated)) => {
+                                error!(
+                                    %addr,
+                                    "closed connection: client sent a request before it authenticated"
+                                );
+                            }
 
                             Err(error) => {
                                 error!(?error);
@@ -561,8 +569,6 @@ pub struct Builder<N, C, I, A, S, L> {
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
     silent: bool,
-    maintenance_interval: Option<Duration>,
-    transaction_maintenance_interval: Option<Duration>,
 
     cancellation: CancellationToken,
 }
@@ -591,8 +597,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
             cancellation: self.cancellation,
         }
     }
@@ -611,8 +615,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
@@ -632,8 +634,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
@@ -656,48 +656,15 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
     }
 
-    pub fn storage(self, mut storage: Url) -> Result<Builder<N, C, I, A, Url, L>> {
-        let maintenance_interval =
-            nisshi_storage::parse_duration_option(&storage, nisshi_storage::MAINTENANCE_INTERVAL)?;
+    pub fn storage(self, storage: Url) -> Builder<N, C, I, A, Url, L> {
+        debug!(storage = %redact_url(&storage));
 
-        let transaction_maintenance_interval = nisshi_storage::parse_duration_option(
-            &storage,
-            nisshi_storage::TRANSACTION_MAINTENANCE_INTERVAL,
-        )?;
-
-        let pairs = storage
-            .query_pairs()
-            .filter_map(|(k, v)| {
-                if k == nisshi_storage::MAINTENANCE_INTERVAL
-                    || k == nisshi_storage::TRANSACTION_MAINTENANCE_INTERVAL
-                {
-                    None
-                } else {
-                    Some((k.to_string(), v.to_string()))
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if pairs.is_empty() {
-            storage.set_query(None);
-        } else {
-            _ = storage.query_pairs_mut().clear().extend_pairs(pairs);
-        }
-
-        debug!(
-            ?maintenance_interval,
-            ?transaction_maintenance_interval,
-            storage = %redact_url(&storage)
-        );
-
-        Ok(Builder {
+        Builder {
             node_id: self.node_id,
             cluster_id: self.cluster_id,
             incarnation_id: self.incarnation_id,
@@ -710,11 +677,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval,
-            transaction_maintenance_interval,
 
             cancellation: self.cancellation,
-        })
+        }
     }
 
     pub fn listener(self, listener: Url) -> Builder<N, C, I, A, S, Url> {
@@ -733,8 +698,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
@@ -789,6 +752,9 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .map(otel::metric_exporter)
             .transpose()?;
 
+        let (storage, intervals) = maintenance::take_intervals(self.storage.clone())?;
+        debug!(?intervals);
+
         let builder = {
             let mut builder = StorageContainer::builder();
 
@@ -828,7 +794,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .advertised_listener(self.advertised_listener.clone())
             .schema_registry(self.schema_registry.clone())
             .lake_house(self.lake_house.clone())
-            .storage(self.storage.clone())?
+            .storage(storage)
             .cancellation(self.cancellation.clone())
             .silent(self.silent)
             .build()
@@ -855,8 +821,8 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maintenance_interval: intervals.maintenance,
+            transaction_maintenance_interval: intervals.transaction_maintenance,
             cancellation: self.cancellation,
             meter_provider,
         })

@@ -55,6 +55,7 @@ pub mod storage_describe_configs;
 pub mod storage_fetch;
 pub mod storage_list_offsets;
 pub mod storage_metadata;
+pub mod storage_options;
 pub mod tls;
 pub mod topic;
 pub mod topic_lifecycle;

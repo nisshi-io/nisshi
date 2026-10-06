@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Transport-level tests for SOL-155256: on a broker with `--authentication`,
+//! Transport-level tests: on a broker with `--authentication`,
 //! a client that sends a request before completing SASL must have its
 //! connection closed promptly, the same way `nisshi-broker/tests/it/auth.rs`
 //! proves the error type without ever opening a socket. These tests open a
@@ -76,7 +76,7 @@ async fn spawn_authenticating_broker() -> Result<RunningBroker> {
         .cluster_id(format!("unauthenticated-{}", Uuid::now_v7()))
         .incarnation_id(Uuid::now_v7())
         .advertised_listener(listener.clone())
-        .storage(Url::parse("memory://")?)?
+        .storage(Url::parse("memory://")?)
         .listener(listener)
         .authentication(true)
         .silent(true)
@@ -206,8 +206,7 @@ async fn api_versions_exempt_before_authentication() -> Result<()> {
 
 /// A request other than `ApiVersions`/`SaslHandshake`/`SaslAuthenticate`,
 /// sent before any SASL exchange, must close the connection promptly rather
-/// than hang: this is the hang SOL-155256 reports (a 40s test harness bound
-/// was shorter than the client's own 60s retry window, not a broker fault).
+/// than hang.
 #[tokio::test]
 async fn request_before_authentication_closes_connection() -> Result<()> {
     let _guard = init_tracing()?;

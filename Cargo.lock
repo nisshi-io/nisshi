@@ -5750,6 +5750,8 @@ dependencies = [
  "futures",
  "glob",
  "http-body-util",
+ "human-units",
+ "humantime",
  "hyper",
  "hyper-util",
  "indicatif",

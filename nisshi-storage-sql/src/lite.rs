@@ -5642,7 +5642,7 @@ mod tests {
                     .map(|path| format!("sqlite://{path}"))
                     .inspect(|url| debug!(url))
                     .and_then(|url| Url::parse(&url).map_err(Into::into))?,
-            )?
+            )
             .build()
             .await
     }

@@ -29,7 +29,7 @@ use opentelemetry::KeyValue;
 use rama::{Layer, Service, extensions::Extensions, matcher::Matcher, service::BoxService};
 use rsasl::config::SASLConfig;
 use tokio::task::spawn_blocking;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, instrument};
 
 use crate::{API_ERRORS, API_REQUESTS, ProgressBarExtension};
 
@@ -323,7 +323,7 @@ where
                 .map(|api_key| i16::from_be_bytes([api_key[0], api_key[1]]))
                 && !self.is_authenticated(peeked_api_key)
             {
-                warn!(api_key = peeked_api_key, "request before authentication");
+                debug!(api_key = peeked_api_key, "request before authentication");
                 return Err(Into::into(nisshi_sans_io::Error::NotAuthenticated));
             }
 
@@ -335,10 +335,10 @@ where
         let api_key = req.api_key()?;
 
         if !self.is_authenticated(api_key) {
-            warn!(
+            debug!(
                 api_key,
                 api_name = %req.api_name(),
-                "closing connection: request before authentication"
+                "request before authentication"
             );
 
             return Err(Into::into(nisshi_sans_io::Error::NotAuthenticated));

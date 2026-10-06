@@ -3287,7 +3287,7 @@ mod tests {
             .node_id(node)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
             .schema_registry(None)
-            .storage(Url::parse("memory://")?)?
+            .storage(Url::parse("memory://")?)
             .build()
             .await
             .map_err(Into::into)
