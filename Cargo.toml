@@ -84,7 +84,7 @@ chrono = "0.4"
 clap = { version = "4.5.57", features = ["derive", "env"] }
 condtype = "1.3.0"
 console = "0.16.2"
-convert_case = "0.11.0"
+convert_case = "0.12.0"
 crc-fast = "1.8.0"
 criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
 datafusion = "53"
