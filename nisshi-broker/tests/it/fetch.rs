@@ -1305,7 +1305,8 @@ fn assert_offset_out_of_range(
 /// `OFFSET_OUT_OF_RANGE` straight away (not after `max_wait`), without
 /// disturbing another partition in the same request, and the service keeps
 /// answering valid fetches afterwards. A fetch offset above the high
-/// watermark is answered with `NONE` and no records, as in Kafka.
+/// watermark is answered with `NONE` and no records on every engine, where
+/// Kafka answers `NONE` only up to the log end offset.
 pub async fn offset_out_of_range<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
 where
     C: Into<String>,

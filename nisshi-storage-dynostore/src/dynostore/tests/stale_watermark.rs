@@ -102,6 +102,9 @@ async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
         ErrorCode::None,
         ErrorCode::try_from(partitions[0].error_code)?
     );
+    // B answered from its cached (stale) high watermark; had the cache
+    // entry expired, the fetch would have taken the fresh path instead
+    assert_eq!(stale, partitions[0].high_watermark);
     assert!(partitions[0].records.is_none());
 
     Ok(())
