@@ -57,18 +57,11 @@ jobs:
       # below: pinning stops tag mutation, this catches a pin that's already
       # bad. contents:read is sufficient; no extra permission needed.
       #
-      # The medium/medium filter below hides two finding classes entirely:
-      # `artipacked` (low confidence) and `cache-poisoning` (high severity,
-      # 0 medium). Every checkout in this repo now sets
-      # `persist-credentials: false`, so artipacked is fixed at the source
-      # and filtered out regardless of the threshold. cache-poisoning is
-      # still open (6 cache steps across test/fmt/clippy/compat-franz-go/
-      # cargo-publish-dry-run/third-party-license - tracked as SOL-155352)
-      # and stays filtered on purpose: confidence/severity
-      # thresholds are global zizmor CLI flags with no per-rule equivalent
-      # (confirmed against zizmor v1.30.1's own docs), so there is no way to
-      # loosen the filter to surface artipacked alone without also surfacing
-      # cache-poisoning, which is out of scope for this change.
+      # The medium/medium thresholds below also hide the open
+      # `cache-poisoning` findings. zizmor applies the thresholds globally,
+      # so this step cannot show one audit without the other. The thresholds
+      # hide `artipacked` findings too, so each checkout must set
+      # `persist-credentials: false` itself.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor --min-confidence medium --min-severity medium .github/workflows/

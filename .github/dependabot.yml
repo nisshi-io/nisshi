@@ -1,9 +1,7 @@
 version: 2
 updates:
-  # Dependabot applies a 3-day default cooldown even with no `cooldown` key
-  # at all, so `default-days: 7` below moves the effective window from 3
-  # days to 7, not from zero to 7 - it buys more time for an upstream CVE
-  # or yanked release to surface before this repo auto-opens the bump PR.
+  # The 7-day cooldown gives an upstream CVE or a yanked release time to
+  # surface before Dependabot opens a bump PR.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

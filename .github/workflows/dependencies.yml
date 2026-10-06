@@ -35,7 +35,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
+      # cargo-deny is not pinned, because it parses the RustSec advisory
+      # database, which is not pinned either. An older cargo-deny can fail to
+      # parse a newer database format and turn this check red on an unrelated
+      # pull request.
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-deny@0.20.2
+          tool: cargo-deny
       - run: cargo-deny --all-features --locked check --warn unmaintained
