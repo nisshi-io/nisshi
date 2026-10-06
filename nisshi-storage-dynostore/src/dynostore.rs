@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{Debug, Display},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::SystemTime,
 };
 
@@ -1075,17 +1075,20 @@ impl Storage for DynoStore {
             // The record is now durably written; only now is it safe to
             // durably advance the idempotent sequence number. This
             // re-checks (not just re-applies) because the pre-check above
-            // and this commit are not atomic with each other - a
+            // and this commit are not atomic with each other, so a
             // concurrent request for the same producer/epoch/partition
-            // could have advanced the sequence in between, in which case
-            // this reports the same rejection it would have anyway, after
-            // a record has already been written for what turned out to be
-            // a fenced/racing request. That's a narrow, pre-existing risk
-            // for two genuinely concurrent requests on the same producer
-            // epoch (already out of contract for a well-behaved idempotent
-            // producer, which serializes its own sends per partition);
-            // it's a substantial improvement over unconditionally losing
-            // data on any transient failure of the write above.
+            // could have advanced the sequence in between.
+            //
+            // Known residual: if this advance fails (a transient
+            // object-store error, or a shutdown aborting the request
+            // between the put above and here) the record is durable but
+            // the sequence is not advanced. The client's retry then passes
+            // the pre-check and the batch is written a second time at a new
+            // offset. This trades the silent loss the previous ordering
+            // allowed for a duplicate, and is not limited to concurrent
+            // requests. Closing it needs a dedupe against the partition's
+            // tail batch (as Kafka does by rebuilding producer state from
+            // the log), tracked as a follow-up.
             if is_idempotent {
                 self.meta
                     .with_mut(&self.object_store, |meta| {
@@ -1136,15 +1139,28 @@ impl Storage for DynoStore {
                     .await
                     .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
                     .inspect_err(|err| {
+                        // The record is already in the log, so unlike the
+                        // pre-check a sequence rejection here is not
+                        // harmless: the client is told the batch failed
+                        // while it is stored.
                         if matches!(
                             err,
                             Error::Api(ErrorCode::OutOfOrderSequenceNumber)
                                 | Error::Api(ErrorCode::DuplicateSequenceNumber)
                         ) {
-                            return;
+                            POST_WRITE_SEQUENCE_REJECTED
+                                .add(1, &[KeyValue::new("cluster", self.cluster.clone())]);
                         }
 
-                        error!(?err, transaction_id, ?topition);
+                        error!(
+                            ?err,
+                            transaction_id,
+                            ?topition,
+                            offset,
+                            %location,
+                            producer_id,
+                            base_sequence,
+                        );
                     })?;
             }
 
@@ -2599,6 +2615,18 @@ impl Storage for DynoStore {
 
                 let txn_detail = current_epoch.get_mut();
 
+                // A retry must repeat the decision that was prepared:
+                // markers of the opposite kind after the first would
+                // commit some partitions and abort others.
+                match (&txn_detail.state, committed) {
+                    (Some(TxnState::PrepareCommit), false)
+                    | (Some(TxnState::PrepareAbort), true) => {
+                        debug!(state = ?txn_detail.state, committed);
+                        return Err(Error::Api(ErrorCode::InvalidTxnState));
+                    }
+                    _ => {}
+                }
+
                 if txn_detail.state == Some(TxnState::Begin) {
                     assert_eq!(
                         Some(TxnState::Begin),
@@ -2918,6 +2946,15 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
         }
     }
 }
+
+static POST_WRITE_SEQUENCE_REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_produce_post_write_sequence_rejected")
+        .with_description(
+            "Idempotent produce batches stored but rejected on the post-write sequence advance",
+        )
+        .build()
+});
 
 #[derive(Debug, Clone)]
 struct Metron<O> {

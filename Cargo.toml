@@ -75,7 +75,6 @@ private_intra_doc_links = "deny"
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
 arrow = { version = "58" }
-assert_matches = "1.5.0"
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}
 bytes = { version = "1", features = ["serde"] }

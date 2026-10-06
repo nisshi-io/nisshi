@@ -67,7 +67,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-assert_matches.workspace = true
 object_store.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true

@@ -16,7 +16,6 @@ use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
 };
-use assert_matches::assert_matches;
 use nisshi_broker::Error;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
@@ -27,6 +26,7 @@ use nisshi_sans_io::{
 use nisshi_storage::{ArcDynStorage, CreateTopicsService, DeleteTopicsService, Storage};
 use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
+use std::assert_matches;
 use uuid::Uuid;
 
 async fn delete_unknown_by_name(storage: impl Storage + Clone) -> Result<(), Error> {
@@ -104,33 +104,36 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
 
     let extensions = Extensions::default();
 
-    assert_matches!(
-        create_topics
-            .serve(
-                RequestInput{
-                request: CreateTopicsRequest::default()
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.clone())
-                            .num_partitions(num_partitions)
-                            .replication_factor(replication_factor)
-                            .assignments(assignments.clone())
-                            .configs(configs.clone()),]
-                        .into()
-                    ))
-                    .validate_only(Some(false)), extensions: extensions.clone()},
-            )
-            .await?,
-        CreateTopicsResponse { topics: Some(topics), ..} => {
-            assert_eq!(topics.len(), 1);
-            assert_eq!(name, topics[0].name.as_str());
-            assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
-            assert_eq!(topics[0].topic_config_error_code, Some(0));
-            assert_eq!(topics[0].num_partitions, Some(num_partitions));
-            assert_eq!(topics[0].replication_factor, Some(replication_factor));
-            assert_eq!(topics[0].error_code, i16::from(error_code));
-        }
-    );
+    let response = create_topics
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(name.clone())
+                        .num_partitions(num_partitions)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone())]
+                    .into(),
+                ))
+                .validate_only(Some(false)),
+            extensions: extensions.clone(),
+        })
+        .await?;
+    let CreateTopicsResponse {
+        topics: Some(topics),
+        ..
+    } = response
+    else {
+        panic!("unexpected response: {response:?}");
+    };
+    assert_eq!(topics.len(), 1);
+    assert_eq!(name, topics[0].name.as_str());
+    assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
+    assert_eq!(topics[0].topic_config_error_code, Some(0));
+    assert_eq!(topics[0].num_partitions, Some(num_partitions));
+    assert_eq!(topics[0].replication_factor, Some(replication_factor));
+    assert_eq!(topics[0].error_code, i16::from(error_code));
 
     let delete_topics = DeleteTopicsService {
         storage: storage.clone(),
@@ -160,34 +163,36 @@ async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(
             .await?
     );
 
-    assert_matches!(
-        create_topics
-            .serve(
-                RequestInput {
-                request: CreateTopicsRequest::default()
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.clone())
-                            .num_partitions(num_partitions)
-                            .replication_factor(replication_factor)
-                            .assignments(assignments.clone())
-                            .configs(configs.clone()),]
-                        .into()
-                    ))
-                    .validate_only(Some(false)),
-                extensions: extensions.clone()
-                }
-            ).await?,
-        CreateTopicsResponse { topics: Some(topics), ..} => {
-            assert_eq!(topics.len(), 1);
-            assert_eq!(name, topics[0].name.as_str());
-            assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
-            assert_eq!(topics[0].topic_config_error_code, Some(0));
-            assert_eq!(topics[0].num_partitions, Some(num_partitions));
-            assert_eq!(topics[0].replication_factor, Some(replication_factor));
-            assert_eq!(topics[0].error_code, i16::from(error_code));
-        }
-    );
+    let response = create_topics
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(name.clone())
+                        .num_partitions(num_partitions)
+                        .replication_factor(replication_factor)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone())]
+                    .into(),
+                ))
+                .validate_only(Some(false)),
+            extensions: extensions.clone(),
+        })
+        .await?;
+    let CreateTopicsResponse {
+        topics: Some(topics),
+        ..
+    } = response
+    else {
+        panic!("unexpected response: {response:?}");
+    };
+    assert_eq!(topics.len(), 1);
+    assert_eq!(name, topics[0].name.as_str());
+    assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
+    assert_eq!(topics[0].topic_config_error_code, Some(0));
+    assert_eq!(topics[0].num_partitions, Some(num_partitions));
+    assert_eq!(topics[0].replication_factor, Some(replication_factor));
+    assert_eq!(topics[0].error_code, i16::from(error_code));
 
     Ok(())
 }
