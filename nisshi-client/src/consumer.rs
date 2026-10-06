@@ -109,12 +109,6 @@ where
                 })
                 .map(|next_action| {
                     let api_key = next_action.api_key();
-                    // This consumer-group frame path has no `ApiVersions` round trip of its own
-                    // to negotiate a version against, because it builds a request directly
-                    // rather than serving one from a real client, so it stamps the highest
-                    // version it can safely send instead: the protocol's own maximum for most
-                    // APIs, or a capped API's own narrower `SupportedApiVersions::SUPPORTED`
-                    // maximum where one applies.
                     let api_version = routable_max_version(api_key).unwrap_or_default();
 
                     FrameInput {

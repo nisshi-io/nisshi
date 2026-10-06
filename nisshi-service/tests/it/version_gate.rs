@@ -12,27 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! These tests route a real `FrameInput` through `capped_service` for each of the 3 capped
-//! APIs at an out-of-range version and assert the response genuinely echoes the request's real
-//! topics/partitions with `UnsupportedVersion`, plus the separate acks=0 case that drops the
-//! connection instead of building a response at all. An `unsupported_version` impl that
-//! returns an empty default response instead of echoing the real request's partitions would
-//! still satisfy a check that only looks at the error code, so these tests check the response
-//! content itself.
+//! Tests for the version gate on each route registered through `with_capped_route`, and for
+//! the `ApiVersions` reply to a request outside the protocol range.
 
 use bytes::Bytes;
 use nisshi_sans_io::{
     AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey as _, ApiVersionsRequest,
-    ApiVersionsResponse, BytesInput, ErrorCode, Frame, FrameInput, Header, IsolationLevel,
-    ListOffset, ListOffsetsRequest, ListOffsetsResponse, ProduceRequest, ProduceResponse,
-    RequestInput,
-    add_partitions_to_txn_request::{AddPartitionsToTxnTopic, AddPartitionsToTxnTransaction},
-    list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-    produce_request::{PartitionProduceData, TopicProduceData},
+    ApiVersionsResponse, Body, BytesInput, ErrorCode, Frame, FrameInput, Header,
+    ListOffsetsRequest, ListOffsetsResponse, ProduceRequest, ProduceResponse, RequestInput,
 };
 use nisshi_service::{
-    BytesFrameLayer, BytesTcpService, FrameRouteService, ResponseService, TcpListenerInput,
-    TcpListenerLayer, TcpStreamLayer, capped_service,
+    BytesFrameLayer, BytesTcpService, CAPPED_API_VERSIONS, FrameRouteService, ResponseService,
+    TcpListenerInput, TcpListenerLayer, TcpStreamLayer,
 };
 use rama::{
     Layer as _, Service,
@@ -45,269 +36,116 @@ use tracing::debug;
 
 use crate::common::Error;
 
-/// A `FrameRouteService` with all 3 real capped routes registered, each backed by a stub inner
-/// service. The stub is never actually invoked by the tests below -- the version gate rejects
-/// every request here before it would ever reach the inner service -- so its response content
-/// does not matter, only that the types line up.
-async fn capped_frame_route() -> Result<FrameRouteService<Error>, Error> {
-    let builder = FrameRouteService::<Error>::builder()
-        .with_capped_route::<ListOffsetsRequest>(capped_service::<ListOffsetsRequest, _, Error>(
-            ResponseService::new(|_: RequestInput<ListOffsetsRequest>| {
+/// A `FrameRouteService` with a stub handler for each capped API.
+fn capped_frame_route() -> Result<FrameRouteService<Error>, Error> {
+    FrameRouteService::<Error>::builder()
+        .with_capped_route::<ListOffsetsRequest, _>(ResponseService::new(
+            |_: RequestInput<ListOffsetsRequest>| {
                 Ok::<_, nisshi_service::Error>(ListOffsetsResponse::default())
-            }),
-        ))
-        .map_err(Error::from)?;
-
-    let builder = builder
-        .with_capped_route::<ProduceRequest>(capped_service::<ProduceRequest, _, Error>(
-            ResponseService::new(|_: RequestInput<ProduceRequest>| {
+            },
+        ))?
+        .with_capped_route::<ProduceRequest, _>(ResponseService::new(
+            |_: RequestInput<ProduceRequest>| {
                 Ok::<_, nisshi_service::Error>(ProduceResponse::default())
-            }),
-        ))
-        .map_err(Error::from)?;
-
-    let builder = builder
-        .with_capped_route::<AddPartitionsToTxnRequest>(capped_service::<
-            AddPartitionsToTxnRequest,
-            _,
-            Error,
-        >(ResponseService::new(
+            },
+        ))?
+        .with_capped_route::<AddPartitionsToTxnRequest, _>(ResponseService::new(
             |_: RequestInput<AddPartitionsToTxnRequest>| {
                 Ok::<_, nisshi_service::Error>(AddPartitionsToTxnResponse::default())
             },
-        )))
-        .map_err(Error::from)?;
-
-    builder.build().map_err(Error::from)
+        ))?
+        .build()
+        .map_err(Error::from)
 }
 
-#[tokio::test]
-async fn list_offsets_out_of_range_version_echoes_the_real_request() -> Result<(), Error> {
-    let frame_route = capped_frame_route().await?;
+fn default_body(api_key: i16) -> Body {
+    match api_key {
+        ProduceRequest::KEY => ProduceRequest::default().into(),
+        ListOffsetsRequest::KEY => ListOffsetsRequest::default().into(),
+        AddPartitionsToTxnRequest::KEY => AddPartitionsToTxnRequest::default().into(),
+        otherwise => panic!("no capped API with key {otherwise}"),
+    }
+}
 
-    let topic = "my-topic";
-
-    let request = ListOffsetsRequest::default()
-        .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-        .replica_id(-1)
-        .topics(Some(vec![
-            ListOffsetsTopic::default()
-                .name(topic.into())
-                .partitions(Some(vec![
-                    ListOffsetsPartition::default()
-                        .partition_index(3)
-                        .max_num_offsets(Some(1))
-                        .timestamp(ListOffset::Latest.try_into()?)
-                        .current_leader_epoch(Some(-1)),
-                ])),
-        ]));
-
-    // ListOffsets' own SUPPORTED range is 0-6; 9 is within the protocol's own 0-9 range, so
-    // this reaches the route (and its version gate) rather than the generic backstop.
-    let response = frame_route
+async fn serve(
+    frame_route: &FrameRouteService<Error>,
+    api_key: i16,
+    api_version: i16,
+) -> Result<Frame, Error> {
+    frame_route
         .serve(FrameInput {
             frame: Frame {
                 size: 0,
                 header: Header::Request {
-                    api_key: ListOffsetsRequest::KEY,
-                    api_version: 9,
+                    api_key,
+                    api_version,
                     correlation_id: 0,
                     client_id: None,
                 },
-                body: request.into(),
-            },
-            extensions: Extensions::default(),
-        })
-        .await?;
-
-    let response = ListOffsetsResponse::try_from(response.body)?;
-
-    let topics = response.topics.unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic, topics[0].name);
-
-    let partitions = topics[0].partitions.clone().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(3, partitions[0].partition_index);
-    assert_eq!(
-        ErrorCode::UnsupportedVersion,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn produce_out_of_range_version_with_acks_echoes_the_real_request() -> Result<(), Error> {
-    let frame_route = capped_frame_route().await?;
-
-    let topic = "my-topic";
-
-    let request = ProduceRequest::default()
-        .transactional_id(None)
-        .acks(1)
-        .timeout_ms(0)
-        .topic_data(Some(vec![
-            TopicProduceData::default()
-                .name(topic.into())
-                .partition_data(Some(vec![
-                    PartitionProduceData::default().index(7).records(None),
-                ])),
-        ]));
-
-    // Produce's own SUPPORTED range is 3-11; 2 is within the protocol's own 0-11 range.
-    let response = frame_route
-        .serve(FrameInput {
-            frame: Frame {
-                size: 0,
-                header: Header::Request {
-                    api_key: ProduceRequest::KEY,
-                    api_version: 2,
-                    correlation_id: 0,
-                    client_id: None,
-                },
-                body: request.into(),
-            },
-            extensions: Extensions::default(),
-        })
-        .await?;
-
-    let response = ProduceResponse::try_from(response.body)?;
-
-    let responses = response.responses.unwrap_or_default();
-    assert_eq!(1, responses.len());
-    assert_eq!(topic, responses[0].name);
-
-    let partitions = responses[0].partition_responses.clone().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(7, partitions[0].index);
-    assert_eq!(
-        ErrorCode::UnsupportedVersion,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn add_partitions_to_txn_out_of_range_version_echoes_the_real_request() -> Result<(), Error> {
-    let frame_route = capped_frame_route().await?;
-
-    let transactional_id = "my-txn";
-    let topic = "my-topic";
-
-    let request = AddPartitionsToTxnRequest::default().transactions(Some(vec![
-        AddPartitionsToTxnTransaction::default()
-            .transactional_id(transactional_id.into())
-            .producer_id(54345)
-            .producer_epoch(0)
-            .verify_only(false)
-            .topics(Some(vec![
-                AddPartitionsToTxnTopic::default()
-                    .name(topic.into())
-                    .partitions(Some(vec![5])),
-            ])),
-    ]));
-
-    // AddPartitionsToTxn's own SUPPORTED range is 0-3; 4 is within the protocol's own 0-5
-    // range.
-    let response = frame_route
-        .serve(FrameInput {
-            frame: Frame {
-                size: 0,
-                header: Header::Request {
-                    api_key: AddPartitionsToTxnRequest::KEY,
-                    api_version: 4,
-                    correlation_id: 0,
-                    client_id: None,
-                },
-                body: request.into(),
-            },
-            extensions: Extensions::default(),
-        })
-        .await?;
-
-    let response = AddPartitionsToTxnResponse::try_from(response.body)?;
-
-    assert_eq!(
-        Some(i16::from(ErrorCode::UnsupportedVersion)),
-        response.error_code
-    );
-
-    let results = response.results_by_transaction.unwrap_or_default();
-    assert_eq!(1, results.len());
-    assert_eq!(transactional_id, results[0].transactional_id);
-
-    let topics = results[0].topic_results.clone().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic, topics[0].name);
-
-    let partitions = topics[0].results_by_partition.clone().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(5, partitions[0].partition_index);
-    assert_eq!(
-        ErrorCode::UnsupportedVersion,
-        ErrorCode::try_from(partitions[0].partition_error_code)?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn produce_out_of_range_version_with_acks_zero_drops_the_connection() -> Result<(), Error> {
-    let frame_route = capped_frame_route().await?;
-
-    let request = ProduceRequest::default()
-        .transactional_id(None)
-        .acks(0)
-        .timeout_ms(0)
-        .topic_data(Some(vec![
-            TopicProduceData::default()
-                .name("my-topic".into())
-                .partition_data(Some(vec![
-                    PartitionProduceData::default().index(0).records(None),
-                ])),
-        ]));
-
-    let err = frame_route
-        .serve(FrameInput {
-            frame: Frame {
-                size: 0,
-                header: Header::Request {
-                    api_key: ProduceRequest::KEY,
-                    api_version: 2,
-                    correlation_id: 0,
-                    client_id: None,
-                },
-                body: request.into(),
+                body: default_body(api_key),
             },
             extensions: Extensions::default(),
         })
         .await
-        .expect_err("acks=0 drops the connection instead of building a response");
+}
 
-    assert!(matches!(
-        err,
-        Error::Service(nisshi_service::Error::Protocol(
-            nisshi_sans_io::Error::UnsupportedVersion { api_key, api_version }
-        )) if api_key == ProduceRequest::KEY && api_version == 2
-    ));
+#[tokio::test]
+async fn version_inside_the_cap_reaches_the_handler() -> Result<(), Error> {
+    let frame_route = capped_frame_route()?;
+
+    for (api_key, supported) in CAPPED_API_VERSIONS {
+        for api_version in [*supported.start(), *supported.end()] {
+            let response = serve(&frame_route, api_key, api_version).await?;
+            assert!(
+                matches!(response.header, Header::Response { .. }),
+                "api_key: {api_key}, api_version: {api_version}"
+            );
+        }
+    }
 
     Ok(())
 }
 
-/// The unit test alongside `FrameRouteService`'s two `serve` impls in `api.rs` proves the
-/// routing exemption (an out-of-range `ApiVersions` request gets an answer, not a closed
-/// connection) but calls `serve` directly, never going through `BytesFrameService` -- so it
-/// cannot catch a mistake in that service's `encode_version` (frame.rs), which is what actually
-/// forces the reply onto the wire at v0 instead of whatever out-of-range version the client
-/// sent. This test goes over a real `TcpStream` through the full byte-level stack instead, and
-/// decodes the raw response bytes explicitly at both versions: decoding at v0 must succeed and
-/// report `UnsupportedVersion`, and decoding the exact same bytes at v9 (the flexible,
-/// tagged-field shape) must fail, proving the reply really is v0-shaped rather than happening
-/// to decode at any version asked of it.
+// Each version below is inside the protocol range, so the request passes the protocol-range
+// check in `FrameRouteService` and reaches the version gate.
 #[tokio::test]
-async fn out_of_range_api_versions_is_encoded_at_v0_over_the_wire() -> Result<(), Error> {
+async fn version_outside_the_cap_closes_the_connection() -> Result<(), Error> {
+    let frame_route = capped_frame_route()?;
+
+    for (api_key, api_version) in [
+        (ProduceRequest::KEY, 2),
+        (ListOffsetsRequest::KEY, 7),
+        (ListOffsetsRequest::KEY, 9),
+        (AddPartitionsToTxnRequest::KEY, 4),
+    ] {
+        let err = serve(&frame_route, api_key, api_version)
+            .await
+            .expect_err("a version outside the cap");
+
+        assert!(
+            matches!(
+                err,
+                Error::Service(nisshi_service::Error::Protocol(
+                    nisshi_sans_io::Error::UnsupportedVersion {
+                        api_key: rejected_key,
+                        api_version: rejected_version,
+                    }
+                )) if rejected_key == api_key && rejected_version == api_version
+            ),
+            "api_key: {api_key}, api_version: {api_version}, err: {err:?}"
+        );
+    }
+
+    Ok(())
+}
+
+// `ApiVersionsRequest` v5 adds `ClusterId` and `NodeId` as non-tagged fields
+// (https://github.com/apache/kafka/blob/e90d6f42c2957f2b970266e3c5b0ff2ebf972b59/clients/src/main/resources/common/message/ApiVersionsRequest.json#L27-L42).
+// This build's decoder knows versions 0-4, so it fails on a v5 body with `ClusterId` set. The
+// broker answers without decoding the body, at v0, with `UNSUPPORTED_VERSION` and the
+// `ApiVersions` range that the client retries with.
+#[tokio::test]
+async fn api_versions_above_the_protocol_range_is_answered_at_v0() -> Result<(), Error> {
     let _guard = crate::common::init_tracing()?;
 
     let frame_route = FrameRouteService::<nisshi_service::Error>::builder().build()?;
@@ -342,27 +180,19 @@ async fn out_of_range_api_versions_is_encoded_at_v0_over_the_wire() -> Result<()
     );
     let client = BytesTcpService::new(stream);
 
-    // Hand-built rather than via `Frame::request`: this crate's generated encoder has never
-    // been exercised at a version outside the protocol's own declared range (no real client
-    // ever sends one), and encoding a v9 `ApiVersionsRequest` through it here produced a
-    // malformed, too-short frame the server failed to decode -- an encode-side gap in
-    // already-generated code this PR does not touch, not something to paper over inside a
-    // test. A real out-of-range client only ever sends bytes that decode as some version this
-    // crate's descriptors recognise (that's what "which version" even means on the wire), so a
-    // literal byte buffer mirroring the real v9 wire shape (flexible header, compact-null
-    // `ClientSoftwareName`/`ClientSoftwareVersion`, empty tag buffers) is the faithful way to
-    // construct this request.
     #[rustfmt::skip]
     let request_bytes = Bytes::from_static(&[
-        0, 0, 0, 14,     // size
-        0, 18,           // api_key = ApiVersionsRequest::KEY
-        0, 9,            // api_version = 9 (out of range; valid is 0-4)
-        0, 0, 0, 0,      // correlation_id = 0
-        0xff, 0xff,      // client_id = null (classic nullable string, even in a flexible header)
-        0x00,            // header tag buffer: empty
-        0x00,            // client_software_name: compact-null
-        0x00,            // client_software_version: compact-null
-        0x00,            // body tag buffer: empty
+        0, 0, 0, 22,          // size
+        0, 18,                // api_key = ApiVersionsRequest::KEY
+        0, 5,                 // api_version = 5
+        0, 0, 0, 7,           // correlation_id = 7
+        0xff, 0xff,           // client_id = null
+        0x00,                 // header tag buffer: empty
+        0x00,                 // client_software_name: compact null
+        0x00,                 // client_software_version: compact null
+        0x04, b'a', b'b', b'c', // cluster_id = "abc" (compact string, length + 1)
+        0, 0, 0, 111,         // node_id = 111
+        0x00,                 // body tag buffer: empty
     ]);
 
     let outcome = client
@@ -376,19 +206,25 @@ async fn out_of_range_api_versions_is_encoded_at_v0_over_the_wire() -> Result<()
     let joined = join.join_all().await;
     debug!(?joined);
 
-    let response_bytes = outcome?;
+    let response = Frame::response_from_bytes(outcome?, ApiVersionsRequest::KEY, 0)?;
+    assert!(matches!(
+        response.header,
+        Header::Response { correlation_id: 7 }
+    ));
 
-    let at_v0 = Frame::response_from_bytes(response_bytes.clone(), ApiVersionsRequest::KEY, 0)?;
-    let response = ApiVersionsResponse::try_from(at_v0.body)?;
+    let response = ApiVersionsResponse::try_from(response.body)?;
     assert_eq!(
-        i16::from(ErrorCode::UnsupportedVersion),
-        response.error_code
+        ErrorCode::UnsupportedVersion,
+        ErrorCode::try_from(response.error_code)?
     );
 
-    assert!(
-        Frame::response_from_bytes(response_bytes, ApiVersionsRequest::KEY, 9).is_err(),
-        "the same bytes decoded as if shaped for v9 should fail to parse: they are v0-shaped"
-    );
+    let api_versions = response
+        .api_keys
+        .unwrap_or_default()
+        .into_iter()
+        .find(|api| api.api_key == ApiVersionsRequest::KEY)
+        .expect("the reply lists ApiVersions");
+    assert_eq!((0, 4), (api_versions.min_version, api_versions.max_version));
 
     Ok(())
 }

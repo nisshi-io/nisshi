@@ -21,7 +21,7 @@ use nisshi_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, capped_service};
+use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
 use nisshi_storage::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
     CreateTopicsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
@@ -424,7 +424,7 @@ where
     S: Storage,
 {
     builder
-        .with_capped_route::<ListOffsetsRequest>(capped_service(ListOffsetsService { storage }))
+        .with_capped_route::<ListOffsetsRequest, _>(ListOffsetsService { storage })
         .map_err(Into::into)
 }
 
@@ -476,7 +476,7 @@ where
     S: Storage,
 {
     builder
-        .with_capped_route::<ProduceRequest>(capped_service(ProduceService { storage }))
+        .with_capped_route::<ProduceRequest, _>(ProduceService { storage })
         .map_err(Into::into)
 }
 
@@ -508,9 +508,7 @@ where
     S: Storage,
 {
     builder
-        .with_capped_route::<AddPartitionsToTxnRequest>(capped_service(TxnAddPartitionService {
-            storage,
-        }))
+        .with_capped_route::<AddPartitionsToTxnRequest, _>(TxnAddPartitionService { storage })
         .map_err(Into::into)
 }
 
