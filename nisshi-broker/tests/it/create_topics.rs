@@ -16,7 +16,8 @@ use crate::common::{alphanumeric_string, init_tracing};
 use nisshi_broker::Error;
 use nisshi_sans_io::{
     CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID, RequestInput,
-    create_topics_request::CreatableTopic, describe_topic_partitions_request::TopicRequest,
+    create_topics_request::{CreatableReplicaAssignment, CreatableTopic},
+    describe_topic_partitions_request::TopicRequest,
 };
 use nisshi_storage::{CreateTopicsService, DescribeTopicPartitionsService, Storage};
 use rama::{Service as _, extensions::Extensions};
@@ -435,7 +436,9 @@ async fn mixed_batch_partial_success(storage: impl Storage + Clone) -> Result<()
 /// through the total-partitions check and on to per-topic validation,
 /// which then rejects both topics for their bad names; one more partition
 /// over the cap is rejected as a whole with `PolicyViolation`, including
-/// the second topic, whose name is otherwise valid.
+/// the second topic, whose name is otherwise valid. Exactly the cap passing
+/// is a deliberate difference from Kafka 3.9.1; see
+/// `in_memory::total_partitions_cap_creates_at_the_boundary`.
 async fn total_partitions_cap_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = CreateTopicsService {
         storage: storage.clone(),
@@ -520,6 +523,85 @@ async fn total_partitions_cap_rejected(storage: impl Storage + Clone) -> Result<
             "name = {:?}: one partition over the cap must reject the whole request",
             topic.name
         );
+        assert_eq!(
+            Some(
+                "Excessively large number of partitions per request: 10001 requested, limit 10000."
+            ),
+            topic.error_message.as_deref()
+        );
+    }
+
+    // Each case below uses only invalid names, so nothing reaches storage
+    // whether or not the cap fires: below the cap every topic gets
+    // `InvalidTopicException`, over it every topic gets `PolicyViolation`.
+    let topic = |num_partitions: i32, assignments: usize| {
+        CreatableTopic::default()
+            .name(invalid_name.into())
+            .num_partitions(num_partitions)
+            .replication_factor(replication_factor)
+            .assignments(Some(
+                (0..assignments)
+                    .map(|partition_index| {
+                        CreatableReplicaAssignment::default()
+                            .partition_index(i32::try_from(partition_index).unwrap())
+                            .broker_ids(Some(vec![111]))
+                    })
+                    .collect(),
+            ))
+            .configs(Some([].into()))
+    };
+
+    let cases = [
+        // A `-1` topic counts as the broker default of 3 partitions.
+        (
+            "9,997 + default",
+            vec![topic(9_997, 0), topic(-1, 0)],
+            false,
+            ErrorCode::InvalidTopicException,
+        ),
+        (
+            "9,998 + default",
+            vec![topic(9_998, 0), topic(-1, 0)],
+            false,
+            ErrorCode::PolicyViolation,
+        ),
+        // A negative count can't pull the total back under the cap.
+        (
+            "large + i32::MIN",
+            vec![topic(2_000_000_000, 0), topic(i32::MIN, 0)],
+            false,
+            ErrorCode::PolicyViolation,
+        ),
+        // The cap doesn't depend on `validate_only`.
+        (
+            "10,001 validate_only",
+            vec![topic(10_000, 0), topic(1, 0)],
+            true,
+            ErrorCode::PolicyViolation,
+        ),
+        // Manual assignments count one partition each, whatever `num_partitions` says.
+        (
+            "default + 10,001 assignments",
+            vec![topic(-1, 10_001)],
+            false,
+            ErrorCode::PolicyViolation,
+        ),
+    ];
+
+    for (case, topics, validate_only, expected) in cases {
+        let response = service
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .topics(Some(topics))
+                    .validate_only(Some(validate_only)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        for topic in response.topics.unwrap_or_default() {
+            assert_eq!(expected, ErrorCode::try_from(topic.error_code)?, "{case}");
+            assert_eq!(Some(NULL_TOPIC_ID), topic.topic_id, "{case}");
+        }
     }
 
     Ok(())
@@ -643,7 +725,12 @@ mod in_memory {
 
     /// Extra confidence beyond `total_partitions_cap_rejected`: exactly the
     /// cap, split across two topics with valid names, actually creates both
-    /// topics rather than merely reaching per-topic validation. Runs on the
+    /// topics rather than merely reaching per-topic validation.
+    ///
+    /// This pins a deliberate difference from Kafka 3.9.1, which rejects
+    /// this request: it also caps metadata records per request at 10,000,
+    /// and 10,000 partitions plus 2 `TopicRecord`s exceeds that. nisshi has
+    /// no metadata records and counts partitions only. Runs on the
     /// in-memory backend only -- materializing 10,000 real partitions is
     /// cheap here, but not worth paying four times over across every
     /// backend.

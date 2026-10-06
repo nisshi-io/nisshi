@@ -42,20 +42,16 @@ fn error_result(
         .configs(Some([].into()))
 }
 
-/// Kafka ships `MAX_PARTITIONS_PER_BATCH = 10_000` hardcoded in every
-/// release (`ReplicationControlManager`, `metadata/.../controller/`), with
-/// no public config to raise or lower it: a request whose topics add up to
-/// more than this many partitions is rejected as a whole, before any
-/// per-topic validation runs (`validateTotalNumberOfPartitions`, called
-/// before the topic-name check; see KAFKA-17870 / apache/kafka#17604).
-/// Kafka trunk has since turned the same number into an *internal*,
-/// undocumented `controller.max.records.per.batch` config (added in
-/// KAFKA-20976 / apache/kafka#23245), but that config caps a different,
-/// broader concept ("metadata records per batch") that nisshi has no
-/// equivalent of, and every shipped release (4.0 through 4.4 at the time
-/// of writing) still hardcodes the 10,000 partition figure with zero
-/// public knob. nisshi mirrors the shipped default as a constant; a CLI
-/// flag can be added later if a deployment ever needs to tune it.
+/// Kafka 3.9.1 rejects a whole `CreateTopics` request whose topics add up
+/// to more than `MAX_PARTITIONS_PER_BATCH` (10,000) partitions, before any
+/// per-topic validation runs, including the name check
+/// ([ReplicationControlManager.java#L1152-L1169](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L1152-L1169)).
+///
+/// nisshi counts partitions only. Kafka 3.9.1 also caps the metadata
+/// records a request produces at 10,000 (one `TopicRecord` per topic, one
+/// per config, one per partition), so a request for exactly 10,000
+/// partitions fails there with `POLICY_VIOLATION`. nisshi has no metadata
+/// records, so it deliberately allows exactly 10,000 partitions.
 const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
 
 /// Partitions created for a topic whose `num_partitions` is `-1` (the
@@ -66,29 +62,29 @@ const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
 const BROKER_DEFAULT_NUM_PARTITIONS: i32 = 3;
 
 /// Sum of partitions this request would create, computed before any
-/// per-topic validation runs. Mirrors Kafka's
-/// `validateTotalNumberOfPartitions`: a topic requesting the broker
-/// default (`-1`) counts as [`BROKER_DEFAULT_NUM_PARTITIONS`]; a topic
-/// whose `num_partitions` is already invalid (`0`, or some other negative
-/// value) counts as zero here, since it will be rejected on its own merits
-/// by the per-topic check further down in `serve`, not double-counted.
-///
-/// Unlike upstream Kafka, this ignores `assignments` (manual partition
-/// placement): every nisshi storage backend sizes a topic from
-/// `num_partitions` alone (`nisshi-storage-dynostore`, `-sql`'s `pg.rs`
-/// and `limbo.rs`, `-slatedb`), so `assignments` can never be used to
-/// create more partitions than `num_partitions` already accounts for.
+/// per-topic validation runs, counted as Kafka 3.9.1 does: a topic with
+/// manual `assignments` counts one partition per assignment, a topic
+/// requesting the broker default (`-1`) counts as
+/// [`BROKER_DEFAULT_NUM_PARTITIONS`]. A topic whose `num_partitions` is
+/// otherwise invalid (`0`, or another negative value) counts as zero, so it
+/// can't pull the total under the cap; the per-topic check in `serve`
+/// rejects it on its own merits.
 fn total_requested_partitions(
     topics: &[nisshi_sans_io::create_topics_request::CreatableTopic],
 ) -> i64 {
     topics
         .iter()
-        .map(|topic| match topic.num_partitions {
-            -1 => i64::from(BROKER_DEFAULT_NUM_PARTITIONS),
-            n if n > 0 => i64::from(n),
-            _ => 0,
-        })
-        .sum()
+        .map(
+            |topic| match (topic.assignments.as_deref(), topic.num_partitions) {
+                (Some(assignments), _) if !assignments.is_empty() => {
+                    i64::try_from(assignments.len()).unwrap_or(i64::MAX)
+                }
+                (_, -1) => i64::from(BROKER_DEFAULT_NUM_PARTITIONS),
+                (_, n) if n > 0 => i64::from(n),
+                _ => 0,
+            },
+        )
+        .fold(0i64, i64::saturating_add)
 }
 
 /// A [`Service`] using its [`Storage`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
@@ -164,9 +160,20 @@ where
 
         // Reject the whole request, before any per-topic validation or
         // storage call, when the partitions requested across every topic
-        // exceed Kafka's cap, matching upstream, which throws here before
-        // even checking topic names.
-        if total_requested_partitions(requested) > MAX_PARTITIONS_PER_REQUEST {
+        // exceed the cap. Kafka also runs this before the name check.
+        let total = total_requested_partitions(requested);
+        if total > MAX_PARTITIONS_PER_REQUEST {
+            debug!(
+                total,
+                limit = MAX_PARTITIONS_PER_REQUEST,
+                "rejecting CreateTopics: too many partitions in one request"
+            );
+
+            let message = format!(
+                "Excessively large number of partitions per request: \
+                 {total} requested, limit {MAX_PARTITIONS_PER_REQUEST}."
+            );
+
             let topics = requested
                 .iter()
                 .map(|topic| {
@@ -176,6 +183,7 @@ where
                         Some(topic.replication_factor),
                         ErrorCode::PolicyViolation,
                     )
+                    .error_message(Some(message.clone()))
                 })
                 .collect();
 
