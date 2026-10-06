@@ -2180,6 +2180,23 @@ mod slatedb {
         .await
     }
 
+    // compaction keeps the log start at 0, so a fetch at 0 passes the
+    // bounds check and reads the surviving record at 1
+    #[tokio::test]
+    async fn compacted_header() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::compacted_header(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn empty_topic() -> Result<()> {
         let _guard = init_tracing()?;
