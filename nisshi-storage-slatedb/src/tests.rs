@@ -1006,7 +1006,7 @@ mod cleanup_policy {
     use std::time::{Duration, SystemTime};
 
     use nisshi_sans_io::{
-        IsolationLevel,
+        BatchAttribute, Compression, IsolationLevel,
         create_topics_request::CreatableTopicConfig,
         record::{Record, inflated},
     };
@@ -1104,6 +1104,44 @@ mod cleanup_policy {
         // Compaction is idempotent
         engine.maintain(SystemTime::now()).await.unwrap();
         assert_eq!(2, fetch_all(&engine, &topition).await.len());
+    }
+
+    #[tokio::test]
+    async fn compact_skips_a_batch_it_cannot_inflate() {
+        let engine = create_test_engine().await;
+        let topition = topic_with_policy(
+            &engine,
+            "policy-compact-skip",
+            &[("cleanup.policy", "compact")],
+        )
+        .await;
+
+        // Without a schema registry the engine stores a batch without
+        // inflating it, so one that cannot be inflated (plain record data
+        // labelled as zstd) is stored but can never be read back as records.
+        // Compaction must leave it alone, not abandon the pass.
+        let mut undecodable = keyed_batch(b"b", b"opaque", None);
+        undecodable.attributes = BatchAttribute::default()
+            .compression(Compression::Zstd)
+            .into();
+
+        for batch in [
+            keyed_batch(b"a", b"one", None),
+            undecodable,
+            keyed_batch(b"a", b"two", None),
+        ] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        engine.maintain(SystemTime::now()).await.unwrap();
+
+        // Offset 0 (key "a", superseded at offset 2) is removed; the batch
+        // that cannot be inflated is still there, untouched.
+        let batches = fetch_all(&engine, &topition).await;
+        assert_eq!(2, batches.len());
+        assert_eq!(1, batches[0].base_offset);
+        assert_eq!(2, batches[1].base_offset);
+        assert!(inflated::Batch::try_from(batches[0].clone()).is_err());
     }
 
     #[tokio::test]
