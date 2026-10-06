@@ -33,6 +33,7 @@ pub mod gap6;
 pub mod mandatory_sequence_encoding;
 pub mod proptest;
 pub mod snappy;
+pub mod topic;
 pub mod version;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a

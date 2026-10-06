@@ -29,7 +29,7 @@ use opentelemetry::KeyValue;
 use rama::{Layer, Service, extensions::Extensions, matcher::Matcher, service::BoxService};
 use rsasl::config::SASLConfig;
 use tokio::task::spawn_blocking;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{API_ERRORS, API_REQUESTS, ProgressBarExtension};
 
@@ -312,6 +312,21 @@ where
                 ),
             }
         } else {
+            // Peek `api_key` from the raw frame bytes, before paying for a
+            // full decode of a body that may be unbounded on an
+            // unauthenticated connection. `[size:4][api_key:2]...`: a frame
+            // too short to even hold an api_key falls through to the normal
+            // decode below, which already rejects malformed frames.
+            if let Some(peeked_api_key) = req
+                .bytes
+                .get(4..6)
+                .map(|api_key| i16::from_be_bytes([api_key[0], api_key[1]]))
+                && !self.is_authenticated(peeked_api_key)
+            {
+                warn!(api_key = peeked_api_key, "request before authentication");
+                return Err(Into::into(nisshi_sans_io::Error::NotAuthenticated));
+            }
+
             spawn_blocking(|| Frame::request_from_bytes(req.bytes))
                 .await?
                 .inspect(|request| debug!(?request))?

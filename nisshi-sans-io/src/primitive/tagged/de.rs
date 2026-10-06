@@ -41,6 +41,19 @@ impl<'de> Decoder<'de> {
         }
     }
 
+    /// Bounds every length-prefixed field this decoder reads to at most
+    /// `message_max_size`, instead of the much larger `MESSAGE_MAX_SIZE`
+    /// fallback. Callers that already know the exact size of the buffer
+    /// they're decoding from (for example a tag field's own already-in-memory
+    /// bytes) should pass that length here.
+    #[must_use]
+    pub fn with_message_max_size(self, message_max_size: usize) -> Self {
+        Self {
+            message_max_size: Some(message_max_size),
+            ..self
+        }
+    }
+
     pub fn unsigned_varint(&mut self) -> Result<u32> {
         const CONTINUATION: u8 = 0b1000_0000;
         const MASK: u8 = 0b0111_1111;
@@ -243,6 +256,10 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                 Ok,
             )
             .and_then(|length| {
+                if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+                    return Err(Error::MessageMaxSizeExceeded(length));
+                }
+
                 let mut buf = vec![0u8; length];
                 self.reader.read_exact(&mut buf)?;
                 std::str::from_utf8(buf.as_slice())
