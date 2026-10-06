@@ -2035,11 +2035,8 @@ impl Storage for Engine {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    // Earliest/Latest on an empty partition is offset 0 (nothing
-                    // written yet). A Timestamp lookup that matches no record is
-                    // "not found", not "empty": leave offset/timestamp as None so
-                    // the caller applies Kafka's not-found default (-1), matching
-                    // KafkaApis.scala's buildErrorResponse.
+                    // No record row: Earliest/Latest answer 0, a Timestamp
+                    // lookup answers no offset (see `ListOffsetResponse::offset`).
                     let (offset, timestamp) = match offset_type {
                         ListOffsetRequest::Earliest | ListOffsetRequest::Latest => (Some(0), None),
                         ListOffsetRequest::Timestamp(_) => (None, None),

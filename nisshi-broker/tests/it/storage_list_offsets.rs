@@ -114,6 +114,8 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
 /// `buildErrorResponse` (KafkaApis.scala) sends offset=-1/timestamp=-1 with
 /// error_code=NONE for this case, and `ListOffsetsService` must apply that
 /// default rather than the Earliest/Latest empty-partition default of 0.
+/// Kafka sends leader epoch -1 here; nisshi sends 0, a known difference that
+/// clients ignore when the offset is -1.
 async fn timestamp_no_match(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let extensions = Extensions::default();
 

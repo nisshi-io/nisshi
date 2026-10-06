@@ -1387,10 +1387,8 @@ impl Storage for Engine {
                             offset: Some(offset),
                             timestamp: to_system_time(ts).ok(),
                         },
-                        // No record's timestamp is >= target: "not found", not
-                        // "empty". Leave offset/timestamp as None so the caller
-                        // applies Kafka's not-found default (-1), matching
-                        // KafkaApis.scala's buildErrorResponse.
+                        // No record at or after the target: no offset (see
+                        // `ListOffsetResponse::offset`).
                         None => ListOffsetResponse {
                             error_code: ErrorCode::None,
                             offset: None,

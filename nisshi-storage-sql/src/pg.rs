@@ -2737,11 +2737,8 @@ impl Storage for Postgres {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    // Earliest/Latest on an empty partition is offset 0 (nothing
-                    // written yet). A Timestamp lookup that matches no record is
-                    // "not found", not "empty": leave offset/timestamp as None so
-                    // the caller applies Kafka's not-found default (-1), matching
-                    // KafkaApis.scala's buildErrorResponse.
+                    // No record row: Earliest/Latest answer 0, a Timestamp
+                    // lookup answers no offset (see `ListOffsetResponse::offset`).
                     let (offset, timestamp) = match offset_type {
                         ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
                         ListOffset::Timestamp(_) => (None, None),

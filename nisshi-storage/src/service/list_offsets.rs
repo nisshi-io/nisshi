@@ -165,12 +165,12 @@ where
                                                                 .unwrap_or(Some(-1))
                                                                 .or(Some(-1)),
                                                         )
-                                                        // Kafka's buildErrorResponse (KafkaApis.scala)
-                                                        // sends offset=-1 on every error path, not just
-                                                        // when a Timestamp lookup finds no match, so a
-                                                        // backend that leaves offset: None on any
-                                                        // not-found path gets the same default here.
+                                                        // `None` is sent as -1, as Kafka does:
+                                                        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1171-L1177
                                                         .offset(offset.offset().or(Some(-1)))
+                                                        // Kafka sends -1 (the schema default) when
+                                                        // the offset is unknown; nisshi always sends
+                                                        // 0. Clients ignore the epoch for offset -1.
                                                         .leader_epoch(Some(0)),
                                                 )
                                             } else {

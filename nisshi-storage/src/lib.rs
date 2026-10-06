@@ -614,6 +614,10 @@ pub type ListOffsetRequest = ListOffset;
 pub struct ListOffsetResponse {
     pub error_code: ErrorCode,
     pub timestamp: Option<SystemTime>,
+    /// `None` when a [`ListOffset::Timestamp`] lookup matches no record, or
+    /// when `error_code` is not [`ErrorCode::None`]; `ListOffsetsService`
+    /// sends `None` as -1, as Kafka does. [`ListOffset::Earliest`] and
+    /// [`ListOffset::Latest`] with [`ErrorCode::None`] are always `Some`.
     pub offset: Option<i64>,
 }
 
@@ -1409,7 +1413,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query the offset stage for a topic partition.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
-    /// Query the offsets for one or more topic partitions.
+    /// Query the offsets for one or more topic partitions. See
+    /// [`ListOffsetResponse::offset`] for when an answer has no offset.
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
