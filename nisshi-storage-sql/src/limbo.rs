@@ -485,6 +485,7 @@ impl Engine {
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
+        inflated: inflated::Batch,
         tx: &Transaction<'conn>,
     ) -> Result<i64> {
         debug!(cluster = ?self.cluster, ?transaction_id, ?topition, ?deflated);
@@ -508,8 +509,6 @@ impl Engine {
         // re-deflates with the codec the producer used, as Kafka does with
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
-
-        let inflated = inflate(deflated).await.inspect_err(|err| debug!(?err))?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -717,8 +716,13 @@ impl Engine {
                 .and_then(TryInto::try_into)
                 .inspect(|deflated| debug!(?deflated))?;
 
+            // A control batch holds one uncompressed record, so it is
+            // inflated inline. `inflate` would wait for a decode permit
+            // while this transaction holds the database write lock.
+            let inflated = inflated::Batch::try_from(&batch)?;
+
             let offset = self
-                .produce_in_tx(Some(transaction_id), &topition, batch, tx)
+                .produce_in_tx(Some(transaction_id), &topition, batch, inflated, tx)
                 .await?;
 
             debug!(offset, ?topition);
@@ -1401,13 +1405,20 @@ impl Storage for Engine {
     ) -> Result<i64> {
         debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
 
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = inflate(deflated.clone())
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
         let mut connection = self.connection().await?;
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
 
         let high = self
-            .produce_in_tx(transaction_id, topition, deflated, &tx)
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
             .await?;
 
         tx.commit().await.map_err(Into::into).and(Ok(high))
