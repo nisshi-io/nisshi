@@ -17,15 +17,19 @@
 //!
 //! Malformed means: records that do not decode, an unknown compression codec,
 //! or other than exactly one batch for the partition. Every malformed batch
-//! here carries a valid CRC, so the tests still exercise decoding if produce
-//! starts enforcing the CRC.
+//! here carries a valid CRC as sent, so the tests still exercise decoding if
+//! produce starts enforcing the CRC.
+//!
+//! Every malformed batch here uses `LogAppendTime`. A `CreateTime` batch can
+//! be decoded in `ProduceService` before it reaches storage, and these tests
+//! cover the decode that each storage backend does.
 
 use crate::common::{StorageType, alphanumeric_string, init_tracing};
 use bytes::Bytes;
 use nisshi_broker::{Error, Result};
 use nisshi_sans_io::{
-    BatchAttribute, Compression, CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset,
-    ListOffsetsRequest, ProduceRequest, RequestInput,
+    BatchAttribute, Compression, CreateTopicsRequest, ErrorCode, InitProducerIdRequest,
+    IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest, RequestInput, TimestampType,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -38,7 +42,8 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::Registry;
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, ListOffsetsService, ProduceService, Storage,
+    ArcDynStorage, CreateTopicsService, InitProducerIdService, ListOffsetsService, ProduceService,
+    Storage,
 };
 use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -172,11 +177,19 @@ async fn latest(storage: &(impl Storage + Clone), name: &str) -> Result<Option<i
 }
 
 fn well_formed(value: &'static [u8]) -> Result<deflated::Batch> {
-    inflated::Batch::builder()
+    from_builder(inflated::Batch::builder(), value)
+}
+
+fn from_builder(builder: inflated::Builder, value: &'static [u8]) -> Result<deflated::Batch> {
+    builder
         .record(Record::builder().value(Bytes::from_static(value).into()))
         .build()
         .and_then(deflated::Batch::try_from)
         .map_err(Into::into)
+}
+
+fn log_append_time() -> BatchAttribute {
+    BatchAttribute::default().timestamp(TimestampType::LogAppendTime)
 }
 
 /// `batch` with its attributes and record data replaced, and its batch length
@@ -199,19 +212,19 @@ fn rebuilt(mut batch: deflated::Batch, attributes: i16, record_data: Bytes) -> d
 /// by value this fails with `Overflow` or `TryGet`, and by reference with
 /// `Io(UnexpectedEof)`.
 fn truncated_record() -> Result<deflated::Batch> {
-    let batch = well_formed(b"Lorem ipsum dolor sit amet")?;
-    let attributes = batch.attributes;
+    truncated(well_formed(b"Lorem ipsum dolor sit amet")?)
+}
+
+fn truncated(batch: deflated::Batch) -> Result<deflated::Batch> {
     let record_data = batch.record_data.slice(..batch.record_data.len() - 10);
 
-    Ok(rebuilt(batch, attributes, record_data))
+    Ok(rebuilt(batch, log_append_time().into(), record_data))
 }
 
 /// A batch flagged as gzip whose record data is not a gzip stream.
 fn garbage_gzip() -> Result<deflated::Batch> {
     let batch = well_formed(b"Lorem ipsum dolor sit amet")?;
-    let attributes = BatchAttribute::default()
-        .compression(Compression::Gzip)
-        .into();
+    let attributes = log_append_time().compression(Compression::Gzip).into();
 
     Ok(rebuilt(
         batch,
@@ -224,7 +237,7 @@ fn garbage_gzip() -> Result<deflated::Batch> {
 /// no Kafka codec uses.
 fn unknown_codec() -> Result<deflated::Batch> {
     let batch = well_formed(b"Lorem ipsum dolor sit amet")?;
-    let attributes = batch.attributes | 0b111;
+    let attributes = i16::from(log_append_time()) | 0b111;
     let record_data = batch.record_data.clone();
 
     Ok(rebuilt(batch, attributes, record_data))
@@ -310,6 +323,56 @@ async fn not_exactly_one_batch(storage: impl Storage + Clone) -> Result<()> {
     assert_nothing_written(&storage, name).await
 }
 
+/// An idempotent batch that does not decode leaves the producer's sequence
+/// where it was. The producer can then send a well-formed batch with the same
+/// sequence, and that batch is stored. If the rejected batch had moved the
+/// sequence, the well-formed batch would get `DUPLICATE_SEQUENCE_NUMBER`, which
+/// a client reports as success.
+async fn rejected_idempotent_batch_keeps_its_sequence(storage: impl Storage + Clone) -> Result<()> {
+    let name = &alphanumeric_string(15)[..];
+    create_topic(&storage, name).await?;
+
+    let producer = InitProducerIdService {
+        storage: storage.clone(),
+    }
+    .serve(RequestInput {
+        request: InitProducerIdRequest::default()
+            .transactional_id(None)
+            .transaction_timeout_ms(0)
+            .producer_id(Some(-1))
+            .producer_epoch(Some(-1)),
+        extensions: Extensions::default(),
+    })
+    .await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(producer.error_code)?);
+
+    let idempotent = |value| {
+        from_builder(
+            inflated::Batch::builder()
+                .producer_id(producer.producer_id)
+                .producer_epoch(producer.producer_epoch)
+                .base_sequence(0),
+            value,
+        )
+    };
+
+    assert_invalid_record(
+        &produce(&storage, name, vec![truncated(idempotent(b"rejected")?)?]).await?,
+    )?;
+
+    let response = produce(&storage, name, vec![idempotent(b"well formed")?]).await?;
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(response.error_code)?,
+        "{response:?}"
+    );
+    assert_eq!(0, response.base_offset);
+
+    assert_eq!(Some(1), latest(&storage, name).await?);
+
+    Ok(())
+}
+
 /// Without a schema registry or lake, dynostore and slatedb store a produced
 /// batch without decoding its records, so records that do not decode are
 /// accepted and stored as sent. This pins that existing behaviour: it is not
@@ -360,6 +423,13 @@ mod in_memory {
         let _guard = init_tracing()?;
         super::not_exactly_one_batch(storage(StorageType::InMemory, true).await?).await
     }
+
+    #[tokio::test]
+    async fn rejected_idempotent_batch_keeps_its_sequence_with_registry() -> Result<()> {
+        let _guard = init_tracing()?;
+        rejected_idempotent_batch_keeps_its_sequence(storage(StorageType::InMemory, true).await?)
+            .await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -382,6 +452,15 @@ mod lite {
     async fn not_exactly_one_batch() -> Result<()> {
         let _guard = init_tracing()?;
         super::not_exactly_one_batch(storage(StorageType::Lite, false).await?).await
+    }
+
+    #[tokio::test]
+    async fn rejected_idempotent_batch_keeps_its_sequence() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::rejected_idempotent_batch_keeps_its_sequence(
+            storage(StorageType::Lite, false).await?,
+        )
+        .await
     }
 }
 
@@ -434,5 +513,38 @@ mod slate {
     async fn undecodable_records_with_registry() -> Result<()> {
         let _guard = init_tracing()?;
         undecodable_records(storage(StorageType::SlateDb, true).await?).await
+    }
+
+    #[tokio::test]
+    async fn rejected_idempotent_batch_keeps_its_sequence_with_registry() -> Result<()> {
+        let _guard = init_tracing()?;
+        rejected_idempotent_batch_keeps_its_sequence(storage(StorageType::SlateDb, true).await?)
+            .await
+    }
+}
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn undecodable_records() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::undecodable_records(storage(StorageType::Turso, false).await?).await
+    }
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn unknown_compression_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::unknown_compression_codec(storage(StorageType::Turso, false).await?).await
+    }
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn not_exactly_one_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::not_exactly_one_batch(storage(StorageType::Turso, false).await?).await
     }
 }

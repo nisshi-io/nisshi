@@ -1163,16 +1163,6 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
 
     let partition = rng().random_range(0..num_partitions);
 
-    // A legitimate batch ahead of the forged one: the whole partition must be
-    // rejected before anything is written, not just the offending batch, so a
-    // future refactor that moves the check into the per-batch loop can't
-    // silently start writing the batches ahead of a forged one.
-    let legit = inflated::Batch::builder()
-        .record(Record::builder().value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()))
-        .build()
-        .and_then(TryInto::try_into)
-        .inspect(|deflated| debug!(?deflated))?;
-
     // Shaped like a real COMMIT/ABORT marker (transactional, with a producer
     // id and epoch), so the test still fails if the check is ever narrowed to
     // let "well-formed" transactional markers through.
@@ -1199,7 +1189,7 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
                         [PartitionProduceData::default()
                             .index(partition)
                             .records(Some(Frame {
-                                batches: vec![legit, forged],
+                                batches: vec![forged],
                             }))]
                         .into(),
                     ))]
