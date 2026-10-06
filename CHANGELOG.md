@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - A listener with SASL configured closes a connection that sends a frame larger than 512KiB before the client authenticates, matching the Apache Kafka default for `sasl.server.max.receive.size`. The same limit applies while a client re-authenticates. The broker logs this rejection as `PreAuthenticationFrameTooBig`, and counts it in `nisshi_frames_rejected`.
+- A produced `CreateTime` batch is now validated record by record. A record timestamped more than one hour ahead of the broker's clock is rejected with `INVALID_TIMESTAMP`, and a batch whose records do not decode is rejected with `INVALID_RECORD`. The response's record errors name the rejected record and the allowed window.
+- The broker stores a produced batch's `max_timestamp` as its largest record timestamp, whatever the client's header claims, as Kafka does. SlateDB retention then follows the records, including for clients that send the header as -1.
+- A produced batch whose CRC does not match its contents is rejected with `CORRUPT_MESSAGE` when the broker rewrites its timestamps.
 
 ### Security
 
@@ -31,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `LogAppendTime` batch is stored with a CRC that covers the broker's timestamps. A Java consumer with `check.crcs` enabled no longer fails on it with `CorruptRecordException`.
+- A Snappy batch that the Java producer compresses into more than one 32 KiB block now decodes.
 - A Snappy batch with a truncated xerial header is rejected with an error
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,

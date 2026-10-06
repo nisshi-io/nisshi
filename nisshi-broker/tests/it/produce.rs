@@ -16,13 +16,15 @@ use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
 };
-use bytes::Bytes;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::{BufMut as _, Bytes, BytesMut};
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    BatchAttribute, CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, FetchRequest,
+    BatchAttribute, Compression, CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, FetchRequest,
     InitProducerIdRequest, IsolationLevel, ListOffset, ListOffsetsRequest, NULL_TOPIC_ID,
     ProduceRequest, ProduceResponse, RequestInput, TimestampType,
-    create_topics_request::CreatableTopic,
+    create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -1362,379 +1364,466 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
     Ok(())
 }
 
-/// A `CreateTime` record more than Kafka's own
-/// `log.message.timestamp.after.max.ms` default (one hour) ahead of the
-/// broker's clock must be rejected with `INVALID_TIMESTAMP` before anything
-/// is written, matching Kafka's own `LogValidator`, and must not wedge the
-/// partition for a subsequent well-formed produce.
-async fn produce_rejects_future_timestamp(storage: impl Storage + Clone) -> Result<()> {
-    let topic = &alphanumeric_string(15)[..];
+/// Kafka's `log.message.timestamp.after.max.ms` default from 4.0, which the
+/// broker applies to every `CreateTime` record.
+const TIMESTAMP_AFTER_MAX_MS: i64 = 60 * 60 * 1000;
 
-    let extensions = Extensions::default();
+fn now_ms() -> Result<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(Into::into)
+        .and_then(|duration| i64::try_from(duration.as_millis()).map_err(Into::into))
+}
 
-    let create_topic = CreateTopicsService {
-        storage: storage.clone(),
-    };
+/// Creates a topic with one partition and `configs`, and returns its name.
+async fn create_topic_with_configs(
+    storage: impl Storage + Clone,
+    configs: &[(&str, &str)],
+) -> Result<String> {
+    let topic = alphanumeric_string(15);
 
-    {
-        let response = create_topic
-            .serve(RequestInput {
-                request: CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(topic.into())
-                            .num_partitions(1)
-                            .replication_factor(0)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-                extensions: extensions.clone(),
-            })
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-    }
-
-    let index = 0;
-
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
-
-    const TWO_HOURS_MS: i64 = 2 * 60 * 60 * 1000;
-
-    let future = produce
+    let response = CreateTopicsService { storage }
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder().record(
-                    Record::builder()
-                        .value(Bytes::from_static(b"two hours from now").into())
-                        .timestamp_delta(TWO_HOURS_MS),
-                ),
-            )?),
-            extensions: extensions.clone(),
+            request: CreateTopicsRequest::default()
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(topic.clone())
+                        .num_partitions(1)
+                        .replication_factor(0)
+                        .assignments(Some([].into()))
+                        .configs(Some(
+                            configs
+                                .iter()
+                                .map(|(name, value)| {
+                                    CreatableTopicConfig::default()
+                                        .name((*name).into())
+                                        .value(Some((*value).into()))
+                                })
+                                .collect(),
+                        ))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
         })
         .await?;
 
-    {
-        let topics = future.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::InvalidTimestamp,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-        assert_eq!(-1, partitions[0].base_offset);
-        assert_eq!(
-            Some("record timestamp is outside the allowed window".into()),
-            partitions[0].error_message
-        );
-    }
+    Ok(topic)
+}
 
-    // The partition must not be wedged: a well-formed produce afterwards
-    // still lands at offset 0, proving the rejected batch wrote nothing.
-    let well_formed = produce
+/// Sends `batches` to one partition with `acks=-1`, and returns that
+/// partition's response.
+async fn produce_batches(
+    storage: impl Storage + Clone,
+    topic: &str,
+    index: i32,
+    batches: Vec<deflated::Batch>,
+) -> Result<PartitionProduceResponse> {
+    let response = ProduceService { storage }
         .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder()
-                    .record(Record::builder().value(Bytes::from_static(b"well formed").into())),
-            )?),
-            extensions: extensions.clone(),
+            request: ProduceRequest::default().acks(-1).topic_data(Some(vec![
+                TopicProduceData::default()
+                    .name(topic.into())
+                    .partition_data(Some(vec![
+                        PartitionProduceData::default()
+                            .index(index)
+                            .records(Some(Frame { batches })),
+                    ])),
+            ])),
+            extensions: Extensions::default(),
         })
         .await?;
 
-    {
-        let topics = well_formed.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
+    let topics = response.responses.unwrap_or_default();
+    assert_eq!(1, topics.len());
 
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
+    let mut partitions = topics[0].partition_responses.clone().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+
+    Ok(partitions.remove(0))
+}
+
+/// A `CreateTime` batch with one record for each of `timestamp_deltas`.
+fn create_time_batch(
+    compression: Compression,
+    base_timestamp: i64,
+    max_timestamp: i64,
+    timestamp_deltas: &[i64],
+) -> Result<deflated::Batch> {
+    let mut builder = inflated::Batch::builder()
+        .attributes(BatchAttribute::default().compression(compression).into())
+        .base_timestamp(base_timestamp)
+        .max_timestamp(max_timestamp)
+        .last_offset_delta(i32::try_from(timestamp_deltas.len())? - 1);
+
+    for (offset_delta, timestamp_delta) in timestamp_deltas.iter().enumerate() {
+        builder = builder.record(
+            Record::builder()
+                .offset_delta(i32::try_from(offset_delta)?)
+                .timestamp_delta(*timestamp_delta)
+                .value(Bytes::from(format!("record {offset_delta}")).into()),
         );
-        assert_eq!(0, partitions[0].base_offset);
     }
 
+    builder
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+/// Compresses an uncompressed batch the way the Java producer does: a
+/// snappy-java (xerial) stream with a new block for every 32 KiB of
+/// uncompressed records.
+fn xerial_snappy(batch: deflated::Batch) -> Result<deflated::Batch> {
+    const BLOCK: usize = 32 * 1024;
+
+    let mut framed = BytesMut::new();
+    framed.put_slice(b"\x82SNAPPY\0");
+    framed.put_i32(1);
+    framed.put_i32(1);
+
+    for chunk in batch.record_data.chunks(BLOCK) {
+        let block = snap::raw::Encoder::new()
+            .compress_vec(chunk)
+            .map_err(nisshi_sans_io::Error::from)?;
+        framed.put_i32(i32::try_from(block.len())?);
+        framed.put_slice(&block);
+    }
+
+    let record_data = framed.freeze();
+
+    let mut batch = deflated::Batch {
+        attributes: BatchAttribute::default()
+            .compression(Compression::Snappy)
+            .into(),
+        batch_length: batch.batch_length - i32::try_from(batch.record_data.len())?
+            + i32::try_from(record_data.len())?,
+        record_data,
+        ..batch
+    };
+
+    batch.crc = batch.computed_crc();
+    Ok(batch)
+}
+
+fn assert_accepted_at(base_offset: i64, response: &PartitionProduceResponse) -> Result<()> {
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+    assert_eq!(base_offset, response.base_offset);
     Ok(())
 }
 
-/// A batch whose header `max_timestamp` disagrees with its records' actual
-/// maximum must be stored with the corrected value, not rejected: real
-/// Kafka's `LogValidator` recomputes and overwrites rather than rejecting a
-/// header/records mismatch, and a client (sarama releases before 2025-02-28,
-/// for one) that never set `max_timestamp` sends every batch with it at -1.
+/// A `CreateTime` record more than one hour ahead of the broker's clock is
+/// rejected with `INVALID_TIMESTAMP` before anything is written. The record
+/// error names the record's index in its batch, so a client can find it.
+async fn produce_rejects_future_timestamp(storage: impl Storage + Clone) -> Result<()> {
+    let topic = create_topic_with_configs(storage.clone(), &[]).await?;
+    let index = 0;
+    let now = now_ms()?;
+
+    let rejected = produce_batches(
+        storage.clone(),
+        &topic,
+        index,
+        vec![create_time_batch(
+            Compression::None,
+            now,
+            now,
+            &[0, 2 * TIMESTAMP_AFTER_MAX_MS],
+        )?],
+    )
+    .await?;
+
+    assert_eq!(
+        ErrorCode::InvalidTimestamp,
+        ErrorCode::try_from(rejected.error_code)?
+    );
+    assert_eq!(-1, rejected.base_offset);
+    assert_eq!(
+        Some("One or more records have been rejected due to invalid timestamp".into()),
+        rejected.error_message
+    );
+
+    let record_errors = rejected.record_errors.unwrap_or_default();
+    assert_eq!(1, record_errors.len());
+    assert_eq!(1, record_errors[0].batch_index);
+    assert!(
+        record_errors[0]
+            .batch_index_error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("is out of range"))
+    );
+
+    // A well-formed produce afterwards lands at offset 0, so the rejected
+    // batch wrote nothing.
+    let well_formed = produce_batches(
+        storage,
+        &topic,
+        index,
+        vec![create_time_batch(Compression::None, now, now, &[0])?],
+    )
+    .await?;
+
+    assert_accepted_at(0, &well_formed)
+}
+
+/// The broker validates every batch for a partition before it writes any of
+/// them, so a rejected second batch leaves the first one unwritten too.
+async fn produce_rejects_every_batch_when_a_later_one_is_invalid(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let topic = create_topic_with_configs(storage.clone(), &[]).await?;
+    let index = 0;
+    let now = now_ms()?;
+
+    let rejected = produce_batches(
+        storage.clone(),
+        &topic,
+        index,
+        vec![
+            create_time_batch(Compression::None, now, -1, &[0])?,
+            create_time_batch(Compression::None, now, now, &[2 * TIMESTAMP_AFTER_MAX_MS])?,
+        ],
+    )
+    .await?;
+
+    assert_eq!(
+        ErrorCode::InvalidTimestamp,
+        ErrorCode::try_from(rejected.error_code)?
+    );
+
+    let well_formed = produce_batches(
+        storage,
+        &topic,
+        index,
+        vec![create_time_batch(Compression::None, now, now, &[0])?],
+    )
+    .await?;
+
+    assert_accepted_at(0, &well_formed)
+}
+
+/// A batch whose header `max_timestamp` differs from its largest record
+/// timestamp is stored with the largest record timestamp, not rejected.
+/// Kafka's `LogValidator` overwrites the header in the same way, and some
+/// clients (sarama releases before 2025-02-28, for one) send every batch
+/// with the header at -1.
 ///
-/// Each case below produces to its own topic, one batch each, so the
-/// assertion on `fetch_batches`'s result doesn't depend on a backend's
-/// batch-boundary fidelity: the SQL backends reconstruct one combined batch
-/// per fetch from their flat record storage, while the byte-preserving
-/// backends (in-memory, slatedb) return exactly the batches produced.
-///
-/// `assert_stored_header` is only meaningful on a byte-preserving backend:
-/// only there does the fetched batch carry back the exact bytes
-/// [`ProduceService`] wrote. A SQL backend's fetch reconstructs a fresh
-/// batch from its flat record storage rather than returning the stored
-/// bytes, and (a separate, pre-existing gap) never derives
-/// that reconstructed batch's `max_timestamp` from the records it just read,
-/// so neither its `max_timestamp` nor its `crc` says anything about what
-/// [`ProduceService`] wrote here.
+/// Each case produces to its own topic, so a backend that combines batches
+/// on fetch does not change the result. `assert_stored_header` is true only
+/// for a backend whose fetch returns the stored bytes. A SQL backend builds
+/// a new batch from its records on fetch, so its header and `crc` say
+/// nothing about what [`ProduceService`] wrote.
 async fn produce_rewrites_header_max_timestamp(
     storage: impl Storage + Clone,
     assert_stored_header: bool,
 ) -> Result<()> {
-    let create_topic = CreateTopicsService {
-        storage: storage.clone(),
-    };
-
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
-
     let index = 0;
+    let now = now_ms()?;
+    let ten_hours = 10 * TIMESTAMP_AFTER_MAX_MS;
 
-    // Reproduces the real sarama wire shape: `max_timestamp` left at -1,
-    // never derived from the records.
-    let base_timestamp = 1_700_000_000_000;
+    for (base_timestamp, header_max_timestamp, timestamp_deltas, expected) in [
+        // The sarama case: the header says -1.
+        (now, -1, vec![5], now + 5),
+        // The header claims ten hours ahead of the broker's clock, and the
+        // record is sane.
+        (now, now + ten_hours, vec![0], now),
+        // The largest record timestamp is not the last one.
+        (now, -1, vec![0, 300, 100], now + 300),
+    ] {
+        let topic = create_topic_with_configs(storage.clone(), &[]).await?;
 
-    {
-        let topic = &alphanumeric_string(15)[..];
-        let extensions = Extensions::default();
+        let response = produce_batches(
+            storage.clone(),
+            &topic,
+            index,
+            vec![create_time_batch(
+                Compression::None,
+                base_timestamp,
+                header_max_timestamp,
+                &timestamp_deltas,
+            )?],
+        )
+        .await?;
 
-        let response = create_topic
-            .serve(RequestInput {
-                request: CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(topic.into())
-                            .num_partitions(1)
-                            .replication_factor(0)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-                extensions: extensions.clone(),
-            })
-            .await?;
+        assert_accepted_at(0, &response)?;
 
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-        let response = produce
-            .serve(RequestInput {
-                request: ProduceRequest::default().topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .base_timestamp(base_timestamp)
-                        .max_timestamp(-1)
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"header says -1").into())
-                                .timestamp_delta(5),
-                        ),
-                )?),
-                extensions: extensions.clone(),
-            })
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-        assert_eq!(0, partitions[0].base_offset);
-
-        let fetched = fetch_batches(storage.clone(), topic, index).await?;
+        let fetched = fetch_batches(storage.clone(), &topic, index).await?;
         assert_eq!(1, fetched.len());
 
         if assert_stored_header {
-            assert_eq!(base_timestamp + 5, fetched[0].max_timestamp);
-            assert_eq!(fetched[0].computed_crc()?, fetched[0].crc);
-        }
-    }
-
-    // A header that claims a time far in the future, but whose records are
-    // sane, must also be accepted and corrected -- the retention/time-index
-    // poisoning scenario a reject-only design would leave unfixed.
-    {
-        let topic = &alphanumeric_string(15)[..];
-        let extensions = Extensions::default();
-
-        let response = create_topic
-            .serve(RequestInput {
-                request: CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(topic.into())
-                            .num_partitions(1)
-                            .replication_factor(0)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-                extensions: extensions.clone(),
-            })
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-        let far_future_header = base_timestamp + 10 * 60 * 60 * 1000;
-
-        let response = produce
-            .serve(RequestInput {
-                request: ProduceRequest::default().topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .base_timestamp(base_timestamp)
-                        .max_timestamp(far_future_header)
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"header lies, record is sane").into())
-                                .timestamp_delta(0),
-                        ),
-                )?),
-                extensions: extensions.clone(),
-            })
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-        assert_eq!(0, partitions[0].base_offset);
-
-        let fetched = fetch_batches(storage.clone(), topic, index).await?;
-        assert_eq!(1, fetched.len());
-
-        if assert_stored_header {
-            assert_eq!(base_timestamp, fetched[0].max_timestamp);
-            assert_eq!(fetched[0].computed_crc()?, fetched[0].crc);
+            assert_eq!(expected, fetched[0].max_timestamp);
+            assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
         }
     }
 
     Ok(())
 }
 
-/// nisshi honors a client-set `LogAppendTime` bit by design (unlike real
-/// Kafka, which would reject it on a `CreateTime` topic, the only mode
-/// nisshi supports) -- this test confirms the new bounds/mismatch check for
-/// `CreateTime` batches doesn't interfere with that existing behavior. A
-/// record timestamped far enough in the future to fail the new check must
-/// still be accepted, because the `LogAppendTime` bit routes the batch past
-/// it entirely.
+/// The header rewrite decodes the records, so it must accept each codec a
+/// client can send, including a snappy-java stream of several blocks.
+async fn produce_rewrites_header_for_every_codec(
+    storage: impl Storage + Clone,
+    assert_stored_header: bool,
+) -> Result<()> {
+    let index = 0;
+    let now = now_ms()?;
+
+    let mut batches = [
+        Compression::None,
+        Compression::Gzip,
+        Compression::Snappy,
+        Compression::Lz4,
+        Compression::Zstd,
+    ]
+    .into_iter()
+    .map(|compression| create_time_batch(compression, now, -1, &[0, 7]))
+    .collect::<Result<Vec<_>>>()?;
+
+    // One record of 40,000 bytes needs two 32 KiB snappy-java blocks.
+    batches.push(xerial_snappy(
+        inflated::Batch::builder()
+            .base_timestamp(now)
+            .max_timestamp(-1)
+            .record(
+                Record::builder()
+                    .timestamp_delta(7)
+                    .value(Bytes::from(vec![b'x'; 40_000]).into()),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?,
+    )?);
+
+    for batch in batches {
+        let attributes = batch.attributes;
+        let topic = create_topic_with_configs(storage.clone(), &[]).await?;
+
+        let response = produce_batches(storage.clone(), &topic, index, vec![batch]).await?;
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(response.error_code)?,
+            "attributes: {attributes}"
+        );
+
+        if assert_stored_header {
+            let fetched = fetch_batches(storage.clone(), &topic, index).await?;
+            assert_eq!(1, fetched.len());
+            assert_eq!(
+                now + 7,
+                fetched[0].max_timestamp,
+                "attributes: {attributes}"
+            );
+            assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
+        }
+    }
+
+    Ok(())
+}
+
+/// A header rewrite gives the batch a new CRC, so the broker checks the
+/// client's CRC first. A batch whose CRC does not match its contents is
+/// rejected with `CORRUPT_MESSAGE`, as Kafka does.
+async fn produce_rejects_corrupt_batch_before_rewrite(storage: impl Storage + Clone) -> Result<()> {
+    let topic = create_topic_with_configs(storage.clone(), &[]).await?;
+    let index = 0;
+    let now = now_ms()?;
+
+    let mut corrupt = create_time_batch(Compression::None, now, -1, &[0])?;
+    corrupt.crc ^= 1;
+
+    let rejected = produce_batches(storage.clone(), &topic, index, vec![corrupt]).await?;
+
+    assert_eq!(
+        ErrorCode::CorruptMessage,
+        ErrorCode::try_from(rejected.error_code)?
+    );
+
+    let well_formed = produce_batches(
+        storage,
+        &topic,
+        index,
+        vec![create_time_batch(Compression::None, now, now, &[0])?],
+    )
+    .await?;
+
+    assert_accepted_at(0, &well_formed)
+}
+
+/// SlateDB retention deletes a batch whose `max_timestamp` is older than
+/// `retention.ms`. A header of -1 stored as sent makes a new batch eligible
+/// at once, so the stored header must hold the largest record timestamp.
+#[cfg(feature = "slatedb")]
+async fn produce_rewritten_header_keeps_a_new_batch_from_retention(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let topic = create_topic_with_configs(
+        storage.clone(),
+        &[("cleanup.policy", "delete"), ("retention.ms", "60000")],
+    )
+    .await?;
+    let index = 0;
+    let now = now_ms()?;
+
+    let response = produce_batches(
+        storage.clone(),
+        &topic,
+        index,
+        vec![create_time_batch(Compression::None, now, -1, &[0])?],
+    )
+    .await?;
+    assert_accepted_at(0, &response)?;
+
+    storage.maintain(SystemTime::now()).await?;
+
+    let fetched = fetch_batches(storage, &topic, index).await?;
+    assert_eq!(1, fetched.len());
+    assert_eq!(now, fetched[0].max_timestamp);
+
+    Ok(())
+}
+
+/// The broker honours a client-set `LogAppendTime` bit, and that batch skips
+/// the `CreateTime` timestamp window. Kafka takes the timestamp type from the
+/// topic's `message.timestamp.type` instead: on a `CreateTime` topic it
+/// validates such a batch like any `CreateTime` batch and clears the bit, so
+/// Kafka rejects this batch.
 ///
-/// It also guards the pre-existing `recompute_crc()` call on this
-/// `LogAppendTime` rewrite path: without it, a byte-preserving backend would
-/// hand a consumer back a batch whose header no longer matches its stored
-/// CRC. `assert_stored_header` gates this the same way
-/// [`produce_rewrites_header_max_timestamp`] does, since only a
-/// byte-preserving backend's fetch returns the exact bytes
-/// [`ProduceService`] wrote.
+/// The test also checks that the broker gives the rewritten batch a new
+/// `crc`. `assert_stored_header` gates that check as in
+/// [`produce_rewrites_header_max_timestamp`].
 async fn produce_log_append_time_ignores_bounds_check(
     storage: impl Storage + Clone,
     assert_stored_header: bool,
 ) -> Result<()> {
-    let topic = &alphanumeric_string(15)[..];
-
-    let extensions = Extensions::default();
-
-    let create_topic = CreateTopicsService {
-        storage: storage.clone(),
-    };
-
-    {
-        let response = create_topic
-            .serve(RequestInput {
-                request: CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(topic.into())
-                            .num_partitions(1)
-                            .replication_factor(0)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-                extensions: extensions.clone(),
-            })
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-    }
-
+    let topic = create_topic_with_configs(storage.clone(), &[]).await?;
     let index = 0;
-
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
 
     const TEN_YEARS_MS: i64 = 10 * 365 * 24 * 60 * 60 * 1000;
 
-    let response = produce
-        .serve(RequestInput {
-            request: ProduceRequest::default().topic_data(topic_data(
-                topic,
-                index,
-                inflated::Batch::builder()
-                    .attributes(
-                        BatchAttribute::default()
-                            .timestamp(TimestampType::LogAppendTime)
-                            .into(),
-                    )
-                    .record(
-                        Record::builder()
-                            .value(Bytes::from_static(b"far future, but log append time").into())
-                            .timestamp_delta(TEN_YEARS_MS),
-                    ),
-            )?),
-            extensions: extensions.clone(),
-        })
-        .await?;
+    let batch = inflated::Batch::builder()
+        .attributes(
+            BatchAttribute::default()
+                .timestamp(TimestampType::LogAppendTime)
+                .into(),
+        )
+        .record(
+            Record::builder()
+                .value(Bytes::from_static(b"far future, but log append time").into())
+                .timestamp_delta(TEN_YEARS_MS),
+        )
+        .build()
+        .and_then(deflated::Batch::try_from)?;
 
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-
-    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-    assert_eq!(0, partitions[0].base_offset);
+    let response = produce_batches(storage.clone(), &topic, index, vec![batch]).await?;
+    assert_accepted_at(0, &response)?;
 
     if assert_stored_header {
-        let fetched = fetch_batches(storage.clone(), topic, index).await?;
+        let fetched = fetch_batches(storage.clone(), &topic, index).await?;
         assert_eq!(1, fetched.len());
-        assert_eq!(fetched[0].computed_crc()?, fetched[0].crc);
+        assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
     }
 
     Ok(())
@@ -1896,6 +1985,42 @@ mod in_memory {
             Ok(())
         }
     }
+
+    #[tokio::test]
+    async fn produce_rejects_every_batch_when_a_later_one_is_invalid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_every_batch_when_a_later_one_is_invalid(storage).await
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_header_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_header_for_every_codec(storage, true).await
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_corrupt_batch_before_rewrite() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_corrupt_batch_before_rewrite(storage).await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -2053,6 +2178,42 @@ mod lite {
 
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_every_batch_when_a_later_one_is_invalid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_every_batch_when_a_later_one_is_invalid(storage).await
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_header_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_header_for_every_codec(storage, false).await
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_corrupt_batch_before_rewrite() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_corrupt_batch_before_rewrite(storage).await
     }
 }
 
@@ -2212,6 +2373,54 @@ mod slatedb {
             Ok(())
         }
     }
+
+    #[tokio::test]
+    async fn produce_rejects_every_batch_when_a_later_one_is_invalid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_every_batch_when_a_later_one_is_invalid(storage).await
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_header_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_header_for_every_codec(storage, true).await
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_corrupt_batch_before_rewrite() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_corrupt_batch_before_rewrite(storage).await
+    }
+
+    #[tokio::test]
+    async fn produce_rewritten_header_keeps_a_new_batch_from_retention() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewritten_header_keeps_a_new_batch_from_retention(storage).await
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -2369,5 +2578,41 @@ mod pg {
 
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_every_batch_when_a_later_one_is_invalid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_every_batch_when_a_later_one_is_invalid(storage).await
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_header_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_header_for_every_codec(storage, false).await
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_corrupt_batch_before_rewrite() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_corrupt_batch_before_rewrite(storage).await
     }
 }

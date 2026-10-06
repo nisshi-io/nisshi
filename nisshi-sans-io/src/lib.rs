@@ -1783,6 +1783,32 @@ impl<R: Read> Read for LimitedRead<R> {
     }
 }
 
+/// The magic that starts a snappy-java (xerial) framed stream.
+const XERIAL_MAGIC: &[u8] = b"\x82SNAPPY\0";
+
+/// Appends one raw snappy block, decompressed, to `decompressed`.
+///
+/// Returns [`Error::MessageMaxSizeExceeded`] before decompressing when the
+/// block's claimed length would take `decompressed` past `limit` bytes, so a
+/// small block can never make the broker allocate an unbounded buffer.
+fn snappy_decompress_block(block: &[u8], limit: usize, decompressed: &mut Vec<u8>) -> Result<()> {
+    let start = decompressed.len();
+    let claimed_len = snap::raw::decompress_len(block)?;
+    let total = start.saturating_add(claimed_len);
+
+    if total > limit {
+        return Err(Error::MessageMaxSizeExceeded(total));
+    }
+
+    decompressed.resize(total, 0);
+
+    snap::raw::Decoder::new()
+        .decompress(block, &mut decompressed[start..])
+        .map(|written| decompressed.truncate(start + written))
+        .map_err(Into::into)
+        .inspect_err(|err| error!(?err))
+}
+
 impl Compression {
     fn inflator(
         &self,
@@ -1797,46 +1823,48 @@ impl Compression {
                 _ = deflated.read_to_end(&mut input)?;
                 debug!(?input);
 
+                let mut decompressed = Vec::new();
+
                 // https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
-                let payload = if let Some(framed) = input.strip_prefix(b"\x82SNAPPY\0") {
-                    // The magic is followed by version, compatible version
-                    // and block size, 4 bytes each. Untrusted input: a
-                    // batch that stops short of those 12 bytes is an error,
-                    // not a slice panic.
-                    let Some((header, block)) = framed.split_at_checked(12) else {
+                //
+                // The xerial magic is followed by a 4-byte version, a 4-byte
+                // compatible version, and then a sequence of blocks, each a
+                // 4-byte big-endian compressed length and a raw snappy block.
+                // snappy-java's `SnappyOutputStream`, which the Java producer
+                // uses, starts a new block every 32 KiB of uncompressed input,
+                // so a larger batch has more than one block.
+                if let Some(framed) = input.strip_prefix(XERIAL_MAGIC) {
+                    // Untrusted input: a header or block that stops short is
+                    // an error, not a slice panic.
+                    let Some((versions, mut blocks)) = framed.split_at_checked(8) else {
                         return Err(Error::Overflow);
                     };
 
-                    let (version, header) = header.split_at(4);
-                    let version: i32 = version.try_into().map(i32::from_be_bytes)?;
+                    let (version, compatible_version) = versions.split_at(4);
+                    debug!(?version, ?compatible_version);
 
-                    let (compatible_version, block_size) = header.split_at(4);
-                    let compatible_version: i32 =
-                        compatible_version.try_into().map(i32::from_be_bytes)?;
-                    let block_size: i32 = block_size.try_into().map(i32::from_be_bytes)?;
+                    while !blocks.is_empty() {
+                        let Some((length, rest)) = blocks.split_at_checked(4) else {
+                            return Err(Error::Overflow);
+                        };
 
-                    debug!(version, compatible_version, block_size, ?block);
-                    block
+                        let length = length.try_into().map(u32::from_be_bytes)?;
+
+                        let Some((block, rest)) = usize::try_from(length)
+                            .ok()
+                            .and_then(|length| rest.split_at_checked(length))
+                        else {
+                            return Err(Error::Overflow);
+                        };
+
+                        snappy_decompress_block(block, limit, &mut decompressed)?;
+                        blocks = rest;
+                    }
                 } else {
-                    &input[..]
-                };
-
-                let claimed_len = snap::raw::decompress_len(payload)?;
-
-                if claimed_len > limit {
-                    return Err(Error::MessageMaxSizeExceeded(claimed_len));
+                    snappy_decompress_block(&input, limit, &mut decompressed)?;
                 }
 
-                let mut decoder = snap::raw::Decoder::new();
-
-                decoder
-                    .decompress_vec(payload)
-                    .map_err(Into::into)
-                    .map(Bytes::from)
-                    .map(|bytes| bytes.reader())
-                    .map(Box::new)
-                    .map(|boxed| boxed as Box<dyn Read>)
-                    .inspect_err(|err| error!(?err))
+                Ok(Box::new(Bytes::from(decompressed).reader()))
             }
             Compression::Lz4 => lz4::Decoder::new(deflated)
                 .map(|inner| LimitedRead::new(inner, limit))
@@ -2691,12 +2719,13 @@ mod tests {
 
     #[test]
     fn snappy_truncated_xerial_header_is_an_error_not_a_panic() {
-        // The magic followed by fewer than the 12 header bytes (version,
-        // compatible version, block size) used to panic on a slice. Each of
-        // those lengths must come back as an error. (A full header followed
-        // by `[0]` is a valid, empty block, so longer inputs are not errors.)
-        for short in 0..12 {
-            let mut input = b"\x82SNAPPY\0".to_vec();
+        // The magic is followed by an 8-byte header (version, compatible
+        // version) and then blocks, each with a 4-byte length. Input that
+        // stops inside the header or inside a block's length must come back
+        // as an error. The full header alone is a valid stream without
+        // blocks, so 8 is not in the list.
+        for short in (0..8).chain(9..12) {
+            let mut input = XERIAL_MAGIC.to_vec();
             input.extend(std::iter::repeat_n(0u8, short));
 
             let result = Compression::Snappy.inflator(
@@ -2709,6 +2738,78 @@ mod tests {
                 "{short} bytes after the xerial magic must be rejected as truncated"
             );
         }
+    }
+
+    #[test]
+    fn snappy_xerial_block_longer_than_the_input_is_an_error() {
+        let mut input = XERIAL_MAGIC.to_vec();
+        input.extend(1i32.to_be_bytes());
+        input.extend(1i32.to_be_bytes());
+        input.extend(100i32.to_be_bytes());
+        input.extend([0u8; 10]);
+
+        let result = Compression::Snappy.inflator(
+            Cursor::new(input),
+            crate::record::codec::MAX_DECODED_BATCH_BYTES,
+        );
+
+        assert!(matches!(result, Err(Error::Overflow)));
+    }
+
+    /// snappy-java's `SnappyOutputStream` writes a new block for every
+    /// 32 KiB of uncompressed input, so the Java producer sends a larger
+    /// batch as several blocks.
+    #[test]
+    fn snappy_xerial_stream_with_several_blocks_decodes() -> Result<()> {
+        const BLOCK: usize = 32 * 1024;
+
+        let uncompressed = (0..40_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+
+        let mut input = XERIAL_MAGIC.to_vec();
+        input.extend(1i32.to_be_bytes());
+        input.extend(1i32.to_be_bytes());
+
+        for chunk in uncompressed.chunks(BLOCK) {
+            let block = snap::raw::Encoder::new().compress_vec(chunk)?;
+            input.extend(i32::try_from(block.len())?.to_be_bytes());
+            input.extend(block);
+        }
+
+        let mut decompressed = Vec::new();
+        _ = Compression::Snappy
+            .inflator(
+                Cursor::new(input),
+                crate::record::codec::MAX_DECODED_BATCH_BYTES,
+            )?
+            .read_to_end(&mut decompressed)?;
+
+        assert_eq!(uncompressed, decompressed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn snappy_xerial_blocks_count_together_against_the_limit() -> Result<()> {
+        let chunk = [7u8; 1024];
+
+        let mut input = XERIAL_MAGIC.to_vec();
+        input.extend(1i32.to_be_bytes());
+        input.extend(1i32.to_be_bytes());
+
+        for _ in 0..2 {
+            let block = snap::raw::Encoder::new().compress_vec(&chunk)?;
+            input.extend(i32::try_from(block.len())?.to_be_bytes());
+            input.extend(block);
+        }
+
+        let err = Compression::Snappy
+            .inflator(Cursor::new(input), 1500)
+            .err()
+            .expect("two 1 KiB blocks must exceed a 1500 byte limit");
+
+        assert!(matches!(err, Error::MessageMaxSizeExceeded(2048)));
+
+        Ok(())
     }
 
     #[test]

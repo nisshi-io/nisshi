@@ -28,7 +28,7 @@ use serde::{
 use tracing::{debug, error, instrument};
 
 use crate::{
-    ByteSize, Compression, Decode as _, Decoder, Encode, Error, Result,
+    ByteSize, Compression, Decode as _, Decoder, Encode, Error, ErrorCode, Result,
     record::{
         Header, Record,
         codec::{
@@ -257,19 +257,31 @@ impl Batch {
 
     /// The CRC-32C of this batch's current contents, as Kafka's own encoder
     /// would compute it: everything from `attributes` through `record_data`.
-    pub fn computed_crc(&self) -> Result<u32> {
+    pub fn computed_crc(&self) -> u32 {
         CrcData::from(self).crc()
     }
 
-    /// Recomputes `crc` from this batch's current contents.
+    /// Sets `base_timestamp` and `max_timestamp`, and recomputes `crc` so
+    /// that it covers the new values.
     ///
-    /// Anything that mutates a field covered by the CRC after the batch was
-    /// built (for example, rewriting `max_timestamp` to match its records'
-    /// actual maximum, or rewriting `base_timestamp`/`max_timestamp` for a
-    /// `LogAppendTime` batch) must call this afterwards, or `crc` goes stale
-    /// and a client re-decoding the stored bytes sees a corrupted batch.
-    pub fn recompute_crc(&mut self) -> Result<()> {
-        self.crc = self.computed_crc()?;
+    /// The method verifies `crc` against the current contents first, because
+    /// a new `crc` would make a batch that was damaged in transit look intact
+    /// to every consumer. Kafka rejects such a batch with `CORRUPT_MESSAGE`
+    /// before it validates timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ApiError`] with [`ErrorCode::CorruptMessage`] when
+    /// `crc` does not match the current contents. The batch is then
+    /// unchanged.
+    pub fn set_timestamps(&mut self, base_timestamp: i64, max_timestamp: i64) -> Result<()> {
+        if self.computed_crc() != self.crc {
+            return Err(Error::ApiError(ErrorCode::CorruptMessage));
+        }
+
+        self.base_timestamp = base_timestamp;
+        self.max_timestamp = max_timestamp;
+        self.crc = self.computed_crc();
         Ok(())
     }
 }
@@ -285,39 +297,6 @@ struct CrcData {
     pub base_sequence: i32,
     pub record_count: u32,
     pub record_data: Bytes,
-}
-
-impl TryFrom<&CrcData> for Bytes {
-    type Error = Error;
-
-    fn try_from(value: &CrcData) -> result::Result<Self, Self::Error> {
-        let mut encoded = value.size_in_bytes().map(BytesMut::with_capacity)?;
-        encoded.put_i16(value.attributes);
-        encoded.put_i32(value.last_offset_delta);
-        encoded.put_i64(value.base_timestamp);
-        encoded.put_i64(value.max_timestamp);
-        encoded.put_i64(value.producer_id);
-        encoded.put_i16(value.producer_epoch);
-        encoded.put_i32(value.base_sequence);
-        encoded.put_u32(value.record_count);
-        encoded.put(&value.record_data[..]);
-
-        Ok(Bytes::from(encoded))
-    }
-}
-
-impl ByteSize for CrcData {
-    fn size_in_bytes(&self) -> Result<usize> {
-        Ok(size_of_val(&self.attributes)
-            + size_of_val(&self.last_offset_delta)
-            + size_of_val(&self.base_timestamp)
-            + size_of_val(&self.max_timestamp)
-            + size_of_val(&self.producer_id)
-            + size_of_val(&self.producer_epoch)
-            + size_of_val(&self.base_sequence)
-            + size_of_val(&self.record_count)
-            + self.record_data.len())
-    }
 }
 
 impl From<&Batch> for CrcData {
@@ -338,9 +317,8 @@ impl From<&Batch> for CrcData {
 
 impl CrcData {
     fn into_batch(self, base_offset: i64, partition_leader_epoch: i32, magic: i8) -> Result<Batch> {
-        let crc = self
-            .crc()
-            .inspect(|crc| debug!(?self, base_offset, partition_leader_epoch, magic, crc))?;
+        let crc = self.crc();
+        debug!(?self, base_offset, partition_leader_epoch, magic, crc);
 
         Ok(Batch {
             base_offset,
@@ -360,14 +338,22 @@ impl CrcData {
         })
     }
 
-    fn crc(&self) -> Result<u32> {
-        let encoded = Bytes::try_from(self)?;
-        debug!(encoded = ?&encoded[..]);
+    fn crc(&self) -> u32 {
+        let mut header = Vec::with_capacity(FIXED_CRC_HEADER_LENGTH);
+        header.put_i16(self.attributes);
+        header.put_i32(self.last_offset_delta);
+        header.put_i64(self.base_timestamp);
+        header.put_i64(self.max_timestamp);
+        header.put_i64(self.producer_id);
+        header.put_i16(self.producer_epoch);
+        header.put_i32(self.base_sequence);
+        header.put_u32(self.record_count);
 
         let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-        digest.update(&encoded[..]);
+        digest.update(&header[..]);
+        digest.update(&self.record_data[..]);
 
-        Ok(digest.finalize() as u32)
+        digest.finalize() as u32
     }
 }
 
@@ -605,6 +591,11 @@ const FIXED_BATCH_LENGTH: usize =
     + size_of::<i32>()
     // record count
     + size_of::<u32>();
+
+/// The length of the fixed fields that the CRC covers: `attributes` through
+/// `record_count`, the part of [`FIXED_BATCH_LENGTH`] after the CRC itself.
+const FIXED_CRC_HEADER_LENGTH: usize =
+    FIXED_BATCH_LENGTH - size_of::<i32>() - size_of::<i8>() - size_of::<u32>();
 
 impl<'de> Deserialize<'de> for Batch {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1597,16 +1588,13 @@ mod tests {
             .build()
             .and_then(TryInto::try_into)?;
 
-        assert_eq!(batch.crc, batch.computed_crc()?);
+        assert_eq!(batch.crc, batch.computed_crc());
 
         Ok(())
     }
 
-    /// Rewriting a field the CRC covers (here `base_timestamp`, the way
-    /// `ProduceService` rewrites it) must leave the stored `crc` stale until
-    /// [`Batch::recompute_crc`] is called.
     #[test]
-    fn recompute_crc_fixes_a_rewritten_field() -> Result<()> {
+    fn set_timestamps_recomputes_the_crc() -> Result<()> {
         let _guard = init_tracing()?;
 
         let mut batch: Batch = inflated::Batch::builder()
@@ -1616,12 +1604,32 @@ mod tests {
 
         let original_crc = batch.crc;
 
-        batch.base_timestamp += 1;
-        assert_eq!(original_crc, batch.crc);
-        assert_ne!(batch.computed_crc()?, batch.crc);
+        batch.set_timestamps(batch.base_timestamp + 1, batch.max_timestamp + 2)?;
 
-        batch.recompute_crc()?;
-        assert_eq!(batch.computed_crc()?, batch.crc);
+        assert_ne!(original_crc, batch.crc);
+        assert_eq!(batch.computed_crc(), batch.crc);
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_timestamps_rejects_a_batch_whose_crc_does_not_match() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut batch: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        batch.crc ^= 1;
+        let damaged = batch.clone();
+
+        let err = batch
+            .set_timestamps(batch.base_timestamp, batch.max_timestamp + 1)
+            .expect_err("a batch whose crc does not match must be rejected");
+
+        assert!(matches!(err, Error::ApiError(ErrorCode::CorruptMessage)));
+        assert_eq!(damaged, batch);
 
         Ok(())
     }
