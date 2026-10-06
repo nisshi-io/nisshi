@@ -95,26 +95,24 @@ pub(super) struct TopicMetadata {
 
 /// Watermark for a topic partition
 ///
-/// `timestamps` is a deprecated field, kept at its original (3rd) position
-/// purely so that decoding legacy (pre-time-index) bytes can be detected: a
-/// postcard decode of this (now 5-field) shape against legacy 3-field bytes
-/// fails, which is the signal `Engine::partition_watermark`/`decode_watermark`
-/// use to fall back to [`WatermarkLegacy`] and (on a write path) backfill the
-/// time index. Nothing writes to `timestamps` any more; the time index lives
-/// in the `t/` keyspace (see [`TimeIndexKey`]), keyed correctly by
-/// `max_timestamp` rather than this field's old (and buggy) `base_timestamp`
-/// keying.
+/// The engine always writes `timestamps` as `None`. The field keeps its 3rd
+/// position so that the two layouts stay distinguishable in both directions:
+/// a [`WatermarkLegacy`] value is too short to decode as this shape, and a
+/// binary that knows only [`WatermarkLegacy`] still reads `low` and `high`
+/// from this shape, because postcard ignores trailing bytes. The time index
+/// lives in the `t/` keyspace (see [`TimeIndexKey`]).
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct Watermark {
     pub low: Option<i64>,
     pub high: Option<i64>,
     pub timestamps: Option<BTreeMap<i64, i64>>,
-    /// The greatest `max_timestamp` ever appended to the `t/` time index for
+    /// The greatest `max_timestamp` appended to the `t/` time index for
     /// this partition, via the monotonic "maybeAppend" rule matching Kafka's
     /// own `TimeIndex` (floored at `NO_TIMESTAMP = -1`, so a negative
-    /// timestamp is never indexed/never advances this). `None` means the
-    /// index holds nothing for this partition: either it is genuinely empty,
-    /// or every batch so far had a `max_timestamp <= -1`.
+    /// timestamp is never indexed/never advances this). A prune that empties
+    /// the partition resets it to `None`, and a compaction recomputes it from
+    /// the surviving batches. `None` means no batch since then had a
+    /// `max_timestamp > -1`.
     pub latest_indexed_timestamp: Option<i64>,
     /// The `max_timestamp` header of the most recently appended batch,
     /// unconditionally (not floored, not gated by the monotonic rule above).
@@ -124,10 +122,10 @@ pub(super) struct Watermark {
     pub last_batch_max_timestamp: Option<i64>,
 }
 
-/// The pre-time-index, 3-field shape of [`Watermark`]. A stored watermark
-/// that fails to decode as the current shape is re-parsed as this shape
-/// (ANY decode error, not just a specific error kind: any shape mismatch
-/// means "not the current format"). See [`Watermark`] for why this works.
+/// The 3-field watermark layout, written by a binary that does not maintain
+/// the `t/` time index. The engine reads a stored watermark as this layout
+/// only when it fails to decode as [`Watermark`] and decodes as this layout
+/// with no bytes left over.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct WatermarkLegacy {
     pub low: Option<i64>,

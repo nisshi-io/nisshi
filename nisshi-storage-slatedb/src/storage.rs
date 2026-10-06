@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     iter,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -56,7 +56,7 @@ use nisshi_storage::{
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
 };
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::engine::Engine;
@@ -93,18 +93,13 @@ impl Engine {
             .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == policy))
     }
 
-    /// Load a partition's watermark inside a write transaction, migrating a
-    /// legacy (pre-time-index) value in place.
+    /// Load a partition's watermark inside a write transaction, and migrate
+    /// a [`WatermarkLegacy`] value in place.
     ///
-    /// A postcard decode failure against the current (5-field) shape is
-    /// treated as "legacy 3-field bytes" (broadened past any specific error
-    /// kind - any shape mismatch means "not the current format"). On that
-    /// fallback, the time index is backfilled by replaying the monotonic
-    /// rule over every batch currently in the `b/` keyspace for this
-    /// partition (`Self::backfill_time_index`), rather than trusting the
-    /// old, lossy, wrongly-`base_timestamp`-keyed `timestamps` map. The
-    /// backfill's `t/` writes land in `tx`, so they commit atomically with
-    /// whatever write triggered this load.
+    /// A legacy watermark carries no trustworthy time index, so this
+    /// rebuilds the `t/` entries from the partition's `b/` batch headers
+    /// (`Self::backfill_time_index`). The rebuild writes to `tx`, so it
+    /// commits atomically with the write that loaded the watermark.
     async fn partition_watermark(
         &self,
         tx: &slatedb::DbTransaction,
@@ -117,49 +112,56 @@ impl Engine {
             return Ok(Watermark::default());
         };
 
-        match postcard::from_bytes::<Watermark>(&encoded) {
-            Ok(watermark) => Ok(watermark),
-            Err(_) => {
-                let legacy: WatermarkLegacy = postcard::from_bytes(&encoded)?;
-                let mut watermark = Watermark {
-                    low: legacy.low,
-                    high: legacy.high,
-                    timestamps: None,
-                    latest_indexed_timestamp: None,
-                    last_batch_max_timestamp: None,
-                };
-                self.backfill_time_index(tx, topic, partition, &mut watermark)
-                    .await?;
-                Ok(watermark)
-            }
+        let (mut watermark, legacy) = Self::decode_watermark(&encoded)?;
+
+        if legacy {
+            let started = Instant::now();
+            let batches = self
+                .backfill_time_index(tx, topic, partition, &mut watermark)
+                .await?;
+            info!(
+                ?topic,
+                partition,
+                batches,
+                elapsed_ms = started.elapsed().as_millis(),
+                "migrated legacy watermark and rebuilt time index"
+            );
         }
+
+        Ok(watermark)
     }
 
-    /// Decode a stored watermark, tolerating the legacy 3-field shape.
+    /// Decode a stored watermark in either the current or the
+    /// [`WatermarkLegacy`] layout.
     ///
-    /// Used by read-only paths (`list_offsets`, `offset_stage`) that must
-    /// not perform the tx-based backfill in `Self::partition_watermark`. The
-    /// `bool` is `true` when the legacy fallback fired: callers use it to
-    /// skip any shortcut that trusts `latest_indexed_timestamp` as
-    /// authoritative, since a legacy watermark's index has not been
-    /// backfilled yet and so understates reality rather than reflecting it.
+    /// The `bool` is `true` for a legacy watermark. Its time index is not
+    /// built yet, so a caller must not trust `latest_indexed_timestamp` as
+    /// an upper bound for that partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the legacy decode error when `encoded` is neither a current
+    /// watermark nor exactly a legacy one.
     fn decode_watermark(encoded: &[u8]) -> Result<(Watermark, bool)> {
-        match postcard::from_bytes::<Watermark>(encoded) {
-            Ok(watermark) => Ok((watermark, false)),
-            Err(_) => {
-                let legacy: WatermarkLegacy = postcard::from_bytes(encoded)?;
-                Ok((
-                    Watermark {
-                        low: legacy.low,
-                        high: legacy.high,
-                        timestamps: None,
-                        latest_indexed_timestamp: None,
-                        last_batch_max_timestamp: None,
-                    },
-                    true,
-                ))
-            }
+        if let Ok(watermark) = postcard::from_bytes::<Watermark>(encoded) {
+            return Ok((watermark, false));
         }
+
+        let (legacy, remainder) = postcard::take_from_bytes::<WatermarkLegacy>(encoded)?;
+        if !remainder.is_empty() {
+            return Err(postcard::Error::DeserializeBadEncoding.into());
+        }
+
+        Ok((
+            Watermark {
+                low: legacy.low,
+                high: legacy.high,
+                timestamps: None,
+                latest_indexed_timestamp: None,
+                last_batch_max_timestamp: None,
+            },
+            true,
+        ))
     }
 
     /// Append `(max_timestamp, base_offset)` to the `t/` time index when
@@ -189,64 +191,52 @@ impl Engine {
         Ok(())
     }
 
-    /// Replay the monotonic rule (`Self::append_time_index`) over every
-    /// batch currently stored for `partition`, in offset order, rebuilding
-    /// the time index from `b/` batch headers only (no need to inflate
-    /// individual records). Used both to migrate a legacy watermark on
-    /// first write (`Self::partition_watermark`) and to rebuild the index
-    /// after compaction (`Self::policy_compact`), where pruning individual
-    /// `t/` entries would leave a coverage gap.
+    /// Rebuild the `t/` time index of `partition` from its `b/` batch
+    /// headers, and return the number of batches that the rebuild read.
     ///
-    /// Resets `latest_indexed_timestamp`/`last_batch_max_timestamp` on
-    /// `watermark` before replaying, so this is safe to call against a
-    /// `watermark` that already has entries in the index (the caller is
-    /// expected to have deleted them first via `Self::delete_time_index`).
+    /// This deletes every existing `t/` entry of the partition first, so an
+    /// entry that an older write left behind cannot survive the rebuild.
+    /// Then it replays the monotonic rule (`Self::append_time_index`) over
+    /// each batch in offset order.
     ///
-    /// Reads via `self.db.scan` rather than `tx.scan`, so a cold-start
-    /// migration triggered from inside `delete_records`/`policy_delete`
-    /// (which issue their `b/` deletes on `tx` *before* calling
-    /// `Self::partition_watermark`) sees the pre-delete, still-committed
-    /// state: it can backfill a `t/` entry for a `base_offset` that this
-    /// same transaction is about to delete, so after commit the index
-    /// transiently names an offset with no batch behind it. This is
-    /// harmless: every lookup through it (`Self::list_offset_for_timestamp`)
-    /// only uses an entry's offset as a *starting point* for the forward
-    /// scan, never requires an exact match there, so at worst it starts a
-    /// little earlier than strictly necessary - and the next compaction
-    /// rebuilds the index from survivors anyway.
+    /// This reads through `tx`, so the rebuild sees the batch deletes that
+    /// `tx` already holds, and a concurrent write to the partition makes
+    /// `tx` fail to commit.
     async fn backfill_time_index(
         &self,
         tx: &slatedb::DbTransaction,
         topic: Uuid,
         partition: i32,
         watermark: &mut Watermark,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        self.delete_time_index(tx, topic, partition).await?;
         watermark.latest_indexed_timestamp = None;
         watermark.last_batch_max_timestamp = None;
 
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic, partition))?;
-        let scan_start = postcard::to_stdvec(&BatchKey::scan_from(topic, partition, 0))?;
 
-        let mut scan = self.db.scan(scan_start..).await?;
+        let mut batches = 0;
+        let mut scan = tx.scan_prefix(&prefix, ..).await?;
         while let Some(kv) = scan.next().await? {
-            if !kv.key.starts_with(&prefix) {
-                break;
-            }
-
             let key: BatchKey = postcard::from_bytes(&kv.key)?;
+            batches += 1;
 
-            // A batch whose header fails to decode is skipped, not a hard
-            // failure for the whole backfill: this replays history on a
-            // best-effort basis, and one unreadable batch should not take
-            // down every other partition's migration in the same write.
-            let Ok(batch) = self.decode(kv.value) else {
-                tracing::warn!(
-                    ?topic,
-                    partition,
-                    offset = key.offset,
-                    "skipping undecodable batch during time index backfill"
-                );
-                continue;
+            // The backfill skips a batch whose header fails to decode,
+            // instead of failing, because a failure aborts the write that
+            // triggered the migration, and every later write to the
+            // partition fails the same way.
+            let batch = match self.decode(kv.value) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::warn!(
+                        ?topic,
+                        partition,
+                        offset = key.offset,
+                        ?error,
+                        "skipping undecodable batch during time index backfill"
+                    );
+                    continue;
+                }
             };
 
             Self::append_time_index(
@@ -259,31 +249,27 @@ impl Engine {
             )?;
         }
 
-        Ok(())
+        Ok(batches)
     }
 
-    /// Clear `last_batch_max_timestamp` once pruning (`delete_records`/
-    /// `policy_delete`) has left `partition` fully empty (`low >= high`).
+    /// Clear the time-index state of `watermark` when pruning has left the
+    /// partition empty (`low >= high`).
     ///
-    /// `last_batch_max_timestamp` is always the highest-offset batch's own
-    /// header, so it only goes stale when that batch itself is gone - i.e.
-    /// exactly when the partition is now empty, never on a partial prefix
-    /// prune. Without this, `ListOffsets(Latest)`'s O(1) fast path
-    /// (`Storage::list_offsets`) keeps answering with a timestamp for a
-    /// batch that no longer exists; `main`'s pre-time-index, map-based
-    /// watermark didn't have this problem because the map naturally
-    /// emptied along with the data. `policy_compact` doesn't need this
-    /// helper: it always fully resets-and-replays the index already.
-    fn clear_latest_if_partition_empty(watermark: &mut Watermark) {
+    /// `last_batch_max_timestamp` belongs to the highest-offset batch, and
+    /// `latest_indexed_timestamp` to the newest `t/` entry. A prune removes
+    /// that batch, and that entry, only when it removes every batch. Without
+    /// this reset, `ListOffsets(Latest)` answers with the timestamp of a
+    /// deleted batch, and the monotonic rule refuses to index a refill whose
+    /// timestamps are older than the deleted data.
+    fn clear_time_index_state_if_partition_empty(watermark: &mut Watermark) {
         if watermark.low.unwrap_or(0) >= watermark.high.unwrap_or(0) {
+            watermark.latest_indexed_timestamp = None;
             watermark.last_batch_max_timestamp = None;
         }
     }
 
-    /// Delete every `t/` entry for `partition`. Used before replaying the
-    /// index from scratch (`Self::backfill_time_index` via
-    /// `Self::policy_compact`) and when a topic is deleted
-    /// (`Self::delete_topic`).
+    /// Delete every `t/` entry for `partition`, reading through `tx` so
+    /// that a concurrent append to the index makes `tx` fail to commit.
     async fn delete_time_index(
         &self,
         tx: &slatedb::DbTransaction,
@@ -291,13 +277,9 @@ impl Engine {
         partition: i32,
     ) -> Result<()> {
         let prefix = postcard::to_stdvec(&TimeIndexKeyPrefix::new(topic, partition))?;
-        let scan_start = postcard::to_stdvec(&TimeIndexKey::scan_from(topic, partition, 0))?;
 
-        let mut scan = self.db.scan(scan_start..).await?;
+        let mut scan = tx.scan_prefix(&prefix, ..).await?;
         while let Some(kv) = scan.next().await? {
-            if !kv.key.starts_with(&prefix) {
-                break;
-            }
             tx.delete(&kv.key)?;
         }
 
@@ -341,9 +323,9 @@ impl Engine {
         Ok(())
     }
 
-    /// `ListOffsets(Timestamp)`: the offset of the first record with an
-    /// absolute timestamp `>= target_millis`, found by this lookup
-    /// algorithm:
+    /// `ListOffsets(Timestamp)`: the offset of the first record at or after
+    /// `low` with an absolute timestamp `>= target_millis`, found by this
+    /// lookup algorithm:
     ///
     /// 1. `target_millis` beyond everything ever indexed means no match,
     ///    answered in O(1) - *unless* `legacy` is set, in which case the
@@ -354,9 +336,10 @@ impl Engine {
     ///    deletes old `t/` entries but not the batches between the new
     ///    `low` and the first remaining entry (Kafka never hits this
     ///    because its index is per-segment, so deleting old segments can't
-    ///    uncover anything). Start at `low` whenever the index can't rule
-    ///    that gap out (empty, or its first entry is already `>= target`),
-    ///    otherwise start at the ceiling entry's offset.
+    ///    uncover anything). Start at the batch that holds `low` whenever
+    ///    the index can't rule that gap out (empty, or its first entry is
+    ///    already `>= target`), otherwise start at the ceiling entry's
+    ///    offset.
     /// 3. Sequentially scan `b/` batches forward from there
     ///    (`Self::sequential_timestamp_scan`).
     async fn list_offset_for_timestamp(
@@ -390,23 +373,36 @@ impl Engine {
 
         let low = watermark.low.unwrap_or(0);
 
-        let start_offset = match first_indexed {
+        let ceiling = match first_indexed {
             Some(first_ts) if first_ts < target_millis => {
                 let from =
                     postcard::to_stdvec(&TimeIndexKey::scan_from(topic, partition, target_millis))?;
                 let mut scan = self.db.scan(from..).await?;
                 match scan.next().await? {
                     Some(kv) if kv.key.starts_with(&index_prefix) => {
-                        postcard::from_bytes(&kv.value)?
+                        Some(postcard::from_bytes::<i64>(&kv.value)?)
                     }
-                    _ => low,
+                    _ => None,
                 }
             }
-            _ => low,
+            _ => None,
+        };
+
+        let start_offset = match ceiling {
+            Some(offset) => offset,
+            None => {
+                // `low` can fall inside a batch, so the scan starts at the
+                // base of that batch, and `Self::sequential_timestamp_scan`
+                // drops each record below `low`.
+                let batch_prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic, partition))?;
+                self.batch_base_at_or_before(&batch_prefix, topic, partition, low)
+                    .await?
+                    .unwrap_or(low)
+            }
         };
 
         match self
-            .sequential_timestamp_scan(topic, partition, start_offset, target_millis)
+            .sequential_timestamp_scan(topic, partition, start_offset, low, target_millis)
             .await?
         {
             Some((offset, ts)) => Ok(ListOffsetResponse {
@@ -422,24 +418,20 @@ impl Engine {
         }
     }
 
-    /// Scan `b/` batches forward from `start_offset`, skipping a batch
-    /// whose header `max_timestamp` rules it out, and inspecting records
-    /// otherwise. A header can overstate - but never understate - the
-    /// true max after compaction leaves it stale, so a qualifying header is
-    /// a reason to look, not a match by itself:
+    /// Scan `b/` batches forward from `start_offset` for the first record at
+    /// or after `low` with a timestamp `>= target_millis`. The scan skips a
+    /// batch whose header `max_timestamp` rules it out, and inspects the
+    /// records of every other batch. A header can overstate - but never
+    /// understate - the true max after compaction leaves it stale, so a
+    /// qualifying header is a reason to look, not a match by itself:
     /// skipping straight to a batch's own `base_offset` without checking
     /// its records would be the exact bug this scan exists to avoid.
-    ///
-    /// A batch whose header fails to decode, or whose records fail to
-    /// inflate (corrupt/malformed data either way), is treated as
-    /// contributing nothing and skipped, rather than failing the whole
-    /// lookup: the primary thing a `ListOffsets` caller needs is the
-    /// `offset`, and a best-effort `timestamp` should not take that down.
     async fn sequential_timestamp_scan(
         &self,
         topic: Uuid,
         partition: i32,
         start_offset: i64,
+        low: i64,
         target_millis: i64,
     ) -> Result<Option<(i64, i64)>> {
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic, partition))?;
@@ -453,35 +445,47 @@ impl Engine {
 
             let key: BatchKey = postcard::from_bytes(&kv.key)?;
 
-            let Ok(deflated) = self.decode(kv.value) else {
-                tracing::warn!(
-                    ?topic,
-                    partition,
-                    offset = key.offset,
-                    "skipping undecodable batch during timestamp scan"
-                );
-                continue;
+            // The scan skips a batch that fails to decode or to inflate,
+            // instead of failing the lookup, so that one corrupt batch does
+            // not fail every `ListOffsets(Timestamp)` on the partition.
+            // Kafka returns an error for a corrupt batch here; this is a
+            // deliberate difference.
+            let deflated = match self.decode(kv.value) {
+                Ok(deflated) => deflated,
+                Err(error) => {
+                    tracing::warn!(
+                        ?topic,
+                        partition,
+                        offset = key.offset,
+                        ?error,
+                        "skipping undecodable batch during timestamp scan"
+                    );
+                    continue;
+                }
             };
 
             if deflated.max_timestamp < target_millis {
                 continue;
             }
 
-            let Ok(inflated) = InflatedBatch::try_from(deflated.clone()) else {
-                tracing::warn!(
-                    ?topic,
-                    partition,
-                    offset = key.offset,
-                    "skipping un-inflatable batch during timestamp scan"
-                );
-                continue;
+            let inflated = match InflatedBatch::try_from(deflated.clone()) {
+                Ok(inflated) => inflated,
+                Err(error) => {
+                    tracing::warn!(
+                        ?topic,
+                        partition,
+                        offset = key.offset,
+                        ?error,
+                        "skipping un-inflatable batch during timestamp scan"
+                    );
+                    continue;
+                }
             };
 
-            if let Some(record) = inflated
-                .records
-                .iter()
-                .find(|record| deflated.base_timestamp + record.timestamp_delta >= target_millis)
-            {
+            if let Some(record) = inflated.records.iter().find(|record| {
+                key.offset + i64::from(record.offset_delta) >= low
+                    && deflated.base_timestamp + record.timestamp_delta >= target_millis
+            }) {
                 return Ok(Some((
                     key.offset + i64::from(record.offset_delta),
                     deflated.base_timestamp + record.timestamp_delta,
@@ -497,10 +501,7 @@ impl Engine {
     /// a batch whose header fails to decode or whose records fail to
     /// inflate (corrupt/malformed data; see `Self::sequential_timestamp_scan`
     /// for why this degrades gracefully rather than failing the call). Used
-    /// for `ListOffsets(Earliest)`'s timestamp, decoupled from the old
-    /// (lossy, wrongly keyed) `timestamps` map via the same
-    /// `batch_base_at_or_after`/`batch_base_at_or_before` helpers `fetch`
-    /// uses to locate the batch covering an arbitrary offset.
+    /// for `ListOffsets(Earliest)`'s timestamp.
     async fn timestamp_at_offset(
         &self,
         topic: Uuid,
@@ -687,7 +688,7 @@ impl Engine {
 
                 self.prune_time_index_below(&tx, metadata.id, partition, low)
                     .await?;
-                Self::clear_latest_if_partition_empty(&mut watermark);
+                Self::clear_time_index_state_if_partition_empty(&mut watermark);
 
                 let watermark_key =
                     postcard::to_stdvec(&WatermarkKey::new(metadata.id, partition))?;
@@ -713,26 +714,29 @@ impl Engine {
             .filter(|metadata| Self::has_cleanup_policy(metadata, COMPACT))
         {
             for partition in 0..metadata.topic.num_partitions {
-                let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, partition))?;
-                let scan_start =
-                    postcard::to_stdvec(&BatchKey::scan_from(metadata.id, partition, 0))?;
-
-                let mut batches = vec![];
-                let mut scan = self.db.scan(scan_start..).await?;
-                while let Some(kv) = scan.next().await? {
-                    if !kv.key.starts_with(&prefix) {
-                        break;
-                    }
-                    let key: BatchKey = postcard::from_bytes(&kv.key)?;
-                    let batch = self.decode(kv.value)?;
-                    batches.push((kv.key, key.offset, batch));
-                }
-
                 let tx = self
                     .db
                     .begin(slatedb::IsolationLevel::SerializableSnapshot)
                     .await
                     .inspect_err(|err| debug!(?err))?;
+
+                // The compaction reads the batches, and later the time
+                // index, through `tx`, never through `self.db`. A read
+                // through `tx` registers its range for conflict detection,
+                // so a produce that commits to this partition during the
+                // compaction makes `tx` fail to commit. A read through
+                // `self.db` sees that produce's batch nowhere and its `t/`
+                // entry in the index, so the rebuild below deletes the
+                // entry and never adds it back.
+                let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, partition))?;
+
+                let mut batches = vec![];
+                let mut scan = tx.scan_prefix(&prefix, ..).await?;
+                while let Some(kv) = scan.next().await? {
+                    let key: BatchKey = postcard::from_bytes(&kv.key)?;
+                    let batch = self.decode(kv.value)?;
+                    batches.push((kv.key, key.offset, batch));
+                }
 
                 // Working from the newest batch to the oldest, a record is
                 // dropped when its key reappears in a newer batch.
@@ -805,15 +809,13 @@ impl Engine {
                 // log start would answer OFFSET_OUT_OF_RANGE and reset the
                 // consumer. Only retention and DeleteRecords move it.
 
-                // Pruning individual `t/` entries here (as the old
-                // `timestamps`-map code did) can leave a coverage gap: a
-                // partially-compacted survivor keeps its original header
-                // verbatim (see `Builder::build`), which can now be stale,
-                // and any entry naming a since-deleted base_offset is
-                // simply wrong. Rebuild from scratch instead, replaying the
-                // monotonic rule over the survivors in offset order - the
-                // same full-rebuild Kafka's own LogCleaner does on segment
-                // compaction.
+                // The compaction rebuilds the time index from the surviving
+                // batches, in offset order, instead of deleting only the
+                // entries of removed batches. A removed batch can hold the
+                // only entry that covers a later, unindexed survivor, so a
+                // per-entry delete leaves a gap in the index. Kafka's
+                // LogCleaner also rebuilds the time index of a segment that
+                // it compacts.
                 self.delete_time_index(&tx, metadata.id, partition).await?;
                 watermark.latest_indexed_timestamp = None;
                 watermark.last_batch_max_timestamp = None;
@@ -1046,7 +1048,7 @@ impl Storage for Engine {
                                 new_low_watermark,
                             )
                             .await?;
-                            Self::clear_latest_if_partition_empty(&mut watermark);
+                            Self::clear_time_index_state_if_partition_empty(&mut watermark);
 
                             let watermark_key = postcard::to_stdvec(&WatermarkKey::new(
                                 metadata.id,
@@ -1842,6 +1844,11 @@ impl Storage for Engine {
                     }
                 }
                 ListOffset::Timestamp(target_ts) => {
+                    // This lookup ignores `isolation_level`. Kafka drops a
+                    // match at or above the last fetchable offset (the last
+                    // stable offset for ReadCommitted), and this engine does
+                    // not; that is a known difference.
+                    //
                     // target_ts is SystemTime, need to convert to i64 for comparison
                     let target_millis = target_ts
                         .duration_since(SystemTime::UNIX_EPOCH)

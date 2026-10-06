@@ -1518,6 +1518,84 @@ mod time_index {
         assert_eq!(150, millis_since_epoch(response.timestamp.unwrap()));
     }
 
+    /// The index is `{100->0, 150->2, 200->5}`, and the target equals the
+    /// middle entry. A ceiling seek that lands one entry too far starts the
+    /// scan at offset 5 and answers 5.
+    #[tokio::test]
+    async fn ceiling_scan_exact_middle_entry() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-ceiling-middle").await;
+
+        for (key, timestamp) in [
+            (b"a", 100),
+            (b"b", 90),
+            (b"c", 150),
+            (b"d", 120),
+            (b"e", 130),
+            (b"f", 200),
+        ] {
+            let _ = engine
+                .produce(None, &topition, keyed_batch(key, b"v", timestamp))
+                .await
+                .unwrap();
+        }
+
+        let topic = topic_uuid(&engine, "time-index-ceiling-middle").await;
+        assert_eq!(3, time_index_count(&engine, topic, 0).await);
+
+        let response = list_offsets_timestamp(&engine, &topition, 150).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(2), response.offset);
+        assert_eq!(150, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
+    /// The log start offset falls inside the only batch. The lookup must
+    /// inspect that batch, and must not answer a record below the log start.
+    #[tokio::test]
+    async fn timestamp_lookup_skips_records_below_log_start_in_straddling_batch() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-straddle").await;
+        let topic = topic_uuid(&engine, "time-index-straddle").await;
+
+        // One batch: offsets 0-4, timestamps 10, 20, 30, 40, 50.
+        let batch = {
+            let mut builder = inflated::Batch::builder()
+                .base_timestamp(10)
+                .max_timestamp(50)
+                .last_offset_delta(4);
+
+            for delta in 0..5 {
+                builder = builder.record(
+                    Record::builder()
+                        .key(None)
+                        .value(Some(Bytes::from_static(b"v")))
+                        .offset_delta(delta)
+                        .timestamp_delta(i64::from(delta) * 10),
+                );
+            }
+
+            builder.build().and_then(Batch::try_from).unwrap()
+        };
+        let _ = engine.produce(None, &topition, batch).await.unwrap();
+
+        // The test moves the log start to offset 2 and keeps the batch.
+        let mut watermark = watermark_of(&engine, topic, 0).await;
+        watermark.low = Some(2);
+        let watermark_key = postcard::to_stdvec(&WatermarkKey::new(topic, 0)).unwrap();
+        let _ = engine
+            .db
+            .put(watermark_key, postcard::to_stdvec(&watermark).unwrap())
+            .await
+            .unwrap();
+
+        // Offset 1 (ts 20) is the first match in the batch, but it is below
+        // the log start, so the answer is offset 2 (ts 30).
+        let response = list_offsets_timestamp(&engine, &topition, 15).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(2), response.offset);
+        assert_eq!(30, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
     #[tokio::test]
     async fn future_timestamp_returns_no_match() {
         let (engine, topition) = ceiling_fixture("time-index-ceiling-future").await;
@@ -1973,6 +2051,129 @@ mod time_index {
         assert_eq!(ErrorCode::None, response.error_code);
         assert_eq!(Some(1), response.offset);
         assert!(response.timestamp.is_none());
+    }
+
+    /// A refill after `delete_records` empties the partition is indexed
+    /// again, even when its timestamps are older than the deleted data.
+    #[tokio::test]
+    async fn refill_after_emptying_partition_is_indexed() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-refill").await;
+        let topic = topic_uuid(&engine, "time-index-refill").await;
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"a", b"v", 1000))
+            .await
+            .unwrap();
+
+        let delete_request = vec![
+            DeleteRecordsTopic::default()
+                .name("time-index-refill".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(1),
+                ])),
+        ];
+        let _ = engine.delete_records(&delete_request).await.unwrap();
+
+        let watermark = watermark_of(&engine, topic, 0).await;
+        assert_eq!(None, watermark.latest_indexed_timestamp);
+        assert_eq!(0, time_index_count(&engine, topic, 0).await);
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"a", b"v", 500))
+            .await
+            .unwrap();
+
+        let watermark = watermark_of(&engine, topic, 0).await;
+        assert_eq!(Some(500), watermark.latest_indexed_timestamp);
+        assert_eq!(1, time_index_count(&engine, topic, 0).await);
+
+        let response = list_offsets_timestamp(&engine, &topition, 400).await;
+        assert_eq!(Some(1), response.offset);
+        assert_eq!(500, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
+    /// A partially emptied partition keeps `latest_indexed_timestamp`, so
+    /// the monotonic rule still holds for the surviving batches.
+    #[tokio::test]
+    async fn partial_prune_keeps_latest_indexed_timestamp() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-partial-prune").await;
+        let topic = topic_uuid(&engine, "time-index-partial-prune").await;
+
+        for timestamp in [1000, 2000] {
+            let _ = engine
+                .produce(None, &topition, keyed_batch(b"a", b"v", timestamp))
+                .await
+                .unwrap();
+        }
+
+        let delete_request = vec![
+            DeleteRecordsTopic::default()
+                .name("time-index-partial-prune".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(1),
+                ])),
+        ];
+        let _ = engine.delete_records(&delete_request).await.unwrap();
+
+        let watermark = watermark_of(&engine, topic, 0).await;
+        assert_eq!(Some(2000), watermark.latest_indexed_timestamp);
+        assert_eq!(Some(2000), watermark.last_batch_max_timestamp);
+    }
+
+    /// The legacy migration deletes every existing `t/` entry before it
+    /// rebuilds the index, so an entry that does not match the batches
+    /// cannot survive it.
+    #[tokio::test]
+    async fn legacy_migration_deletes_stale_time_index_entries() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-legacy-stale").await;
+        let topic = topic_uuid(&engine, "time-index-legacy-stale").await;
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"a", b"v", 100))
+            .await
+            .unwrap();
+
+        // An entry for a batch that does not exist.
+        let stale_key = postcard::to_stdvec(&TimeIndexKey::new(topic, 0, 500)).unwrap();
+        let _ = engine
+            .db
+            .put(stale_key, postcard::to_stdvec(&7i64).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(2, time_index_count(&engine, topic, 0).await);
+
+        let legacy = WatermarkLegacy {
+            low: Some(0),
+            high: Some(1),
+            timestamps: None,
+        };
+        let watermark_key = postcard::to_stdvec(&WatermarkKey::new(topic, 0)).unwrap();
+        let _ = engine
+            .db
+            .put(watermark_key, postcard::to_stdvec(&legacy).unwrap())
+            .await
+            .unwrap();
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"a", b"v", 200))
+            .await
+            .unwrap();
+
+        // The rebuild indexes 100->0 and the produce appends 200->1.
+        assert_eq!(2, time_index_count(&engine, topic, 0).await);
+        let watermark = watermark_of(&engine, topic, 0).await;
+        assert_eq!(Some(200), watermark.latest_indexed_timestamp);
+
+        let response = list_offsets_timestamp(&engine, &topition, 150).await;
+        assert_eq!(Some(1), response.offset);
+        assert_eq!(200, millis_since_epoch(response.timestamp.unwrap()));
     }
 
     /// A worked example exercising the ceiling-then-scan lookup and the
