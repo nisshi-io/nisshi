@@ -91,6 +91,7 @@ use object_store::{
 };
 use rama::{Service as _, extensions::Extensions};
 use std::{
+    assert_matches,
     collections::VecDeque,
     sync::{Arc, Mutex},
     time::Duration,
@@ -646,4 +647,96 @@ fn end_txn_marker_write_failure_completes_transaction_anyway() {
         stats.execs, 3,
         "expected all 3 fault-slot combinations explored"
     );
+}
+
+/// A `txn_end` retry must repeat the decision that was prepared. After a
+/// commit whose partition 1 marker write failed, an abort retry would put
+/// abort markers on partition 1 after partition 0's commit marker; it is
+/// rejected with `InvalidTxnState`, and a commit retry still completes.
+#[test]
+fn end_txn_retry_with_opposite_decision_is_rejected() {
+    _ = verify(Config::builder().build(), || {
+        let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
+        let storage: ArcDynStorage = Arc::new(Box::new(
+            DynoStore::new("spike", 111, object_store.clone())
+                .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
+                .schemas(None)
+                .lake(None),
+        ));
+
+        let topic = alphanumeric_string(15);
+        _ = future::block_on(
+            storage.create_topic(
+                CreatableTopic::default()
+                    .name(topic.clone())
+                    .num_partitions(2)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            ),
+        )
+        .expect("create topic");
+
+        let transaction_id = alphanumeric_string(15);
+        let producer = future::block_on(storage.init_producer(
+            Some(&transaction_id),
+            10_000,
+            Some(-1),
+            Some(-1),
+        ))
+        .expect("init producer");
+
+        _ = future::block_on(
+            storage.txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: [AddPartitionsToTxnTopic::default()
+                    .name(topic.clone())
+                    .partitions(Some([0, 1].into()))]
+                .into(),
+            }),
+        )
+        .expect("add partitions");
+
+        for partition in 0..2 {
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Bytes::from_static(b"payload").into()))
+                .attributes(BatchAttribute::default().transaction(true).into())
+                .producer_id(producer.id)
+                .producer_epoch(producer.epoch)
+                .base_sequence(0)
+                .build()
+                .and_then(deflated::Batch::try_from)
+                .expect("well-formed batch");
+
+            _ = future::block_on(storage.produce(
+                Some(&transaction_id),
+                &Topition::new(topic.clone(), partition),
+                batch,
+            ))
+            .expect("produce");
+        }
+
+        // Partition 0's marker lands, partition 1's fails: the transaction is
+        // left in `PrepareCommit`.
+        object_store.schedule_record_write(false);
+        object_store.schedule_record_write(true);
+
+        _ = future::block_on(storage.txn_end(&transaction_id, producer.id, producer.epoch, true))
+            .expect_err("faulted marker write must surface as an error");
+
+        let opposite =
+            future::block_on(storage.txn_end(&transaction_id, producer.id, producer.epoch, false));
+        assert_matches!(
+            opposite,
+            Err(nisshi_storage::Error::Api(ErrorCode::InvalidTxnState))
+        );
+
+        let retry =
+            future::block_on(storage.txn_end(&transaction_id, producer.id, producer.epoch, true))
+                .expect("commit retry");
+        assert_eq!(retry, ErrorCode::None);
+    });
 }
