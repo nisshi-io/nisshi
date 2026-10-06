@@ -377,10 +377,15 @@ async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<()
 }
 
 /// `replication_factor` of `0` or less than `-1` must be rejected with
-/// `InvalidReplicationFactor`; `-1` (the "use the default" sentinel) must
-/// still succeed.
+/// `InvalidReplicationFactor` under both values of `validate_only`, and the
+/// topic must never reach storage (SlateDB's `create_topic` ignores
+/// `validate_only`, so the check has to run before storage either way).
+/// `-1` (the "use the default" sentinel) must still succeed.
 async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = CreateTopicsService {
+        storage: storage.clone(),
+    };
+    let describe = DescribeTopicPartitionsService {
         storage: storage.clone(),
     };
 
@@ -388,35 +393,81 @@ async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> R
     let assignments = Some([].into());
     let configs = Some([].into());
 
-    for replication_factor in [0, -2] {
-        let name = alphanumeric_string(15);
+    for validate_only in [false, true] {
+        for replication_factor in [0, -2] {
+            let name = alphanumeric_string(15);
 
-        let response = service
-            .serve(RequestInput {
-                request: CreateTopicsRequest::default()
-                    .topics(Some(vec![
-                        CreatableTopic::default()
-                            .name(name.clone())
-                            .num_partitions(num_partitions)
-                            .replication_factor(replication_factor)
-                            .assignments(assignments.clone())
-                            .configs(configs.clone()),
-                    ]))
-                    .validate_only(Some(false)),
-                extensions: Extensions::default(),
-            })
-            .await?;
+            let response = service
+                .serve(RequestInput {
+                    request: CreateTopicsRequest::default()
+                        .topics(Some(vec![
+                            CreatableTopic::default()
+                                .name(name.clone())
+                                .num_partitions(num_partitions)
+                                .replication_factor(replication_factor)
+                                .assignments(assignments.clone())
+                                .configs(configs.clone()),
+                        ]))
+                        .validate_only(Some(validate_only)),
+                    extensions: Extensions::default(),
+                })
+                .await?;
 
-        let topics = response.topics.unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(name, topics[0].name.as_str());
-        assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-        assert_eq!(
-            ErrorCode::InvalidReplicationFactor,
-            ErrorCode::try_from(topics[0].error_code)?,
-            "replication_factor = {replication_factor}"
-        );
+            let topics = response.topics.unwrap_or_default();
+            assert_eq!(1, topics.len());
+            assert_eq!(name, topics[0].name.as_str());
+            assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+            assert_eq!(
+                ErrorCode::InvalidReplicationFactor,
+                ErrorCode::try_from(topics[0].error_code)?,
+                "replication_factor = {replication_factor}, validate_only = {validate_only}"
+            );
+
+            let describe_response = describe
+                .serve(RequestInput {
+                    request: DescribeTopicPartitionsRequest::default()
+                        .topics(Some([TopicRequest::default().name(name.clone())].into())),
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            let describe_topics = describe_response.topics.unwrap_or_default();
+            assert_eq!(1, describe_topics.len());
+            assert_eq!(
+                ErrorCode::UnknownTopicOrPartition,
+                ErrorCode::try_from(describe_topics[0].error_code)?,
+                "replication_factor = {replication_factor}, validate_only = {validate_only} \
+                 must never have reached storage"
+            );
+        }
     }
+
+    // Both `num_partitions` and `replication_factor` invalid: the replication
+    // factor is checked first, as Kafka's KRaft controller does.
+    let name = alphanumeric_string(15);
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(name.clone())
+                        .num_partitions(0)
+                        .replication_factor(0)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(
+        ErrorCode::InvalidReplicationFactor,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
 
     // -1 still means "use the broker default".
     let name = alphanumeric_string(15);
