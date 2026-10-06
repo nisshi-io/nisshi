@@ -45,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OFFSET_OUT_OF_RANGE`, and an offset at or below the current log start is a
   no-op. The record or batch holding the last committed offset is never
   physically removed, even when deleting everything, so `ListOffsets(Latest)`
-  is unaffected by a `DeleteRecords` call. An unknown topic or an
+  is unaffected by a `DeleteRecords` call. `ListOffsets(Earliest)` answers
+  the new log start on every storage engine. An unknown topic or an
   out-of-range partition is reported per-partition and never fails a sibling
-  partition in the same request.
+  partition in the same request, and a partition that fails reports a low
+  watermark of `-1`, as Kafka does.

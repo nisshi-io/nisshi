@@ -58,11 +58,11 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    delete_records_cutoff,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, delete_records_cutoff,
 };
 use opentelemetry::{
     KeyValue,
@@ -1250,7 +1250,9 @@ impl Storage for Engine {
 
                     let (error_code, low_watermark) =
                         match self.watermark_select_for_update(&topition, &tx).await {
-                            Err(Error::Api(error_code)) => (error_code, 0),
+                            Err(Error::Api(error_code)) => {
+                                (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            }
                             Err(err) => return Err(err),
 
                             Ok((low, high)) => {
@@ -1261,21 +1263,15 @@ impl Storage for Engine {
                                 };
 
                                 match delete_records_cutoff(partition.offset, &stage) {
-                                    Err(error_code) => (error_code, stage.log_start),
+                                    Err(error_code) => {
+                                        (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                    }
 
                                     Ok(cutoff) => {
-                                        // Physically delete at most up to
-                                        // `high_watermark - 1`: the row
-                                        // holding the last committed offset
-                                        // is Kafka's active segment and must
-                                        // survive even a `cutoff ==
-                                        // high_watermark` ("delete
-                                        // everything") request, or
-                                        // `ListOffsets` (Latest) would
-                                        // regress once nothing is left to
-                                        // derive it from. The logical
-                                        // watermark below is still set to
-                                        // the full `cutoff`.
+                                        // This keeps the record at `high_watermark - 1`, because
+                                        // `list_latest_offset_committed.sql` and
+                                        // `list_latest_offset_uncommitted.sql` answer `Latest` from
+                                        // that record. The watermark still advances to `cutoff`.
                                         let physical_cutoff = cutoff.min(stage.high_watermark - 1);
 
                                         if physical_cutoff > stage.log_start {
@@ -2163,9 +2159,12 @@ impl Storage for Engine {
                         .and_then(|offset| {
                             row.get_value(1)
                                 .map_err(Into::into)
-                                .and_then(LiteTimestamp::try_from)
-                                .map(SystemTime::from)
-                                .map(Some)
+                                .and_then(|value| match value {
+                                    Value::Null => Ok(None),
+                                    value => LiteTimestamp::try_from(value)
+                                        .map(SystemTime::from)
+                                        .map(Some),
+                                })
                                 .map(|timestamp| {
                                     debug!(
                                         cluster = self.cluster,
@@ -4631,6 +4630,22 @@ mod tests {
             record_count, stage.high_watermark,
             "the active batch holding high_watermark - 1 must survive a -1 delete"
         );
+
+        // `offset_stage` reads the watermark only, so these check the
+        // records: `Latest` needs the record at `high_watermark - 1`, and
+        // `Earliest` must answer the log start and not that record.
+        let offsets = engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[
+                    (topition.clone(), ListOffsetRequest::Latest),
+                    (topition.clone(), ListOffsetRequest::Earliest),
+                ],
+            )
+            .await?;
+
+        assert_eq!(Some(record_count), offsets[0].1.offset, "{offsets:?}");
+        assert_eq!(Some(record_count), offsets[1].1.offset, "{offsets:?}");
 
         Ok(())
     }

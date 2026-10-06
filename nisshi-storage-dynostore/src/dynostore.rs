@@ -57,10 +57,11 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, delete_records_cutoff,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, delete_records_cutoff,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -430,26 +431,26 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
-    /// Best-effort physical reclaim for `DeleteRecords`: removes batch
-    /// objects in one partition that are now entirely below `cutoff`.
+    /// Removes the batch objects of one partition that lie entirely below
+    /// `cutoff`, after `DeleteRecords` has committed `cutoff` as the low
+    /// watermark.
     ///
-    /// Batches are stored one object per batch, named by their *base*
-    /// offset (the same layout `fetch` reads). A batch's end offset isn't
-    /// part of its key, so rather than decoding every candidate batch just
-    /// to check its span, this uses the next batch's base offset as the
-    /// exclusive upper bound: batches are produced back-to-back with no
-    /// gaps, so batch N's last offset is `objects[N + 1].base - 1`. The
-    /// last object in the partition has no successor, so its end can't be
-    /// bounded this way -- and it always holds `high_watermark - 1`,
-    /// Kafka's active segment, which must never be removed -- so it is
-    /// simply never a deletion candidate here.
+    /// Each failure is logged and skipped, instead of returned, because the
+    /// watermark advance has already taken effect: an error here would report
+    /// a failed request for a delete that succeeded.
     ///
-    /// Scoped to exactly this one partition's `records/` prefix, never the
-    /// whole topic: the broader a prefix delete, the more it can take out
-    /// by mistake.
-    async fn delete_records_batches(&self, topition: &Topition, cutoff: i64) -> Result<()> {
+    /// An object is named by the base offset of its batch, and the name does
+    /// not hold the end offset. A batch ends before the base offset of the
+    /// next batch, so this deletes an object when the next object's base
+    /// offset is at or below `cutoff`, without reading either object. The
+    /// last object has no successor, so this never deletes it. That object
+    /// holds `high_watermark - 1`, which `ListOffsets(Latest)` reads.
+    ///
+    /// The listing covers this partition's `records/` prefix only, so that a
+    /// mistake here cannot remove the objects of another partition.
+    async fn delete_records_batches(&self, topition: &Topition, cutoff: i64) {
         if cutoff <= 0 {
-            return Ok(());
+            return;
         }
 
         let prefix = Path::from(format!(
@@ -457,44 +458,64 @@ impl DynoStore {
             self.cluster, topition.topic, topition.partition
         ));
 
-        let mut objects = vec![];
-
-        let mut list_stream = self.object_store.list(Some(&prefix));
-
-        while let Some(meta) = list_stream
-            .next()
+        let mut objects = match self
+            .object_store
+            .list(Some(&prefix))
+            .map_ok(|meta| meta.location)
+            .try_collect::<Vec<Path>>()
             .await
-            .transpose()
-            .inspect_err(|error| error!(?error, ?topition, cutoff))
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
         {
-            let Some(name) = meta.location.parts().next_back() else {
-                continue;
-            };
+            Ok(locations) => locations
+                .into_iter()
+                .filter_map(|location| {
+                    let base_offset = location
+                        .parts()
+                        .next_back()
+                        .and_then(|name| i64::from_str(name.as_ref().get(0..20)?).ok())?;
 
-            let Ok(base_offset) = i64::from_str(&name.as_ref()[0..20]) else {
-                continue;
-            };
+                    Some((location, base_offset))
+                })
+                .collect::<Vec<_>>(),
 
-            objects.push((meta.location, base_offset));
-        }
+            Err(error) => {
+                error!(?error, ?topition, cutoff);
+                return;
+            }
+        };
 
         objects.sort_by_key(|(_, base_offset)| *base_offset);
 
-        for window in objects.windows(2) {
-            let (location, base_offset) = &window[0];
-            let (_, next_base_offset) = &window[1];
+        let expired = objects
+            .windows(2)
+            .filter(|window| window[1].1 <= cutoff)
+            .map(|window| Ok::<_, object_store::Error>(window[0].0.clone()))
+            .collect::<Vec<_>>();
 
-            if *base_offset < cutoff && *next_base_offset <= cutoff {
-                _ = self
-                    .object_store
-                    .delete(location)
-                    .await
-                    .inspect_err(|error| error!(?error, ?topition, ?location, cutoff));
+        let mut deleted = self
+            .object_store
+            .delete_stream(futures::stream::iter(expired).boxed());
+
+        while let Some(outcome) = deleted.next().await {
+            if let Err(error) = outcome {
+                error!(?error, ?topition, cutoff);
             }
         }
+    }
 
-        Ok(())
+    /// Returns the low watermark of one partition: its log start offset.
+    async fn log_start(&self, topition: &Topition) -> Result<i64> {
+        let watermark = self.watermarks.lock().map(|mut locked| {
+            locked
+                .entry(topition.to_owned())
+                .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                .to_owned()
+        })?;
+
+        watermark
+            .with(&self.object_store, |watermark| {
+                Ok(watermark.low.unwrap_or(0))
+            })
+            .await
     }
 
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
@@ -717,13 +738,19 @@ impl Storage for DynoStore {
 
                 for partition in partitions {
                     let (error_code, low_watermark) = match &metadata {
-                        None => (ErrorCode::UnknownTopicOrPartition, 0),
+                        None => (
+                            ErrorCode::UnknownTopicOrPartition,
+                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                        ),
 
                         Some(metadata)
                             if partition.partition_index < 0
                                 || partition.partition_index >= metadata.topic.num_partitions =>
                         {
-                            (ErrorCode::UnknownTopicOrPartition, 0)
+                            (
+                                ErrorCode::UnknownTopicOrPartition,
+                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                            )
                         }
 
                         Some(_) => {
@@ -754,15 +781,12 @@ impl Storage for DynoStore {
                                     };
 
                                     match delete_records_cutoff(partition.offset, &stage) {
-                                        Err(error_code) => Ok((error_code, stage.log_start)),
+                                        Err(error_code) => {
+                                            Ok((error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK))
+                                        }
 
                                         Ok(cutoff) => {
                                             w.low = Some(cutoff);
-
-                                            if let Some(ref mut timestamps) = w.timestamps {
-                                                timestamps.retain(|_, offset| *offset >= cutoff);
-                                            }
-
                                             Ok((ErrorCode::None, cutoff))
                                         }
                                     }
@@ -776,7 +800,7 @@ impl Storage for DynoStore {
                                 // above: the logical delete has already taken effect,
                                 // same as Kafka's own segment reclaim lagging behind
                                 // a logStartOffset bump.
-                                self.delete_records_batches(&topition, cutoff).await?;
+                                self.delete_records_batches(&topition, cutoff).await;
                             }
 
                             (error_code, cutoff)
@@ -1481,6 +1505,32 @@ impl Storage for DynoStore {
             }
 
             debug!(?candidate);
+
+            if offset_request == &ListOffset::Earliest {
+                let log_start = self.log_start(topition).await?;
+
+                // Kafka answers `Earliest` with the log start offset. An object
+                // that begins below the log start can remain after
+                // `DeleteRecords`, so the base offset of the oldest object can
+                // be below the log start.
+                let base_offset = candidate
+                    .as_ref()
+                    .and_then(|found| found.location.parts().next_back())
+                    .and_then(|name| i64::from_str(name.as_ref().get(0..20)?).ok());
+
+                if base_offset.is_none_or(|base_offset| base_offset < log_start) {
+                    responses.push((
+                        topition.to_owned(),
+                        ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            offset: Some(log_start),
+                            ..Default::default()
+                        },
+                    ));
+
+                    continue;
+                }
+            }
 
             if let Some(ref found) = candidate {
                 let Some(offset) = found.location.parts().next_back() else {

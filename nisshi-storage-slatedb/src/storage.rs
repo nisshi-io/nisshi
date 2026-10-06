@@ -50,10 +50,11 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, delete_records_cutoff,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, delete_records_cutoff,
 };
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -515,7 +516,10 @@ impl Storage for Engine {
                         if partition.partition_index < 0
                             || partition.partition_index >= metadata.topic.num_partitions
                         {
-                            (ErrorCode::UnknownTopicOrPartition, 0)
+                            (
+                                ErrorCode::UnknownTopicOrPartition,
+                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                            )
                         } else {
                             let watermark_key = postcard::to_stdvec(&WatermarkKey::new(
                                 metadata.id,
@@ -541,28 +545,20 @@ impl Storage for Engine {
                             };
 
                             match delete_records_cutoff(partition.offset, &stage) {
-                                Err(error_code) => (error_code, log_start),
+                                Err(error_code) => {
+                                    (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                }
 
                                 Ok(cutoff) => {
                                     if cutoff > log_start {
-                                        // Delete batches entirely below the cutoff. A
-                                        // batch is identified by its *base* offset, so a
-                                        // batch is only safe to remove once its *end*
-                                        // offset (base + last_offset_delta) is below the
-                                        // cutoff too -- otherwise a batch that starts
-                                        // before the cutoff but extends past it would be
-                                        // removed whole, taking still-visible records
-                                        // with it.
-                                        //
-                                        // When the cutoff is the high watermark itself
-                                        // (the common `offset == -1`, "delete everything"
-                                        // request), every stored batch's end offset is
-                                        // below the cutoff, including the active batch
-                                        // holding `high_watermark - 1`. Kafka never
-                                        // removes its active segment, so that one batch
-                                        // is kept regardless.
-                                        let protect_active_batch = cutoff == high_watermark;
-
+                                        // A batch key holds the base offset of the batch,
+                                        // and not its end offset. A batch ends before the
+                                        // base offset of the next batch, so this deletes a
+                                        // batch when the next batch's base offset is at or
+                                        // below the cutoff, without decoding either batch.
+                                        // A batch that straddles the cutoff stays whole.
+                                        // The last batch has no successor, so this never
+                                        // deletes it. That batch holds `high_watermark - 1`.
                                         let batch_prefix =
                                             postcard::to_stdvec(&BatchKeyPrefix::new(
                                                 metadata.id,
@@ -575,7 +571,7 @@ impl Storage for Engine {
                                                 0,
                                             ))?;
 
-                                        let mut candidates = vec![];
+                                        let mut previous: Option<Bytes> = None;
 
                                         let mut scan = self.db.scan(scan_start..).await?;
                                         while let Some(kv) = scan.next().await? {
@@ -583,35 +579,22 @@ impl Storage for Engine {
                                                 break;
                                             }
 
-                                            let batch_key: BatchKey =
-                                                match postcard::from_bytes(&kv.key) {
-                                                    Ok(key) => key,
-                                                    Err(_) => continue,
-                                                };
+                                            let Ok(batch_key) =
+                                                postcard::from_bytes::<BatchKey>(&kv.key)
+                                            else {
+                                                continue;
+                                            };
 
-                                            if batch_key.offset >= cutoff {
+                                            if batch_key.offset > cutoff {
                                                 break;
                                             }
 
-                                            let batch = self.decode(kv.value.clone())?;
-                                            let end = batch_key.offset
-                                                + i64::from(batch.last_offset_delta);
-
-                                            candidates.push((kv.key, batch_key.offset, end));
-                                        }
-
-                                        let active_base = if protect_active_batch {
-                                            candidates.iter().map(|(_, base, _)| *base).max()
-                                        } else {
-                                            None
-                                        };
-
-                                        for (key, base, end) in candidates {
-                                            let is_active_batch =
-                                                protect_active_batch && Some(base) == active_base;
-
-                                            if end < cutoff && !is_active_batch {
+                                            if let Some(key) = previous.replace(kv.key) {
                                                 tx.delete(&key)?;
+                                            }
+
+                                            if batch_key.offset == cutoff {
+                                                break;
                                             }
                                         }
                                     }
@@ -631,7 +614,10 @@ impl Storage for Engine {
                             }
                         }
                     } else {
-                        (ErrorCode::UnknownTopicOrPartition, 0)
+                        (
+                            ErrorCode::UnknownTopicOrPartition,
+                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                        )
                     };
 
                     partition_results.push(

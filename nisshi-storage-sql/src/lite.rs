@@ -51,12 +51,12 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
-    ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel, delete_records_cutoff,
+    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, bounded_channel, delete_records_cutoff,
 };
 use opentelemetry::{
     KeyValue,
@@ -2529,7 +2529,9 @@ impl Storage for Delegate {
 
                     let (error_code, low_watermark) =
                         match self.watermark_select_for_update(&topition, &pc).await {
-                            Err(Error::Api(error_code)) => (error_code, 0),
+                            Err(Error::Api(error_code)) => {
+                                (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            }
                             Err(err) => return Err(err),
 
                             Ok((low, high)) => {
@@ -2540,21 +2542,15 @@ impl Storage for Delegate {
                                 };
 
                                 match delete_records_cutoff(partition.offset, &stage) {
-                                    Err(error_code) => (error_code, stage.log_start),
+                                    Err(error_code) => {
+                                        (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                    }
 
                                     Ok(cutoff) => {
-                                        // Physically delete at most up to
-                                        // `high_watermark - 1`: the row
-                                        // holding the last committed offset
-                                        // is Kafka's active segment and must
-                                        // survive even a `cutoff ==
-                                        // high_watermark` ("delete
-                                        // everything") request, or
-                                        // `ListOffsets` (Latest) would
-                                        // regress once nothing is left to
-                                        // derive it from. The logical
-                                        // watermark below is still set to
-                                        // the full `cutoff`.
+                                        // This keeps the record at `high_watermark - 1`, because
+                                        // `list_latest_offset_committed.sql` and
+                                        // `list_latest_offset_uncommitted.sql` answer `Latest` from
+                                        // that record. The watermark still advances to `cutoff`.
                                         let physical_cutoff = cutoff.min(stage.high_watermark - 1);
 
                                         if physical_cutoff > stage.log_start {
@@ -3456,9 +3452,12 @@ impl Storage for Delegate {
                         .and_then(|offset| {
                             row.get_value(1)
                                 .map_err(Into::into)
-                                .and_then(LiteTimestamp::try_from)
-                                .map(SystemTime::from)
-                                .map(Some)
+                                .and_then(|value| match value {
+                                    Value::Null => Ok(None),
+                                    value => LiteTimestamp::try_from(value)
+                                        .map(SystemTime::from)
+                                        .map(Some),
+                                })
                                 .map(|timestamp| {
                                     debug!(
                                         cluster = self.cluster,

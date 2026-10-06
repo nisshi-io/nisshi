@@ -50,10 +50,8 @@ async fn create_test_engine() -> Engine {
     )
 }
 
-/// A single-record batch, built through the real encode path (unlike a hand
-/// constructed [`Batch`] literal with an empty `record_data`, this decodes
-/// back correctly -- `DeleteRecords`' batch-span check decodes every
-/// candidate batch to find its end offset).
+/// A single-record batch, built through the encode path, so that it decodes
+/// back to the record it holds.
 fn simple_batch() -> Batch {
     use nisshi_sans_io::record::{Record, inflated};
 
@@ -439,26 +437,27 @@ async fn test_delete_records_to_high_watermark_keeps_one_physical_batch() {
         let _ = engine.produce(None, &topition, batch).await.unwrap();
     }
 
-    async fn count_batches(db: &Db, topic_id: uuid::Uuid, partition: i32) -> usize {
+    async fn batch_offsets(db: &Db, topic_id: uuid::Uuid, partition: i32) -> Vec<i64> {
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic_id, partition)).unwrap();
         let scan_start = postcard::to_stdvec(&BatchKey::scan_from(topic_id, partition, 0)).unwrap();
 
         let mut scan = db.scan(scan_start..).await.unwrap();
-        let mut count = 0;
+        let mut offsets = vec![];
 
         while let Some(kv) = scan.next().await.unwrap() {
             if !kv.key.starts_with(&prefix) {
                 break;
             }
-            count += 1;
+
+            offsets.push(postcard::from_bytes::<BatchKey>(&kv.key).unwrap().offset);
         }
 
-        count
+        offsets
     }
 
     assert_eq!(
-        5,
-        count_batches(&db, topic_id, 0).await,
+        vec![0, 1, 2, 3, 4],
+        batch_offsets(&db, topic_id, 0).await,
         "setup: expected one physical batch object per produced record"
     );
 
@@ -480,13 +479,12 @@ async fn test_delete_records_to_high_watermark_keeps_one_physical_batch() {
     );
     assert_eq!(5, partitions[0].low_watermark);
 
-    // Exactly one physical batch -- the one holding high_watermark - 1 --
-    // must remain. If `protect_active_batch` were ever removed, this would
-    // be 0: every batch's end offset is below the cutoff when the cutoff
-    // is the high watermark itself.
+    // Only the batch at offset 4, which holds high_watermark - 1, remains.
+    // Every batch ends below a cutoff equal to the high watermark, so this
+    // batch survives only because the delete keeps the last batch.
     assert_eq!(
-        1,
-        count_batches(&db, topic_id, 0).await,
+        vec![4],
+        batch_offsets(&db, topic_id, 0).await,
         "the active batch holding high_watermark - 1 must survive a -1 delete"
     );
 }

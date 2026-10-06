@@ -843,6 +843,10 @@ impl OffsetStage {
     }
 }
 
+/// The `low_watermark` of a `DeleteRecords` partition result that carries an
+/// error, as Kafka's `DeleteRecordsResponse.INVALID_LOW_WATERMARK`.
+pub const DELETE_RECORDS_INVALID_LOW_WATERMARK: i64 = -1;
+
 /// Validate a client-requested `DeleteRecords` offset against a partition's
 /// current [`OffsetStage`], and resolve it to the new low watermark (log
 /// start offset).
