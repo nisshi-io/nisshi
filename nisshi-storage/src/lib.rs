@@ -2514,7 +2514,7 @@ mod tests {
     #[test]
     fn reject_unrecognized_options_names_unknown_key_and_scheme() -> Result<()> {
         let error = reject_unrecognized_options(
-            &Url::parse("sqlite://nisshi.db?vacume_into=/tmp/x")?,
+            &Url::parse("sqlite://nisshi.db?vacuum_onto=/tmp/x")?,
             &["vacuum_into"],
         )
         .unwrap_err();
@@ -2523,7 +2523,7 @@ mod tests {
             matches!(
                 &error,
                 Error::UnrecognizedStorageOption { scheme, option }
-                    if scheme == "sqlite" && option == "vacume_into"
+                    if scheme == "sqlite" && option == "vacuum_onto"
             ),
             "{error:?}"
         );

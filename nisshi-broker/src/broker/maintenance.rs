@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bare_zero_unparseable_and_too_long_values() {
+    fn rejects_bare_zero_unparsable_and_too_long_values() {
         for value in [
             "",
             "600000",

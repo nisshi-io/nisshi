@@ -132,9 +132,9 @@ mod sqlite {
     async fn rejects_misspelt_option() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let error = build(&url("vacume_into=/tmp/x")).await.unwrap_err();
+        let error = build(&url("vacuum_onto=/tmp/x")).await.unwrap_err();
         assert!(
-            is_unrecognized(&error, "sqlite", "vacume_into"),
+            is_unrecognized(&error, "sqlite", "vacuum_onto"),
             "{error:?}"
         );
 
