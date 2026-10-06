@@ -228,7 +228,10 @@ where
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
         Ok(FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
-            .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            // From v13 the client matches a response topic by id and drops
+            // one it cannot match, so the requested id is echoed: the client
+            // then sees the error and refreshes its metadata.
+            .topic_id(fetch.topic_id)
             .partitions(fetch.partitions.as_ref().map(|partitions| {
                 partitions
                     .iter()
@@ -243,9 +246,8 @@ where
                                 EpochEndOffset::default().epoch(-1).end_offset(-1),
                             ))
                             // Kafka sends a leader hint only with a leadership
-                            // error, not with `UNKNOWN_TOPIC_OR_PARTITION`.
-                            // librdkafka honors a hint here regardless, and
-                            // consumer close then hangs on a deleted topic.
+                            // error; librdkafka acts on one here, and its
+                            // consumer close then hangs on a deleted topic
                             .current_leader(None)
                             .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
                             .aborted_transactions(Some([].into()))
@@ -323,6 +325,21 @@ where
                 .topic_id(topic_id.to_owned())
                 .partitions(Some(partitions)))
         } else {
+            // Any metadata error answers the client as an unknown topic, so a
+            // storage failure would otherwise leave no trace naming the topic.
+            if let Some(MetadataResponseTopic { error_code, .. }) = metadata.topics().first()
+                && *error_code != i16::from(ErrorCode::None)
+                && *error_code != i16::from(ErrorCode::UnknownTopicOrPartition)
+            {
+                tracing::warn!(
+                    topic = ?fetch.topic,
+                    topic_id = ?fetch.topic_id,
+                    error_code,
+                    error = ?ErrorCode::try_from(*error_code).ok(),
+                    "metadata error, answering UNKNOWN_TOPIC_OR_PARTITION"
+                );
+            }
+
             self.unknown_topic_response(fetch)
         }
     }
@@ -378,9 +395,7 @@ where
                     break;
                 }
 
-                // as in Kafka, an error in any partition answers now: waiting
-                // cannot clear it, and the client acts on it
-                if responses.iter().any(has_partition_error) {
+                if answers_without_waiting(&responses) {
                     debug!(?iteration, "partition error, not waiting for min_bytes");
                     break;
                 }
@@ -466,13 +481,43 @@ where
     }
 }
 
-fn has_partition_error(topic: &FetchableTopicResponse) -> bool {
-    topic
-        .partitions
-        .as_deref()
-        .unwrap_or_default()
+/// Returns true when a fetch answers before `min_bytes` or `max_wait`, as
+/// Kafka does: a log read error, such as `OFFSET_OUT_OF_RANGE`, in any
+/// partition ([ReplicaManager.scala]), or an error in every partition.
+///
+/// An unknown topic alone does not end the wait while another partition has
+/// no error, because Kafka sets unknown topics aside before it reads the log,
+/// and waits for the other partitions ([KafkaApis.scala]). A consumer still
+/// assigned to a deleted topic then fetches once per `max_wait`, instead of
+/// at round trip speed.
+///
+/// [ReplicaManager.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
+/// [KafkaApis.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1031-L1032
+fn answers_without_waiting(responses: &[FetchableTopicResponse]) -> bool {
+    let unknown_topic = i16::from(ErrorCode::UnknownTopicOrPartition);
+    let none = i16::from(ErrorCode::None);
+
+    let mut error_codes = responses
         .iter()
-        .any(|partition| partition.error_code != i16::from(ErrorCode::None))
+        .flat_map(|topic| topic.partitions.as_deref().unwrap_or_default())
+        .map(|partition| partition.error_code)
+        .peekable();
+
+    if error_codes.peek().is_none() {
+        return false;
+    }
+
+    let mut every_partition_has_error = true;
+
+    for error_code in error_codes {
+        if error_code == none {
+            every_partition_has_error = false;
+        } else if error_code != unknown_topic {
+            return true;
+        }
+    }
+
+    every_partition_has_error
 }
 
 trait ByteSize {
