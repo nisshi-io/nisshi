@@ -199,6 +199,7 @@ pub use batch::ProduceRequestBatcher;
 pub use latency::LatencyIntroducingStorage;
 pub use producer::{check_claim, producer_claim};
 pub use proxy::SemaphoreProxy;
+pub use service::deadline;
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,

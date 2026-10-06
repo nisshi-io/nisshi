@@ -19,19 +19,23 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     hash::Hash,
+    io,
     marker::PhantomData,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, LazyLock},
+    task::{Context, Poll, ready},
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use deadpool::managed;
 use deadpool_postgres::{
     Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
     Transaction,
 };
-use futures::pin_mut;
+use futures::{FutureExt as _, future::FusedFuture as _, pin_mut};
 use futures_util::future;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
@@ -65,19 +69,31 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, deadline,
+    producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpStream, UnixStream},
+    runtime::Handle,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::timeout,
+};
 use tokio_postgres::{
-    Config, Row, RowStream,
+    CancelToken, Config, Row, RowStream,
     binary_copy::BinaryCopyInWriter,
+    config::Host,
     error::SqlState,
+    tls::MakeTlsConnect,
     types::{BorrowToSql, ToSql, Type},
 };
-use tracing::{debug, error, instrument};
+use tokio_postgres_rustls::MakeRustlsConnect;
+use tokio_util::either::Either;
+use tracing::{debug, error, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -92,6 +108,10 @@ pub struct Postgres {
     node: i32,
     advertised_listener: Url,
     pool: Pool,
+    cancel: Option<CancelRequests>,
+    /// Permits for the ListOffsets partition reads in flight, see
+    /// [`LIST_OFFSETS_READS`].
+    list_offsets_reads: Arc<Semaphore>,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -103,6 +123,7 @@ pub struct Builder<C, N, L, P> {
     node: N,
     advertised_listener: L,
     pool: P,
+    cancel: Option<CancelRequests>,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -114,6 +135,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -125,6 +147,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -136,6 +159,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -157,11 +181,36 @@ impl Builder<String, i32, Url, Pool> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
+            list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
             schemas: self.schemas,
             lake: self.lake,
         }
     }
 }
+
+/// How many connections the pool opens at most.
+const POOL_MAX_SIZE: usize = 16;
+
+/// How many ListOffsets partition reads this engine has in flight at once,
+/// across every request, counting an abandoned read until its statement
+/// has been cancelled or its cancel request has been given up on.
+///
+/// Each read holds a pooled connection, so this limit leaves half the pool
+/// for other requests. A read past this limit waits for a permit, and
+/// [`ListOffsetsService`]'s deadline drops it if the wait lasts too long.
+///
+/// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
+const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
+
+/// How long cancelling an abandoned statement may take, from opening the
+/// cancel connection to the statement's end, before the statement's
+/// connection is closed rather than returned to the pool.
+///
+/// The cancel request is a connection, a TLS handshake and one packet, and
+/// a backend ends its statement at the next interrupt check, so the whole
+/// exchange takes milliseconds on a healthy server.
+const ABANDONED_STATEMENT_GRACE: Duration = Duration::from_secs(2);
 
 /// Postgres statement timeout applied to every connection by default, so a stalled query
 /// (e.g. a lock wait) is aborted server-side instead of holding a pooled connection open
@@ -230,19 +279,24 @@ where
         .map(|config| config.with_root_certificates(root_store))
         .map(|config| config.with_no_client_auth())?;
 
-        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(config);
+        let tls = MakeRustlsConnect::new(config);
+        let cancel = Some(CancelRequests {
+            config: pg_config.clone(),
+            tls: tls.clone(),
+        });
 
         let mgr = Manager::from_config(pg_config, tls, mgr_config);
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
 
         Pool::builder(mgr)
-            .max_size(16)
+            .max_size(POOL_MAX_SIZE)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
             .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
             .build()
             .map(|pool| Self {
                 pool,
+                cancel,
                 advertised_listener,
                 node: N::default(),
                 cluster: C::default(),
@@ -250,6 +304,362 @@ where
                 lake: None,
             })
             .map_err(Into::into)
+    }
+}
+
+/// What a cancel request needs to reach the server on a connection of its
+/// own: the connection config, and the TLS connector.
+#[derive(Clone)]
+struct CancelRequests {
+    config: Config,
+    tls: MakeRustlsConnect,
+}
+
+impl Debug for CancelRequests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelRequests")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CancelRequests {
+    /// Asks the server to cancel the statement that `token` identifies, and
+    /// returns once the server has passed the request on to its backend.
+    ///
+    /// [`CancelToken::cancel_query`] returns as soon as it has written the
+    /// request, so a statement sent on the connection after it could be the
+    /// one cancelled instead. The server closes the cancel connection once
+    /// it has signalled the backend, and libpq's `PQcancel` waits for that
+    /// close; so does this, through [`ClosedByPeer`].
+    ///
+    /// This relies on a direct connection to PostgreSQL: a proxy that
+    /// closes the cancel connection before forwarding the request breaks
+    /// the ordering, for libpq as well.
+    ///
+    /// The request goes to the first configured host that accepts a
+    /// connection, as a new connection would. A server other than the one
+    /// running the statement ignores it, and the statement then ends on
+    /// its own or its connection is closed at the grace period.
+    async fn cancel(&self, token: &CancelToken) -> Result<()> {
+        let (stream, hostname) = self.connect().await?;
+
+        let tls = MakeTlsConnect::<CancelStream>::make_tls_connect(
+            &mut self.tls.clone(),
+            hostname.unwrap_or_default(),
+        )
+        .map_err(io::Error::other)?;
+
+        token
+            .cancel_query_raw(ClosedByPeer::new(stream), tls)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Opens a socket to the first configured host that accepts one,
+    /// returning it with the host name that TLS verifies.
+    async fn connect(&self) -> io::Result<(Either<TcpStream, UnixStream>, Option<&str>)> {
+        let hosts = self.config.get_hosts();
+        let ports = self.config.get_ports();
+        let hostaddrs = self.config.get_hostaddrs();
+        let connect_timeout = self
+            .config
+            .get_connect_timeout()
+            .copied()
+            .unwrap_or(DEFAULT_POOL_CREATE_TIMEOUT);
+
+        let mut last = io::Error::new(io::ErrorKind::NotFound, "no host configured");
+
+        for (index, host) in hosts.iter().enumerate() {
+            let port = ports.get(index).or(ports.first()).copied().unwrap_or(5432);
+
+            let connect = async {
+                match (hostaddrs.get(index), host) {
+                    (Some(addr), _) => TcpStream::connect((*addr, port)).await.map(Either::Left),
+
+                    (None, Host::Tcp(host)) => TcpStream::connect((host.as_str(), port))
+                        .await
+                        .map(Either::Left),
+
+                    #[cfg(unix)]
+                    (None, Host::Unix(dir)) => {
+                        UnixStream::connect(dir.join(format!(".s.PGSQL.{port}")))
+                            .await
+                            .map(Either::Right)
+                    }
+                }
+            };
+
+            match timeout(connect_timeout, connect).await {
+                Ok(Ok(stream)) => {
+                    let hostname = match host {
+                        Host::Tcp(hostname) => Some(hostname.as_str()),
+                        #[cfg(unix)]
+                        Host::Unix(_) => None,
+                    };
+
+                    return Ok((stream, hostname));
+                }
+
+                Ok(Err(err)) => last = err,
+
+                Err(_) => last = io::Error::new(io::ErrorKind::TimedOut, "connect timed out"),
+            }
+        }
+
+        Err(last)
+    }
+}
+
+/// The stream a cancel request travels on.
+type CancelStream = ClosedByPeer<Either<TcpStream, UnixStream>>;
+
+/// A stream whose shutdown also waits for the peer to close its side.
+struct ClosedByPeer<S> {
+    stream: S,
+    writes_shut: bool,
+}
+
+impl<S> ClosedByPeer<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            writes_shut: false,
+        }
+    }
+}
+
+impl<S> AsyncRead for ClosedByPeer<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for ClosedByPeer<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.writes_shut {
+            match ready!(Pin::new(&mut self.stream).poll_shutdown(cx)) {
+                // A peer that has already closed makes some systems refuse
+                // the shutdown, and the close is what this waits for.
+                Ok(()) | Err(_) => self.writes_shut = true,
+            }
+        }
+
+        let mut scratch = [0; 64];
+
+        loop {
+            let mut buf = ReadBuf::new(&mut scratch);
+
+            match ready!(Pin::new(&mut self.stream).poll_read(cx, &mut buf)) {
+                Ok(()) if buf.filled().is_empty() => return Poll::Ready(Ok(())),
+                Ok(()) => {}
+                // An abrupt close is still a close.
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return Poll::Ready(Ok(()));
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+    }
+}
+
+/// A pooled object that goes back to its pool only through
+/// [`Abandonable::release`].
+///
+/// The pool recycles a connection after checking only that it is open
+/// ([`RecyclingMethod::Fast`]). A connection dropped while a statement runs
+/// on the server would go back to the pool still busy, and the next caller
+/// would wait behind that statement. Dropping this guard instead passes the
+/// object, still checked out of its pool, to `abandon`, which decides when
+/// the object may go back.
+struct Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    object: Option<managed::Object<M>>,
+    abandon: Option<F>,
+}
+
+impl<M, F> Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    fn new(object: managed::Object<M>, abandon: F) -> Self {
+        Self {
+            object: Some(object),
+            abandon: Some(abandon),
+        }
+    }
+
+    fn object(&self) -> &managed::Object<M> {
+        self.object
+            .as_ref()
+            .expect("an abandonable object is held until release or drop")
+    }
+
+    /// Returns the object to its pool, once its work has finished.
+    fn release(mut self) {
+        drop(self.object.take());
+    }
+}
+
+impl<M, F> Drop for Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    fn drop(&mut self) {
+        if let (Some(object), Some(abandon)) = (self.object.take(), self.abandon.take()) {
+            abandon(object);
+        }
+    }
+}
+
+impl<M, F> Debug for Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Abandonable")
+            .field("held", &self.object.is_some())
+            .finish()
+    }
+}
+
+/// Why an abandoned connection was closed instead of returned to the pool.
+#[derive(Debug)]
+enum NotSettled {
+    /// The cancel request did not reach the server.
+    Cancel(Error),
+    /// The connection failed after the cancel request.
+    Probe(Error),
+}
+
+/// Cancels the statement running on an abandoned `connection` and returns
+/// the connection to its pool once that statement has ended, so the pool
+/// keeps to its [`POOL_MAX_SIZE`] server connections.
+///
+/// The cancel request travels on a connection of its own, and returns once
+/// the server has signalled the backend (see [`CancelRequests::cancel`]).
+/// The statement has ended once an empty query on `connection` answers,
+/// because the server runs the two in order. The connection is closed
+/// instead, and the pool opens a replacement, when the cancel request
+/// fails or the two together take longer than
+/// [`ABANDONED_STATEMENT_GRACE`], so the pool does not hand out a
+/// connection that is still busy. A cancel request still in flight at
+/// that point is sent anyway, within [`DEFAULT_POOL_CREATE_TIMEOUT`]. A
+/// statement whose cancel request never arrives runs on the server until
+/// `statement_timeout`.
+///
+/// `permit` is held until the connection goes back or the cancel request
+/// has been given up on, so the statement counts against
+/// [`LIST_OFFSETS_READS`] meanwhile.
+async fn cancel_and_return(
+    connection: Object,
+    cancel: Option<CancelRequests>,
+    permit: OwnedSemaphorePermit,
+) {
+    let _permit = permit;
+
+    let Some(cancel) = cancel else {
+        drop(Object::take(connection));
+        return;
+    };
+
+    let token = connection.cancel_token();
+    let cancel = timeout(DEFAULT_POOL_CREATE_TIMEOUT, cancel.cancel(&token)).fuse();
+    pin_mut!(cancel);
+
+    let settled = timeout(ABANDONED_STATEMENT_GRACE, async {
+        match (&mut cancel).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(NotSettled::Cancel(err)),
+            Err(elapsed) => return Err(NotSettled::Cancel(io::Error::from(elapsed).into())),
+        }
+
+        connection
+            .batch_execute("")
+            .await
+            .map_err(|err| NotSettled::Probe(err.into()))
+    })
+    .await;
+
+    match settled {
+        Ok(Ok(())) => drop(connection),
+
+        Ok(Err(NotSettled::Cancel(err))) => {
+            warn!(
+                ?err,
+                "the cancel request for an abandoned statement did not reach the server; closing its connection"
+            );
+            drop(Object::take(connection));
+        }
+
+        Ok(Err(NotSettled::Probe(err))) => {
+            warn!(
+                ?err,
+                "an abandoned statement's connection failed after its cancel request; closing it"
+            );
+            drop(Object::take(connection));
+        }
+
+        Err(_) => {
+            warn!(
+                grace = ?ABANDONED_STATEMENT_GRACE,
+                "an abandoned statement did not end within the grace period; closing its connection"
+            );
+            drop(Object::take(connection));
+
+            // The cancel request is only dropped once it has been sent or
+            // has timed out, so the statement still stops, and the permit
+            // counts it meanwhile.
+            if !cancel.is_terminated() {
+                match cancel.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => warn!(
+                        ?err,
+                        "the cancel request for an abandoned statement did not reach the server after its connection was closed"
+                    ),
+                    Err(_) => warn!(
+                        timeout = ?DEFAULT_POOL_CREATE_TIMEOUT,
+                        "the cancel request for an abandoned statement timed out after its connection was closed"
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -318,6 +728,137 @@ impl Postgres {
                 }
             })
             .map_err(Into::into)
+    }
+
+    /// Checks out a connection for a ListOffsets read that a caller may drop
+    /// mid-statement, holding `permit` from [`LIST_OFFSETS_READS`].
+    ///
+    /// Dropping the guard before [`Abandonable::release`] asks the server to
+    /// cancel the statement, so it stops instead of running until
+    /// `statement_timeout`, and keeps the connection and the permit until
+    /// the statement has ended (see [`cancel_and_return`]).
+    async fn abandonable_connection(
+        &self,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Abandonable<Manager, impl FnOnce(Object) + use<>>> {
+        let cancel = self.cancel.clone();
+
+        self.connection().await.map(|connection| {
+            Abandonable::new(connection, move |connection: Object| {
+                match Handle::try_current() {
+                    Ok(runtime) => {
+                        _ = runtime.spawn(cancel_and_return(connection, cancel, permit));
+                    }
+
+                    // Without a runtime the cancel request cannot be sent.
+                    // Closing the connection still keeps the pool from
+                    // handing out one that is busy.
+                    Err(_) => drop(Object::take(connection)),
+                }
+            })
+        })
+    }
+
+    /// Reads `offsets` one statement at a time on `c`.
+    async fn list_offsets_on(
+        &self,
+        c: &Object,
+        isolation_level: IsolationLevel,
+        offsets: &[(Topition, ListOffset)],
+    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        let mut responses = vec![];
+
+        for (topition, offset_type) in offsets {
+            let query = match (offset_type, isolation_level) {
+                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
+                (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
+                    "list_latest_offset_committed.sql"
+                }
+                (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
+                    "list_latest_offset_uncommitted.sql"
+                }
+                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
+            };
+
+            debug!(?query);
+
+            let list_offset = match offset_type {
+                ListOffset::Earliest | ListOffset::Latest => self
+                    .prepare_query_opt(
+                        c,
+                        query,
+                        &[&self.cluster, &topition.topic(), &topition.partition()],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
+
+                ListOffset::Timestamp(timestamp) => self
+                    .prepare_query_opt(
+                        c,
+                        query,
+                        &[
+                            &self.cluster.as_str(),
+                            &topition.topic(),
+                            &topition.partition(),
+                            timestamp,
+                        ],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err)),
+            }
+            .inspect_err(|err| {
+                error!(?err, cluster = self.cluster, ?topition);
+            })
+            .inspect(|result| debug!(?result))?
+            .map_or_else(
+                || {
+                    // No record row: Earliest/Latest answer 0, a Timestamp
+                    // lookup answers no offset (see `ListOffsetResponse::offset`).
+                    let (offset, timestamp) = match offset_type {
+                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
+                        ListOffset::Timestamp(_) => (None, None),
+                    };
+                    debug!(
+                        cluster = self.cluster,
+                        ?topition,
+                        ?offset_type,
+                        offset,
+                        ?timestamp
+                    );
+
+                    Ok(ListOffsetResponse {
+                        timestamp,
+                        offset,
+                        ..Default::default()
+                    })
+                },
+                |row| {
+                    debug!(?row);
+
+                    row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
+                        row.try_get::<_, SystemTime>(1).map(Some).map(|timestamp| {
+                            debug!(
+                                cluster = self.cluster,
+                                ?topition,
+                                ?offset_type,
+                                offset,
+                                ?timestamp
+                            );
+
+                            ListOffsetResponse {
+                                timestamp,
+                                offset,
+                                ..Default::default()
+                            }
+                        })
+                    })
+                },
+            )?;
+
+            responses.push((topition.clone(), list_offset));
+        }
+
+        Ok(responses)
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
@@ -2737,101 +3278,14 @@ impl Storage for Postgres {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         debug!(cluster = self.cluster, ?isolation_level, ?offsets);
 
-        let c = self.connection().await?;
+        let permit = deadline::queued(self.list_offsets_reads.clone().acquire_owned()).await?;
+        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let responses = self
+            .list_offsets_on(connection.object(), isolation_level, offsets)
+            .await;
+        connection.release();
 
-        let mut responses = vec![];
-
-        for (topition, offset_type) in offsets {
-            let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
-                (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
-                    "list_latest_offset_committed.sql"
-                }
-                (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
-                    "list_latest_offset_uncommitted.sql"
-                }
-                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
-            };
-
-            debug!(?query);
-
-            let list_offset = match offset_type {
-                ListOffset::Earliest | ListOffset::Latest => self
-                    .prepare_query_opt(
-                        &c,
-                        query,
-                        &[&self.cluster, &topition.topic(), &topition.partition()],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
-
-                ListOffset::Timestamp(timestamp) => self
-                    .prepare_query_opt(
-                        &c,
-                        query,
-                        &[
-                            &self.cluster.as_str(),
-                            &topition.topic(),
-                            &topition.partition(),
-                            timestamp,
-                        ],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err)),
-            }
-            .inspect_err(|err| {
-                error!(?err, cluster = self.cluster, ?topition);
-            })
-            .inspect(|result| debug!(?result))?
-            .map_or_else(
-                || {
-                    // No record row: Earliest/Latest answer 0, a Timestamp
-                    // lookup answers no offset (see `ListOffsetResponse::offset`).
-                    let (offset, timestamp) = match offset_type {
-                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
-                        ListOffset::Timestamp(_) => (None, None),
-                    };
-                    debug!(
-                        cluster = self.cluster,
-                        ?topition,
-                        ?offset_type,
-                        offset,
-                        ?timestamp
-                    );
-
-                    Ok(ListOffsetResponse {
-                        timestamp,
-                        offset,
-                        ..Default::default()
-                    })
-                },
-                |row| {
-                    debug!(?row);
-
-                    row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
-                        row.try_get::<_, SystemTime>(1).map(Some).map(|timestamp| {
-                            debug!(
-                                cluster = self.cluster,
-                                ?topition,
-                                ?offset_type,
-                                offset,
-                                ?timestamp
-                            );
-
-                            ListOffsetResponse {
-                                timestamp,
-                                offset,
-                                ..Default::default()
-                            }
-                        })
-                    })
-                },
-            )?;
-
-            responses.push((topition.clone(), list_offset));
-        }
-
-        Ok(responses).inspect(|r| debug!(?r))
+        responses.inspect(|r| debug!(?r))
     }
 
     #[instrument(skip_all)]
@@ -4202,6 +4656,270 @@ mod tests {
             .expect_err("an option that tokio-postgres does not read must be rejected");
 
         assert!(error.to_string().contains("vacuum_into"), "{error}");
+    }
+
+    /// Hands out numbered objects, so a test can tell a fresh object from a
+    /// recycled one.
+    #[derive(Debug, Default)]
+    struct Numbered(std::sync::atomic::AtomicU32);
+
+    impl managed::Manager for Numbered {
+        type Type = u32;
+        type Error = std::convert::Infallible;
+
+        async fn create(&self) -> std::result::Result<u32, Self::Error> {
+            Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        }
+
+        async fn recycle(
+            &self,
+            _object: &mut u32,
+            _metrics: &managed::Metrics,
+        ) -> managed::RecycleResult<Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// A released object goes back to the pool. A dropped one reaches
+    /// `abandon` still checked out, so the pool cannot hand it out until
+    /// `abandon` lets it go.
+    #[tokio::test]
+    async fn abandoned_object_is_handed_to_abandon_still_checked_out() -> Result<()> {
+        let pool = managed::Pool::<Numbered>::builder(Numbered::default())
+            .max_size(1)
+            .build()
+            .map_err(|err| Error::Message(err.to_string()))?;
+
+        let abandoned = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let get = async || {
+            let abandoned = abandoned.clone();
+            pool.get()
+                .await
+                .map(|object| {
+                    Abandonable::new(object, move |object| {
+                        abandoned.lock().expect("abandoned").push(object)
+                    })
+                })
+                .map_err(|err| Error::Message(err.to_string()))
+        };
+
+        let first = get().await?;
+        assert_eq!(0, **first.object());
+        first.release();
+        assert_eq!(1, pool.status().available);
+
+        let second = get().await?;
+        assert_eq!(0, **second.object());
+        drop(second);
+
+        assert_eq!(1, pool.status().size);
+        assert_eq!(0, pool.status().available);
+        assert!(
+            timeout(Duration::from_millis(50), pool.get())
+                .await
+                .is_err(),
+            "the abandoned object is still checked out"
+        );
+
+        let held = abandoned
+            .lock()
+            .expect("abandoned")
+            .pop()
+            .expect("abandon received the object");
+        assert_eq!(0, *held);
+        drop(held);
+
+        let third = get().await?;
+        assert_eq!(0, **third.object());
+        third.release();
+
+        Ok(())
+    }
+
+    /// Shutting down a `ClosedByPeer` stream finishes only once the peer
+    /// has closed its side, and everything the peer sent meanwhile is
+    /// discarded.
+    #[tokio::test]
+    async fn closed_by_peer_shutdown_waits_for_the_peer() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (ours, mut peer) = tokio::io::duplex(64);
+        let mut ours = ClosedByPeer::new(ours);
+
+        ours.write_all(b"cancel").await?;
+        ours.flush().await?;
+
+        let mut shutdown = tokio::spawn(async move { ours.shutdown().await.map(|()| ours) });
+
+        let mut request = [0; 6];
+        _ = peer.read_exact(&mut request).await?;
+        assert_eq!(b"cancel", &request);
+        peer.write_all(b"busy").await?;
+
+        assert!(
+            timeout(Duration::from_millis(100), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown finished before the peer closed"
+        );
+
+        drop(peer);
+
+        let ours = timeout(Duration::from_secs(1), shutdown)
+            .await
+            .map_err(|_| Error::Message("shutdown did not finish after the peer closed".into()))?
+            .map_err(|err| Error::Message(err.to_string()))??;
+        assert!(ours.writes_shut);
+
+        Ok(())
+    }
+
+    /// At most `LIST_OFFSETS_READS` ListOffsets reads reach the pool at
+    /// once; the rest wait for a permit, and the permits come back when the
+    /// reads are dropped.
+    ///
+    /// The pool has no permits at all, so each read that has a ListOffsets
+    /// permit waits in the pool, where the pool counts it, without a server.
+    #[tokio::test]
+    async fn list_offsets_reads_are_limited_before_the_pool() -> Result<()> {
+        let pool = Pool::builder(Manager::new(
+            Config::from_str(CONNECTION)?,
+            tokio_postgres::NoTls,
+        ))
+        .max_size(0)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+        .build()?;
+
+        let storage = Postgres {
+            pool,
+            ..Postgres::builder(CONNECTION)?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(rng().random_range(0..i32::MAX))
+                .build()
+        };
+
+        let topition = Topition::new("limited", 0);
+        let reads = (0..LIST_OFFSETS_READS + 3)
+            .map(|_| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+
+                tokio::spawn(async move {
+                    storage
+                        .list_offsets(
+                            IsolationLevel::ReadUncommitted,
+                            &[(topition, ListOffset::Latest)],
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let settled = tokio::time::Instant::now() + Duration::from_secs(5);
+        while storage.pool.status().waiting < LIST_OFFSETS_READS {
+            assert!(
+                tokio::time::Instant::now() < settled,
+                "{:?}",
+                storage.pool.status()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(LIST_OFFSETS_READS, storage.pool.status().waiting);
+        assert_eq!(0, storage.list_offsets_reads.available_permits());
+
+        for read in &reads {
+            read.abort();
+        }
+        for read in reads {
+            let outcome = read.await;
+            assert!(
+                outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+                "{outcome:?}"
+            );
+        }
+
+        assert_eq!(0, storage.pool.status().waiting);
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// Dropping an abandonable connection mid-statement stops the statement
+    /// on the server and returns the connection to the pool, with its
+    /// permit.
+    #[tokio::test]
+    async fn abandoned_statement_is_cancelled_and_its_connection_returned() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_statement_is_cancelled_and_its_connection_returned: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let marker = alphanumeric_string(15);
+        let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
+
+        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
+        let connection = storage.abandonable_connection(permit).await?;
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                connection.object().batch_execute(&sleep)
+            )
+            .await
+            .is_err(),
+            "pg_sleep(30) is still running"
+        );
+        drop(connection);
+
+        let settled = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let running = monitor
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1",
+                    &[&format!("%{marker}%")],
+                )
+                .await?
+                .get::<_, i64>(0);
+            let status = storage.pool.status();
+
+            if running == 0 && status.available == 1 {
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < settled,
+                "statement still running on {running} backend(s), pool {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(2, storage.pool.status().size);
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
     }
 
     #[test]
