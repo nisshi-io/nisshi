@@ -557,6 +557,50 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
         assert_eq!(Some(-1), partition.timestamp);
     }
 
+    debug!(phase = "after last record");
+    let timestamp = ListOffset::Timestamp(third + Duration::from_secs(1))
+        .try_into()
+        .inspect(|after| debug!(?after))?;
+
+    let response = broker
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
+                .isolation_level(isolation)
+                .replica_id(replica_id)
+                .topics(Some(
+                    [ListOffsetsTopic::default()
+                        .name(topic_name.into())
+                        .partitions(Some(
+                            (0..num_partitions)
+                                .map(|partition_index| {
+                                    ListOffsetsPartition::default()
+                                        .partition_index(partition_index)
+                                        .max_num_offsets(max_num_offsets)
+                                        .timestamp(timestamp)
+                                        .current_leader_epoch(Some(current_leader_epoch))
+                                })
+                                .collect::<Vec<_>>(),
+                        ))]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(topic_name, topics[0].name);
+    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+    assert_eq!(num_partitions as usize, partitions.len());
+
+    // Partition 0 holds records, but none at or after the target: Kafka
+    // answers offset -1 and timestamp -1 with no error.
+    for partition in partitions {
+        assert_eq!(i16::from(ErrorCode::None), partition.error_code);
+        assert_eq!(Some(-1), partition.offset);
+        assert_eq!(Some(-1), partition.timestamp);
+    }
+
     Ok(())
 }
 
@@ -753,6 +797,7 @@ where
     // backend itself).
     assert_eq!(1, responses.len());
     assert_eq!(None, responses[0].1.offset);
+    assert_eq!(None, responses[0].1.timestamp);
 
     Ok(())
 }

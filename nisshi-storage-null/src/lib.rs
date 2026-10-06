@@ -577,3 +577,45 @@ impl Storage for Engine {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_offsets_timestamp_has_no_offset() -> Result<()> {
+        let engine = Engine::new(
+            "cluster".into(),
+            111,
+            Url::parse("tcp://127.0.0.1:9092/").expect("valid url"),
+        );
+        let topition = Topition::new("t", 0);
+
+        let responses = engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[
+                    (topition.clone(), ListOffset::Earliest),
+                    (topition.clone(), ListOffset::Latest),
+                    (topition.clone(), ListOffset::Timestamp(SystemTime::now())),
+                ],
+            )
+            .await?;
+
+        let offsets = responses
+            .iter()
+            .map(|(_, response)| (response.error_code, response.offset))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![
+                (ErrorCode::None, Some(0)),
+                (ErrorCode::None, Some(0)),
+                (ErrorCode::None, None),
+            ],
+            offsets
+        );
+
+        Ok(())
+    }
+}
