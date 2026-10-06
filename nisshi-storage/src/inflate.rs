@@ -20,12 +20,38 @@
 //! worker. [`offload`] moves the work onto Tokio's blocking thread pool, and
 //! [`inflate`] does so for the common case of inflating one batch.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, LazyLock, OnceLock},
+    time::Instant,
+};
 
 use nisshi_sans_io::record::{deflated, inflated};
+use opentelemetry::metrics::Histogram;
 use tokio::{runtime::Handle, sync::Semaphore, task};
 
-use crate::{Error, Result};
+use crate::{Error, METER, Result};
+
+const DURATION_BOUNDARIES_MS: [f64; 15] = [
+    0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0,
+];
+
+static OFFLOAD_PERMIT_ACQUIRE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("nisshi_storage_offload_permit_acquire_duration")
+        .with_boundaries(DURATION_BOUNDARIES_MS.into())
+        .with_unit("ms")
+        .with_description("Time an offloaded decode waits for a permit in ms")
+        .build()
+});
+
+static OFFLOAD_RUN_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("nisshi_storage_offload_run_duration")
+        .with_boundaries(DURATION_BOUNDARIES_MS.into())
+        .with_unit("ms")
+        .with_description("Time an offloaded decode runs on the blocking pool in ms")
+        .build()
+});
 
 /// Bounds how many offloaded decodes run at once, to at most one per runtime
 /// worker thread.
@@ -60,13 +86,30 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let permit = permits().acquire_owned().await?;
+    offload_with(permits(), f).await
+}
+
+async fn offload_with<F, T>(permits: Arc<Semaphore>, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let waiting = Instant::now();
+    let permit = permits.acquire_owned().await?;
+    OFFLOAD_PERMIT_ACQUIRE_DURATION.record(elapsed_millis(waiting), &[]);
 
     task::spawn_blocking(move || {
         let _permit = permit;
-        f()
+        let running = Instant::now();
+        let outcome = f();
+        OFFLOAD_RUN_DURATION.record(elapsed_millis(running), &[]);
+        outcome
     })
     .await?
+}
+
+fn elapsed_millis(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Inflate `deflated` on Tokio's blocking thread pool, as [`offload`] does.
@@ -76,9 +119,17 @@ pub async fn inflate(deflated: deflated::Batch) -> Result<inflated::Batch> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
 
-    use tokio::task::yield_now;
+    use tokio::task::{JoinSet, yield_now};
 
     use super::*;
 
@@ -95,7 +146,9 @@ mod tests {
     async fn offload_runs_off_the_runtime_thread() -> Result<()> {
         let (tx, rx) = mpsc::channel::<()>();
 
-        let task = tokio::spawn(offload(move || Ok(rx.recv_timeout(SIGNAL_TIMEOUT).is_ok())));
+        let task = tokio::spawn(offload_with(Arc::new(Semaphore::new(1)), move || {
+            Ok(rx.recv_timeout(SIGNAL_TIMEOUT).is_ok())
+        }));
 
         yield_now().await;
         _ = tx.send(());
@@ -110,8 +163,44 @@ mod tests {
 
     #[tokio::test]
     async fn offload_returns_a_panic_as_join_error() {
-        let outcome = offload::<_, ()>(|| panic!("decode panicked")).await;
+        let outcome =
+            offload_with::<_, ()>(Arc::new(Semaphore::new(1)), || panic!("decode panicked")).await;
 
         assert!(matches!(outcome, Err(Error::Join(_))), "{outcome:?}");
+    }
+
+    // Each closure holds its permit long enough for every other spawned
+    // closure to start, if a permit were free for it.
+    #[tokio::test]
+    async fn offload_runs_at_most_one_closure_per_permit() -> Result<()> {
+        const PERMITS: usize = 2;
+        const HOLD: Duration = Duration::from_millis(100);
+
+        let permits = Arc::new(Semaphore::new(PERMITS));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut closures = JoinSet::new();
+
+        for _ in 0..=PERMITS {
+            let running = running.clone();
+            let peak = peak.clone();
+
+            _ = closures.spawn(offload_with(permits.clone(), move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                _ = peak.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(HOLD);
+                _ = running.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }));
+        }
+
+        while let Some(outcome) = closures.join_next().await {
+            outcome??;
+        }
+
+        assert_eq!(PERMITS, peak.load(Ordering::SeqCst));
+
+        Ok(())
     }
 }
