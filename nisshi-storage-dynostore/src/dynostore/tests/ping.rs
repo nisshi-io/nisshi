@@ -15,7 +15,7 @@
 //! Regression coverage for `DynoStore::ping()`: when the underlying object
 //! store's `list()` fails (e.g. no usable AWS credentials), `ping()` must
 //! return that error rather than `Ok(())`, so the broker fails to start
-//! instead of failing confusingly on the first real request (SOL-155184).
+//! instead of failing confusingly on the first real request.
 
 use std::fmt::{Debug, Display};
 
@@ -30,16 +30,30 @@ use url::Url;
 
 use crate::dynostore::{DynoStore, tests::init_tracing};
 
-/// Wraps an [`ObjectStore`] and makes every `list()` call fail, to exercise
-/// the `ping()` path without needing real credentials or network access.
+/// Wraps an [`ObjectStore`] and makes each `list()` call fail, except a call
+/// for a prefix under `allowed_prefix`, to exercise the `ping()` path without
+/// real credentials or network access.
 #[derive(Clone)]
 struct FailingListObjectStore<O> {
     object_store: O,
+    allowed_prefix: Option<Path>,
 }
 
 impl<O> FailingListObjectStore<O> {
     fn new(object_store: O) -> Self {
-        Self { object_store }
+        Self {
+            object_store,
+            allowed_prefix: None,
+        }
+    }
+
+    /// Allows `list()` only under `prefix`, like an IAM policy that grants
+    /// `s3:ListBucket` with an `s3:prefix` condition.
+    fn allow_prefix(object_store: O, prefix: &str) -> Self {
+        Self {
+            object_store,
+            allowed_prefix: Some(Path::from(prefix)),
+        }
     }
 }
 
@@ -94,8 +108,14 @@ where
 
     fn list(
         &self,
-        _prefix: Option<&Path>,
+        prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        if let (Some(prefix), Some(allowed)) = (prefix, self.allowed_prefix.as_ref())
+            && prefix.prefix_matches(allowed)
+        {
+            return self.object_store.list(Some(prefix));
+        }
+
         Box::pin(stream::once(async {
             Err(object_store::Error::Generic {
                 store: "test",
@@ -146,6 +166,24 @@ async fn ping_ok_on_healthy_store() -> Result<(), Error> {
 
     let storage =
         DynoStore::new("nisshi", 12322, InMemory::new()).advertised_listener(advertised_listener);
+
+    assert!(storage.ping().await.is_ok());
+
+    Ok(())
+}
+
+/// `ping()` lists only the cluster's prefix, so a policy that allows listing
+/// only under `clusters/<cluster>/` still passes the startup check.
+#[tokio::test]
+async fn ping_lists_only_the_cluster_prefix() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let advertised_listener = Url::parse("tcp://localhost:9092")?;
+
+    let object_store = FailingListObjectStore::allow_prefix(InMemory::new(), "clusters/nisshi/");
+
+    let storage =
+        DynoStore::new("nisshi", 12323, object_store).advertised_listener(advertised_listener);
 
     assert!(storage.ping().await.is_ok());
 
