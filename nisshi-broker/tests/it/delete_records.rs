@@ -299,6 +299,21 @@ where
     assert_eq!(cutoff, stage.log_start());
     assert_eq!(record_count, stage.high_watermark());
 
+    let earliest = sc
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(topition.clone(), ListOffset::Earliest)],
+        )
+        .await?;
+
+    assert!(
+        matches!(
+            earliest[..],
+            [(_, ListOffsetResponse { offset: Some(offset), .. })] if offset == cutoff
+        ),
+        "{earliest:?}"
+    );
+
     // Every record at or after the cutoff must still be reachable, in
     // order and without gaps. Fetching at an offset that falls inside a
     // batch returns that batch whole (the client skips the records below
@@ -359,12 +374,8 @@ where
 /// `offset_stage`'s `high_watermark`, which `Latest` is ultimately built
 /// from -- must be unaffected by even a "delete everything" request.
 ///
-/// This deliberately does *not* assert `ListOffsets(Earliest)` here: on
-/// pg/lite/limbo/dynostore it is still derived by scanning the physically
-/// remaining records/objects rather than from the watermark (see the
-/// `Earliest`/`Latest`-from-watermark follow-up), so it reports the one
-/// physically-retained record's offset, not the logical log start that
-/// `offset_stage` and the `DeleteRecords` response already correctly carry.
+/// `ListOffsets(Earliest)` answers the log start, the high watermark here,
+/// and not the offset of the record that the delete keeps.
 pub async fn delete_to_high_watermark_keeps_latest<G>(
     cluster_id: Uuid,
     broker_id: i32,
@@ -401,6 +412,21 @@ where
         [(_, ListOffsetResponse { offset: Some(offset), .. })] if offset == record_count
     ));
 
+    let earliest = sc
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(topition.clone(), ListOffset::Earliest)],
+        )
+        .await?;
+
+    assert!(
+        matches!(
+            earliest[..],
+            [(_, ListOffsetResponse { offset: Some(offset), .. })] if offset == record_count
+        ),
+        "{earliest:?}"
+    );
+
     Ok(())
 }
 
@@ -427,6 +453,7 @@ where
         ErrorCode::OffsetOutOfRange,
         ErrorCode::try_from(result.error_code)?
     );
+    assert_eq!(-1, result.low_watermark);
 
     let stage = sc.offset_stage(&topition).await?;
     assert_eq!(0, stage.log_start());
@@ -456,6 +483,7 @@ where
         ErrorCode::OffsetOutOfRange,
         ErrorCode::try_from(result.error_code)?
     );
+    assert_eq!(-1, result.low_watermark);
 
     Ok(())
 }
@@ -565,6 +593,7 @@ where
         ErrorCode::UnknownTopicOrPartition,
         ErrorCode::try_from(unknown_topic_partitions[0].error_code)?
     );
+    assert_eq!(-1, unknown_topic_partitions[0].low_watermark);
 
     let known_topic_result = topics
         .iter()
@@ -581,6 +610,7 @@ where
         ErrorCode::UnknownTopicOrPartition,
         ErrorCode::try_from(out_of_range_partition.error_code)?
     );
+    assert_eq!(-1, out_of_range_partition.low_watermark);
 
     let valid_partition = known_topic_partitions
         .iter()

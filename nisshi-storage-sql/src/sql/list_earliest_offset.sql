@@ -14,16 +14,27 @@
 -- limitations under the License.
 
 -- prepare list_earliest_offset (text, text, integer) as
-select
 
-r.offset_id,
-r.timestamp
+-- Kafka answers Earliest with the log start offset, which is watermark.low.
+-- DeleteRecords advances watermark.low and keeps the record at
+-- watermark.high - 1, so a record below watermark.low can remain. The query
+-- answers with the first record at or above watermark.low, or with
+-- watermark.low and no timestamp when none remains.
+
+select offset_id, timestamp
+
+from
+
+(select
+
+1 as o, r.offset_id, r.timestamp
 
 from
 
 cluster c
 join topic t on t.cluster = c.id
 join topition tp on tp.topic = t.id
+left join watermark w on w.topition = tp.id
 join record r on r.topition = tp.id
 
 where
@@ -31,6 +42,27 @@ where
 c.name = $1
 and t.name = $2
 and tp.partition = $3
+and r.offset_id >= coalesce(w.low, 0)
 
-order by r.offset_id asc
-limit 1;
+union
+
+select
+
+2 as o, w.low, null
+
+from
+
+cluster c
+join topic t on t.cluster = c.id
+join topition tp on tp.topic = t.id
+join watermark w on w.topition = tp.id
+
+where
+
+c.name = $1
+and t.name = $2
+and tp.partition = $3
+and w.low is not null
+
+order by o, offset_id asc
+limit 1);
