@@ -6169,6 +6169,7 @@ dependencies = [
  "object_store 0.14.2",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "postcard",
  "pretty_assertions",
  "protobuf",
