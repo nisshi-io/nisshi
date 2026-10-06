@@ -49,4 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the new log start on every storage engine. An unknown topic or an
   out-of-range partition is reported per-partition and never fails a sibling
   partition in the same request, and a partition that fails reports a low
-  watermark of `-1`, as Kafka does.
+  watermark of `-1`, as Kafka does. On PostgreSQL each partition's log start
+  commits on its own, and removing the records below it follows as a separate
+  best-effort step: if that step fails or times out, the records stay below
+  the log start until the next storage maintenance run removes them.
