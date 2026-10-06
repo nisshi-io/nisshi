@@ -1461,92 +1461,98 @@ where
         }
     }
 
-    /// Deletes every named group that has no members and no rebalance in
-    /// progress, refusing the rest with `NON_EMPTY_GROUP`.
+    /// Deletes every named group that has no members, and refuses each other
+    /// group with `NON_EMPTY_GROUP`.
     ///
-    /// Checking a group's cached wrapper out of `wrappers` for the duration
-    /// of this call (same as `join`/`sync`/`heartbeat`/`leave` already do)
-    /// narrows, but does not close, the race with a concurrent request for
-    /// the same group on this broker: a `join`/`sync`/`heartbeat`/`leave`
-    /// that lands while a group is being considered here sees a cache miss
-    /// and self-heals via the usual `UpdateError::Outdated` retry path, the
-    /// same way a cache miss after a restart already does - but that
-    /// self-heal reinserts a fresh, versioned cache entry, and if it lands
-    /// between this removing the group from the cache and the storage
-    /// delete actually completing, the delete still goes ahead and that
-    /// freshly-reinserted entry is left stale, the same problem this method
-    /// exists to prevent, just re-opened by a narrower window. A group
-    /// deleted here is deliberately
-    /// not reinserted into the cache: nothing should resurrect it from a
-    /// stale cached version on the next heartbeat for it. Closing the
-    /// window fully needs a version-guarded delete in the `Storage` trait
-    /// itself, which no backend has today; see the follow-up ticket.
+    /// The decision comes from storage, not from this broker's cache, because
+    /// another broker that shares the storage can hold the group's members.
+    /// This broker forgets its cached state for each group that it deletes.
+    /// A known race remains: a concurrent request for the same group can
+    /// write the group's detail again after the delete, because the
+    /// `Storage` delete does not check the version of the group's detail.
     #[instrument(skip(self))]
     async fn delete_groups(&self, group_ids: &[String]) -> Result<Body> {
         debug!(?group_ids);
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "delete_groups")]);
 
+        // Kafka processes each distinct group id once, and answers it once:
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1891
+        let mut seen = HashSet::with_capacity(group_ids.len());
+        let group_ids = group_ids
+            .iter()
+            .filter(|group_id| seen.insert(group_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut described = self
+            .storage
+            .describe_groups(Some(&group_ids), false)
+            .await?
+            .into_iter()
+            .map(|named| (named.name, named.response))
+            .collect::<BTreeMap<_, _>>();
+
+        let now = SystemTime::now();
         let mut results = Vec::with_capacity(group_ids.len());
         let mut deletable = Vec::with_capacity(group_ids.len());
 
         for group_id in group_ids {
-            let now = SystemTime::now();
+            let refusal = match described.remove(&group_id) {
+                Some(GroupDetailResponse::Found(detail)) => {
+                    // The coordinator removes each member whose session
+                    // timeout has expired, so that a member that never sent
+                    // `LeaveGroup` does not keep the group alive.
+                    let wrapper = Wrapper::with_storage_group_detail(self.storage.clone(), detail)
+                        .missed_heartbeat(&group_id, "", now);
 
-            let cached = self
-                .wrappers
-                .lock()
-                .map(|mut wrappers| wrappers.remove(group_id))?;
+                    (!wrapper.members().is_empty()).then_some(ErrorCode::NonEmptyGroup)
+                }
 
-            let checked_out = match cached {
-                Some(cached) => Some(cached),
+                // `Storage::delete_groups` answers for a group that does not
+                // exist and for an invalid group id.
+                Some(GroupDetailResponse::ErrorCode(
+                    ErrorCode::GroupIdNotFound | ErrorCode::InvalidGroupId,
+                )) => None,
 
-                // Nothing cached for this group on this broker (never
-                // joined here, or a cache miss after a restart): fall back
-                // to whatever is actually stored.
-                None => self
-                    .storage
-                    .describe_groups(Some(std::slice::from_ref(group_id)), false)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .and_then(|named| match named.response {
-                        GroupDetailResponse::Found(detail) => Some((
-                            Wrapper::with_storage_group_detail(self.storage.clone(), detail),
-                            None,
-                        )),
-                        GroupDetailResponse::ErrorCode(_) => None,
-                    }),
+                // The coordinator keeps a group whose state it cannot read,
+                // because an unread group can still have members.
+                Some(GroupDetailResponse::ErrorCode(error_code)) => {
+                    warn!(
+                        group_id,
+                        ?error_code,
+                        "describe groups failed, not deleting"
+                    );
+                    Some(error_code)
+                }
+
+                None => {
+                    warn!(group_id, "describe groups omitted group, not deleting");
+                    Some(ErrorCode::UnknownServerError)
+                }
             };
 
-            match checked_out {
-                // No group_detail anywhere for this id (never joined, never
-                // committed an offset): nothing to check here, let
-                // `Storage::delete_groups` answer `GroupIdNotFound` /
-                // `InvalidGroupId` exactly as it does today.
-                None => deletable.push(group_id.to_owned()),
-
-                Some((wrapper, version)) => {
-                    let wrapper = wrapper.missed_heartbeat(group_id, "", now);
-
-                    if wrapper.members().is_empty() {
-                        deletable.push(group_id.to_owned());
-                    } else {
-                        _ = self.wrappers.lock().map(|mut wrappers| {
-                            wrappers.insert(group_id.to_owned(), (wrapper, version))
-                        })?;
-
-                        results.push(
-                            DeletableGroupResult::default()
-                                .group_id(group_id.to_owned())
-                                .error_code(ErrorCode::NonEmptyGroup.into()),
-                        );
-                    }
-                }
+            match refusal {
+                None => deletable.push(group_id),
+                Some(error_code) => results.push(
+                    DeletableGroupResult::default()
+                        .group_id(group_id)
+                        .error_code(error_code.into()),
+                ),
             }
         }
 
         if !deletable.is_empty() {
-            results.extend(self.storage.delete_groups(Some(&deletable)).await?);
+            let deleted = self.storage.delete_groups(Some(&deletable)).await?;
+
+            _ = self.wrappers.lock().map(|mut wrappers| {
+                for result in &deleted {
+                    if result.error_code == i16::from(ErrorCode::None) {
+                        _ = wrappers.remove(&result.group_id);
+                    }
+                }
+            })?;
+
+            results.extend(deleted);
         }
 
         Ok(Body::DeleteGroupsResponse(

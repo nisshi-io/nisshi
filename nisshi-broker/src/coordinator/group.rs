@@ -89,9 +89,8 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
         require_stable: Option<bool>,
     ) -> Result<Body>;
 
-    /// Deletes one or more groups, refusing any that still have members or a
-    /// rebalance in progress (`NON_EMPTY_GROUP`), and forgetting whatever
-    /// in-memory state this coordinator held for each group it actually
-    /// deletes.
+    /// Deletes one or more groups, refusing any that still has members
+    /// (`NON_EMPTY_GROUP`), and forgetting the in-memory state that this
+    /// coordinator held for each group it deletes.
     async fn delete_groups(&self, group_ids: &[String]) -> Result<Body>;
 }
