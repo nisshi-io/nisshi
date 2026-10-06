@@ -153,7 +153,7 @@ pub mod header;
 pub mod inflated;
 
 use crate::{
-    ByteSize, Decode, Encode, Result,
+    ByteSize, Decode, Encode, Error, Result,
     primitive::varint::{LongVarInt, VarInt},
 };
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
@@ -199,15 +199,8 @@ pub struct Record {
 
 impl ByteSize for Record {
     fn size_in_bytes(&self) -> Result<usize> {
-        let size = VarInt::from(self.length).size_in_bytes()?
-            + 1
-            + LongVarInt::from(self.timestamp_delta).size_in_bytes()?
-            + VarInt::from(self.offset_delta).size_in_bytes()?
-            + Octets(self.key.clone()).size_in_bytes()?
-            + Octets(self.value.clone()).size_in_bytes()?
-            + VarIntSequence(self.headers.clone()).size_in_bytes()?;
-
-        Ok(size)
+        let body = self.body_size_in_bytes()?;
+        Ok(VarInt::try_from(body)?.size_in_bytes()? + body)
     }
 }
 
@@ -238,7 +231,7 @@ impl Encode for Record {
             .inspect(|with_capacity| debug!(with_capacity))
             .map(BytesMut::with_capacity)?;
 
-        let length = VarInt::from(self.length);
+        let length = self.body_size_in_bytes().and_then(VarInt::try_from)?;
         encoded.put(length.encode()?);
         encoded.put_u8(self.attributes);
         encoded.put(LongVarInt::from(self.timestamp_delta).encode()?);
@@ -256,13 +249,32 @@ impl Decode for Record {
     fn decode(encoded: &mut Bytes) -> Result<Self> {
         debug!(encoded = ?encoded[..]);
 
-        let length = VarInt::decode(encoded).map(Into::into)?;
-        let attributes = encoded.try_get_u8()?;
-        let timestamp_delta = LongVarInt::decode(encoded).map(Into::into)?;
-        let offset_delta = VarInt::decode(encoded).map(Into::into)?;
-        let key = Octets::decode(encoded).map(Into::into)?;
-        let value = Octets::decode(encoded).map(Into::into)?;
-        let headers = VarIntSequence::decode(encoded).map(Into::into)?;
+        let length: i32 = VarInt::decode(encoded).map(Into::into)?;
+
+        // `length` bounds everything that follows it in this record
+        // (attributes through headers). Scope every subsequent read to
+        // exactly that many bytes, split off the front of `encoded`, so a
+        // corrupt or adversarial length can never read into the next
+        // record's bytes: a header/key/value count that claims too little
+        // leaves `body` non-empty afterward, one that claims too much runs
+        // `body` dry; both fail here, at this record's true boundary,
+        // instead of bleeding into whatever is next in the batch.
+        let body_len = usize::try_from(length).map_err(|_| Error::Overflow)?;
+        if body_len > encoded.len() {
+            return Err(Error::Overflow);
+        }
+        let mut body = encoded.split_to(body_len);
+
+        let attributes = body.try_get_u8()?;
+        let timestamp_delta = LongVarInt::decode(&mut body).map(Into::into)?;
+        let offset_delta = VarInt::decode(&mut body).map(Into::into)?;
+        let key = Octets::decode(&mut body).map(Into::into)?;
+        let value = Octets::decode(&mut body).map(Into::into)?;
+        let headers = VarIntSequence::decode(&mut body).map(Into::into)?;
+
+        if !body.is_empty() {
+            return Err(Error::Overflow);
+        }
 
         Ok(Self {
             length,
@@ -280,6 +292,20 @@ impl Record {
     #[must_use]
     pub fn builder() -> Builder {
         Builder::default()
+    }
+
+    /// The encoded size of everything after the length prefix, computed from
+    /// the fields. [`Encode`] writes this as the length prefix rather than
+    /// the stored `length`, so that a record rebuilt with changed fields
+    /// (`Record { offset_delta, ..record }`) still encodes to a record that
+    /// [`Decode`] accepts.
+    fn body_size_in_bytes(&self) -> Result<usize> {
+        Ok(size_of::<u8>()
+            + LongVarInt::from(self.timestamp_delta).size_in_bytes()?
+            + VarInt::from(self.offset_delta).size_in_bytes()?
+            + Octets(self.key.clone()).size_in_bytes()?
+            + Octets(self.value.clone()).size_in_bytes()?
+            + VarIntSequence(self.headers.clone()).size_in_bytes()?)
     }
 
     pub fn key(&self) -> Option<Bytes> {
@@ -578,6 +604,146 @@ mod tests {
         ]);
 
         assert_eq!(1_126_819_645, digester.finalize());
+
+        Ok(())
+    }
+
+    /// A declared record length with no room left for the key payload its
+    /// own key-length byte claims: body = [attributes=0, timestamp_delta=0,
+    /// offset_delta=0, key_length=5], declared length 4, exactly enough
+    /// for those four bytes and nothing more. `Octets::decode` rejects a
+    /// key length that reaches past this record's declared boundary,
+    /// rather than reading from whatever follows in the wider buffer
+    /// (here, deliberately distinct filler).
+    #[test]
+    fn decode_length_shorter_than_fields_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(4).encode()?); // declared length: body only
+        encoded.put_u8(0); // attributes
+        encoded.put(LongVarInt(0).encode()?); // timestamp_delta
+        encoded.put(VarInt(0).encode()?); // offset_delta
+        encoded.put(VarInt(5).encode()?); // key length: claims 5 bytes
+
+        // Filler that belongs to no record. Decode stops at this record's
+        // declared boundary instead of reading these bytes as the key,
+        // even though the wider buffer has enough bytes left to satisfy
+        // the claimed key length.
+        encoded.put_slice(&[0u8; 10]);
+
+        let mut encoded = encoded.freeze();
+
+        let err = Record::decode(&mut encoded)
+            .expect_err("a key length outrunning the declared record length must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// A declared record length one byte longer than the fields it
+    /// actually contains: a fully empty record body is 6 bytes (attributes,
+    /// zero timestamp/offset deltas, null key, null value, zero headers),
+    /// but this record declares 7, with one padding byte tacked on inside
+    /// its own declared span. Honoring the length prefix means that extra
+    /// byte is detected, not silently folded into the next record's bytes.
+    #[test]
+    fn decode_length_longer_than_fields_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(7).encode()?); // declared length: one byte too many
+        encoded.put_u8(0); // attributes
+        encoded.put(LongVarInt(0).encode()?); // timestamp_delta
+        encoded.put(VarInt(0).encode()?); // offset_delta
+        encoded.put(VarInt(-1).encode()?); // null key
+        encoded.put(VarInt(-1).encode()?); // null value
+        encoded.put(VarInt(0).encode()?); // header count: 0
+        encoded.put_u8(0xFF); // padding inside the declared length
+
+        let mut encoded = encoded.freeze();
+
+        let err = Record::decode(&mut encoded)
+            .expect_err("a declared length longer than the record's fields must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// A declared length that runs past the end of the buffer is rejected
+    /// before the body is split off; `Bytes::split_to` panics on it.
+    #[test]
+    fn decode_length_past_end_of_buffer_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(100).encode()?);
+        encoded.put_slice(&[0, 0, 0]);
+        let mut encoded = encoded.freeze();
+
+        let err = Record::decode(&mut encoded)
+            .expect_err("a declared length past the end of the buffer must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn decode_negative_length_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(-1).encode()?);
+        encoded.put_slice(&[0, 0, 0, 1, 1, 0]);
+        let mut encoded = encoded.freeze();
+
+        let err =
+            Record::decode(&mut encoded).expect_err("a negative declared length must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn min_encoded_record_size_matches_encoder() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_eq!(
+            codec::MIN_ENCODED_RECORD_SIZE,
+            Record::builder().build()?.encode()?.len()
+        );
+
+        Ok(())
+    }
+
+    /// The length prefix is computed from the fields, not taken from the
+    /// stored `length`, so a record rebuilt with a field that grows its
+    /// varint encoding (`offset_delta` 63 to 64, `timestamp_delta` -64 to
+    /// -65) still encodes to a record that decodes.
+    #[test]
+    fn encode_computes_length_from_fields() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let original = Record::builder()
+            .value(Some(Bytes::from_static(b"def")))
+            .offset_delta(63)
+            .timestamp_delta(-64)
+            .build()?;
+
+        let rebuilt = Record {
+            offset_delta: 64,
+            timestamp_delta: -65,
+            ..original.clone()
+        };
+
+        let encoded = rebuilt.encode()?;
+        assert_eq!(rebuilt.size_in_bytes()?, encoded.len());
+
+        let decoded = Record::decode(&mut encoded.clone())?;
+        assert_eq!(original.length + 2, decoded.length);
+        assert_eq!(rebuilt.offset_delta, decoded.offset_delta);
+        assert_eq!(rebuilt.timestamp_delta, decoded.timestamp_delta);
+        assert_eq!(rebuilt.value, decoded.value);
 
         Ok(())
     }
