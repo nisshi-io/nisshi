@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `nisshi-sans-io` has an `arbitrary` feature that derives `arbitrary::Arbitrary` on every generated message type. The dev-only `fuzz` crate uses it to run a fuzzed request through each non-transaction storage service, and it gains a target for each of them.
+
 ### Changed
 
 - A listener with SASL configured closes a connection that sends a frame larger than 512KiB before the client authenticates, matching the Apache Kafka default for `sasl.server.max.receive.size`. The same limit applies while a client re-authenticates. The broker logs this rejection as `PreAuthenticationFrameTooBig`, and counts it in `nisshi_frames_rejected`.
@@ -35,3 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- A `Fetch` request with an invalid `isolation_level`, `max_wait_ms`, `min_bytes` or `max_bytes` gets `INVALID_REQUEST` on the response and on every requested partition, instead of an internal error. `FetchService` takes a `ValidatedFetchRequest`, which parses these fields once.
+- A `ListOffsets` request with an invalid `isolation_level` gets `INVALID_REQUEST`, and one with an invalid timestamp gets `INVALID_TIMESTAMP` on that partition, instead of an internal error.
+- An `AlterUserScramCredentials` request with an unrecognized SASL mechanism gets `UNSUPPORTED_SASL_MECHANISM` on that item, instead of an internal error.
+- A `Fetch` or `Metadata` request for a topic with neither a name nor a topic id no longer panics.
