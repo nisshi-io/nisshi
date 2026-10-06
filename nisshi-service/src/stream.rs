@@ -1015,21 +1015,22 @@ where
     async fn req<R>(
         &self,
         req: &mut R,
+        extensions: &Extensions,
         limits: ConnectionLimits,
         attributes: &[KeyValue],
     ) -> Result<(), S::Error>
     where
-        R: AsyncReadExt + AsyncWriteExt + Unpin + ExtensionsRef,
+        R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
         let limits = ConnectionLimits {
-            maximum_frame_size: effective_maximum_frame_size(req.extensions()),
+            maximum_frame_size: effective_maximum_frame_size(extensions),
             ..limits
         };
 
         let size = self.wait(req, limits).await?;
         let request = self.read(req, size, limits).await?;
         let response = self
-            .process(attributes, request, req.extensions().clone())
+            .process(attributes, request, extensions.clone())
             .await?;
 
         // An `acks=0` Produce response is suppressed here, after it's already been
@@ -1037,7 +1038,7 @@ where
         // response that is never actually written to the peer. That's a known, accepted
         // minor inaccuracy rather than one worth threading a "don't record this" signal
         // through every layer for.
-        if SuppressResponseExtension::take(req.extensions()) {
+        if SuppressResponseExtension::take(extensions) {
             return Ok(());
         }
 
@@ -1074,10 +1075,18 @@ where
 
         let limits = ConnectionLimits::from_extensions(req.extensions());
 
+        // Each connection gets its own scope, because a listener can hand the
+        // same store to every connection that it accepts. A request on this
+        // connection then sees the listener's settings, and what it inserts
+        // stays on this connection.
+        let extensions = req.extensions().fork();
+        _ = extensions.insert(SuppressResponseExtension::default());
+
         loop {
             let attributes = attributes.clone();
 
-            self.req(&mut req, limits, &attributes[..]).await?
+            self.req(&mut req, &extensions, limits, &attributes[..])
+                .await?
         }
     }
 }

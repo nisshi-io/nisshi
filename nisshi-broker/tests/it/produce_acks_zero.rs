@@ -26,7 +26,7 @@ use nisshi_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::
 use nisshi_sans_io::{
     Ack, ApiKey as _, Body, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, Frame, Header,
     IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
-    ProduceRequest,
+    ProduceRequest, ProduceResponse,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -161,7 +161,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     write_request(stream, api_key, api_version, correlation_id, body).await?;
+    read_response(stream, api_key, api_version).await
+}
 
+/// Reads one response frame off `stream` and decodes it as a response to
+/// `api_key` at `api_version`.
+async fn read_response<S>(stream: &mut S, api_key: i16, api_version: i16) -> Result<Frame>
+where
+    S: AsyncRead + Unpin,
+{
     let mut size = [0u8; 4];
     _ = stream.read_exact(&mut size).await?;
 
@@ -400,6 +408,94 @@ async fn acks_zero_success_is_not_written(storage: Url) -> Result<()> {
     .await?
 }
 
+/// Several `acks=0` Produce requests on one connection, then an `acks=1`
+/// Produce and a Metadata request: only the last two get a response, in
+/// order. The second and third `acks=0` requests reuse the connection's
+/// suppression marker after the first one cleared it, and the `acks=1`
+/// response proves the marker suppresses only the request that set it.
+async fn acks_zero_then_acks_one_on_one_connection(storage: Url) -> Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        let broker = spawn_broker(storage).await?;
+        let mut stream = TcpStream::connect(broker.addr).await?;
+
+        let topic = &alphanumeric_string(15)[..];
+        let partition = 0;
+
+        create_topic(&mut stream, topic).await?;
+
+        for correlation_id in 100..103 {
+            write_request(
+                &mut stream,
+                ProduceRequest::KEY,
+                9,
+                correlation_id,
+                produce_body(topic, partition, b"acks zero", i16::from(Ack::None))?,
+            )
+            .await?;
+        }
+
+        write_request(
+            &mut stream,
+            ProduceRequest::KEY,
+            9,
+            103,
+            produce_body(topic, partition, b"acks one", i16::from(Ack::Leader))?,
+        )
+        .await?;
+
+        write_request(
+            &mut stream,
+            MetadataRequest::KEY,
+            12,
+            104,
+            MetadataRequest::default()
+                .topics(Some([].into()))
+                .allow_auto_topic_creation(Some(false))
+                .include_cluster_authorized_operations(Some(false))
+                .include_topic_authorized_operations(Some(false))
+                .into(),
+        )
+        .await?;
+
+        let produce = read_response(&mut stream, ProduceRequest::KEY, 9).await?;
+        assert_eq!(
+            Header::Response {
+                correlation_id: 103
+            },
+            produce.header,
+            "the first frame must be the acks=1 Produce response"
+        );
+
+        let base_offset = ProduceResponse::try_from(produce.body)?
+            .responses
+            .unwrap_or_default()
+            .first()
+            .and_then(|topic| topic.partition_responses.as_deref())
+            .and_then(|partitions| partitions.first())
+            .map(|partition| partition.base_offset);
+        assert_eq!(
+            Some(3),
+            base_offset,
+            "the acks=1 record must follow the three acks=0 records"
+        );
+
+        let metadata = read_response(&mut stream, MetadataRequest::KEY, 12).await?;
+        assert_eq!(
+            Header::Response {
+                correlation_id: 104
+            },
+            metadata.header,
+            "the second frame must be the Metadata response"
+        );
+
+        let offset = latest_offset(&mut stream, topic, partition).await?;
+        assert_eq!(Some(4), offset, "all four records must be stored");
+
+        Ok(())
+    })
+    .await?
+}
+
 /// An `acks=0` Produce that fails (here: a record-less batch, rejected with
 /// `INVALID_RECORD` before storage is touched) must close the connection
 /// rather than respond: a bounded `read_exact` on the connection must observe
@@ -489,6 +585,12 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn acks_zero_then_acks_one() -> Result<()> {
+        let _guard = init_tracing()?;
+        acks_zero_then_acks_one_on_one_connection(Url::parse("memory://")?).await
+    }
+
+    #[tokio::test]
     async fn failure_closes_connection() -> Result<()> {
         let _guard = init_tracing()?;
         acks_zero_failure_closes_connection(Url::parse("memory://")?).await
@@ -509,6 +611,12 @@ mod slatedb {
     async fn success_is_not_written() -> Result<()> {
         let _guard = init_tracing()?;
         acks_zero_success_is_not_written(Url::parse("slatedb://memory")?).await
+    }
+
+    #[tokio::test]
+    async fn acks_zero_then_acks_one() -> Result<()> {
+        let _guard = init_tracing()?;
+        acks_zero_then_acks_one_on_one_connection(Url::parse("slatedb://memory")?).await
     }
 
     #[tokio::test]
@@ -533,6 +641,15 @@ mod pg {
         let _guard = init_tracing()?;
         acks_zero_success_is_not_written(Url::parse("postgres://postgres:postgres@localhost")?)
             .await
+    }
+
+    #[tokio::test]
+    async fn acks_zero_then_acks_one() -> Result<()> {
+        let _guard = init_tracing()?;
+        acks_zero_then_acks_one_on_one_connection(Url::parse(
+            "postgres://postgres:postgres@localhost",
+        )?)
+        .await
     }
 
     #[tokio::test]
@@ -582,6 +699,16 @@ mod lite {
             .ok_or_else(|| anyhow!("unnamed thread"))?
             .to_owned();
         acks_zero_success_is_not_written(sqlite_url(&name).await?).await
+    }
+
+    #[tokio::test]
+    async fn acks_zero_then_acks_one() -> Result<()> {
+        let _guard = init_tracing()?;
+        let name = thread::current()
+            .name()
+            .ok_or_else(|| anyhow!("unnamed thread"))?
+            .to_owned();
+        acks_zero_then_acks_one_on_one_connection(sqlite_url(&name).await?).await
     }
 
     #[tokio::test]

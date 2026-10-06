@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use nisshi_sans_io::{
     Ack, ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
@@ -21,10 +24,24 @@ use nisshi_sans_io::{
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::deflated,
 };
+use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tracing::{error, instrument, warn};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, METER, Result, Storage, Topition};
+
+/// Counts the connections closed by a failed `acks=0` Produce, by the error
+/// code of the first failing partition.
+///
+/// The failed request does not reach the request and error counts, because
+/// it ends the connection before a response is encoded. A producer that
+/// keeps failing shows here as a reconnect loop.
+static ACKS_ZERO_PRODUCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_produce_acks_zero_failed")
+        .with_description("Connections closed by a failed acks=0 Produce")
+        .build()
+});
 
 /// Why a client batch must be rejected before anything is written, with the
 /// error code to send, or `None` if it may be stored. Kafka's `LogValidator`
@@ -467,6 +484,9 @@ where
         // producer a retriable `NetworkException` instead of nothing at all.
         if input.request.acks == i16::from(Ack::None) {
             if let Some((topic, partition, error_code)) = first_error(&responses) {
+                ACKS_ZERO_PRODUCE_FAILED
+                    .add(1, &[KeyValue::new("error_code", format!("{error_code:?}"))]);
+
                 return Err(Error::AcksZeroProduceFailed {
                     topic,
                     partition,
