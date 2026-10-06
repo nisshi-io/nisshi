@@ -35,3 +35,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- Records combined into one batch kept their absolute timestamps only when the batches shared a base timestamp. Otherwise each record's timestamp shifted by twice the gap between the batches' base timestamps. This affected records written through the produce batcher (`memory://` and `s3://` storage with `batch_max_delay` set) and through `nisshi proxy`. Records already stored keep the shifted timestamps.
+
