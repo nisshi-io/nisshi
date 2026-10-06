@@ -21,6 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 mod latency;
 mod ping;
+mod stale_watermark;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A Fetch at an offset outside the partition, over a real connection: the
+//! A Fetch at an offset below the log start, over a real connection: the
 //! broker answers `OFFSET_OUT_OF_RANGE` without waiting out `max_wait`, and
 //! the connection stays open for the next request.
 //!
@@ -116,7 +116,7 @@ async fn fetch(
     FetchResponse::try_from(frame.body).map_err(Into::into)
 }
 
-/// Fetch at -5, then at `i64::MAX`, then ApiVersions, all on one connection.
+/// Fetch at -5, then at `i64::MIN`, then ApiVersions, all on one connection.
 #[tokio::test]
 async fn out_of_range_fetch_keeps_the_connection() -> Result<()> {
     let _guard = init_tracing()?;
@@ -128,7 +128,7 @@ async fn out_of_range_fetch_keeps_the_connection() -> Result<()> {
         let topic = alphanumeric_string(15);
         create_topic(&mut stream, &topic).await?;
 
-        for (correlation_id, fetch_offset) in [(2, -5), (3, i64::MAX)] {
+        for (correlation_id, fetch_offset) in [(2, -5), (3, i64::MIN)] {
             let started_at = Instant::now();
             let response = fetch(&mut stream, correlation_id, &topic, fetch_offset).await?;
             let elapsed = started_at.elapsed();

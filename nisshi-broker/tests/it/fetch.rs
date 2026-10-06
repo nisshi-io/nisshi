@@ -1301,10 +1301,11 @@ fn assert_offset_out_of_range(
     Ok(())
 }
 
-/// A fetch offset outside the partition is answered with
+/// A fetch offset below the log start is answered with
 /// `OFFSET_OUT_OF_RANGE` straight away (not after `max_wait`), without
 /// disturbing another partition in the same request, and the service keeps
-/// answering valid fetches afterwards.
+/// answering valid fetches afterwards. A fetch offset above the high
+/// watermark is answered with `NONE` and no records, as in Kafka.
 pub async fn offset_out_of_range<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
 where
     C: Into<String>,
@@ -1340,7 +1341,7 @@ where
     let max_wait_ms = 10_000;
     let answered_within = Duration::from_secs(5);
 
-    for fetch_offset in [-5, i64::MIN, high_watermark + 1, i64::MAX] {
+    for fetch_offset in [-5, i64::MIN] {
         let started_at = SystemTime::now();
         let response = fetch_offsets(&sc, &topic_name, &[(0, fetch_offset)], max_wait_ms).await?;
         let elapsed = started_at.elapsed()?;
@@ -1353,6 +1354,48 @@ where
         let partitions = partition_data(response);
         assert_eq!(1, partitions.len());
         assert_offset_out_of_range(&partitions[0], fetch_offset)?;
+    }
+
+    // a client can be ahead of the high watermark that a broker reads
+    for fetch_offset in [high_watermark + 1, i64::MAX] {
+        let response = fetch_offsets(&sc, &topic_name, &[(0, fetch_offset)], 500).await?;
+        let partitions = partition_data(response);
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?,
+            "fetch at {fetch_offset}"
+        );
+        assert_eq!(
+            high_watermark, partitions[0].high_watermark,
+            "fetch at {fetch_offset}"
+        );
+        assert!(partitions[0].records.is_none(), "fetch at {fetch_offset}");
+    }
+
+    // one partition out of range, the other idle at its high watermark: the
+    // error ends the wait
+    {
+        let started_at = SystemTime::now();
+        let response = fetch_offsets(
+            &sc,
+            &topic_name,
+            &[(0, -5), (1, high_watermark)],
+            max_wait_ms,
+        )
+        .await?;
+        let elapsed = started_at.elapsed()?;
+
+        assert!(elapsed < answered_within, "took {elapsed:?}");
+
+        let partitions = partition_data(response);
+        assert_eq!(2, partitions.len());
+        assert_offset_out_of_range(&partitions[0], -5)?;
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+        assert!(record_offsets(&partitions[1])?.is_empty());
     }
 
     // one partition out of range, the other holding records
@@ -1468,6 +1511,96 @@ where
         assert_eq!(Some(log_start), partitions[0].log_start_offset);
         assert_eq!(vec![3, 4], record_offsets(&partitions[0])?);
     }
+
+    Ok(())
+}
+
+/// A fetch for an unknown topic beside a live topic idle at its high
+/// watermark waits out `max_wait`, as in Kafka, which sets unknown topics
+/// aside and waits for the rest. A consumer still assigned to a deleted
+/// topic then fetches once per `max_wait`, not at round trip speed.
+pub async fn unknown_topic_beside_idle_topic<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let partition = |fetch_offset| {
+        FetchPartition::default()
+            .partition(0)
+            .current_leader_epoch(Some(-1))
+            .fetch_offset(fetch_offset)
+            .last_fetched_epoch(Some(-1))
+            .log_start_offset(Some(-1))
+            .partition_max_bytes(50 * 1024)
+    };
+
+    let max_wait_ms = 1_000;
+    let started_at = SystemTime::now();
+
+    let response = FetchService {
+        storage: sc.clone(),
+    }
+    .serve(RequestInput {
+        request: FetchRequest::default()
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(1)
+            .max_bytes(Some(50 * 1024))
+            .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+            .topics(Some(
+                [
+                    FetchTopic::default()
+                        .topic(None)
+                        .topic_id(Some(Uuid::now_v7().into_bytes()))
+                        .partitions(Some([partition(0)].into())),
+                    FetchTopic::default()
+                        .topic(Some(topic_name))
+                        .topic_id(Some(NULL_TOPIC_ID))
+                        .partitions(Some([partition(0)].into())),
+                ]
+                .into(),
+            )),
+        extensions: Extensions::default(),
+    })
+    .await?;
+
+    let elapsed = started_at.elapsed()?;
+    assert!(
+        elapsed >= Duration::from_millis(max_wait_ms as u64 / 2),
+        "answered after {elapsed:?}"
+    );
+
+    let partitions = partition_data(response);
+    assert_eq!(2, partitions.len());
+    assert_eq!(
+        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[1].error_code)?
+    );
+    assert!(record_offsets(&partitions[1])?.is_empty());
 
     Ok(())
 }
@@ -1625,6 +1758,21 @@ mod pg {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn unknown_topic_beside_idle_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_beside_idle_topic(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "dynostore")]
@@ -1774,6 +1922,21 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::offset_out_of_range(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_beside_idle_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_beside_idle_topic(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1950,6 +2113,21 @@ mod lite {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn unknown_topic_beside_idle_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_beside_idle_topic(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -2114,6 +2292,21 @@ mod slatedb {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::below_log_start(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_beside_idle_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::unknown_topic_beside_idle_topic(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
