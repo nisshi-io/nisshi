@@ -55,7 +55,7 @@ Note: when running nisshi directly (not via docker compose), set `AWS_ENDPOINT="
 
 ## Architecture
 
-Cargo workspace with 20 member crates (21 including the `fuzz` harness), producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `user`, `generator`, `perf`, `proxy`.
+Cargo workspace (members, including the `fuzz` harness, are listed in the root `Cargo.toml`), producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `user`, `generator`, `perf`, `proxy`.
 
 ### Key Crates
 
