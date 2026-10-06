@@ -22,38 +22,148 @@ use nisshi_sans_io::{
     record::deflated,
 };
 use rama::Service;
-use tracing::{debug, error, instrument, warn};
+use tracing::{error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
 
-/// Why a client batch must be rejected with `INVALID_RECORD` before anything
-/// is written, or `None` if it may be stored. Kafka's `LogValidator` rejects
-/// the same batches.
+/// Why a client batch must be rejected before anything is written, with the
+/// error code to send, or `None` if it may be stored. Kafka's `LogValidator`
+/// rejects the same batches.
 ///
 /// - Only the broker writes control batches (transaction commit/abort
 ///   markers), and those go directly to storage rather than through
 ///   [`ProduceService`]. Every backend skips schema validation and lake
 ///   writes for a control batch, so a client must not be able to set the bit.
+///   `INVALID_RECORD`.
 /// - A consistent header has at least one record and
 ///   `last_offset_delta + 1 == record_count`. Every backend uses
 ///   `last_offset_delta` to advance the high watermark, so a mismatch corrupts
 ///   or wedges the partition. `record_count` is an int32 on the wire, so a
-///   value above `i32::MAX` is rejected too.
-fn rejection(batch: &deflated::Batch) -> Option<&'static str> {
+///   value above `i32::MAX` is rejected too. `INVALID_RECORD`.
+/// - `record_count` alone must not imply more decoded memory than the
+///   decoded-size limit allows. `nisshi-sans-io` enforces the limit during
+///   decode as well; checking here rejects the batch before `storage.produce()`
+///   and before any decompression is paid for. `MESSAGE_TOO_LARGE`, the same
+///   code the decode-time rejection maps to (see [`storage_error_code`]).
+fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
     if batch.is_control() {
-        return Some("clients may not write control batches");
+        return Some((
+            ErrorCode::InvalidRecord,
+            "clients may not write control batches",
+        ));
     }
 
     let Ok(record_count) = i32::try_from(batch.record_count) else {
-        return Some("record_count exceeds i32::MAX");
+        return Some((ErrorCode::InvalidRecord, "record_count exceeds i32::MAX"));
     };
 
     if record_count < 1 {
-        Some("batch has no records")
+        Some((ErrorCode::InvalidRecord, "batch has no records"))
     } else if batch.last_offset_delta.checked_add(1) != Some(record_count) {
-        Some("last_offset_delta + 1 does not equal record_count")
+        Some((
+            ErrorCode::InvalidRecord,
+            "last_offset_delta + 1 does not equal record_count",
+        ))
+    } else if batch.exceeds_decoded_record_count_limit() {
+        Some((
+            ErrorCode::MessageTooLarge,
+            "record_count exceeds the maximum decoded batch size",
+        ))
     } else {
         None
+    }
+}
+
+/// The error code for a failed `storage.produce()`.
+///
+/// A batch over the decoded-size limit is reported as `MESSAGE_TOO_LARGE`:
+/// Kafka's code for "this batch is too large for the broker", which a
+/// producer can recover from on its own (the Java producer splits a batch of
+/// more than one record and retries). `UNKNOWN_SERVER_ERROR` is reserved for
+/// failures the client did not cause.
+fn storage_error_code(error: &Error) -> ErrorCode {
+    match error {
+        Error::Api(error_code) => *error_code,
+        Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
+            ErrorCode::MessageTooLarge
+        }
+        _ => ErrorCode::UnknownServerError,
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_record_count_is_rejected_before_storage_is_called() {
+        let batch = deflated::Batch {
+            record_count: 1_000_000,
+            last_offset_delta: 999_999,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            Some((
+                ErrorCode::MessageTooLarge,
+                "record_count exceeds the maximum decoded batch size"
+            )),
+            rejection(&batch)
+        );
+    }
+
+    #[test]
+    fn a_record_count_within_the_limit_is_not_rejected_for_this_reason() {
+        let batch = deflated::Batch {
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(None, rejection(&batch));
+    }
+
+    #[test]
+    fn an_inconsistent_header_is_an_invalid_record() {
+        let batch = deflated::Batch {
+            record_count: 2,
+            last_offset_delta: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            Some((
+                ErrorCode::InvalidRecord,
+                "last_offset_delta + 1 does not equal record_count"
+            )),
+            rejection(&batch)
+        );
+    }
+
+    #[test]
+    fn decoded_size_limit_from_storage_is_message_too_large() {
+        assert_eq!(
+            ErrorCode::MessageTooLarge,
+            storage_error_code(&Error::SansIo(
+                nisshi_sans_io::Error::MessageMaxSizeExceeded(1)
+            ))
+        );
+    }
+
+    #[test]
+    fn api_errors_from_storage_pass_through() {
+        assert_eq!(
+            ErrorCode::UnknownTopicOrPartition,
+            storage_error_code(&Error::Api(ErrorCode::UnknownTopicOrPartition))
+        );
+    }
+
+    #[test]
+    fn other_storage_errors_are_unknown_server_error() {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            storage_error_code(&Error::SansIo(nisshi_sans_io::Error::Overflow))
+        );
     }
 }
 
@@ -190,22 +300,21 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         if let Some(records) = partition.records {
-            if let Some((rejected, reason)) = records
-                .batches
-                .iter()
-                .find_map(|batch| rejection(batch).map(|reason| (batch, reason)))
-            {
+            if let Some((rejected, error_code, reason)) = records.batches.iter().find_map(|batch| {
+                rejection(batch).map(|(error_code, reason)| (batch, error_code, reason))
+            }) {
                 warn!(
                     topic = name,
                     partition = partition.index,
                     record_count = rejected.record_count,
                     last_offset_delta = rejected.last_offset_delta,
+                    ?error_code,
                     reason,
                     "rejecting produce batch",
                 );
 
                 return self
-                    .error(partition.index, ErrorCode::InvalidRecord)
+                    .error(partition.index, error_code)
                     .error_message(Some(reason.into()));
             }
 
@@ -227,27 +336,33 @@ where
                     batch.max_timestamp = base_timestamp;
                 }
 
-                match self
-                    .storage
-                    .produce(transaction_id, &tp, batch)
-                    .await
-                    .inspect_err(|err| match err {
-                        storage_api @ Error::Api(_) => {
-                            warn!(?storage_api)
-                        }
-                        otherwise => error!(?otherwise),
-                    }) {
+                match self.storage.produce(transaction_id, &tp, batch).await {
                     Ok(offset) => _ = base_offset.get_or_insert(offset),
 
-                    Err(Error::Api(error_code)) => {
-                        debug!(?self, ?error_code);
-                        return self.error(partition.index, error_code);
-                    }
+                    Err(error) => {
+                        let error_code = storage_error_code(&error);
 
-                    Err(otherwise) => {
-                        warn!(?otherwise);
-                        let error = self.error(partition.index, ErrorCode::UnknownServerError);
-                        return error;
+                        // Logged once, here, with the partition: a rejection
+                        // the client caused is a warning, an internal failure
+                        // is an error.
+                        if error_code == ErrorCode::UnknownServerError {
+                            error!(
+                                topic = name,
+                                partition = partition.index,
+                                ?error,
+                                "produce failed"
+                            );
+                        } else {
+                            warn!(
+                                topic = name,
+                                partition = partition.index,
+                                ?error_code,
+                                %error,
+                                "rejecting produce batch"
+                            );
+                        }
+
+                        return self.error(partition.index, error_code);
                     }
                 }
             }

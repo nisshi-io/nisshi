@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, RootMessageMeta};
+use crate::{Error, Result, RootMessageMeta, record::codec::DecodeBudget};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nisshi_model::{FieldMeta, MessageMeta};
 use serde::{
@@ -73,6 +73,7 @@ pub struct Decoder<'de> {
     path: VecDeque<&'static str>,
     in_records: bool,
     message_max_size: Option<usize>,
+    budget: Option<DecodeBudget>,
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -128,10 +129,11 @@ impl<'de> Decoder<'de> {
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
             message_max_size: None,
+            budget: None,
         }
     }
 
-    pub(crate) fn request(reader: &'de mut dyn Read) -> Self {
+    pub(crate) fn request(reader: &'de mut dyn Read, message_max_size: Option<usize>) -> Self {
         Self {
             reader,
             containers: VecDeque::with_capacity(PARSE_DEPTH),
@@ -144,7 +146,8 @@ impl<'de> Decoder<'de> {
             in_seq_of_primitive: false,
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
-            message_max_size: None,
+            message_max_size,
+            budget: None,
         }
     }
 
@@ -175,7 +178,28 @@ impl<'de> Decoder<'de> {
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
             message_max_size: None,
+            budget: None,
         }
+    }
+
+    /// Charge every element this decoder produces inside a sequence (each
+    /// `Header`, each copied byte of a key or value, ...) to `budget`, so a
+    /// batch whose decoded form outgrows the budget is rejected as it is
+    /// decoded rather than after it has been allocated. A decoder without a
+    /// budget is unbounded, as before: only record data is decoded under one.
+    #[must_use]
+    pub(crate) fn with_budget(self, budget: DecodeBudget) -> Self {
+        Self {
+            budget: Some(budget),
+            ..self
+        }
+    }
+
+    /// Charge `cost` decoded bytes to the budget, if there is one.
+    pub(crate) fn charge(&mut self, cost: usize) -> Result<()> {
+        self.budget
+            .as_mut()
+            .map_or(Ok(()), |budget| budget.charge(cost))
     }
 
     #[must_use]
@@ -581,6 +605,10 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.length
             .ok_or(Error::StringWithoutLength)
             .and_then(|length| {
+                if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+                    return Err(Error::MessageMaxSizeExceeded(length));
+                }
+
                 let mut buf = vec![0u8; length];
                 self.reader.read_exact(&mut buf)?;
                 from_utf8(buf.as_slice())
@@ -634,13 +662,18 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
 
         let length = if self.is_flexible() {
             self.unsigned_varint()
-                .and_then(|length| usize::try_from(length - 1).map_err(Into::into))?
+                .and_then(|length| usize::try_from(length).map_err(Into::into))
+                .and_then(|length| length.checked_sub(1).ok_or(Error::Overflow))?
         } else {
             let mut buf = [0u8; 4];
 
             self.reader.read_exact(&mut buf)?;
             usize::try_from(u32::from_be_bytes(buf))?
         };
+
+        if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+            return Err(Error::MessageMaxSizeExceeded(length));
+        }
 
         let mut buf = vec![0u8; length];
         self.reader.read_exact(&mut buf)?;
@@ -1385,10 +1418,18 @@ impl<'de> SeqAccess<'de> for Seq<'de, '_> {
 
             Some(length) => {
                 _ = self.length.replace(length - 1);
+                // Charged by the element's decoded size, not its wire size:
+                // that is what bounds the memory a batch decodes into,
+                // whatever the element type (a `Header`, a byte of a key or
+                // value, a sequence added later).
+                self.de.charge(size_of::<T::Value>())?;
                 seed.deserialize(&mut *self.de).map(Some)
             }
 
-            None => seed.deserialize(&mut *self.de).map(Some),
+            None => {
+                self.de.charge(size_of::<T::Value>())?;
+                seed.deserialize(&mut *self.de).map(Some)
+            }
         }
     }
 }
@@ -1527,5 +1568,56 @@ mod tests {
 
         let result = seq.next_element_seed(PhantomData::<crate::record::deflated::Batch>);
         assert!(result.is_err());
+    }
+
+    /// A [`Visitor`] that is never actually invoked: every test below expects
+    /// the size check to short-circuit before the visitor would be called, so
+    /// only `expecting` needs an implementation.
+    struct UnreachableVisitor;
+
+    impl<'de> Visitor<'de> for UnreachableVisitor {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a value (this visitor should never be invoked)")
+        }
+    }
+
+    /// `deserialize_str` had no `message_max_size` check at all: a claimed
+    /// length over the limit must be rejected before the body is read, the
+    /// same way `deserialize_string` already does.
+    #[test]
+    fn deserialize_str_rejects_length_over_message_max_size() {
+        let declared_length = 1_000_000i32;
+        let mut encoded: Vec<u8> = declared_length.to_be_bytes().to_vec();
+        let mut reader: &[u8] = &mut encoded;
+        let mut decoder = Decoder::request(&mut reader, Some(10));
+
+        let err = Deserializer::deserialize_str(&mut decoder, UnreachableVisitor)
+            .expect_err("a length over message_max_size must be rejected");
+
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(length) if length == declared_length as usize),
+            "{err:?}"
+        );
+    }
+
+    /// `deserialize_bytes` had no `message_max_size` check on either the
+    /// flexible or non-flexible length-read branch, unlike its sibling
+    /// `deserialize_byte_buf`.
+    #[test]
+    fn deserialize_bytes_rejects_length_over_message_max_size() {
+        let declared_length = 1_000_000i32;
+        let mut encoded: Vec<u8> = declared_length.to_be_bytes().to_vec();
+        let mut reader: &[u8] = &mut encoded;
+        let mut decoder = Decoder::request(&mut reader, Some(10));
+
+        let err = Deserializer::deserialize_bytes(&mut decoder, UnreachableVisitor)
+            .expect_err("a length over message_max_size must be rejected");
+
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(length) if length == declared_length as usize),
+            "{err:?}"
+        );
     }
 }

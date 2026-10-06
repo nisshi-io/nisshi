@@ -21,7 +21,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use cached::{Cached as _, stores::TtlSortedCache};
+use cached::{CachedExt as _, stores::TtlSortedCache};
 use futures::stream::{BoxStream, StreamExt};
 use nisshi_storage::Error;
 use object_store::{
@@ -175,7 +175,10 @@ where
                 if let Ok(mut guard) = self.entries.lock() {
                     debug!(cached = guard.len());
 
-                    _ = guard.insert_evict(location.to_owned(), CacheEntry::from(put_result), true);
+                    _ = guard
+                        .set_with(location.to_owned(), CacheEntry::from(put_result))
+                        .evict()
+                        .set();
                 }
             })
             .inspect_err(|error| {
@@ -289,9 +292,9 @@ where
 
                     let outcome = match guard
                         .deref_mut()
-                        .insert_evict(location.to_owned(), replacement.clone(), true)
-                        .ok()
-                        .flatten()
+                        .set_with(location.to_owned(), replacement.clone())
+                        .evict()
+                        .set()
                     {
                         None => "add",
 
@@ -314,9 +317,9 @@ where
 
                         let outcome = match guard
                             .deref_mut()
-                            .insert_evict(location.to_owned(), replacement.clone(), true)
-                            .ok()
-                            .flatten()
+                            .set_with(location.to_owned(), replacement.clone())
+                            .evict()
+                            .set()
                         {
                             None => "add",
 

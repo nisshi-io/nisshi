@@ -871,7 +871,7 @@ impl Postgres {
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
 
-        let inflated = Batch::try_from(deflated).inspect_err(|err| error!(?err))?;
+        let inflated = Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
