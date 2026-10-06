@@ -6134,6 +6134,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nisshi-smoke-test"
+version = "0.7.0-pre.2"
+
+[[package]]
 name = "nisshi-storage"
 version = "0.7.0-pre.3"
 dependencies = [

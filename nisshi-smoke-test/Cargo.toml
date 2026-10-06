@@ -1,0 +1,24 @@
+[package]
+name = "nisshi-smoke-test"
+description = "Smoke tests that run the Kafka CLI tools against a broker"
+publish = false
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+authors.workspace = true
+include.workspace = true
+
+# One feature per storage engine. A test that applies only to some engines
+# goes in a module gated on these, so `just smoke <engine>` compiles only the
+# tests for that engine.
+[features]
+memory = []
+postgres = []
+s3 = []
+sqlite = []
+
+[lints]
+workspace = true

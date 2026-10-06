@@ -73,7 +73,7 @@ release-sqlite: (cargo-build "--release" "--bin" "nisshi" "--no-default-features
 
 test: test-workspace test-doc
 
-test-workspace *args: (nextest "run" "--workspace" "--all-targets" "--all-features" "--no-fail-fast" "--exclude" "fuzz" args)
+test-workspace *args: (nextest "run" "--workspace" "--all-targets" "--all-features" "--no-fail-fast" "--exclude" "fuzz" "--exclude" "nisshi-smoke-test" args)
 
 nextest *args:
     cargo nextest {{ args }}
@@ -523,6 +523,10 @@ compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build
     broker=$!
     trap 'kill ${broker}' EXIT
     BROKER_PID=${broker} ./compat/franz-go/run.sh
+
+# run the Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3 (needs Docker; starts its own broker and services)
+smoke engine:
+    nisshi-smoke-test/run.sh {{ engine }}
 
 compat-franz-go-test tests timeout="600s" count="1":
     #!/usr/bin/env bash
