@@ -90,7 +90,7 @@ use tokio::sync::{
     oneshot,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 pub use txn::add_offsets::AddOffsetsService as TxnAddOffsetsService;
 pub use txn::add_partitions::AddPartitionService as TxnAddPartitionService;
 pub use txn::end::EndService as TxnEndService;
@@ -997,9 +997,19 @@ static STORAGE_CHANNEL_SERVER_FAILURE: LazyLock<Counter<u64>> = LazyLock::new(||
     METER
         .u64_counter("nisshi_storage_channel_server_failure")
         .with_description(
-            "Count of per-request storage task failures in the mpsc server loop (a panic, or a \
-             requester dropping its response receiver); the loop itself continues serving other \
-             requests in either case",
+            "Count of per-request storage task failures in the mpsc server loop, by kind: a \
+             panic, a task cancelled at runtime shutdown, or a storage error; the loop itself \
+             continues serving other requests in every case",
+        )
+        .build()
+});
+
+static STORAGE_CHANNEL_RESPONSE_DISCARDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_storage_channel_response_discarded")
+        .with_description(
+            "Count of mpsc storage responses discarded because the requester dropped its \
+             response receiver (a client disconnect or a read deadline); normal client churn",
         )
         .build()
 });
@@ -1046,32 +1056,45 @@ where
                                     "requester dropped its response receiver; discarding response"
                                 );
 
-                                STORAGE_CHANNEL_SERVER_FAILURE.add(
-                                    1,
-                                    &[
-                                        KeyValue::new("operation", operation),
-                                        KeyValue::new("kind", "receiver_dropped"),
-                                    ],
-                                );
+                                STORAGE_CHANNEL_RESPONSE_DISCARDED
+                                    .add(1, &[KeyValue::new("operation", operation)]);
                             }
                         }
 
                         Ok(Err(error)) => {
                             error!(operation, ?error, "storage request failed");
-                        }
-
-                        Err(join_error) => {
-                            error!(
-                                operation,
-                                ?join_error,
-                                "storage request task panicked; isolated, loop continues"
-                            );
 
                             STORAGE_CHANNEL_SERVER_FAILURE.add(
                                 1,
                                 &[
                                     KeyValue::new("operation", operation),
-                                    KeyValue::new("kind", "panic"),
+                                    KeyValue::new("kind", "error"),
+                                ],
+                            );
+                        }
+
+                        Err(join_error) => {
+                            let kind = if join_error.is_panic() {
+                                error!(
+                                    operation,
+                                    ?join_error,
+                                    "storage request task panicked; isolated, loop continues"
+                                );
+                                "panic"
+                            } else {
+                                warn!(
+                                    operation,
+                                    ?join_error,
+                                    "storage request task cancelled"
+                                );
+                                "cancelled"
+                            };
+
+                            STORAGE_CHANNEL_SERVER_FAILURE.add(
+                                1,
+                                &[
+                                    KeyValue::new("operation", operation),
+                                    KeyValue::new("kind", kind),
                                 ],
                             );
                         }

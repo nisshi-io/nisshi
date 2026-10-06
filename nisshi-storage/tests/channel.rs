@@ -20,7 +20,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -238,6 +238,77 @@ async fn panicking_request_does_not_end_server_loop() -> Result<(), TestError> {
     // A second request (the flaky service's panic-once flag is now consumed) must
     // still succeed - proving the shared loop kept serving other callers.
     client.ping().await?;
+
+    cancellation.cancel();
+    let joined = join.join_all().await;
+    debug!(?joined);
+
+    Ok(())
+}
+
+/// A [`Service<Request>`] that records how many `serve` calls overlap, yielding inside
+/// each call so that overlapping calls would actually interleave.
+#[derive(Clone, Default)]
+struct InFlightService {
+    in_flight: Arc<AtomicUsize>,
+    high_water: Arc<AtomicUsize>,
+}
+
+impl Service<Request> for InFlightService {
+    type Output = Response;
+    type Error = Error;
+
+    async fn serve(&self, _req: Request) -> Result<Self::Output, Self::Error> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        _ = self.high_water.fetch_max(now, Ordering::SeqCst);
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        _ = self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(Response::Ping(Ok(())))
+    }
+}
+
+/// mpsc mode's single-writer discipline depends on the supervisor loop serving one
+/// request at a time. Concurrent requests through a channel with room for all of them
+/// must still never overlap inside storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_are_served_one_at_a_time() -> Result<(), TestError> {
+    let _guard = init_tracing()?;
+
+    let (sender, receiver) = bounded_channel(10);
+    let cancellation = CancellationToken::new();
+    let server = InFlightService::default();
+    let high_water = server.high_water.clone();
+
+    let mut join = JoinSet::new();
+
+    {
+        let cancellation = cancellation.clone();
+
+        let _ = join.spawn(async move {
+            ChannelRequestLayer::new(cancellation)
+                .into_layer(server)
+                .serve(receiver)
+                .await
+        });
+    }
+
+    let client = RequestChannelService::new(sender);
+
+    let mut pings = JoinSet::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let _ = pings.spawn(async move { client.ping().await });
+    }
+
+    for ping in pings.join_all().await {
+        ping?;
+    }
+
+    assert_eq!(1, high_water.load(Ordering::SeqCst));
 
     cancellation.cancel();
     let joined = join.join_all().await;

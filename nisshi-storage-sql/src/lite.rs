@@ -5507,10 +5507,11 @@ mod tests {
         Ok(())
     }
 
-    /// Regression coverage for SOL-155270: `?mode=mpsc` wiring must still behave
-    /// correctly for the ordinary (non-panicking, non-cancelled) path, given that
-    /// `ChannelRequestService::serve` (`nisshi-storage/src/service.rs`) isolates each
-    /// request in its own child task.
+    /// Smoke test for the `?mode=mpsc` wiring on the ordinary (non-panicking,
+    /// non-cancelled) path. It does not cover the panic isolation in
+    /// `ChannelRequestService::serve` (`nisshi-storage/tests/channel.rs` does), and it
+    /// does not prove the mpsc engine was selected: an unrecognised mode falls back to
+    /// Semaphore, and this test would pass there too.
     #[tokio::test]
     async fn mpsc_mode_produce_and_fetch_round_trip() -> Result<()> {
         let _guard = init_tracing()?;
