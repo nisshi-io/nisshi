@@ -13,14 +13,17 @@
 // limitations under the License.
 
 use dotenv::dotenv;
-use nisshi_storage::{Error, Result};
-use object_store::path::PathPart;
+use nisshi_storage::{Error, Result, Topition};
+use object_store::{
+    memory::InMemory,
+    path::{Path, PathPart},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::File, sync::Arc, thread};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
-use super::{EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
+use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
 mod latency;
 mod ping;
@@ -108,43 +111,107 @@ fn percent_empty_literal_is_escaped_as_percent25empty() {
 }
 
 #[test]
-fn empty_group_id_encodes_as_sentinel() {
-    assert_eq!(EMPTY_GROUP_SENTINEL, group_path_part("").as_ref());
+fn empty_group_id_encodes_as_sentinel() -> Result<()> {
+    assert_eq!(EMPTY_GROUP_SENTINEL, group_path_part("")?.as_ref());
+    Ok(())
 }
 
 #[test]
-fn literal_percent_empty_group_id_does_not_collide_with_sentinel() {
-    let sentinel_segment = group_path_part("");
-    let literal_segment = group_path_part("%empty");
+fn literal_percent_empty_group_id_does_not_collide_with_sentinel() -> Result<()> {
+    let sentinel_segment = group_path_part("")?;
+    let literal_segment = group_path_part("%empty")?;
 
     assert_ne!(sentinel_segment.as_ref(), literal_segment.as_ref());
     assert_eq!(EMPTY_GROUP_SENTINEL, sentinel_segment.as_ref());
     assert_eq!("%25empty", literal_segment.as_ref());
+    Ok(())
 }
 
 #[test]
-fn group_path_part_round_trips_through_decode_group_segment() {
-    for group_id in ["", "a", "a/b", "/", "//", "a/", "%empty", ".", ".."] {
-        let encoded = group_path_part(group_id);
+fn group_path_part_round_trips_through_decode_group_segment() -> Result<()> {
+    for group_id in [
+        "", "a", "a/b", "/", "//", "a/", "%empty", ".", "..", "a#b", "café",
+    ] {
+        let encoded = group_path_part(group_id)?;
         let decoded = decode_group_segment(encoded.as_ref()).expect("encoded segment must decode");
         assert_eq!(group_id, decoded, "round trip failed for {group_id:?}");
     }
+    Ok(())
 }
 
 #[test]
-fn group_path_part_gives_every_id_a_distinct_segment() {
-    let ids = ["", "a", "/", "//", "a/", "%empty", ".", ".."];
+fn group_path_part_gives_every_id_a_distinct_segment() -> Result<()> {
+    let ids = [
+        "", "a", "a/b", "/", "//", "a/", "%empty", ".", "..", "a#b", "café",
+    ];
 
     for (i, a) in ids.iter().enumerate() {
         for (j, b) in ids.iter().enumerate() {
-            let segments_equal = group_path_part(a).as_ref() == group_path_part(b).as_ref();
+            let segments_equal = group_path_part(a)?.as_ref() == group_path_part(b)?.as_ref();
             assert_eq!(i == j, segments_equal, "{a:?} vs {b:?}");
         }
     }
+    Ok(())
 }
 
 #[test]
 fn decode_group_segment_rejects_invalid_utf8() {
     // 0x80 alone is not valid UTF-8, and is not the percent-encoded sentinel.
     assert_eq!(None, decode_group_segment("%80"));
+}
+
+/// Existing data is stored under these keys and is not migrated, so a group
+/// id without a `/` (other than `.` and `..`, whose state file moved) must
+/// keep the exact key it had when keys were built with
+/// `Path::from(format!(..))` from these templates.
+#[test]
+fn group_keys_are_stable_for_ids_without_a_slash() -> Result<()> {
+    let storage = DynoStore::new("c", 111, InMemory::new());
+    let topition = Topition::new("t", 3);
+
+    assert_eq!(
+        "clusters/c/groups/consumers/grp/offsets/t/partitions/0000000003.json",
+        storage
+            .committed_offset_location("grp", &topition)?
+            .as_ref()
+    );
+    assert_eq!(
+        "clusters/c/groups/consumers/grp.json",
+        storage.group_state_location("grp")?.as_ref()
+    );
+
+    for group_id in ["grp", "a#b", "a%b", "a b", "café", "%empty"] {
+        assert_eq!(
+            Path::from(format!(
+                "clusters/c/groups/consumers/{group_id}/offsets/t/partitions/0000000003.json"
+            )),
+            storage.committed_offset_location(group_id, &topition)?,
+            "committed offset key moved for {group_id:?}"
+        );
+        assert_eq!(
+            Path::from(format!("clusters/c/groups/consumers/{group_id}.json")),
+            storage.group_state_location(group_id)?,
+            "group state key moved for {group_id:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Only the group id became one segment. The topic keeps the `Path::from`
+/// rule of its data keys, so a topic named before CreateTopics rejected "/"
+/// keeps the committed offset key it had, which `delete_topic` matches on.
+#[test]
+fn committed_offset_key_keeps_the_topic_segment_rule() -> Result<()> {
+    let storage = DynoStore::new("c", 111, InMemory::new());
+
+    for topic in ["t", "a/b", "a#b", "café"] {
+        assert_eq!(
+            Path::from(format!(
+                "clusters/c/groups/consumers/grp/offsets/{topic}/partitions/0000000003.json"
+            )),
+            storage.committed_offset_location("grp", &Topition::new(topic, 3))?,
+            "committed offset key moved for topic {topic:?}"
+        );
+    }
+    Ok(())
 }

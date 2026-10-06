@@ -129,13 +129,26 @@ const EMPTY_GROUP_SENTINEL: &str = "%empty";
 /// encoded, so the result is always exactly one path segment regardless of
 /// what the group id contains. See [`EMPTY_GROUP_SENTINEL`] for why the empty
 /// string needs special-casing rather than going through the same encoding.
-fn group_path_part(group_id: &str) -> PathPart<'_> {
+/// The sentinel is validated rather than encoded, so the result is fallible
+/// in its type, though a constant without `/` or a control character passes.
+fn group_path_part(group_id: &str) -> Result<PathPart<'_>> {
     if group_id.is_empty() {
-        PathPart::parse(EMPTY_GROUP_SENTINEL)
-            .expect("EMPTY_GROUP_SENTINEL is a valid, already path-safe segment")
+        parse_segment(EMPTY_GROUP_SENTINEL)
     } else {
-        PathPart::from(group_id)
+        Ok(PathPart::from(group_id))
     }
+}
+
+/// Validates `segment` as one already-encoded path segment, as
+/// [`PathPart::parse`] does, and reports a bad segment as a storage error.
+fn parse_segment(segment: &str) -> Result<PathPart<'_>> {
+    PathPart::parse(segment).map_err(|source| {
+        object_store::Error::from(object_store::path::Error::BadSegment {
+            path: segment.to_owned(),
+            source,
+        })
+        .into()
+    })
 }
 
 /// Recover the original group id from a listed `object_store` path segment
@@ -513,30 +526,36 @@ impl DynoStore {
 
     /// The single-file location of a group's persisted [`GroupDetail`] state,
     /// e.g. `clusters/{cluster}/groups/consumers/{group}.json`.
-    fn group_state_location(&self, group_id: &str) -> Path {
-        let file_name = format!("{}.json", group_path_part(group_id).as_ref());
+    fn group_state_location(&self, group_id: &str) -> Result<Path> {
+        let file_name = format!("{}.json", group_path_part(group_id)?.as_ref());
 
-        self.group_consumers_prefix().join(
-            PathPart::parse(&file_name)
-                .expect("an escaped group id with a \".json\" suffix is always a valid segment"),
-        )
+        Ok(self
+            .group_consumers_prefix()
+            .join(parse_segment(&file_name)?))
     }
 
     /// The prefix a group's committed offsets are stored beneath, e.g.
     /// `clusters/{cluster}/groups/consumers/{group}/offsets`.
-    fn group_offsets_prefix(&self, group_id: &str) -> Path {
-        self.group_consumers_prefix()
-            .join(group_path_part(group_id))
-            .join("offsets")
+    fn group_offsets_prefix(&self, group_id: &str) -> Result<Path> {
+        Ok(self
+            .group_consumers_prefix()
+            .join(group_path_part(group_id)?)
+            .join("offsets"))
     }
 
     /// The location of a single committed offset, e.g.
     /// `clusters/{cluster}/groups/consumers/{group}/offsets/{topic}/partitions/{partition:0>10}.json`.
-    fn committed_offset_location(&self, group_id: &str, topition: &Topition) -> Path {
-        self.group_offsets_prefix(group_id)
-            .join(topition.topic.as_str())
+    ///
+    /// The topic keeps the segment rule of its data keys, `Path::from`, which
+    /// splits on "/": a topic named before CreateTopics rejected "/" keeps the
+    /// key it had, and `delete_topic` matches its offsets by the same rule.
+    fn committed_offset_location(&self, group_id: &str, topition: &Topition) -> Result<Path> {
+        let mut location = self.group_offsets_prefix(group_id)?;
+        location.extend(Path::from(topition.topic.as_str()).parts());
+
+        Ok(location
             .join("partitions")
-            .join(format!("{:0>10}.json", topition.partition))
+            .join(format!("{:0>10}.json", topition.partition)))
     }
 
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
@@ -821,7 +840,7 @@ impl Storage for DynoStore {
                      its name is not a safe key prefix"
                 );
             } else {
-                let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
+                let prefix = self.group_consumers_prefix();
 
                 let topic_name = metadata.topic.name.clone();
                 let prefix_clone = prefix.clone();
@@ -1532,7 +1551,7 @@ impl Storage for DynoStore {
                 .await?
                 .is_some()
             {
-                let location = self.committed_offset_location(group_id, topition);
+                let location = self.committed_offset_location(group_id, topition)?;
 
                 let payload = serde_json::to_vec(&offset_commit)
                     .map(Bytes::from)
@@ -1565,7 +1584,7 @@ impl Storage for DynoStore {
         let mut topitions = vec![];
 
         {
-            let location = self.group_offsets_prefix(group_id);
+            let location = self.group_offsets_prefix(group_id)?;
 
             let mut list_stream = self.object_store.list(Some(&location));
 
@@ -1578,20 +1597,22 @@ impl Storage for DynoStore {
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             {
                 debug!(?meta);
-                let Some(topic): Option<String> = meta
-                    .location
-                    .parts()
-                    .nth(6)
+
+                // Below the offsets prefix: `{topic}/partitions/{partition:0>10}.json`.
+                let Some(mut parts) = meta.location.prefix_match(&location) else {
+                    continue;
+                };
+
+                let Some(topic): Option<String> = parts
+                    .next()
                     .inspect(|topic| debug!(?topic))
                     .map(|topic| topic.as_ref().into())
                 else {
                     continue;
                 };
 
-                let Some(partition) = meta
-                    .location
-                    .parts()
-                    .nth(8)
+                let Some(partition) = parts
+                    .nth(1)
                     .inspect(|partition| debug!(?partition))
                     .map(|partition| i32::from_str(&partition.as_ref()[0..10]))
                     .transpose()?
@@ -1619,7 +1640,7 @@ impl Storage for DynoStore {
 
         if let Some(group_id) = group_id {
             for topition in topics {
-                let location = self.committed_offset_location(group_id, topition);
+                let location = self.committed_offset_location(group_id, topition)?;
 
                 let offset = match self.object_store.get(&location).await {
                     Ok(get_result) => get_result
@@ -1986,7 +2007,7 @@ impl Storage for DynoStore {
     }
 
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        let location = Path::from(format!("clusters/{}/groups/consumers/", self.cluster,));
+        let location = self.group_consumers_prefix();
         let list_result = self
             .object_store
             .list_with_delimiter(Some(&location))
@@ -2025,7 +2046,7 @@ impl Storage for DynoStore {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                let location = self.group_state_location(group_id);
+                let location = self.group_state_location(group_id)?;
 
                 let had_group_state = self
                     .object_store
@@ -2039,7 +2060,7 @@ impl Storage for DynoStore {
 
                 let prefix = self
                     .group_consumers_prefix()
-                    .join(group_path_part(group_id));
+                    .join(group_path_part(group_id)?);
 
                 let locations = self
                     .object_store
@@ -2081,7 +2102,7 @@ impl Storage for DynoStore {
         let mut results = vec![];
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                let location = self.group_state_location(group_id);
+                let location = self.group_state_location(group_id)?;
 
                 match self
                     .get::<GroupDetail>(&location)
@@ -2128,7 +2149,7 @@ impl Storage for DynoStore {
         detail: GroupDetail,
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>> {
-        let location = self.group_state_location(group_id);
+        let location = self.group_state_location(group_id)?;
 
         self.put(
             &location,

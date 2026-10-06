@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{assert_matches, slice};
+use std::{assert_matches, collections::BTreeMap, slice};
 
 use crate::common::alphanumeric_string;
 use nisshi_broker::Error;
@@ -56,15 +56,15 @@ async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error>
 /// widen the delete's key prefix to every group, wiping all group state and
 /// committed offsets.
 ///
-/// Kafka still accepts `""` in DeleteGroups for backwards compatibility.
-/// Every backend - SQL, SlateDB, and dynostore alike - treats it like any
-/// other opaque group id that nothing was ever committed under: SQL and
-/// SlateDB answer `GROUP_ID_NOT_FOUND`. Dynostore's object store layer
-/// treats `delete` as idempotent (deleting an absent key still succeeds, the
-/// same as a real S3 `DeleteObject`), so it answers `NONE` instead - the same
-/// ambiguity `delete_non_existent` above already tolerates for any id, not
-/// something specific to the empty id.
-async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), Error> {
+/// Kafka still accepts `""` in DeleteGroups for backwards compatibility, and
+/// every backend treats it like any other id that nothing was stored under.
+/// SQL and SlateDB answer `GROUP_ID_NOT_FOUND`. Dynostore answers `NONE`,
+/// because deleting an absent object store key succeeds, as an S3
+/// `DeleteObject` does.
+async fn empty_group_id_mixed_list(
+    storage: impl Storage + Clone,
+    expected_for_empty: ErrorCode,
+) -> Result<(), Error> {
     let topic_name = alphanumeric_string(15);
     let num_partitions = 6;
 
@@ -132,9 +132,9 @@ async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), 
         .iter()
         .find(|result| result.group_id.is_empty())
         .expect("missing result for the empty group id");
-    assert_matches!(
-        ErrorCode::try_from(empty_result.error_code)?,
-        ErrorCode::None | ErrorCode::GroupIdNotFound
+    assert_eq!(
+        expected_for_empty,
+        ErrorCode::try_from(empty_result.error_code)?
     );
 
     let group_b_result = results
@@ -176,25 +176,34 @@ async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), 
     Ok(())
 }
 
+/// The generation of `group_id`'s stored group state, or `None` when
+/// `describe_groups` finds no state for it.
+async fn described_generation(
+    storage: &(impl Storage + Clone),
+    group_id: &str,
+) -> Result<Option<i32>, Error> {
+    let described = storage
+        .describe_groups(Some(&[group_id.to_owned()]), false)
+        .await?;
+    assert_eq!(1, described.len());
+    assert_eq!(group_id, described[0].name);
+
+    Ok(match &described[0].response {
+        GroupDetailResponse::Found(detail) => Some(detail.generation_id),
+        GroupDetailResponse::ErrorCode(_) => None,
+    })
+}
+
 /// `Storage::delete_groups` has callers other than `DeleteGroupsService`, and
-/// the service passes every id through unchanged, so every group id -
-/// including `""`, `"/"`, `"//"`, `"a/"`, and the literal string `"%empty"` -
-/// must be its own fully opaque, independently addressable group.
+/// the service passes every id through unchanged, so every group id,
+/// including `""`, `"/"`, `"//"`, `"a/"` and the literal string `"%empty"`,
+/// must be its own independently addressable group.
 ///
-/// Before the fix, dynostore built an object store key by interpolating the
-/// raw group id into a path string and reparsing it: a `/` in the id split
-/// into extra path segments, an empty id collapsed onto the `consumers/`
-/// prefix shared by every group, and a literal `"%empty"` id risked colliding
-/// with the sentinel segment chosen to represent the empty id. Any of those
-/// could make one group's delete or fetch quietly observe or destroy another
-/// group's committed offsets.
-///
-/// This commits a distinct offset under each id (plus a real baseline id,
-/// `"a"`, for comparison), confirms all six are independently fetchable with
-/// their own correct value, then deletes them one at a time - never as a
-/// batch, which could mask a collision - confirming at each step that only
-/// the just-deleted group's offset is gone and every other group's offset is
-/// still intact.
+/// This gives each id (plus a baseline id, `"a"`) a distinct committed offset
+/// and a distinct group state (its own generation), confirms each reads back
+/// its own, then deletes them one at a time, never as a batch, which could
+/// mask a collision. After each delete, only the deleted group's offset and
+/// state are gone, and every other group still reads back its own.
 async fn slash_and_empty_group_ids_are_distinct_groups(
     storage: impl Storage + Clone,
 ) -> Result<(), Error> {
@@ -244,7 +253,21 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
         assert_eq!(ErrorCode::None, commit[0].1);
     }
 
-    for (group_id, offset) in group_ids.iter().zip(&offsets) {
+    for (generation_id, group_id) in (1..).zip(&group_ids) {
+        _ = storage
+            .update_group(
+                group_id,
+                GroupDetail {
+                    generation_id,
+                    ..GroupDetail::default()
+                },
+                None,
+            )
+            .await
+            .map_err(|err| Error::Message(format!("update_group {group_id:?}: {err:?}")))?;
+    }
+
+    for (generation_id, (group_id, offset)) in (1..).zip(group_ids.iter().zip(&offsets)) {
         let offset_fetch = storage
             .offset_fetch(Some(group_id), slice::from_ref(&topition), None)
             .await?;
@@ -252,6 +275,12 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
             Some(offset),
             offset_fetch.get(&topition),
             "group {group_id:?} fetched the wrong committed offset"
+        );
+
+        assert_eq!(
+            Some(generation_id),
+            described_generation(&storage, group_id).await?,
+            "group {group_id:?} described the wrong group state"
         );
     }
 
@@ -269,21 +298,32 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
             let offset_fetch = storage
                 .offset_fetch(Some(other_group_id), slice::from_ref(&topition), None)
                 .await?;
+            let other_generation = i32::try_from(other_index + 1).expect("few groups");
+            let described = described_generation(&storage, other_group_id).await?;
 
             if other_index <= deleted_index {
-                // The exact "not found" sentinel differs subtly between
-                // backends; what matters here is that this group's committed
-                // value is gone, not what replaces it.
+                // Backends answer a deleted group differently; what matters
+                // is that its committed offset and state are gone.
                 assert_ne!(
                     Some(other_offset),
                     offset_fetch.get(&topition),
-                    "group {other_group_id:?} should have been deleted by now (deleting {group_id:?})"
+                    "group {other_group_id:?} offset should have been deleted by now (deleting {group_id:?})"
+                );
+                assert_ne!(
+                    Some(other_generation),
+                    described,
+                    "group {other_group_id:?} state should have been deleted by now (deleting {group_id:?})"
                 );
             } else {
                 assert_eq!(
                     Some(other_offset),
                     offset_fetch.get(&topition),
-                    "group {other_group_id:?} should still be intact after deleting {group_id:?}"
+                    "group {other_group_id:?} offset should still be intact after deleting {group_id:?}"
+                );
+                assert_eq!(
+                    Some(other_generation),
+                    described,
+                    "group {other_group_id:?} state should still be intact after deleting {group_id:?}"
                 );
             }
         }
@@ -292,13 +332,10 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
     Ok(())
 }
 
-/// Regression coverage for `committed_offset_topitions`'s positional
-/// path-segment parsing (`.parts().nth(6)`, `.nth(8)`), independent of
-/// `delete_groups`: that parsing assumes the group id is exactly one path
-/// segment. A group id like `"a/b"` would otherwise split into two segments,
-/// shifting every later segment and turning the partition-number parse into
-/// a `ParseIntError`. Encoding the whole group id as one opaque segment keeps
-/// that assumption true for every group id.
+/// `committed_offset_topitions` parses the topic and partition from each key
+/// below the group's offsets prefix. A group id containing `/` must not shift
+/// those segments, which would turn the partition parse into a
+/// `ParseIntError`.
 #[cfg(feature = "dynostore")]
 async fn slash_in_group_id_does_not_break_committed_offset_topitions(
     storage: impl Storage + Clone,
@@ -340,9 +377,97 @@ async fn slash_in_group_id_does_not_break_committed_offset_topitions(
     Ok(())
 }
 
+/// `delete_topic` removes a topic's committed offsets by skipping one
+/// segment, the group id, in each key below `consumers/` and matching the
+/// rest against `offsets/{topic}/partitions/`. That holds only while a group
+/// id is one segment: interpolated raw, "a/b" took two segments and ""
+/// none, so those groups kept their offsets for a deleted topic.
+#[cfg(feature = "dynostore")]
+async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids(
+    storage: impl Storage + Clone,
+) -> Result<(), Error> {
+    let deleted_name = alphanumeric_string(15);
+    let kept_name = alphanumeric_string(15);
+
+    for name in [deleted_name.clone(), kept_name.clone()] {
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(name)
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+    }
+
+    let deleted = Topition::new(deleted_name.clone(), 0);
+    let kept = Topition::new(kept_name, 0);
+
+    let group_ids = ["a/b", "", "a"];
+    let offsets = group_ids.map(|_| rng().random_range(0..i64::MAX));
+
+    for (group_id, offset) in group_ids.iter().zip(&offsets) {
+        let commit = storage
+            .offset_commit(
+                group_id,
+                None,
+                &[
+                    (
+                        deleted.clone(),
+                        OffsetCommitRequest::default().offset(*offset),
+                    ),
+                    (kept.clone(), OffsetCommitRequest::default().offset(*offset)),
+                ],
+            )
+            .await?;
+
+        assert_eq!(2, commit.len());
+        assert!(
+            commit.iter().all(|(_, code)| *code == ErrorCode::None),
+            "{commit:?}"
+        );
+    }
+
+    assert_eq!(
+        ErrorCode::None,
+        storage.delete_topic(&deleted_name.into()).await?
+    );
+
+    for (group_id, offset) in group_ids.iter().zip(&offsets) {
+        let fetched = storage
+            .offset_fetch(Some(group_id), &[deleted.clone(), kept.clone()], None)
+            .await?;
+        assert_ne!(
+            Some(offset),
+            fetched.get(&deleted),
+            "group {group_id:?} kept its offset for the deleted topic"
+        );
+        assert_eq!(
+            Some(offset),
+            fetched.get(&kept),
+            "group {group_id:?} lost its offset for the kept topic"
+        );
+
+        let committed = storage.committed_offset_topitions(group_id).await?;
+        assert_eq!(
+            [(kept.clone(), *offset)]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            committed,
+            "group {group_id:?}"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -379,7 +504,7 @@ mod in_memory {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::None).await?;
 
         Ok(())
     }
@@ -411,12 +536,27 @@ mod in_memory {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_topic_removes_offsets_of_slash_and_empty_group_ids(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
 mod lite {
     use crate::common::{init_tracing, lite_storage};
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -451,7 +591,7 @@ mod lite {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
 
         Ok(())
     }
@@ -475,6 +615,7 @@ mod lite {
 mod slatedb {
     use crate::common::{init_tracing, slate_storage};
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -509,7 +650,7 @@ mod slatedb {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
 
         Ok(())
     }
@@ -533,6 +674,7 @@ mod slatedb {
 mod pg {
     use crate::common::{init_tracing, postgres_storage};
     use nisshi_broker::Result;
+    use nisshi_sans_io::ErrorCode;
     use nisshi_storage::ArcDynStorage;
     use rand::{RngExt as _, rng};
     use uuid::Uuid;
@@ -567,7 +709,7 @@ mod pg {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::empty_group_id_mixed_list(storage).await?;
+        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
 
         Ok(())
     }
