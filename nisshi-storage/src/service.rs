@@ -26,7 +26,6 @@ mod describe_groups;
 mod describe_topic_partitions;
 mod describe_user_scram_credentials;
 mod fetch;
-mod fetch_validation;
 mod find_coordinator;
 mod get_telemetry_subscriptions;
 mod incremental_alter_configs;
@@ -59,8 +58,12 @@ pub use describe_configs::DescribeConfigsService;
 pub use describe_groups::DescribeGroupsService;
 pub use describe_topic_partitions::DescribeTopicPartitionsService;
 pub use describe_user_scram_credentials::DescribeUserScramCredentialsService;
-pub use fetch::FetchService;
-pub use fetch_validation::{FetchValidationLayer, FetchValidationService};
+pub use fetch::{
+    FetchService,
+    validation::{
+        FetchValidationLayer, FetchValidationService, MalformedFetchRequest, ValidatedFetchRequest,
+    },
+};
 pub use find_coordinator::FindCoordinatorService;
 pub use get_telemetry_subscriptions::GetTelemetrySubscriptionsService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
@@ -93,10 +96,11 @@ use tokio::sync::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
-pub use txn::add_offsets::AddOffsetsService as TxnAddOffsetsService;
-pub use txn::add_partitions::AddPartitionService as TxnAddPartitionService;
-pub use txn::end::EndService as TxnEndService;
-pub use txn::offset_commit::OffsetCommitService as TxnOffsetCommitService;
+pub use txn::{
+    add_offsets::AddOffsetsService as TxnAddOffsetsService,
+    add_partitions::AddPartitionService as TxnAddPartitionService,
+    end::EndService as TxnEndService, offset_commit::OffsetCommitService as TxnOffsetCommitService,
+};
 use url::Url;
 use uuid::Uuid;
 

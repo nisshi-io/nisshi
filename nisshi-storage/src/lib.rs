@@ -206,10 +206,10 @@ pub use service::{
     DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
     FetchValidationService, FindCoordinatorService, GetTelemetrySubscriptionsService,
     IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MetadataService, ProduceService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    ListPartitionReassignmentsService, MalformedFetchRequest, MetadataService, ProduceService,
+    Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
     RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService, bounded_channel,
+    TxnOffsetCommitService, ValidatedFetchRequest, bounded_channel,
 };
 
 #[cfg(feature = "dynostore")]

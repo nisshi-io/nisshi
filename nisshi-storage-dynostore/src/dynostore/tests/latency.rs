@@ -32,12 +32,14 @@ use nisshi_sans_io::{
         inflated,
     },
 };
-use nisshi_storage::{CreateTopicsService, Error, FetchService, ProduceService};
+use nisshi_storage::{
+    CreateTopicsService, Error, FetchService, FetchValidationLayer, ProduceService,
+};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
-use rama::{Service as _, extensions::Extensions};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use tokio::time::sleep;
 use tracing::{debug, instrument};
 use url::Url;
@@ -253,9 +255,9 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
     assert_eq!(Some(3), topics[0].replication_factor);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let partition = 0;
 
@@ -340,9 +342,9 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
     assert_eq!(Some(3), topics[0].replication_factor);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let partition = 0;
 
@@ -400,9 +402,9 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
         storage: storage.clone(),
     };
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -657,9 +659,9 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
         storage: storage.clone(),
     };
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -812,9 +814,9 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
         storage: storage.clone(),
     };
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -982,9 +984,9 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
         storage: storage.clone(),
     };
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -1131,9 +1133,9 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
         storage: storage.clone(),
     };
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -1281,9 +1283,9 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
         storage: storage.clone(),
     };
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -1445,9 +1447,9 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
         storage: storage.clone(),
     };
 
-    let fetch = FetchService {
+    let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;

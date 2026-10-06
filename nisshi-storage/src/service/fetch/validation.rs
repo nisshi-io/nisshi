@@ -12,16 +12,119 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::{self, Debug};
+use std::{
+    fmt::{self, Debug},
+    time::Duration,
+};
 
-use nisshi_sans_io::{ErrorCode, FetchRequest, FetchResponse, RequestInput};
+use nisshi_sans_io::{
+    ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput, fetch_request::FetchTopic,
+};
 use rama::{Layer, Service};
 use tracing::{debug, instrument};
 
-use super::fetch::{parse_fetch_fields, topic_error_response};
+use super::topic_error_response;
 use crate::{Error, Result};
 
-/// A [`Layer`] rejecting a malformed [`FetchRequest`] before it reaches the wrapped [`Service`].
+const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
+
+/// A [`FetchRequest`] whose whole-request fields have decoded to valid values.
+///
+/// [`FetchService`](super::FetchService) takes this instead of a [`FetchRequest`], so it
+/// never parses those fields itself.
+#[derive(Clone, Debug)]
+pub struct ValidatedFetchRequest {
+    pub(super) isolation_level: IsolationLevel,
+    pub(super) max_wait: Duration,
+    pub(super) min_bytes: u32,
+    pub(super) max_bytes: u32,
+    pub(super) topics: Vec<FetchTopic>,
+}
+
+/// The topics of a [`FetchRequest`] that failed to convert into a [`ValidatedFetchRequest`].
+#[derive(Clone, Debug)]
+pub struct MalformedFetchRequest {
+    topics: Vec<FetchTopic>,
+}
+
+impl MalformedFetchRequest {
+    /// Builds the [`FetchResponse`] reporting `INVALID_REQUEST` for the whole request.
+    ///
+    /// `FetchResponse` has a top-level `error_code`, but that field is `versions: 7+`, so the
+    /// same error is also mirrored onto every requested partition for clients on earlier
+    /// versions.
+    pub fn into_response(self) -> Result<FetchResponse> {
+        self.topics
+            .iter()
+            .map(|topic| topic_error_response(topic, ErrorCode::InvalidRequest))
+            .collect::<Result<Vec<_>>>()
+            .map(|responses| {
+                FetchResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(Some(ErrorCode::InvalidRequest.into()))
+                    .session_id(Some(0))
+                    .node_endpoints(Some([].into()))
+                    .responses(Some(responses))
+            })
+    }
+}
+
+impl TryFrom<FetchRequest> for ValidatedFetchRequest {
+    type Error = MalformedFetchRequest;
+
+    fn try_from(request: FetchRequest) -> Result<Self, Self::Error> {
+        let Some(topics) = request.topics else {
+            // A request without topics fetches nothing, so its other fields are never used.
+            return Ok(Self {
+                isolation_level: IsolationLevel::ReadUncommitted,
+                max_wait: Duration::ZERO,
+                min_bytes: 0,
+                max_bytes: 0,
+                topics: vec![],
+            });
+        };
+
+        let isolation_level = request
+            .isolation_level
+            .map_or(
+                Ok(IsolationLevel::ReadUncommitted),
+                IsolationLevel::try_from,
+            )
+            .map_err(|_| MalformedFetchRequest {
+                topics: topics.clone(),
+            })?;
+
+        let max_wait = u64::try_from(request.max_wait_ms)
+            .map(Duration::from_millis)
+            .map_err(|_| MalformedFetchRequest {
+                topics: topics.clone(),
+            })?;
+
+        let min_bytes = u32::try_from(request.min_bytes).map_err(|_| MalformedFetchRequest {
+            topics: topics.clone(),
+        })?;
+
+        let max_bytes = request
+            .max_bytes
+            .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
+                u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
+            })
+            .map_err(|_| MalformedFetchRequest {
+                topics: topics.clone(),
+            })?;
+
+        Ok(Self {
+            isolation_level,
+            max_wait,
+            min_bytes,
+            max_bytes,
+            topics,
+        })
+    }
+}
+
+/// A [`Layer`] converting a [`FetchRequest`] into a [`ValidatedFetchRequest`] for the wrapped
+/// [`Service`], and answering a malformed one itself.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FetchValidationLayer;
 
@@ -39,7 +142,8 @@ impl<S> Layer<S> for FetchValidationLayer {
     }
 }
 
-/// A [`Service`] rejecting a malformed [`FetchRequest`] before it reaches `inner`.
+/// A [`Service`] passing a [`ValidatedFetchRequest`] to `inner`, or answering `INVALID_REQUEST`
+/// for a [`FetchRequest`] that does not convert into one.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FetchValidationService<S> {
     inner: S,
@@ -51,45 +155,24 @@ impl<S> Debug for FetchValidationService<S> {
     }
 }
 
-/// Whether `request`'s whole-request fields decode to valid values.
-///
-/// [`FetchService`](super::fetch::FetchService) re-parses the same fields to use them, so this
-/// check only has to decide whether to short-circuit, not produce the parsed values.
-fn is_malformed(request: &FetchRequest) -> bool {
-    parse_fetch_fields(request).is_err()
-}
-
-impl<S> Service<RequestInput<FetchRequest>> for FetchValidationService<S>
+impl<S, I> Service<I> for FetchValidationService<S>
 where
-    S: Service<RequestInput<FetchRequest>, Output = FetchResponse, Error = Error>,
+    S: Service<ValidatedFetchRequest, Output = FetchResponse, Error = Error>,
+    I: Into<RequestInput<FetchRequest>> + Send + 'static,
 {
     type Output = FetchResponse;
     type Error = Error;
 
     #[instrument(skip(self, input))]
-    async fn serve(&self, input: RequestInput<FetchRequest>) -> Result<Self::Output> {
-        if input.request.topics.is_none() || !is_malformed(&input.request) {
-            return self.inner.serve(input).await;
+    async fn serve(&self, input: I) -> Result<Self::Output> {
+        match ValidatedFetchRequest::try_from(input.into().request) {
+            Ok(request) => self.inner.serve(request).await,
+
+            Err(malformed) => {
+                debug!(?malformed, "malformed fetch request");
+                malformed.into_response()
+            }
         }
-
-        debug!(request = ?input.request, "malformed fetch request");
-
-        input
-            .request
-            .topics
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|topic| topic_error_response(topic, ErrorCode::InvalidRequest))
-            .collect::<Result<Vec<_>>>()
-            .map(|responses| {
-                FetchResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(Some(ErrorCode::InvalidRequest.into()))
-                    .session_id(Some(0))
-                    .node_endpoints(Some([].into()))
-                    .responses(Some(responses))
-            })
     }
 }
 
@@ -106,11 +189,11 @@ mod tests {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl rama::Service<RequestInput<FetchRequest>> for CountingInner {
+    impl rama::Service<super::ValidatedFetchRequest> for CountingInner {
         type Output = FetchResponse;
         type Error = Error;
 
-        async fn serve(&self, _input: RequestInput<FetchRequest>) -> Result<Self::Output> {
+        async fn serve(&self, _input: super::ValidatedFetchRequest) -> Result<Self::Output> {
             _ = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             Ok(FetchResponse::default()

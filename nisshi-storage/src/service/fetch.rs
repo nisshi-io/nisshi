@@ -15,7 +15,7 @@
 use std::{cmp::min, time::SystemTime};
 
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput,
+    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{
         EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
@@ -28,16 +28,24 @@ use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, Topition};
+use validation::ValidatedFetchRequest;
 
-/// A [`Service`] using its [`Storage`] taking [`FetchRequest`] returning [`FetchResponse`].
+pub(super) mod validation;
+
+/// A [`Service`] using its [`Storage`] taking [`ValidatedFetchRequest`] returning [`FetchResponse`].
+///
+/// Wrap it in a [`FetchValidationLayer`](validation::FetchValidationLayer) to serve a
+/// [`FetchRequest`].
 /// ```no_run
-/// use rama::Service as _;
+/// use rama::{Layer as _, Service as _};
 /// use nisshi_sans_io::{
 ///     CreateTopicsRequest, ErrorCode, FetchRequest,
 ///     create_topics_request::CreatableTopic,
 ///     fetch_request::{FetchPartition, FetchTopic},
 /// };
-/// use nisshi_storage::{CreateTopicsService, Error, FetchService, StorageContainer};
+/// use nisshi_storage::{
+///     CreateTopicsService, Error, FetchService, FetchValidationLayer, StorageContainer,
+/// };
 /// use url::Url;
 ///
 /// # #[tokio::main]
@@ -80,9 +88,9 @@ use crate::{Error, Result, Storage, Topition};
 /// assert_eq!(1, topics.len());
 /// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 ///
-/// let fetch = FetchService {
+/// let fetch = FetchValidationLayer::new().layer(FetchService {
 ///     storage: storage.clone(),
-/// };
+/// });
 ///
 /// let partition = 0;
 ///
@@ -373,39 +381,6 @@ fn unknown_topic_response(fetch: &FetchTopic) -> Result<FetchableTopicResponse> 
     topic_error_response(fetch, ErrorCode::UnknownTopicOrPartition)
 }
 
-/// Parses `request`'s whole-request fields (`isolation_level`, `max_wait_ms`, `min_bytes`,
-/// `max_bytes`), or `Err` if any of them fails to decode to a valid value.
-///
-/// [`FetchValidationService`](super::fetch_validation::FetchValidationService) calls this to
-/// decide whether to short-circuit before this module re-parses the same fields to use them.
-pub(super) fn parse_fetch_fields(
-    request: &FetchRequest,
-) -> Result<(IsolationLevel, Duration, u32, u32), ()> {
-    let isolation_level = request.isolation_level.map_or(
-        Ok(IsolationLevel::ReadUncommitted),
-        IsolationLevel::try_from,
-    );
-
-    let max_wait_ms = u64::try_from(request.max_wait_ms).map(Duration::from_millis);
-
-    let min_bytes = u32::try_from(request.min_bytes);
-
-    const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
-
-    let max_bytes = request
-        .max_bytes
-        .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
-            u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
-        });
-
-    match (isolation_level, max_wait_ms, min_bytes, max_bytes) {
-        (Ok(isolation_level), Ok(max_wait_ms), Ok(min_bytes), Ok(max_bytes)) => {
-            Ok((isolation_level, max_wait_ms, min_bytes, max_bytes))
-        }
-        _ => Err(()),
-    }
-}
-
 /// Builds a [`FetchableTopicResponse`] reporting `error_code` on every partition `fetch` requested.
 pub(super) fn topic_error_response(
     fetch: &FetchTopic,
@@ -413,7 +388,7 @@ pub(super) fn topic_error_response(
 ) -> Result<FetchableTopicResponse> {
     Ok(FetchableTopicResponse::default()
         .topic(fetch.topic.clone())
-        .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+        .topic_id(fetch.topic_id)
         .partitions(fetch.partitions.as_ref().map(|partitions| {
             partitions
                 .iter()
@@ -437,70 +412,33 @@ pub(super) fn topic_error_response(
         })))
 }
 
-impl<G, I> Service<I> for FetchService<G>
+impl<G> Service<ValidatedFetchRequest> for FetchService<G>
 where
     G: Storage,
-    I: Into<RequestInput<FetchRequest>> + Send + 'static,
 {
     type Output = FetchResponse;
     type Error = Error;
 
-    #[instrument(skip(self, input))]
-    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+    #[instrument(skip(self, request))]
+    async fn serve(&self, mut request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
         let started_at = SystemTime::now();
 
-        let input = input.into();
-
-        let responses = Some(if let Some(ref topics) = input.request.topics {
-            // These fields apply to the whole request, and (unlike e.g.
-            // ListOffsets) `FetchResponse` has a top-level `error_code` for
-            // exactly this: a malformed value here reports `INVALID_REQUEST`
-            // there, rather than leaking the low-level parse error. That
-            // field is `versions: 7+` though, so it's also mirrored onto
-            // every requested partition for clients on earlier versions.
-            let (isolation_level, max_wait_ms, min_bytes, mut max_bytes) =
-                match parse_fetch_fields(&input.request) {
-                    Ok(parsed) => parsed,
-
-                    Err(()) => {
-                        debug!(request = ?input.request, "malformed fetch request");
-
-                        // pre-v7 clients can't see the top-level error code
-                        // above (it's `versions: 7+`, absent on the wire for
-                        // them), so the same error has to also show up per
-                        // partition or those clients see no error at all
-                        let responses = topics
-                            .iter()
-                            .map(|topic| topic_error_response(topic, ErrorCode::InvalidRequest))
-                            .collect::<Result<Vec<_>>>()?;
-
-                        return Ok(FetchResponse::default()
-                            .throttle_time_ms(Some(0))
-                            .error_code(Some(ErrorCode::InvalidRequest.into()))
-                            .session_id(Some(0))
-                            .node_endpoints(Some([].into()))
-                            .responses(Some(responses)));
-                    }
-                };
-
-            self.fetch(
-                max_wait_ms,
-                min_bytes,
-                &mut max_bytes,
-                isolation_level,
-                topics.as_ref(),
-            )
-            .await?
-        } else {
-            vec![]
-        });
-
-        Ok(FetchResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(Some(ErrorCode::None.into()))
-            .session_id(Some(0))
-            .node_endpoints(Some([].into()))
-            .responses(responses))
+        self.fetch(
+            request.max_wait,
+            request.min_bytes,
+            &mut request.max_bytes,
+            request.isolation_level,
+            &request.topics,
+        )
+        .await
+        .map(|responses| {
+            FetchResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(Some(ErrorCode::None.into()))
+                .session_id(Some(0))
+                .node_endpoints(Some([].into()))
+                .responses(Some(responses))
+        })
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed().ok()))
     }
 }
