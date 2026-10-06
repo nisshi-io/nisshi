@@ -5780,6 +5780,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slatedb",
+ "snap",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
