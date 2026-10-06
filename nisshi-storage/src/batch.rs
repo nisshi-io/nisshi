@@ -51,7 +51,7 @@ use crate::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    TxnOffsetCommitRequest, UpdateError, Version, offload,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -284,7 +284,9 @@ where
         // both cases every owner (not just whichever caller happened to
         // trigger this flush) must be told the outcome, not just the one
         // that happened to call `send_queued`.
-        let outcome = match combine(queued.into_iter().map(|queued| queued.batch).collect()) {
+        let batches = queued.into_iter().map(|queued| queued.batch).collect();
+
+        let outcome = match offload(move || combine(batches)).await {
             Ok(Some(combined)) => {
                 let record_count = (combined.last_offset_delta + 1) as u64;
 
@@ -752,7 +754,7 @@ mod tests {
 
     use bytes::Bytes;
     use nisshi_sans_io::{
-        BatchAttribute,
+        BatchAttribute, Compression,
         record::{Record, deflated, inflated},
     };
     use tokio::{task::yield_now, time::advance};
@@ -1456,6 +1458,65 @@ mod tests {
 
         // Nothing should have actually landed in storage.
         assert_eq!(None, recorder.produced(&abc0)?);
+
+        Ok(())
+    }
+
+    // The test runtime has a single thread. If `send_queued` combined the
+    // batch inline, the produce task would decode, store and resolve its
+    // ticket within its first poll, so it would already be finished when
+    // `yield_now` returns. Offloaded, it is still waiting on the decode.
+    #[tokio::test]
+    async fn combine_runs_off_the_runtime_thread() -> Result<()> {
+        const RECORDS: usize = 1_000;
+        const RECORD_SIZE: usize = 1_024;
+
+        let recorder = FlightRecorder::new();
+        let storage = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)))
+            .with_minimum_size(Some(0));
+
+        let abc0 = Topition::new("abc", 0);
+        let attributes: i16 = BatchAttribute::default()
+            .compression(Compression::Gzip)
+            .into();
+
+        // Pseudo-random values, so gzip has real work to do on decode.
+        let mut seed = 0x2545_f491_u32;
+        let values = (0..RECORDS)
+            .map(|_| {
+                (0..RECORD_SIZE)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        seed as u8
+                    })
+                    .collect::<Bytes>()
+            })
+            .collect::<Vec<_>>();
+
+        let batch = into_batch(attributes, 54345, 32123, 0, &values)?;
+
+        let produce = {
+            let storage = storage.clone();
+            let abc0 = abc0.clone();
+
+            tokio::spawn(async move { storage.produce(None, &abc0, batch).await })
+        };
+
+        yield_now().await;
+
+        assert!(
+            !produce.is_finished(),
+            "the batch was combined on the runtime thread"
+        );
+
+        assert_eq!(0, produce.await.expect("join_handle")?);
+
+        let sent = recorder.produced(&abc0)?.unwrap();
+        assert_eq!(1, sent.len());
+        assert_eq!(RECORDS, sent[0].records.len());
 
         Ok(())
     }

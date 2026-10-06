@@ -35,3 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- A large produce batch no longer holds an async runtime worker thread while
+  it is decompressed and decoded. Every storage backend and the produce
+  batcher decode on Tokio's blocking pool, at most one decode per runtime
+  worker thread at a time. Schema validation and lake conversion of a
+  produced batch, and re-compression of a fetched batch, still run on the
+  worker thread.
+- A panic while decoding a produce batch is reported for that partition as
+  `UNKNOWN_SERVER_ERROR` instead of unwinding the connection task.

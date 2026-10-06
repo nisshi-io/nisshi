@@ -53,7 +53,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, inflate,
 };
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -784,6 +784,15 @@ impl Storage for Engine {
         topition: &Topition,
         deflated: Batch,
     ) -> Result<i64> {
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not lengthen the optimistic
+        // transaction.
+        let inflated = if self.schemas.is_some() || self.lake.is_some() {
+            Some(inflate(deflated.clone()).await?)
+        } else {
+            None
+        };
+
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
@@ -801,13 +810,14 @@ impl Storage for Engine {
         }
 
         // Schema validation (if schemas registry is configured)
-        if let Some(ref schemas) = self.schemas {
-            let inflated = InflatedBatch::try_from(deflated.clone())?;
+        if let Some(ref schemas) = self.schemas
+            && let Some(ref inflated) = inflated
+        {
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             // Only validate non-control batches
             if !attributes.control {
-                schemas.validate(topition.topic(), &inflated).await?;
+                schemas.validate(topition.topic(), inflated).await?;
             }
         }
 
@@ -942,8 +952,9 @@ impl Storage for Engine {
         tx.put(watermark_key, watermark_value)?;
 
         // Store to data lake if configured
-        if let Some(ref lake) = self.lake {
-            let inflated = InflatedBatch::try_from(deflated.clone())?;
+        if let Some(ref lake) = self.lake
+            && let Some(ref inflated) = inflated
+        {
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             if !attributes.control {
@@ -958,7 +969,7 @@ impl Storage for Engine {
                     topition.topic(),
                     topition.partition(),
                     offset,
-                    &inflated,
+                    inflated,
                     config,
                 )
                 .await?;

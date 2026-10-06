@@ -56,7 +56,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
     ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel,
+    bounded_channel, inflate,
 };
 use opentelemetry::{
     KeyValue,
@@ -678,6 +678,7 @@ impl Delegate {
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
+        inflated: inflated::Batch,
         connection: &PoolConnection,
     ) -> Result<i64> {
         let start = SystemTime::now();
@@ -708,10 +709,6 @@ impl Delegate {
         // re-deflates with the codec the producer used, as Kafka does with
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
-
-        let inflated = inflated::Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
-
-        debug!(after_inflate = elapsed_millis(start));
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -967,8 +964,13 @@ impl Delegate {
                 .and_then(TryInto::try_into)
                 .inspect(|deflated| debug!(?deflated))?;
 
+            // A control batch holds one uncompressed record, so it is
+            // inflated inline. `inflate` would wait for a decode permit
+            // while this transaction holds the database write lock.
+            let inflated = inflated::Batch::try_from(&batch)?;
+
             let offset = self
-                .produce_in_tx(Some(transaction_id), &topition, batch, connection)
+                .produce_in_tx(Some(transaction_id), &topition, batch, inflated, connection)
                 .await?;
 
             debug!(offset, ?topition);
@@ -2668,6 +2670,15 @@ impl Storage for Delegate {
     ) -> Result<i64> {
         let start = SystemTime::now();
 
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = inflate(deflated.clone())
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
+        debug!(after_inflate = elapsed_millis(start));
+
         let pc = self.connection().await?;
 
         let tx = pc.transaction().await.inspect(|_| {
@@ -2675,7 +2686,7 @@ impl Storage for Delegate {
         })?;
 
         let high = self
-            .produce_in_tx(transaction_id, topition, deflated, &pc)
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &pc)
             .await
             .inspect(|_| {
                 debug!(after_produce_in_tx = elapsed_millis(start));
@@ -5006,9 +5017,10 @@ impl TryFrom<Value> for LiteTimestamp {
 mod tests {
     use std::thread;
 
+    use nisshi_sans_io::Compression;
     use nisshi_storage::{ArcDynStorage, StorageContainer};
-    use tempfile::tempdir;
-    use tokio::fs::remove_file;
+    use tempfile::{tempdir, tempdir_in};
+    use tokio::{fs::remove_file, task::yield_now};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -5487,6 +5499,115 @@ mod tests {
             .create_topic(creatable_topic, false)
             .await
             .inspect(|uuid| debug!(?uuid))?;
+
+        Ok(())
+    }
+
+    // The test runtime has a single thread, and `mode=direct` calls the
+    // storage without a channel to another task. If `produce` inflated the
+    // batch inline, the produce task would decode and store it within its
+    // first poll, so it would already be finished when `yield_now` returns.
+    // Offloaded, it is still waiting on the decode.
+    #[tokio::test]
+    async fn produce_inflates_off_the_runtime_thread() -> Result<()> {
+        const RECORDS: usize = 1_000;
+        const RECORD_SIZE: usize = 1_024;
+
+        let _guard = init_tracing()?;
+
+        // The builder resolves the storage path against the current
+        // directory, so the database lives in a temporary directory there.
+        let current_dir = env::current_dir()?;
+        let temp_dir = tempdir_in(&current_dir).inspect(|temporary| debug!(?temporary))?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(&current_dir)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let storage = Url::parse(&format!("file:///{}?mode=direct", relative.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // Pseudo-random values, so gzip has real work to do on decode.
+        let mut seed = 0x2545_f491_u32;
+        let mut builder = inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+            )
+            .producer_id(-1)
+            .producer_epoch(-1)
+            .base_sequence(-1)
+            .last_offset_delta(RECORDS as i32 - 1);
+
+        for offset_delta in 0..RECORDS {
+            let value = (0..RECORD_SIZE)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect::<Bytes>();
+
+            builder = builder.record(
+                Record::builder()
+                    .value(value.into())
+                    .offset_delta(offset_delta as i32),
+            );
+        }
+
+        let batch: deflated::Batch = builder.build().and_then(TryInto::try_into)?;
+
+        let topition = Topition::new(topic, 0);
+
+        let produce = {
+            let engine = engine.clone();
+            let topition = topition.clone();
+
+            tokio::spawn(async move { engine.produce(None, &topition, batch).await })
+        };
+
+        yield_now().await;
+
+        assert!(
+            !produce.is_finished(),
+            "the batch was inflated on the runtime thread"
+        );
+
+        assert_eq!(0, produce.await??);
 
         Ok(())
     }

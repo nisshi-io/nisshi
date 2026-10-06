@@ -65,7 +65,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, inflate,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -832,6 +832,7 @@ impl Postgres {
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
+        inflated: Batch,
         tx: &Transaction<'_>,
     ) -> Result<i64> {
         debug!(cluster = ?self.cluster, ?transaction_id, ?topition, ?deflated);
@@ -870,8 +871,6 @@ impl Postgres {
         // re-deflates with the codec the producer used, as Kafka does with
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
-
-        let inflated = Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -1243,8 +1242,13 @@ impl Postgres {
                     .and_then(TryInto::try_into)
                     .inspect(|deflated| debug!(?deflated))?;
 
+                // A control batch holds one uncompressed record, so it is
+                // inflated inline. `inflate` would wait for a decode permit
+                // while this transaction holds its watermark row locks.
+                let inflated = Batch::try_from(&batch)?;
+
                 let offset = self
-                    .produce_in_tx(Some(transaction_id), &topition, batch, tx)
+                    .produce_in_tx(Some(transaction_id), &topition, batch, inflated, tx)
                     .await?;
 
                 debug!(offset, ?topition);
@@ -2210,12 +2214,19 @@ impl Storage for Postgres {
     ) -> Result<i64> {
         debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
 
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a pooled connection
+        // or the partition's watermark row lock.
+        let inflated = inflate(deflated.clone())
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
         let mut c = self.connection().await?;
 
         let tx = c.transaction().await?;
 
         let high = self
-            .produce_in_tx(transaction_id, topition, deflated, &tx)
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
             .await?;
 
         tx.commit().await?;
