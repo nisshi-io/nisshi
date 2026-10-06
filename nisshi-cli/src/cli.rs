@@ -36,12 +36,10 @@ mod proxy;
 mod topic;
 mod user;
 
-// `127.0.0.1`, not `localhost`: a client whose resolver returns `::1` before
-// `127.0.0.1` (the macOS/glibc default resolution order) would otherwise be sent back to
-// an advertised address this build cannot always serve. Every `DEFAULT_BROKER` consumer
-// (the broker's advertised listener, `cat`'s bootstrap server, `proxy`'s advertised
-// listener and origin) shares this constant, so every subcommand's `--help` tells the
-// same consistent story.
+// `127.0.0.1`, not `localhost`, because the broker's default advertised listener uses
+// this value, and a client connects to the address it receives in Metadata. A client
+// whose resolver returns `::1` first would otherwise try IPv6, which a broker that
+// listens on IPv4 only refuses.
 const DEFAULT_BROKER: &str = "tcp://127.0.0.1:9092";
 
 fn storage_engines() -> Vec<&'static str> {

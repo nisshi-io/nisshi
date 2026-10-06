@@ -61,11 +61,8 @@ pub(super) struct Arg {
 
     /// The broker will listen on this address
     //
-    // `[::]`, not `0.0.0.0`: the broker binds this with `IPV6_V6ONLY` cleared (see
-    // `nisshi_broker::broker::configure_listener`), so an IPv6 unspecified address still
-    // accepts IPv4 connections, and the default listens on every interface either way.
-    // `nisshi-proxy`'s own listener keeps its own `0.0.0.0` default: its bind path goes
-    // through `host_port`, which resolves and filters to IPv4 only.
+    // `[::]`, not `0.0.0.0`. This default requires the broker to bind an IPv6 address
+    // with `IPV6_V6ONLY` cleared, so that it also accepts IPv4 connections.
     #[arg(
         long,
         env = "LISTENER_URL",

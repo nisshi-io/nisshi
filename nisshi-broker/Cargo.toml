@@ -34,6 +34,7 @@ hyper-util.workspace = true
 hyper.workspace = true
 indicatif.workspace = true
 jsonschema.workspace = true
+libc.workspace = true
 nisshi-auth.workspace = true
 nisshi-model.workspace = true
 nisshi-otel.workspace = true

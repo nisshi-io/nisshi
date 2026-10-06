@@ -5755,6 +5755,7 @@ dependencies = [
  "hyper-util",
  "indicatif",
  "jsonschema",
+ "libc",
  "nisshi-auth",
  "nisshi-model",
  "nisshi-otel",

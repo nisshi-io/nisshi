@@ -66,10 +66,6 @@ mod tests {
     /// The proxy's advertised listener and origin share `DEFAULT_BROKER` with the
     /// broker's own advertised listener, so they resolve to the same IPv4 loopback
     /// address, not `localhost`.
-    ///
-    /// The proxy's own listener keeps its own `0.0.0.0` default rather than following
-    /// suit: its bind path goes through `nisshi_service::host_port`, which resolves and
-    /// filters to IPv4 only, so it cannot bind an IPv6 address regardless.
     #[test]
     fn advertised_defaults_resolve_to_loopback() {
         let arg = parse();
