@@ -499,14 +499,10 @@ mod tests {
     use serde::de::IgnoredAny;
     use std::io::Cursor;
 
-    /// `deserialize_str` has the same missing-length-guard shape as the non-tagged decoder's
-    /// `deserialize_bytes` and `deserialize_str`, and matches the guard already present on
-    /// this file's `deserialize_string`: a declared length wildly exceeding the configured
-    /// message size must be rejected before it sizes an allocation. Asserting the specific
-    /// `MessageMaxSizeExceeded` variant (not just `is_err()`) matters: without the guard this
-    /// same input still returns an `Err`, just a different one (`Error::Io`, from
-    /// `read_exact` hitting an empty cursor after a huge allocation attempt), so only the
-    /// specific variant proves the allocation was never attempted.
+    /// `deserialize_str` rejects a declared length above the message size limit
+    /// before it allocates. The test matches `MessageMaxSizeExceeded`, because
+    /// without the guard the decoder still fails, with `Error::Io`, after it
+    /// allocates.
     #[test]
     fn deserialize_str_length_exceeding_max_size_returns_err_not_huge_allocation() {
         // Tagged-field string lengths are varint-encoded as length + 1 (0
