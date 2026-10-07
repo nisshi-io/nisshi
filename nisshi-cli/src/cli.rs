@@ -36,7 +36,11 @@ mod proxy;
 mod topic;
 mod user;
 
-const DEFAULT_BROKER: &str = "tcp://localhost:9092";
+// `127.0.0.1`, not `localhost`, because the broker's default advertised listener uses
+// this value, and a client connects to the address it receives in Metadata. A client
+// whose resolver returns `::1` first would otherwise try IPv6, which a broker that
+// listens on IPv4 only refuses.
+const DEFAULT_BROKER: &str = "tcp://127.0.0.1:9092";
 
 fn storage_engines() -> Vec<&'static str> {
     vec![

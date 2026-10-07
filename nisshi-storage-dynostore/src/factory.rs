@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use nisshi_schema::redact_url;
 use nisshi_storage::{
     ArcDynStorage, ProduceRequestBatcher, Result, StorageFactory, StorageFactoryConfiguration,
+    reject_unrecognized_options,
 };
 use object_store::{
     aws::{AmazonS3Builder, S3ConditionalPut},
@@ -39,6 +40,8 @@ impl StorageFactory for MemoryEngineFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+        reject_unrecognized_options(&configuration.storage, &[])?;
+
         Ok(Arc::new(Box::new(
             DynoStore::new(
                 configuration.cluster.as_str(),
@@ -62,6 +65,11 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+        reject_unrecognized_options(
+            &configuration.storage,
+            &["batch_min_size", "batch_max_delay"],
+        )?;
+
         let bucket_name = configuration.storage.host_str().unwrap_or("nisshi");
 
         let minimum_size = configuration.storage.query_pairs().find_map(|(k, v)| {
@@ -128,6 +136,11 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+        reject_unrecognized_options(
+            &configuration.storage,
+            &["batch_min_size", "batch_max_delay"],
+        )?;
+
         let bucket_name = configuration.storage.host_str().unwrap_or("nisshi");
 
         let minimum_size = configuration.storage.query_pairs().find_map(|(k, v)| {

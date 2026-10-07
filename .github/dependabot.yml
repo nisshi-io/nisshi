@@ -1,10 +1,14 @@
 version: 2
 updates:
+  # The 7-day cooldown gives an upstream CVE or a yanked release time to
+  # surface before Dependabot opens a bump PR.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     target-branch: "main"
+    cooldown:
+      default-days: 7
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -29,3 +33,23 @@ updates:
       # 0.11.
       - dependency-name: "sha2"
         versions: [">0.10.9"]
+    cooldown:
+      default-days: 7
+  # The Dockerfile's alpine base and .devcontainer's rust base are pinned to
+  # exact digests. A digest pin only stays current if something deliberately
+  # bumps it, so both get the same Dependabot coverage the other ecosystems
+  # above already have, rather than freezing in place indefinitely.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7
+  - package-ecosystem: "docker"
+    directory: "/.devcontainer"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7
