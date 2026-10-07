@@ -1626,4 +1626,40 @@ mod tests {
             "{err:?}"
         );
     }
+
+    /// The flexible length-read branch of `deserialize_bytes` must also be
+    /// rejected over `message_max_size`. `ApiVersionsResponse` (api key 18)
+    /// is flexible from v3, so this decoder reads an unsigned varint length.
+    #[test]
+    fn deserialize_bytes_flexible_rejects_length_over_message_max_size() {
+        // Unsigned varint 1_000_001: the flexible encoding of a length of
+        // 1_000_000, because the wire value is the length plus one.
+        let mut encoded: &[u8] = &[0xc1, 0x84, 0x3d];
+        let mut decoder = Decoder::response(&mut encoded, 18, 3);
+        decoder.message_max_size = Some(10);
+
+        let err = Deserializer::deserialize_bytes(&mut decoder, UnreachableVisitor)
+            .expect_err("a length over message_max_size must be rejected");
+
+        assert!(
+            matches!(err, Error::MessageMaxSizeExceeded(1_000_000)),
+            "{err:?}"
+        );
+    }
+
+    /// A flexible length prefix of `0` must be rejected with
+    /// `Error::Overflow`. Subtracting one from it underflows, and the wrapped
+    /// value would size the allocation.
+    #[test]
+    fn deserialize_bytes_flexible_zero_length_does_not_underflow() {
+        // Unsigned varint 0: one byte without the continuation bit.
+        let mut encoded: &[u8] = &[0];
+        // ApiVersionsResponse (api key 18) is flexible from v3.
+        let mut decoder = Decoder::response(&mut encoded, 18, 3);
+
+        let err = Deserializer::deserialize_bytes(&mut decoder, UnreachableVisitor)
+            .expect_err("a zero flexible length must be rejected");
+
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+    }
 }

@@ -95,12 +95,11 @@ use tokio::sync::{
     oneshot,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
-pub use txn::{
-    add_offsets::AddOffsetsService as TxnAddOffsetsService,
-    add_partitions::AddPartitionService as TxnAddPartitionService,
-    end::EndService as TxnEndService, offset_commit::OffsetCommitService as TxnOffsetCommitService,
-};
+use tracing::{debug, error, instrument, warn};
+pub use txn::add_offsets::AddOffsetsService as TxnAddOffsetsService;
+pub use txn::add_partitions::AddPartitionService as TxnAddPartitionService;
+pub use txn::end::EndService as TxnEndService;
+pub use txn::offset_commit::OffsetCommitService as TxnOffsetCommitService;
 use url::Url;
 use uuid::Uuid;
 
@@ -999,23 +998,112 @@ pub struct ChannelRequestService<S> {
     cancellation: CancellationToken,
 }
 
+static STORAGE_CHANNEL_SERVER_FAILURE: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_storage_channel_server_failure")
+        .with_description(
+            "Count of per-request storage task failures in the mpsc server loop, by kind: a \
+             panic, a task cancelled at runtime shutdown, or a storage error; the loop itself \
+             continues serving other requests in every case",
+        )
+        .build()
+});
+
+static STORAGE_CHANNEL_RESPONSE_DISCARDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_storage_channel_response_discarded")
+        .with_description(
+            "Count of mpsc storage responses discarded because the requester dropped its \
+             response receiver (a client disconnect or a read deadline); normal client churn",
+        )
+        .build()
+});
+
 impl<S> Service<RequestReceiver> for ChannelRequestService<S>
 where
-    S: Service<Request, Output = Response, Error = Error>,
+    S: Service<Request, Output = Response, Error = Error> + Clone,
 {
     type Output = ();
     type Error = Error;
 
+    /// Runs the mpsc-mode storage supervisor loop.
+    ///
+    /// Each request's storage work runs in its own `tokio::spawn`'d task so that a panic
+    /// there is caught by Tokio's own per-task unwind handling (surfaced as
+    /// `JoinError::is_panic`) instead of unwinding this loop and ending storage for every
+    /// other caller sharing this channel. `spawn` is immediately followed by `.await` on
+    /// the resulting `JoinHandle`, which keeps request processing strictly sequential:
+    /// mpsc mode's single-writer discipline against the underlying SQLite connection
+    /// depends on staying sequential here, so this must not become fire-and-forget.
+    ///
+    /// Note that aborting this task (e.g. by dropping a `JoinSet` that owns it) only
+    /// cancels whichever child `JoinHandle` it happens to be awaiting at that moment; the
+    /// child keeps running detached to completion. That is harmless for correctness (its
+    /// `tx` is simply dropped, and the pooled connection still returns to the pool
+    /// normally through the child's own unwind/return path), but abort is not transitive.
     async fn serve(&self, mut req: RequestReceiver) -> Result<Self::Output, Self::Error> {
         loop {
             tokio::select! {
-                Some((request, tx)) = req.recv() => {
-                    self.inner
-                    .serve(request)
-                    .await
-                    .and_then(|response| {
-                        tx.send(response).map_err(|_unsent| Error::UnableToSend)
-                    })?
+                received = req.recv() => {
+                    let Some((request, tx)) = received else {
+                        debug!("storage channel closed; ending supervisor loop");
+                        break;
+                    };
+
+                    let operation = request.to_string();
+                    let inner = self.inner.clone();
+
+                    match tokio::spawn(async move { inner.serve(request).await }).await {
+                        Ok(Ok(response)) => {
+                            if tx.send(response).is_err() {
+                                debug!(
+                                    operation,
+                                    "requester dropped its response receiver; discarding response"
+                                );
+
+                                STORAGE_CHANNEL_RESPONSE_DISCARDED
+                                    .add(1, &[KeyValue::new("operation", operation)]);
+                            }
+                        }
+
+                        Ok(Err(error)) => {
+                            error!(operation, ?error, "storage request failed");
+
+                            STORAGE_CHANNEL_SERVER_FAILURE.add(
+                                1,
+                                &[
+                                    KeyValue::new("operation", operation),
+                                    KeyValue::new("kind", "error"),
+                                ],
+                            );
+                        }
+
+                        Err(join_error) => {
+                            let kind = if join_error.is_panic() {
+                                error!(
+                                    operation,
+                                    ?join_error,
+                                    "storage request task panicked; isolated, loop continues"
+                                );
+                                "panic"
+                            } else {
+                                warn!(
+                                    operation,
+                                    ?join_error,
+                                    "storage request task cancelled"
+                                );
+                                "cancelled"
+                            };
+
+                            STORAGE_CHANNEL_SERVER_FAILURE.add(
+                                1,
+                                &[
+                                    KeyValue::new("operation", operation),
+                                    KeyValue::new("kind", kind),
+                                ],
+                            );
+                        }
+                    }
                 }
 
                 cancelled = self.cancellation.cancelled() => {

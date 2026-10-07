@@ -1506,6 +1506,28 @@ mod tests {
         Ok(split)
     }
 
+    /// The second batch's record is rebuilt with `offset_delta` 64, one byte
+    /// longer as a varint than the 0 it was encoded with, so the combined
+    /// batch must still decode record by record.
+    #[test]
+    fn combine_offset_delta_crossing_varint_width_decodes_by_value() -> Result<()> {
+        let batches = [
+            vec![Bytes::from_static(b"a"); 64],
+            vec![Bytes::from_static(b"b")],
+        ];
+
+        let combined = into_batches(BatchAttribute::default().into(), 54345, 32123, 0, &batches)
+            .and_then(combine)?
+            .expect("a batch");
+
+        let records = Vec::<Record>::try_from(combined)?;
+        assert_eq!(65, records.len());
+        assert_eq!(64, records[64].offset_delta);
+        assert_eq!(Some(Bytes::from_static(b"b")), records[64].value);
+
+        Ok(())
+    }
+
     #[test]
     fn combine_batches() -> Result<()> {
         let batches = [

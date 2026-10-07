@@ -501,3 +501,32 @@ impl<'de> SeqAccess<'de> for Struct<'de, '_> {
         seed.deserialize(&mut *self.de).map(Some)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Encode, primitive::varint::UnsignedVarInt};
+    use serde::de::IgnoredAny;
+    use std::io::Cursor;
+
+    /// `deserialize_str` rejects a declared length above the message size limit
+    /// before it allocates. The test matches `MessageMaxSizeExceeded`, because
+    /// without the guard the decoder still fails, with `Error::Io`, after it
+    /// allocates.
+    #[test]
+    fn deserialize_str_length_exceeding_max_size_returns_err_not_huge_allocation() {
+        // Tagged-field string lengths are varint-encoded as length + 1 (0
+        // means null); encode MESSAGE_MAX_SIZE + 2 so the decoded length,
+        // after the mandatory `- 1`, is MESSAGE_MAX_SIZE + 1 - just past
+        // the guard, with no data behind it on the wire.
+        let declared = u32::try_from(MESSAGE_MAX_SIZE).unwrap() + 2;
+        let encoded = UnsignedVarInt(declared).encode().unwrap();
+
+        let mut cursor = Cursor::new(encoded);
+        let mut decoder = Decoder::new(&mut cursor);
+
+        let result = (&mut decoder).deserialize_str(IgnoredAny);
+
+        assert!(matches!(result, Err(Error::MessageMaxSizeExceeded(_))));
+    }
+}
