@@ -18,8 +18,9 @@ jobs:
       # --no-verify skips cargo's pre-upload build, so no build script runs
       # while this job holds the crates.io token. The verify step is
       # ci.yml's cargo-publish-dry-run, which runs in the merge queue. This
-      # relies on each `v*` tag going on a commit on main, which the main
-      # ruleset accepts only through the merge queue.
+      # relies on each `v*` tag going on a commit that already merged to main
+      # through the queue. Tags are pushed by hand, and no tag ruleset
+      # enforces that today.
       - run: cargo publish --locked --no-verify --workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
