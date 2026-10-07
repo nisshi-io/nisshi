@@ -877,22 +877,15 @@ const RESPONSE_MARGIN: Duration = Duration::from_secs(5);
 /// when that is longer. The manager's maximum request wait caps the time the request asks
 /// for.
 ///
-/// The Java client waits `request.timeout.ms` (default [30s][producer]) for each response,
-/// and chooses each request's wait itself: the producer sends `request.timeout.ms` as the
-/// [produce timeout][produce], and the consumer's `fetch.max.wait.ms` is [500ms][fetch] by
-/// default. JoinGroup waits
-/// [`max(request.timeout.ms, rebalance timeout + 5s)`][join]. We apply that JoinGroup
-/// rule to every request, because a proxy forwards requests whose wait another client
-/// chose, and our deadline must not end before that client's own deadline.
+/// A proxy forwards requests whose wait another client chose, so this deadline must not
+/// end before that client's own deadline. For that reason we apply the Java client's
+/// JoinGroup rule, `max(request.timeout.ms, rebalance timeout + 5s)`
+/// ([`AbstractCoordinator`][join]), to every request.
 ///
 /// We cap the wait, because every client of a proxy shares the connections in its pool,
 /// and a request holds its connection until the broker answers. So we fail a JoinGroup
-/// after 5 minutes and 5 seconds by default, where the Java client waits for any
-/// `max.poll.interval.ms`.
+/// whose rebalance timeout is above the cap, where the Java client would wait (#882).
 ///
-/// [producer]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java#L424-L426
-/// [produce]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L910-L915
-/// [fetch]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerConfig.java#L206
 /// [join]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L620-L628
 fn response_timeout(manager: &ConnectionManager, body: &Body) -> Duration {
     let wait_ms = match body {
