@@ -6184,6 +6184,7 @@ dependencies = [
  "nisshi-sans-io",
  "nisshi-storage",
  "regex",
+ "tokio",
  "tracing",
  "url",
  "uuid",
