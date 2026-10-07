@@ -1818,7 +1818,16 @@ where
                                 .collect(),
                         ))
                         .error_code(ErrorCode::None.into())
-                })?;
+                })
+                // Kafka reports an error per group from version 8, so a group
+                // whose offsets the storage can't read fails alone, and the
+                // other groups still get their offsets.
+                .unwrap_or_else(|error| {
+                    OffsetFetchResponseGroup::default()
+                        .group_id(group.group_id.clone())
+                        .topics(Some([].into()))
+                        .error_code(offset_fetch_error_code(&error.into()).into())
+                });
 
                 responses.push(response);
             }
@@ -2568,8 +2577,11 @@ where
         {
             Ok(body) => (self, body),
             Err(error) => {
-                debug!(?error);
-                todo!()
+                warn!(group_id, ?topics, ?error);
+                (
+                    self,
+                    offset_fetch_error_response(topics, groups, offset_fetch_error_code(&error)),
+                )
             }
         }
     }
@@ -3159,8 +3171,11 @@ where
         {
             Ok(body) => (self, body),
             Err(error) => {
-                debug!(?error);
-                todo!()
+                warn!(group_id, ?topics, ?error);
+                (
+                    self,
+                    offset_fetch_error_response(topics, groups, offset_fetch_error_code(&error)),
+                )
             }
         }
     }
@@ -3194,6 +3209,74 @@ fn offset_commit_response(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> B
                                 })
                                 .collect()
                         }))
+                })
+                .collect()
+        }))
+        .into()
+}
+
+/// Returns the error code that an `OffsetFetch` reports when storage fails
+/// with `error`.
+///
+/// A storage error that carries a code, such as an offset that storage can't
+/// decode, keeps that code. Any other storage error is transient, so the
+/// response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
+/// [retry](https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L1460-L1464).
+fn offset_fetch_error_code(error: &Error) -> ErrorCode {
+    match error {
+        Error::Storage(nisshi_storage::Error::Api(error_code)) => *error_code,
+        _ => ErrorCode::CoordinatorNotAvailable,
+    }
+}
+
+/// Returns an `OffsetFetch` response that reports `error_code` for every
+/// requested partition and group.
+///
+/// Each version reads the error from a different field: version 0 and 1 from
+/// each partition, versions 2 to 7 from the top level, and version 8 onward
+/// from each group. The response sets all of them, and the encoder writes only
+/// the fields of the negotiated version.
+fn offset_fetch_error_response(
+    topics: Option<&[OffsetFetchRequestTopic]>,
+    groups: Option<&[OffsetFetchRequestGroup]>,
+    error_code: ErrorCode,
+) -> Body {
+    OffsetFetchResponse::default()
+        .throttle_time_ms(Some(0))
+        .topics(topics.map(|topics| {
+            topics
+                .iter()
+                .map(|topic| {
+                    OffsetFetchResponseTopic::default()
+                        .name(topic.name.clone())
+                        .partitions(Some(
+                            topic
+                                .partition_indexes
+                                .as_deref()
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|partition_index| {
+                                    OffsetFetchResponsePartition::default()
+                                        .partition_index(*partition_index)
+                                        .committed_offset(-1)
+                                        .committed_leader_epoch(Some(-1))
+                                        .metadata(Some("".into()))
+                                        .error_code(error_code.into())
+                                })
+                                .collect(),
+                        ))
+                })
+                .collect()
+        }))
+        .error_code(Some(error_code.into()))
+        .groups(groups.map(|groups| {
+            groups
+                .iter()
+                .map(|group| {
+                    OffsetFetchResponseGroup::default()
+                        .group_id(group.group_id.clone())
+                        .topics(Some([].into()))
+                        .error_code(error_code.into())
                 })
                 .collect()
         }))

@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An OffsetFetch whose storage fails no longer panics the connection. The
+  response reports `COORDINATOR_NOT_AVAILABLE`, which clients retry, for a
+  transient failure, or the storage's own error code. From version 8 each
+  group reports its own error, and the other groups still get their offsets.
 - A Snappy batch with a truncated xerial header is rejected with an error
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,

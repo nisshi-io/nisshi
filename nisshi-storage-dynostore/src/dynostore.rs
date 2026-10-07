@@ -1415,8 +1415,7 @@ impl Storage for DynoStore {
                 .await
                 .inspect(|meta| debug!(?meta))
                 .transpose()
-                .inspect_err(|error| error!(?error))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .inspect_err(|error| error!(?error))?
             {
                 debug!(?meta);
                 let Some(topic): Option<String> = meta
@@ -1465,24 +1464,27 @@ impl Storage for DynoStore {
                     self.cluster, group_id, topition.topic, topition.partition,
                 ));
 
+                // An object store failure may clear on a retry, so it stays a
+                // plain error. An offset that doesn't decode won't, so it is
+                // UNKNOWN_SERVER_ERROR.
                 let offset = match self.object_store.get(&location).await {
-                    Ok(get_result) => get_result
-                        .bytes()
-                        .await
-                        .map_err(Error::from)
-                        .and_then(|encoded| {
-                            serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
-                                .map_err(Error::from)
-                        })
-                        .map(|commit| commit.offset)
-                        .inspect_err(|error| error!(?error, ?group_id, ?topition))
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError)),
+                    Ok(get_result) => {
+                        let encoded = get_result
+                            .bytes()
+                            .await
+                            .inspect_err(|error| error!(?error, ?group_id, ?topition))?;
+
+                        serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
+                            .map(|commit| commit.offset)
+                            .inspect_err(|error| error!(?error, ?group_id, ?topition))
+                            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                    }
 
                     Err(object_store::Error::NotFound { .. }) => Ok(-1),
 
                     Err(error) => {
                         error!(?error, ?group_id, ?topition);
-                        Err(Error::Api(ErrorCode::UnknownServerError))
+                        Err(Error::from(error))
                     }
                 }?;
 
