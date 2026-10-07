@@ -2744,8 +2744,20 @@ impl Storage for DynoStore {
 
     #[instrument(skip_all)]
     async fn ping(&self) -> Result<()> {
-        // Verify connectivity by listing objects at the root
-        let _ = self.object_store.list(Some(&Path::from("/"))).next().await;
+        // A `list()` failure here means storage is unusable (no usable
+        // credentials, an unreachable endpoint, a missing bucket), so we
+        // return it and the broker fails to start, instead of failing later
+        // on its first real request.
+        //
+        // We list the cluster's prefix and not the bucket root, because the
+        // broker reads only under that prefix. A policy can allow
+        // `s3:ListBucket` only for that prefix in a shared bucket.
+        let _ = self
+            .object_store
+            .list(Some(&Path::from(format!("clusters/{}/", self.cluster))))
+            .next()
+            .await
+            .transpose()?;
         Ok(())
     }
 }

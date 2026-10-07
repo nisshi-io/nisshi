@@ -605,7 +605,9 @@ jobs:
           path: initdb
       - run: ls -lR
       - run: cp -v initdb/etc/initdb.d/010-schema.sql integration/etc/initdb.d
-      - run: docker compose --ansi never --progress plain up --no-color --quiet-pull --detach
+      # nisshi exits at startup when it cannot list its bucket, so minio and
+      # the bucket must exist before the full stack starts.
+      - run: docker compose --ansi never --progress plain up --no-color --quiet-pull --detach minio
         working-directory: integration
         env:
           NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
@@ -618,6 +620,10 @@ jobs:
         env:
           NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
       - run: docker compose --ansi never exec minio /usr/bin/mc mb local/nisshi
+        working-directory: integration
+        env:
+          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
+      - run: docker compose --ansi never --progress plain up --no-color --quiet-pull --detach
         working-directory: integration
         env:
           NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
