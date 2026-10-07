@@ -198,10 +198,26 @@ zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }
 zstd = "0.14.0"
 
+# Line tables keep file:line in workspace backtraces; full debug info costs
+# disk and link time. Build with `--profile debugging` for a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
 
 [profile.profiling]
 inherits = "release"
+debug = true
+
+# Full debug info for every crate, built into target/debugging.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
 debug = true
