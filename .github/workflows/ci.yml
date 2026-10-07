@@ -136,7 +136,7 @@ jobs:
         if: always()
       - run: tar --create --verbose --gzip --file=logs-${{env.PG_IMAGE_DASH}}.tar.gz logs
         if: always()
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: logs-${{env.PG_IMAGE_DASH}}.tar.gz
@@ -280,7 +280,7 @@ jobs:
       - run: just compat-infra-up
       - run: just compat-librdkafka '${{matrix.storage.engine}}' '${{matrix.storage.features}}'
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: compat-librdkafka-results-${{matrix.storage.name}}
           path: ${{env.RESULTS_FILE}}
@@ -299,7 +299,7 @@ jobs:
             .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
           path: reports
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: compat-librdkafka-results-*
           path: results
@@ -353,7 +353,7 @@ jobs:
       - run: just compat-infra-up
       - run: just compat-franz-go '${{matrix.storage.engine}}' '${{matrix.storage.features}}'
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: compat-franz-go-results-${{matrix.storage.name}}
           path: ${{env.RESULTS_FILE}}
@@ -372,7 +372,7 @@ jobs:
             .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
           path: reports
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: compat-franz-go-results-*
           path: results
@@ -436,7 +436,7 @@ jobs:
         with:
           tool: cargo-about@0.8.4
       - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: third-party-license
           path: THIRD-PARTY-LICENSE.html
@@ -449,7 +449,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: |
           git archive --format=tar.gz HEAD >${{runner.temp}}/src.tar.gz
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: src
           path: ${{runner.temp}}/src.tar.gz
@@ -469,7 +469,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # release's static musl binaries, as dist/linux/<arch>/nisshi.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: image-*
           merge-multiple: true
@@ -635,7 +635,7 @@ jobs:
           cache-key: ${{ matrix.target }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustc -vV
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -666,7 +666,7 @@ jobs:
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       - if: ${{github.ref_type != 'tag'}}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nisshi-${{matrix.target}}
           path: nisshi-${{matrix.target}}.tar.gz
@@ -684,7 +684,7 @@ jobs:
           mkdir -p dist/"${PLATFORM}"
           cp target/"${TARGET}"/release/nisshi dist/"${PLATFORM}"/nisshi
       - if: ${{runner.os == 'Linux'}}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-${{matrix.target}}
           path: dist/
