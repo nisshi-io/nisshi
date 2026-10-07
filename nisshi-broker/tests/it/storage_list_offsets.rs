@@ -95,7 +95,7 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let partitions = topics[0].partitions.as_deref().unwrap_or_default();
     assert_eq!(1, partitions.len());
     assert_eq!(0, partitions[0].partition_index);
-    assert!(partitions[0].old_style_offsets.is_none());
+    assert_eq!(Some(vec![0]), partitions[0].old_style_offsets);
     assert_eq!(
         ErrorCode::None,
         ErrorCode::try_from(partitions[0].error_code)?

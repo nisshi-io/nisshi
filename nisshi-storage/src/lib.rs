@@ -204,11 +204,11 @@ pub use service::{
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
     DescribeUserScramCredentialsService, FetchService, FindCoordinatorService,
-    GetTelemetrySubscriptionsService, IncrementalAlterConfigsService, InitProducerIdService,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, bounded_channel,
+    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MetadataService, ProduceService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService, bounded_channel,
 };
 
 #[cfg(feature = "dynostore")]
@@ -323,6 +323,9 @@ pub enum Error {
     UnknownCacheKey(String),
 
     UnsupportedStorageUrl(Url),
+    /// The v4+ (multi-transaction) field shape of `AddPartitionsToTxn` is not implemented on
+    /// this backend.
+    UnsupportedTxnAddPartitionsVersion,
     UnexpectedAddPartitionsToTxnRequest(Box<AddPartitionsToTxnRequest>),
     Url(#[from] url::ParseError),
     UnknownTxnState(String),

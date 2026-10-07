@@ -21,7 +21,6 @@ use std::{
 
 use nisshi_sans_io::{
     ApiKey as _, Body, ErrorCode, Frame, FrameInput, Header, HeartbeatResponse, MetadataResponse,
-    RootMessageMeta,
     consumer::{DynConsumerAssignment, GroupConsumer, MemberAssignment},
 };
 use rama::{Layer, Service, extensions::Extensions};
@@ -194,11 +193,7 @@ where
             })
             .map(|body| {
                 let api_key = body.api_key();
-                let api_version = RootMessageMeta::messages()
-                    .requests()
-                    .get(&api_key)
-                    .map(|message_meta| message_meta.version.valid().end)
-                    .unwrap_or_default();
+                let api_version = crate::routable_max_version(api_key).unwrap_or_default();
 
                 Frame {
                     size: 0,

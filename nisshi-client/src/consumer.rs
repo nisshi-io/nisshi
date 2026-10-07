@@ -18,9 +18,10 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    Frame, FrameInput, Header, MetadataResponse, RootMessageMeta,
+    Frame, FrameInput, Header, MetadataResponse,
     consumer::{GroupConsumer, MemberAssignment},
 };
+use nisshi_service::routable_max_version;
 use rama::{Layer, Service, extensions::Extensions};
 use tracing::debug;
 
@@ -108,11 +109,7 @@ where
                 })
                 .map(|next_action| {
                     let api_key = next_action.api_key();
-                    let api_version = RootMessageMeta::messages()
-                        .requests()
-                        .get(&api_key)
-                        .map(|message_meta| message_meta.version.valid().end)
-                        .unwrap_or_default();
+                    let api_version = routable_max_version(api_key).unwrap_or_default();
 
                     FrameInput {
                         frame: Frame {

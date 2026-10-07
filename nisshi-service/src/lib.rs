@@ -230,7 +230,7 @@
 use std::{
     fmt, io,
     net::SocketAddr,
-    ops::Range,
+    ops::{Range, RangeInclusive},
     sync::{Arc, LazyLock, Mutex, PoisonError},
     time::{Duration, SystemTime},
 };
@@ -254,8 +254,13 @@ mod consumer;
 mod frame;
 mod input;
 mod stream;
+mod version_gate;
 
 pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
+
+pub use version_gate::{
+    CAPPED_API_VERSIONS, VersionGateLayer, VersionGateService, capped_range, routable_max_version,
+};
 
 pub use input::TcpListenerInput;
 
@@ -297,6 +302,14 @@ impl AsRef<ProgressBar> for ProgressBarExtension {
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     Auth(#[from] nisshi_auth::Error),
+    /// An entry in [`CAPPED_API_VERSIONS`] is not a subset of `protocol`, the Kafka protocol's
+    /// own valid range for `api_key` (`None` when this build has no protocol metadata for
+    /// `api_key`).
+    CapRangeExceedsProtocolRange {
+        api_key: i16,
+        declared: RangeInclusive<i16>,
+        protocol: Option<RangeInclusive<i16>>,
+    },
     DuplicateRoute(i16),
     FrameTooBig(usize),
     InvalidFrameLength(i32),
@@ -314,6 +327,9 @@ pub enum Error {
     Parse(#[from] url::ParseError),
     Protocol(#[from] nisshi_sans_io::Error),
     UnableToSend(Box<Frame>),
+    /// [`FrameRouteBuilder::with_capped_route`] registered an `api_key` that
+    /// [`CAPPED_API_VERSIONS`] does not cap.
+    UncappedApi(i16),
     UnknownHost(Url),
     UnknownServiceBody(Box<Body>),
     UnknownServiceFrame(Box<Frame>),

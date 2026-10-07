@@ -22,10 +22,13 @@ use rama::{Service, extensions::Extensions, service::BoxService};
 
 use crate::Error;
 
-/// An [`ApiVersionsResponse`] [`Service`] with a supported set of API and versions from [`RootMessageMeta`].
+/// An [`ApiVersionsResponse`] [`Service`] with a supported set of API and versions from
+/// [`RootMessageMeta`], narrowed by `capped` for a route registered through
+/// [`FrameRouteBuilder::with_capped_route`].
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ApiVersionsService<E> {
     supported: Vec<i16>,
+    capped: BTreeMap<i16, (i16, i16)>,
     error: PhantomData<E>,
 }
 
@@ -52,11 +55,17 @@ where
                         .requests()
                         .iter()
                         .filter(|(api_key, _)| self.supported.contains(api_key))
-                        .map(|(_, meta)| {
+                        .map(|(api_key, meta)| {
+                            let (min_version, max_version) = self
+                                .capped
+                                .get(api_key)
+                                .copied()
+                                .unwrap_or((meta.version.valid.start, meta.version.valid.end));
+
                             ApiVersion::default()
                                 .api_key(meta.api_key)
-                                .min_version(meta.version.valid.start)
-                                .max_version(meta.version.valid.end)
+                                .min_version(min_version)
+                                .max_version(max_version)
                         })
                         .collect(),
                 ))
@@ -159,6 +168,38 @@ where
     pub fn builder() -> FrameRouteBuilder<E> {
         FrameRouteBuilder::<E>::new()
     }
+
+    /// The number of routes registered, including the `ApiVersions` route `build` always adds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Whether no routes are registered. `build` always adds an `ApiVersions` route, so this is
+    /// only ever true for a [`FrameRouteService`] built some other way.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// The API key of every registered route.
+    pub fn api_keys(&self) -> impl Iterator<Item = i16> + '_ {
+        self.routes.keys().copied()
+    }
+}
+
+/// Whether `api_version` falls inside the Kafka protocol's own declared range for `api_key`,
+/// per [`RootMessageMeta`].
+///
+/// [`FrameRouteService`] closes the connection for a version outside this range instead of
+/// passing the frame to a handler, because the handler's request type has no wire shape for
+/// that version. `BytesFrameService` answers an `ApiVersions` request outside this range
+/// itself, before it decodes the body.
+pub(crate) fn is_within_protocol_range(api_key: i16, api_version: i16) -> bool {
+    RootMessageMeta::messages()
+        .requests()
+        .get(&api_key)
+        .is_some_and(|meta| meta.version.valid.within(api_version))
 }
 
 impl<E> Service<FrameInput> for FrameRouteService<E>
@@ -171,11 +212,20 @@ where
     async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
         let api_key = req.frame.api_key()?;
 
-        if let Some(service) = self.routes.get(&api_key) {
-            service.serve(req).await
-        } else {
-            Err(E::from(Error::UnknownServiceFrame(Box::new(req.frame))))
+        let Some(service) = self.routes.get(&api_key) else {
+            return Err(E::from(Error::UnknownServiceFrame(Box::new(req.frame))));
+        };
+
+        let api_version = req.frame.api_version()?;
+
+        if is_within_protocol_range(api_key, api_version) {
+            return service.serve(req).await;
         }
+
+        Err(E::from(nisshi_sans_io::Error::UnsupportedVersion {
+            api_key,
+            api_version,
+        }))
     }
 }
 
@@ -192,16 +242,25 @@ where
     async fn serve(&self, req: Frame) -> Result<Self::Output, Self::Error> {
         let api_key = req.api_key()?;
 
-        if let Some(service) = self.routes.get(&api_key) {
-            service
-                .serve(FrameInput {
-                    frame: req,
-                    extensions: Extensions::default(),
-                })
-                .await
-        } else {
-            Err(E::from(Error::UnknownServiceFrame(Box::new(req))))
+        let Some(service) = self.routes.get(&api_key) else {
+            return Err(E::from(Error::UnknownServiceFrame(Box::new(req))));
+        };
+
+        let api_version = req.api_version()?;
+
+        let req = FrameInput {
+            frame: req,
+            extensions: Extensions::default(),
+        };
+
+        if is_within_protocol_range(api_key, api_version) {
+            return service.serve(req).await;
         }
+
+        Err(E::from(nisshi_sans_io::Error::UnsupportedVersion {
+            api_key,
+            api_version,
+        }))
     }
 }
 
@@ -209,6 +268,7 @@ where
 #[derive(Debug)]
 pub struct FrameRouteBuilder<E> {
     routes: BTreeMap<i16, BoxService<FrameInput, Frame, E>>,
+    capped: BTreeMap<i16, (i16, i16)>,
 }
 
 impl<E> FrameRouteBuilder<E>
@@ -218,7 +278,23 @@ where
     fn new() -> Self {
         Self {
             routes: BTreeMap::new(),
+            capped: BTreeMap::new(),
         }
+    }
+
+    /// Records that `api_key`'s route advertises `(min_version, max_version)` in
+    /// [`ApiVersionsResponse`] rather than the protocol's own range for it, for
+    /// [`FrameRouteBuilder::with_capped_route`] to call: a client negotiates against what
+    /// `ApiVersions` advertises, so a capped route's handler must never reject a version
+    /// `ApiVersions` itself told the client was fine to send.
+    pub(crate) fn with_capped_range(
+        mut self,
+        api_key: i16,
+        min_version: i16,
+        max_version: i16,
+    ) -> Self {
+        _ = self.capped.insert(api_key, (min_version, max_version));
+        self
     }
 
     pub fn with_service<S>(self, service: S) -> Result<Self, Error>
@@ -238,15 +314,34 @@ where
             .map_or(Ok(self), |_existing| Err(Error::DuplicateRoute(api_key)))
     }
 
+    /// The number of routes registered so far (`build` has not yet added `ApiVersions`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Whether no routes have been registered yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// The API key of every route registered so far.
+    pub fn api_keys(&self) -> impl Iterator<Item = i16> + '_ {
+        self.routes.keys().copied()
+    }
+
     pub fn build(self) -> Result<FrameRouteService<E>, Error> {
         let api_key = ApiVersionsRequest::KEY;
         let mut supported = self.routes.keys().copied().collect::<Vec<_>>();
         supported.push(api_key);
+        let capped = self.capped.clone();
 
         self.with_route(
             api_key,
             ApiVersionsService {
                 supported,
+                capped,
                 error: PhantomData,
             }
             .boxed(),
@@ -254,5 +349,123 @@ where
         .map(|builder| FrameRouteService {
             routes: Arc::new(builder.routes),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nisshi_sans_io::{ApiVersionsRequest, ProduceRequest};
+
+    use super::*;
+
+    // A client negotiates a version from what `ApiVersions` advertises, so a capped route
+    // advertises its cap, not the protocol's wider range, or the client picks a version that
+    // `VersionGateLayer` rejects.
+    #[tokio::test]
+    async fn api_versions_response_uses_capped_range_for_a_capped_api() {
+        let service = ApiVersionsService::<Error> {
+            supported: vec![ProduceRequest::KEY],
+            capped: BTreeMap::from([(ProduceRequest::KEY, (3, 11))]),
+            error: PhantomData,
+        };
+
+        let response = service
+            .serve(RequestInput {
+                request: ApiVersionsRequest::default(),
+                extensions: Extensions::default(),
+            })
+            .await
+            .expect("ApiVersionsService::serve is infallible here");
+
+        let produce = response
+            .api_keys
+            .unwrap_or_default()
+            .into_iter()
+            .find(|version| version.api_key == ProduceRequest::KEY)
+            .expect("Produce is in the supported list");
+
+        assert_eq!(3, produce.min_version);
+        assert_eq!(11, produce.max_version);
+    }
+
+    // Produce's own protocol range is 0-11.
+    #[test]
+    fn version_within_protocol_range_is_accepted() {
+        assert!(is_within_protocol_range(ProduceRequest::KEY, 11));
+    }
+
+    #[test]
+    fn version_outside_protocol_range_is_rejected() {
+        assert!(!is_within_protocol_range(ProduceRequest::KEY, 12));
+    }
+
+    #[test]
+    fn unknown_api_key_is_rejected() {
+        assert!(!is_within_protocol_range(i16::MAX, 0));
+    }
+
+    fn api_versions_frame(api_version: i16) -> Frame {
+        Frame {
+            size: 0,
+            header: Header::Request {
+                api_key: ApiVersionsRequest::KEY,
+                api_version,
+                correlation_id: 0,
+                client_id: None,
+            },
+            body: ApiVersionsRequest::default().into(),
+        }
+    }
+
+    fn assert_unsupported_version(result: Result<Frame, Error>, expected_version: i16) {
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(nisshi_sans_io::Error::UnsupportedVersion {
+                api_key,
+                api_version,
+            })) if api_key == ApiVersionsRequest::KEY && api_version == expected_version
+        ));
+    }
+
+    // The `ApiVersions` route answers any request it is given, so a frame outside the protocol
+    // range (0-4) reaches the handler only if the backstop lets it through.
+    #[tokio::test]
+    async fn frame_input_outside_protocol_range_is_rejected() {
+        let frame_route = FrameRouteService::<Error>::builder()
+            .build()
+            .expect("a route table with only the ApiVersions route");
+
+        assert_unsupported_version(
+            frame_route
+                .serve(FrameInput {
+                    frame: api_versions_frame(9),
+                    extensions: Extensions::default(),
+                })
+                .await,
+            9,
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_outside_protocol_range_is_rejected() {
+        let frame_route = FrameRouteService::<Error>::builder()
+            .build()
+            .expect("a route table with only the ApiVersions route");
+
+        assert_unsupported_version(frame_route.serve(api_versions_frame(9)).await, 9);
+    }
+
+    #[tokio::test]
+    async fn frame_within_protocol_range_is_routed() {
+        let frame_route = FrameRouteService::<Error>::builder()
+            .build()
+            .expect("a route table with only the ApiVersions route");
+
+        let response = frame_route
+            .serve(api_versions_frame(4))
+            .await
+            .expect("v4 is within the ApiVersions protocol range");
+
+        assert!(ApiVersionsResponse::try_from(response.body).is_ok());
     }
 }
