@@ -20,6 +20,11 @@
 -- watermark.high - 1, so a record below watermark.low can remain. The query
 -- answers with the first record at or above watermark.low, or with
 -- watermark.low and no timestamp when none remains.
+--
+-- The first branch takes its own limit 1 so it stays one probe of the
+-- record primary key. With only the outer limit, the constant o hides the
+-- index order and the engine can read every record at or above
+-- watermark.low before choosing one.
 
 select offset_id, timestamp
 
@@ -27,7 +32,13 @@ from
 
 (select
 
-1 as o, r.offset_id, r.timestamp
+1 as o, offset_id, timestamp
+
+from
+
+(select
+
+r.offset_id, r.timestamp
 
 from
 
@@ -44,7 +55,10 @@ and t.name = $2
 and tp.partition = $3
 and r.offset_id >= coalesce(w.low, 0)
 
-union
+order by r.offset_id asc
+limit 1) first_record
+
+union all
 
 select
 
@@ -65,4 +79,4 @@ and tp.partition = $3
 and w.low is not null
 
 order by o, offset_id asc
-limit 1);
+limit 1) earliest;
