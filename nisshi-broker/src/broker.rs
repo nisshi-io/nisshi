@@ -34,10 +34,11 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    io::ErrorKind,
+    io::{self, ErrorKind},
     marker::PhantomData,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -66,7 +67,7 @@ pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// EOF and reset. Anything else is a client that spoke but could not
 /// negotiate: almost always a plaintext client or one that does not trust
 /// the broker certificate, so the warning says so.
-fn handshake_failed(addr: SocketAddr, err: &std::io::Error) {
+fn handshake_failed(addr: SocketAddr, err: &io::Error) {
     match err.kind() {
         ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
             debug!(%addr, ?err, "peer closed during tls handshake");
@@ -80,6 +81,78 @@ fn handshake_failed(addr: SocketAddr, err: &std::io::Error) {
             );
         }
     }
+}
+
+/// Pending-connection backlog passed to `listen(2)`.
+///
+/// `mio`, which `tokio::net::TcpListener::bind` uses, listens with a backlog of 128. This
+/// socket uses a larger queue. The kernel caps the value at `somaxconn`.
+const LISTEN_BACKLOG: i32 = 1024;
+
+/// Builds, binds and arms a listening socket for `addr`, ready for
+/// [`TcpListener::from_std`](tokio::net::TcpListener::from_std).
+fn configure_listener(addr: SocketAddr) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    arm(socket, addr)
+}
+
+/// Binds `socket` to `addr`, listens, and makes it non-blocking.
+///
+/// macOS and Linux both default a new IPv6 socket to dual-stack (it also accepts
+/// IPv4-mapped connections), but that default is a tunable OS setting
+/// (`net.inet6.ip6.v6only` on macOS, `bindv6only` on Linux) a host can override. Clearing
+/// `IPV6_V6ONLY` here removes the dependency on that tuning, so an IPv6 `addr` always
+/// binds dual-stack. Setting `IPV6_V6ONLY` on an IPv4 socket fails, so this is skipped for
+/// an IPv4 `addr`.
+fn arm(socket: Socket, addr: SocketAddr) -> io::Result<Socket> {
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+
+    // `TcpListener::bind` sets this on Unix by default; a bare `socket2::Socket` does not,
+    // so a restart while a prior connection is in `TIME_WAIT` would otherwise fail with
+    // `EADDRINUSE`.
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+
+    // `tokio::net::TcpListener::from_std` requires a non-blocking, already-listening
+    // socket.
+    socket.set_nonblocking(true)?;
+
+    Ok(socket)
+}
+
+/// Returns `true` when `err` means the host does not support the address family of the
+/// socket, for example IPv6 on a kernel booted with `ipv6.disable=1`.
+fn is_address_family_unsupported(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EAFNOSUPPORT)
+}
+
+/// Returns the IPv4 address to bind after binding `addr` failed with `err`, or `None` when
+/// the failure stands.
+///
+/// Only the IPv6 unspecified address falls back, to `0.0.0.0` on the same port, and only
+/// when the host does not support IPv6. Apache Kafka's listener with a blank host does the
+/// same, because the JDK binds it to `0.0.0.0` on such a host. An explicit IPv6 address
+/// does not fall back, because the operator asked for that address.
+fn ipv4_fallback(addr: SocketAddr, err: &io::Error) -> Option<SocketAddr> {
+    (addr.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED) && is_address_family_unsupported(err))
+        .then(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, addr.port())))
+}
+
+/// Binds a listening, non-blocking, standard-library socket for `addr`, falling back to
+/// IPv4 as [`ipv4_fallback`] decides.
+fn bind_listener(addr: SocketAddr) -> io::Result<StdTcpListener> {
+    configure_listener(addr)
+        .or_else(|err| match ipv4_fallback(addr, &err) {
+            Some(fallback) => {
+                warn!(%addr, %fallback, ?err, "IPv6 is unavailable on this host, listening on IPv4 only");
+                configure_listener(fallback)
+            }
+            None => Err(err),
+        })
+        .map(StdTcpListener::from)
 }
 
 #[derive(Clone, Debug)]
@@ -270,7 +343,7 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
-        let listener = TcpListener::bind(self.listener.host().map_or_else(
+        let addr = self.listener.host().map_or_else(
             || {
                 SocketAddr::from((
                     IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -288,10 +361,24 @@ where
                     url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
                 }
             },
-        ))
-        .await
-        .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
-        .inspect_err(|err| error!(?err, %self.advertised_listener))?;
+        );
+
+        let listener = bind_listener(addr)
+            .and_then(TcpListener::from_std)
+            .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
+            .inspect_err(|err| {
+                if is_address_family_unsupported(err) {
+                    error!(
+                        ?err,
+                        %addr,
+                        "this host does not support the address family of \
+                         --kafka-listener-url (LISTENER_URL), set it to an address this host \
+                         supports, such as tcp://0.0.0.0:9092"
+                    );
+                } else {
+                    error!(?err, %addr, %self.advertised_listener, "failed to bind the listener");
+                }
+            })?;
 
         let mut interval =
             time::interval(self.maintenance_interval.unwrap_or(Duration::from_mins(10)));
@@ -864,5 +951,115 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             cancellation: self.cancellation,
             meter_provider,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{arm, configure_listener, ipv4_fallback};
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::{
+        io,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    };
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// The socket starts out IPv6-only, as on a host that defaults new IPv6 sockets to
+    /// v6-only, so this test fails on any host if [`arm`] stops clearing `IPV6_V6ONLY`.
+    #[tokio::test]
+    async fn dual_stack_listener_accepts_v4_and_v6_clients() {
+        let unspecified = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+            .expect("create IPv6 socket");
+        socket.set_only_v6(true).expect("start out IPv6-only");
+
+        let socket = arm(socket, unspecified).expect("arm dual-stack listener");
+        assert_eq!(
+            Some(false),
+            socket.only_v6().ok(),
+            "IPV6_V6ONLY must be cleared on the dual-stack listener"
+        );
+
+        let port = socket
+            .local_addr()
+            .expect("local_addr")
+            .as_socket()
+            .expect("socket address")
+            .port();
+
+        let listener =
+            TcpListener::from_std(socket.into()).expect("hand the bound socket to tokio");
+
+        _ = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("a dual-stack listener must accept an IPv4 client");
+
+        _ = TcpStream::connect(("::1", port))
+            .await
+            .expect("a dual-stack listener must accept an IPv6 client");
+
+        drop(listener);
+    }
+
+    /// Guards the `if addr.is_ipv6()` gate in [`arm`]: setting `IPV6_V6ONLY` on an IPv4
+    /// socket fails (`EINVAL` on macOS, `ENOPROTOOPT` on Linux), so an IPv4-literal bind
+    /// must skip that call.
+    #[tokio::test]
+    async fn ipv4_literal_listener_accepts_v4_clients() {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+
+        let socket = configure_listener(loopback).expect("configure IPv4-literal listener");
+
+        let port = socket
+            .local_addr()
+            .expect("local_addr")
+            .as_socket()
+            .expect("socket address")
+            .port();
+
+        let listener =
+            TcpListener::from_std(socket.into()).expect("hand the bound socket to tokio");
+
+        _ = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("an IPv4-literal listener must accept an IPv4 client");
+
+        drop(listener);
+    }
+
+    fn os_error(code: i32) -> io::Error {
+        io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn ipv6_unspecified_falls_back_to_ipv4_without_ipv6_support() {
+        let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 9092));
+
+        assert_eq!(
+            Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9092))),
+            ipv4_fallback(addr, &os_error(libc::EAFNOSUPPORT)),
+        );
+    }
+
+    #[test]
+    fn explicit_ipv6_address_does_not_fall_back() {
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 9092));
+
+        assert_eq!(None, ipv4_fallback(addr, &os_error(libc::EAFNOSUPPORT)));
+    }
+
+    #[test]
+    fn other_bind_errors_do_not_fall_back() {
+        let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 9092));
+
+        assert_eq!(None, ipv4_fallback(addr, &os_error(libc::EADDRINUSE)));
+    }
+
+    #[test]
+    fn ipv4_address_does_not_fall_back() {
+        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9092));
+
+        assert_eq!(None, ipv4_fallback(addr, &os_error(libc::EAFNOSUPPORT)));
     }
 }

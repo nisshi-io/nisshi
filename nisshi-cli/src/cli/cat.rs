@@ -131,3 +131,36 @@ impl Command {
         Cat::from(self).main().await.map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    fn broker_default(args: &[&str]) -> url::Url {
+        let Wrapper { command } = temp_env::with_vars_unset(["ADVERTISED_LISTENER_URL"], || {
+            Wrapper::try_parse_from(std::iter::once("cat").chain(args.iter().copied()))
+                .expect("defaults parse")
+        });
+
+        match command {
+            Command::Produce { broker, .. } | Command::Consume { broker, .. } => broker,
+        }
+    }
+
+    /// `cat produce`/`cat consume` share `DEFAULT_BROKER` with the broker's own
+    /// advertised listener, so with no override they resolve to the same IPv4 loopback
+    /// address, not `localhost`.
+    #[test]
+    fn produce_and_consume_broker_defaults_resolve_to_loopback() {
+        for args in [["produce", "test"], ["consume", "test"]] {
+            assert_eq!(Some("127.0.0.1"), broker_default(&args).host_str());
+        }
+    }
+}
