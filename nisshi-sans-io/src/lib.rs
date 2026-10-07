@@ -574,6 +574,16 @@ fn fix_length(mut encoded: BytesMut) -> Result<Bytes> {
     Ok(sz.freeze())
 }
 
+/// Writes `[hidden]` in place of a secret in `Debug` output, as Kafka's
+/// `Password.HIDDEN` does.
+pub(crate) struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[hidden]")
+    }
+}
+
 impl Frame {
     fn elapsed_millis(start: SystemTime) -> u64 {
         start
@@ -600,7 +610,7 @@ impl Frame {
                 .map(BytesMut::with_capacity)?,
         );
         frame.serialize(&mut serializer)?;
-        fix_length(BytesMut::from(serializer)).inspect(|encoded| debug!(encoded = ?&encoded[..]))
+        fix_length(BytesMut::from(serializer)).inspect(|encoded| debug!(len = encoded.len()))
     }
 
     /// deserialize bytes into an API request frame
@@ -636,7 +646,7 @@ impl Frame {
             api_version,
         );
         frame.serialize(&mut encoder)?;
-        fix_length(BytesMut::from(encoder)).inspect(|encoded| debug!(encoded = ?&encoded[..]))
+        fix_length(BytesMut::from(encoder)).inspect(|encoded| debug!(len = encoded.len()))
     }
 
     /// deserialize bytes into an API response frame
@@ -1795,7 +1805,7 @@ impl Compression {
             Compression::Snappy => {
                 let mut input = vec![];
                 _ = deflated.read_to_end(&mut input)?;
-                debug!(?input);
+                debug!(len = input.len());
 
                 // https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
                 let payload = if let Some(framed) = input.strip_prefix(b"\x82SNAPPY\0") {
@@ -1815,7 +1825,7 @@ impl Compression {
                         compatible_version.try_into().map(i32::from_be_bytes)?;
                     let block_size: i32 = block_size.try_into().map(i32::from_be_bytes)?;
 
-                    debug!(version, compatible_version, block_size, ?block);
+                    debug!(version, compatible_version, block_size, len = block.len());
                     block
                 } else {
                     &input[..]
@@ -2783,6 +2793,71 @@ mod tests {
             64,
             i16::from(BatchAttribute::default().delete_horizon(true))
         );
+    }
+
+    #[test]
+    fn mezzanine_debug_hides_sensitive_fields() {
+        let secret = Bytes::from_static(b"\0alice\0hunter2-secret");
+
+        let bodies: [Body; 9] = [
+            AlterConfigsRequest::default()
+                .resources(Some(vec![
+                    alter_configs_request::AlterConfigsResource::default().configs(Some(vec![
+                        alter_configs_request::AlterableConfig::default()
+                            .value(Some("hunter2-secret".into())),
+                    ])),
+                ]))
+                .into(),
+            IncrementalAlterConfigsRequest::default()
+                .resources(Some(vec![
+                    incremental_alter_configs_request::AlterConfigsResource::default().configs(
+                        Some(vec![
+                            incremental_alter_configs_request::AlterableConfig::default()
+                                .value(Some("hunter2-secret".into())),
+                        ]),
+                    ),
+                ]))
+                .into(),
+            SaslAuthenticateRequest::default()
+                .auth_bytes(secret.clone())
+                .into(),
+            SaslAuthenticateResponse::default()
+                .auth_bytes(secret.clone())
+                .into(),
+            AlterUserScramCredentialsRequest::default()
+                .upsertions(Some(vec![
+                    alter_user_scram_credentials_request::ScramCredentialUpsertion::default()
+                        .salted_password(secret.clone()),
+                ]))
+                .into(),
+            CreateDelegationTokenResponse::default()
+                .hmac(secret.clone())
+                .into(),
+            DescribeDelegationTokenResponse::default()
+                .tokens(Some(vec![
+                    describe_delegation_token_response::DescribedDelegationToken::default()
+                        .hmac(secret.clone()),
+                ]))
+                .into(),
+            ExpireDelegationTokenRequest::default()
+                .hmac(secret.clone())
+                .into(),
+            RenewDelegationTokenRequest::default()
+                .hmac(secret.clone())
+                .into(),
+        ];
+
+        for body in bodies {
+            let debug = format!("{:?}", mezzanine::Body::from(body));
+
+            assert!(!debug.contains("hunter2"), "{debug}");
+            assert!(
+                !debug.contains("104, 117, 110, 116, 101, 114, 50"),
+                "{debug}"
+            );
+            assert!(debug.contains("[hidden]"), "{debug}");
+            assert!(debug.contains("tag_buffer"), "{debug}");
+        }
     }
 
     #[test]
