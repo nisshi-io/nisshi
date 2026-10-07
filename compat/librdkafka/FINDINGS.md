@@ -15,11 +15,12 @@ Sweeps of the librdkafka integration test suite against
    that previously could not run.
 
 2. **IncrementalAlterConfigs APPEND/SUBTRACT panicked the broker**
-   *(fixed 2026-06-11)* — `todo!()` in dynostore `alter_topic` panicked
+   *(fixed for dynostore 2026-06-11, for every backend 2026-10-07)* — `todo!()` in dynostore `alter_topic` panicked
    while holding the topics lock, poisoning it: every subsequent request
-   failed with `Poison` until restart (hit by 0011). Now applies
-   comma-separated-list append/subtract semantics. The same `todo!()`
-   remains in the pg, lite and limbo backends.
+   failed with `Poison` until restart (hit by 0011). Every backend now
+   applies Kafka's list semantics, all or nothing per resource, and
+   `IncrementalAlterConfigsService` rejects APPEND/SUBTRACT on a key that
+   isn't a LIST with `INVALID_CONFIG`.
 
 ## Open gaps, most impactful first
 

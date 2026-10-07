@@ -2239,6 +2239,7 @@ impl From<ConfigSource> for i8 {
 }
 
 /// The configuration operation type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpType {
     Set,
     Delete,

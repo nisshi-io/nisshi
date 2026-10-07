@@ -248,6 +248,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/topic_configuration_select.sql"),
         ),
         (
+            "topic_configuration_select_name.sql",
+            include_sql!("sql/topic_configuration_select_name.sql"),
+        ),
+        (
             "topic_configuration_upsert.sql",
             include_sql!("sql/topic_configuration_upsert.sql"),
         ),
@@ -257,6 +261,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         ),
         ("topic_insert.sql", include_sql!("sql/topic_insert.sql")),
         ("topic_select.sql", include_sql!("sql/topic_select.sql")),
+        (
+            "topic_select_name_for_update.sql",
+            include_sql!("sql/topic_select_name_for_update.sql"),
+        ),
         (
             "topic_select_name.sql",
             include_sql!("sql/topic_select_name.sql"),

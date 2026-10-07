@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use nisshi_sans_io::{
-    ApiKey, IncrementalAlterConfigsRequest, IncrementalAlterConfigsResponse, RequestInput,
+    ApiKey, ConfigResource, ErrorCode, IncrementalAlterConfigsRequest,
+    IncrementalAlterConfigsResponse, OpType, RequestInput,
+    incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
 };
 use rama::Service;
-use tracing::instrument;
+use tracing::{debug, instrument, warn};
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, TopicId, config::is_list_config};
 
 /// A [`Service`] using its [`Storage`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
 /// ```no_run
@@ -164,15 +169,205 @@ where
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
+        let validate_only = input.request.validate_only;
+        let resources = input.request.resources.unwrap_or_default();
+
+        let mut occurrences = BTreeMap::new();
+        for resource in &resources {
+            *occurrences
+                .entry((resource.resource_type, resource.resource_name.as_str()))
+                .or_insert(0) += 1;
+        }
+
+        let duplicates: BTreeSet<_> = occurrences
+            .into_iter()
+            .filter_map(|(id, count)| (count > 1).then_some(id))
+            .map(|(resource_type, resource_name)| (resource_type, resource_name.to_owned()))
+            .collect();
 
         let mut responses = vec![];
 
-        for resource in input.request.resources.unwrap_or_default() {
-            responses.push(self.storage.incremental_alter_resource(resource).await?);
+        for resource in resources {
+            let rejection =
+                if duplicates.contains(&(resource.resource_type, resource.resource_name.clone())) {
+                    Some((
+                        ErrorCode::InvalidRequest,
+                        "Each resource must appear at most once.".into(),
+                    ))
+                } else {
+                    validate(&resource)
+                };
+
+            let response = match rejection {
+                Some((error_code, message)) => {
+                    debug!(?resource, ?error_code, message);
+                    resource_response(&resource, error_code, Some(message))
+                }
+
+                None if validate_only => self.validate_existence(&resource).await,
+
+                None => match self
+                    .storage
+                    .incremental_alter_resource(resource.clone())
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(Error::Api(error_code)) => error_response(&resource, error_code),
+                    Err(error) => {
+                        warn!(
+                            resource_type = resource.resource_type,
+                            resource_name = resource.resource_name,
+                            ?error
+                        );
+                        error_response(&resource, ErrorCode::UnknownServerError)
+                    }
+                },
+            };
+
+            responses.push(response);
         }
 
         Ok(IncrementalAlterConfigsResponse::default()
             .throttle_time_ms(0)
             .responses(Some(responses)))
     }
+}
+
+impl<G> IncrementalAlterConfigsService<G>
+where
+    G: Storage,
+{
+    /// Answers a `validate_only` request for `resource` without changing it:
+    /// only a topic that doesn't exist fails.
+    async fn validate_existence(
+        &self,
+        resource: &AlterConfigsResource,
+    ) -> AlterConfigsResourceResponse {
+        if ConfigResource::from(resource.resource_type) != ConfigResource::Topic {
+            return resource_response(resource, ErrorCode::None, None);
+        }
+
+        let error_code = match self
+            .storage
+            .metadata(Some(&[TopicId::Name(resource.resource_name.clone())]))
+            .await
+        {
+            Ok(metadata) => metadata
+                .topics()
+                .first()
+                .map_or(Ok(ErrorCode::UnknownTopicOrPartition), |topic| {
+                    ErrorCode::try_from(topic.error_code)
+                })
+                .unwrap_or(ErrorCode::UnknownServerError),
+
+            Err(error) => {
+                warn!(
+                    resource_type = resource.resource_type,
+                    resource_name = resource.resource_name,
+                    ?error
+                );
+                ErrorCode::UnknownServerError
+            }
+        };
+
+        error_response(resource, error_code)
+    }
+}
+
+/// Returns the error for a `resource` that Kafka rejects before it reads or
+/// changes any configuration, checked in the order of Kafka's
+/// [`ConfigAdminManager.preprocess`](https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L105-L165)
+/// and [`incrementalAlterConfigResource`](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L237).
+fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
+    let configs = resource.configs.as_deref().unwrap_or_default();
+
+    let mut names = BTreeSet::new();
+    if !configs
+        .iter()
+        .all(|config| names.insert(config.name.as_str()))
+    {
+        return Some((
+            ErrorCode::InvalidRequest,
+            "Error due to duplicate config keys".into(),
+        ));
+    }
+
+    let null_updates: Vec<&str> = configs
+        .iter()
+        .filter(|config| {
+            config.config_operation != i8::from(OpType::Delete) && config.value.is_none()
+        })
+        .map(|config| config.name.as_str())
+        .collect();
+
+    if !null_updates.is_empty() {
+        return Some((
+            ErrorCode::InvalidRequest,
+            format!("Null value not supported for : {}", null_updates.join(", ")),
+        ));
+    }
+
+    for config in configs {
+        // Kafka rejects an unknown operation with INVALID_REQUEST only on a
+        // broker resource
+        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L176-L179).
+        // On a topic resource its controller looks the operation up as null
+        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ControllerApis.scala#L745).
+        // We reject an unknown operation with INVALID_REQUEST on every
+        // resource, because the request is malformed whatever the resource.
+        let Ok(op) = OpType::try_from(config.config_operation) else {
+            return Some((
+                ErrorCode::InvalidRequest,
+                format!("Unknown operations type {}", config.config_operation),
+            ));
+        };
+
+        if ConfigResource::from(resource.resource_type) == ConfigResource::Topic
+            && matches!(op, OpType::Append | OpType::Subtract)
+            && !is_list_config(ConfigResource::Topic, &config.name)
+        {
+            let op = if op == OpType::Append {
+                "APPEND"
+            } else {
+                "SUBTRACT"
+            };
+
+            return Some((
+                ErrorCode::InvalidConfig,
+                format!(
+                    "Can't {op} to key {} because its type is not LIST.",
+                    config.name
+                ),
+            ));
+        }
+    }
+
+    None
+}
+
+/// Returns the response for a `resource` that failed with `error_code`, with
+/// the message that Kafka sends for that error, if any.
+fn error_response(
+    resource: &AlterConfigsResource,
+    error_code: ErrorCode,
+) -> AlterConfigsResourceResponse {
+    // Kafka's message for a missing topic:
+    // https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/QuorumController.java#L488-L489
+    let message = (error_code == ErrorCode::UnknownTopicOrPartition
+        && ConfigResource::from(resource.resource_type) == ConfigResource::Topic)
+        .then(|| format!("The topic '{}' does not exist.", resource.resource_name));
+
+    resource_response(resource, error_code, message)
+}
+
+fn resource_response(
+    resource: &AlterConfigsResource,
+    error_code: ErrorCode,
+    error_message: Option<String>,
+) -> AlterConfigsResourceResponse {
+    AlterConfigsResourceResponse::default()
+        .error_code(error_code.into())
+        .error_message(error_message)
+        .resource_type(resource.resource_type)
+        .resource_name(resource.resource_name.clone())
 }

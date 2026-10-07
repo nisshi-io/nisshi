@@ -190,6 +190,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod batch;
+pub mod config;
 mod latency;
 mod proxy;
 mod service;
@@ -1364,6 +1365,22 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid>;
 
     /// Incrementally alter a resource on this storage.
+    ///
+    /// A topic resource applies all of its changes or none of them. Its
+    /// `APPEND` and `SUBTRACT` changes follow [`config::apply_op`].
+    ///
+    /// [`IncrementalAlterConfigsService`] checks each resource the way Kafka
+    /// does before it calls this method. A caller that skips the service gets
+    /// only the checks that `apply_op` makes.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for a topic
+    ///   that doesn't exist;
+    /// - [`Error::Api`] with [`ErrorCode::InvalidConfig`] for `APPEND` or
+    ///   `SUBTRACT` on a key that isn't a list;
+    /// - any other error when storage fails, or when a change has an unknown
+    ///   operation.
     async fn incremental_alter_resource(
         &self,
         resource: AlterConfigsResource,

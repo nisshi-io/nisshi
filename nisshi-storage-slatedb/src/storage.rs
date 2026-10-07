@@ -53,7 +53,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, config::apply_op,
 };
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -77,6 +77,57 @@ const RETENTION_MS: &str = "retention.ms";
 const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl Engine {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let tx = self
+            .db
+            .begin(slatedb::IsolationLevel::SerializableSnapshot)
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
+        let mut topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
+
+        let metadata = topics
+            .get_mut(&resource.resource_name[..])
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))?;
+
+        let mut configuration: BTreeMap<String, Option<String>> = metadata
+            .topic
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| (item.name.clone(), item.value.clone()))
+            .collect();
+
+        for change in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(change.config_operation)?;
+            let current = configuration.get(&change.name).and_then(Option::as_deref);
+
+            match apply_op(
+                ConfigResource::Topic,
+                &change.name,
+                current,
+                op,
+                change.value.as_deref(),
+            )? {
+                Some(value) => _ = configuration.insert(change.name.clone(), Some(value)),
+                None => _ = configuration.remove(&change.name),
+            }
+        }
+
+        _ = metadata.topic.configs.replace(
+            configuration
+                .into_iter()
+                .map(|(key, value)| CreatableTopicConfig::default().name(key).value(value))
+                .collect(),
+        );
+
+        self.save_metadata(&tx, Self::TOPICS, &topics)?;
+        tx.commit().await.map_err(Error::from).and(Ok(()))
+    }
+
     fn topic_config<'a>(metadata: &'a TopicMetadata, name: &str) -> Option<&'a str> {
         metadata
             .topic
@@ -709,58 +760,20 @@ impl Storage for Engine {
     ) -> Result<AlterConfigsResourceResponse> {
         match ConfigResource::from(resource.resource_type) {
             ConfigResource::Topic => {
-                let tx = self
-                    .db
-                    .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                    .await
-                    .inspect_err(|err| debug!(?err))?;
-
-                let mut topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
-
-                if let Some(metadata) = topics.get_mut(&resource.resource_name[..]) {
-                    // Build current config map
-                    let mut configuration: BTreeMap<&str, Option<&str>> = metadata
-                        .topic
-                        .configs
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .fold(BTreeMap::new(), |mut acc, item| {
-                            _ = acc.insert(item.name.as_str(), item.value.as_deref());
-                            acc
-                        });
-
-                    // Apply changes
-                    for change in resource.configs.as_deref().unwrap_or_default() {
-                        match OpType::try_from(change.config_operation)? {
-                            OpType::Set => {
-                                _ = configuration
-                                    .insert(change.name.as_str(), change.value.as_deref());
-                            }
-                            OpType::Delete => {
-                                _ = configuration.remove(change.name.as_str());
-                            }
-                            OpType::Append | OpType::Subtract => {
-                                // Not implemented yet
-                                debug!("Append/Subtract operations not implemented");
-                            }
+                // Every alter, create and delete of a topic rewrites the one
+                // TOPICS key, so concurrent writers conflict at commit. Each
+                // conflict means another transaction committed, so a retry
+                // makes progress.
+                loop {
+                    match self.alter_topic(&resource).await {
+                        Err(Error::Slate(error))
+                            if error.kind() == slatedb::ErrorKind::Transaction =>
+                        {
+                            debug!(?error, resource = resource.resource_name);
                         }
+
+                        otherwise => break otherwise?,
                     }
-
-                    // Convert back to configs vec
-                    _ = metadata.topic.configs.replace(
-                        configuration
-                            .into_iter()
-                            .map(|(key, value)| {
-                                CreatableTopicConfig::default()
-                                    .name(key.to_owned())
-                                    .value(value.map(|v| v.to_owned()))
-                            })
-                            .collect(),
-                    );
-
-                    self.save_metadata(&tx, Self::TOPICS, &topics)?;
-                    _ = tx.commit().await.map_err(Error::from)?;
                 }
 
                 Ok(AlterConfigsResourceResponse::default()
