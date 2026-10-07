@@ -35,3 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking the decoder.
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
+- `DeleteRecords` is implemented on the libSQL, Turso and DynoStore storage
+  engines instead of panicking the connection task, and the PostgreSQL
+  implementation no longer fails at SQL-prepare time (it referenced columns
+  that don't exist in the current schema). All five storage engines
+  (PostgreSQL, libSQL, Turso, DynoStore, SlateDB) now validate the requested
+  offset identically: `-1` deletes up to the high watermark, an offset above
+  the high watermark or any other negative offset is rejected with
+  `OFFSET_OUT_OF_RANGE`, and an offset at or below the current log start is a
+  no-op. The record or batch holding the last committed offset is never
+  physically removed, even when deleting everything, so `ListOffsets(Latest)`
+  is unaffected by a `DeleteRecords` call. `ListOffsets(Earliest)` answers
+  the new log start on every storage engine. An unknown topic or an
+  out-of-range partition is reported per-partition and never fails a sibling
+  partition in the same request, and a partition that fails reports a low
+  watermark of `-1`, as Kafka does. On PostgreSQL each partition's log start
+  commits on its own, and removing the records below it follows as a separate
+  best-effort step: if that step fails or times out, the records stay below
+  the log start until the next storage maintenance run removes them.

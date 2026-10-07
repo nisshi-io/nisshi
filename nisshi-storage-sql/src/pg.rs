@@ -62,10 +62,11 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, delete_records_cutoff,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -77,7 +78,7 @@ use tokio_postgres::{
     error::SqlState,
     types::{BorrowToSql, ToSql, Type},
 };
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -430,6 +431,94 @@ impl Postgres {
         } else {
             Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
         }
+    }
+
+    /// Advances one partition's log start for DeleteRecords, answering the
+    /// error code and new low watermark.
+    ///
+    /// The watermark advance is the delete: it commits first, in a short
+    /// transaction that holds the watermark row lock. Removing the records
+    /// below it follows in a separate transaction under the default statement
+    /// timeout. That removal is best effort: a failure is logged, and
+    /// `maintain` removes the rows on its next run.
+    async fn delete_records_partition(
+        &self,
+        c: &mut Object,
+        topition: &Topition,
+        offset: i64,
+    ) -> Result<(ErrorCode, i64)> {
+        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+        let (low, high) = self.watermark_select_for_update(topition, &tx).await?;
+
+        let stage = OffsetStage {
+            last_stable: high.unwrap_or_default(),
+            high_watermark: high.unwrap_or_default(),
+            log_start: low.unwrap_or_default(),
+        };
+
+        let cutoff = match delete_records_cutoff(offset, &stage) {
+            Ok(cutoff) => cutoff,
+            Err(error_code) => return Ok((error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)),
+        };
+
+        _ = self
+            .tx_prepare_execute(
+                &tx,
+                "watermark_update.sql",
+                &[
+                    &self.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &cutoff,
+                    &high.unwrap_or_default(),
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        tx.commit().await.inspect_err(|err| error!(?err))?;
+
+        // This keeps the record at `high_watermark - 1`, because
+        // `list_latest_offset_committed.sql` and
+        // `list_latest_offset_uncommitted.sql` answer `Latest` from that
+        // record. A produce only inserts at or above the high watermark, so
+        // these rows need no watermark lock.
+        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
+
+        if cutoff > stage.log_start
+            && let Err(err) = self.record_delete_below(c, topition, physical_cutoff).await
+        {
+            warn!(?err, cluster = ?self.cluster, ?topition, physical_cutoff);
+        }
+
+        Ok((ErrorCode::None, cutoff))
+    }
+
+    async fn record_delete_below(
+        &self,
+        c: &mut Object,
+        topition: &Topition,
+        physical_cutoff: i64,
+    ) -> Result<u64> {
+        let tx = c.transaction().await?;
+
+        let deleted = self
+            .tx_prepare_execute(
+                &tx,
+                "record_delete_by_offset.sql",
+                &[
+                    &self.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &physical_cutoff,
+                ],
+            )
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(deleted)
     }
 
     fn attributes_for_error(
@@ -1729,6 +1818,25 @@ impl Postgres {
         tx.commit().await.map_err(Into::into).and(Ok(deleted))
     }
 
+    /// Removes the records that DeleteRecords left below each partition's log
+    /// start, when its own removal failed or timed out.
+    #[instrument(skip(self), ret)]
+    async fn record_delete_below_log_start(&self) -> Result<u64> {
+        let mut c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        // see policy_compact: exempt this sweep from the default statement_timeout.
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        let deleted = self
+            .tx_prepare_execute(&tx, "record_delete_below_log_start.sql", &[&self.cluster])
+            .await?;
+
+        tx.commit().await.map_err(Into::into).and(Ok(deleted))
+    }
+
     async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {
         if let Some((base, key)) = topic.split_once('/')
             && self
@@ -1925,125 +2033,52 @@ impl Storage for Postgres {
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(cluster = self.cluster, ?topics);
 
-        let c = self.connection().await?;
+        let mut c = self.connection().await?;
+        let mut responses = Vec::with_capacity(topics.len());
 
-        let delete_records = c
-            .prepare(concat!(
-                "delete from record",
-                " using topic, cluster",
-                " where",
-                " cluster.name=$1",
-                " and topic.name = $2",
-                " and record.partition = $3",
-                " and record.id >= $4",
-                " and topic.cluster = cluster.id",
-                " and record.topic = topic.id",
-            ))
-            .await
-            .inspect_err(|err| error!(?err, ?topics))?;
-
-        let mut responses = vec![];
-
+        // Each partition commits on its own, so the request holds at most one
+        // watermark row lock at a time. It cannot then deadlock with EndTxn,
+        // and a produce waits only while its own partition advances.
         for topic in topics {
-            let mut partition_responses = vec![];
+            let mut partitions = Vec::with_capacity(topic.partitions.as_ref().map_or(0, Vec::len));
 
-            if let Some(ref partitions) = topic.partitions {
-                for partition in partitions {
-                    _ = c
-                        .execute(
-                            &delete_records,
-                            &[
-                                &self.cluster,
-                                &topic.name,
-                                &partition.partition_index,
-                                &partition.offset,
-                            ],
-                        )
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
+            for partition in topic.partitions.iter().flatten() {
+                let topition = Topition::new(topic.name.as_str(), partition.partition_index);
 
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })?;
+                let (error_code, low_watermark) = self
+                    .delete_records_partition(&mut c, &topition, partition.offset)
+                    .await
+                    .unwrap_or_else(|err| match err {
+                        Error::Api(error_code) => {
+                            (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                        }
 
-                    let prepared = c
-                        .prepare(concat!(
-                            "select",
-                            " id as offset",
-                            " from",
-                            " record",
-                            " join (",
-                            " select",
-                            " coalesce(min(record.id), (select last_value from record_id_seq)) as offset",
-                            " from record, topic, cluster",
-                            " where",
-                            " topic.cluster = cluster.id",
-                            " and cluster.name = $1",
-                            " and topic.name = $2",
-                            " and record.partition = $3",
-                            " and record.topic = topic.id) as minimum",
-                            " on record.id = minimum.offset",
-                        ))
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
+                        // Retriable, as Kafka answers a storage failure. A retry
+                        // is safe: at or below the log start it changes nothing.
+                        err => {
+                            error!(?err, cluster = ?self.cluster, ?topition);
+                            (
+                                ErrorCode::KafkaStorageError,
+                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                            )
+                        }
+                    });
 
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })?;
-
-                    let partition_result = c
-                        .query_opt(
-                            &prepared,
-                            &[&self.cluster, &topic.name, &partition.partition_index],
-                        )
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
-
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })
-                        .map_or(
-                            Ok(DeleteRecordsPartitionResult::default()
-                                .partition_index(partition.partition_index)
-                                .low_watermark(0)
-                                .error_code(ErrorCode::UnknownServerError.into())),
-                            |row| {
-                                row.map_or(
-                                    Ok(DeleteRecordsPartitionResult::default()
-                                        .partition_index(partition.partition_index)
-                                        .low_watermark(0)
-                                        .error_code(ErrorCode::UnknownServerError.into())),
-                                    |row| {
-                                        row.try_get::<_, i64>(0).map(|low_watermark| {
-                                            DeleteRecordsPartitionResult::default()
-                                                .partition_index(partition.partition_index)
-                                                .low_watermark(low_watermark)
-                                                .error_code(ErrorCode::None.into())
-                                        })
-                                    },
-                                )
-                            },
-                        )?;
-
-                    partition_responses.push(partition_result);
-                }
+                partitions.push(
+                    DeleteRecordsPartitionResult::default()
+                        .partition_index(partition.partition_index)
+                        .low_watermark(low_watermark)
+                        .error_code(error_code.into()),
+                );
             }
 
             responses.push(
                 DeleteRecordsTopicResult::default()
                     .name(topic.name.clone())
-                    .partitions(Some(partition_responses)),
+                    .partitions(Some(partitions)),
             );
         }
+
         Ok(responses)
     }
 
@@ -2757,7 +2792,7 @@ impl Storage for Postgres {
                     debug!(?row);
 
                     row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
-                        row.try_get::<_, SystemTime>(1).map(Some).map(|timestamp| {
+                        row.try_get::<_, Option<SystemTime>>(1).map(|timestamp| {
                             debug!(
                                 cluster = self.cluster,
                                 ?topition,
@@ -3941,6 +3976,12 @@ impl Storage for Postgres {
         let deleted = self.policy_delete(now).await?;
         debug!(deleted);
 
+        // Best effort: a failure here must not stop compaction or the lake.
+        match self.record_delete_below_log_start().await {
+            Ok(below_log_start) => debug!(below_log_start),
+            Err(err) => warn!(?err),
+        }
+
         let compacted = self.policy_compact().await?;
         debug!(compacted);
 
@@ -4307,6 +4348,112 @@ mod tests {
 
         _ = storage.policy_compact().await?;
         _ = storage.policy_delete(SystemTime::now()).await?;
+        _ = storage.record_delete_below_log_start().await?;
+
+        Ok(())
+    }
+
+    /// DeleteRecords commits the new log start before it removes the records
+    /// below it. When that removal fails, `maintain` removes them, and keeps
+    /// the record at `high_watermark - 1` that `Latest` reads.
+    #[tokio::test]
+    async fn maintain_removes_records_left_below_log_start() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintain_removes_records_left_below_log_start: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+        let record_count = 6i64;
+
+        for _ in 0..record_count {
+            let batch = Batch::builder()
+                .record(Record::builder().value(Bytes::from_static(b"r").into()))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = storage.produce(None, &topition, batch).await?;
+        }
+
+        let stored = async || -> Result<i64> {
+            let c = storage.connection().await?;
+            let row = c
+                .query_one(
+                    "select count(*) from record r \
+                     join topition tp on r.topition = tp.id \
+                     join topic t on tp.topic = t.id \
+                     join cluster c on t.cluster = c.id \
+                     where c.name = $1 and t.name = $2",
+                    &[&cluster, &topic_name],
+                )
+                .await?;
+            row.try_get::<_, i64>(0).map_err(Into::into)
+        };
+
+        // the log start advances, as a DeleteRecords whose removal failed leaves it
+        let advance_log_start = async |low: i64| -> Result<()> {
+            let mut c = storage.connection().await?;
+            let tx = c.transaction().await?;
+
+            _ = storage
+                .tx_prepare_execute(
+                    &tx,
+                    "watermark_update.sql",
+                    &[&cluster, &topic_name, &0i32, &low, &record_count],
+                )
+                .await?;
+
+            tx.commit().await.map_err(Into::into)
+        };
+
+        advance_log_start(3).await?;
+        assert_eq!(record_count, stored().await?);
+
+        storage.maintain(SystemTime::now()).await?;
+        assert_eq!(record_count - 3, stored().await?);
+
+        advance_log_start(record_count).await?;
+        storage.maintain(SystemTime::now()).await?;
+        assert_eq!(1, stored().await?);
+
+        let latest = storage
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), ListOffset::Latest)],
+            )
+            .await?;
+
+        assert_eq!(Some(record_count), latest[0].1.offset);
 
         Ok(())
     }

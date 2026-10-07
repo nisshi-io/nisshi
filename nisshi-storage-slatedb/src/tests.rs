@@ -50,6 +50,18 @@ async fn create_test_engine() -> Engine {
     )
 }
 
+/// A single-record batch, built through the encode path, so that it decodes
+/// back to the record it holds.
+fn simple_batch() -> Batch {
+    use nisshi_sans_io::record::{Record, inflated};
+
+    inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from_static(b"value"))))
+        .build()
+        .and_then(Batch::try_from)
+        .unwrap()
+}
+
 // ========== Unique Error Case Tests ==========
 
 #[tokio::test]
@@ -341,22 +353,7 @@ async fn test_delete_records() {
     let topition = Topition::new("delete-records-topic", 0);
 
     // Produce some data
-    let batch = Batch {
-        base_offset: 0,
-        batch_length: 0,
-        partition_leader_epoch: 0,
-        magic: 2,
-        crc: 0,
-        attributes: 0,
-        last_offset_delta: 0,
-        base_timestamp: 1000,
-        max_timestamp: 1000,
-        producer_id: -1,
-        producer_epoch: -1,
-        base_sequence: -1,
-        record_count: 1,
-        record_data: Bytes::new(),
-    };
+    let batch = simple_batch();
 
     for _ in 0..5 {
         let _ = engine
@@ -395,6 +392,101 @@ async fn test_delete_records() {
     // Verify log_start was updated
     let stage = engine.offset_stage(&topition).await.unwrap();
     assert_eq!(3, stage.log_start);
+}
+
+/// `offset == -1` ("delete everything up to the high watermark") must never
+/// physically remove the batch holding `high_watermark - 1`: it's Kafka's
+/// active segment. The public API can't observe this directly -- `Latest`
+/// is read straight from the stored watermark, not by scanning batches, so
+/// every public-API test still passes even with that protection deleted
+/// entirely. This test builds the `Engine` from a `Db` handle it keeps for
+/// itself, so it can scan the batch-key prefix directly afterward and
+/// confirm the one physical object that must survive actually does.
+#[tokio::test]
+async fn test_delete_records_to_high_watermark_keeps_one_physical_batch() {
+    use super::types::{BatchKey, BatchKeyPrefix};
+    use nisshi_sans_io::delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic};
+
+    let object_store = Arc::new(InMemory::new());
+    let db = Arc::new(
+        Db::open("test.slatedb", object_store)
+            .await
+            .expect("Failed to open SlateDB"),
+    );
+
+    let engine = Engine::new(
+        "test-cluster",
+        1,
+        Url::parse("tcp://localhost:9092").unwrap(),
+        db.clone(),
+    );
+
+    let topic = CreatableTopic::default()
+        .name("protect-active-batch-topic".into())
+        .num_partitions(1)
+        .replication_factor(1);
+    let topic_id = engine.create_topic(topic, false).await.unwrap();
+
+    let topition = Topition::new("protect-active-batch-topic", 0);
+
+    // Five single-record batches: offsets 0..=4, each its own physical
+    // batch object (unlike `test_delete_records` above, which only needs
+    // log_start/low_watermark to move, not an exact physical object count).
+    for _ in 0..5 {
+        let batch = simple_batch();
+        let _ = engine.produce(None, &topition, batch).await.unwrap();
+    }
+
+    async fn batch_offsets(db: &Db, topic_id: uuid::Uuid, partition: i32) -> Vec<i64> {
+        let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic_id, partition)).unwrap();
+        let scan_start = postcard::to_stdvec(&BatchKey::scan_from(topic_id, partition, 0)).unwrap();
+
+        let mut scan = db.scan(scan_start..).await.unwrap();
+        let mut offsets = vec![];
+
+        while let Some(kv) = scan.next().await.unwrap() {
+            if !kv.key.starts_with(&prefix) {
+                break;
+            }
+
+            offsets.push(postcard::from_bytes::<BatchKey>(&kv.key).unwrap().offset);
+        }
+
+        offsets
+    }
+
+    assert_eq!(
+        vec![0, 1, 2, 3, 4],
+        batch_offsets(&db, topic_id, 0).await,
+        "setup: expected one physical batch object per produced record"
+    );
+
+    let delete_request = vec![
+        DeleteRecordsTopic::default()
+            .name("protect-active-batch-topic".into())
+            .partitions(Some(vec![
+                DeleteRecordsPartition::default()
+                    .partition_index(0)
+                    .offset(-1),
+            ])),
+    ];
+
+    let results = engine.delete_records(&delete_request).await.unwrap();
+    let partitions = results[0].partitions.as_ref().unwrap();
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code).unwrap()
+    );
+    assert_eq!(5, partitions[0].low_watermark);
+
+    // Only the batch at offset 4, which holds high_watermark - 1, remains.
+    // Every batch ends below a cutoff equal to the high watermark, so this
+    // batch survives only because the delete keeps the last batch.
+    assert_eq!(
+        vec![4],
+        batch_offsets(&db, topic_id, 0).await,
+        "the active batch holding high_watermark - 1 must survive a -1 delete"
+    );
 }
 
 #[tokio::test]
@@ -938,22 +1030,7 @@ async fn test_list_offsets_earliest_after_delete_records() {
 
     let topition = Topition::new("earliest-topic", 0);
 
-    let batch = Batch {
-        base_offset: 0,
-        batch_length: 0,
-        partition_leader_epoch: 0,
-        magic: 2,
-        crc: 0,
-        attributes: 0,
-        last_offset_delta: 0,
-        base_timestamp: 1000,
-        max_timestamp: 1000,
-        producer_id: -1,
-        producer_epoch: -1,
-        base_sequence: -1,
-        record_count: 1,
-        record_data: Bytes::new(),
-    };
+    let batch = simple_batch();
 
     for _ in 0..5 {
         let _ = engine

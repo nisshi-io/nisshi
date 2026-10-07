@@ -30,7 +30,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
+    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::{
@@ -51,12 +51,12 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
-    ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel,
+    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, bounded_channel, delete_records_cutoff,
 };
 use opentelemetry::{
     KeyValue,
@@ -2514,7 +2514,101 @@ impl Storage for Delegate {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(?topics);
-        todo!()
+
+        let pc = self.connection().await?;
+        let tx = pc.transaction().await?;
+
+        let mut responses = vec![];
+
+        for topic in topics {
+            let mut partition_responses = vec![];
+
+            if let Some(ref partitions) = topic.partitions {
+                for partition in partitions {
+                    let topition = Topition::new(topic.name.as_str(), partition.partition_index);
+
+                    let (error_code, low_watermark) =
+                        match self.watermark_select_for_update(&topition, &pc).await {
+                            Err(Error::Api(error_code)) => {
+                                (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            }
+                            Err(err) => return Err(err),
+
+                            Ok((low, high)) => {
+                                let stage = OffsetStage {
+                                    last_stable: high.unwrap_or_default(),
+                                    high_watermark: high.unwrap_or_default(),
+                                    log_start: low.unwrap_or_default(),
+                                };
+
+                                match delete_records_cutoff(partition.offset, &stage) {
+                                    Err(error_code) => {
+                                        (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                    }
+
+                                    Ok(cutoff) => {
+                                        // This keeps the record at `high_watermark - 1`, because
+                                        // `list_latest_offset_committed.sql` and
+                                        // `list_latest_offset_uncommitted.sql` answer `Latest` from
+                                        // that record. The watermark still advances to `cutoff`.
+                                        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
+
+                                        if physical_cutoff > stage.log_start {
+                                            _ = pc
+                                                .execute(
+                                                    "record_delete_by_offset.sql",
+                                                    (
+                                                        self.cluster.as_str(),
+                                                        topic.name.as_str(),
+                                                        partition.partition_index,
+                                                        physical_cutoff,
+                                                    ),
+                                                )
+                                                .await
+                                                .inspect_err(|err| {
+                                                    error!(?err, ?topition, physical_cutoff)
+                                                })?;
+                                        }
+
+                                        _ = pc
+                                            .execute(
+                                                "watermark_update.sql",
+                                                (
+                                                    self.cluster.as_str(),
+                                                    topic.name.as_str(),
+                                                    partition.partition_index,
+                                                    cutoff,
+                                                    high.unwrap_or_default(),
+                                                ),
+                                            )
+                                            .await
+                                            .inspect_err(|err| error!(?err, ?topition))?;
+
+                                        (ErrorCode::None, cutoff)
+                                    }
+                                }
+                            }
+                        };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
+                }
+            }
+
+            responses.push(
+                DeleteRecordsTopicResult::default()
+                    .name(topic.name.clone())
+                    .partitions(Some(partition_responses)),
+            );
+        }
+
+        pc.commit(tx).await.inspect_err(|err| error!(?err))?;
+
+        Ok(responses)
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
@@ -3358,9 +3452,12 @@ impl Storage for Delegate {
                         .and_then(|offset| {
                             row.get_value(1)
                                 .map_err(Into::into)
-                                .and_then(LiteTimestamp::try_from)
-                                .map(SystemTime::from)
-                                .map(Some)
+                                .and_then(|value| match value {
+                                    Value::Null => Ok(None),
+                                    value => LiteTimestamp::try_from(value)
+                                        .map(SystemTime::from)
+                                        .map(Some),
+                                })
                                 .map(|timestamp| {
                                     debug!(
                                         cluster = self.cluster,

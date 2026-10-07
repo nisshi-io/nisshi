@@ -37,7 +37,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
+    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::{
@@ -58,10 +58,11 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, delete_records_cutoff,
 };
 use opentelemetry::{
     KeyValue,
@@ -1232,7 +1233,105 @@ impl Storage for Engine {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(?topics);
-        todo!()
+
+        let mut connection = self.connection().await?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+
+        let mut responses = vec![];
+
+        for topic in topics {
+            let mut partition_responses = vec![];
+
+            if let Some(ref partitions) = topic.partitions {
+                for partition in partitions {
+                    let topition = Topition::new(topic.name.as_str(), partition.partition_index);
+
+                    let (error_code, low_watermark) =
+                        match self.watermark_select_for_update(&topition, &tx).await {
+                            Err(Error::Api(error_code)) => {
+                                (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            }
+                            Err(err) => return Err(err),
+
+                            Ok((low, high)) => {
+                                let stage = OffsetStage {
+                                    last_stable: high.unwrap_or_default(),
+                                    high_watermark: high.unwrap_or_default(),
+                                    log_start: low.unwrap_or_default(),
+                                };
+
+                                match delete_records_cutoff(partition.offset, &stage) {
+                                    Err(error_code) => {
+                                        (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                    }
+
+                                    Ok(cutoff) => {
+                                        // This keeps the record at `high_watermark - 1`, because
+                                        // `list_latest_offset_committed.sql` and
+                                        // `list_latest_offset_uncommitted.sql` answer `Latest` from
+                                        // that record. The watermark still advances to `cutoff`.
+                                        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
+
+                                        if physical_cutoff > stage.log_start {
+                                            _ = self
+                                                .prepare_execute(
+                                                    &tx,
+                                                    &sql_lookup("record_delete_by_offset.sql")?,
+                                                    (
+                                                        self.cluster.as_str(),
+                                                        topic.name.as_str(),
+                                                        partition.partition_index,
+                                                        physical_cutoff,
+                                                    ),
+                                                )
+                                                .await
+                                                .inspect_err(|err| {
+                                                    error!(?err, ?topition, physical_cutoff)
+                                                })?;
+                                        }
+
+                                        _ = self
+                                            .prepare_execute(
+                                                &tx,
+                                                &sql_lookup("watermark_update.sql")?,
+                                                (
+                                                    self.cluster.as_str(),
+                                                    topic.name.as_str(),
+                                                    partition.partition_index,
+                                                    cutoff,
+                                                    high.unwrap_or_default(),
+                                                ),
+                                            )
+                                            .await
+                                            .inspect_err(|err| error!(?err, ?topition))?;
+
+                                        (ErrorCode::None, cutoff)
+                                    }
+                                }
+                            }
+                        };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
+                }
+            }
+
+            responses.push(
+                DeleteRecordsTopicResult::default()
+                    .name(topic.name.clone())
+                    .partitions(Some(partition_responses)),
+            );
+        }
+
+        tx.commit().await.inspect_err(|err| error!(?err))?;
+
+        Ok(responses)
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
@@ -2060,9 +2159,12 @@ impl Storage for Engine {
                         .and_then(|offset| {
                             row.get_value(1)
                                 .map_err(Into::into)
-                                .and_then(LiteTimestamp::try_from)
-                                .map(SystemTime::from)
-                                .map(Some)
+                                .and_then(|value| match value {
+                                    Value::Null => Ok(None),
+                                    value => LiteTimestamp::try_from(value)
+                                        .map(SystemTime::from)
+                                        .map(Some),
+                                })
                                 .map(|timestamp| {
                                     debug!(
                                         cluster = self.cluster,
@@ -4350,6 +4452,306 @@ mod tests {
             stage.last_stable,
             stage.high_watermark,
         );
+
+        Ok(())
+    }
+
+    /// `#[ignore]`d like every other engine-level test here: turso/limbo
+    /// cannot yet run the full produce flow in CI. Run manually against
+    /// turso with `cargo nextest run --features turso -- --ignored`.
+    #[ignore]
+    #[tokio::test]
+    async fn delete_records_advances_log_start() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let file_path = temp_dir.path().join("nisshi.db");
+
+        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        let record_count = 6;
+        for n in 0..record_count {
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Some(Bytes::from(format!("record-{n}")))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        let cutoff = 3;
+
+        let results = engine
+            .delete_records(&[DeleteRecordsTopic::default()
+                .name("t".into())
+                .partitions(Some(
+                    [DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(cutoff)]
+                    .into(),
+                ))])
+            .await?;
+
+        assert_eq!(1, results.len());
+        let partitions = results[0].partitions.clone().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(cutoff, partitions[0].low_watermark);
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(cutoff, stage.log_start);
+        assert_eq!(record_count, stage.high_watermark);
+
+        Ok(())
+    }
+
+    /// `offset == -1` ("delete everything up to the high watermark") must
+    /// never remove the active batch holding `high_watermark - 1`: the log
+    /// start catches up to the high watermark, but the high watermark
+    /// itself, and hence `ListOffsets(Latest)`, is unaffected.
+    ///
+    /// `#[ignore]`d like every other engine-level test here: turso/limbo
+    /// cannot yet run the full produce flow in CI. Run manually against
+    /// turso with `cargo nextest run --features turso -- --ignored`.
+    #[ignore]
+    #[tokio::test]
+    async fn delete_records_to_high_watermark_keeps_latest() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let file_path = temp_dir.path().join("nisshi.db");
+
+        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        let record_count = 6;
+        for n in 0..record_count {
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Some(Bytes::from(format!("record-{n}")))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        let results = engine
+            .delete_records(&[DeleteRecordsTopic::default()
+                .name("t".into())
+                .partitions(Some(
+                    [DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(-1)]
+                    .into(),
+                ))])
+            .await?;
+
+        let partitions = results[0].partitions.clone().unwrap_or_default();
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(record_count, partitions[0].low_watermark);
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(record_count, stage.log_start);
+        assert_eq!(
+            record_count, stage.high_watermark,
+            "the active batch holding high_watermark - 1 must survive a -1 delete"
+        );
+
+        // `offset_stage` reads the watermark only, so these check the
+        // records: `Latest` needs the record at `high_watermark - 1`, and
+        // `Earliest` must answer the log start and not that record.
+        let offsets = engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[
+                    (topition.clone(), ListOffsetRequest::Latest),
+                    (topition.clone(), ListOffsetRequest::Earliest),
+                ],
+            )
+            .await?;
+
+        assert_eq!(Some(record_count), offsets[0].1.offset, "{offsets:?}");
+        assert_eq!(Some(record_count), offsets[1].1.offset, "{offsets:?}");
+
+        Ok(())
+    }
+
+    /// An unknown topic in a `DeleteRecords` request must never fail the
+    /// whole call: it reports `UnknownTopicOrPartition` for that one
+    /// partition while a sibling topic in the same request still succeeds.
+    ///
+    /// `#[ignore]`d like every other engine-level test here: turso/limbo
+    /// cannot yet run the full produce flow in CI. Run manually against
+    /// turso with `cargo nextest run --features turso -- --ignored`.
+    #[ignore]
+    #[tokio::test]
+    async fn delete_records_unknown_topic_does_not_fail_sibling() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let file_path = temp_dir.path().join("nisshi.db");
+
+        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        let batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from_static(b"one"))))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = engine.produce(None, &topition, batch).await?;
+
+        let results = engine
+            .delete_records(&[
+                DeleteRecordsTopic::default()
+                    .name("missing".into())
+                    .partitions(Some(
+                        [DeleteRecordsPartition::default()
+                            .partition_index(0)
+                            .offset(0)]
+                        .into(),
+                    )),
+                DeleteRecordsTopic::default()
+                    .name("t".into())
+                    .partitions(Some(
+                        [DeleteRecordsPartition::default()
+                            .partition_index(0)
+                            .offset(1)]
+                        .into(),
+                    )),
+            ])
+            .await?;
+
+        assert_eq!(2, results.len());
+
+        let missing = results
+            .iter()
+            .find(|topic| topic.name == "missing")
+            .expect("missing topic result");
+        let missing_partitions = missing.partitions.clone().unwrap_or_default();
+        assert_eq!(
+            ErrorCode::UnknownTopicOrPartition,
+            ErrorCode::try_from(missing_partitions[0].error_code)?
+        );
+
+        let known = results
+            .iter()
+            .find(|topic| topic.name == "t")
+            .expect("known topic result");
+        let known_partitions = known.partitions.clone().unwrap_or_default();
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(known_partitions[0].error_code)?
+        );
+        assert_eq!(1, known_partitions[0].low_watermark);
 
         Ok(())
     }
