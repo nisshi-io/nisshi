@@ -648,63 +648,112 @@ impl Storage for DynoStore {
                 })
                 .await?;
 
-            let prefix = Path::from(format!(
-                "clusters/{}/topics/{}/",
-                self.cluster, metadata.topic.name,
-            ));
+            // Both sweeps below build a key prefix from the name, and
+            // `Path::from` treats "/" as a separator and drops empty
+            // segments. Such a name can only predate CreateTopics' name
+            // check. The metadata entry is already gone, so the topic is
+            // gone through the Kafka API; a sweep whose prefix can reach
+            // another topic's objects is skipped, and the objects stay.
+            // Names with other invalid characters (a space, non-ASCII) stay
+            // one path segment, so they are swept.
+            //
+            // The resolved name is checked, not the request's, because a
+            // delete by id carries no name until `topic_metadata` resolves it.
+            let name = metadata.topic.name.as_str();
 
-            let locations = self
-                .object_store
-                .list(Some(&prefix))
-                .map_ok(|m| m.location)
-                .boxed();
+            // The data sweep deletes everything under `topics/<name>/`, so any
+            // "/" in the name puts that prefix on or inside another topic's
+            // keys: "a/partitions/" is all of topic "a"'s data.
+            let data_prefix_is_shared = name.is_empty() || name.contains('/');
 
-            _ = self
-                .object_store
-                .delete_stream(locations)
-                .try_collect::<Vec<Path>>()
-                .await?;
+            // The offsets sweep matches whole segments after `offsets/`, so a
+            // name with no empty segment does not reach the keys of the plain
+            // name it starts with; only a name that `Path::from` collapses
+            // onto another ("a/", "/a", "a//b", "") is skipped.
+            let offsets_prefix_is_shared = name.split('/').any(str::is_empty);
 
-            let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
+            if data_prefix_is_shared {
+                warn!(
+                    name,
+                    topic_id = %metadata.id,
+                    location = %Path::from(format!(
+                        "clusters/{}/topics/{}/partitions",
+                        self.cluster, name
+                    )),
+                    "topic deleted, but its data was left in place: \
+                     its name is not a safe key prefix"
+                );
+            } else {
+                let prefix = Path::from(format!("clusters/{}/topics/{}/", self.cluster, name));
 
-            let topic_name = metadata.topic.name.clone();
-            let prefix_clone = prefix.clone();
-            let locations = self
-                .object_store
-                .list(Some(&prefix))
-                .filter_map(move |m| {
-                    let prefix = prefix_clone.clone();
-                    let topic_name = topic_name.clone();
-                    async move {
-                        m.map_or(None, |m| {
-                            debug!(?m.location);
+                let locations = self
+                    .object_store
+                    .list(Some(&prefix))
+                    .map_ok(|m| m.location)
+                    .boxed();
 
-                            m.location.prefix_match(&prefix).and_then(|mut i| {
-                                // skip over the consumer group name
-                                _ = i.next();
+                _ = self
+                    .object_store
+                    .delete_stream(locations)
+                    .try_collect::<Vec<Path>>()
+                    .await?;
+            }
 
-                                let sub = Path::from_iter(i);
-                                debug!(?sub);
+            if offsets_prefix_is_shared {
+                warn!(
+                    name,
+                    topic_id = %metadata.id,
+                    location = format!(
+                        "clusters/{}/groups/consumers/<group>/{}",
+                        self.cluster,
+                        Path::from(format!("offsets/{}/partitions", name))
+                    ),
+                    "topic deleted, but its committed offsets were left in place: \
+                     its name is not a safe key prefix"
+                );
+            } else {
+                let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
 
-                                if sub.prefix_matches(&Path::from(format!(
-                                    "offsets/{}/partitions/",
-                                    topic_name
-                                ))) {
-                                    Some(Ok(m.location.clone()))
-                                } else {
-                                    None
-                                }
+                let topic_name = metadata.topic.name.clone();
+                let prefix_clone = prefix.clone();
+                let locations = self
+                    .object_store
+                    .list(Some(&prefix))
+                    .filter_map(move |m| {
+                        let prefix = prefix_clone.clone();
+                        let topic_name = topic_name.clone();
+                        async move {
+                            m.map_or(None, |m| {
+                                debug!(?m.location);
+
+                                m.location.prefix_match(&prefix).and_then(|mut i| {
+                                    // skip over the consumer group name
+                                    _ = i.next();
+
+                                    let sub = Path::from_iter(i);
+                                    debug!(?sub);
+
+                                    if sub.prefix_matches(&Path::from(format!(
+                                        "offsets/{}/partitions/",
+                                        topic_name
+                                    ))) {
+                                        Some(Ok(m.location.clone()))
+                                    } else {
+                                        None
+                                    }
+                                })
                             })
-                        })
-                    }
-                })
-                .boxed();
+                        }
+                    })
+                    .boxed();
 
-            _ = self
-                .object_store
-                .delete_stream(locations)
-                .try_collect::<Vec<Path>>()
-                .await?;
+                _ = self
+                    .object_store
+                    .delete_stream(locations)
+                    .try_collect::<Vec<Path>>()
+                    .await?;
+            }
+
             Ok(ErrorCode::None)
         } else {
             Ok(ErrorCode::UnknownTopicOrPartition)
