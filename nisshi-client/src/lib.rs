@@ -104,6 +104,7 @@
 //! ```
 
 use std::{
+    cmp,
     collections::BTreeMap,
     error, fmt, io,
     sync::{Arc, LazyLock, PoisonError},
@@ -112,7 +113,10 @@ use std::{
 
 use backoff::{ExponentialBackoffBuilder, future::retry};
 use bytes::Bytes;
-use deadpool::managed::{self, BuildError, Object, PoolError};
+use deadpool::{
+    Runtime,
+    managed::{self, BuildError, Object, PoolError, RecycleError, TimeoutType},
+};
 use nisshi_sans_io::{
     ApiKey, ApiVersionsRequest, Body, Frame, FrameInput, Header, Request, RootMessageMeta,
 };
@@ -130,7 +134,7 @@ use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpStream,
     task::JoinError,
-    time::Duration,
+    time::{Duration, timeout},
 };
 use tracing::{Instrument, Level, debug, span};
 use tracing_subscriber::filter::ParseError;
@@ -153,6 +157,7 @@ pub enum Error {
     Pool(Arc<Box<dyn error::Error + Send + Sync>>),
     Protocol(#[from] nisshi_sans_io::Error),
     Service(#[from] nisshi_service::Error),
+    Timeout(Duration),
     UnknownApiKey(i16),
     UnknownHost(Url),
 }
@@ -210,6 +215,11 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
 pub struct Connection {
     stream: TcpStream,
     correlation_id: i32,
+
+    /// True from the write of a request until its complete response is read. A request
+    /// that fails or is cancelled leaves it true, and the pool then discards the
+    /// connection, because the next read could return that request's late response.
+    in_flight: bool,
 }
 
 /// Manager of supported API versions for a broker
@@ -218,6 +228,10 @@ pub struct ConnectionManager {
     broker: Url,
     client_id: Option<String>,
     versions: BTreeMap<i16, i16>,
+    connect_timeout: Duration,
+    max_idle: Duration,
+    request_timeout: Duration,
+    max_request_wait: Duration,
 }
 
 impl ConnectionManager {
@@ -240,7 +254,10 @@ impl ConnectionManager {
     }
 }
 
-const INITIAL_CONNECTION_TIMEOUT_MILLIS: u64 = 30_000;
+/// The default of Kafka's `socket.connection.setup.timeout.ms`: the longest that one
+/// connection attempt waits. A broker that drops packets otherwise holds an attempt until
+/// the operating system gives up, which takes minutes.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl managed::Manager for ConnectionManager {
     type Type = Connection;
@@ -255,13 +272,12 @@ impl managed::Manager for ConnectionManager {
         let addr = host_port(self.broker.clone()).await?;
 
         let backoff = ExponentialBackoffBuilder::new()
-            .with_max_elapsed_time(Some(Duration::from_millis(
-                INITIAL_CONNECTION_TIMEOUT_MILLIS,
-            )))
+            .with_max_elapsed_time(Some(self.connect_timeout))
             .build();
         retry(backoff, || async {
-            Ok(TcpStream::connect(addr)
+            Ok(timeout(CONNECT_ATTEMPT_TIMEOUT, TcpStream::connect(addr))
                 .await
+                .unwrap_or_else(|_elapsed| Err(io::ErrorKind::TimedOut.into()))
                 .inspect(|_| {
                     TCP_CONNECT_DURATION.record(
                         start
@@ -277,6 +293,7 @@ impl managed::Manager for ConnectionManager {
                 .map(|stream| Connection {
                     stream,
                     correlation_id: 0,
+                    in_flight: false,
                 })?)
         })
         .await
@@ -288,8 +305,43 @@ impl managed::Manager for ConnectionManager {
         obj: &mut Self::Type,
         metrics: &managed::Metrics,
     ) -> managed::RecycleResult<Self::Error> {
-        debug!(obj.correlation_id, metrics.recycle_count);
-        Ok(())
+        debug!(obj.correlation_id, obj.in_flight, metrics.recycle_count);
+
+        self.reusable(obj, metrics)
+            .inspect_err(|reason| {
+                debug!(broker = %self.broker, reason);
+                CONNECTIONS_DISCARDED.add(1, &[KeyValue::new("reason", *reason)]);
+            })
+            .map_err(RecycleError::message)
+    }
+}
+
+impl ConnectionManager {
+    /// Returns why the pool must discard this connection, if it must.
+    fn reusable(&self, obj: &Connection, metrics: &managed::Metrics) -> Result<(), &'static str> {
+        if obj.in_flight {
+            return Err("request in flight");
+        }
+
+        // A network device between us and the broker can drop an idle connection without
+        // telling either end, and the next request on it then waits for its whole
+        // deadline. `last_used` counts from when the pool last handed the connection out,
+        // so a connection that served a long request goes a little early.
+        if metrics.last_used() > self.max_idle {
+            return Err("idle");
+        }
+
+        // An idle connection has nothing to read. Reading one byte is safe, because the
+        // pool discards the connection whenever the read returns anything.
+        match obj.stream.try_read(&mut [0u8; 1]) {
+            Ok(0) => Err("closed by broker"),
+            Ok(_) => Err("unread bytes"),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(err) => {
+                debug!(broker = %self.broker, ?err);
+                Err("read error")
+            }
+        }
     }
 }
 
@@ -304,12 +356,62 @@ fn status_update(pool: &Pool) {
     POOL_WAITING.record(status.waiting as u64, &[]);
 }
 
+/// Takes a [`Connection`] from the [`Pool`], and records how long that took or why it
+/// failed.
+async fn pool_get(pool: &Pool) -> Result<Object<ConnectionManager>, PoolError<Error>> {
+    let start = SystemTime::now();
+
+    pool.get()
+        .await
+        .inspect(|_| {
+            POOL_GET_DURATION.record(
+                start
+                    .elapsed()
+                    .map_or(0, |duration| duration.as_millis() as u64),
+                &[],
+            );
+        })
+        .inspect_err(|err| {
+            let error = match err {
+                PoolError::Timeout(TimeoutType::Wait) => "wait timeout",
+                PoolError::Timeout(TimeoutType::Create) => "create timeout",
+                PoolError::Timeout(TimeoutType::Recycle) => "recycle timeout",
+                PoolError::Backend(_) => "backend",
+                PoolError::Closed => "closed",
+                PoolError::NoRuntimeSpecified => "no runtime",
+                PoolError::PostCreateHook(_) => "post create hook",
+            };
+
+            POOL_GET_ERRORS.add(1, &[KeyValue::new("error", error)]);
+        })
+}
+
 /// [Build][`Builder#method.build`] a [`Connection`] [`Pool`] to a [broker][`Builder#method.broker`]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Builder {
     broker: Url,
     client_id: Option<String>,
+    max_size: Option<usize>,
+    wait_timeout: Duration,
+    connect_timeout: Duration,
+    max_idle: Duration,
+    request_timeout: Duration,
+    max_request_wait: Duration,
 }
+
+/// The default of Kafka's `request.timeout.ms`.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The default of Kafka's `max.poll.interval.ms`, which the Java consumer sends as its
+/// JoinGroup rebalance timeout.
+const DEFAULT_MAX_REQUEST_WAIT: Duration = Duration::from_secs(300);
+
+/// The default of the Java client's `connections.max.idle.ms`, which is a minute below
+/// the broker's, so that the client closes an idle connection before the broker does.
+const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(540);
+
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Builder {
     /// Broker URL
@@ -317,12 +419,96 @@ impl Builder {
         Self {
             broker,
             client_id: None,
+            max_size: None,
+            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            max_idle: DEFAULT_MAX_IDLE,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_request_wait: DEFAULT_MAX_REQUEST_WAIT,
         }
     }
 
     /// Client id used when making requests to the broker
     pub fn client_id(self, client_id: Option<String>) -> Self {
         Self { client_id, ..self }
+    }
+
+    /// Maximum number of connections in the pool, by default twice the number of CPUs
+    /// ([`PoolConfig::default`][`managed::PoolConfig::default`])
+    pub fn max_size(self, max_size: usize) -> Self {
+        Self {
+            max_size: Some(max_size),
+            ..self
+        }
+    }
+
+    /// Maximum time a request waits for a free slot in the pool, by default 30s.
+    /// A request that waits longer fails with [`Error::Pool`].
+    pub fn wait_timeout(self, wait_timeout: Duration) -> Self {
+        Self {
+            wait_timeout,
+            ..self
+        }
+    }
+
+    /// Maximum time to open a new connection to the broker, including retries, by default
+    /// 30s. A request that takes longer fails with [`Error::Pool`].
+    pub fn connect_timeout(self, connect_timeout: Duration) -> Self {
+        Self {
+            connect_timeout,
+            ..self
+        }
+    }
+
+    /// Maximum time a connection stays unused in the pool before the pool closes it, by
+    /// default 9 minutes
+    pub fn max_idle(self, max_idle: Duration) -> Self {
+        Self { max_idle, ..self }
+    }
+
+    /// Time the broker has to answer a request, by default 30s. A request that asks the
+    /// broker to wait, such as a fetch, gets that wait plus 5s instead when that is
+    /// longer, with the wait capped at
+    /// [`max_request_wait`][`Builder#method.max_request_wait`]. A request that takes
+    /// longer fails with [`Error::Timeout`].
+    pub fn request_timeout(self, request_timeout: Duration) -> Self {
+        Self {
+            request_timeout,
+            ..self
+        }
+    }
+
+    /// Maximum wait that a request can ask the broker for, by default 5 minutes. See
+    /// [`request_timeout`][`Builder#method.request_timeout`].
+    pub fn max_request_wait(self, max_request_wait: Duration) -> Self {
+        Self {
+            max_request_wait,
+            ..self
+        }
+    }
+
+    fn pool(&self, versions: BTreeMap<i16, i16>) -> Result<Pool, Error> {
+        let builder = Pool::builder(ConnectionManager {
+            broker: self.broker.clone(),
+            client_id: self.client_id.clone(),
+            versions,
+            connect_timeout: self.connect_timeout,
+            max_idle: self.max_idle,
+            request_timeout: self.request_timeout,
+            max_request_wait: self.max_request_wait,
+        })
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(self.wait_timeout))
+        // The connect retries stop after the connect timeout, but they check it only
+        // between attempts. This bounds the whole creation, including the address lookup.
+        .create_timeout(Some(self.connect_timeout));
+
+        match self.max_size {
+            Some(max_size) => builder.max_size(max_size),
+            None => builder,
+        }
+        .build()
+        .map_err(Into::into)
     }
 
     /// Inquire with the broker supported api versions
@@ -335,13 +521,7 @@ impl Builder {
             .client_software_name(Some(env!("CARGO_PKG_NAME").into()))
             .client_software_version(Some(env!("CARGO_PKG_VERSION").into()));
 
-        let client = Pool::builder(ConnectionManager {
-            broker: self.broker.clone(),
-            client_id: self.client_id.clone(),
-            versions,
-        })
-        .build()
-        .map(Client::new)?;
+        let client = self.pool(versions).map(Client::new)?;
 
         let supported = RootMessageMeta::messages().requests();
 
@@ -368,15 +548,9 @@ impl Builder {
 
     /// Establish the API versions supported by the broker returning a [`Pool`]
     pub async fn build(self) -> Result<Pool, Error> {
-        self.bootstrap().await.and_then(|versions| {
-            Pool::builder(ConnectionManager {
-                broker: self.broker,
-                client_id: self.client_id,
-                versions,
-            })
-            .build()
-            .map_err(Into::into)
-        })
+        self.bootstrap()
+            .await
+            .and_then(|versions| self.pool(versions))
     }
 }
 
@@ -580,19 +754,10 @@ where
 
         status_update(&req.pool);
 
-        let connection = {
-            let start = SystemTime::now();
-            req.pool.get().await.inspect(|_| {
-                POOL_GET_DURATION.record(
-                    start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[],
-                );
-            })?
-        };
+        let connection = pool_get(&req.pool).await?;
 
         let correlation_id = connection.correlation_id;
+        let timeout = response_timeout(req.pool.manager(), &req.frame.body);
 
         self.inner
             .serve(BytesConnection {
@@ -606,6 +771,7 @@ where
                     req.frame.body,
                 )?,
                 connection,
+                timeout,
                 extensions: req.extensions,
             })
             .await
@@ -654,19 +820,11 @@ where
         let api_key = Q::KEY;
         let api_version = req.pool.manager().api_version(api_key)?;
         let client_id = req.pool.manager().client_id();
-        let connection = {
-            let start = SystemTime::now();
-            req.pool.get().await.inspect(|_| {
-                POOL_GET_DURATION.record(
-                    start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[],
-                );
-            })?
-        };
+        let connection = pool_get(&req.pool).await?;
 
         let correlation_id = connection.correlation_id;
+        let body = req.request.into();
+        let timeout = response_timeout(req.pool.manager(), &body);
 
         let request = Frame::request(
             Header::Request {
@@ -675,7 +833,7 @@ where
                 correlation_id,
                 client_id,
             },
-            req.request.into(),
+            body,
         )?;
 
         let response = self
@@ -683,6 +841,7 @@ where
             .serve(BytesConnection {
                 bytes: request,
                 connection,
+                timeout,
                 extensions: req.extensions,
             })
             .await?;
@@ -699,6 +858,7 @@ where
 pub struct BytesConnection {
     bytes: Bytes,
     connection: Object<ConnectionManager>,
+    timeout: Duration,
     extensions: Extensions,
 }
 
@@ -706,6 +866,67 @@ impl ExtensionsRef for BytesConnection {
     fn extensions(&self) -> &Extensions {
         &self.extensions
     }
+}
+
+/// The time the Java client allows for a JoinGroup beyond its rebalance timeout. We allow
+/// it for every request that asks the broker to wait.
+const RESPONSE_MARGIN: Duration = Duration::from_secs(5);
+
+/// Returns how long the broker has to answer a request: the manager's request timeout. A
+/// request that asks the broker to wait gets that wait plus [`RESPONSE_MARGIN`] instead,
+/// when that is longer. The manager's maximum request wait caps the time the request asks
+/// for.
+///
+/// The Java client waits `request.timeout.ms` (default [30s][producer]) for each response,
+/// and chooses each request's wait itself: the producer sends `request.timeout.ms` as the
+/// [produce timeout][produce], and the consumer's `fetch.max.wait.ms` is [500ms][fetch] by
+/// default. JoinGroup waits
+/// [`max(request.timeout.ms, rebalance timeout + 5s)`][join]. We apply that JoinGroup
+/// rule to every request, because a proxy forwards requests whose wait another client
+/// chose, and our deadline must not end before that client's own deadline.
+///
+/// We cap the wait, because every client of a proxy shares the connections in its pool,
+/// and a request holds its connection until the broker answers. So we fail a JoinGroup
+/// after 5 minutes and 5 seconds by default, where the Java client waits for any
+/// `max.poll.interval.ms`.
+///
+/// [producer]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java#L424-L426
+/// [produce]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java#L910-L915
+/// [fetch]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerConfig.java#L206
+/// [join]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L620-L628
+fn response_timeout(manager: &ConnectionManager, body: &Body) -> Duration {
+    let wait_ms = match body {
+        Body::FetchRequest(fetch) => fetch.max_wait_ms,
+
+        // A v0 JoinGroup has no rebalance timeout, and the broker uses the session
+        // timeout in its place.
+        Body::JoinGroupRequest(join) => join
+            .rebalance_timeout_ms
+            .filter(|rebalance_timeout_ms| *rebalance_timeout_ms >= 0)
+            .unwrap_or(join.session_timeout_ms),
+
+        Body::ProduceRequest(produce) => produce.timeout_ms,
+
+        Body::AlterPartitionReassignmentsRequest(alter) => alter.timeout_ms,
+        Body::CreatePartitionsRequest(create) => create.timeout_ms,
+        Body::CreateTopicsRequest(create) => create.timeout_ms,
+        Body::DeleteRecordsRequest(delete) => delete.timeout_ms,
+        Body::DeleteTopicsRequest(delete) => delete.timeout_ms,
+        Body::ElectLeadersRequest(elect) => elect.timeout_ms,
+
+        _ => 0,
+    };
+
+    let wait = Duration::from_millis(u64::try_from(wait_ms).unwrap_or_default());
+
+    if wait.is_zero() {
+        return manager.request_timeout;
+    }
+
+    cmp::max(
+        manager.request_timeout,
+        cmp::min(wait, manager.max_request_wait).saturating_add(RESPONSE_MARGIN),
+    )
 }
 
 /// A [`Service`] that writes a frame represented by [`Bytes`] to the [`Connection`] in a [`BytesConnection`], returning the [`Bytes`] frame response.
@@ -775,21 +996,43 @@ impl Service<BytesConnection> for BytesConnectionService {
     type Output = Bytes;
     type Error = Error;
 
-    async fn serve(&self, mut req: BytesConnection) -> Result<Self::Output, Self::Error> {
-        let local = req.connection.stream.local_addr()?;
-        let peer = req.connection.stream.peer_addr()?;
+    async fn serve(&self, req: BytesConnection) -> Result<Self::Output, Self::Error> {
+        let BytesConnection {
+            bytes,
+            mut connection,
+            timeout: deadline,
+            ..
+        } = req;
+
+        let local = connection.stream.local_addr()?;
+        let peer = connection.stream.peer_addr()?;
 
         let attributes = [KeyValue::new("peer", peer.to_string())];
 
         let span = span!(Level::DEBUG, "client", local = %local, peer = %peer);
 
         async move {
-            self.write(&mut req.connection.stream, req.bytes, &attributes)
-                .await?;
+            connection.in_flight = true;
 
-            req.connection.correlation_id += 1;
+            // The deadline covers the write too, because a write blocks when the broker
+            // stops reading.
+            let response = timeout(deadline, async {
+                self.write(&mut connection.stream, bytes, &attributes)
+                    .await?;
 
-            self.read(&mut req.connection.stream, &attributes).await
+                connection.correlation_id += 1;
+
+                self.read(&mut connection.stream, &attributes).await
+            })
+            .await
+            .map_err(|_elapsed| {
+                REQUEST_TIMEOUTS.add(1, &attributes);
+                Error::Timeout(deadline)
+            })
+            .inspect_err(|err| debug!(?err))??;
+
+            connection.in_flight = false;
+            Ok(response)
         }
         .instrument(span)
         .await
@@ -855,6 +1098,27 @@ static TCP_BYTES_RECEIVED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+static REQUEST_TIMEOUTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("request_timeouts")
+        .with_description("Requests that the broker did not answer before their deadline")
+        .build()
+});
+
+static CONNECTIONS_DISCARDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("pool_connections_discarded")
+        .with_description("Pooled connections closed instead of reused, by reason")
+        .build()
+});
+
+static POOL_GET_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("pool_get_errors")
+        .with_description("Failures to take a connection from the pool, by error")
+        .build()
+});
+
 static POOL_GET_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("pool_get_duration")
@@ -895,7 +1159,11 @@ static POOL_WAITING: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 mod tests {
     use std::{fs::File, thread};
 
-    use nisshi_sans_io::{MetadataRequest, MetadataResponse, RequestInput};
+    use nisshi_sans_io::{
+        AlterPartitionReassignmentsRequest, CreatePartitionsRequest, CreateTopicsRequest,
+        DeleteRecordsRequest, DeleteTopicsRequest, ElectLeadersRequest, FetchRequest,
+        JoinGroupRequest, MetadataRequest, MetadataResponse, ProduceRequest, RequestInput,
+    };
     use nisshi_service::{
         BytesFrameLayer, FrameRouteService, RequestLayer, ResponseService, TcpBytesLayer,
         TcpContextLayer, TcpListenerInput, TcpListenerLayer,
@@ -1011,6 +1279,148 @@ mod tests {
         let joined = join.join_all().await;
         debug!(?joined);
 
+        Ok(())
+    }
+
+    fn manager(
+        request_timeout: Duration,
+        max_request_wait: Duration,
+    ) -> Result<ConnectionManager, Error> {
+        Ok(ConnectionManager {
+            broker: Url::parse("tcp://localhost:9092")?,
+            client_id: None,
+            versions: BTreeMap::new(),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            max_idle: DEFAULT_MAX_IDLE,
+            request_timeout,
+            max_request_wait,
+        })
+    }
+
+    const BASE: Duration = Duration::from_secs(30);
+    const CAP: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn response_timeout_short_wait_is_base() -> Result<(), Error> {
+        let body = FetchRequest::default().max_wait_ms(500).into();
+        assert_eq!(BASE, response_timeout(&manager(BASE, CAP)?, &body));
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_fetch_waits_max_wait() -> Result<(), Error> {
+        let body = FetchRequest::default().max_wait_ms(60_000).into();
+        assert_eq!(
+            Duration::from_secs(65),
+            response_timeout(&manager(BASE, CAP)?, &body)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_join_group_waits_rebalance_timeout() -> Result<(), Error> {
+        let body = JoinGroupRequest::default()
+            .session_timeout_ms(45_000)
+            .rebalance_timeout_ms(Some(60_000))
+            .into();
+        assert_eq!(
+            Duration::from_secs(65),
+            response_timeout(&manager(BASE, CAP)?, &body)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_join_group_v0_waits_session_timeout() -> Result<(), Error> {
+        let manager = manager(BASE, CAP)?;
+
+        for rebalance_timeout_ms in [None, Some(-1)] {
+            let body = JoinGroupRequest::default()
+                .session_timeout_ms(45_000)
+                .rebalance_timeout_ms(rebalance_timeout_ms)
+                .into();
+            assert_eq!(Duration::from_secs(50), response_timeout(&manager, &body));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_produce_waits_timeout() -> Result<(), Error> {
+        let body = ProduceRequest::default().timeout_ms(30_000).into();
+        assert_eq!(
+            Duration::from_secs(35),
+            response_timeout(&manager(BASE, CAP)?, &body)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_admin_waits_timeout() -> Result<(), Error> {
+        let manager = manager(BASE, CAP)?;
+
+        for body in [
+            AlterPartitionReassignmentsRequest::default()
+                .timeout_ms(60_000)
+                .into(),
+            CreatePartitionsRequest::default().timeout_ms(60_000).into(),
+            CreateTopicsRequest::default().timeout_ms(60_000).into(),
+            DeleteRecordsRequest::default().timeout_ms(60_000).into(),
+            DeleteTopicsRequest::default().timeout_ms(60_000).into(),
+            ElectLeadersRequest::default().timeout_ms(60_000).into(),
+        ] {
+            assert_eq!(Duration::from_secs(65), response_timeout(&manager, &body));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_ignores_negative_wait() -> Result<(), Error> {
+        let manager = manager(BASE, CAP)?;
+
+        for body in [
+            FetchRequest::default().max_wait_ms(-60_000).into(),
+            ProduceRequest::default().timeout_ms(-60_000).into(),
+            JoinGroupRequest::default()
+                .session_timeout_ms(-60_000)
+                .rebalance_timeout_ms(None)
+                .into(),
+        ] {
+            assert_eq!(BASE, response_timeout(&manager, &body));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_caps_wait() -> Result<(), Error> {
+        let body = FetchRequest::default().max_wait_ms(i32::MAX).into();
+        assert_eq!(
+            Duration::from_secs(65),
+            response_timeout(&manager(BASE, Duration::from_secs(60))?, &body)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_saturates() -> Result<(), Error> {
+        let body = FetchRequest::default().max_wait_ms(i32::MAX).into();
+        assert_eq!(
+            Duration::MAX,
+            response_timeout(&manager(Duration::MAX, Duration::MAX)?, &body)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_timeout_without_wait_is_base() -> Result<(), Error> {
+        let base = Duration::from_millis(100);
+        let manager = manager(base, CAP)?;
+
+        for body in [
+            MetadataRequest::default().into(),
+            FetchRequest::default().max_wait_ms(0).into(),
+        ] {
+            assert_eq!(base, response_timeout(&manager, &body));
+        }
         Ok(())
     }
 }

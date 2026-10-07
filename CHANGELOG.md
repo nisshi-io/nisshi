@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The broker stops at startup when `maintenance_interval` or `transaction_maintenance_interval` has an invalid value: unparsable, zero, longer than 365 days, or a bare number without a unit. Previously the broker ignored an invalid value and used the default interval. Give a bare number its unit, for example `600s` or `10m` instead of `600`. Compound values such as `1h30m` and `5min` still work.
 - A `parquet`, `iceberg` or `delta` broker without `--schema-registry` stops at startup with an error that names the missing option, instead of panicking. `--schema-registry` is accepted before or after the subcommand.
 - When the broker closes the connection of a client that sends a request other than ApiVersions, SaslHandshake or SaslAuthenticate before it authenticates, it logs an ERROR line that names the client's address.
+- `nisshi proxy` and the CLI tools bound every wait on the broker they connect to ([#882](https://github.com/nisshi-io/nisshi/issues/882)):
+  - A request fails with `Timeout` when the broker does not answer within 30s. A request that asks the broker to wait (Fetch, Produce, JoinGroup, and the topic and partition admin requests) gets that wait plus 5s instead, when that is longer, with the wait capped at 5 minutes. `nisshi proxy` then closes the client's connection, and the client retries.
+  - A request fails with `Pool(Timeout(Wait))` after 30s without a free connection, and with `Pool(Timeout(Create))` when a new connection takes more than 30s to open.
+  - `nisshi proxy` opens up to 256 connections to its origin, instead of twice the number of CPUs.
+  - `nisshi_client::Builder` sets these with `request_timeout`, `max_request_wait`, `wait_timeout`, `connect_timeout`, `max_idle` and `max_size`.
+  - New metrics: `request_timeouts`, `pool_get_errors` (by `error`) and `pool_connections_discarded` (by `reason`).
 
 ### Security
 
@@ -42,3 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SlateDB compaction skips a stored batch it cannot inflate, with a warning,
   instead of abandoning the whole maintenance pass.
 - ListOffsets by timestamp now answers offset -1 and timestamp -1 with error NONE when no record has a timestamp at or after the target, as Apache Kafka does. The broker answered offset 0 before. That made the Java consumer's `offsetsForTimes()` throw `IllegalArgumentException: Invalid negative timestamp`, and it sent a client that seeks to the returned offset back to the start of the partition. A partition answered with an error code now also carries offset -1 instead of 0.
+- `nisshi proxy` and the CLI tools no longer reuse a connection to the broker
+  that the broker closed, that has bytes nobody read, that was idle for more
+  than 9 minutes, or whose last request failed, timed out or was cancelled.
+  Such a connection could fail the next request, or give it the response to
+  an earlier one ([#882](https://github.com/nisshi-io/nisshi/issues/882)).
