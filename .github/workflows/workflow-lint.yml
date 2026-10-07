@@ -11,7 +11,8 @@ name: Workflow lint
 # output rather than filtering the trigger.
 #
 # zizmor is filtered to medium+ severity and confidence - its low-confidence
-# heuristics are useful to read but too noisy to gate merges on.
+# heuristics are useful to read but too noisy to gate merges on. The one
+# exception is `artipacked`, gated at every threshold by its own step.
 permissions:
   contents: read
 
@@ -59,9 +60,25 @@ jobs:
       #
       # The medium/medium thresholds below also hide the open
       # `cache-poisoning` findings. zizmor applies the thresholds globally,
-      # so this step cannot show one audit without the other. The thresholds
-      # hide `artipacked` findings too, so each checkout must set
-      # `persist-credentials: false` itself.
+      # so this step cannot show one audit without the other.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor --min-confidence medium --min-severity medium .github/workflows/
+      # The thresholds above hide `artipacked` (low confidence), so this step
+      # gates that one audit at every threshold. zizmor has no flag to run a
+      # single audit, so it reads the JSON report and fails on any unignored
+      # `artipacked` finding: each `actions/checkout` must set
+      # `persist-credentials: false`, or `true` where a later step needs
+      # the token for git. It runs even when the step above fails, so both
+      # report.
+      - name: zizmor artipacked
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/zizmor.json"
+          zizmor --offline --no-exit-codes --strict-collection --format json .github/workflows/ > "$report"
+          jq -r '.[] | select(.ident == "artipacked" and (.ignored | not))
+            | .locations[0] as $l
+            | "::error file=\($l.symbolic.key.Local.verbatim_path),line=\($l.concrete.location.start_point.row + 1)::artipacked: \($l.symbolic.annotation)"' \
+            "$report" | tee "$RUNNER_TEMP/artipacked.txt"
+          test ! -s "$RUNNER_TEMP/artipacked.txt"
