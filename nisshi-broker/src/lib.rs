@@ -34,7 +34,6 @@ use regex::{Regex, Replacer};
 use thiserror::Error;
 use tokio::{sync::broadcast::error::SendError, task::JoinError};
 use tracing_subscriber::filter::ParseError;
-use url::Url;
 
 pub mod broker;
 pub mod coordinator;
@@ -79,6 +78,14 @@ pub enum Error {
     ExpectedJoinGroupRequestProtocol(&'static str),
 
     Hyper(Arc<hyper::http::Error>),
+
+    /// A sweep interval option in the storage URL has a value that the broker
+    /// rejects.
+    InvalidStorageOptionValue {
+        option: String,
+        value: String,
+    },
+
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Json(Arc<serde_json::Error>),
@@ -105,7 +112,6 @@ pub enum Error {
     TryFromInt(#[from] TryFromIntError),
 
     UnsupportedApiService(i16),
-    UnsupportedStorageUrl(Url),
     UnsupportedTracingFormat(String),
     Url(#[from] url::ParseError),
     Utf8(#[from] Utf8Error),
