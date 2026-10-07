@@ -4193,6 +4193,17 @@ mod tests {
         Ok(())
     }
 
+    /// A storage URL option that tokio-postgres does not read (`vacuum_into` is an
+    /// option of the sqlite engine) stops the build before any connection, and the
+    /// error names the option.
+    #[test]
+    fn unrecognized_query_option_rejected_without_connecting() {
+        let error = Postgres::builder(&format!("{CONNECTION}?vacuum_into=/tmp/does-not-matter"))
+            .expect_err("an option that tokio-postgres does not read must be rejected");
+
+        assert!(error.to_string().contains("vacuum_into"), "{error}");
+    }
+
     #[test]
     fn pool_error_timeout_maps_to_retriable_error_code() {
         let error = Error::from(PoolError::Timeout(TimeoutType::Wait));

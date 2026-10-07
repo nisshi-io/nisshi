@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod group;
+mod maintenance;
 
 use crate::{
     CancelKind, Error, Result,
@@ -542,6 +543,18 @@ where
                                     // not an anomaly worth an `error!` on every occurrence.
                                     || io.kind() == ErrorKind::TimedOut => {}
 
+                            // The broker closes the connection of a client that sends a
+                            // request other than ApiVersions or SASL before it
+                            // authenticates. This line names the peer at ERROR, the level
+                            // of the default filter, because that filter disables the
+                            // INFO `peer` span that carries the address.
+                            Err(Error::KafkaProtocol(nisshi_sans_io::Error::NotAuthenticated)) => {
+                                error!(
+                                    %addr,
+                                    "closed connection: client sent a request before it authenticated"
+                                );
+                            }
+
                             Err(error) => {
                                 error!(?error);
                             },
@@ -643,8 +656,6 @@ pub struct Builder<N, C, I, A, S, L> {
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
     silent: bool,
-    maintenance_interval: Option<Duration>,
-    transaction_maintenance_interval: Option<Duration>,
 
     cancellation: CancellationToken,
 }
@@ -659,9 +670,6 @@ type PhantomBuilder = Builder<
 >;
 
 impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
-    const MAINTENANCE_INTERVAL: &str = "maintenance_interval";
-    const TRANSACTION_MAINTENANCE_INTERVAL: &str = "transaction_maintenance_interval";
-
     pub fn node_id(self, node_id: i32) -> Builder<i32, C, I, A, S, L> {
         Builder {
             node_id,
@@ -676,8 +684,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
             cancellation: self.cancellation,
         }
     }
@@ -696,8 +702,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
@@ -717,8 +721,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
@@ -741,52 +743,13 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
     }
 
-    pub fn storage(self, mut storage: Url) -> Builder<N, C, I, A, Url, L> {
-        let maintenance_interval = storage.query_pairs().find_map(|(k, v)| {
-            if k == Self::MAINTENANCE_INTERVAL {
-                v.parse::<humantime::Duration>().map(Into::into).ok()
-            } else {
-                None
-            }
-        });
-
-        let transaction_maintenance_interval = storage.query_pairs().find_map(|(k, v)| {
-            if k == Self::TRANSACTION_MAINTENANCE_INTERVAL {
-                v.parse::<humantime::Duration>().map(Into::into).ok()
-            } else {
-                None
-            }
-        });
-
-        let pairs = storage
-            .query_pairs()
-            .filter_map(|(k, v)| {
-                if k == Self::MAINTENANCE_INTERVAL || k == Self::TRANSACTION_MAINTENANCE_INTERVAL {
-                    None
-                } else {
-                    Some((k.to_string(), v.to_string()))
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if pairs.is_empty() {
-            storage.set_query(None);
-        } else {
-            _ = storage.query_pairs_mut().clear().extend_pairs(pairs);
-        }
-
-        debug!(
-            ?maintenance_interval,
-            ?transaction_maintenance_interval,
-            storage = %redact_url(&storage)
-        );
+    pub fn storage(self, storage: Url) -> Builder<N, C, I, A, Url, L> {
+        debug!(storage = %redact_url(&storage));
 
         Builder {
             node_id: self.node_id,
@@ -801,8 +764,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval,
-            transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
@@ -824,8 +785,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
 
             cancellation: self.cancellation,
         }
@@ -880,6 +839,9 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .map(otel::metric_exporter)
             .transpose()?;
 
+        let (storage, intervals) = maintenance::take_intervals(self.storage.clone())?;
+        debug!(?intervals);
+
         let builder = {
             let mut builder = StorageContainer::builder();
 
@@ -919,7 +881,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .advertised_listener(self.advertised_listener.clone())
             .schema_registry(self.schema_registry.clone())
             .lake_house(self.lake_house.clone())
-            .storage(self.storage.clone())
+            .storage(storage)
             .cancellation(self.cancellation.clone())
             .silent(self.silent)
             .build()
@@ -946,8 +908,8 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
-            transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maintenance_interval: intervals.maintenance,
+            transaction_maintenance_interval: intervals.transaction_maintenance,
             cancellation: self.cancellation,
             meter_provider,
         })
