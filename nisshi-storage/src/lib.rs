@@ -208,7 +208,7 @@ pub use service::{
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
     ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
     RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, bounded_channel,
+    TxnEndService, TxnOffsetCommitService, bounded_channel, inflate_produced,
 };
 
 #[cfg(feature = "dynostore")]
@@ -1388,6 +1388,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// writes. Only the broker may write control batches, so client Produce
     /// batches must reach storage through [`ProduceService`], which rejects
     /// them.
+    ///
+    /// A backend that decodes the batch does so with [`inflate_produced`], so
+    /// records that do not decode fail with `INVALID_RECORD`.
     async fn produce(
         &self,
         transaction_id: Option<&str>,

@@ -60,7 +60,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, inflate_produced,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -760,6 +760,32 @@ impl Storage for DynoStore {
                 })
                 .unwrap_or(false)
         {
+            // Decode and validate before the high watermark moves, so that a
+            // batch rejected here leaves no state behind.
+            let inflated = if let Some(ref registry) = self.schemas {
+                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
+                    .inspect(|batch_attribute| debug!(?batch_attribute))
+                    .inspect_err(|err| debug!(?err))?;
+
+                if batch_attribute.control {
+                    None
+                } else {
+                    let inflated = inflate_produced(&deflated)
+                        .inspect(|inflated| debug!(?inflated))
+                        .inspect_err(|err| debug!(?err))?;
+
+                    registry
+                        .validate(topition.topic(), &inflated)
+                        .await
+                        .inspect(|validation| debug!(?validation))
+                        .inspect_err(|err| debug!(?err))?;
+
+                    Some(inflated)
+                }
+            } else {
+                None
+            };
+
             // Get watermark to calculate proper offset for lake sink
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
@@ -788,39 +814,48 @@ impl Storage for DynoStore {
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
 
-            if let Some(ref registry) = self.schemas {
-                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
-                    .inspect(|batch_attribute| debug!(?batch_attribute))
-                    .inspect_err(|err| debug!(?err))?;
-
-                if !batch_attribute.control {
-                    let inflated = inflated::Batch::try_from(&deflated)
-                        .inspect(|inflated| debug!(?inflated))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect(|validation| debug!(?validation))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    if let Some(ref lake) = self.lake {
-                        lake.store(
-                            topition.topic(),
-                            topition.partition(),
-                            offset,
-                            &inflated,
-                            config,
-                        )
-                        .await
-                        .inspect(|store| debug!(?store))
-                        .inspect_err(|err| debug!(?err))?;
-                    }
-                }
+            if let Some(ref lake) = self.lake
+                && let Some(ref inflated) = inflated
+            {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                    inflated,
+                    config,
+                )
+                .await
+                .inspect(|store| debug!(?store))
+                .inspect_err(|err| debug!(?err))?;
             }
 
             Ok(offset)
         } else {
+            let attributes =
+                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
+
+            // Decode and validate before the producer's sequence or the high
+            // watermark moves, so that a batch rejected here leaves no state
+            // behind. A producer can reuse a rejected batch's sequence for its
+            // next batch. If the stored sequence had moved, that batch would
+            // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
+            // although nothing was stored.
+            let inflated = if !attributes.control && (self.schemas.is_some() || self.lake.is_some())
+            {
+                let inflated = inflate_produced(&deflated).inspect_err(|err| debug!(?err))?;
+
+                if let Some(ref registry) = self.schemas {
+                    registry
+                        .validate(topition.topic(), &inflated)
+                        .await
+                        .inspect_err(|err| debug!(?err))?;
+                }
+
+                Some(inflated)
+            } else {
+                None
+            };
+
             if deflated.is_idempotent() {
                 self.meta
                 .with_mut(&self.object_store, |meta| {
@@ -879,21 +914,6 @@ impl Storage for DynoStore {
                 })?;
             }
 
-            if let Some(ref registry) = self.schemas {
-                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
-                    .inspect_err(|err| debug!(?err))?;
-
-                if !batch_attribute.control {
-                    let inflated =
-                        inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect_err(|err| debug!(?err))?;
-                }
-            }
-
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
@@ -921,20 +941,14 @@ impl Storage for DynoStore {
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
 
-            let attributes =
-                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
-
-            if !attributes.control
-                && let Some(ref lake) = self.lake
+            if let Some(ref lake) = self.lake
+                && let Some(ref inflated) = inflated
             {
-                let inflated =
-                    inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
-
                 lake.store(
                     topition.topic(),
                     topition.partition(),
                     offset,
-                    &inflated,
+                    inflated,
                     config,
                 )
                 .await

@@ -5747,6 +5747,7 @@ dependencies = [
  "bytes",
  "clap",
  "console",
+ "crc-fast",
  "futures",
  "glob",
  "http-body-util",

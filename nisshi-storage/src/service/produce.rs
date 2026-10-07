@@ -19,12 +19,62 @@ use nisshi_sans_io::{
     TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
-    record::deflated,
+    record::{deflated, inflated},
 };
 use rama::Service;
-use tracing::{error, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
+
+/// Inflate a batch that a client sent in a Produce request, mapping a
+/// decode failure to `INVALID_RECORD`.
+///
+/// Accepts both a `deflated::Batch` and a `&deflated::Batch`. The two
+/// conversions take different decode paths and fail with different
+/// [`nisshi_sans_io::Error`] variants for the same bytes: by value, an
+/// uncompressed batch is parsed directly and a short record fails with
+/// `Overflow` or `TryGet`. By reference, every batch goes through the serde
+/// decoder and the same record fails with `Io(UnexpectedEof)`. Mapping every
+/// error keeps the client-visible code the same on every backend, whichever
+/// path it uses.
+///
+/// Every error is safe to treat as the client's fault, because decoding only
+/// reads bytes already in memory: decompression, varints, lengths and record
+/// fields all come from the request. Retrying the same bytes fails the same
+/// way, so the client needs `INVALID_RECORD` rather than
+/// `UNKNOWN_SERVER_ERROR`.
+///
+/// For a compressed batch this differs from Kafka on purpose. Kafka answers
+/// `INVALID_RECORD` for a truncated uncompressed record, but it wraps a
+/// decompression failure, including record data that is not a stream of the
+/// declared codec, in a `KafkaException`, and the client gets
+/// `UNKNOWN_SERVER_ERROR`. That code invites a retry of the same bytes, which
+/// cannot succeed. See
+/// <https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L633-L641>.
+///
+/// The decode error is logged at debug: [`ProduceService`] logs each
+/// rejection once, at warn, with the topic and partition, and a client can
+/// send any number of batches that do not decode.
+///
+/// A batch over the decoded-size limit keeps its
+/// [`nisshi_sans_io::Error::MessageMaxSizeExceeded`], so that
+/// [`ProduceService`] answers `MESSAGE_TOO_LARGE`, which a producer can
+/// recover from by splitting the batch.
+///
+/// Only use this on a batch from a client Produce request. A stored batch
+/// that fails to decode is a broker fault, and must keep its own error.
+pub fn inflate_produced<B>(batch: B) -> Result<inflated::Batch>
+where
+    inflated::Batch: TryFrom<B, Error = nisshi_sans_io::Error>,
+{
+    inflated::Batch::try_from(batch).map_err(|err| match err {
+        nisshi_sans_io::Error::MessageMaxSizeExceeded(_) => Error::SansIo(err),
+        err => {
+            debug!(?err, "produce batch does not decode");
+            Error::Api(ErrorCode::InvalidRecord)
+        }
+    })
+}
 
 /// Why a client batch must be rejected before anything is written, with the
 /// error code to send, or `None` if it may be stored. Kafka's `LogValidator`
@@ -35,6 +85,12 @@ use crate::{Error, Result, Storage, Topition};
 ///   [`ProduceService`]. Every backend skips schema validation and lake
 ///   writes for a control batch, so a client must not be able to set the bit.
 ///   `INVALID_RECORD`.
+/// - The compression codec in the attributes must be one Kafka defines. An
+///   unknown codec id is a defect in the client's batch header, like a bad
+///   record count. Kafka returns `UNKNOWN_SERVER_ERROR` for it only because
+///   its codec lookup throws an unchecked exception that reaches the generic
+///   handler. Checking here also stops a backend from advancing the high
+///   watermark before it parses the attributes. `INVALID_RECORD`.
 /// - A consistent header has at least one record and
 ///   `last_offset_delta + 1 == record_count`. Every backend uses
 ///   `last_offset_delta` to advance the high watermark, so a mismatch corrupts
@@ -51,6 +107,10 @@ fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
             ErrorCode::InvalidRecord,
             "clients may not write control batches",
         ));
+    }
+
+    if BatchAttribute::try_from(batch.attributes).is_err() {
+        return Some((ErrorCode::InvalidRecord, "unknown compression codec"));
     }
 
     let Ok(record_count) = i32::try_from(batch.record_count) else {
@@ -156,6 +216,40 @@ mod rejection_tests {
             ErrorCode::UnknownTopicOrPartition,
             storage_error_code(&Error::Api(ErrorCode::UnknownTopicOrPartition))
         );
+    }
+
+    #[test]
+    fn a_produced_batch_over_the_decoded_size_limit_is_message_too_large() {
+        let oversized = || deflated::Batch {
+            record_count: 1_000_000,
+            last_offset_delta: 999_999,
+            ..Default::default()
+        };
+
+        for result in [
+            inflate_produced(&oversized()),
+            inflate_produced(oversized()),
+        ] {
+            let error = result.expect_err("an oversized batch must not decode");
+            assert_eq!(ErrorCode::MessageTooLarge, storage_error_code(&error));
+        }
+    }
+
+    #[test]
+    fn a_produced_batch_that_does_not_decode_is_an_invalid_record() {
+        let truncated = || deflated::Batch {
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        };
+
+        for result in [
+            inflate_produced(&truncated()),
+            inflate_produced(truncated()),
+        ] {
+            let error = result.expect_err("a batch without record data must not decode");
+            assert_eq!(ErrorCode::InvalidRecord, storage_error_code(&error));
+        }
     }
 
     #[test]
@@ -299,89 +393,104 @@ where
         name: &str,
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
-        if let Some(records) = partition.records {
-            if let Some((rejected, error_code, reason)) = records.batches.iter().find_map(|batch| {
-                rejection(batch).map(|(error_code, reason)| (batch, error_code, reason))
-            }) {
-                warn!(
-                    topic = name,
-                    partition = partition.index,
-                    record_count = rejected.record_count,
-                    last_offset_delta = rejected.last_offset_delta,
-                    ?error_code,
-                    reason,
-                    "rejecting produce batch",
-                );
+        let Some(records) = partition.records else {
+            return self.error(partition.index, ErrorCode::UnknownServerError);
+        };
 
-                return self
-                    .error(partition.index, error_code)
-                    .error_message(Some(reason.into()));
-            }
+        // Kafka allows exactly one batch per partition from Produce v3, the
+        // first version that carries record batches, which is the only format
+        // this broker decodes. Kafka checks the count before it validates any
+        // batch, so this check runs before `rejection`. See
+        // https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
+        let batches = records.batches.len();
+        let Ok([mut batch]) = <[deflated::Batch; 1]>::try_from(records.batches) else {
+            const REASON: &str =
+                "a produce request must contain exactly one record batch per partition";
 
-            let mut base_offset = None;
+            warn!(
+                topic = name,
+                partition = partition.index,
+                batches,
+                reason = REASON,
+                "rejecting produce request",
+            );
 
-            for mut batch in records.batches {
-                let tp = Topition::new(name, partition.index);
+            return self
+                .error(partition.index, ErrorCode::InvalidRecord)
+                .error_message(Some(REASON.into()));
+        };
 
-                if BatchAttribute::try_from(batch.attributes)
-                    .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
-                    .unwrap_or_default()
-                {
-                    let base_timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_millis() as i64)
-                        .unwrap_or_default();
+        if let Some((error_code, reason)) = rejection(&batch) {
+            warn!(
+                topic = name,
+                partition = partition.index,
+                producer_id = batch.producer_id,
+                record_count = batch.record_count,
+                last_offset_delta = batch.last_offset_delta,
+                ?error_code,
+                reason,
+                "rejecting produce batch",
+            );
 
-                    batch.base_timestamp = base_timestamp;
-                    batch.max_timestamp = base_timestamp;
+            return self
+                .error(partition.index, error_code)
+                .error_message(Some(reason.into()));
+        }
+
+        if BatchAttribute::try_from(batch.attributes)
+            .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
+            .unwrap_or_default()
+        {
+            let base_timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or_default();
+
+            batch.base_timestamp = base_timestamp;
+            batch.max_timestamp = base_timestamp;
+        }
+
+        let tp = Topition::new(name, partition.index);
+        let producer_id = batch.producer_id;
+
+        match self.storage.produce(transaction_id, &tp, batch).await {
+            Ok(base_offset) => PartitionProduceResponse::default()
+                .index(partition.index)
+                .error_code(ErrorCode::None.into())
+                .base_offset(base_offset)
+                .log_append_time_ms(Some(-1))
+                .log_start_offset(Some(0))
+                .record_errors(Some([].into()))
+                .error_message(None)
+                .current_leader(None),
+
+            Err(error) => {
+                let error_code = storage_error_code(&error);
+
+                // Logged once, here, with the partition: a rejection
+                // the client caused is a warning, an internal failure
+                // is an error.
+                if error_code == ErrorCode::UnknownServerError {
+                    error!(
+                        topic = name,
+                        partition = partition.index,
+                        producer_id,
+                        ?error,
+                        "produce failed"
+                    );
+                } else {
+                    warn!(
+                        topic = name,
+                        partition = partition.index,
+                        producer_id,
+                        ?error_code,
+                        %error,
+                        "rejecting produce batch"
+                    );
                 }
 
-                match self.storage.produce(transaction_id, &tp, batch).await {
-                    Ok(offset) => _ = base_offset.get_or_insert(offset),
-
-                    Err(error) => {
-                        let error_code = storage_error_code(&error);
-
-                        // Logged once, here, with the partition: a rejection
-                        // the client caused is a warning, an internal failure
-                        // is an error.
-                        if error_code == ErrorCode::UnknownServerError {
-                            error!(
-                                topic = name,
-                                partition = partition.index,
-                                ?error,
-                                "produce failed"
-                            );
-                        } else {
-                            warn!(
-                                topic = name,
-                                partition = partition.index,
-                                ?error_code,
-                                %error,
-                                "rejecting produce batch"
-                            );
-                        }
-
-                        return self.error(partition.index, error_code);
-                    }
-                }
+                self.error(partition.index, error_code)
             }
-
-            if let Some(base_offset) = base_offset {
-                PartitionProduceResponse::default()
-                    .index(partition.index)
-                    .error_code(ErrorCode::None.into())
-                    .base_offset(base_offset)
-                    .log_append_time_ms(Some(-1))
-                    .log_start_offset(Some(0))
-                    .record_errors(Some([].into()))
-                    .error_message(None)
-                    .current_leader(None)
-            } else {
-                self.error(partition.index, ErrorCode::UnknownServerError)
-            }
-        } else {
-            self.error(partition.index, ErrorCode::UnknownServerError)
         }
     }
 
