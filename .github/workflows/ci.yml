@@ -125,7 +125,7 @@ jobs:
           # shares one entry and only one of them should save it: pg17,
           # the leg that runs in both tiers.
           cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.pg == 'postgres:17' }}
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
@@ -432,7 +432,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-about@0.8.4
       - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
