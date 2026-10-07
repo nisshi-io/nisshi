@@ -65,7 +65,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -1468,16 +1468,34 @@ impl Postgres {
     }
 
     /// Mints a fresh producer, or bumps an existing transactional.id's producer to its next
-    /// epoch -- shared by a plain (-1, -1) InitProducerId request and, once validated
-    /// against the current record, a KIP-360-style epoch-bump recovery request.
+    /// epoch.
+    ///
+    /// A `claim` must match the transactional ID's current producer and epoch, or the
+    /// answer is [`ErrorCode::ProducerFenced`]. Without a transactional ID, or for one with
+    /// no producer yet, the claim is ignored, as in Kafka.
     async fn bump_or_create_producer(
         &self,
         transaction_id: Option<&str>,
         transaction_timeout_ms: i32,
+        claim: Option<(i64, i16)>,
     ) -> Result<ProducerIdResponse> {
         if let Some(transaction_id) = transaction_id {
             let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
             let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+            // At read committed, two requests for this transactional ID can both read the
+            // same epoch before either bumps it, and both pass the claim check. The lock
+            // makes the second request wait, and its next statement then reads the
+            // committed bump. The unique transactional ID name covers a txn row that does
+            // not exist yet.
+            _ = self
+                .tx_prepare_query_opt(
+                    &tx,
+                    "txn_select_name_for_update.sql",
+                    &[&self.cluster, &transaction_id],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
 
             if let Some(row) = self
                 .tx_prepare_query_opt(
@@ -1497,7 +1515,37 @@ impl Postgres {
                         TxnState::from_str(status.as_str()).map(Some)
                     })?;
 
-                debug!(transaction_id, id, epoch, ?status);
+                debug!(transaction_id, id, epoch, ?status, ?claim);
+
+                if let Some(claim) = claim {
+                    // The claim must match the producer's newest epoch, not the newest
+                    // epoch with a transaction. The timeout sweep fences a producer by
+                    // adding an epoch without a transaction, and the fenced producer must
+                    // not get the transactional ID back with its old epoch.
+                    let current = self
+                        .tx_prepare_query_opt(
+                            &tx,
+                            "producer_epoch_current_for_producer.sql",
+                            &[&self.cluster, &id],
+                        )
+                        .await
+                        .inspect_err(|err| error!(?err))?
+                        .map(|row| row.try_get::<_, i16>(0))
+                        .transpose()
+                        .inspect_err(|err| error!(?err))?
+                        .unwrap_or(epoch);
+
+                    let error = check_claim((id, current), claim);
+
+                    if error != ErrorCode::None {
+                        _ = tx
+                            .rollback()
+                            .await
+                            .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
+
+                        return Ok(ProducerIdResponse::failed(error));
+                    }
+                }
 
                 if let Some(TxnState::Begin) = status {
                     let error = self
@@ -3607,68 +3655,14 @@ impl Storage for Postgres {
             transaction_id, producer_id, producer_epoch
         );
 
-        // (None, None) means an older InitProducerId API version (<= 2), which has no wire
-        // representation for these fields at all -- there is no other possible meaning for
-        // those versions, so treat it exactly like an explicit (-1, -1) "give me a fresh
-        // epoch" request.
-        let requesting_fresh = matches!((producer_id, producer_epoch), (None, None))
-            || (producer_id.is_some_and(|producer_id| producer_id == -1)
-                && producer_epoch.is_some_and(|producer_epoch| producer_epoch == -1));
+        match producer_claim(producer_id, producer_epoch) {
+            Ok(claim) => {
+                self.bump_or_create_producer(transaction_id, transaction_timeout_ms, claim)
+                    .await
+            }
 
-        if requesting_fresh {
-            return self
-                .bump_or_create_producer(transaction_id, transaction_timeout_ms)
-                .await;
+            Err(error) => Ok(ProducerIdResponse::failed(error)),
         }
-
-        let (Some(producer_id), Some(producer_epoch)) = (producer_id, producer_epoch) else {
-            // one of producer_id/producer_epoch was set without the other -- not a
-            // well-formed request under any InitProducerId version.
-            return Ok(ProducerIdResponse {
-                error: ErrorCode::InvalidRequest,
-                id: producer_id.unwrap_or(-1),
-                epoch: producer_epoch.unwrap_or(-1),
-            });
-        };
-
-        // KIP-360-style epoch-bump recovery: the client claims a specific, already-issued
-        // identity (a v3+ producer recovering after e.g. a broker-initiated abort) rather
-        // than asking for a brand new one. Validate the claim against what's actually on
-        // record before treating it the same as a fresh bump -- a stale claim (exactly what
-        // maintain_transactions' sweep produces by fencing a timed-out producer) must be
-        // rejected as ProducerFenced, not silently granted a new epoch.
-        let c = self.connection().await.inspect_err(|err| error!(?err))?;
-
-        let Some(row) = self
-            .prepare_query_opt(
-                &c,
-                "producer_epoch_current_for_producer.sql",
-                &[&self.cluster, &producer_id],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
-        else {
-            return Ok(ProducerIdResponse {
-                error: ErrorCode::UnknownProducerId,
-                id: producer_id,
-                epoch: producer_epoch,
-            });
-        };
-
-        let current_epoch = row.try_get::<_, i16>(0).inspect_err(|err| error!(?err))?;
-
-        if producer_epoch != current_epoch {
-            return Ok(ProducerIdResponse {
-                error: ErrorCode::ProducerFenced,
-                id: producer_id,
-                epoch: producer_epoch,
-            });
-        }
-
-        drop(c);
-
-        self.bump_or_create_producer(transaction_id, transaction_timeout_ms)
-            .await
     }
 
     #[instrument(skip_all)]
@@ -6136,6 +6130,194 @@ mod tests {
             stale_recovery.error,
             "a recovery request carrying a stale epoch must be rejected as ProducerFenced"
         );
+
+        Ok(())
+    }
+
+    /// The timeout sweep fences a producer by adding an epoch that has no transaction. A
+    /// claim of the fenced epoch must be rejected, not bumped past the sweep's epoch.
+    #[tokio::test]
+    async fn init_producer_recovery_after_sweep_is_fenced() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_recovery_after_sweep_is_fenced: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"abandoned").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let fenced = storage
+            .init_producer(
+                Some(transaction_id.as_str()),
+                10_000,
+                Some(producer.id),
+                Some(producer.epoch),
+            )
+            .await?;
+
+        assert_eq!(ErrorCode::ProducerFenced, fenced.error);
+        assert_eq!((-1, -1), (fenced.id, fenced.epoch));
+
+        let fresh = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        assert_eq!(ErrorCode::None, fresh.error);
+        assert_eq!(producer.id, fresh.id);
+        assert_eq!(producer.epoch + 2, fresh.epoch);
+
+        Ok(())
+    }
+
+    /// Concurrent claims of the same producer and epoch bump the epoch once: one claim
+    /// succeeds, and every other claim is fenced against the bumped epoch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn init_producer_concurrent_claims_bump_once() -> Result<()> {
+        const CLAIMS: usize = 8;
+        const ROUNDS: usize = 10;
+
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_concurrent_claims_bump_once: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        // Open a pooled connection for each claim first, so that the claims run at the
+        // same time instead of one after another while the pool connects.
+        drop(future::try_join_all((0..CLAIMS).map(|_| storage.connection())).await?);
+
+        let transaction_id = alphanumeric_string(10);
+
+        let mut producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        for _ in 0..ROUNDS {
+            let claims = (0..CLAIMS)
+                .map(|_| {
+                    let storage = storage.clone();
+                    let transaction_id = transaction_id.clone();
+
+                    tokio::spawn(async move {
+                        storage
+                            .init_producer(
+                                Some(transaction_id.as_str()),
+                                10_000,
+                                Some(producer.id),
+                                Some(producer.epoch),
+                            )
+                            .await
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut responses = vec![];
+
+            for claim in claims {
+                responses.push(claim.await.expect("claim task panicked"));
+            }
+
+            let bumped = responses
+                .iter()
+                .filter_map(|response| response.as_ref().ok())
+                .filter(|response| response.error == ErrorCode::None)
+                .copied()
+                .collect::<Vec<_>>();
+
+            let fenced = responses
+                .iter()
+                .filter_map(|response| response.as_ref().ok())
+                .filter(|response| response.error == ErrorCode::ProducerFenced)
+                .count();
+
+            assert_eq!(1, bumped.len(), "{responses:?}");
+            assert_eq!(CLAIMS - 1, fenced, "{responses:?}");
+            assert_eq!(
+                (producer.id, producer.epoch + 1),
+                (bumped[0].id, bumped[0].epoch)
+            );
+
+            producer = bumped[0];
+        }
 
         Ok(())
     }

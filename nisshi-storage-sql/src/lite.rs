@@ -56,7 +56,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
     ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel,
+    bounded_channel, check_claim, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -4259,8 +4259,20 @@ impl Storage for Delegate {
             transaction_id, transaction_timeout_ms, producer_id, producer_epoch
         );
 
-        match (producer_id, producer_epoch, transaction_id) {
-            (Some(-1), Some(-1), Some(transaction_id)) => {
+        let claim = match producer_claim(producer_id, producer_epoch) {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
+                    DELEGATE_REQUEST_DURATION.record(
+                        elapsed_millis(start),
+                        &[KeyValue::new("operation", "init_producer")],
+                    )
+                });
+            }
+        };
+
+        match transaction_id {
+            Some(transaction_id) => {
                 let pc = self.connection().await?;
                 let tx = pc.transaction().await?;
 
@@ -4281,7 +4293,25 @@ impl Storage for Delegate {
                             TxnState::from_str(status.as_str()).map(Some)
                         })?;
 
-                    debug!(transaction_id, id, epoch, ?status);
+                    debug!(transaction_id, id, epoch, ?status, ?claim);
+
+                    if let Some(claim) = claim {
+                        let error = check_claim((id, epoch), claim);
+
+                        if error != ErrorCode::None {
+                            _ = tx
+                                .rollback()
+                                .await
+                                .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
+
+                            return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
+                                DELEGATE_REQUEST_DURATION.record(
+                                    elapsed_millis(start),
+                                    &[KeyValue::new("operation", "init_producer")],
+                                )
+                            });
+                        }
+                    }
 
                     if let Some(TxnState::Begin) = status {
                         let error = self
@@ -4412,7 +4442,7 @@ impl Storage for Delegate {
                 })
             }
 
-            (Some(-1), Some(-1), None) => {
+            None => {
                 let pc = self.connection().await?;
                 let tx = pc.transaction().await?;
 
@@ -4494,8 +4524,6 @@ impl Storage for Delegate {
                     })
                 }
             }
-
-            (_, _, _) => todo!(),
         }
     }
 

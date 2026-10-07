@@ -60,7 +60,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -2015,99 +2015,110 @@ impl Storage for DynoStore {
             },
         }
 
+        let claim = match producer_claim(producer_id, producer_epoch) {
+            Ok(claim) => claim,
+            Err(error) => return Ok(ProducerIdResponse::failed(error)),
+        };
+
         if let Some(transaction_id) = transaction_id {
             match self
                 .meta
                 .with_mut(&self.object_store, |meta| {
-                    debug!(?meta);
-                    match (producer_id, producer_epoch) {
-                        (Some(-1), Some(-1)) => {
-                            match meta.transactions.entry(transaction_id.to_string()) {
-                                Entry::Vacant(vacant) => {
-                                    let id = meta
-                                        .producers
-                                        .last_key_value()
-                                        .map_or(1.into(), |(k, _v)| k + 1);
+                    debug!(?meta, ?claim);
+                    match meta.transactions.entry(transaction_id.to_string()) {
+                        Entry::Vacant(vacant) => {
+                            let id = meta
+                                .producers
+                                .last_key_value()
+                                .map_or(1.into(), |(k, _v)| k + 1);
 
-                                    let mut pd = ProducerDetail::default();
-                                    assert_eq!(None, pd.sequences.insert(0, BTreeMap::new()));
-                                    assert_eq!(None, meta.producers.insert(id, pd));
+                            let mut pd = ProducerDetail::default();
+                            assert_eq!(None, pd.sequences.insert(0, BTreeMap::new()));
+                            assert_eq!(None, meta.producers.insert(id, pd));
 
-                                    let mut epochs = BTreeMap::new();
+                            let mut epochs = BTreeMap::new();
+                            assert_eq!(
+                                None,
+                                epochs.insert(
+                                    0,
+                                    TxnDetail {
+                                        transaction_timeout_ms,
+                                        ..Default::default()
+                                    },
+                                )
+                            );
+
+                            _ = vacant.insert(Txn {
+                                producer: id,
+                                epochs,
+                            });
+
+                            Ok(InitProducer::Completed(ProducerIdResponse {
+                                id,
+                                epoch: 0,
+                                error: ErrorCode::None,
+                            }))
+                        }
+
+                        Entry::Occupied(mut occupied) => {
+                            if let Some((current_epoch, txn_detail)) =
+                                occupied.get().epochs.last_key_value()
+                            {
+                                if let Some(claim) = claim {
+                                    let error = check_claim(
+                                        (occupied.get().producer, *current_epoch),
+                                        claim,
+                                    );
+
+                                    if error != ErrorCode::None {
+                                        return Ok(InitProducer::Completed(
+                                            ProducerIdResponse::failed(error),
+                                        ));
+                                    }
+                                }
+
+                                if txn_detail.state == Some(TxnState::Begin) {
+                                    Ok(InitProducer::NeedToRollback {
+                                        producer_id: occupied.get().producer,
+                                        producer_epoch: *current_epoch,
+                                    })
+                                } else {
+                                    let id = occupied.get().producer;
+                                    let epoch = current_epoch + 1;
+
+                                    _ = meta.producers.entry(id).and_modify(|pd| {
+                                        assert_eq!(
+                                            None,
+                                            pd.sequences.insert(epoch, BTreeMap::new())
+                                        );
+                                    });
+
                                     assert_eq!(
                                         None,
-                                        epochs.insert(
-                                            0,
+                                        occupied.get_mut().epochs.insert(
+                                            epoch,
                                             TxnDetail {
                                                 transaction_timeout_ms,
                                                 ..Default::default()
-                                            },
+                                            }
                                         )
                                     );
 
-                                    _ = vacant.insert(Txn {
-                                        producer: id,
-                                        epochs,
-                                    });
-
                                     Ok(InitProducer::Completed(ProducerIdResponse {
                                         id,
-                                        epoch: 0,
+                                        epoch,
                                         error: ErrorCode::None,
                                     }))
                                 }
+                            } else {
+                                // Unreachable: every transaction starts with epoch 0,
+                                // and no code removes an epoch.
+                                error!(transaction_id, "transaction has no epoch");
 
-                                Entry::Occupied(mut occupied) => {
-                                    if let Some((current_epoch, txn_detail)) =
-                                        occupied.get().epochs.last_key_value()
-                                    {
-                                        if txn_detail.state == Some(TxnState::Begin) {
-                                            Ok(InitProducer::NeedToRollback {
-                                                producer_id: occupied.get().producer,
-                                                producer_epoch: *current_epoch,
-                                            })
-                                        } else {
-                                            let id = occupied.get().producer;
-                                            let epoch = current_epoch + 1;
-
-                                            _ = meta.producers.entry(id).and_modify(|pd| {
-                                                assert_eq!(
-                                                    None,
-                                                    pd.sequences.insert(epoch, BTreeMap::new())
-                                                );
-                                            });
-
-                                            assert_eq!(
-                                                None,
-                                                occupied.get_mut().epochs.insert(
-                                                    epoch,
-                                                    TxnDetail {
-                                                        transaction_timeout_ms,
-                                                        ..Default::default()
-                                                    }
-                                                )
-                                            );
-
-                                            Ok(InitProducer::Completed(ProducerIdResponse {
-                                                id,
-                                                epoch,
-                                                error: ErrorCode::None,
-                                            }))
-                                        }
-                                    } else {
-                                        todo!()
-                                    }
-                                }
+                                Ok(InitProducer::Completed(ProducerIdResponse::failed(
+                                    ErrorCode::UnknownServerError,
+                                )))
                             }
-                        }
-
-                        (producer, epoch) => {
-                            error!(?producer, ?epoch);
-                            Ok(InitProducer::Completed(ProducerIdResponse {
-                                id: -1,
-                                epoch: -1,
-                                error: ErrorCode::UnknownServerError,
-                            }))
                         }
                     }
                 })
@@ -2151,35 +2162,22 @@ impl Storage for DynoStore {
             self.meta
                 .with_mut(&self.object_store, |meta| {
                     debug!(?meta);
-                    match (producer_id, producer_epoch) {
-                        (Some(-1), Some(-1)) => {
-                            let producer = meta
-                                .producers
-                                .last_key_value()
-                                .map_or(1.into(), |(k, _v)| k + 1);
+                    let producer = meta
+                        .producers
+                        .last_key_value()
+                        .map_or(1.into(), |(k, _v)| k + 1);
 
-                            let epoch = 0;
-                            let mut pd = ProducerDetail::default();
-                            assert_eq!(None, pd.sequences.insert(epoch, BTreeMap::new()));
-                            debug!(?producer, ?pd);
-                            assert_eq!(None, meta.producers.insert(producer, pd));
+                    let epoch = 0;
+                    let mut pd = ProducerDetail::default();
+                    assert_eq!(None, pd.sequences.insert(epoch, BTreeMap::new()));
+                    debug!(?producer, ?pd);
+                    assert_eq!(None, meta.producers.insert(producer, pd));
 
-                            Ok(ProducerIdResponse {
-                                id: producer,
-                                epoch,
-                                ..Default::default()
-                            })
-                        }
-
-                        (producer, epoch) => {
-                            error!(?producer, ?epoch);
-                            Ok(ProducerIdResponse {
-                                id: -1,
-                                epoch: -1,
-                                error: ErrorCode::UnknownServerError,
-                            })
-                        }
-                    }
+                    Ok(ProducerIdResponse {
+                        id: producer,
+                        epoch,
+                        ..Default::default()
+                    })
                 })
                 .await
         }
