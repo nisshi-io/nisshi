@@ -79,7 +79,10 @@ services:
       - 9092:9092
       - 9100:9100
   jaeger:
-    image: jaegertracing/all-in-one
+    # Jaeger v1 (jaegertracing/all-in-one) is end of life. Jaeger v2 ships
+    # under a different image name, jaegertracing/jaeger, so a move to v2
+    # needs more than a tag bump.
+    image: jaegertracing/all-in-one:1.76.0
     ports:
       - 16686:16686
       - 4317:4317

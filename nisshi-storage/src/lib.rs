@@ -323,7 +323,14 @@ pub enum Error {
 
     UnknownCacheKey(String),
 
-    UnsupportedStorageUrl(Url),
+    /// A storage URL named a query option that scheme's engine does not
+    /// recognise (for example a typo, or an option that belongs to a
+    /// different engine).
+    UnrecognizedStorageOption {
+        scheme: String,
+        option: String,
+    },
+
     UnexpectedAddPartitionsToTxnRequest(Box<AddPartitionsToTxnRequest>),
     Url(#[from] url::ParseError),
     UnknownTxnState(String),
@@ -615,6 +622,10 @@ pub type ListOffsetRequest = ListOffset;
 pub struct ListOffsetResponse {
     pub error_code: ErrorCode,
     pub timestamp: Option<SystemTime>,
+    /// `None` when a [`ListOffset::Timestamp`] lookup matches no record, or
+    /// when `error_code` is not [`ErrorCode::None`]; `ListOffsetsService`
+    /// sends `None` as -1, as Kafka does. [`ListOffset::Earliest`] and
+    /// [`ListOffset::Latest`] with [`ErrorCode::None`] are always `Some`.
     pub offset: Option<i64>,
 }
 
@@ -1426,7 +1437,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query the offset stage for a topic partition.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
-    /// Query the offsets for one or more topic partitions.
+    /// Query the offsets for one or more topic partitions. See
+    /// [`ListOffsetResponse::offset`] for when an answer has no offset.
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
@@ -2211,6 +2223,23 @@ pub struct Builder<N, C, A, S> {
 type PhantomBuilder =
     Builder<PhantomData<i32>, PhantomData<String>, PhantomData<Url>, PhantomData<Url>>;
 
+/// Returns [`Error::UnrecognizedStorageOption`] for the first of `storage`'s query keys
+/// that is not in `recognized`.
+///
+/// A [`StorageFactory::build`] passes the options that its engine reads, so a misspelt
+/// option, or an option of a different engine, stops startup instead of being ignored.
+pub fn reject_unrecognized_options(storage: &Url, recognized: &[&str]) -> Result<()> {
+    storage
+        .query_pairs()
+        .find(|(k, _)| !recognized.contains(&k.as_ref()))
+        .map_or(Ok(()), |(k, _)| {
+            Err(Error::UnrecognizedStorageOption {
+                scheme: storage.scheme().to_owned(),
+                option: k.into_owned(),
+            })
+        })
+}
+
 impl<N, C, A, S> Builder<N, C, A, S> {
     pub fn node_id(self, node_id: i32) -> Builder<i32, C, A, S> {
         Builder {
@@ -2491,6 +2520,35 @@ mod tests {
         let message = err.to_string();
         assert!(!message.contains("secret"));
         assert!(message.contains("user@host"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn reject_unrecognized_options_accepts_listed_keys() -> Result<()> {
+        reject_unrecognized_options(&Url::parse("sqlite://nisshi.db")?, &[])?;
+        reject_unrecognized_options(
+            &Url::parse("sqlite://nisshi.db?vacuum_into=/tmp/x&mode=memory")?,
+            &["vacuum_into", "mode"],
+        )
+    }
+
+    #[test]
+    fn reject_unrecognized_options_names_unknown_key_and_scheme() -> Result<()> {
+        let error = reject_unrecognized_options(
+            &Url::parse("sqlite://nisshi.db?vacuum_onto=/tmp/x")?,
+            &["vacuum_into"],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                Error::UnrecognizedStorageOption { scheme, option }
+                    if scheme == "sqlite" && option == "vacuum_onto"
+            ),
+            "{error:?}"
+        );
 
         Ok(())
     }

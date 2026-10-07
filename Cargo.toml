@@ -118,6 +118,7 @@ iceberg-storage-opendal = { version = "0.10.1", default-features = false, featur
 indicatif = "0.18.3"
 jsonschema = "0.45.0"
 lazy_static = "1.4.0"
+libc = "0.2.189"
 libfuzzer-sys = "0.4"
 libsql = { version = "0.9.18", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
@@ -158,6 +159,7 @@ serde_json = "1"
 sha2 = "0.10.9"
 slatedb = "0.14.1"
 snap = "1.1.1"
+socket2 = "0.6.5"
 syn = { version = "3.0.3", features = ["extra-traits", "full"] }
 nisshi = { version = "0.7.0-pre.2", path = "nisshi", default-features = false }
 nisshi-auth = { version = "0.7.0-pre.2", path = "nisshi-auth", default-features = false }

@@ -1320,11 +1320,18 @@ impl Storage for DynoStore {
                     },
                 ))
             } else {
+                // No matching object: Earliest/Latest answer 0, a Timestamp
+                // lookup answers no offset (see `ListOffsetResponse::offset`).
+                let offset = match offset_request {
+                    ListOffset::Earliest | ListOffset::Latest => Some(0),
+                    ListOffset::Timestamp(_) => None,
+                };
+
                 responses.push((
                     topition.to_owned(),
                     ListOffsetResponse {
                         error_code: ErrorCode::None,
-                        offset: Some(0),
+                        offset,
                         ..Default::default()
                     },
                 ))

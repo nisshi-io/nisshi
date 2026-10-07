@@ -1400,10 +1400,11 @@ impl Storage for Engine {
                             offset: Some(offset),
                             timestamp: to_system_time(ts).ok(),
                         },
-                        // Match PostgreSQL behavior: return offset 0 when no match found
+                        // No record at or after the target: no offset (see
+                        // `ListOffsetResponse::offset`).
                         None => ListOffsetResponse {
                             error_code: ErrorCode::None,
-                            offset: Some(0),
+                            offset: None,
                             timestamp: None,
                         },
                     }
