@@ -16,7 +16,11 @@
 
 use std::collections::HashMap;
 
-use apache_avro::{Reader, schema::Schema as AvroSchema, types::Value};
+use apache_avro::{
+    Reader,
+    schema::{Schema as AvroSchema, SchemaKind},
+    types::Value,
+};
 use bytes::Bytes;
 use chrono::NaiveDateTime;
 
@@ -328,13 +332,14 @@ fn field_ids(schema: &AvroSchema) -> HashMap<String, i32> {
 }
 
 fn decode(validator: Option<&AvroSchema>, encoded: Option<Bytes>) -> Result<Option<Value>> {
-    debug!(?validator, ?encoded);
+    debug!(?validator, len = ?encoded.as_ref().map(Bytes::len));
     validator.map_or(Ok(None), |schema| {
         encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
+            // The apache_avro error writes the record's values into its
+            // message, so we log that the record failed and not the error.
             Reader::with_schema(schema, &encoded[..])
                 .and_then(|reader| reader.into_iter().next().transpose())
-                .inspect(|value| debug!(?value))
-                .inspect_err(|err| debug!(?err))
+                .inspect_err(|_| debug!("record does not match its Avro schema"))
                 .map_err(|_| Error::Api(ErrorCode::InvalidRecord))
                 .and_then(|value| value.ok_or(Error::Api(ErrorCode::InvalidRecord)))
                 .map(Some)
@@ -363,7 +368,7 @@ impl Validator for Schema {
 }
 
 fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
-    debug!(?schema, ?json);
+    debug!(?schema);
 
     match (schema, json) {
         (AvroSchema::Null, JsonValue::Null) => Ok(Value::Null),
@@ -374,17 +379,17 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
             .as_i64()
             .ok_or(Error::JsonToAvro(
                 Box::new(schema.to_owned()),
-                Box::new(json.to_owned()),
+                crate::json_kind(json),
             ))
             .and_then(|value| i32::try_from(value).map_err(Into::into))
             .map(Value::Int)
-            .inspect_err(|err| debug!(?schema, ?json, ?err)),
+            .inspect_err(|err| debug!(?schema, ?err)),
 
         (AvroSchema::Long, JsonValue::Number(value)) => value
             .as_i64()
             .ok_or(Error::JsonToAvro(
                 Box::new(schema.to_owned()),
-                Box::new(json.to_owned()),
+                crate::json_kind(json),
             ))
             .map(Value::Long),
 
@@ -392,20 +397,20 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
             .as_f64()
             .ok_or(Error::JsonToAvro(
                 Box::new(schema.to_owned()),
-                Box::new(json.to_owned()),
+                crate::json_kind(json),
             ))
             .map(Value::Double)
-            .inspect_err(|err| debug!(?schema, ?json, ?err)),
+            .inspect_err(|err| debug!(?schema, ?err)),
 
         (AvroSchema::Float, JsonValue::Number(value)) => value
             .as_f64()
             .ok_or(Error::JsonToAvro(
                 Box::new(schema.to_owned()),
-                Box::new(json.to_owned()),
+                crate::json_kind(json),
             ))
             .map(|double| double as f32)
             .map(Value::Float)
-            .inspect_err(|err| debug!(?schema, ?json, ?err)),
+            .inspect_err(|err| debug!(?schema, ?err)),
 
         (AvroSchema::Uuid, JsonValue::String(value)) => {
             Uuid::parse_str(value).map_err(Into::into).map(Value::Uuid)
@@ -419,7 +424,7 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
             NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
                 .map(|date_time| date_time.and_utc().timestamp_millis())
                 .map(Value::TimestampMillis)
-                .inspect_err(|err| debug!(?err, value))
+                .inspect_err(|err| debug!(?err))
                 .map_err(Into::into)
         }
 
@@ -427,13 +432,13 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
             NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
                 .map(|date_time| date_time.and_utc().timestamp_micros())
                 .map(Value::TimestampMicros)
-                .inspect_err(|err| debug!(?err, value))
+                .inspect_err(|err| debug!(?err))
                 .map_err(Into::into)
         }
 
         (AvroSchema::TimestampNanos, JsonValue::String(value)) => {
             NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
-                .inspect_err(|err| debug!(?err, value))
+                .inspect_err(|err| debug!(?err))
                 .map_err(Into::into)
                 .and_then(|date_time| {
                     date_time
@@ -441,7 +446,7 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
                         .timestamp_nanos_opt()
                         .ok_or(Error::JsonToAvro(
                             Box::new(schema.to_owned()),
-                            Box::new(json.to_owned()),
+                            crate::json_kind(json),
                         ))
                 })
                 .map(Value::TimestampNanos)
@@ -454,7 +459,7 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
             .find(|(_, symbol)| *symbol == value)
             .ok_or(Error::JsonToAvro(
                 Box::new(schema.to_owned()),
-                Box::new(json.to_owned()),
+                crate::json_kind(json),
             ))
             .and_then(|(index, symbol)| {
                 u32::try_from(index)
@@ -470,7 +475,7 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
             .map(|value| from_json(schema.items.as_ref(), value))
             .collect::<Result<Vec<_>>>()
             .map(Value::Array)
-            .inspect_err(|err| debug!(?schema, ?json, ?err)),
+            .inspect_err(|err| debug!(?schema, ?err)),
 
         (AvroSchema::Map(inner), JsonValue::Object(values)) => values
             .iter()
@@ -486,11 +491,10 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
                     .get(&field.name)
                     .ok_or(Error::JsonToAvroFieldNotFound {
                         schema: Box::new(schema.to_owned()),
-                        value: Box::new(json.to_owned()),
                         field: field.name.clone(),
                     })
                     .and_then(|value| from_json(&field.schema, value))
-                    .inspect(|value| debug!(name = ?field.name, ?value))
+                    .inspect(|_| debug!(name = ?field.name))
                     .map(|value| (field.name.clone(), value))
             })
             .collect::<Result<Vec<_>>>()
@@ -499,7 +503,7 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
 
         (schema, value) => Err(Error::JsonToAvro(
             Box::new(schema.to_owned()),
-            Box::new(value.to_owned()),
+            crate::json_kind(value),
         )),
     }
 }
@@ -508,28 +512,24 @@ impl AsKafkaRecord for Schema {
     fn as_kafka_record(&self, value: &JsonValue) -> Result<nisshi_sans_io::record::Builder> {
         let mut builder = nisshi_sans_io::record::Record::builder();
 
-        if let Some(value) = value.get(MessageKind::Key.as_ref()) {
-            debug!(?value);
-
-            if let Some(ref schema) = self.key {
-                builder = builder.key(
-                    from_json(schema, value)
-                        .and_then(|value| schema_write(schema, value))
-                        .map(Into::into)?,
-                );
-            }
+        if let Some(value) = value.get(MessageKind::Key.as_ref())
+            && let Some(ref schema) = self.key
+        {
+            builder = builder.key(
+                from_json(schema, value)
+                    .and_then(|value| schema_write(schema, value))
+                    .map(Into::into)?,
+            );
         }
 
-        if let Some(value) = value.get(MessageKind::Value.as_ref()) {
-            debug!(?value);
-
-            if let Some(ref schema) = self.value {
-                builder = builder.value(
-                    from_json(schema, value)
-                        .and_then(|value| schema_write(schema, value))
-                        .map(Into::into)?,
-                );
-            }
+        if let Some(value) = value.get(MessageKind::Value.as_ref())
+            && let Some(ref schema) = self.value
+        {
+            builder = builder.value(
+                from_json(schema, value)
+                    .and_then(|value| schema_write(schema, value))
+                    .map(Into::into)?,
+            );
         }
 
         Ok(builder)
@@ -553,11 +553,11 @@ fn json_value(value: Value) -> Result<JsonValue> {
         Value::Long(inner) => Ok(JsonValue::Number(Number::from(inner))),
 
         Value::Float(inner) => Number::from_f64(inner as f64)
-            .ok_or(Error::AvroToJson(value.to_owned()))
+            .ok_or(Error::AvroToJson(SchemaKind::from(&value)))
             .map(JsonValue::Number),
 
         Value::Double(inner) => Number::from_f64(inner)
-            .ok_or(Error::AvroToJson(value.to_owned()))
+            .ok_or(Error::AvroToJson(SchemaKind::from(&value)))
             .map(JsonValue::Number),
 
         Value::Bytes(inner) => Ok(JsonValue::String(String::from(String::from_utf8_lossy(
@@ -651,9 +651,9 @@ pub fn r<'a>(
 
 #[doc(hidden)]
 pub fn schema_write(schema: &AvroSchema, value: Value) -> Result<Bytes> {
-    debug!(?schema, ?value);
+    debug!(?schema);
     let mut writer = apache_avro::Writer::new(schema, vec![]);
-    _ = writer.append(value)?;
+    _ = writer.append(value).map_err(|_| Error::AvroRecord)?;
     writer.into_inner().map(Bytes::from).map_err(Into::into)
 }
 
