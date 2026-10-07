@@ -33,7 +33,7 @@ use crate::{
         Header, Record,
         codec::{
             DecodeBudget, MAX_DECODED_BATCH_BYTES, MAX_PREALLOCATED_ELEMENTS,
-            exceeds_decoded_batch_limit,
+            MIN_ENCODED_RECORD_SIZE, exceeds_decoded_batch_limit,
         },
     },
 };
@@ -466,16 +466,26 @@ impl TryFrom<Batch> for Vec<Record> {
         debug!(?record_count);
         debug!(?batch.record_data);
 
+        let uncompressed = batch
+            .compression()
+            .is_ok_and(|compression| compression == Compression::None);
+
+        // On the uncompressed path `record_data` is the byte stream the
+        // records are decoded from, and no record encodes in fewer than
+        // `MIN_ENCODED_RECORD_SIZE` bytes, so a larger `record_count` means
+        // the batch is corrupt. This runs ahead of the decoded-size check so
+        // that such a batch is reported as corrupt, not as too large.
+        if uncompressed && record_count > batch.record_data.len() / MIN_ENCODED_RECORD_SIZE {
+            return Err(Error::Overflow);
+        }
+
         if batch.exceeds_decoded_record_count_limit() {
             return Err(Error::MessageMaxSizeExceeded(
                 record_count.saturating_mul(size_of::<Record>()),
             ));
         }
 
-        if batch
-            .compression()
-            .is_ok_and(|compression| compression == Compression::None)
-        {
+        if uncompressed {
             let mut budget = DecodeBudget::new(MAX_DECODED_BATCH_BYTES);
             let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
@@ -483,6 +493,10 @@ impl TryFrom<Batch> for Vec<Record> {
                 let record = Record::decode(&mut batch.record_data)?;
                 budget.charge(allocated_size(&record))?;
                 records.push(record);
+            }
+
+            if !batch.record_data.is_empty() {
+                return Err(Error::Overflow);
             }
 
             Ok(records)
@@ -1566,6 +1580,107 @@ mod tests {
             assert!(Vec::<Record>::try_from(batch.clone()).is_err());
             assert!(Vec::<Record>::try_from(&batch).is_err());
         }
+
+        Ok(())
+    }
+
+    /// A header count that outruns this record's own declared length is
+    /// rejected at the record's boundary, instead of reading into the bytes
+    /// that follow it in the batch (here, two bytes that belong to no
+    /// record). `record_count: 1` exercises one `Record::decode` call on the
+    /// uncompressed by-value path.
+    #[test]
+    fn header_count_reads_past_record_boundary_is_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // record: length=6, body=[attributes=0, timestamp_delta=0,
+        // offset_delta=0, null key, null value, header_count=1], followed
+        // by two bytes that belong to no record: a phantom null/null header
+        // that decode must not consume as this record's one declared
+        // header.
+        let record_data = Bytes::from_static(&[12, 0, 0, 0, 1, 1, 2, 1, 1]);
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 1,
+            record_data,
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a header count outrunning this record's declared length must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// `record_count` claims more records than the 10 bytes of
+    /// `record_data` could hold, since every record is at least
+    /// `MIN_ENCODED_RECORD_SIZE` bytes, so the batch is rejected before any
+    /// record is decoded.
+    #[test]
+    fn record_count_inconsistent_with_remaining_data_returns_overflow() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 5,
+            record_data: Bytes::from_static(&[0u8; 10]),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch).expect_err(
+            "a record_count inconsistent with the remaining record_data must be rejected",
+        );
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// A `record_count` the bytes cannot hold is reported as corrupt rather
+    /// than as too large, even when it is also past the decoded-size limit.
+    #[test]
+    fn record_count_inconsistent_with_data_wins_over_decoded_size_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: u32::MAX,
+            record_data: Bytes::from_static(&[0u8; 10]),
+            ..Default::default()
+        };
+
+        assert!(batch.exceeds_decoded_record_count_limit());
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("a record_count the record_data cannot hold must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    /// Bytes left in `record_data` after `record_count` records mean the
+    /// batch's declared size and its records disagree, so the batch is
+    /// rejected, as Kafka's `DefaultRecordBatch` does ("Incorrect declared
+    /// batch size, records still remaining").
+    #[test]
+    fn bytes_after_last_record_are_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut record_data = BytesMut::new();
+        record_data.put(Record::builder().build()?.encode()?);
+        record_data.put(Record::builder().build()?.encode()?);
+
+        let batch = Batch {
+            attributes: BatchAttribute::default().into(),
+            record_count: 1,
+            record_data: record_data.freeze(),
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(batch)
+            .expect_err("bytes after the last declared record must be rejected");
+        assert!(matches!(err, Error::Overflow), "{err:?}");
 
         Ok(())
     }

@@ -96,6 +96,12 @@ pub(crate) fn exceeds_decoded_batch_limit(count: usize, size: usize) -> bool {
     count.saturating_mul(size) > MAX_DECODED_BATCH_BYTES
 }
 
+/// The smallest a wire-encoded [`crate::record::Record`] can be: a 1-byte
+/// length prefix, a 1-byte attributes field, 1-byte (zero-valued) varints for
+/// the timestamp and offset deltas, and 1-byte null-sentinel varints for the
+/// key, value, and header count.
+pub(crate) const MIN_ENCODED_RECORD_SIZE: usize = 7;
+
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Octets(pub Option<Bytes>);
 
@@ -367,6 +373,19 @@ where
         let length = VarInt::decode(encoded)
             .and_then(|length| usize::try_from(length.0).map_err(|_| Error::Overflow))
             .inspect(|length| debug!(length))?;
+
+        // Matches Kafka's own bound in `DefaultRecord.readFrom`
+        // (`numHeaders > buffer.remaining()`): a real element needs at
+        // least one byte to encode, so a count that exceeds the bytes
+        // actually left can never be satisfied without reading past this
+        // buffer's true end. Deliberately undivided: a record can pack
+        // several null/null headers into very few bytes each, so dividing
+        // by anything larger than 1 here would reject real, valid batches.
+        // It runs ahead of the decoded-size check so that a count the bytes
+        // cannot hold is reported as corrupt, not as too large.
+        if length > encoded.len() {
+            return Err(Error::Overflow);
+        }
 
         if exceeds_decoded_batch_limit(length, size_of::<T>()) {
             return Err(Error::MessageMaxSizeExceeded(
