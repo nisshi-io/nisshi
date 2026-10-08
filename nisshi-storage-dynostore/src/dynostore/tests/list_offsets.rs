@@ -28,7 +28,9 @@ use std::{
 };
 
 use crate::dynostore::{
-    DynoStore, Txn, TxnDetail, TxnProduceOffset, Watermark, tests::init_tracing,
+    DynoStore, Txn, TxnDetail, TxnProduceOffset, Watermark,
+    tests::init_tracing,
+    time_index::{MAX_ENTRIES, TimeIndex},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -219,8 +221,7 @@ async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
     seed_watermark(&storage, &topition, |w| {
         w.low = Some(0);
         w.high = Some(2);
-        w.time_index = None;
-        w.time_index_complete = false;
+        w.time_index = TimeIndex::default();
         Ok(())
     })
     .await?;
@@ -228,7 +229,8 @@ async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
     // Step 1: collect a candidate from the pre-concurrent-produce state.
     let (candidate, batches) = storage.collect_time_index_candidate(&topition).await?;
     assert_eq!(2, batches);
-    assert_eq!(BTreeMap::from([(T0, 0)]), candidate);
+    assert_eq!(&BTreeMap::from([(T0, 0)]), candidate.entries());
+    assert_eq!(T0, candidate.max_timestamp());
 
     // Step 2: a concurrent produce lands before the backfill commits, with a
     // new running max above everything seen so far.
@@ -240,7 +242,12 @@ async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
     let merged = storage
         .commit_time_index_backfill(&topition, &candidate)
         .await?;
-    assert_eq!(BTreeMap::from([(T0, 0), (concurrent_timestamp, 2)]), merged);
+    assert_eq!(
+        &BTreeMap::from([(T0, 0), (concurrent_timestamp, 2)]),
+        merged.entries()
+    );
+    assert_eq!(concurrent_timestamp, merged.max_timestamp());
+    assert!(merged.is_complete());
 
     // Step 4: the concurrent produce's entry must still be answerable.
     let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 25).await?;
@@ -251,10 +258,11 @@ async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
 }
 
 /// A plain `BTreeMap` union of a backfill candidate and whatever is live
-/// would let offset 2's lower timestamp outrank offset 0's
-/// already-established higher one, corrupting the ceiling lookup. The
-/// correct merge (replay the monotonic rule over the union, sorted by
-/// offset) must answer offset 0, not offset 2.
+/// would keep offset 2's entry below offset 0's already-established higher
+/// one. A floor lookup between the two would then start its scan at offset
+/// 2 and miss offset 0's record. The correct merge (replay the append rule
+/// over the union, sorted by offset) drops that entry, so the lookup
+/// answers offset 0.
 #[tokio::test]
 async fn merge_does_not_let_a_lower_concurrent_entry_outrank_an_established_one() -> Result<()> {
     let _guard = init_tracing()?;
@@ -264,14 +272,13 @@ async fn merge_does_not_let_a_lower_concurrent_entry_outrank_an_established_one(
 
     create_topic(&storage, topic, 1).await?;
 
-    write_legacy_batch(&storage, &topition, 0, T0).await?; // the eventual ceiling
+    write_legacy_batch(&storage, &topition, 0, T0).await?; // the eventual floor
     write_legacy_batch(&storage, &topition, 1, T0 - 50).await?;
 
     seed_watermark(&storage, &topition, |w| {
         w.low = Some(0);
         w.high = Some(2);
-        w.time_index = None;
-        w.time_index_complete = false;
+        w.time_index = TimeIndex::default();
         Ok(())
     })
     .await?;
@@ -282,10 +289,10 @@ async fn merge_does_not_let_a_lower_concurrent_entry_outrank_an_established_one(
     let offset = produce(&storage, &topition, &[T0 - 20]).await?;
     assert_eq!(2, offset);
 
-    // The first read now triggers the backfill. `target = 70` is below both
-    // off1 (T0 - 50) and off2 (T0 - 20), relative to off0's T0 - so the only
-    // correct ceiling is off0.
-    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 - 70).await?;
+    // The first read now triggers the backfill. The target is above off2's
+    // T0 - 20, so an entry for off2 would be the floor, and a scan from
+    // there finds nothing. Off0's T0 is the first record at or after it.
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 - 10).await?;
     assert_eq!(Some(0), offset);
     assert_eq!(Some(T0), timestamp);
 
@@ -313,8 +320,7 @@ async fn timestamp_lookup_skips_deleted_prefix_of_a_straddling_batch() -> Result
     assert_eq!(0, offset);
 
     // Simulate DeleteRecords(cutoff = 2): offsets 0 and 1 are logically
-    // gone, but `time_index` is never pruned, so the index still points at
-    // the batch's base offset (0).
+    // gone, and the index still points at the batch's base offset (0).
     seed_watermark(&storage, &topition, |w| {
         w.low = Some(2);
         Ok(())
@@ -371,8 +377,8 @@ async fn empty_partition_no_match() -> Result<()> {
 }
 
 /// A Timestamp lookup above every record's timestamp must answer "no
-/// match", found directly from a complete, non-empty index with no entry
-/// reaching the target - no scan required.
+/// match", found directly from the index's greatest timestamp - no scan
+/// required.
 #[tokio::test]
 async fn future_timestamp_no_match() -> Result<()> {
     let _guard = init_tracing()?;
@@ -405,7 +411,7 @@ async fn new_partition_first_produce_marks_index_complete() -> Result<()> {
 
     let watermark = storage.watermark_for(&topition)?;
     let complete = watermark
-        .with(&storage.object_store, |w| Ok(w.time_index_complete))
+        .with(&storage.object_store, |w| Ok(w.time_index.is_complete()))
         .await?;
     assert!(complete);
 
@@ -418,7 +424,7 @@ async fn new_partition_first_produce_marks_index_complete() -> Result<()> {
 /// timestamps (a genuine mid-batch match). One batch, offsets 0/1/2 at
 /// T0/T0+50/T0+100, is indexed under a single `time_index` entry keyed by its
 /// `max_timestamp` (T0+100), so every assertion here is answered by the
-/// sequential scan walking records inside that one batch, not by a ceiling
+/// sequential scan walking records inside that one batch, not by a floor
 /// lookup landing on a different batch.
 #[tokio::test]
 async fn equal_and_mid_batch_timestamps_match_inside_a_batch() -> Result<()> {
@@ -455,9 +461,9 @@ async fn equal_and_mid_batch_timestamps_match_inside_a_batch() -> Result<()> {
 
 /// Each produce into a freshly created topic maintains the index under the
 /// monotonic rule: a batch whose `max_timestamp` is below the running max
-/// adds no entry. An entry for offset 1 here would make a lookup below both
-/// timestamps answer offset 1, when offset 0 holds the first record at or
-/// after the target.
+/// adds no entry. An entry for offset 1 here would be the floor of a lookup
+/// between the two timestamps, and a scan from offset 1 would miss offset
+/// 0, which holds the first record at or after the target.
 #[tokio::test]
 async fn produce_skips_an_entry_below_the_running_max() -> Result<()> {
     let _guard = init_tracing()?;
@@ -466,13 +472,139 @@ async fn produce_skips_an_entry_below_the_running_max() -> Result<()> {
     let topition = Topition::new(topic, 0);
 
     create_topic(&storage, topic, 1).await?;
+    seed_dense_index(&storage, &topition).await?;
 
     assert_eq!(0, produce(&storage, &topition, &[T0]).await?);
     assert_eq!(1, produce(&storage, &topition, &[T0 - 50]).await?);
 
-    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 - 60).await?;
-    assert_eq!(Some(0), offset);
-    assert_eq!(Some(T0), timestamp);
+    assert_eq!(
+        BTreeMap::from([(T0, 0)]),
+        time_index_entries(&storage, &topition).await?
+    );
+
+    for target in [T0 - 60, T0 - 40] {
+        let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, target).await?;
+        assert_eq!(Some(0), offset, "target {target}");
+        assert_eq!(Some(T0), timestamp, "target {target}");
+    }
+
+    Ok(())
+}
+
+/// Sets a fresh partition's index interval to one byte, so that every batch
+/// that raises the maximum timestamp is indexed.
+async fn seed_dense_index(storage: &DynoStore, topition: &Topition) -> Result<()> {
+    seed_index_interval(storage, topition, 1).await
+}
+
+async fn seed_index_interval(
+    storage: &DynoStore,
+    topition: &Topition,
+    interval_bytes: u64,
+) -> Result<()> {
+    seed_watermark(storage, topition, |w| {
+        w.time_index = TimeIndex::complete_with_interval(interval_bytes);
+        Ok(())
+    })
+    .await
+}
+
+async fn time_index_entries(
+    storage: &DynoStore,
+    topition: &Topition,
+) -> Result<BTreeMap<i64, i64>> {
+    storage
+        .watermark_for(topition)?
+        .with(&storage.object_store, |w| {
+            Ok(w.time_index.entries().clone())
+        })
+        .await
+}
+
+/// The index is sparse: a batch that raises the maximum timestamp inside
+/// the interval gets no entry. A lookup for a target between two entries
+/// must scan from the greatest entry at or below the target (the floor), so
+/// that it finds the unindexed batch. A scan from the entry above the
+/// target would answer that entry's batch, a later offset than Kafka's.
+#[tokio::test]
+async fn lookup_scans_from_the_floor_entry_past_an_unindexed_batch() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage();
+    let topic = "sparse";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+
+    // Every batch here is one record of the same value, so they are all the
+    // same size. The interval admits an entry every third batch.
+    let batch_bytes = u64::try_from(batch_with_timestamps(0, &[T0])?.batch_length)?;
+    seed_index_interval(&storage, &topition, 2 * batch_bytes + 1).await?;
+
+    for (expected, timestamp) in (0..).zip([T0, T0 + 100, T0 + 200, T0 + 300]) {
+        assert_eq!(expected, produce(&storage, &topition, &[timestamp]).await?);
+    }
+
+    assert_eq!(
+        BTreeMap::from([(T0, 0), (T0 + 300, 3)]),
+        time_index_entries(&storage, &topition).await?
+    );
+
+    // Offset 2 holds the first record at or after the target, and has no
+    // entry.
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 150).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 200), timestamp);
+
+    // A target equal to an entry's timestamp answers that entry's batch.
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 300).await?;
+    assert_eq!(Some(3), offset);
+    assert_eq!(Some(T0 + 300), timestamp);
+
+    // A target between the maximum timestamp and the last entry's timestamp
+    // is a match; only a target above the maximum is no match.
+    assert_eq!(4, produce(&storage, &topition, &[T0 + 400]).await?);
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 350).await?;
+    assert_eq!(Some(4), offset);
+    assert_eq!(Some(T0 + 400), timestamp);
+    assert_eq!(
+        (None, None),
+        list_offsets_timestamp(&storage, &topition, T0 + 401).await?
+    );
+
+    Ok(())
+}
+
+/// The index holds at most `MAX_ENTRIES` entries however many batches the
+/// partition has, and still answers each lookup with the first record at or
+/// after the target once it has been thinned.
+#[tokio::test]
+async fn index_stays_within_the_cap_and_answers_after_thinning() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage();
+    let topic = "capped";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    seed_dense_index(&storage, &topition).await?;
+
+    let batches = i64::try_from(MAX_ENTRIES)? + 1;
+    for i in 0..batches {
+        assert_eq!(i, produce(&storage, &topition, &[T0 + i]).await?);
+    }
+
+    let entries = time_index_entries(&storage, &topition).await?;
+    assert!(entries.len() <= MAX_ENTRIES, "{} entries", entries.len());
+    assert!(
+        entries.len() >= MAX_ENTRIES / 2,
+        "{} entries",
+        entries.len()
+    );
+
+    for target in [T0, T0 + 1, T0 + 2, T0 + batches / 2, T0 + batches - 1] {
+        let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, target).await?;
+        assert_eq!(Some(target - T0), offset, "target {target}");
+        assert_eq!(Some(target), timestamp, "target {target}");
+    }
 
     Ok(())
 }
@@ -692,8 +824,7 @@ async fn legacy_partition_with_max_at_offset_1(
     seed_watermark(storage, &topition, |w| {
         w.low = Some(0);
         w.high = Some(3);
-        w.time_index = None;
-        w.time_index_complete = false;
+        w.time_index = TimeIndex::default();
         Ok(())
     })
     .await?;
@@ -704,8 +835,34 @@ async fn legacy_partition_with_max_at_offset_1(
 async fn time_index_complete(storage: &DynoStore, topition: &Topition) -> Result<bool> {
     storage
         .watermark_for(topition)?
-        .with(&storage.object_store, |w| Ok(w.time_index_complete))
+        .with(&storage.object_store, |w| Ok(w.time_index.is_complete()))
         .await
+}
+
+/// A produce into a legacy partition before its first lookup indexes its
+/// batch against an empty live index, whatever the legacy batches hold.
+/// The backfill's candidate is sparse, so its maximum (offset 1 here) has
+/// no entry of its own. The merge must still drop the live entry (offset
+/// 3), which is below that maximum: kept, it would be the floor of a lookup
+/// between the two, and a scan from offset 3 would miss offset 1.
+#[tokio::test]
+async fn backfill_merge_drops_a_live_entry_below_an_unindexed_legacy_batch() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage();
+    let topition = legacy_partition_with_max_at_offset_1(&storage, "legacy-sparse").await?;
+
+    assert_eq!(3, produce(&storage, &topition, &[T0 + 70]).await?);
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 80).await?;
+    assert_eq!(Some(1), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+
+    assert_eq!(
+        BTreeMap::from([(T0, 0)]),
+        time_index_entries(&storage, &topition).await?
+    );
+
+    Ok(())
 }
 
 /// A backfill that cannot read a batch fails the request and leaves the
