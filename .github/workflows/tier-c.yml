@@ -5,7 +5,7 @@ name: tier-c
 # or too unstable to gate a merge: the compat suites on the S3 engine, and
 # the `test` suite on more Postgres versions, including one beta.
 #
-# Tier C does not gate anything. It is not a trigger for ci-gate and it is
+# Tier C does not gate anything. It is not in the `needs` of ci-gate and it is
 # not a required check. A red run opens or updates one GitHub issue with the
 # `nightly-failure` label. The next green run closes that issue.
 #
@@ -19,10 +19,13 @@ on:
     # not queue with the many scheduled workflows that start at :00.
     - cron: "17 3 * * *"
   workflow_dispatch:
-# Two Tier C runs must not overlap: both write to the same issue. A run that
-# arrives while another runs waits, and is never cancelled mid-run.
+# Two Tier C runs on one ref must not overlap: both write to the same issue.
+# A run that arrives while another runs waits. GitHub keeps one waiting run
+# per group, so a newer run replaces the one that waits. A running job is
+# never cancelled. The group includes the ref, so a manual run from another
+# ref cannot replace the scheduled run on main.
 concurrency:
-  group: tier-c
+  group: tier-c-${{ github.ref }}
   cancel-in-progress: false
 env:
   CLICOLOR: 1
@@ -85,10 +88,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          # The cache key is the job id, `test`, so these legs read the cache
-          # that the `test` job in ci.yml saves on main. This workflow never
-          # saves, because a save here would replace the cache that ci.yml
-          # restores on every pull request.
+          # These legs read the cache that the `test` job in ci.yml saves on
+          # main. That needs the same job id, `test`, and the same values of
+          # every `RUST*` and `CARGO*` variable as that job, because the
+          # cache key hashes them. A mismatch gives a cold build. This
+          # workflow never saves, because a save here would replace the cache
+          # that ci.yml restores on every pull request.
           cache-save-if: false
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -246,7 +251,7 @@ jobs:
   alert:
     # This job reads the result of each job above. A beta leg that fails does
     # not change the result of `test`, so it does not raise an alert.
-    if: always() && github.ref == 'refs/heads/main'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
     needs: [test, compat-librdkafka, compat-franz-go]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -265,8 +270,7 @@ jobs:
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          failed="$(jq -r 'to_entries[] | select(.value.result == "failure") | .key' <<<"${NEEDS_JSON}")"
-          not_success="$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"${NEEDS_JSON}")"
+          failed="$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"${NEEDS_JSON}")"
           open_issue="$(gh issue list --label "${LABEL}" --state open --limit 1 --json number --jq '.[0].number // empty')"
 
           if [ -n "${failed}" ]; then
@@ -281,10 +285,6 @@ jobs:
                 --title "Nightly Tier C run failed" \
                 --body "${body}"$'\n\n'"This issue closes when a nightly run passes. Later failures add a comment here."
             fi
-          elif [ -z "${not_success}" ]; then
-            if [ -n "${open_issue}" ]; then
-              gh issue close "${open_issue}" --comment "The nightly run passed: ${run_url}"
-            fi
-          else
-            echo "No job failed, and not every job passed (cancelled or skipped). The issue is unchanged."
+          elif [ -n "${open_issue}" ]; then
+            gh issue close "${open_issue}" --comment "The nightly run passed: ${run_url}"
           fi
