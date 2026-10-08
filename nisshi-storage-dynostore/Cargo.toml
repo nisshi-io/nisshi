@@ -23,6 +23,7 @@ nisshi-storage = {workspace = true, features = ["dynostore"]}
 object_store.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
+percent-encoding.workspace = true
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -34,6 +35,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 rama.workspace = true
+temp-env = { workspace = true, features = ["async_closure"] }
+tokio-util.workspace = true
 tracing-subscriber.workspace = true
 
 
