@@ -23,7 +23,7 @@ name: ci
 # - Tier B runs once per merge-queue entry (`merge_group`) and on push:
 #   the full build-storage/build-storage-lake matrix, `test` on pg16/pg18,
 #   the experimental compat legs, cargo-publish-dry-run, src, package,
-#   smoke, smoke-report, release.
+#   smoke, smoke-oldest-client, smoke-report, release.
 #
 # Tier B jobs carry `if: github.event_name != 'pull_request' ||
 # (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, and the trimmed matrices pick the smaller list
@@ -616,9 +616,83 @@ jobs:
           name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
           path: target/smoke/*.log
           if-no-files-found: warn
+  # Runs the smoke suite with the Kafka CLI tools from the oldest Kafka release that CI tests, so
+  # CI checks that an older Java client still negotiates API versions with the broker.
+  smoke-oldest-client:
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [package]
+    strategy:
+      fail-fast: false
+      # The job runs on every storage engine, because an older client can call other APIs than a
+      # newer one, and each engine implements those APIs in its own code.
+      matrix:
+        storage:
+          - postgres
+          - sqlite
+          - memory
+          - s3
+    # A Java client sends the same requests on any CPU, so this job runs on x86 only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KAFKA_IMAGE: apache/kafka:3.7.2
+      RUST_BACKTRACE: 1
+      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
+      STORAGE: ${{matrix.storage}}
+    steps:
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{env.REGISTRY}}/${{github.repository}}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - if: matrix.storage == 'sqlite'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # The sqlite leg reads the cache that the smoke job saves.
+          cache: ${{ matrix.storage == 'sqlite' }}
+          cache-save-if: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+      # The leg name is one word: the report reads the storage column from
+      # the results file name with `(\w+).csv`.
+      - env:
+          IMAGE: ${{env.REGISTRY}}/${{github.repository}}:${{steps.meta.outputs.version}}
+        run: |
+          kafka=${KAFKA_IMAGE#*:}
+          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
+          # The packaged image crashes at startup on sqlite:// (#796), so
+          # the sqlite leg builds the broker from source instead.
+          if [[ "${STORAGE}" != sqlite ]]; then
+            echo "NISSHI_SMOKE_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          fi
+      - run: just smoke "${STORAGE}"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/results-*.csv
+          if-no-files-found: warn
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/*.log
+          if-no-files-found: warn
   smoke-report:
-    if: always() && needs.smoke.result != 'skipped'
-    needs: [smoke]
+    if: always() && (needs.smoke.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped')
+    needs: [smoke, smoke-oldest-client]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -774,6 +848,7 @@ jobs:
       - src
       - package
       - smoke
+      - smoke-oldest-client
       - release
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -809,7 +884,7 @@ jobs:
       - name: Tier A ran on pull_request
         if: github.event_name == 'pull_request'
         env:
-          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src package smoke release
+          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src package smoke smoke-oldest-client release
         run: |
           skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
