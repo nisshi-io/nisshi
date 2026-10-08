@@ -30,6 +30,7 @@ pub mod fetch;
 pub mod fetch_response;
 pub mod find_coordinator;
 pub mod gap6;
+pub mod mandatory_sequence_encoding;
 pub mod proptest;
 pub mod snappy;
 pub mod topic;

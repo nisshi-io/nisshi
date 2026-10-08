@@ -94,6 +94,15 @@ fuzz-member-metadata: (cargo-fuzz "run" "fuzz_member_metadata" "--" "-max_total_
 
 fuzz-generate-seed: (cargo-fuzz "run" "--package" "fuzz" "--bin" "generate_seeds")
 
+# run every fuzz target in turn for `seconds` seconds each (stops at the first crash)
+fuzz-all seconds="60":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for target in $(cargo +nightly fuzz list | grep -v '^generate_seeds$'|grep -v '^fuzz_delete_records_storage$'); do
+        echo "=== ${target} (max_total_time={{ seconds }}) ==="
+        cargo +nightly fuzz run "${target}" -- -max_total_time={{ seconds }}
+    done
+
 check:
     cargo check --workspace --all-features --all-targets
 
@@ -102,6 +111,9 @@ clippy:
 
 fmt:
     cargo fmt --all --check
+
+fmt-fix:
+    cargo fmt --all
 
 miri:
     cargo +nightly miri test --no-fail-fast --all-features

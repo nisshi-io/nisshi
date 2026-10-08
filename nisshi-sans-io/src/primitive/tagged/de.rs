@@ -373,10 +373,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
     where
         V: Visitor<'de>,
     {
-        Err(Error::UnexpectedType(format!(
-            "{len}:{}",
-            type_name::<V::Value>()
-        )))
+        visitor.visit_seq(Seq::new(self, Some(len)))
     }
 
     fn deserialize_tuple_struct<V>(

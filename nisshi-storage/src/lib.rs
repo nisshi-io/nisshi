@@ -203,12 +203,13 @@ pub use service::{
     ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DeleteGroupsService,
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
-    DescribeUserScramCredentialsService, FetchService, FindCoordinatorService,
-    GetTelemetrySubscriptionsService, IncrementalAlterConfigsService, InitProducerIdService,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, bounded_channel,
+    DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
+    FetchValidationService, FindCoordinatorService, GetTelemetrySubscriptionsService,
+    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MalformedFetchRequest, MetadataService, ProduceService,
+    Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService, ValidatedFetchRequest, bounded_channel,
 };
 
 #[cfg(feature = "dynostore")]
@@ -763,7 +764,11 @@ impl From<&FetchTopic> for TopicId {
         } else if let Some(ref id) = value.topic_id {
             Self::Id(Uuid::from_bytes(*id))
         } else {
-            panic!("neither name nor uuid")
+            // A malformed/adversarial request naming neither a topic nor a
+            // topic id: fall back to the nil UUID sentinel already used
+            // elsewhere for "no such topic", so storage lookups resolve to
+            // an ordinary "not found" instead of panicking.
+            Self::Id(Uuid::from_bytes(NULL_TOPIC_ID))
         }
     }
 }
@@ -775,7 +780,7 @@ impl From<&MetadataRequestTopic> for TopicId {
         } else if let Some(ref id) = value.topic_id {
             Self::Id(Uuid::from_bytes(*id))
         } else {
-            panic!("neither name nor uuid")
+            Self::Id(Uuid::from_bytes(NULL_TOPIC_ID))
         }
     }
 }

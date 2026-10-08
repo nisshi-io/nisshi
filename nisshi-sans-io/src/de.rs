@@ -246,11 +246,17 @@ impl<'de> Decoder<'de> {
     }
 
     fn is_nullable(&self) -> bool {
-        self.api_version.is_some_and(|api_version| {
-            self.meta
-                .field
-                .is_some_and(|field| field.is_nullable(api_version))
-        })
+        // `self.meta.field` describes the sequence field as a whole (e.g. a
+        // nullable `[]string`), not its individual elements, which are never
+        // themselves nullable. While iterating a sequence of primitives,
+        // that field metadata is left in place for every element, so it
+        // must not be mistaken for the element's own nullability.
+        !self.in_seq_of_primitive
+            && self.api_version.is_some_and(|api_version| {
+                self.meta
+                    .field
+                    .is_some_and(|field| field.is_nullable(api_version))
+            })
     }
 
     #[must_use]

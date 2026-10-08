@@ -58,7 +58,12 @@ pub use describe_configs::DescribeConfigsService;
 pub use describe_groups::DescribeGroupsService;
 pub use describe_topic_partitions::DescribeTopicPartitionsService;
 pub use describe_user_scram_credentials::DescribeUserScramCredentialsService;
-pub use fetch::FetchService;
+pub use fetch::{
+    FetchService,
+    validation::{
+        FetchValidationLayer, FetchValidationService, MalformedFetchRequest, ValidatedFetchRequest,
+    },
+};
 pub use find_coordinator::FindCoordinatorService;
 pub use get_telemetry_subscriptions::GetTelemetrySubscriptionsService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
