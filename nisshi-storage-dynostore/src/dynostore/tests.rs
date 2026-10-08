@@ -27,6 +27,7 @@ use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_pa
 
 mod latency;
 mod ping;
+mod stale_watermark;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();
