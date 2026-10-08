@@ -102,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   find.
 - On S3 and in-memory storage, DeleteGroups accepts the empty group id, as
   the other storage engines do, instead of answering `INVALID_GROUP_ID`.
-- On S3 and memory storage, `ListOffsets` by timestamp (a consumer's
+- On S3 and in-memory storage, `ListOffsets` by timestamp (a consumer's
   `offsetsForTimes`) answers the first record whose own timestamp is at or
   after the target, instead of using the time each batch was stored. A
   consumer that seeks by time can land on a different offset after

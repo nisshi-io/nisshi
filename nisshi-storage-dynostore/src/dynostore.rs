@@ -77,6 +77,7 @@ use opticon::OptiCon;
 use percent_encoding::percent_decode_str;
 use rand::{prelude::*, rng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use time_index::TimeIndex;
 use tokio::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
@@ -84,6 +85,7 @@ use uuid::Uuid;
 
 mod metadata;
 mod opticon;
+mod time_index;
 
 #[cfg(test)]
 mod tests;
@@ -436,39 +438,18 @@ struct TopicMetadata {
     topic: CreatableTopic,
 }
 
-/// Kafka's own `NO_TIMESTAMP` sentinel: a batch whose `max_timestamp` is at
-/// or below this is never indexed (see [`Watermark::time_index`]).
-const NO_TIMESTAMP: i64 = -1;
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Watermark {
     low: Option<i64>,
     high: Option<i64>,
-    /// Time index for `ListOffsets(Timestamp)`: `max_timestamp -> base_offset`
-    /// of every batch appended so far, maintained by Kafka's own
-    /// `TimeIndex.maybeAppend` rule - an entry is kept only when its
-    /// `max_timestamp` is strictly greater than every one appended before it
-    /// for this partition, floored at [`NO_TIMESTAMP`] so a negative
-    /// timestamp is never indexed. `None`/empty means nothing has been
-    /// indexed yet for this partition, either because it's genuinely empty
-    /// or because `time_index_complete` is still `false` and a backfill from
-    /// `records/` hasn't run yet (see `DynoStore::collect_time_index_candidate`).
-    ///
-    /// The JSON key stays `timestamps`: every watermark document ever
-    /// written has this key as `null`, which decodes identically under this
-    /// type with no migration (see
+    /// The index that answers `ListOffsets(Timestamp)` for this partition.
+    /// A document written before the index existed lacks this key, and
+    /// decodes to an incomplete index that the first lookup backfills (see
     /// `dynostore::tests::watermark_decodes_pre_time_index_documents`).
-    #[serde(rename = "timestamps")]
-    time_index: Option<BTreeMap<i64, i64>>,
-    /// Whether `time_index` covers this partition from offset 0 onward.
-    /// Set `true` the moment a produce first creates the partition (nothing
-    /// to backfill), and on a successful backfill commit. `#[serde(default)]`
-    /// is required, not cosmetic: a document written before this field
-    /// existed lacks the JSON key entirely, and a bare `bool` fails to
-    /// deserialize such a document ("missing field") instead of defaulting
-    /// to `false` the way `Option` fields do.
+    /// Those documents carry a `timestamps` key that was always `null`, and
+    /// this type ignores it.
     #[serde(default)]
-    time_index_complete: bool,
+    time_index: TimeIndex,
 }
 
 impl OptiCon<Watermark> {
@@ -703,16 +684,15 @@ impl DynoStore {
             .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
     }
 
-    /// Lists every real batch object in `topition` and replays Kafka's own
-    /// monotonic `TimeIndex.maybeAppend` rule (floored at [`NO_TIMESTAMP`])
-    /// over their headers, in offset order, to reconstruct a from-scratch
-    /// time index. Returns that index and the number of batches listed.
+    /// Lists every batch object in `topition` and replays the time index's
+    /// append rule over their headers, in offset order, into a candidate
+    /// index. Returns that index and the number of batches listed.
     /// Pure read: never writes anything. Pairs with
     /// [`DynoStore::commit_time_index_backfill`], which does the actual CAS
     /// write - split this way so a concurrent produce landing between the
-    /// two steps can never be lost (see [`DynoStore::merge_time_index`]).
+    /// two steps can never be lost (see [`TimeIndex::merge`]).
     ///
-    /// Returns an empty map, not an error, when the partition has no real
+    /// Returns an empty index, not an error, when the partition has no
     /// batch objects (an empty partition, or one written only through the
     /// lake-sink produce path, which never creates `records/*.batch`
     /// objects). Returns an error when a batch cannot be read, so that the
@@ -720,85 +700,45 @@ impl DynoStore {
     async fn collect_time_index_candidate(
         &self,
         topition: &Topition,
-    ) -> Result<(BTreeMap<i64, i64>, usize)> {
+    ) -> Result<(TimeIndex, usize)> {
         let offsets = self.list_batch_offsets(topition, 0).await?;
         let batches = offsets.len();
 
         info!(?topition, batches, "time index backfill: starting");
 
-        let mut candidate = BTreeMap::new();
-        let mut running_max = NO_TIMESTAMP;
+        let mut candidate = TimeIndex::default();
 
         for base_offset in offsets {
             let Some(batch) = self.read_batch(topition, base_offset).await? else {
                 continue;
             };
 
-            if batch.max_timestamp > running_max {
-                running_max = batch.max_timestamp;
-                _ = candidate.insert(batch.max_timestamp, base_offset);
-            }
+            candidate.append(
+                batch.max_timestamp,
+                base_offset,
+                u64::try_from(batch.batch_length).unwrap_or_default(),
+            );
         }
 
         Ok((candidate, batches))
     }
 
-    /// Correct merge of a backfill `candidate` with whatever `time_index` is
-    /// live right now. Deliberately NOT a plain `BTreeMap` union: a plain
-    /// union of two independently-maintained running-max maps can let a
-    /// lower, more-recently-inserted entry outrank an already-established
-    /// higher one and corrupt the ceiling lookup `ListOffsets(Timestamp)`
-    /// depends on. Instead this reduces both sides to `(offset, timestamp)`
-    /// pairs, sorts by offset - batches are always appended in strictly
-    /// increasing offset order, the one ordering both `candidate` and `live`
-    /// agree on regardless of when either was actually computed - and
-    /// replays the monotonic rule over the union from scratch.
-    fn merge_time_index(
-        candidate: BTreeMap<i64, i64>,
-        live: Option<&BTreeMap<i64, i64>>,
-    ) -> BTreeMap<i64, i64> {
-        let mut by_offset: BTreeMap<i64, i64> = candidate
-            .into_iter()
-            .map(|(timestamp, offset)| (offset, timestamp))
-            .collect();
-
-        if let Some(live) = live {
-            for (&timestamp, &offset) in live {
-                _ = by_offset.insert(offset, timestamp);
-            }
-        }
-
-        let mut merged = BTreeMap::new();
-        let mut running_max = NO_TIMESTAMP;
-
-        for (offset, timestamp) in by_offset {
-            if timestamp > running_max {
-                running_max = timestamp;
-                _ = merged.insert(timestamp, offset);
-            }
-        }
-
-        merged
-    }
-
     /// Commits a backfill `candidate` (from
     /// [`DynoStore::collect_time_index_candidate`]) via a CAS write that
     /// merges it with whatever is live at write time (see
-    /// [`DynoStore::merge_time_index`]), and marks the index complete.
-    /// Returns the merged index actually persisted.
+    /// [`TimeIndex::merge`]), which marks the index complete. Returns the
+    /// merged index actually persisted.
     async fn commit_time_index_backfill(
         &self,
         topition: &Topition,
-        candidate: &BTreeMap<i64, i64>,
-    ) -> Result<BTreeMap<i64, i64>> {
+        candidate: &TimeIndex,
+    ) -> Result<TimeIndex> {
         let watermark = self.watermark_for(topition)?;
 
         watermark
             .with_mut(&self.object_store, |w| {
-                let merged = Self::merge_time_index(candidate.clone(), w.time_index.as_ref());
-                w.time_index = Some(merged.clone());
-                w.time_index_complete = true;
-                Ok(merged)
+                w.time_index = TimeIndex::merge(candidate.clone(), &w.time_index);
+                Ok(w.time_index.clone())
             })
             .await
     }
@@ -809,25 +749,19 @@ impl DynoStore {
     /// A partition without a watermark document has no batches, so its
     /// empty index is complete. This read does not create the document,
     /// because a read must not create state for a partition.
-    async fn complete_time_index(
-        &self,
-        topition: &Topition,
-    ) -> Result<Option<(BTreeMap<i64, i64>, i64)>> {
+    async fn complete_time_index(&self, topition: &Topition) -> Result<Option<(TimeIndex, i64)>> {
         self.watermark_for(topition)?
             .with(&self.object_store, |w| {
-                Ok((w.time_index_complete || w.high.is_none())
-                    .then(|| (w.time_index.clone().unwrap_or_default(), w.low.unwrap_or(0))))
+                Ok((w.time_index.is_complete() || w.high.is_none())
+                    .then(|| (w.time_index.clone(), w.low.unwrap_or(0))))
             })
             .await
     }
 
     /// Returns this partition's complete time index and log start (`low`),
     /// running a backfill first if the index isn't complete yet (see
-    /// [`Watermark::time_index_complete`]).
-    async fn ensure_time_index_complete(
-        &self,
-        topition: &Topition,
-    ) -> Result<(BTreeMap<i64, i64>, i64)> {
+    /// [`TimeIndex::is_complete`]).
+    async fn ensure_time_index_complete(&self, topition: &Topition) -> Result<(TimeIndex, i64)> {
         if let Some(found) = self.complete_time_index(topition).await? {
             return Ok(found);
         }
@@ -850,7 +784,7 @@ impl DynoStore {
         info!(
             ?topition,
             batches,
-            entries = merged.len(),
+            entries = merged.entries().len(),
             elapsed = ?started.elapsed(),
             "time index backfill: complete"
         );
@@ -1098,11 +1032,7 @@ impl Storage for DynoStore {
                         .with_mut(&self.object_store, |watermark| {
                             _ = watermark.high.take();
                             _ = watermark.low.take();
-                            _ = watermark.time_index.take();
-                            // A freshly (re)created partition has nothing to
-                            // backfill: it's complete from offset 0 by
-                            // definition.
-                            watermark.time_index_complete = true;
+                            watermark.time_index = TimeIndex::complete();
 
                             Ok(())
                         })
@@ -1442,34 +1372,19 @@ impl Storage for DynoStore {
                         |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
                     );
 
-                    // Always insert under Kafka's own monotonic
-                    // `TimeIndex.maybeAppend` rule, with no guard for a
-                    // legacy or still-backfilling index: deferring this
-                    // insert until a concurrent backfill catches up would
-                    // create a permanent index gap, since the backfill can
-                    // read `time_index` while it's still absent, merge
-                    // nothing in, and never pick up this entry on either
-                    // side.
-                    if deflated.max_timestamp > NO_TIMESTAMP {
-                        let running_max = watermark
-                            .time_index
-                            .as_ref()
-                            .and_then(|index| index.keys().next_back().copied())
-                            .unwrap_or(NO_TIMESTAMP);
-
-                        if deflated.max_timestamp > running_max {
-                            _ = watermark
-                                .time_index
-                                .get_or_insert_with(BTreeMap::new)
-                                .insert(deflated.max_timestamp, offset);
-                        }
-                    }
-
                     if is_new_partition {
-                        // Nothing predates offset 0: the index is complete
-                        // immediately, no backfill ever needed.
-                        watermark.time_index_complete = true;
+                        watermark.time_index.mark_complete();
                     }
+
+                    // The index is appended to whether or not it is complete.
+                    // A produce that waited for a concurrent backfill would
+                    // leave a gap: the backfill reads the index before this
+                    // entry exists, and merges nothing in for it.
+                    watermark.time_index.append(
+                        deflated.max_timestamp,
+                        offset,
+                        u64::try_from(deflated.batch_length).unwrap_or_default(),
+                    );
 
                     debug!(?watermark);
 
@@ -1803,33 +1718,9 @@ impl Storage for DynoStore {
                 let target = to_timestamp(system_time)?;
                 let (time_index, low) = self.ensure_time_index_complete(topition).await?;
 
-                // `time_index` is never pruned: every entry this code (or a
-                // future backfill) inserts stays in the map, and logical
-                // deletion is handled entirely by the per-record `low`
-                // filter in the sequential scan below. The ceiling lookup
-                // below relies on that: a pruned entry could make it skip
-                // past a surviving, matching record and land on a later
-                // offset/timestamp pair instead of the earliest match
-                // (any future change to pruning on this field must preserve
-                // this guarantee).
-                //
-                // An empty index therefore means nothing has ever been
-                // indexed, never "pruned to empty", so scanning from offset
-                // 0 instead of `low` is both correct and free: the two
-                // coincide whenever the index can be empty at all.
-                let start_offset = if time_index.is_empty() {
-                    Some(0)
-                } else {
-                    // A ceiling entry exists (smallest indexed timestamp
-                    // `>= target`): start the real scan at its offset. If no
-                    // entry reaches `target`, every real record's timestamp
-                    // is below it (the index is complete and monotonic in
-                    // both offset and timestamp), so there is definitely no
-                    // match - no scan needed.
-                    time_index.range(target..).next().map(|(_, &offset)| offset)
-                };
-
-                let Some(start_offset) = start_offset else {
+                // No record is at or after a target above the greatest
+                // timestamp of every batch, so there is no scan to run.
+                if target > time_index.max_timestamp() {
                     responses.push((
                         topition.to_owned(),
                         ListOffsetResponse {
@@ -1839,7 +1730,9 @@ impl Storage for DynoStore {
                         },
                     ));
                     continue;
-                };
+                }
+
+                let start_offset = time_index.floor_offset(target);
 
                 // Under READ_COMMITTED, Kafka answers only a record before the
                 // last stable offset, and answers no match otherwise
@@ -1960,18 +1853,11 @@ impl Storage for DynoStore {
                     },
                 ))
             } else {
-                // No matching object: Earliest/Latest answer 0, a Timestamp
-                // lookup answers no offset (see `ListOffsetResponse::offset`).
-                let offset = match offset_request {
-                    ListOffset::Earliest | ListOffset::Latest => Some(0),
-                    ListOffset::Timestamp(_) => None,
-                };
-
                 responses.push((
                     topition.to_owned(),
                     ListOffsetResponse {
                         error_code: ErrorCode::None,
-                        offset,
+                        offset: Some(0),
                         ..Default::default()
                     },
                 ))
