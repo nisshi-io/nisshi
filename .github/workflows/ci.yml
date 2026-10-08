@@ -26,16 +26,24 @@ name: ci
 #   smoke, release.
 #
 # Tier B jobs carry `if: github.event_name != 'pull_request' ||
-# vars.MERGE_QUEUE != 'on'`, and the trimmed matrices pick the smaller list
+# (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, and the trimmed matrices pick the smaller list
 # under the same condition, so a leg's check-run name
 # (`test (ubuntu-latest, postgres:17)`) means the same thing whichever tier
 # produced it. The `MERGE_QUEUE` repository variable is the rollback switch:
 # the split only makes sense while a merge queue runs Tier B before merge,
 # so when the queue is off (variable unset or not `on`) pull_request runs
 # everything, as before the split. Flip the variable together with the
-# ruleset's merge_queue rule, in both directions. No Tier A job may `needs`
-# a Tier B job: GitHub marks a job `skipped` (not `failure`) when its own
-# `needs` didn't run, which would silently skip Tier A on every PR.
+# ruleset's merge_queue rule, in both directions.
+#
+# A pull_request from a fork can't read repository variables, so
+# `vars.MERGE_QUEUE` is empty there and the checks above would run Tier B on
+# every push. A fork PR therefore takes the queue-on path whatever the
+# variable says, as `smoke` already did. With the queue off, a fork PR's
+# Tier B then runs only after it merges.
+#
+# No Tier A job may `needs` a Tier B job: GitHub marks a job `skipped` (not
+# `failure`) when its own `needs` didn't run, which would silently skip Tier A
+# on every PR.
 #
 # `merge_group` is here because the queue tests each entry on a
 # `gh-readonly-queue/...` branch; bound to `pull_request` alone, ci-gate
@@ -92,7 +100,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        pg: ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on') && '["postgres:17"]' || '["postgres:16", "postgres:17", "postgres:18"]') }}
+        pg: ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository)) && '["postgres:17"]' || '["postgres:16", "postgres:17", "postgres:18"]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -195,7 +203,7 @@ jobs:
       # this job instead of in a job of its own.
       - run: just doc
   build-storage:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -223,7 +231,7 @@ jobs:
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: just build dev ${{matrix.storage}}
   build-storage-lake:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -263,7 +271,7 @@ jobs:
         # Tier A runs the one non-experimental leg (memory); merge_group/push
         # run all four. Keep this list identical to compat-franz-go's.
         storage: >-
-          ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on')
+          ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
           {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
@@ -344,7 +352,7 @@ jobs:
           - ubuntu-latest
         # Same tiering as compat-librdkafka; keep the two lists identical.
         storage: >-
-          ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on')
+          ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
           {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
@@ -416,7 +424,7 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   cargo-publish-dry-run:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -483,7 +491,7 @@ jobs:
           path: THIRD-PARTY-LICENSE.html
           if-no-files-found: error
   src:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -498,7 +506,7 @@ jobs:
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   package:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     needs: [test, cargo-publish-dry-run, typos, release]
     runs-on: ${{matrix.os}}
     timeout-minutes: 15
@@ -541,8 +549,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           # Push on repo-owned refs (push, merge_group) and same-repo PRs.
-          # Fork PRs get a read-only token, so they build without pushing,
-          # and smoke skips them (see its `if:`).
+          # Tier B's `if:` already skips this job on fork PRs; the repo check
+          # stays as a guard, since a fork's token is read-only.
           push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -642,7 +650,7 @@ jobs:
         env:
           NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
   release:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     # build-storage/build-storage-lake are here (not on `test`, which is Tier
     # A) so a feature combination that doesn't compile stops a queue entry
     # before the release -> package -> smoke chain, and never publishes on a
