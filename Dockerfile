@@ -18,7 +18,7 @@
 
 # CA certs are architecture-independent, so this stage runs on the build
 # host for every target platform and a multi-platform build needs no QEMU.
-FROM --platform=$BUILDPLATFORM alpine:3 AS base
+FROM --platform=$BUILDPLATFORM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS base
 RUN mkdir -p /image/schema /image/data /image/tmp /image/etc && cp -r /etc/ssl /image/etc/
 
 FROM scratch

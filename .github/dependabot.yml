@@ -1,10 +1,14 @@
 version: 2
 updates:
+  # The 7-day cooldown gives an upstream CVE or a yanked release time to
+  # surface before Dependabot opens a bump PR.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     target-branch: "main"
+    cooldown:
+      default-days: 7
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -19,3 +23,33 @@ updates:
       # Drop this once deltalake bumps its buoyant_kernel dependency.
       - dependency-name: "buoyant_kernel_derive"
         versions: [">1.1.0"]
+      # rsasl 2.3.1 (the latest release) requires digest 0.10 for its SCRAM
+      # key derivation, and sha2 0.11 depends on digest 0.11 instead, so the
+      # two cannot both appear as the Sha256/Sha512 types
+      # nisshi-storage::alter_user_scram_credentials passes into
+      # rsasl::mechanisms::scram::tools::derive_keys. Dependabot cannot see
+      # that constraint and will keep proposing 0.11.x, which fails to
+      # build. Drop this once rsasl ships a release built against digest
+      # 0.11.
+      - dependency-name: "sha2"
+        versions: [">0.10.9"]
+    cooldown:
+      default-days: 7
+  # The Dockerfile's alpine base and .devcontainer's rust base are pinned to
+  # exact digests. A digest pin only stays current if something deliberately
+  # bumps it, so both get the same Dependabot coverage the other ecosystems
+  # above already have, rather than freezing in place indefinitely.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7
+  - package-ecosystem: "docker"
+    directory: "/.devcontainer"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7

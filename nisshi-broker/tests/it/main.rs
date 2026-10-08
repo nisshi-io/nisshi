@@ -55,6 +55,7 @@ pub mod storage_describe_configs;
 pub mod storage_fetch;
 pub mod storage_list_offsets;
 pub mod storage_metadata;
+pub mod storage_options;
 pub mod tls;
 pub mod topic;
 pub mod topic_lifecycle;
@@ -64,6 +65,7 @@ pub mod traceforge_offset_commit;
 pub mod traceforge_produce_idempotent;
 pub mod traceforge_produce_object_store_fault;
 pub mod txn;
+pub mod unauthenticated;
 pub mod update_group_conditional;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a

@@ -1572,8 +1572,6 @@ fn fix_parameters(sql: &str) -> Result<String> {
 
 #[derive(Clone, Debug)]
 pub struct Engine {
-    #[allow(dead_code)]
-    server: Arc<JoinSet<Result<(), Error>>>,
     inner: RequestChannelService,
 }
 
@@ -2292,12 +2290,34 @@ impl Builder<String, i32, Url, Url> {
                     })
                 };
 
+                // The supervisor loop above isolates each request's storage work in its
+                // own child task (see `ChannelRequestService::serve`), so a panic handling
+                // one request does not end this loop. Nothing should ordinarily end it
+                // either: it runs until the channel closes (every `RequestSender`, held by
+                // `Engine.inner`, is dropped) or `cancellation` fires. This JoinSet holds
+                // exactly one task; rather than leave it unread for the life of `Engine`,
+                // this watches it and logs if it ever ends - belt and braces for a future
+                // bug, not something this should ever observe in practice.
+                drop(tokio::spawn(async move {
+                    match server.join_next().await {
+                        Some(Ok(Ok(()))) => {
+                            debug!("mpsc storage supervisor ended (channel closed or cancelled)")
+                        }
+                        Some(Ok(Err(error))) => error!(
+                            ?error,
+                            "mpsc storage supervisor ended with an error; storage unavailable for this engine"
+                        ),
+                        Some(Err(join_error)) => error!(
+                            ?join_error,
+                            "mpsc storage supervisor panicked; storage unavailable for this engine"
+                        ),
+                        None => unreachable!("exactly one task was ever spawned onto this JoinSet"),
+                    }
+                }));
+
                 let inner = RequestChannelService::new(sender);
 
-                Ok(Arc::new(Box::new(Engine {
-                    server: Arc::new(server),
-                    inner,
-                }) as Box<dyn Storage>))
+                Ok(Arc::new(Box::new(Engine { inner }) as Box<dyn Storage>))
             }
 
             CommunicationMode::Direct => Ok(Arc::new(Box::new(Delegate {
@@ -3313,8 +3333,12 @@ impl Storage for Delegate {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    let timestamp = None;
-                    let offset = Some(0);
+                    // No record row: Earliest/Latest answer 0, a Timestamp
+                    // lookup answers no offset (see `ListOffsetResponse::offset`).
+                    let (offset, timestamp) = match offset_type {
+                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
+                        ListOffset::Timestamp(_) => (None, None),
+                    };
                     debug!(
                         cluster = self.cluster,
                         ?topition,
@@ -5487,6 +5511,102 @@ mod tests {
             .create_topic(creatable_topic, false)
             .await
             .inspect(|uuid| debug!(?uuid))?;
+
+        Ok(())
+    }
+
+    /// Smoke test for the `?mode=mpsc` wiring on the ordinary (non-panicking,
+    /// non-cancelled) path. It does not cover the panic isolation in
+    /// `ChannelRequestService::serve` (`nisshi-storage/tests/channel.rs` does), and it
+    /// does not prove the mpsc engine was selected: an unrecognised mode falls back to
+    /// Semaphore, and this test would pass there too.
+    #[tokio::test]
+    async fn mpsc_mode_produce_and_fetch_round_trip() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // lite's build() resolves the URL path relative to the crate dir (it strips
+        // the leading "/" and pushes onto cwd), so use a crate-local db file rather
+        // than a tempdir (see `read_committed_last_stable_offset_pinned_by_open_transaction`
+        // below for the same note). The guard removes the file (and its WAL/SHM
+        // sidecars) on drop, including on panic.
+        struct DbFileGuard(&'static str);
+        impl Drop for DbFileGuard {
+            fn drop(&mut self) {
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
+                }
+            }
+        }
+
+        let db_file = "mpsc-mode-produce-and-fetch-round-trip-test.db";
+        let _db_file_guard = DbFileGuard(db_file);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{db_file}{suffix}"));
+        }
+
+        let storage = Url::parse(&format!("file:///{db_file}?mode=mpsc"))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let topic = "test";
+        let num_partitions = 1;
+        let replication_factor = 1;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        let creatable_topic = CreatableTopic::default()
+            .name(topic.to_owned())
+            .num_partitions(num_partitions)
+            .replication_factor(replication_factor)
+            .assignments(Some([].into()))
+            .configs(Some([].into()));
+
+        _ = engine
+            .create_topic(creatable_topic, false)
+            .await
+            .inspect(|uuid| debug!(?uuid))?;
+
+        let topition = Topition::new(topic, 0);
+
+        let batch: deflated::Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"sol-155270").into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let offset = engine
+            .produce(None, &topition, batch)
+            .await
+            .inspect(|offset| debug!(offset))?;
+        assert_eq!(0, offset);
+
+        let fetched = engine
+            .fetch(
+                &topition,
+                0,
+                0,
+                1_000_000,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(1),
+            )
+            .await
+            .inspect(|fetched| debug!(?fetched))?;
+
+        assert_eq!(1, fetched.len());
 
         Ok(())
     }

@@ -75,7 +75,7 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
     };
 
     let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
+    let replication_factor = rng().random_range(1..64);
 
     {
         let response = create_topic
@@ -162,7 +162,7 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
     };
 
     let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
+    let replication_factor = rng().random_range(1..64);
 
     {
         let response = create_topic
@@ -358,7 +358,7 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
     };
 
     let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
+    let replication_factor = rng().random_range(1..64);
 
     {
         let response = create_topic
@@ -513,7 +513,7 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
     };
 
     let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
+    let replication_factor = rng().random_range(1..64);
 
     {
         let response = create_topic
@@ -665,7 +665,7 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
     let name = &alphanumeric_string(15)[..];
 
     let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
+    let replication_factor = rng().random_range(1..64);
 
     {
         let response = create_topic
@@ -904,7 +904,7 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
                         [CreatableTopic::default()
                             .name(topic.into())
                             .num_partitions(1)
-                            .replication_factor(0)
+                            .replication_factor(1)
                             .assignments(Some([].into()))
                             .configs(Some([].into()))]
                         .into(),
@@ -1136,7 +1136,7 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
     let name = &alphanumeric_string(15)[..];
 
     let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
+    let replication_factor = rng().random_range(1..64);
 
     {
         let response = create_topic

@@ -59,4 +59,5 @@ zeroize.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+temp-env.workspace = true
 tempfile.workspace = true

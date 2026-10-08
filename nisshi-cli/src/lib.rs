@@ -27,6 +27,11 @@ pub enum Error {
     DotEnv(#[from] dotenv::Error),
     Generate(#[from] nisshi_generator::Error),
     InvalidLength(#[from] sha2::digest::InvalidLength),
+    /// A data lake subcommand (`iceberg`, `delta`, `parquet`) was given
+    /// without `--schema-registry`, which every lake writer requires.
+    LakeRequiresSchemaRegistry {
+        lake: &'static str,
+    },
     Perf(#[from] nisshi_perf::Error),
     Proxy(#[from] nisshi_proxy::Error),
     Regex(#[from] regex::Error),
