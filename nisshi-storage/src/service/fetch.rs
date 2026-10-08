@@ -79,15 +79,29 @@ static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Why [`before`] did not return the output of its read.
+/// What a read bounded by [`before`] was doing when its deadline passed.
+///
+/// An operator reads it from the `stage` attribute of the
+/// `nisshi_storage_read_deadline_exceeded` counter: `reading` points at a
+/// slow storage engine, and `not_started` at a request with more
+/// partitions than could be read before the deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Missed {
-    /// The deadline had passed before the read started, so the read was
-    /// never polled.
+    /// The deadline had passed before the read was polled, so no storage
+    /// call was made.
     NotStarted,
 
-    /// The read started and did not finish by the deadline.
-    Expired,
+    /// The read was in storage.
+    Reading,
+}
+
+impl Missed {
+    fn stage(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Reading => "reading",
+        }
+    }
 }
 
 /// Runs `read` until `deadline`.
@@ -117,36 +131,44 @@ where
     } else {
         timeout_at(deadline, read)
             .await
-            .map_err(|_| Missed::Expired)
+            .map_err(|_| Missed::Reading)
     }
 }
 
-/// Records a read of `tp` that [`before`] abandoned at `stage`, in the
+/// Records a read of `tp` at `offset` that [`before`] abandoned, in the
 /// `nisshi_storage_read_deadline_exceeded` counter and the log.
+///
+/// `operation` is the [`Storage`] method that was read: `fetch` for the
+/// records, `offset_stage` for the offsets. The counter carries it with
+/// the stage of the read, so a slow engine is told apart from a request
+/// that was too wide for its deadline.
 ///
 /// A read that was never started logs at debug: once a slow backend has
 /// spent the read deadline, every partition after it is not started, and a
 /// warning for each of them would blame partitions that were never read.
-fn missed(tp: &Topition, stage: &'static str, missed: Missed, started_at: Instant) {
-    let stage = match missed {
-        Missed::NotStarted => "not_started",
-        Missed::Expired => stage,
-    };
+fn missed(
+    tp: &Topition,
+    operation: &'static str,
+    offset: i64,
+    missed: Missed,
+    started_at: Instant,
+) {
+    let stage = missed.stage();
 
     READ_DEADLINE_EXCEEDED.add(
         1,
         &[
-            KeyValue::new("operation", "fetch"),
+            KeyValue::new("operation", operation),
             KeyValue::new("stage", stage),
         ],
     );
 
     match missed {
         Missed::NotStarted => {
-            debug!(?tp, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
+            debug!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
         }
-        Missed::Expired => {
-            warn!(?tp, stage, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
+        Missed::Reading => {
+            warn!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
         }
     }
 }
@@ -354,7 +376,7 @@ where
         let offset_stage = match before(cap, self.storage.offset_stage(&tp)).await {
             Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
             Err(reason) => {
-                missed(&tp, "offset_stage", reason, started_at);
+                missed(&tp, "offset_stage", fetch_offset, reason, started_at);
                 return Ok(Self::unknown_offsets(partition_index, ErrorCode::None));
             }
         };
@@ -451,7 +473,7 @@ where
             {
                 Ok(fetched) => fetched,
                 Err(reason) => {
-                    missed(&tp, "read", reason, started_at);
+                    missed(&tp, "fetch", offset, reason, started_at);
                     stalled = true;
                     break;
                 }
@@ -524,7 +546,7 @@ where
             {
                 Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
                 Err(reason) => {
-                    missed(&tp, "offset_stage", reason, started_at);
+                    missed(&tp, "offset_stage", offset, reason, started_at);
                     Self::covering(offset_stage, offset, isolation)
                 }
             }
@@ -2273,7 +2295,7 @@ mod tests {
         let deadline = started_at + Duration::from_secs(1);
 
         assert_eq!(
-            Err(Missed::Expired),
+            Err(Missed::Reading),
             before(deadline, std::future::pending::<()>()).await
         );
         assert_eq!(Duration::from_secs(1), started_at.elapsed());
