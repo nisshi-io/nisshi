@@ -3333,8 +3333,12 @@ impl Storage for Delegate {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    let timestamp = None;
-                    let offset = Some(0);
+                    // No record row: Earliest/Latest answer 0, a Timestamp
+                    // lookup answers no offset (see `ListOffsetResponse::offset`).
+                    let (offset, timestamp) = match offset_type {
+                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
+                        ListOffset::Timestamp(_) => (None, None),
+                    };
                     debug!(
                         cluster = self.cluster,
                         ?topition,

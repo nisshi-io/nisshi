@@ -15,7 +15,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nisshi_storage::{ArcDynStorage, Error, Result, StorageFactory, StorageFactoryConfiguration};
+use nisshi_storage::{
+    ArcDynStorage, Error, Result, StorageFactory, StorageFactoryConfiguration,
+    reject_unrecognized_options,
+};
 use regex::Regex;
 use slatedb::{
     Db, Settings,
@@ -48,6 +51,8 @@ impl StorageFactory for EngineFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+        reject_unrecognized_options(&configuration.storage, &[])?;
+
         let host = configuration.storage.host_str().unwrap_or("nisshi");
         let db_path = format!("nisshi-{}.slatedb", configuration.cluster);
 

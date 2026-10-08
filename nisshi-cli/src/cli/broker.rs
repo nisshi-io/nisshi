@@ -60,10 +60,13 @@ pub(super) struct Arg {
     cluster_id: String,
 
     /// The broker will listen on this address
+    //
+    // `[::]`, not `0.0.0.0`. This default requires the broker to bind an IPv6 address
+    // with `IPV6_V6ONLY` cleared, so that it also accepts IPv4 connections.
     #[arg(
         long,
         env = "LISTENER_URL",
-        default_value = "tcp://0.0.0.0:9092",
+        default_value = "tcp://[::]:9092",
         visible_alias = "kafka-listener-url"
     )]
     listener_url: EnvVarExp<Url>,
@@ -82,7 +85,7 @@ pub(super) struct Arg {
     storage_engine: EnvVarExp<Url>,
 
     /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
-    #[arg(long, env = "SCHEMA_REGISTRY")]
+    #[arg(long, env = "SCHEMA_REGISTRY", global = true)]
     schema_registry: Option<EnvVarExp<Url>>,
 
     /// Schema registry cache expiry duration
@@ -332,6 +335,40 @@ pub(super) enum Lake {
     },
 }
 
+#[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+impl Lake {
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "iceberg")]
+            Self::Iceberg { .. } => "iceberg",
+
+            #[cfg(feature = "delta")]
+            Self::Delta { .. } => "delta",
+
+            #[cfg(feature = "parquet")]
+            Self::Parquet { .. } => "parquet",
+        }
+    }
+}
+
+/// Requires a schema registry whenever a data lake subcommand is selected.
+///
+/// clap cannot enforce this itself without making `--schema-registry`
+/// required on each lake subcommand individually, which rejects the flag
+/// given before the subcommand (`broker --schema-registry y iceberg ...`):
+/// the only ordering this repo's own `justfile`, `compose.yaml` and
+/// `docs/schema-registry.md` use. This check runs instead, after clap has
+/// already resolved the value regardless of where the flag appeared.
+#[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+fn require_schema_registry(command: &Option<Lake>, has_schema_registry: bool) -> Result<()> {
+    match command {
+        Some(lake) if !has_schema_registry => {
+            Err(Error::LakeRequiresSchemaRegistry { lake: lake.name() })
+        }
+        _ => Ok(()),
+    }
+}
+
 impl Arg {
     pub(super) async fn main(self) -> Result<ErrorCode> {
         let started = Instant::now();
@@ -387,6 +424,9 @@ impl Arg {
             .transpose()?;
 
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+        require_schema_registry(&self.command, schema_registry.is_some())?;
+
+        #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
         let lake_house = match self.command {
             #[cfg(feature = "iceberg")]
             Some(Lake::Iceberg {
@@ -401,7 +441,7 @@ impl Arg {
                     .schema_registry(
                         schema_registry
                             .clone()
-                            .ok_or(Error::LakeSchemaRegistryRequired)?,
+                            .ok_or(Error::LakeRequiresSchemaRegistry { lake: "iceberg" })?,
                     )
                     .namespace(namespace)
                     .warehouse(warehouse)
@@ -420,7 +460,7 @@ impl Arg {
                     .schema_registry(
                         schema_registry
                             .clone()
-                            .ok_or(Error::LakeSchemaRegistryRequired)?,
+                            .ok_or(Error::LakeRequiresSchemaRegistry { lake: "delta" })?,
                     )
                     .database(database)
                     .records_per_second(records_per_second)
@@ -434,7 +474,7 @@ impl Arg {
                     .schema_registry(
                         schema_registry
                             .clone()
-                            .ok_or(Error::LakeSchemaRegistryRequired)?,
+                            .ok_or(Error::LakeRequiresSchemaRegistry { lake: "parquet" })?,
                     )
                     .build()?,
             ),
@@ -568,6 +608,31 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Arg, clap::Error> {
         Arg::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
+    }
+
+    /// With neither flag nor environment variable overriding them, the listener binds
+    /// every interface dual-stack and the advertised listener resolves to the IPv4
+    /// loopback address, not `localhost`: a client whose resolver returns `::1` first
+    /// must not be sent back to an address this build cannot always serve.
+    ///
+    /// `LISTENER_URL` and `ADVERTISED_LISTENER_URL` are unset for the duration of this
+    /// test because CI and a developer's own `.env` both set `ADVERTISED_LISTENER_URL`,
+    /// which would otherwise mask the default this test exists to pin.
+    #[test]
+    fn defaults_resolve_listener_and_advertised_listener() {
+        temp_env::with_vars_unset(["LISTENER_URL", "ADVERTISED_LISTENER_URL"], || {
+            let arg = parse(&[]).expect("defaults parse");
+
+            assert_eq!(
+                Some(url::Host::Ipv6(std::net::Ipv6Addr::UNSPECIFIED)),
+                arg.listener_url.into_inner().host(),
+            );
+
+            assert_eq!(
+                Some("127.0.0.1"),
+                arg.advertised_listener_url.into_inner().host_str(),
+            );
+        });
     }
 
     #[test]
@@ -1059,5 +1124,128 @@ mod tests {
             .build()
             .await
             .expect("build with an encrypted cert and key bundle");
+    }
+
+    #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+    mod lake_schema_registry {
+        use super::*;
+
+        /// Whichever lake feature this build enables, so the test runs
+        /// regardless of which combination `--all-features` turns on.
+        fn lake() -> Lake {
+            #[cfg(feature = "parquet")]
+            {
+                Lake::Parquet {
+                    location: "file://./lake".parse().expect("valid url"),
+                }
+            }
+
+            #[cfg(all(not(feature = "parquet"), feature = "delta"))]
+            {
+                Lake::Delta {
+                    location: "file://./lake".parse().expect("valid url"),
+                    database: None,
+                    records_per_second: None,
+                }
+            }
+
+            #[cfg(all(not(feature = "parquet"), not(feature = "delta"), feature = "iceberg"))]
+            {
+                Lake::Iceberg {
+                    location: "file://./lake".parse().expect("valid url"),
+                    catalog: "http://localhost:8181/".parse().expect("valid url"),
+                    namespace: None,
+                    warehouse: None,
+                }
+            }
+        }
+
+        #[test]
+        fn no_lake_no_registry_is_ok() {
+            require_schema_registry(&None, false).expect("no lake command needs no registry");
+        }
+
+        #[test]
+        fn no_lake_with_registry_is_ok() {
+            require_schema_registry(&None, true)
+                .expect("a registry present without a lake command is fine");
+        }
+
+        #[test]
+        fn lake_without_registry_is_rejected() {
+            let err = require_schema_registry(&Some(lake()), false)
+                .expect_err("a lake command without a schema registry must be rejected");
+
+            assert!(
+                matches!(err, Error::LakeRequiresSchemaRegistry { .. }),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn lake_with_registry_is_ok() {
+            require_schema_registry(&Some(lake()), true)
+                .expect("a lake command with a schema registry must be accepted");
+        }
+    }
+
+    #[cfg(feature = "parquet")]
+    #[tokio::test]
+    async fn parquet_lake_without_schema_registry_fails_build() {
+        let arg = parse(&[
+            "--storage-engine",
+            "memory://nisshi/",
+            "--silent",
+            "parquet",
+            "--location",
+            "file://./lake",
+        ])
+        .expect("arguments parse");
+
+        // Never depend on a SCHEMA_REGISTRY the environment happens to export.
+        let arg = Arg {
+            schema_registry: None,
+            ..arg
+        };
+
+        let err = arg
+            .build()
+            .await
+            .expect_err("a lake command without a schema registry must fail build");
+
+        assert!(
+            matches!(err, Error::LakeRequiresSchemaRegistry { lake: "parquet" }),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn schema_registry_before_subcommand_parses() {
+        let arg = parse(&[
+            "--schema-registry",
+            "file://./etc/schema",
+            "parquet",
+            "--location",
+            "file://./lake",
+        ])
+        .expect("--schema-registry given before the subcommand must still parse");
+
+        assert!(arg.schema_registry.is_some());
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn schema_registry_after_subcommand_parses() {
+        let arg = parse(&[
+            "parquet",
+            "--location",
+            "file://./lake",
+            "--schema-registry",
+            "file://./etc/schema",
+        ])
+        .expect("--schema-registry given after the subcommand must parse");
+
+        assert!(arg.schema_registry.is_some());
     }
 }

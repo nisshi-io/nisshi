@@ -222,13 +222,20 @@ impl Storage for Engine {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         Ok(offsets
             .iter()
-            .map(|(topition, _)| {
+            .map(|(topition, list_offset)| {
+                // No records are stored: Earliest/Latest answer 0, a Timestamp
+                // lookup answers no offset (see `ListOffsetResponse::offset`).
+                let offset = match list_offset {
+                    ListOffset::Earliest | ListOffset::Latest => Some(0),
+                    ListOffset::Timestamp(_) => None,
+                };
+
                 (
                     topition.to_owned(),
                     ListOffsetResponse {
                         error_code: ErrorCode::None,
                         timestamp: None,
-                        offset: Some(0),
+                        offset,
                     },
                 )
             })
@@ -569,5 +576,47 @@ impl Storage for Engine {
             feature: FEATURE.into(),
             message: MESSAGE.into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_offsets_timestamp_has_no_offset() -> Result<()> {
+        let engine = Engine::new(
+            "cluster".into(),
+            111,
+            Url::parse("tcp://127.0.0.1:9092/").expect("valid url"),
+        );
+        let topition = Topition::new("t", 0);
+
+        let responses = engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[
+                    (topition.clone(), ListOffset::Earliest),
+                    (topition.clone(), ListOffset::Latest),
+                    (topition.clone(), ListOffset::Timestamp(SystemTime::now())),
+                ],
+            )
+            .await?;
+
+        let offsets = responses
+            .iter()
+            .map(|(_, response)| (response.error_code, response.offset))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![
+                (ErrorCode::None, Some(0)),
+                (ErrorCode::None, Some(0)),
+                (ErrorCode::None, None),
+            ],
+            offsets
+        );
+
+        Ok(())
     }
 }

@@ -118,8 +118,9 @@ iceberg-catalog-rest = "0.10.1"
 iceberg-datafusion = "0.10.1"
 iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3", "opendal-fs", "opendal-memory"] }
 indicatif = "0.18.3"
-jsonschema = "0.45.0"
+jsonschema = "0.58.3"
 lazy_static = "1.4.0"
+libc = "0.2.189"
 libfuzzer-sys = "0.4"
 libsql = { version = "0.9.18", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
@@ -129,7 +130,7 @@ num-bigint = "0.4"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 opentelemetry = "0.32.0"
 opentelemetry-otlp = "0.32.0"
-opentelemetry-semantic-conventions = "0.32.0"
+opentelemetry-semantic-conventions = "0.33.0"
 opentelemetry-stdout = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
 ordered-float = "5.1"
@@ -160,6 +161,7 @@ serde_json = "1"
 sha2 = "0.10.9"
 slatedb = "0.14.1"
 snap = "1.1.1"
+socket2 = "0.6.5"
 syn = { version = "3.0.3", features = ["extra-traits", "full"] }
 nisshi = { version = "0.7.0-pre.2", path = "nisshi", default-features = false }
 nisshi-auth = { version = "0.7.0-pre.2", path = "nisshi-auth", default-features = false }
@@ -200,10 +202,26 @@ zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }
 zstd = "0.14.0"
 
+# Line tables keep file:line in workspace backtraces; full debug info costs
+# disk and link time. Build with `--profile debugging` for a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
 
 [profile.profiling]
 inherits = "release"
+debug = true
+
+# Full debug info for every crate, built into target/debugging.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
 debug = true
