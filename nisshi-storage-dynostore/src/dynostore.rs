@@ -65,13 +65,15 @@ use nisshi_storage::{
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
     ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion,
+    path::{Path, PathPart},
 };
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
 };
 use opticon::OptiCon;
+use percent_encoding::percent_decode_str;
 use rand::{prelude::*, rng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::time::Duration;
@@ -86,6 +88,92 @@ mod opticon;
 mod tests;
 
 const APPLICATION_JSON: &str = "application/json";
+
+/// Dynostore stores a consumer group's id as a single, opaque, percent-encoded
+/// [`PathPart`] (see [`group_path_part`]), so any group id - including `""`,
+/// `"/"`, or one containing any other `object_store`-reserved character -
+/// becomes its own distinct, independently addressable group.
+///
+/// The empty group id is the one case `PathPart`'s own encoding can't carry:
+/// percent-encoding `""` still produces an empty string, and joining an empty
+/// segment onto a `Path` produces a key containing an empty path segment
+/// (e.g. `consumers//offsets/...`). Plain prefix-based operations
+/// (`list`/`delete`, used everywhere else in this module) happen to still
+/// treat that key as its own, correctly isolated group, because
+/// `object_store`'s prefix-match semantics require the byte right after the
+/// matched prefix to be a delimiter, and the doubled slash supplies it.
+/// `list_groups` is the exception: it lists via `list_with_delimiter`, whose
+/// common-prefix computation normalizes the doubled slash away, which
+/// surfaces a phantom group under the wrong name instead of the empty-id
+/// group. `EMPTY_GROUP_SENTINEL` stands in for the empty id instead, so
+/// `list_groups` never has to see a double slash in the first place.
+///
+/// This sentinel can never collide with another group's real, encoded path
+/// segment:
+/// - It can't collide with an *encoded* segment, because `percent_encode_byte`
+///   always emits uppercase hex after `%`, and `m` (lowercase) is not a hex
+///   digit in either case - so no real percent-escape sequence can ever begin
+///   `%em...`, which means `%empty` can never be the start of the encoded
+///   form of some other input.
+/// - It can't collide with an *unencoded* literal group id of `"%empty"`
+///   either, because `%` itself is in `object_store`'s reserved/escaped
+///   character set: a group literally named `"%empty"` is non-empty, so it
+///   goes through ordinary [`PathPart`] encoding and comes out as `%25empty`
+///   (see `percent_empty_literal_is_escaped_as_percent25empty` in `tests.rs`),
+///   which is a different string to the sentinel.
+const EMPTY_GROUP_SENTINEL: &str = "%empty";
+
+/// Encode a Kafka group id as a single, opaque `object_store` path segment.
+///
+/// Every character [`PathPart`] treats as reserved (including `/`) is percent
+/// encoded, so the result is always exactly one path segment regardless of
+/// what the group id contains. See [`EMPTY_GROUP_SENTINEL`] for why the empty
+/// string needs special-casing rather than going through the same encoding.
+/// The sentinel is validated rather than encoded, so the result is fallible
+/// in its type, though a constant without `/` or a control character passes.
+fn group_path_part(group_id: &str) -> Result<PathPart<'_>> {
+    if group_id.is_empty() {
+        parse_segment(EMPTY_GROUP_SENTINEL)
+    } else {
+        Ok(PathPart::from(group_id))
+    }
+}
+
+/// Validates `segment` as one already-encoded path segment, as
+/// [`PathPart::parse`] does, and reports a bad segment as a storage error.
+fn parse_segment(segment: &str) -> Result<PathPart<'_>> {
+    PathPart::parse(segment).map_err(|source| {
+        object_store::Error::from(object_store::path::Error::BadSegment {
+            path: segment.to_owned(),
+            source,
+        })
+        .into()
+    })
+}
+
+/// Recover the original group id from a listed `object_store` path segment
+/// previously written by [`group_path_part`].
+///
+/// A key written by something else under the `consumers/` prefix (or simply
+/// corrupted data) could percent-decode to invalid UTF-8; rather than panic,
+/// this returns `None` so `list_groups` can skip that listing entry.
+fn decode_group_segment(segment: &str) -> Option<String> {
+    if segment == EMPTY_GROUP_SENTINEL {
+        return Some(String::new());
+    }
+
+    percent_decode_str(segment)
+        .decode_utf8()
+        .inspect_err(|error| {
+            warn!(
+                segment,
+                %error,
+                "skipping list_groups entry: path segment is not valid UTF-8 after percent-decoding"
+            )
+        })
+        .ok()
+        .map(std::borrow::Cow::into_owned)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DynoStore {
@@ -430,6 +518,46 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
+    /// `clusters/{cluster}/groups/consumers`, the prefix every group - state
+    /// file and committed offsets alike - is stored beneath.
+    fn group_consumers_prefix(&self) -> Path {
+        Path::from(format!("clusters/{}/groups/consumers", self.cluster))
+    }
+
+    /// The single-file location of a group's persisted [`GroupDetail`] state,
+    /// e.g. `clusters/{cluster}/groups/consumers/{group}.json`.
+    fn group_state_location(&self, group_id: &str) -> Result<Path> {
+        let file_name = format!("{}.json", group_path_part(group_id)?.as_ref());
+
+        Ok(self
+            .group_consumers_prefix()
+            .join(parse_segment(&file_name)?))
+    }
+
+    /// The prefix a group's committed offsets are stored beneath, e.g.
+    /// `clusters/{cluster}/groups/consumers/{group}/offsets`.
+    fn group_offsets_prefix(&self, group_id: &str) -> Result<Path> {
+        Ok(self
+            .group_consumers_prefix()
+            .join(group_path_part(group_id)?)
+            .join("offsets"))
+    }
+
+    /// The location of a single committed offset, e.g.
+    /// `clusters/{cluster}/groups/consumers/{group}/offsets/{topic}/partitions/{partition:0>10}.json`.
+    ///
+    /// The topic keeps the segment rule of its data keys, `Path::from`, which
+    /// splits on "/": a topic named before CreateTopics rejected "/" keeps the
+    /// key it had, and `delete_topic` matches its offsets by the same rule.
+    fn committed_offset_location(&self, group_id: &str, topition: &Topition) -> Result<Path> {
+        let mut location = self.group_offsets_prefix(group_id)?;
+        location.extend(Path::from(topition.topic.as_str()).parts());
+
+        Ok(location
+            .join("partitions")
+            .join(format!("{:0>10}.json", topition.partition)))
+    }
+
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
     where
         V: DeserializeOwned,
@@ -712,7 +840,7 @@ impl Storage for DynoStore {
                      its name is not a safe key prefix"
                 );
             } else {
-                let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
+                let prefix = self.group_consumers_prefix();
 
                 let topic_name = metadata.topic.name.clone();
                 let prefix_clone = prefix.clone();
@@ -1423,10 +1551,7 @@ impl Storage for DynoStore {
                 .await?
                 .is_some()
             {
-                let location = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
-                    self.cluster, group_id, topition.topic, topition.partition,
-                ));
+                let location = self.committed_offset_location(group_id, topition)?;
 
                 let payload = serde_json::to_vec(&offset_commit)
                     .map(Bytes::from)
@@ -1459,10 +1584,7 @@ impl Storage for DynoStore {
         let mut topitions = vec![];
 
         {
-            let location = Path::from(format!(
-                "clusters/{}/groups/consumers/{}/offsets/",
-                self.cluster, group_id,
-            ));
+            let location = self.group_offsets_prefix(group_id)?;
 
             let mut list_stream = self.object_store.list(Some(&location));
 
@@ -1475,20 +1597,22 @@ impl Storage for DynoStore {
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             {
                 debug!(?meta);
-                let Some(topic): Option<String> = meta
-                    .location
-                    .parts()
-                    .nth(6)
+
+                // Below the offsets prefix: `{topic}/partitions/{partition:0>10}.json`.
+                let Some(mut parts) = meta.location.prefix_match(&location) else {
+                    continue;
+                };
+
+                let Some(topic): Option<String> = parts
+                    .next()
                     .inspect(|topic| debug!(?topic))
                     .map(|topic| topic.as_ref().into())
                 else {
                     continue;
                 };
 
-                let Some(partition) = meta
-                    .location
-                    .parts()
-                    .nth(8)
+                let Some(partition) = parts
+                    .nth(1)
                     .inspect(|partition| debug!(?partition))
                     .map(|partition| i32::from_str(&partition.as_ref()[0..10]))
                     .transpose()?
@@ -1516,10 +1640,7 @@ impl Storage for DynoStore {
 
         if let Some(group_id) = group_id {
             for topition in topics {
-                let location = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
-                    self.cluster, group_id, topition.topic, topition.partition,
-                ));
+                let location = self.committed_offset_location(group_id, topition)?;
 
                 let offset = match self.object_store.get(&location).await {
                     Ok(get_result) => get_result
@@ -1886,7 +2007,7 @@ impl Storage for DynoStore {
     }
 
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        let location = Path::from(format!("clusters/{}/groups/consumers/", self.cluster,));
+        let location = self.group_consumers_prefix();
         let list_result = self
             .object_store
             .list_with_delimiter(Some(&location))
@@ -1897,15 +2018,21 @@ impl Storage for DynoStore {
         let mut listed_groups = vec![];
 
         for prefix in list_result.common_prefixes {
-            if let Some(group_id) = prefix.parts().next_back() {
-                listed_groups.push(
-                    ListedGroup::default()
-                        .group_id(group_id.as_ref().into())
-                        .protocol_type("consumer".into())
-                        .group_state(Some("Unknown".into()))
-                        .group_type(Some("classic".into())),
-                );
-            }
+            let Some(segment) = prefix.parts().next_back() else {
+                continue;
+            };
+
+            let Some(group_id) = decode_group_segment(segment.as_ref()) else {
+                continue;
+            };
+
+            listed_groups.push(
+                ListedGroup::default()
+                    .group_id(group_id)
+                    .protocol_type("consumer".into())
+                    .group_state(Some("Unknown".into()))
+                    .group_type(Some("classic".into())),
+            );
         }
 
         Ok(listed_groups)
@@ -1919,21 +2046,7 @@ impl Storage for DynoStore {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                if group_id.split('/').any(str::is_empty) {
-                    // `Path::from` drops empty segments, so "", "/", "a/" etc.
-                    // would widen the prefix delete below to every group.
-                    results.push(
-                        DeletableGroupResult::default()
-                            .group_id(group_id.into())
-                            .error_code(ErrorCode::InvalidGroupId.into()),
-                    );
-                    continue;
-                }
-
-                let location = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}.json",
-                    self.cluster, group_id,
-                ));
+                let location = self.group_state_location(group_id)?;
 
                 let had_group_state = self
                     .object_store
@@ -1945,10 +2058,9 @@ impl Storage for DynoStore {
 
                 debug!(group_id, had_group_state);
 
-                let prefix = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}",
-                    self.cluster, group_id,
-                ));
+                let prefix = self
+                    .group_consumers_prefix()
+                    .join(group_path_part(group_id)?);
 
                 let locations = self
                     .object_store
@@ -1990,10 +2102,7 @@ impl Storage for DynoStore {
         let mut results = vec![];
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                let location = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}.json",
-                    self.cluster, group_id,
-                ));
+                let location = self.group_state_location(group_id)?;
 
                 match self
                     .get::<GroupDetail>(&location)
@@ -2040,10 +2149,7 @@ impl Storage for DynoStore {
         detail: GroupDetail,
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>> {
-        let location = Path::from(format!(
-            "clusters/{}/groups/consumers/{}.json",
-            self.cluster, group_id,
-        ));
+        let location = self.group_state_location(group_id)?;
 
         self.put(
             &location,
