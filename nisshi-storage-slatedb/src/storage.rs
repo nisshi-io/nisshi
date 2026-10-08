@@ -353,7 +353,7 @@ impl Engine {
         if !legacy && target_millis > watermark.latest_indexed_timestamp.unwrap_or(-1) {
             return Ok(ListOffsetResponse {
                 error_code: ErrorCode::None,
-                offset: Some(0),
+                offset: None,
                 timestamp: None,
             });
         }
@@ -412,7 +412,7 @@ impl Engine {
             }),
             None => Ok(ListOffsetResponse {
                 error_code: ErrorCode::None,
-                offset: Some(0),
+                offset: None,
                 timestamp: None,
             }),
         }
@@ -1844,25 +1844,40 @@ impl Storage for Engine {
                     }
                 }
                 ListOffset::Timestamp(target_ts) => {
-                    // This lookup ignores `isolation_level`. Kafka drops a
-                    // match at or above the last fetchable offset (the last
-                    // stable offset for ReadCommitted), and this engine does
-                    // not; that is a known difference.
-                    //
-                    // target_ts is SystemTime, need to convert to i64 for comparison
                     let target_millis = target_ts
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
 
-                    self.list_offset_for_timestamp(
-                        metadata.id,
-                        topition.partition,
-                        target_millis,
-                        &watermark,
-                        legacy,
-                    )
-                    .await?
+                    let found = self
+                        .list_offset_for_timestamp(
+                            metadata.id,
+                            topition.partition,
+                            target_millis,
+                            &watermark,
+                            legacy,
+                        )
+                        .await?;
+
+                    // Under ReadCommitted, Kafka answers only a record before
+                    // the last stable offset, and answers no match otherwise
+                    // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589).
+                    let past_last_stable = match found.offset {
+                        Some(offset) if isolation_level == IsolationLevel::ReadCommitted => {
+                            offset >= self.offset_stage(topition).await?.last_stable
+                        }
+                        _ => false,
+                    };
+
+                    if past_last_stable {
+                        ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            offset: None,
+                            timestamp: None,
+                        }
+                    } else {
+                        found
+                    }
                 }
             };
 

@@ -1602,7 +1602,7 @@ mod time_index {
 
         let response = list_offsets_timestamp(&engine, &topition, 151).await;
         assert_eq!(ErrorCode::None, response.error_code);
-        assert_eq!(Some(0), response.offset);
+        assert_eq!(None, response.offset);
         assert!(response.timestamp.is_none());
     }
 
@@ -1668,6 +1668,44 @@ mod time_index {
         assert_eq!(ErrorCode::None, response.error_code);
         assert_eq!(Some(7), response.offset);
         assert_eq!(95, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
+    /// A target at or below the greatest indexed timestamp, whose only
+    /// matching records DeleteRecords has removed, is a scan miss: no
+    /// offset, as for a target above every record.
+    #[tokio::test]
+    async fn scan_miss_after_delete_records_answers_no_match() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-scan-miss").await;
+
+        // Offset 0 (ts=100) is indexed; offset 1 (ts=50) is below the
+        // running max, so it is not.
+        for batch in [keyed_batch(b"a", b"v1", 100), keyed_batch(b"b", b"v2", 50)] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        // delete_records(1) removes offset 0 and its entry; the greatest
+        // indexed timestamp stays 100, so a lookup for 80 cannot take the
+        // shortcut and scans the surviving batch, which is below 80.
+        let delete_request = vec![
+            DeleteRecordsTopic::default()
+                .name("time-index-scan-miss".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(1),
+                ])),
+        ];
+        let _ = engine.delete_records(&delete_request).await.unwrap();
+
+        let response = list_offsets_timestamp(&engine, &topition, 80).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(None, response.offset);
+        assert!(response.timestamp.is_none());
+
+        let response = list_offsets_timestamp(&engine, &topition, 50).await;
+        assert_eq!(Some(1), response.offset);
+        assert_eq!(50, millis_since_epoch(response.timestamp.unwrap()));
     }
 
     #[tokio::test]
@@ -2249,7 +2287,7 @@ mod time_index {
         // Timestamp(151): beyond everything ever indexed -> no match.
         let response = list_offsets_timestamp(&engine, &topition, 151).await;
         assert_eq!(ErrorCode::None, response.error_code);
-        assert_eq!(Some(0), response.offset);
+        assert_eq!(None, response.offset);
         assert!(response.timestamp.is_none());
 
         // delete_records(10) removes B0 (offsets 0-9) only.
@@ -2275,6 +2313,94 @@ mod time_index {
         let response = list_offsets_timestamp(&engine, &topition, 70).await;
         assert_eq!(Some(10), response.offset);
         assert_eq!(91, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
+    async fn list_offsets_timestamp_at(
+        engine: &Engine,
+        isolation_level: IsolationLevel,
+        topition: &Topition,
+        millis: i64,
+    ) -> ListOffsetResponse {
+        engine
+            .list_offsets(
+                isolation_level,
+                &[(topition.clone(), ListOffset::Timestamp(at_millis(millis)))],
+            )
+            .await
+            .unwrap()
+            .remove(0)
+            .1
+    }
+
+    /// Under ReadCommitted, a match at or after the first offset of an open
+    /// transaction is no match, as in Kafka. ReadUncommitted still answers
+    /// it.
+    #[tokio::test]
+    async fn read_committed_lookup_stops_at_the_last_stable_offset() {
+        use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-read-committed").await;
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"a", b"v1", 100))
+            .await
+            .unwrap();
+
+        let producer = engine
+            .init_producer(Some("time-index-txn"), 60000, Some(-1), Some(-1))
+            .await
+            .unwrap();
+        let _ = engine
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: "time-index-txn".into(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name("time-index-read-committed".into())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await
+            .unwrap();
+
+        let open = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Some(Bytes::from_static(b"b")))
+                    .value(Some(Bytes::from_static(b"v2"))),
+            )
+            .base_timestamp(200)
+            .max_timestamp(200)
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(Batch::try_from)
+            .unwrap();
+        let _ = engine
+            .produce(Some("time-index-txn"), &topition, open)
+            .await
+            .unwrap();
+
+        let stage = engine.offset_stage(&topition).await.unwrap();
+        assert_eq!((1, 2), (stage.last_stable, stage.high_watermark));
+
+        let committed =
+            list_offsets_timestamp_at(&engine, IsolationLevel::ReadCommitted, &topition, 150).await;
+        assert_eq!(ErrorCode::None, committed.error_code);
+        assert_eq!(None, committed.offset);
+        assert!(committed.timestamp.is_none());
+
+        let committed =
+            list_offsets_timestamp_at(&engine, IsolationLevel::ReadCommitted, &topition, 100).await;
+        assert_eq!(Some(0), committed.offset);
+        assert_eq!(100, millis_since_epoch(committed.timestamp.unwrap()));
+
+        let uncommitted = list_offsets_timestamp(&engine, &topition, 150).await;
+        assert_eq!(Some(1), uncommitted.offset);
+        assert_eq!(200, millis_since_epoch(uncommitted.timestamp.unwrap()));
     }
 }
 
