@@ -480,7 +480,7 @@ async fn storage_rolls_back_failed_resource(storage: impl Storage + Clone) -> Re
 }
 
 /// Each APPEND reads the current list and writes a new one, so concurrent
-/// APPENDs to one topic lose an item unless storage orders them.
+/// APPEND operations on one topic lose an item unless storage orders them.
 async fn concurrent_appends(storage: impl Storage + Clone) -> Result<()> {
     const APPENDS: usize = 8;
 

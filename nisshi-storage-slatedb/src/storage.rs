@@ -55,8 +55,9 @@ use nisshi_storage::{
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, config::apply_op,
 };
-use serde::Serialize;
-use tracing::{debug, warn};
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::time::sleep;
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::engine::Engine;
@@ -75,6 +76,24 @@ const RETENTION_MS: &str = "retention.ms";
 /// Default retention period applied when a topic has no `retention.ms`
 /// configuration, matching the PG engine.
 const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The number of times an alter of a topic's configuration tries to commit.
+const ALTER_ATTEMPTS: u32 = 8;
+
+/// The delay before an alter retries its first conflict. It doubles for each
+/// later conflict, so the alter waits about 1.3 seconds in all before it fails.
+const ALTER_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Decodes a stored committed offset key or value.
+///
+/// A committed offset that doesn't decode stays that way, so the error is
+/// `UNKNOWN_SERVER_ERROR`, which OffsetFetch reports to the client instead of
+/// a code that the client retries.
+fn decode_offset<T: DeserializeOwned>(encoded: &[u8]) -> Result<T> {
+    postcard::from_bytes(encoded)
+        .inspect_err(|err| error!(?err))
+        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+}
 
 impl Engine {
     /// Applies every change in `resource` to its topic in one transaction, so
@@ -761,15 +780,23 @@ impl Storage for Engine {
         match ConfigResource::from(resource.resource_type) {
             ConfigResource::Topic => {
                 // Every alter, create and delete of a topic rewrites the one
-                // TOPICS key, so concurrent writers conflict at commit. Each
-                // conflict means another transaction committed, so a retry
-                // makes progress.
+                // TOPICS key, so concurrent writers conflict at commit. The
+                // alter retries a conflict with a growing delay, and gives up
+                // after ALTER_ATTEMPTS so that constant topic churn can't hold
+                // one request forever.
+                let mut delay = ALTER_RETRY_DELAY;
+                let mut attempt = 1;
+
                 loop {
                     match self.alter_topic(&resource).await {
                         Err(Error::Slate(error))
-                            if error.kind() == slatedb::ErrorKind::Transaction =>
+                            if error.kind() == slatedb::ErrorKind::Transaction
+                                && attempt < ALTER_ATTEMPTS =>
                         {
-                            debug!(?error, resource = resource.resource_name);
+                            debug!(?error, attempt, resource = resource.resource_name);
+                            sleep(delay).await;
+                            delay *= 2;
+                            attempt += 1;
                         }
 
                         otherwise => break otherwise?,
@@ -1235,8 +1262,8 @@ impl Storage for Engine {
                 break;
             }
 
-            let key: OffsetCommitKey = postcard::from_bytes(&kv.key)?;
-            let value: OffsetCommitValue = postcard::from_bytes(&kv.value)?;
+            let key: OffsetCommitKey = decode_offset(&kv.key)?;
+            let value: OffsetCommitValue = decode_offset(&kv.value)?;
 
             _ = topitions.insert(Topition::new(key.topic, key.partition), value.offset);
         }
@@ -1279,7 +1306,7 @@ impl Storage for Engine {
 
                 let offset = match self.db.get(&key).await {
                     Ok(Some(encoded)) => {
-                        let value: OffsetCommitValue = postcard::from_bytes(&encoded)?;
+                        let value: OffsetCommitValue = decode_offset(&encoded)?;
                         value.offset
                     }
                     Ok(None) => -1, // No committed offset

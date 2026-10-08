@@ -1421,8 +1421,15 @@ impl Storage for DynoStore {
                     .parts()
                     .nth(8)
                     .inspect(|partition| debug!(?partition))
-                    .map(|partition| i32::from_str(&partition.as_ref()[0..10]))
-                    .transpose()?
+                    .map(|partition| {
+                        partition
+                            .as_ref()
+                            .get(0..10)
+                            .and_then(|partition| i32::from_str(partition).ok())
+                            .ok_or(Error::Api(ErrorCode::UnknownServerError))
+                    })
+                    .transpose()
+                    .inspect_err(|error| error!(?error, ?meta))?
                 else {
                     continue;
                 };

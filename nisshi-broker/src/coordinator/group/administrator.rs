@@ -3218,9 +3218,11 @@ fn offset_commit_response(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> B
 /// Returns the error code that an `OffsetFetch` reports when storage fails
 /// with `error`.
 ///
-/// A storage error that carries a code, such as an offset that storage can't
-/// decode, keeps that code. Any other storage error is transient, so the
-/// response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
+/// A storage error that carries a code keeps that code. Each storage engine
+/// reports a committed offset that it can't decode as `UNKNOWN_SERVER_ERROR`,
+/// because a retry can't fix it. Any other storage error is treated as
+/// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka
+/// clients
 /// [retry](https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L1460-L1464).
 fn offset_fetch_error_code(error: &Error) -> ErrorCode {
     match error {

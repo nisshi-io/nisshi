@@ -1321,3 +1321,38 @@ async fn test_builder_pattern() {
     assert_eq!("builder-cluster", engine.cluster_id().await.unwrap());
     assert_eq!(42, engine.node().await.unwrap());
 }
+
+#[tokio::test]
+async fn corrupt_committed_offset_is_unknown_server_error() {
+    use super::types::OffsetCommitKey;
+
+    let engine = create_test_engine().await;
+
+    _ = engine
+        .create_topic(
+            CreatableTopic::default()
+                .name("corrupt".into())
+                .num_partitions(1)
+                .replication_factor(1),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let key = postcard::to_stdvec(&OffsetCommitKey::new("group", "corrupt", 0)).unwrap();
+    _ = engine.db.put(&key, b"").await.unwrap();
+
+    let topition = Topition::new("corrupt", 0);
+
+    assert!(matches!(
+        engine
+            .offset_fetch(Some("group"), std::slice::from_ref(&topition), None)
+            .await,
+        Err(Error::Api(ErrorCode::UnknownServerError))
+    ));
+
+    assert!(matches!(
+        engine.committed_offset_topitions("group").await,
+        Err(Error::Api(ErrorCode::UnknownServerError))
+    ));
+}
