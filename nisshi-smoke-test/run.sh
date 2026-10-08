@@ -23,8 +23,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 engine=${1:-}
 case "${engine}" in
     postgres) feature=postgres storage=postgres://postgres:postgres@localhost services=db ports=5432 ;;
-    sqlite) feature=libsql storage=sqlite:// services= ports= ;;
-    memory) feature=dynostore storage=memory://nisshi/ services= ports= ;;
+    sqlite) feature=libsql storage=sqlite:// services='' ports='' ;;
+    memory) feature=dynostore storage=memory://nisshi/ services='' ports='' ;;
     s3) feature=dynostore storage=s3://nisshi/ services=minio ports="9000 9001" ;;
     *) echo "usage: nisshi-smoke-test/run.sh <postgres|sqlite|memory|s3>" >&2; exit 2 ;;
 esac
@@ -55,6 +55,10 @@ started=false
 # The harness removes each broker container that it stops, so a broker
 # container that is still here belongs to a run that hung or was cancelled.
 # Cleanup saves its log before it removes it.
+#
+# The EXIT trap calls cleanup. ShellCheck doesn't see that call when the script runs `exit`
+# (koalaman/shellcheck#2542).
+# shellcheck disable=SC2329
 cleanup() (
     set +e
     docker ps --all --filter "label=nisshi-smoke=${NISSHI_SMOKE_RUN}" --filter name=nisshi-smoke-broker --format '{{.Names}}' |
