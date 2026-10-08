@@ -21,7 +21,7 @@ use nisshi_storage::{
     reject_unrecognized_options,
 };
 use object_store::{
-    aws::{AmazonS3Builder, S3ConditionalPut},
+    aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
     gcp::GoogleCloudStorageBuilder,
     memory::InMemory,
 };
@@ -101,29 +101,62 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
 
         debug!(?minimum_size, ?maximum_delay);
 
-        AmazonS3Builder::from_env()
+        let builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket_name)
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .build()
-            .map(|object_store| {
-                DynoStore::new(
-                    configuration.cluster.as_str(),
-                    configuration.node_id,
-                    object_store,
-                )
-                .advertised_listener(configuration.advertised_listener.clone())
-                .schemas(configuration.schema_registry)
-                .lake(configuration.lake_house.clone())
-            })
-            .map(|storage| {
-                ProduceRequestBatcher::new(storage)
-                    .with_minimum_size(minimum_size)
-                    .with_maximum_delay(maximum_delay)
-            })
-            .map(Box::new)
-            .map(|storage| Arc::new(storage) as ArcDynStorage)
-            .map_err(Into::into)
+            .with_conditional_put(S3ConditionalPut::ETagMatch);
+
+        // With `AWS_SKIP_SIGNATURE` on, object_store sends unsigned requests
+        // and never asks the credential provider for a credential. The provider
+        // still exists and, with no keys set, falls back to the instance
+        // metadata service, so this check would fail a setup that works.
+        let skip_signature = builder
+            .get_config_value(&AmazonS3ConfigKey::SkipSignature)
+            .is_some_and(|value| skip_signature(&value));
+
+        let object_store = builder.build().map_err(nisshi_storage::Error::from)?;
+
+        // We get a credential from the configured provider now, so that a
+        // provider failure is reported as `NoCredentials` and not as a failed
+        // request. The provider caches the credential, so the `ping()` startup
+        // check that follows does not fetch it again.
+        if !skip_signature {
+            let _ = object_store
+                .credentials()
+                .get_credential()
+                .await
+                .map_err(|source| nisshi_storage::Error::NoCredentials(Arc::new(source)))?;
+        }
+
+        let storage = DynoStore::new(
+            configuration.cluster.as_str(),
+            configuration.node_id,
+            object_store,
+        )
+        .advertised_listener(configuration.advertised_listener.clone())
+        .schemas(configuration.schema_registry)
+        .lake(configuration.lake_house.clone());
+
+        let storage = ProduceRequestBatcher::new(storage)
+            .with_minimum_size(minimum_size)
+            .with_maximum_delay(maximum_delay);
+
+        Ok(Arc::new(Box::new(storage)) as ArcDynStorage)
     }
+}
+
+/// Returns whether `object_store` reads `value`, the raw `AWS_SKIP_SIGNATURE`
+/// setting, as true.
+///
+/// [`AmazonS3Builder::get_config_value`] returns the unparsed string, and
+/// `object_store` parses it only in `build()`, with a crate-private parser
+/// that this function must keep matching: `1`, `true`, `on`, `yes` and `y`
+/// in any case are true. Every other value is either false or rejected by
+/// `build()` before the credential check runs.
+fn skip_signature(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes" | "y"
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -198,3 +231,6 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
             .map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod tests;
