@@ -143,7 +143,10 @@ fn address_family_unsupported_os_error() -> i32 {
 
 #[cfg(windows)]
 fn address_family_unsupported_os_error() -> i32 {
-    10047
+    /// <https://learn.microsoft.com/windows/win32/winsock/windows-sockets-error-codes-2>
+    const WSAEAFNOSUPPORT: i32 = 10047;
+
+    WSAEAFNOSUPPORT
 }
 
 /// Returns the IPv4 address to bind after binding `addr` failed with `err`, or `None` when
