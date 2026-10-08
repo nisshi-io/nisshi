@@ -218,13 +218,16 @@ impl Deadlines {
     /// The client's `max_wait` bounds the response: engines stop assembling
     /// batches at their budget and return what they have. A partition that
     /// starts with less than half of `max_wait` left, because one before it
-    /// was slow, still gets that half, rather than a budget engines would
-    /// read nothing with.
+    /// was slow, gets that half rather than a budget engines would read
+    /// nothing with, as far as its share allows.
     ///
     /// The budget ends a quarter of the partition's share, and at least
     /// [`MIN_BUDGET_MARGIN`], before `cap`. A budget that ends at `cap`
     /// makes a read that uses all of it return after `cap`, so the broker
-    /// abandons it and loses every batch it read.
+    /// abandons it and loses every batch it read. So a partition whose
+    /// share is under two thirds of `max_wait`, deep in a request or after
+    /// a stall, gets three quarters of its share, and one whose share is
+    /// under the least margin gets no budget at all.
     fn storage(&self, cap: Instant) -> Instant {
         let now = Instant::now();
         let share = cap.saturating_duration_since(now);
@@ -1016,7 +1019,9 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
-    use super::{Deadlines, FetchService, Missed, READ_DEADLINE_OVERHEAD, before};
+    use super::{
+        Deadlines, FetchService, MIN_BUDGET_MARGIN, Missed, READ_DEADLINE_OVERHEAD, before,
+    };
     use crate::{
         BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
         NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
@@ -1808,12 +1813,14 @@ mod tests {
         /// Does not answer for an hour.
         Stall,
 
-        /// Returns this batch once its budget is spent, plus [`OVERSHOOT`],
-        /// as an engine does that checks its budget only between records.
-        Assemble(deflated::Batch),
+        /// Returns this batch once its budget is spent, plus the given
+        /// overshoot, as an engine does that checks its budget only between
+        /// records.
+        Assemble(deflated::Batch, Duration),
     }
 
-    /// How long past its budget a [`Read::Assemble`] returns.
+    /// How long past its budget a [`Read::Assemble`] returns, when the test
+    /// is not about the overshoot.
     const OVERSHOOT: Duration = Duration::from_millis(8);
 
     /// One storage read of a partition, as [`Partitions`] saw it.
@@ -1883,6 +1890,17 @@ mod tests {
                 .cloned()
                 .collect()
         }
+
+        /// How many times the offset stage of `partition` of [`TOPIC`] was
+        /// read.
+        fn offset_stage_reads(&self, partition: i32) -> usize {
+            self.offset_stage_reads
+                .lock()
+                .expect("offset stage reads")
+                .get(&(TOPIC.into(), partition))
+                .copied()
+                .unwrap_or_default()
+        }
     }
 
     storage_double!(Partitions {
@@ -1923,8 +1941,8 @@ mod tests {
                     tokio::time::sleep(Duration::from_secs(3_600)).await;
                     Ok(vec![])
                 }
-                Read::Assemble(batch) => {
-                    tokio::time::sleep(max_wait + OVERSHOOT).await;
+                Read::Assemble(batch, overshoot) => {
+                    tokio::time::sleep(max_wait + overshoot).await;
                     Ok(vec![batch])
                 }
             }
@@ -2137,11 +2155,14 @@ mod tests {
     }
 
     /// A partition that stalls after reading some batches returns them,
-    /// with the stage read before them, and the bytes they took are not
-    /// given again to the partitions after it.
+    /// with the stage read before them raised to cover them rather than
+    /// read again, and the bytes they took are not given again to the
+    /// partitions after it.
     #[tokio::test(start_paused = true)]
     async fn a_partition_that_stalls_keeps_what_it_read() -> Result<()> {
-        let first = batch(0, &[0, 1])?;
+        // the records reach past the high watermark the stage read before
+        // them holds
+        let first = batch(1_000, &[0, 1])?;
         let size = u32::try_from(first.record_data.len())?;
 
         let storage = Partitions::new([
@@ -2154,9 +2175,10 @@ mod tests {
         assert_eq!(READ_DEADLINE / 2, elapsed);
 
         assert_eq!(1, batches(&partitions[0]));
-        assert_eq!(1_000, partitions[0].high_watermark);
+        assert_eq!(1_002, partitions[0].high_watermark);
         assert_eq!(Some(1_000), partitions[0].last_stable_offset);
         assert_eq!(Some(0), partitions[0].log_start_offset);
+        assert_eq!(1, storage.offset_stage_reads(0));
 
         assert_eq!(1, batches(&partitions[1]));
 
@@ -2190,25 +2212,28 @@ mod tests {
         Ok(())
     }
 
-    /// A partition whose budget equals its share of the read deadline gets
-    /// a budget that ends before that share does, so a read that spends
-    /// its whole budget returns what it assembled. With `max_wait` of 5s,
-    /// the first of two partitions has a share of 5s.
+    /// A partition whose `max_wait` reaches past its share of the read
+    /// deadline gets a budget that ends a quarter of the share before it,
+    /// so a read that spends its whole budget and returns within that
+    /// quarter keeps what it assembled. With `max_wait` of 5s, the first of
+    /// two partitions has a share of 5s and a budget of 3.75s.
     #[tokio::test(start_paused = true)]
     async fn a_read_that_spends_its_budget_keeps_what_it_read() -> Result<()> {
         let max_wait = Duration::from_secs(5);
         let share = (max_wait + READ_DEADLINE_OVERHEAD) / 2;
 
+        // past the least margin, within a quarter of the share
+        let overshoot = Duration::from_secs(1);
+
         let storage = Partitions::new([
-            (0, vec![Read::Assemble(batch(0, &[0])?)]),
+            (0, vec![Read::Assemble(batch(0, &[0])?, overshoot)]),
             (1, vec![Read::Batch(batch(0, &[0])?)]),
         ]);
 
         let (mut topics, _) = fetch_topics(storage.clone(), max_wait, &[(TOPIC, &[0, 1])]).await?;
         let partitions = topics.remove(0);
 
-        let budget = storage.calls(0)[0].max_wait;
-        assert!(budget < share, "budget {budget:?} is not inside {share:?}");
+        assert_eq!(share - share / 4, storage.calls(0)[0].max_wait);
 
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1_000, partitions[0].high_watermark);
@@ -2226,7 +2251,7 @@ mod tests {
         // the record is at the high watermark the stage read before the
         // records holds, so the stage is read again
         let storage = Partitions::new([
-            (0, vec![Read::Assemble(batch(1_000, &[0])?)]),
+            (0, vec![Read::Assemble(batch(1_000, &[0])?, OVERSHOOT)]),
             (1, vec![Read::Batch(batch(0, &[0])?)]),
         ])
         .stall_offset_stage(0, 2);
@@ -2245,6 +2270,125 @@ mod tests {
 
         assert_eq!(1, batches(&partitions[1]));
         assert_eq!(1_000, partitions[1].high_watermark);
+
+        Ok(())
+    }
+
+    /// A `max_wait` whose read deadline halves into whole milliseconds seven
+    /// times, since tokio's timers have millisecond resolution: 5504ms, so
+    /// the 32nd of it is 172ms and the 128th is 43ms.
+    const HALVING_MAX_WAIT: Duration = Duration::from_millis(504);
+
+    /// A partition whose share is too short for a quarter of it to cover
+    /// an engine's overshoot keeps the least margin instead. After five
+    /// stalls the last partition has a share of a 32nd of the read
+    /// deadline, under 200ms, so its budget ends 50ms before its share
+    /// does, and a read that overshoots its budget by less than that keeps
+    /// what it assembled.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_share_keeps_the_least_margin() -> Result<()> {
+        let share = (HALVING_MAX_WAIT + READ_DEADLINE_OVERHEAD) / 32;
+        assert!(share / 4 < MIN_BUDGET_MARGIN && share > MIN_BUDGET_MARGIN);
+
+        // past a quarter of the share, within the least margin
+        let overshoot = Duration::from_millis(45);
+        assert!(share / 4 < overshoot && overshoot < MIN_BUDGET_MARGIN);
+
+        let storage = Partitions::new([
+            (0, vec![Read::Stall]),
+            (1, vec![Read::Stall]),
+            (2, vec![Read::Stall]),
+            (3, vec![Read::Stall]),
+            (4, vec![Read::Stall]),
+            (5, vec![Read::Assemble(batch(0, &[0])?, overshoot)]),
+        ]);
+
+        let (mut topics, _) = fetch_topics(
+            storage.clone(),
+            HALVING_MAX_WAIT,
+            &[(TOPIC, &[0, 1, 2, 3, 4, 5])],
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(share - MIN_BUDGET_MARGIN, storage.calls(5)[0].max_wait);
+        assert_eq!(1, batches(&partitions[5]));
+        assert_eq!(1_000, partitions[5].high_watermark);
+
+        Ok(())
+    }
+
+    /// A partition whose share is under the least margin is read with no
+    /// budget at all, and answers with the stage read before the records.
+    /// After seven stalls the last partition has a share of a 128th of the
+    /// read deadline, under 50ms.
+    #[tokio::test(start_paused = true)]
+    async fn a_share_under_the_least_margin_gives_no_budget() -> Result<()> {
+        let read_deadline = HALVING_MAX_WAIT + READ_DEADLINE_OVERHEAD;
+        let share = read_deadline / 128;
+        assert!(share < MIN_BUDGET_MARGIN);
+
+        let storage = Partitions::new([
+            (0, vec![Read::Stall]),
+            (1, vec![Read::Stall]),
+            (2, vec![Read::Stall]),
+            (3, vec![Read::Stall]),
+            (4, vec![Read::Stall]),
+            (5, vec![Read::Stall]),
+            (6, vec![Read::Stall]),
+            (7, vec![Read::Batch(batch(0, &[0])?)]),
+        ]);
+
+        let (mut topics, elapsed) = fetch_topics(
+            storage.clone(),
+            HALVING_MAX_WAIT,
+            &[(TOPIC, &[0, 1, 2, 3, 4, 5, 6, 7])],
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(read_deadline - share, elapsed);
+
+        assert_eq!(Duration::ZERO, storage.calls(7)[0].max_wait);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[7].error_code)?
+        );
+        assert_eq!(0, batches(&partitions[7]));
+        assert_eq!(1_000, partitions[7].high_watermark);
+
+        Ok(())
+    }
+
+    /// A partition whose offset stage never answers before its records are
+    /// read is answered with no records and unknown offsets at its share,
+    /// its records are never read, and the partitions after it are read
+    /// with a budget of their own.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_offset_stage_before_the_read_answers_unknown_offsets() -> Result<()> {
+        let storage = Partitions::new([
+            (0, vec![Read::Batch(batch(0, &[0])?)]),
+            (1, vec![Read::Batch(batch(0, &[0])?)]),
+        ])
+        .stall_offset_stage(0, 1);
+
+        let (partitions, elapsed) = fetch(storage.clone(), &[0, 1]).await?;
+
+        assert_eq!(READ_DEADLINE / 2, elapsed);
+
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(0, batches(&partitions[0]));
+        assert_eq!(-1, partitions[0].high_watermark);
+        assert_eq!(Some(-1), partitions[0].last_stable_offset);
+        assert_eq!(Some(-1), partitions[0].log_start_offset);
+        assert!(storage.calls(0).is_empty(), "{:?}", storage.calls(0));
+
+        assert_eq!(1, batches(&partitions[1]));
+        assert_eq!(1_000, partitions[1].high_watermark);
+        assert_eq!(MAX_WAIT / 2, storage.calls(1)[0].max_wait);
 
         Ok(())
     }
