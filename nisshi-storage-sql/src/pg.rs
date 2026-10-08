@@ -205,7 +205,7 @@ const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
 
 /// How long cancelling an abandoned statement may take, from opening the
 /// cancel connection to the statement's end, before the statement's
-/// connection is closed rather than returned to the pool.
+/// connection is taken out of the pool rather than returned to it.
 ///
 /// The cancel request is a connection, a TLS handshake and one packet, and
 /// a backend ends its statement at the next interrupt check, so the whole
@@ -569,20 +569,23 @@ enum NotSettled {
 }
 
 /// Cancels the statement running on an abandoned `connection` and returns
-/// the connection to its pool once that statement has ended, so the pool
-/// keeps to its [`POOL_MAX_SIZE`] server connections.
+/// the connection to its pool once that statement has ended, so a
+/// cancelled read costs the server one short cancel connection and the
+/// pool stays within its [`POOL_MAX_SIZE`] server connections.
 ///
 /// The cancel request travels on a connection of its own, and returns once
 /// the server has signalled the backend (see [`CancelRequests::cancel`]).
 /// The statement has ended once an empty query on `connection` answers,
-/// because the server runs the two in order. The connection is closed
-/// instead, and the pool opens a replacement, when the cancel request
-/// fails or the two together take longer than
+/// because the server runs the two in order. The connection is taken out
+/// of the pool instead, and the pool opens a replacement, when the cancel
+/// request fails or the two together take longer than
 /// [`ABANDONED_STATEMENT_GRACE`], so the pool does not hand out a
 /// connection that is still busy. A cancel request still in flight at
 /// that point is sent anyway, within [`DEFAULT_POOL_CREATE_TIMEOUT`]. A
 /// statement whose cancel request never arrives runs on the server until
-/// `statement_timeout`.
+/// `statement_timeout`, and its connection stays open on the server until
+/// then, beside the pool's replacement, because the client closes a
+/// connection only once its last statement has answered.
 ///
 /// `permit` is held until the connection goes back or the cancel request
 /// has been given up on, so the statement counts against
@@ -4890,6 +4893,13 @@ mod tests {
             "pg_sleep(30) is still running"
         );
         drop(connection);
+
+        // The cancel task holds the permit, so the statement still counts
+        // against the limit while it runs.
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
 
         let settled = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {

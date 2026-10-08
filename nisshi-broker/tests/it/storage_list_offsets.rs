@@ -435,6 +435,20 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn many_partitions_with_latency() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::many_partitions_with_latency(storage, broker_id).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
