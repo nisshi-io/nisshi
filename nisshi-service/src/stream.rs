@@ -1124,11 +1124,11 @@ where
 
     #[instrument(skip_all)]
     async fn serve(&self, req: BytesInput) -> Result<Self::Output, Self::Error> {
-        debug!(req = ?&req.bytes[..]);
+        debug!(len = req.bytes.len());
         self.inner
             .serve(req)
             .await
-            .inspect(|response| debug!(response = ?&response[..]))
+            .inspect(|response| debug!(response_len = response.len()))
     }
 }
 
