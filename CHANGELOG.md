@@ -79,3 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fetch checks the fetch offset before it reaches the storage engine, so a storage engine never receives an offset such as `i64::MAX`. Above the high watermark, Fetch answers `NONE` with no records on every engine. Apache Kafka answers `NONE` only up to the log end offset and `OFFSET_OUT_OF_RANGE` above it; Nisshi answers `NONE` because a broker on dynostore can read a high watermark that lags a write through another broker. A consumer whose position is past the end of the log therefore waits there instead of applying `auto.offset.reset`. Such a consumer shows in `nisshi_fetch_offset_out_of_bounds` with `bound` set to `above_high_watermark`, counted once per poll round of a Fetch, so the counter shows whether parked fetches exist rather than how many; a short burst on dynostore with several brokers is expected.
 - SlateDB compaction no longer moves a partition's log start offset, as in Apache Kafka, whose cleaner never does. ListOffsets `earliest` and the `log_start_offset` in Fetch now stay at the log start through compaction, rather than moving to the first surviving batch.
 - Fetch no longer sends a `current_leader` hint with `UNKNOWN_TOPIC_OR_PARTITION`, as in Apache Kafka.
+- The broker's IPv6-to-IPv4 listener fallback recognizes "address family not
+  supported" on Windows. `is_address_family_unsupported` checked only the
+  Unix errno `libc::EAFNOSUPPORT`; Windows reports socket errors through
+  `WSAGetLastError`, so `raw_os_error()` there is `WSAEAFNOSUPPORT` (10047),
+  a different number, and a Windows host without IPv6 support failed to bind
+  `[::]` instead of falling back to `0.0.0.0`.
