@@ -14,7 +14,9 @@
 
 use crate::Engine;
 use async_trait::async_trait;
-use nisshi_storage::{ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration};
+use nisshi_storage::{
+    ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration, reject_unrecognized_options,
+};
 use regex::Regex;
 use std::sync::Arc;
 
@@ -28,6 +30,8 @@ impl StorageFactory for EngineFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+        reject_unrecognized_options(&configuration.storage, &[])?;
+
         Ok(Arc::new(Box::new(Engine::new(
             configuration.cluster,
             configuration.node_id,
