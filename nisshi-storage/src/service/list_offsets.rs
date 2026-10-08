@@ -143,7 +143,7 @@ where
                                                     .error_code(ErrorCode::InvalidRequest.into())
                                                     .old_style_offsets(None)
                                                     .timestamp(Some(-1))
-                                                    .offset(Some(0))
+                                                    .offset(Some(-1))
                                                     .leader_epoch(Some(0))
                                             })
                                             .collect()
@@ -223,7 +223,12 @@ where
                                                             .unwrap_or(Some(-1))
                                                             .or(Some(-1)),
                                                     )
-                                                    .offset(offset.offset().or(Some(0)))
+                                                    // `None` is sent as -1, as Kafka does:
+                                                    // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1171-L1177
+                                                    .offset(offset.offset().or(Some(-1)))
+                                                    // Kafka sends -1 (the schema default) when
+                                                    // the offset is unknown; nisshi always sends
+                                                    // 0. Clients ignore the epoch for offset -1.
                                                     .leader_epoch(Some(0)),
                                             )
                                         } else {

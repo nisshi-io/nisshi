@@ -27,6 +27,20 @@ const CLIENT_ERROR_MESSAGE: &str = "A client error occurred. Possible causes:
 
 Check your internet connection, verify the server address, and try again.";
 
+/// Returns advice for a storage startup check failure, for the storage URL
+/// scheme.
+fn startup_check_hint(scheme: &str) -> &'static str {
+    match scheme {
+        "s3" => {
+            ". Check that the bucket exists, that AWS_ENDPOINT and AWS_REGION are correct, and that the AWS credentials allow listing the cluster's prefix in the bucket."
+        }
+        "gs" => {
+            ". Check that the bucket exists, and that the Google Cloud credentials allow listing the cluster's prefix in the bucket."
+        }
+        _ => "",
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<ErrorCode> {
     _ = dotenv().ok();
@@ -59,6 +73,29 @@ async fn main() -> Result<ErrorCode> {
             nisshi_cli::Error::Topic(error) => match error {
                 nisshi_topic::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
                 _ => error!("Unknown error occurred during command: {}", error),
+            },
+            nisshi_cli::Error::Server(error) => match &**error {
+                #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+                nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
+                    error!(
+                        "could not get AWS credentials from the configured provider: {source}. AWS credentials come from static keys (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY), a web identity token (AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN), an ECS or EKS container credential endpoint, or the EC2 instance metadata service."
+                    )
+                }
+                nisshi_broker::Error::Storage(nisshi_storage::Error::StartupCheck {
+                    storage,
+                    source,
+                }) => error!(
+                    "storage {storage} failed its startup check: {source}{}",
+                    startup_check_hint(storage.scheme())
+                ),
+                nisshi_broker::Error::InvalidStorageOptionValue { option, value } => error!(
+                    "storage option {option}={value} is not a valid interval: give a non-zero duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"
+                ),
+                nisshi_broker::Error::Storage(nisshi_storage::Error::UnrecognizedStorageOption {
+                    scheme,
+                    option,
+                }) => error!("storage option {option} is not recognised by the {scheme} engine"),
+                _ => error!("Unknown error occurred during command: {}", err),
             },
             nisshi_cli::Error::TlsCertificate { path, source } => error!(
                 "TLS certificate {} could not be loaded: {source}. Expected one or more PEM certificates (--cert).",
@@ -94,6 +131,9 @@ async fn main() -> Result<ErrorCode> {
             nisshi_cli::Error::TlsRequiresCertAndKey => {
                 error!("TLS requires both --cert and --key.")
             }
+            nisshi_cli::Error::LakeRequiresSchemaRegistry { lake } => error!(
+                "{lake} requires --schema-registry: a data lake writer validates every record against a schema."
+            ),
             _ => error!("Unknown error occurred during command: {}", err),
         })
 }

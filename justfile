@@ -446,11 +446,11 @@ proxy *args:
 server: (cargo-build "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up
     target/debug/nisshi broker 2>&1  | tee broker.log
 
-gdb: (cargo-build "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket
-    rust-gdb --args target/debug/nisshi broker
+gdb: (cargo-build "--profile" "debugging" "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket
+    rust-gdb --args target/debugging/nisshi broker
 
-lldb: (cargo-build "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up
-    rust-lldb target/debug/nisshi broker
+lldb: (cargo-build "--profile" "debugging" "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up
+    rust-lldb target/debugging/nisshi broker
 
 ci: docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up lakehouse-accept-terms-of-use lakehouse-create-warehouse
 

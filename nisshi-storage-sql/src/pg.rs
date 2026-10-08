@@ -2737,8 +2737,12 @@ impl Storage for Postgres {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    let timestamp = None;
-                    let offset = Some(0);
+                    // No record row: Earliest/Latest answer 0, a Timestamp
+                    // lookup answers no offset (see `ListOffsetResponse::offset`).
+                    let (offset, timestamp) = match offset_type {
+                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
+                        ListOffset::Timestamp(_) => (None, None),
+                    };
                     debug!(
                         cluster = self.cluster,
                         ?topition,
@@ -4187,6 +4191,17 @@ mod tests {
         assert_eq!(timeouts.create, Some(DEFAULT_POOL_CREATE_TIMEOUT));
 
         Ok(())
+    }
+
+    /// A storage URL option that tokio-postgres does not read (`vacuum_into` is an
+    /// option of the sqlite engine) stops the build before any connection, and the
+    /// error names the option.
+    #[test]
+    fn unrecognized_query_option_rejected_without_connecting() {
+        let error = Postgres::builder(&format!("{CONNECTION}?vacuum_into=/tmp/does-not-matter"))
+            .expect_err("an option that tokio-postgres does not read must be rejected");
+
+        assert!(error.to_string().contains("vacuum_into"), "{error}");
     }
 
     #[test]
