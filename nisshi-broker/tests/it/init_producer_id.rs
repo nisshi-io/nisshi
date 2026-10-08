@@ -15,8 +15,8 @@
 use std::time::Duration;
 
 use crate::common::{
-    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
-    register_broker, slate_storage,
+    StorageType, alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
+    register_broker, slate_storage, storage_container as storage_container_of,
 };
 use bytes::Bytes;
 use nisshi_broker::Result;
@@ -32,6 +32,7 @@ use nisshi_storage::{
 };
 use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
+use url::Url;
 use uuid::Uuid;
 
 async fn no_txn_init_producer_id(storage: impl Storage + Clone) -> Result<()> {
@@ -903,6 +904,122 @@ mod pg {
         super::txn_claim_ongoing_txn_aborts_and_bumps(registered_storage().await?).await
     }
 
+    #[tokio::test]
+    async fn txn_fenced_claim_leaves_ongoing_txn() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::txn_fenced_claim_leaves_ongoing_txn(registered_storage().await?).await
+    }
+}
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        storage_container_of(
+            StorageType::Turso,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn no_txn_init_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::no_txn_init_producer_id(storage).await?;
+
+        Ok(())
+    }
+
+    async fn registered_storage() -> Result<ArcDynStorage> {
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &storage).await?;
+
+        Ok(storage)
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn old_versions_are_fresh() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::old_versions_are_fresh(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn no_txn_claim_gets_new_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::no_txn_claim_gets_new_id(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn txn_claim_current_epoch_bumps() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::txn_claim_current_epoch_bumps(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn txn_claim_stale_epoch_is_fenced() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::txn_claim_stale_epoch_is_fenced(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn txn_claim_other_id_is_fenced() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::txn_claim_other_id_is_fenced(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn txn_claim_unknown_txn_is_fresh() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::txn_claim_unknown_txn_is_fresh(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn mixed_shape_is_invalid_request() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::mixed_shape_is_invalid_request(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn txn_claim_ongoing_txn_aborts_and_bumps() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::txn_claim_ongoing_txn_aborts_and_bumps(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
     #[tokio::test]
     async fn txn_fenced_claim_leaves_ongoing_txn() -> Result<()> {
         let _guard = init_tracing()?;
