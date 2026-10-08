@@ -250,8 +250,10 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       # This leg only proves the feature combination compiles, so check
-      # skips codegen and linking.
-      - run: cargo check --features ${{matrix.storage}} --features ${{matrix.lake}}
+      # skips codegen and linking. nisshi-schema enables every lake
+      # feature by default, so without --no-default-features each leg
+      # would check all three lakes instead of its own.
+      - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}} --features ${{matrix.lake}}
   compat-librdkafka:
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
