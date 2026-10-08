@@ -343,29 +343,24 @@ pub struct FailedStart {
 }
 
 impl FailedStart {
-    /// Returns the error message the broker printed as it exited: the last line that starts with
-    /// `Error: ` or `error: `, or `None` if it printed none.
+    /// Returns the error lines the broker printed: each line that starts with `Error: ` or
+    /// `error: `, or that tracing logged at level `ERROR`.
     ///
-    /// A test checks this message rather than the whole log, because the broker prints its storage
+    /// A test checks these lines rather than the whole log, because the broker prints its storage
     /// URL at startup. A bad value in the URL is therefore in the log whatever the error says.
-    fn fatal_error(&self) -> Option<&str> {
-        let start = self
-            .log
-            .match_indices("Error: ")
-            .chain(self.log.match_indices("error: "))
-            .map(|(index, _)| index)
-            .filter(|index| *index == 0 || self.log[..*index].ends_with('\n'))
-            .max()?;
-
-        let error = &self.log[start..];
-        Some(error.lines().next().unwrap_or(error))
+    fn error_lines(&self) -> impl Iterator<Item = &str> {
+        self.log.lines().filter(|line| {
+            line.starts_with("Error: ")
+                || line.starts_with("error: ")
+                || line.split_whitespace().nth(1) == Some("ERROR")
+        })
     }
 
-    /// Asserts the broker exited with an error that contains `text`.
+    /// Asserts the broker exited with an error line that contains `text`.
     #[track_caller]
     pub fn assert_error_names(&self, text: &str) {
         assert!(
-            self.fatal_error().is_some_and(|error| error.contains(text)),
+            self.error_lines().any(|line| line.contains(text)),
             "the broker didn't exit with an error that names {text}: {self}"
         );
     }
@@ -812,48 +807,45 @@ mod tests {
     }
 
     #[test]
-    fn fatal_error_leaves_out_the_storage_url_the_broker_prints_at_startup() {
+    fn error_lines_leave_out_the_storage_url_the_broker_prints_at_startup() {
         let failed_start = failed_start_with_log(
-            "storage: sqlite:////proc/nisshi/nisshi.db [\"sqlite\"]\nError: Io(PermissionDenied)\n",
+            "storage: sqlite:////proc/nisshi/nisshi.db [\"sqlite\"]\nError: Io(PermissionDenied)\n\
+             storage: sqlite:////proc/nisshi/nisshi.db\n",
         );
 
         assert_eq!(
-            failed_start.fatal_error(),
-            Some("Error: Io(PermissionDenied)")
+            failed_start.error_lines().collect::<Vec<_>>(),
+            ["Error: Io(PermissionDenied)"]
         );
     }
 
     #[test]
-    fn fatal_error_includes_an_argument_error_from_clap() {
+    fn error_lines_include_an_argument_error_from_clap() {
         let failed_start = failed_start_with_log(
             "error: invalid value 'not a url' for '--storage-engine <STORAGE_ENGINE>'\n\nFor more \
              information, try '--help'.\n",
         );
 
-        assert!(
-            failed_start
-                .fatal_error()
-                .is_some_and(|error| error.contains("not a url"))
-        );
+        failed_start.assert_error_names("not a url");
     }
 
     #[test]
-    fn fatal_error_leaves_out_the_lines_after_it() {
+    fn error_lines_include_an_error_that_tracing_logged() {
         let failed_start = failed_start_with_log(
-            "Error: Io(PermissionDenied)\nstorage: sqlite:////proc/nisshi/nisshi.db\n",
+            "storage: postgres://localhost?maintenance_interval=0s [\"postgres\"]\n\
+             2026-10-08T21:09:59.160193Z ERROR nisshi: 91: storage option maintenance_interval=0s \
+             is not a valid interval\n\
+             Error: Server(InvalidStorageOptionValue { option: \"maintenance_interval\" })\n",
         );
 
-        assert_eq!(
-            failed_start.fatal_error(),
-            Some("Error: Io(PermissionDenied)")
-        );
+        failed_start.assert_error_names("maintenance_interval=0s");
     }
 
     #[test]
-    fn fatal_error_is_none_when_the_broker_printed_no_error() {
+    fn error_lines_are_empty_when_the_broker_printed_no_error() {
         let failed_start =
             failed_start_with_log("thread 'main' panicked at src/main.rs:1:1:\nsome message\n");
 
-        assert_eq!(failed_start.fatal_error(), None);
+        assert_eq!(failed_start.error_lines().count(), 0);
     }
 }

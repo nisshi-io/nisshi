@@ -28,7 +28,6 @@ fn unparseable_storage_url_stops_the_broker() {
 /// A `maintenance_interval` that doesn't parse must stop the broker with a message that names it,
 /// instead of the broker running with the default interval.
 #[test]
-#[ignore = "the broker starts with the default interval if maintenance_interval doesn't parse"]
 fn unparseable_maintenance_interval_stops_the_broker() {
     let option = "maintenance_interval=banana";
 
@@ -39,7 +38,6 @@ fn unparseable_maintenance_interval_stops_the_broker() {
 
 /// An interval of zero would mean running maintenance without pause, so it must be refused.
 #[test]
-#[ignore = "the broker panics on a maintenance_interval of zero"]
 fn zero_maintenance_interval_stops_the_broker() {
     let option = "maintenance_interval=0s";
 

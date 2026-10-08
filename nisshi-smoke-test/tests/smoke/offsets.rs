@@ -53,11 +53,10 @@ fn timestamp_lookup_returns_first_record_at_or_after_it() {
     );
 }
 
-/// When no record is at or after the time, the lookup must return -1. Offset 0 would make a replay
-/// read the whole partition again.
+/// When no record is at or after the time, the broker must answer -1, and `kafka-get-offsets` then
+/// prints no offset for the partition. Offset 0 would make a replay read the whole partition again.
 #[test]
-#[ignore = "the broker answers offset 0 when no record is at or after the timestamp"]
-fn timestamp_after_last_record_returns_minus_1() {
+fn timestamp_after_last_record_finds_no_offset() {
     let (cli, topic, _) = create_topic_with_records_before_and_after();
     let hour_after_last_record = now_in_millis() + 3_600_000;
 
@@ -65,7 +64,7 @@ fn timestamp_after_last_record_returns_minus_1() {
 
     assert_eq!(
         offsets.succeeded().partition_offsets(&topic),
-        [-1],
+        [] as [i64; 0],
         "{offsets}"
     );
 }
