@@ -39,7 +39,7 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let topic = &alphanumeric_string(15)[..];
 
     let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
+    let replication_factor = rng().random_range(1..64);
 
     {
         let response = create_topic
@@ -126,7 +126,7 @@ async fn timestamp_no_match(storage: impl Storage + Clone, broker_id: i32) -> Re
     let topic = &alphanumeric_string(15)[..];
 
     let num_partitions = 1;
-    let replication_factor = 0;
+    let replication_factor = 1;
 
     {
         let response = create_topic
