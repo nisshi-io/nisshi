@@ -1,0 +1,56 @@
+---
+name: PR title
+
+# PRs are squash-merged, and the PR title becomes the subject of the commit
+# on main, so this check requires a Conventional Commits title.
+#
+# A workflow of its own instead of a job in ci.yml, because the check must
+# rerun when the title changes (`edited`). In ci.yml, `edited` would rerun
+# and cancel all of Tier A on every title or description edit.
+#
+# The trigger is `pull_request`, not the `pull_request_target` that the
+# action's README shows. The action only reads the PR, and the read-only
+# token that a fork PR gets is enough for that.
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, edited, synchronize, reopened]
+  # pr-title is a required check, and the merge queue tests each entry on a
+  # `gh-readonly-queue/...` branch. Without this trigger the check never
+  # reports there and every entry hangs. The job is skipped on merge_group,
+  # and GitHub counts a skipped job as a passing required check.
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            docs
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
