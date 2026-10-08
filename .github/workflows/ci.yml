@@ -664,8 +664,6 @@ jobs:
             platform: linux/arm64
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
     env:
       # cc-rs otherwise looks for aarch64-linux-musl-gcc, which Ubuntu doesn't
       # ship, and falls back to glibc gcc for the C deps (aws-lc-sys, ring,
@@ -686,7 +684,7 @@ jobs:
           build-warnings: ""
           # A tag's release build never restores a cache (cache poisoning).
           cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          # rust-cache keys on job + OS + arch, which both macOS legs share.
+          # Keyed per target so each leg restores its own cache.
           cache-key: ${{ matrix.target }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustc -vV
