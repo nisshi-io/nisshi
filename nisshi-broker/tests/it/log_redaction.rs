@@ -132,29 +132,45 @@ fn capture() -> &'static Capture {
     })
 }
 
-/// The forms in which a log line could hold `secret`: its first bytes as a
-/// decimal list and as hex, its `Debug` text (which is the text itself when it
-/// is ASCII), and the decoder's one-line-per-byte form of its first byte.
-fn forms(secret: &[u8]) -> Vec<String> {
-    let head = &secret[..secret.len().min(8)];
-    let escaped = format!("{:?}", Bytes::copy_from_slice(secret));
+/// The forms in which a log line could hold `marker`, each with a label: its
+/// first bytes as a decimal list and as hex, its `Debug` text (which is the
+/// text itself when it is ASCII), and the decoder's one-line-per-byte form of
+/// its first byte.
+fn forms(marker: &[u8]) -> Vec<(&'static str, String)> {
+    let head = &marker[..marker.len().min(8)];
+    let escaped = format!("{:?}", Bytes::copy_from_slice(marker));
 
     [
-        format!("{head:?}").trim_matches(['[', ']']).to_owned(),
-        head.iter().map(|byte| format!("{byte:02x}")).collect(),
-        escaped
-            .trim_start_matches("b\"")
-            .trim_end_matches('"')
-            .to_owned(),
+        (
+            "a decimal list",
+            format!("{head:?}").trim_matches(['[', ']']).to_owned(),
+        ),
+        (
+            "hex",
+            head.iter().map(|byte| format!("{byte:02x}")).collect(),
+        ),
+        (
+            "Debug text",
+            escaped
+                .trim_start_matches("b\"")
+                .trim_end_matches('"')
+                .to_owned(),
+        ),
     ]
     .into_iter()
-    .chain(head.first().map(|byte| format!("value: {byte}:u8")))
+    .chain(
+        head.first()
+            .map(|byte| ("one line per byte", format!("value: {byte}:u8"))),
+    )
     .collect()
 }
 
-fn assert_hidden(logs: &str, name: &str, secret: &[u8]) {
-    for form in forms(secret) {
-        assert!(!logs.contains(&form), "the log holds {name} as {form:?}");
+/// Asserts that `logs` doesn't hold `marker` in any of its [`forms`]. The
+/// failure message names the form, not its text, so a failure doesn't print
+/// the value it found.
+fn assert_hidden(logs: &str, name: &str, marker: &[u8]) {
+    for (label, form) in forms(marker) {
+        assert!(!logs.contains(&form), "the log holds {name} as {label}");
     }
 }
 
@@ -395,7 +411,9 @@ async fn secrets_stay_out_of_logs(storage: ArcDynStorage) -> Result<()> {
         12,
         FetchRequest::default()
             .replica_id(Some(-1))
-            .max_wait_ms(0)
+            // The broker returns no records to a fetch with a zero wait. With
+            // `min_bytes(1)`, this fetch returns as soon as it has a batch.
+            .max_wait_ms(500)
             .min_bytes(1)
             .max_bytes(Some(1024 * 1024))
             .isolation_level(Some(0))

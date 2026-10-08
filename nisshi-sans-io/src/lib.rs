@@ -2797,14 +2797,14 @@ mod tests {
 
     #[test]
     fn mezzanine_debug_hides_sensitive_fields() {
-        let secret = Bytes::from_static(b"\0alice\0hunter2-secret");
+        let marker = Bytes::from_static(b"\0alice\0hunter2-marker");
 
         let bodies: [Body; 9] = [
             AlterConfigsRequest::default()
                 .resources(Some(vec![
                     alter_configs_request::AlterConfigsResource::default().configs(Some(vec![
                         alter_configs_request::AlterableConfig::default()
-                            .value(Some("hunter2-secret".into())),
+                            .value(Some("hunter2-marker".into())),
                     ])),
                 ]))
                 .into(),
@@ -2813,37 +2813,37 @@ mod tests {
                     incremental_alter_configs_request::AlterConfigsResource::default().configs(
                         Some(vec![
                             incremental_alter_configs_request::AlterableConfig::default()
-                                .value(Some("hunter2-secret".into())),
+                                .value(Some("hunter2-marker".into())),
                         ]),
                     ),
                 ]))
                 .into(),
             SaslAuthenticateRequest::default()
-                .auth_bytes(secret.clone())
+                .auth_bytes(marker.clone())
                 .into(),
             SaslAuthenticateResponse::default()
-                .auth_bytes(secret.clone())
+                .auth_bytes(marker.clone())
                 .into(),
             AlterUserScramCredentialsRequest::default()
                 .upsertions(Some(vec![
                     alter_user_scram_credentials_request::ScramCredentialUpsertion::default()
-                        .salted_password(secret.clone()),
+                        .salted_password(marker.clone()),
                 ]))
                 .into(),
             CreateDelegationTokenResponse::default()
-                .hmac(secret.clone())
+                .hmac(marker.clone())
                 .into(),
             DescribeDelegationTokenResponse::default()
                 .tokens(Some(vec![
                     describe_delegation_token_response::DescribedDelegationToken::default()
-                        .hmac(secret.clone()),
+                        .hmac(marker.clone()),
                 ]))
                 .into(),
             ExpireDelegationTokenRequest::default()
-                .hmac(secret.clone())
+                .hmac(marker.clone())
                 .into(),
             RenewDelegationTokenRequest::default()
-                .hmac(secret.clone())
+                .hmac(marker.clone())
                 .into(),
         ];
 

@@ -34,10 +34,10 @@ use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 /// A SASL/PLAIN message with a marker password.
-const SECRET: &[u8] = b"\0alice\0hunter2-secret";
+const MARKER: &[u8] = b"\0alice\0hunter2-marker";
 
-fn secret() -> Bytes {
-    Bytes::from_static(SECRET)
+fn marker() -> Bytes {
+    Bytes::from_static(MARKER)
 }
 
 /// Asserts that `text` doesn't hold the marker password as text (also inside a
@@ -55,7 +55,7 @@ fn assert_hidden(text: &str) {
 }
 
 /// Asserts that the `Debug` output of `message`, of its `Body` and of a `Frame`
-/// holding it hides the secret and still shows each of `shown`.
+/// holding it hides the marker and still shows each of `shown`.
 fn assert_debug_hidden<T>(message: T, shown: &[&str])
 where
     T: Clone + Debug + Into<Body>,
@@ -84,7 +84,7 @@ where
 #[test]
 fn sasl_authenticate_request() {
     assert_debug_hidden(
-        SaslAuthenticateRequest::default().auth_bytes(secret()),
+        SaslAuthenticateRequest::default().auth_bytes(marker()),
         &["auth_bytes: [hidden]"],
     );
 }
@@ -94,7 +94,7 @@ fn sasl_authenticate_response() {
     assert_debug_hidden(
         SaslAuthenticateResponse::default()
             .error_code(58)
-            .auth_bytes(secret())
+            .auth_bytes(marker())
             .session_lifetime_ms(Some(3_600_000)),
         &[
             "error_code: 58",
@@ -113,7 +113,7 @@ fn alter_user_scram_credentials_request() {
                 .mechanism(1)
                 .iterations(4096)
                 .salt(Bytes::from_static(b"salt-marker"))
-                .salted_password(secret()),
+                .salted_password(marker()),
         ])),
         &[
             "name: \"alice\"",
@@ -130,7 +130,7 @@ fn create_delegation_token_response() {
         CreateDelegationTokenResponse::default()
             .error_code(0)
             .token_id("token-marker".into())
-            .hmac(secret()),
+            .hmac(marker()),
         &["error_code: 0", "token-marker", "hmac: [hidden]"],
     );
 }
@@ -143,7 +143,7 @@ fn describe_delegation_token_response() {
             .tokens(Some(vec![
                 DescribedDelegationToken::default()
                     .token_id("token-marker".into())
-                    .hmac(secret()),
+                    .hmac(marker()),
             ])),
         &["error_code: 0", "token-marker", "hmac: [hidden]"],
     );
@@ -153,7 +153,7 @@ fn describe_delegation_token_response() {
 fn expire_delegation_token_request() {
     assert_debug_hidden(
         ExpireDelegationTokenRequest::default()
-            .hmac(secret())
+            .hmac(marker())
             .expiry_time_period_ms(86_400_000),
         &["hmac: [hidden]", "expiry_time_period_ms: 86400000"],
     );
@@ -163,7 +163,7 @@ fn expire_delegation_token_request() {
 fn renew_delegation_token_request() {
     assert_debug_hidden(
         RenewDelegationTokenRequest::default()
-            .hmac(secret())
+            .hmac(marker())
             .renew_period_ms(86_400_000),
         &["hmac: [hidden]", "renew_period_ms: 86400000"],
     );
@@ -179,7 +179,7 @@ fn alter_configs_request() {
                 .configs(Some(vec![
                     alter_configs_request::AlterableConfig::default()
                         .name("ssl.keystore.password".into())
-                        .value(Some("hunter2-secret".into())),
+                        .value(Some("hunter2-marker".into())),
                 ])),
         ])),
         &["ssl.keystore.password", "value: [hidden]"],
@@ -197,7 +197,7 @@ fn incremental_alter_configs_request() {
                     incremental_alter_configs_request::AlterableConfig::default()
                         .name("ssl.keystore.password".into())
                         .config_operation(0)
-                        .value(Some("hunter2-secret".into())),
+                        .value(Some("hunter2-marker".into())),
                 ])),
         ])),
         &["ssl.keystore.password", "value: [hidden]"],
@@ -283,7 +283,7 @@ fn sasl_authenticate_request_logs() -> Result<()> {
         let logs = request_round_trip(
             api_version,
             SaslAuthenticateRequest::default()
-                .auth_bytes(secret())
+                .auth_bytes(marker())
                 .into(),
         )?;
 
@@ -305,7 +305,7 @@ fn sasl_authenticate_response_logs() -> Result<()> {
             SaslAuthenticateResponse::default()
                 .error_code(0)
                 .error_message(Some("ok".into()))
-                .auth_bytes(secret())
+                .auth_bytes(marker())
                 .session_lifetime_ms((api_version >= 1).then_some(0))
                 .into(),
         )?;
@@ -330,7 +330,7 @@ fn alter_configs_request_logs() -> Result<()> {
                         .configs(Some(vec![
                             alter_configs_request::AlterableConfig::default()
                                 .name("ssl.keystore.password".into())
-                                .value(Some("hunter2-secret".into())),
+                                .value(Some("hunter2-marker".into())),
                         ])),
                 ]))
                 .validate_only(false)
@@ -358,7 +358,7 @@ fn incremental_alter_configs_request_logs() -> Result<()> {
                             incremental_alter_configs_request::AlterableConfig::default()
                                 .name("ssl.keystore.password".into())
                                 .config_operation(0)
-                                .value(Some("hunter2-secret".into())),
+                                .value(Some("hunter2-marker".into())),
                         ])),
                 ]))
                 .validate_only(false)
@@ -384,7 +384,7 @@ fn alter_user_scram_credentials_request_logs() -> Result<()> {
                     .mechanism(1)
                     .iterations(4096)
                     .salt(Bytes::from_static(b"salt-marker"))
-                    .salted_password(secret()),
+                    .salted_password(marker()),
             ]))
             .into(),
     )?;
@@ -395,22 +395,22 @@ fn alter_user_scram_credentials_request_logs() -> Result<()> {
     Ok(())
 }
 
-/// A batch with one record whose key, value and header value are the secret.
-fn secret_batch() -> Result<inflated::Batch> {
-    compressed_secret_batch(Compression::None)
+/// A batch with one record whose key, value and header value are the marker.
+fn marker_batch() -> Result<inflated::Batch> {
+    compressed_marker_batch(Compression::None)
 }
 
-fn compressed_secret_batch(compression: Compression) -> Result<inflated::Batch> {
+fn compressed_marker_batch(compression: Compression) -> Result<inflated::Batch> {
     inflated::Batch::builder()
         .attributes(BatchAttribute::default().compression(compression).into())
         .record(
             Record::builder()
-                .key(Some(secret()))
-                .value(Some(secret()))
+                .key(Some(marker()))
+                .value(Some(marker()))
                 .header(
                     record::Header::builder()
                         .key(Bytes::from_static(b"header-marker"))
-                        .value(secret()),
+                        .value(marker()),
                 ),
         )
         .producer_id(-1)
@@ -418,7 +418,7 @@ fn compressed_secret_batch(compression: Compression) -> Result<inflated::Batch> 
         .build()
 }
 
-fn secret_produce_request() -> Result<ProduceRequest> {
+fn marker_produce_request() -> Result<ProduceRequest> {
     Ok(ProduceRequest::default()
         .transactional_id(None)
         .acks(-1)
@@ -429,7 +429,7 @@ fn secret_produce_request() -> Result<ProduceRequest> {
                 .partition_data(Some(vec![
                     PartitionProduceData::default().index(0).records(Some(
                         inflated::Frame {
-                            batches: vec![secret_batch()?],
+                            batches: vec![marker_batch()?],
                         }
                         .try_into()?,
                     )),
@@ -439,7 +439,7 @@ fn secret_produce_request() -> Result<ProduceRequest> {
 
 #[test]
 fn record_debug() -> Result<()> {
-    let inflated = secret_batch()?;
+    let inflated = marker_batch()?;
     let deflated = deflated::Batch::try_from(inflated.clone())?;
 
     let record = format!("{:?}", inflated.records[0]);
@@ -468,7 +468,7 @@ fn record_inflate_logs() -> Result<()> {
         Compression::Zstd,
     ] {
         let label = format!("{compression:?}");
-        let batch = compressed_secret_batch(compression)?;
+        let batch = compressed_marker_batch(compression)?;
         let expected = batch.records.clone();
 
         let logs = captured(|| {
@@ -487,7 +487,7 @@ fn record_inflate_logs() -> Result<()> {
 
 #[test]
 fn produce_request_debug() -> Result<()> {
-    let request = secret_produce_request()?;
+    let request = marker_produce_request()?;
     let body: Body = request.clone().into();
 
     for text in [format!("{request:?}"), format!("{body:?}")] {
@@ -500,7 +500,7 @@ fn produce_request_debug() -> Result<()> {
 
 #[test]
 fn produce_request_logs() -> Result<()> {
-    let logs = request_round_trip(9, secret_produce_request()?.into())?;
+    let logs = request_round_trip(9, marker_produce_request()?.into())?;
 
     assert!(!logs.is_empty());
     assert_hidden(&logs);
