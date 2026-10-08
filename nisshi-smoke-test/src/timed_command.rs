@@ -14,11 +14,9 @@
 
 //! Runs external commands with a time limit.
 //!
-//! The harness runs every Kafka CLI call through here, and every `docker` command that can block:
-//! starting a container, which may pull an image, and stopping one. `std::process::Command::output`
-//! waits for as long as a command runs, so a command that hangs would hold its test until nextest
-//! kills it minutes later, without saying which command hung. These functions kill a command that
-//! outlives its time limit and report what it printed.
+//! `std::process::Command::output` waits for as long as a command runs, so a hung command would
+//! hold its test until nextest kills it, without saying which command hung. These functions kill a
+//! command that outlives its limit and report what it printed.
 
 use std::{
     io::{Read, Write as _},
@@ -35,9 +33,8 @@ pub(crate) struct Finished {
     pub(crate) stderr: String,
 }
 
-/// Runs `command` to completion, feeding it `input`, and kills it after
-/// `timeout`. A timeout is an error rather than a hang, so a stuck command
-/// fails its test instead of holding the whole run.
+/// Runs `command` to completion, feeding it `input`. Returns an error if the command cannot start,
+/// or if it is still running after `timeout`. In that case, `run` kills the command.
 pub(crate) fn run(
     command: &mut Command,
     input: Option<&str>,

@@ -17,10 +17,18 @@
 //! A test either uses the broker that all tests share, at the address in `NISSHI_SMOKE_BOOTSTRAP`,
 //! or launches a broker of its own: from the Docker image in `NISSHI_SMOKE_IMAGE` when that is
 //! set, otherwise from the `nisshi` binary in `NISSHI_SMOKE_BIN`. A launched broker is checked
-//! when it stops: the check fails if the broker exited or restarted before then, didn't exit with
+//! when it stops: the check fails if the broker exited before then, didn't exit with
 //! 0 within 30 seconds of SIGTERM, or wrote `panicked at` to its log.
+//!
+//! A launched broker can also be restarted on the same storage. A test that expects the broker to
+//! refuse its configuration gets a [`FailedStart`] instead of a broker.
+//!
+//! Each launched broker keeps its files, and a log per start, in a directory of its own under
+//! `NISSHI_SMOKE_WORK_DIR`. The directory is removed when the broker passes its checks and the
+//! test hasn't failed.
 
 use std::{
+    fmt,
     fs::{self, File},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -30,19 +38,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{KafkaCli, env, label, timed_command, unique_name};
+use crate::{KafkaCli, ScramLogin, StorageUrl, label, settings, timed_command, unique_name};
 
-/// How long a launched broker has to answer after it starts.
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a broker has to exit after SIGTERM.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Launched brokers listen on ports from here up. The operating system hands
-/// out ports for outgoing connections and binds to port 0 from 32768 on Linux
-/// and from 49152 on macOS, so it doesn't take a port in this range before the
-/// broker binds it.
-const FIRST_BROKER_PORT: u16 = 20000;
-const BROKER_PORTS: u16 = 10000;
 
 /// A broker the tests talk to: the shared one `just smoke` started, or one
 /// of their own from [`Broker::isolated`].
@@ -61,129 +60,209 @@ pub struct LaunchOptions {
     /// The port the broker listens on and advertises, on 127.0.0.1.
     pub port: u16,
     pub cluster_id: String,
-    /// Extra `nisshi broker` arguments.
-    pub args: Vec<String>,
+    /// The user every client logs in as. When it is set, the broker runs with `--authentication`,
+    /// and the harness's own tools log in as this user.
+    pub login: Option<ScramLogin>,
     /// Where to keep the broker's log. Otherwise the log goes in the broker's temporary
     /// directory, which is removed when the broker passes its checks.
     pub log: Option<PathBuf>,
+    /// The storage engine URL, usually [`settings::storage_url_under_test`].
+    pub storage: StorageUrl,
 }
 
-/// A broker that this harness launched: where it runs, and its files.
+impl LaunchOptions {
+    /// Launch options for a broker on `storage`. The broker gets a cluster id of its own, so its
+    /// data stays apart from other brokers' data on a shared storage engine.
+    pub fn new(storage: StorageUrl) -> Self {
+        Self {
+            port: free_port(),
+            cluster_id: unique_name("cluster"),
+            login: None,
+            log: None,
+            storage,
+        }
+    }
+}
+
+/// A broker that this harness launched.
 #[derive(Debug)]
 struct Deployment {
     host: Host,
-    dir: PathBuf,
+    files: BrokerFiles,
     log: PathBuf,
+    options: LaunchOptions,
 }
 
 /// What a launched broker runs in.
 #[derive(Debug)]
 enum Host {
     Process(Child),
-    Container {
-        name: String,
-        volume: Option<String>,
-    },
+    Container { name: String },
+}
+
+/// A launched broker's files, which it keeps when it restarts. Dropping them removes the volume,
+/// and also the directory unless [`BrokerFiles::keep_dir`] is set or the test is failing,
+/// because the directory then holds the logs that show why.
+#[derive(Debug)]
+struct BrokerFiles {
+    /// The broker's own directory: a log per start, and a process's SQLite database.
+    dir: PathBuf,
+    /// A container's SQLite database volume, mounted as its working directory.
+    volume: Option<String>,
+    /// How many times the broker has started, which numbers its logs.
+    starts: u32,
+    /// Keeps the directory after the files are dropped, for a broker that failed its checks.
+    keep_dir: bool,
 }
 
 impl Broker {
-    /// The broker that all tests share, at `NISSHI_SMOKE_BOOTSTRAP`.
-    pub fn shared() -> Self {
-        let bootstrap = env("NISSHI_SMOKE_BOOTSTRAP")
-            .expect("NISSHI_SMOKE_BOOTSTRAP is not set: run the suite with `just smoke <engine>`");
-
-        Self {
-            bootstrap,
-            deployment: None,
-        }
-    }
-
-    /// A broker of this test's own, for a test that needs its own
-    /// configuration or breaks its broker.
+    /// A broker of this test's own, for a test that needs its own configuration or breaks its
+    /// broker. It runs on [`settings::storage_url_under_test`].
     pub fn isolated() -> Self {
-        Self::isolated_with(&[])
+        Self::launch(LaunchOptions::new(settings::storage_url_under_test()))
     }
 
-    /// Like [`Broker::isolated`], with extra `nisshi broker` arguments.
-    pub fn isolated_with(args: &[&str]) -> Self {
-        Self::launch(LaunchOptions {
-            port: free_port(),
-            cluster_id: unique_name("cluster"),
-            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-            log: None,
+    /// Launches `NISSHI_SMOKE_IMAGE` when set, otherwise `NISSHI_SMOKE_BIN`, and waits until it
+    /// answers. Panics if it doesn't start, or if something else already listens on the port.
+    pub fn launch(options: LaunchOptions) -> Self {
+        let cluster_id = options.cluster_id.clone();
+
+        Self::try_launch(options).unwrap_or_else(|failed_start| {
+            panic!("the broker with cluster id {cluster_id} didn't start: {failed_start}")
         })
     }
 
-    /// Launches `NISSHI_SMOKE_IMAGE` when set, otherwise `NISSHI_SMOKE_BIN`,
-    /// on `NISSHI_SMOKE_STORAGE`, waits until it answers, and checks that the
-    /// broker answering has this broker's cluster id.
-    ///
-    /// SQLite and memory brokers get storage of their own. PostgreSQL and S3
-    /// brokers share the engine's database, kept apart by cluster id.
-    ///
-    /// Panics if something already listens on the port, because the readiness
-    /// check would then pass against that listener instead of this broker.
-    pub fn launch(options: LaunchOptions) -> Self {
+    /// Like [`Broker::launch`], but returns a [`FailedStart`] when the broker exits or doesn't
+    /// answer, for a test that expects the broker to refuse its configuration. Panics, as `launch`
+    /// does, when the binary or container can't start at all.
+    fn try_launch(options: LaunchOptions) -> Result<Self, FailedStart> {
+        assert_port_is_free(options.port);
+
+        let files = BrokerFiles::new(&options.storage);
+        Self::start_with_files(options, files)
+    }
+
+    /// Launches a broker that must refuse its configuration, and returns how it exited. Panics if
+    /// the broker starts, exits with 0, or panics, because a broker that panics gives the user
+    /// only a backtrace.
+    pub fn launch_expecting_refusal(options: LaunchOptions) -> FailedStart {
+        let refused = match Self::try_launch(options) {
+            Ok(broker) => panic!("the broker started at {}", broker.bootstrap()),
+            Err(refused) => refused,
+        };
+
         assert!(
-            port_is_free(options.port),
-            "port {} is already in use: stop what listens there (`docker ps --filter \
-             label=nisshi-smoke` lists containers an earlier run left behind), or choose \
-             another port",
-            options.port
+            refused.exit_code.is_some_and(|code| code != 0) && !refused.log.contains("panicked at"),
+            "the broker didn't exit with an error: {refused}"
         );
 
-        let bootstrap = format!("127.0.0.1:{}", options.port);
+        refused
+    }
 
-        // The tools come first, so a failure to start them doesn't leave a
-        // broker running that nothing stops.
-        let cli = KafkaCli::new(&bootstrap);
+    /// Stops the broker as [`Broker::stop`] does, and starts it again on the same storage, on a
+    /// new port. Panics if it fails its checks or doesn't start again.
+    pub fn restart(self) -> Self {
+        self.restart_with(|_| {})
+    }
 
-        let dir = std::env::temp_dir().join(unique_name("nisshi-smoke"));
-        fs::create_dir_all(&dir).expect("broker directory");
+    /// Like [`Broker::restart`], but the broker starts again with `--authentication`, so every
+    /// client must log in. The harness's readiness check logs in as `login`, so the broker starts
+    /// again only if it still has that user's credentials.
+    pub fn restart_requiring_login(self, login: &ScramLogin) -> Self {
+        self.restart_with(|options| options.login = Some(login.clone()))
+    }
 
-        let log = options
-            .log
-            .clone()
-            .unwrap_or_else(|| dir.join("broker.log"));
+    fn restart_with(mut self, change_options: impl FnOnce(&mut LaunchOptions)) -> Self {
+        let deployment = self
+            .deployment
+            .take()
+            .expect("only a broker this test launched can restart");
 
-        let storage = env("NISSHI_SMOKE_STORAGE").unwrap_or_else(|| "memory://nisshi/".to_owned());
-        let image = env("NISSHI_SMOKE_IMAGE");
+        let (stopped, files, mut options) = deployment.stop();
 
-        let host = match image {
-            Some(image) => launch_container(&image, &options, &storage),
-            None => launch_process(&options, &storage, &dir, &log),
-        };
-
-        let mut broker = Self {
-            bootstrap,
-            deployment: Some(Deployment { host, dir, log }),
-        };
-
-        if let Some(deployment) = &mut broker.deployment {
-            cli.wait_until_ready(READY_TIMEOUT, || match &mut deployment.host {
-                Host::Process(child) => match child.try_wait() {
-                    Ok(Some(status)) => Err(format!("exited with {status}")),
-                    _ => Ok(()),
-                },
-
-                Host::Container { name, .. } => container_alive(name),
-            });
+        if let Err(reason) = stopped {
+            panic!("{reason}");
         }
 
-        // The readiness check passes for any broker on the port, and another test's broker can
-        // bind the port between the check above and this broker's bind. So the harness also
-        // compares the cluster id.
-        let answered = cli.cluster_id();
-        let expected = format!("Cluster ID: {}", options.cluster_id);
+        options.port = free_port();
+        change_options(&mut options);
+        let cluster_id = options.cluster_id.clone();
 
-        assert!(
-            answered.succeeded().lines().contains(&expected.as_str()),
-            "the broker at {} is not the one launched with cluster id {}: {answered:?}",
-            broker.bootstrap,
-            options.cluster_id
+        Self::start_with_files(options, files).unwrap_or_else(|failed_start| {
+            panic!("the broker with cluster id {cluster_id} didn't start again: {failed_start}")
+        })
+    }
+
+    fn start_with_files(
+        options: LaunchOptions,
+        mut files: BrokerFiles,
+    ) -> Result<Self, FailedStart> {
+        let bootstrap = format!("127.0.0.1:{}", options.port);
+
+        // The harness finds the tools' container before it launches the broker, so a missing
+        // `NISSHI_SMOKE_KAFKA` panics while no broker is running.
+        let cli = match &options.login {
+            Some(login) => KafkaCli::logged_in_as(&bootstrap, login),
+            None => KafkaCli::new(&bootstrap),
+        };
+
+        let log = options.log.clone().unwrap_or_else(|| files.next_log());
+
+        let host = match settings::broker_image() {
+            Some(image) => launch_container(&image, &options, files.volume.as_deref()),
+            None => launch_process(&options, &files.dir, &log),
+        };
+
+        let host = host.unwrap_or_else(|reason| panic!("{reason}"));
+
+        // nextest shows a test's stderr only when the test fails, or when nextest kills it for
+        // running too long. That kill skips `Drop`, so this line is the only place that names the
+        // test's broker.
+        eprintln!(
+            "launched the broker with cluster id {} on port {}{}, logging to {}",
+            options.cluster_id,
+            options.port,
+            match &host {
+                Host::Process(child) => format!(" as process {}", child.id()),
+                Host::Container { name } => format!(" in container {name}"),
+            },
+            log.display()
         );
 
-        broker
+        /// How long a launched broker has to answer after it starts.
+        const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+        let mut deployment = Deployment {
+            host,
+            files,
+            log,
+            options,
+        };
+
+        let answered = match cli.wait_until_ready(READY_TIMEOUT, || deployment.host.check_running())
+        {
+            Ok(answered) => answered,
+            Err(reason) => return Err(deployment.stop_and_collect_failed_start(reason)),
+        };
+
+        let expected = deployment.options.cluster_id.clone();
+
+        let broker = Self {
+            bootstrap,
+            deployment: Some(deployment),
+        };
+
+        // The harness also checks the cluster id in the answer. Another test's broker can bind
+        // this port after `assert_port_is_free` and before this broker does, and any broker on the
+        // port answers the readiness check.
+        assert_eq!(
+            answered.cluster_id(),
+            Some(expected.as_str()),
+            "the broker at {} is not the one launched with cluster id {expected}: {answered}",
+            broker.bootstrap,
+        );
+
+        Ok(broker)
     }
 
     /// Returns the broker's bootstrap address, `host:port`, which [`KafkaCli::new`] takes.
@@ -196,9 +275,25 @@ impl Broker {
         &self.bootstrap
     }
 
-    /// Stops a broker this test launched, failing if it exited or restarted
-    /// before now, didn't exit with 0 on SIGTERM, or logged a panic. Dropping
-    /// the broker does the same.
+    /// Returns whether `path` exists where the broker runs: on this machine for a broker process,
+    /// and in its container for a broker container. Panics for the shared broker.
+    pub fn file_exists(&self, path: &str) -> bool {
+        let deployment = self
+            .deployment
+            .as_ref()
+            .expect("only a broker this test launched has files the test can check");
+
+        match &deployment.host {
+            Host::Process(_) => Path::new(path).exists(),
+
+            Host::Container { name } => {
+                docker(&["exec", name, "test", "-e", path]).is_ok_and(|test| test.code == Some(0))
+            }
+        }
+    }
+
+    /// Stops a broker this test launched, failing if it exited before now, didn't exit with 0 on
+    /// SIGTERM, or logged a panic. Dropping the broker does the same.
     pub fn stop(mut self) -> Result<(), String> {
         self.shutdown()
     }
@@ -208,49 +303,13 @@ impl Broker {
             return Ok(());
         };
 
-        let mut failures = Vec::new();
+        let (stopped, mut files, _) = deployment.stop();
 
-        match deployment.host {
-            Host::Process(mut child) => {
-                stop_process(&mut child, &mut failures);
-            }
-
-            Host::Container { name, volume } => {
-                stop_container(&name, &deployment.log, &mut failures);
-                remove_container(&name, volume.as_deref());
-            }
+        if stopped.is_err() {
+            files.keep_dir = true;
         }
 
-        let log = fs::read_to_string(&deployment.log).unwrap_or_default();
-
-        if let Some(line) = log.lines().find(|line| line.contains("panicked at")) {
-            failures.push(format!("broker panicked: {line}"));
-        }
-
-        let result = if failures.is_empty() {
-            Ok(())
-        } else {
-            let lines = log.lines().collect::<Vec<_>>();
-            let tail = lines[lines.len().saturating_sub(40)..]
-                .iter()
-                .map(|line| without_colour(line))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            Err(format!(
-                "{}\nlast lines of {}:\n{tail}",
-                failures.join("\n"),
-                deployment.log.display()
-            ))
-        };
-
-        // A failed broker's directory stays, so the log that the error names
-        // still exists.
-        if result.is_ok() {
-            _ = fs::remove_dir_all(&deployment.dir);
-        }
-
-        result
+        stopped
     }
 }
 
@@ -270,7 +329,216 @@ impl Drop for Broker {
     }
 }
 
-fn broker_args(options: &LaunchOptions, storage: &str) -> Vec<String> {
+/// A broker that didn't start: how it was launched, how it exited, and what it printed.
+#[derive(Debug)]
+pub struct FailedStart {
+    /// The `nisshi broker` command line.
+    command: String,
+    /// The broker's exit code, or `None` when the harness killed a broker that didn't answer.
+    exit_code: Option<i32>,
+    /// What the broker printed, stdout and stderr together.
+    log: String,
+    /// Why the harness counts the start as failed.
+    reason: String,
+}
+
+impl FailedStart {
+    /// Returns the error message the broker printed as it exited: the last line that starts with
+    /// `Error: ` or `error: `, or `None` if it printed none.
+    ///
+    /// A test checks this message rather than the whole log, because the broker prints its storage
+    /// URL at startup. A bad value in the URL is therefore in the log whatever the error says.
+    fn fatal_error(&self) -> Option<&str> {
+        let start = self
+            .log
+            .match_indices("Error: ")
+            .chain(self.log.match_indices("error: "))
+            .map(|(index, _)| index)
+            .filter(|index| *index == 0 || self.log[..*index].ends_with('\n'))
+            .max()?;
+
+        let error = &self.log[start..];
+        Some(error.lines().next().unwrap_or(error))
+    }
+
+    /// Asserts the broker exited with an error that contains `text`.
+    #[track_caller]
+    pub fn assert_error_names(&self, text: &str) {
+        assert!(
+            self.fatal_error().is_some_and(|error| error.contains(text)),
+            "the broker didn't exit with an error that names {text}: {self}"
+        );
+    }
+}
+
+impl fmt::Display for FailedStart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let exit_code = self.exit_code.map_or_else(
+            || "none, the harness killed it".to_owned(),
+            |code| code.to_string(),
+        );
+
+        write!(
+            formatter,
+            "`{}` didn't start: {}\nexit code: {exit_code}\nlog:\n{}",
+            self.command, self.reason, self.log
+        )
+    }
+}
+
+impl Deployment {
+    /// Stops the broker and checks it. Returns the files and options too, for a restart.
+    fn stop(self) -> (Result<(), String>, BrokerFiles, LaunchOptions) {
+        let mut failures = Vec::new();
+
+        match self.host {
+            Host::Process(mut child) => {
+                stop_process(&mut child, &mut failures);
+            }
+
+            Host::Container { name } => {
+                stop_container(&name, &self.log, &mut failures);
+                remove_container(&name);
+            }
+        }
+
+        let log = fs::read_to_string(&self.log).unwrap_or_else(|err| {
+            failures.push(format!(
+                "couldn't read {} to check for a panic: {err}",
+                self.log.display()
+            ));
+            String::new()
+        });
+
+        if let Some(line) = log.lines().find(|line| line.contains("panicked at")) {
+            failures.push(format!("broker panicked: {line}"));
+        }
+
+        let result = if failures.is_empty() {
+            Ok(())
+        } else {
+            let lines = log.lines().collect::<Vec<_>>();
+            let tail = lines[lines.len().saturating_sub(40)..]
+                .iter()
+                .map(|line| without_colour(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            Err(format!(
+                "{}\nlast lines of {}:\n{tail}",
+                failures.join("\n"),
+                self.log.display()
+            ))
+        };
+
+        (result, self.files, self.options)
+    }
+
+    /// Stops a broker that didn't start, if it is still running, and removes it and its files. The
+    /// returned [`FailedStart`] holds its whole log, so nothing is lost.
+    fn stop_and_collect_failed_start(mut self, reason: String) -> FailedStart {
+        let code = match &mut self.host {
+            Host::Process(child) => {
+                if let Ok(None) = child.try_wait() {
+                    _ = child.kill();
+                }
+
+                child.wait().ok().and_then(|status| status.code())
+            }
+
+            Host::Container { name } => {
+                let code = match check_container_running(name) {
+                    Ok(()) => {
+                        _ = docker(&["kill", name]);
+                        None
+                    }
+
+                    Err(_) => inspect(name, "{{.State.ExitCode}}")
+                        .ok()
+                        .and_then(|code| code.parse().ok()),
+                };
+
+                // Save the container's output before removing the container deletes it.
+                // `FailedStart` reads the broker's error from this log, so without it a test
+                // that expects a refusal fails.
+                _ = save_logs(name, &self.log);
+                remove_container(name);
+                code
+            }
+        };
+
+        let log = fs::read_to_string(&self.log).unwrap_or_default();
+
+        FailedStart {
+            command: format!("nisshi {}", broker_args(&self.options).join(" ")),
+            exit_code: code,
+            log: log
+                .lines()
+                .map(|line| without_colour(line) + "\n")
+                .collect(),
+            reason,
+        }
+    }
+}
+
+impl Host {
+    /// An error if the broker has exited.
+    fn check_running(&mut self) -> Result<(), String> {
+        match self {
+            Self::Process(child) => match child.try_wait() {
+                Ok(Some(status)) => Err(format!("exited with {status}")),
+                _ => Ok(()),
+            },
+
+            Self::Container { name } => check_container_running(name),
+        }
+    }
+}
+
+impl BrokerFiles {
+    /// A new directory under [`settings::broker_work_dir`], and a volume for a SQLite broker in a
+    /// container.
+    fn new(storage: &StorageUrl) -> Self {
+        let dir = settings::broker_work_dir().join(unique_name("nisshi-smoke"));
+        fs::create_dir_all(&dir)
+            .unwrap_or_else(|err| panic!("broker directory {}: {err}", dir.display()));
+
+        let volume = (settings::broker_image().is_some() && storage.is_sqlite()).then(|| {
+            let volume = unique_name("nisshi-smoke-sqlite");
+
+            _ = docker(&["volume", "create", &label(), &volume]);
+
+            volume
+        });
+
+        Self {
+            dir,
+            volume,
+            starts: 0,
+            keep_dir: false,
+        }
+    }
+
+    /// The log for the broker's next start, so a restart keeps the log from before it.
+    fn next_log(&mut self) -> PathBuf {
+        self.starts += 1;
+        self.dir.join(format!("broker-{}.log", self.starts))
+    }
+}
+
+impl Drop for BrokerFiles {
+    fn drop(&mut self) {
+        if let Some(volume) = &self.volume {
+            _ = docker(&["volume", "rm", "--force", volume]);
+        }
+
+        if !self.keep_dir && !thread::panicking() {
+            _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn broker_args(options: &LaunchOptions) -> Vec<String> {
     let url = format!("tcp://127.0.0.1:{}", options.port);
 
     let mut args = vec![
@@ -278,36 +546,23 @@ fn broker_args(options: &LaunchOptions, storage: &str) -> Vec<String> {
         format!("--cluster-id={}", options.cluster_id),
         format!("--listener-url={url}"),
         format!("--advertised-listener-url={url}"),
-        format!("--storage-engine={storage}"),
+        format!("--storage-engine={}", options.storage),
     ];
 
-    args.extend(options.args.iter().cloned());
+    if options.login.is_some() {
+        args.push("--authentication".to_owned());
+    }
+
     args
 }
 
-/// A broker's own SQLite database, in its working directory.
-const SQLITE: &str = "sqlite://nisshi.db";
-
-fn is_sqlite(storage: &str) -> bool {
-    storage.starts_with("sqlite:")
-}
-
-fn launch_process(options: &LaunchOptions, storage: &str, dir: &Path, log: &Path) -> Host {
-    let binary = env("NISSHI_SMOKE_BIN").expect(
-        "set NISSHI_SMOKE_BIN or NISSHI_SMOKE_IMAGE: run the suite with `just smoke <engine>`",
-    );
+fn launch_process(options: &LaunchOptions, dir: &Path, log: &Path) -> Result<Host, String> {
+    let binary = settings::broker_binary();
 
     // The broker runs in its own directory, where a relative path would no
     // longer find the binary.
     let binary =
         fs::canonicalize(&binary).unwrap_or_else(|err| panic!("NISSHI_SMOKE_BIN {binary}: {err}"));
-
-    // The broker resolves a sqlite:// path against its working directory.
-    let storage = if is_sqlite(storage) {
-        SQLITE.to_owned()
-    } else {
-        storage.to_owned()
-    };
 
     let output = File::create(log).expect("broker log");
     let errors = output.try_clone().expect("broker log");
@@ -315,9 +570,9 @@ fn launch_process(options: &LaunchOptions, storage: &str, dir: &Path, log: &Path
     let mut command = Command::new(&binary);
 
     _ = command
-        .args(broker_args(options, &storage))
-        // The broker loads `.env` from its working directory; there is none
-        // here.
+        .args(broker_args(options))
+        // The broker resolves a relative sqlite:// path against its working
+        // directory, and loads `.env` from it; there is none here.
         .current_dir(dir)
         .env_clear()
         .envs(broker_environment())
@@ -325,21 +580,19 @@ fn launch_process(options: &LaunchOptions, storage: &str, dir: &Path, log: &Path
         .stdout(output)
         .stderr(errors);
 
-    Host::Process(
-        command
-            .spawn()
-            .unwrap_or_else(|err| panic!("could not start {}: {err}", binary.display())),
-    )
+    command
+        .spawn()
+        .map(Host::Process)
+        .map_err(|err| format!("could not start {}: {err}", binary.display()))
 }
 
-fn launch_container(image: &str, options: &LaunchOptions, storage: &str) -> Host {
+/// Starts `image` in a container, with a SQLite broker's `volume` as its working directory.
+fn launch_container(
+    image: &str,
+    options: &LaunchOptions,
+    volume: Option<&str>,
+) -> Result<Host, String> {
     let name = unique_name("nisshi-smoke-broker");
-
-    let (storage, volume) = if is_sqlite(storage) {
-        (SQLITE.to_owned(), Some(name.clone()))
-    } else {
-        (storage.to_owned(), None)
-    };
 
     let mut command = Command::new("docker");
 
@@ -350,8 +603,6 @@ fn launch_container(image: &str, options: &LaunchOptions, storage: &str) -> Host
         &name,
         &label(),
         "--network=host",
-        // Restart a crashed broker, so a crash shows up as a restart.
-        "--restart=on-failure",
     ]);
 
     // The image sets its own PATH and HOME.
@@ -361,41 +612,54 @@ fn launch_container(image: &str, options: &LaunchOptions, storage: &str) -> Host
         }
     }
 
-    if let Some(volume) = &volume {
-        _ = Command::new("docker")
-            .args(["volume", "create", &label(), volume])
-            .output();
+    if let Some(volume) = volume {
         _ = command.args(["--volume", &format!("{volume}:/data"), "--workdir=/data"]);
     }
 
-    _ = command.arg(image).args(broker_args(options, &storage));
+    _ = command.arg(image).args(broker_args(options));
 
     let started = timed_command::run(&mut command, None, Duration::from_secs(300));
 
     if !matches!(&started, Ok(started) if started.code == Some(0)) {
-        remove_container(&name, volume.as_deref());
-        panic!("could not start {image}: {started:?}");
+        remove_container(&name);
+        return Err(format!("could not start {image}: {started:?}"));
     }
 
-    Host::Container { name, volume }
+    Ok(Host::Container { name })
 }
 
 /// Returns a port for a broker to listen on, which nothing listens on yet.
 ///
 /// Panics if every port in the range is in use.
 pub fn free_port() -> u16 {
+    /// Launched brokers listen on ports from here up, below the ports the operating system picks
+    /// for outgoing connections and port-0 binds (32768 up on Linux, 49152 up on macOS), so the
+    /// operating system can't take a port between this function's check and the broker's bind.
+    const FIRST_BROKER_PORT: u16 = 20000;
+    const BROKER_PORT_COUNT: u16 = 10000;
+
     static PORTS_TRIED: AtomicU16 = AtomicU16::new(0);
 
     // Each process starts at its own offset, so parallel tests try different ports.
-    let start = (std::process::id() % u32::from(BROKER_PORTS)) as u16;
+    let start = (std::process::id() % u32::from(BROKER_PORT_COUNT)) as u16;
 
-    (0..BROKER_PORTS)
+    (0..BROKER_PORT_COUNT)
         .map(|_| {
             let offset = start.wrapping_add(PORTS_TRIED.fetch_add(1, Ordering::Relaxed));
-            FIRST_BROKER_PORT + offset % BROKER_PORTS
+            FIRST_BROKER_PORT + offset % BROKER_PORT_COUNT
         })
         .find(|port| port_is_free(*port))
         .expect("no free port")
+}
+
+/// Panics if something already listens on `port`, because the broker's readiness check would
+/// then pass against it.
+fn assert_port_is_free(port: u16) {
+    assert!(
+        port_is_free(port),
+        "port {port} is already in use: stop what listens there (`docker ps --filter \
+         label=nisshi-smoke` lists containers an earlier run left behind), or choose another port"
+    );
 }
 
 fn port_is_free(port: u16) -> bool {
@@ -435,22 +699,19 @@ fn stop_process(child: &mut Child, failures: &mut Vec<String>) {
     }
 }
 
-fn container_alive(name: &str) -> Result<(), String> {
-    let state = inspect(name, "{{.State.Running}} {{.RestartCount}}")?;
-
-    match state.as_str() {
-        "true 0" => Ok(()),
-        state => Err(format!(
-            "container {name} running and restart count: {state}"
-        )),
+fn check_container_running(name: &str) -> Result<(), String> {
+    match inspect(name, "{{.State.Running}} {{.State.ExitCode}}")?.split_once(' ') {
+        Some(("true", _)) => Ok(()),
+        Some((_, code)) => Err(format!("exited with {code}")),
+        None => Err(format!("container {name} has no state")),
     }
 }
 
 fn stop_container(name: &str, log: &Path, failures: &mut Vec<String>) {
-    if let Err(reason) = container_alive(name) {
-        failures.push(format!(
-            "broker exited or restarted during the run: {reason}"
-        ));
+    if let Err(reason) = check_container_running(name) {
+        failures.push(format!("broker {reason} during the run"));
+        failures.extend(save_logs(name, log).err());
+        return;
     }
 
     let stopped = timed_command::run(
@@ -469,40 +730,43 @@ fn stop_container(name: &str, log: &Path, failures: &mut Vec<String>) {
         Err(reason) => failures.push(reason),
     }
 
-    if let Ok(logs) = Command::new("docker").args(["logs", name]).output() {
-        let mut text = logs.stdout;
-        text.extend(logs.stderr);
-        _ = fs::write(log, text);
-    }
+    failures.extend(save_logs(name, log).err());
 }
 
-/// Removes a broker container, with its SQLite volume if it has one.
-fn remove_container(name: &str, volume: Option<&str>) {
-    _ = Command::new("docker")
-        .args(["rm", "--force", "--volumes", name])
-        .output();
+/// Writes what a broker container printed to `log`.
+fn save_logs(name: &str, log: &Path) -> Result<(), String> {
+    let logs = docker(&["logs", name])?;
 
-    if let Some(volume) = volume {
-        _ = Command::new("docker")
-            .args(["volume", "rm", "--force", volume])
-            .output();
+    if logs.code != Some(0) {
+        return Err(format!("docker logs {name}: {}", logs.stderr.trim()));
     }
+
+    fs::write(log, logs.stdout + &logs.stderr)
+        .map_err(|err| format!("couldn't write {}: {err}", log.display()))
+}
+
+/// Removes a broker container, but not its volume, which [`BrokerFiles`] removes.
+fn remove_container(name: &str) {
+    _ = docker(&["rm", "--force", "--volumes", name]);
 }
 
 fn inspect(name: &str, format: &str) -> Result<String, String> {
-    let output = Command::new("docker")
-        .args(["inspect", "--format", format, name])
-        .output()
-        .map_err(|err| format!("docker inspect {name}: {err}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    } else {
-        Err(format!(
+    match docker(&["inspect", "--format", format, name])? {
+        inspected if inspected.code == Some(0) => Ok(inspected.stdout.trim().to_owned()),
+        inspected => Err(format!(
             "docker inspect {name}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+            inspected.stderr.trim()
+        )),
     }
+}
+
+/// Runs a short `docker` command, such as `docker inspect`, and kills it if it hangs.
+fn docker(args: &[&str]) -> Result<timed_command::Finished, String> {
+    timed_command::run(
+        Command::new("docker").args(args),
+        None,
+        Duration::from_secs(60),
+    )
 }
 
 /// Removes the terminal colour codes the broker writes into its log.
@@ -528,7 +792,7 @@ fn without_colour(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::without_colour;
+    use super::{FailedStart, without_colour};
 
     #[test]
     fn colour_codes_are_removed() {
@@ -536,5 +800,60 @@ mod tests {
             without_colour("\u{1b}[2m2026\u{1b}[0m \u{1b}[34mDEBUG\u{1b}[0m ready"),
             "2026 DEBUG ready"
         );
+    }
+
+    fn failed_start_with_log(log: &str) -> FailedStart {
+        FailedStart {
+            command: "nisshi broker".to_owned(),
+            exit_code: Some(1),
+            log: log.to_owned(),
+            reason: "exited with 1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn fatal_error_leaves_out_the_storage_url_the_broker_prints_at_startup() {
+        let failed_start = failed_start_with_log(
+            "storage: sqlite:////proc/nisshi/nisshi.db [\"sqlite\"]\nError: Io(PermissionDenied)\n",
+        );
+
+        assert_eq!(
+            failed_start.fatal_error(),
+            Some("Error: Io(PermissionDenied)")
+        );
+    }
+
+    #[test]
+    fn fatal_error_includes_an_argument_error_from_clap() {
+        let failed_start = failed_start_with_log(
+            "error: invalid value 'not a url' for '--storage-engine <STORAGE_ENGINE>'\n\nFor more \
+             information, try '--help'.\n",
+        );
+
+        assert!(
+            failed_start
+                .fatal_error()
+                .is_some_and(|error| error.contains("not a url"))
+        );
+    }
+
+    #[test]
+    fn fatal_error_leaves_out_the_lines_after_it() {
+        let failed_start = failed_start_with_log(
+            "Error: Io(PermissionDenied)\nstorage: sqlite:////proc/nisshi/nisshi.db\n",
+        );
+
+        assert_eq!(
+            failed_start.fatal_error(),
+            Some("Error: Io(PermissionDenied)")
+        );
+    }
+
+    #[test]
+    fn fatal_error_is_none_when_the_broker_printed_no_error() {
+        let failed_start =
+            failed_start_with_log("thread 'main' panicked at src/main.rs:1:1:\nsome message\n");
+
+        assert_eq!(failed_start.fatal_error(), None);
     }
 }

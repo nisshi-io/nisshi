@@ -15,15 +15,20 @@
 //! `smoke-broker -- <command>...` starts the broker the smoke tests share,
 //! runs the command with `NISSHI_SMOKE_BOOTSTRAP` pointing at it, then stops
 //! the broker. The run fails if the command fails, or if the broker exited,
-//! restarted, panicked or didn't exit with 0 on SIGTERM.
+//! panicked or didn't exit with 0 on SIGTERM.
 //!
-//! nextest runs each test in its own process, so no test can own a broker
-//! the others share; `just smoke` owns it through this instead.
+//! nextest runs each test in its own process, so a test cannot own a broker that the other tests
+//! share. `just smoke` owns the shared broker through smoke-broker instead.
+//!
+//! The smoke report has one row per test, so smoke-broker adds a row for each failure that the
+//! tests do not report. The `shared_broker` row is FAIL if the broker fails its checks, even if
+//! every test passes. The `suite` row is FAIL if the command fails, including a run that stopped
+//! before any test reported. run.sh parses these rows from the `smoke-broker: result` lines.
 
-use std::{path::PathBuf, process::Command, process::ExitCode};
+use std::process::{Command, ExitCode};
 
 use clap::Parser;
-use nisshi_smoke_test::{Broker, LaunchOptions, free_port};
+use nisshi_smoke_test::{Broker, LaunchOptions, SHARED_CLUSTER_ID, settings};
 
 #[derive(Debug, Parser)]
 struct Arguments {
@@ -39,10 +44,9 @@ fn main() -> ExitCode {
         .expect("clap requires at least one command argument");
 
     let broker = Broker::launch(LaunchOptions {
-        port: free_port(),
-        cluster_id: "nisshi-smoke".to_owned(),
-        args: Vec::new(),
-        log: std::env::var_os("NISSHI_SMOKE_LOG").map(PathBuf::from),
+        cluster_id: SHARED_CLUSTER_ID.to_owned(),
+        log: settings::shared_broker_log(),
+        ..LaunchOptions::new(settings::storage_url_under_test())
     });
 
     let status = Command::new(program)
@@ -70,10 +74,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // The report shows only the rows in the results file, and each test gets
-    // one row. Some failures don't belong to any test, so smoke-broker adds
-    // two rows of its own: `suite` fails when the nextest run fails, and
-    // `shared_broker` fails when the shared broker fails its checks.
     eprintln!("smoke-broker: result suite,{suite}");
 
     let outcome = match stopped {

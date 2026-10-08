@@ -11,9 +11,12 @@ keywords.workspace = true
 authors.workspace = true
 include.workspace = true
 
-# One feature per storage engine. A test that applies only to some engines
-# goes in a module gated on these, so `just smoke <engine>` compiles only the
-# tests for that engine.
+# Each storage engine has one feature, and `just smoke <engine>` turns it on. A
+# test that applies only to some engines is compiled only with their features,
+# by `cfg(feature = ...)` or `cfg(any(...))`. Never gate a test with
+# `cfg(not(feature = ...))`: `just clippy` turns every feature on, and would
+# then never compile it. A test that fails on one engine because of a bug uses
+# `cfg_attr` on that feature to ignore itself there.
 [features]
 memory = []
 postgres = []
