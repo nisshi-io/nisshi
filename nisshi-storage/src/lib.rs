@@ -266,8 +266,23 @@ pub enum Error {
     NoSuchOffset(i64),
     OsString(OsString),
 
+    /// The storage at `storage` failed the startup check in
+    /// [`Builder::build`], so the broker cannot use it.
+    StartupCheck {
+        /// The storage URL, with any password removed.
+        storage: Url,
+        source: Arc<Error>,
+    },
+
     #[cfg(any(feature = "dynostore", feature = "slatedb"))]
     ObjectStore(Arc<object_store::Error>),
+
+    /// The configured AWS credential provider did not return a credential.
+    /// Distinct from [`Error::ObjectStore`], which covers a request that
+    /// failed, including a request signed with a credential that the store
+    /// rejected.
+    #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+    NoCredentials(Arc<object_store::Error>),
 
     ParseFilter(Arc<ParseError>),
     Pattern(Arc<PatternError>),
@@ -2350,6 +2365,7 @@ impl Builder<i32, String, Url, Url> {
         };
 
         let silent = self.silent;
+        let redacted = redact_url(&self.storage);
 
         let storage = factory.build(self.into()).await?;
 
@@ -2368,7 +2384,10 @@ impl Builder<i32, String, Url, Url> {
             Some(pb)
         };
 
-        storage.ping().await?;
+        storage.ping().await.map_err(|source| Error::StartupCheck {
+            storage: redacted,
+            source: Arc::new(source),
+        })?;
 
         if let Some(pb) = pb {
             pb.inc(1);
