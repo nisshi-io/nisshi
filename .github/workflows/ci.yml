@@ -212,16 +212,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: 1.58.0
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
           cache: false
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
-      - run: just build dev ${{matrix.storage}}
+      # This leg only proves the feature compiles, so check skips codegen
+      # and linking.
+      - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}}
   build-storage-lake:
     if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
     runs-on: ${{matrix.os}}
@@ -250,7 +249,9 @@ jobs:
           cache: false
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
-      - run: cargo build --features ${{matrix.storage}} --features ${{matrix.lake}}
+      # This leg only proves the feature combination compiles, so check
+      # skips codegen and linking.
+      - run: cargo check --features ${{matrix.storage}} --features ${{matrix.lake}}
   compat-librdkafka:
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
