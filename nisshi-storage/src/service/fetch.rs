@@ -180,7 +180,9 @@ fn missed(
 /// so one partition that never answers delays the rest of the request by
 /// that half, rather than holding it until the client gives up. The half is
 /// taken of the time left now, so a partition that answers quickly leaves
-/// its unused share to those after it.
+/// its unused share to those after it. A partition whose offset stage is
+/// read again after its records takes a fresh half for that read, so it
+/// can spend up to three quarters of the time left in all.
 fn partition_deadline(read_deadline: Instant, left: usize) -> Instant {
     if left <= 1 {
         read_deadline
@@ -338,16 +340,19 @@ where
     /// to read before the read deadline.
     ///
     /// A read that has not finished by this partition's share of the read
-    /// deadline (see [`partition_deadline`]) is abandoned. Each read is
-    /// given the time left of its storage budget (see [`Deadlines::storage`])
-    /// and the reads stop once that is spent. What is left of the client's
-    /// `max_wait` alone may have been spent by a slow partition earlier in
-    /// the request, and engines read nothing with no budget.
+    /// deadline (see [`partition_deadline`]) is abandoned; an offset stage
+    /// read again after the records gets a share of its own. Each records
+    /// read is given the time left of its storage budget (see
+    /// [`Deadlines::storage`]) and the reads stop once that is spent. What
+    /// is left of the client's `max_wait` alone may have been spent by a
+    /// slow partition earlier in the request, and with no budget some
+    /// engines read nothing and the rest at most one record.
     ///
     /// A partition whose read does not finish in time is answered with
     /// [`ErrorCode::None`], whatever batches it had already read, and the
-    /// offset stage read before them, so the client fetches it again on its
-    /// next request. A partition whose offset stage is not read in time is
+    /// offset stage read before them, raised to cover those batches (see
+    /// [`Self::covering`]), so the client fetches it again on its next
+    /// request. A partition whose offset stage is not read in time is
     /// answered with unknown offsets; see [`Self::unknown_offsets`].
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self,min_bytes,isolation,fetch_partition), fields(partition = fetch_partition.partition))]
@@ -2097,9 +2102,9 @@ mod tests {
 
     /// A partition that never answers holds the request for half of the
     /// read deadline, and the partitions after it are then read with a
-    /// budget of their own: engines read nothing given none, so a budget
-    /// taken from the spent `max_wait` would leave them as starved as
-    /// before.
+    /// budget of their own: given none, engines read nothing or one record,
+    /// so a budget taken from the spent `max_wait` would leave them as
+    /// starved as before.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_partition_does_not_starve_the_rest() -> Result<()> {
         let storage = Partitions::new([
