@@ -1835,16 +1835,19 @@ mod tests {
     /// The reads of each partition, by topic and partition.
     type Scripts = BTreeMap<(String, i32), Vec<Read>>;
 
+    /// How long an offset stage read takes to answer, by topic, partition
+    /// and the position of the read among that partition's stage reads,
+    /// counted from 1.
+    type StageDelays = BTreeMap<(String, i32, usize), Duration>;
+
     /// Storage whose topics each answer their partitions' reads in turn
     /// from their own script, with nothing once it runs out. A topic that
     /// has no script is unknown.
     #[derive(Clone, Debug, Default)]
     struct Partitions {
         scripts: Arc<Mutex<Scripts>>,
-        /// The offset stage reads that never answer, by topic and
-        /// partition: the position of the read among that partition's
-        /// stage reads, counted from 1.
-        stalled_offset_stages: Arc<Mutex<BTreeMap<(String, i32), usize>>>,
+        /// A stage read not listed answers at once.
+        offset_stage_delays: Arc<Mutex<StageDelays>>,
         offset_stage_reads: Arc<Mutex<BTreeMap<(String, i32), usize>>>,
         calls: Arc<Mutex<Vec<Call>>>,
     }
@@ -1874,10 +1877,17 @@ mod tests {
         /// Makes the `read`th offset stage read of `partition` of
         /// [`TOPIC`], counted from 1, never answer.
         fn stall_offset_stage(self, partition: i32, read: usize) -> Self {
-            self.stalled_offset_stages
+            self.delay_offset_stage(partition, read, Duration::from_secs(3_600))
+        }
+
+        /// Makes the `read`th offset stage read of `partition` of
+        /// [`TOPIC`], counted from 1, answer after `delay`.
+        fn delay_offset_stage(self, partition: i32, read: usize, delay: Duration) -> Self {
+            _ = self
+                .offset_stage_delays
                 .lock()
-                .expect("stalled offset stages")
-                .insert((TOPIC.into(), partition), read);
+                .expect("offset stage delays")
+                .insert((TOPIC.into(), partition, read), delay);
             self
         }
 
@@ -1958,10 +1968,14 @@ mod tests {
                 *read
             };
 
-            let stalled = self.stalled_offset_stages.lock()?.get(&key) == Some(&read);
+            let delay = self
+                .offset_stage_delays
+                .lock()?
+                .get(&(key.0, key.1, read))
+                .copied();
 
-            if stalled {
-                tokio::time::sleep(Duration::from_secs(3_600)).await;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
 
             Ok(OffsetStage {
@@ -2356,6 +2370,26 @@ mod tests {
         );
         assert_eq!(0, batches(&partitions[7]));
         assert_eq!(1_000, partitions[7].high_watermark);
+
+        Ok(())
+    }
+
+    /// The storage budget starts once the offset stage is read, so a
+    /// partition whose stage was slow still gets its half of `max_wait`
+    /// for its records, rather than what the stage left of it.
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_starts_after_the_offset_stage() -> Result<()> {
+        let storage = Partitions::new([
+            (0, vec![Read::Batch(batch(0, &[0])?)]),
+            (1, vec![Read::Batch(batch(0, &[0])?)]),
+        ])
+        .delay_offset_stage(0, 1, MAX_WAIT - MAX_WAIT / 4);
+
+        let (partitions, _) = fetch(storage.clone(), &[0, 1]).await?;
+
+        assert_eq!(MAX_WAIT / 2, storage.calls(0)[0].max_wait);
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(1, batches(&partitions[1]));
 
         Ok(())
     }
