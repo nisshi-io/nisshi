@@ -75,6 +75,14 @@ pub(super) struct TimeIndex {
     /// the index from the partition's batches.
     #[serde(default)]
     complete: bool,
+
+    /// The token of the backfill in progress, set before its listing and
+    /// cleared by its commit. A binary without the index rewrites the
+    /// document without this field, so a commit after such a write finds
+    /// its token gone and leaves the index incomplete (see
+    /// [`TimeIndex::merge`]).
+    #[serde(default)]
+    backfill: Option<u64>,
 }
 
 fn no_timestamp() -> i64 {
@@ -93,6 +101,7 @@ impl Default for TimeIndex {
             bytes_since_entry: 0,
             interval_bytes: INITIAL_INTERVAL_BYTES,
             complete: false,
+            backfill: None,
         }
     }
 }
@@ -122,10 +131,18 @@ impl TimeIndex {
         self.complete
     }
 
-    /// Marks the index complete from offset 0 onward, for a partition whose
-    /// first batch is being appended: nothing predates it.
+    /// Marks the index complete from offset 0 onward: for a partition whose
+    /// first batch is being appended, nothing predates it; for a backfill
+    /// candidate, its listing covered every batch below the high watermark.
     pub(super) fn mark_complete(&mut self) {
         self.complete = true;
+    }
+
+    /// Marks a backfill in progress and returns its token: `token` when
+    /// none was in progress, else the token of the backfill another process
+    /// began, which then covers this one's listing as well.
+    pub(super) fn begin_backfill(&mut self, token: u64) -> u64 {
+        *self.backfill.get_or_insert(token)
     }
 
     pub(super) fn entries(&self) -> &BTreeMap<i64, i64> {
@@ -166,6 +183,13 @@ impl TimeIndex {
         }
     }
 
+    /// Raises the maximum timestamp for a batch of `max_timestamp` that gets
+    /// no entry, so that a lookup above every indexed timestamp and at or
+    /// below this one still scans for it.
+    pub(super) fn observe(&mut self, max_timestamp: i64) {
+        self.max_timestamp = self.max_timestamp.max(max_timestamp);
+    }
+
     /// Drops every other entry, keeping the newest, and doubles the interval
     /// so the index fills again at half the rate.
     fn thin(&mut self) {
@@ -204,7 +228,15 @@ impl TimeIndex {
     /// in offset order under the append rule. Each entry of the result is
     /// above every batch before it, so the result keeps the index's
     /// guarantee.
-    pub(super) fn merge(candidate: Self, live: &Self) -> Self {
+    ///
+    /// The result is complete only when the candidate is complete (its
+    /// listing covered every batch below the high watermark) and the live
+    /// index is already complete or still carries the backfill's `token`.
+    /// A binary without the index rewrites the document without the token
+    /// and without the batches it appended, so a commit that finds the
+    /// token gone leaves the index incomplete, and the next lookup
+    /// backfills again.
+    pub(super) fn merge(candidate: Self, live: &Self, token: u64) -> Self {
         let candidate_max = candidate.max_timestamp;
 
         let mut by_offset: BTreeMap<i64, i64> = candidate
@@ -222,7 +254,8 @@ impl TimeIndex {
             max_timestamp: NO_TIMESTAMP,
             bytes_since_entry: 0,
             interval_bytes: candidate.interval_bytes.max(live.interval_bytes),
-            complete: true,
+            complete: candidate.complete && (live.complete || live.backfill == Some(token)),
+            backfill: None,
         };
 
         for (base_offset, timestamp) in by_offset {
@@ -348,13 +381,42 @@ mod tests {
         candidate.append(T0 - 50, 1, 1);
 
         let mut live = TimeIndex::default();
+        assert_eq!(7, live.begin_backfill(7));
         live.append(T0 - 20, 2, 1);
 
-        let merged = TimeIndex::merge(candidate, &live);
+        let merged = TimeIndex::merge(candidate, &live, 7);
 
         assert!(merged.is_complete());
         assert_eq!(&BTreeMap::from([(T0, 0)]), merged.entries());
         assert_eq!(T0, merged.max_timestamp());
+    }
+
+    /// The merged index is complete only when the candidate's listing was
+    /// complete and the live index still carries the backfill's token. A
+    /// live index rewritten without the token (by a binary without the
+    /// index), or under another backfill's token, leaves it incomplete. A
+    /// live index that is already complete stays complete.
+    #[test]
+    fn merge_completes_only_a_complete_candidate_under_its_own_backfill() {
+        let candidate = dense();
+
+        let mut live = TimeIndex::default();
+        assert_eq!(7, live.begin_backfill(7));
+        assert_eq!(
+            7,
+            live.begin_backfill(8),
+            "a second backfill joins the first"
+        );
+        assert!(TimeIndex::merge(candidate.clone(), &live, 7).is_complete());
+        assert!(!TimeIndex::merge(candidate.clone(), &live, 8).is_complete());
+        assert!(!TimeIndex::merge(candidate.clone(), &TimeIndex::default(), 7).is_complete());
+        assert!(TimeIndex::merge(candidate.clone(), &TimeIndex::complete(), 7).is_complete());
+
+        let incomplete = TimeIndex::default();
+        assert!(!TimeIndex::merge(incomplete, &live, 7).is_complete());
+
+        let merged = TimeIndex::merge(candidate, &live, 7);
+        assert_eq!(None, merged.backfill, "the commit clears the token");
     }
 
     /// The candidate's maximum can belong to a batch inside the interval,
@@ -374,7 +436,7 @@ mod tests {
         let mut live = TimeIndex::default();
         live.append(T0 + 70, 3, 10);
 
-        let merged = TimeIndex::merge(candidate, &live);
+        let merged = TimeIndex::merge(candidate, &live, 7);
 
         assert_eq!(&BTreeMap::from([(T0, 0)]), merged.entries());
         assert_eq!(T0 + 100, merged.max_timestamp());
@@ -388,7 +450,7 @@ mod tests {
         let mut live = TimeIndex::default();
         live.append(T0 + 50, 2, 1);
 
-        let merged = TimeIndex::merge(candidate, &live);
+        let merged = TimeIndex::merge(candidate, &live, 7);
 
         assert_eq!(&BTreeMap::from([(T0, 0), (T0 + 50, 2)]), merged.entries());
         assert_eq!(T0 + 50, merged.max_timestamp());

@@ -107,7 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the target, instead of using the time each batch was stored. A
   consumer that seeks by time can land on a different offset after
   upgrading. The first such lookup on each existing partition reads every
-  stored batch of that partition once, to build its time index.
+  stored batch of that partition once, to build its time index. Upgrade
+  every broker sharing a bucket before relying on these lookups: a produce
+  from an older broker discards the partition's time index, so the next
+  lookup reads every batch of the partition again to rebuild it.
 - A Snappy batch with a truncated xerial header is rejected with an error
   instead of panicking the decoder.
 - CreateTopics rejects a `replication_factor` of 0 or below -1 with `INVALID_REPLICATION_FACTOR` (38), as Apache Kafka does. -1 still selects the default (1).
