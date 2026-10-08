@@ -2214,6 +2214,61 @@ mod time_index {
         assert_eq!(200, millis_since_epoch(response.timestamp.unwrap()));
     }
 
+    /// A migration triggered by DeleteRecords rebuilds the index from the
+    /// surviving batches, then prunes below the new log start. The prune
+    /// must read the rebuilt index in the transaction, not the committed
+    /// one: here the committed entry `100->0` (offset 0, below the cutoff)
+    /// shares its key with the rebuilt `100->2`, and a prune of the
+    /// committed index would delete the rebuilt entry with it.
+    #[tokio::test]
+    async fn legacy_migration_by_delete_records_keeps_a_rebuilt_entry() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-legacy-delete").await;
+        let topic = topic_uuid(&engine, "time-index-legacy-delete").await;
+
+        // Index: 100->0 and 300->3. Offsets 1 and 2 are below the running
+        // max, so they have no entry.
+        for batch in [
+            keyed_batch(b"a", b"v", 100),
+            keyed_batch(b"b", b"v", 50),
+            keyed_batch(b"c", b"v", 100),
+            keyed_batch(b"d", b"v", 300),
+        ] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+        assert_eq!(2, time_index_count(&engine, topic, 0).await);
+
+        let legacy = WatermarkLegacy {
+            low: Some(0),
+            high: Some(4),
+            timestamps: None,
+        };
+        let watermark_key = postcard::to_stdvec(&WatermarkKey::new(topic, 0)).unwrap();
+        let _ = engine
+            .db
+            .put(watermark_key, postcard::to_stdvec(&legacy).unwrap())
+            .await
+            .unwrap();
+
+        let delete_request = vec![
+            DeleteRecordsTopic::default()
+                .name("time-index-legacy-delete".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(1),
+                ])),
+        ];
+        let _ = engine.delete_records(&delete_request).await.unwrap();
+
+        // The rebuild from offsets 1, 2 and 3 gives 50->1, 100->2, 300->3.
+        assert_eq!(3, time_index_count(&engine, topic, 0).await);
+
+        let response = list_offsets_timestamp(&engine, &topition, 80).await;
+        assert_eq!(Some(2), response.offset);
+        assert_eq!(100, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
     /// A worked example exercising the ceiling-then-scan lookup and the
     /// post-`delete_records` behavior together: 5 batches of 10 records
     /// each, with out-of-order/overlapping timestamps across batches.
