@@ -563,6 +563,12 @@ jobs:
       RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
       STORAGE: ${{matrix.storage}}
     steps:
+      # The leg name is set first, so the results upload has a name even when
+      # a later setup step fails. It is one word: the report reads the storage
+      # column from the results file name with `(\w+).csv`.
+      - run: |
+          kafka=${KAFKA_IMAGE#*:}
+          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
@@ -589,13 +595,9 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest@0.9.146
-      # The leg name is one word: the report reads the storage column from
-      # the results file name with `(\w+).csv`.
       - env:
           IMAGE: ${{env.REGISTRY}}/${{github.repository}}:${{steps.meta.outputs.version}}
         run: |
-          kafka=${KAFKA_IMAGE#*:}
-          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
           # The packaged image crashes at startup on sqlite:// (#796), so
           # the sqlite legs build the broker from source instead, and say
           # nothing about the image on sqlite. The fix for #796 removes this
@@ -604,6 +606,16 @@ jobs:
             echo "NISSHI_SMOKE_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
           fi
       - run: just smoke "${STORAGE}"
+      # `just smoke` writes the results file even when it fails. A leg that
+      # failed before `just smoke` ran gets a failed row here instead, so it
+      # still has a column in the report.
+      - if: always()
+        run: |
+          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
+          if [[ ! -f "${results}" ]]; then
+            mkdir -p target/smoke
+            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
+          fi
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -640,6 +652,12 @@ jobs:
       RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
       STORAGE: ${{matrix.storage}}
     steps:
+      # The leg name is set first, so the results upload has a name even when
+      # a later setup step fails. It is one word: the report reads the storage
+      # column from the results file name with `(\w+).csv`.
+      - run: |
+          kafka=${KAFKA_IMAGE#*:}
+          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
@@ -665,19 +683,25 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest@0.9.146
-      # The leg name is one word: the report reads the storage column from
-      # the results file name with `(\w+).csv`.
       - env:
           IMAGE: ${{env.REGISTRY}}/${{github.repository}}:${{steps.meta.outputs.version}}
         run: |
-          kafka=${KAFKA_IMAGE#*:}
-          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
           # The packaged image crashes at startup on sqlite:// (#796), so
           # the sqlite leg builds the broker from source instead.
           if [[ "${STORAGE}" != sqlite ]]; then
             echo "NISSHI_SMOKE_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
           fi
       - run: just smoke "${STORAGE}"
+      # `just smoke` writes the results file even when it fails. A leg that
+      # failed before `just smoke` ran gets a failed row here instead, so it
+      # still has a column in the report.
+      - if: always()
+        run: |
+          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
+          if [[ ! -f "${results}" ]]; then
+            mkdir -p target/smoke
+            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
+          fi
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -688,7 +712,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
-          path: target/smoke/*.log
+          path: |
+            target/smoke/*.log
+            target/smoke/brokers-*/*/*.log
           if-no-files-found: warn
   smoke-report:
     if: always() && (needs.smoke.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped')
