@@ -20,5 +20,9 @@ postgres = []
 s3 = []
 sqlite = []
 
+[dependencies]
+clap.workspace = true
+nanoid.workspace = true
+
 [lints]
 workspace = true

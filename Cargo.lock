@@ -6135,7 +6135,11 @@ dependencies = [
 
 [[package]]
 name = "nisshi-smoke-test"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
+dependencies = [
+ "clap",
+ "nanoid",
+]
 
 [[package]]
 name = "nisshi-storage"

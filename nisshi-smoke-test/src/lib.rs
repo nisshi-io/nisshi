@@ -24,10 +24,7 @@
 //! - `NISSHI_SMOKE_RUN`: the run's id, which labels every container and
 //!   volume the suite creates, so a run removes only its own
 
-use std::{
-    sync::atomic::{AtomicU32, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use nanoid::nanoid;
 
 mod broker;
 mod kafka_cli;
@@ -38,21 +35,18 @@ pub use broker::{Broker, LaunchOptions, free_port};
 pub use kafka_cli::{KafkaCli, Output};
 pub use record::Record;
 
-/// A name no other test, process or earlier run uses, for topics, groups,
-/// clusters and containers, so tests can share one broker and one database.
+/// Returns a name that no other test, process or earlier run uses, so tests can share one broker
+/// and one database.
+///
+/// The random part of the name contains only lowercase letters and digits.
 pub fn unique_name(prefix: &str) -> String {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // This alphabet replaces nanoid's default alphabet, which contains `_` and uppercase letters.
+    // `kafka-topics` prints a warning before its output for a topic name that contains `_`, and
+    // the tests read the first line of that output.
+    const NAME_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or_default();
-
-    format!(
-        "{prefix}-{}-{}-{nanos}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )
+    let alphabet = NAME_ALPHABET.chars().collect::<Vec<_>>();
+    format!("{prefix}-{}", nanoid!(21, &alphabet))
 }
 
 /// The `docker --label` on every container and volume this run creates.
@@ -65,4 +59,23 @@ fn label() -> String {
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_name_appends_only_lowercase_letters_and_digits() {
+        let name = unique_name("topic");
+        let random = name.strip_prefix("topic-").unwrap_or_default();
+
+        assert_eq!(random.len(), 21, "{name}");
+        assert!(
+            random
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()),
+            "{name}"
+        );
+    }
 }

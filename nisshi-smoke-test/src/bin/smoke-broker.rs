@@ -22,18 +22,21 @@
 
 use std::{path::PathBuf, process::Command, process::ExitCode};
 
+use clap::Parser;
 use nisshi_smoke_test::{Broker, LaunchOptions, free_port};
 
-fn main() -> ExitCode {
-    let command = std::env::args()
-        .skip(1)
-        .skip_while(|arg| arg == "--")
-        .collect::<Vec<_>>();
+#[derive(Debug, Parser)]
+struct Arguments {
+    /// The command to run against the shared broker, after `--`.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+}
 
-    let Some((program, args)) = command.split_first() else {
-        eprintln!("usage: smoke-broker -- <command>...");
-        return ExitCode::FAILURE;
-    };
+fn main() -> ExitCode {
+    let Arguments { command } = Arguments::parse();
+    let (program, args) = command
+        .split_first()
+        .expect("clap requires at least one command argument");
 
     let broker = Broker::launch(LaunchOptions {
         port: free_port(),
