@@ -124,7 +124,7 @@ Selected at compile time via feature flags, dispatched at runtime through a `Sto
 
 ## Feature Flags
 
-Default: `dynostore`, `postgres`, `libsql`, `slatedb`. Full build: `delta,dynostore,iceberg,libsql,parquet,postgres,slatedb`.
+Default: `dynostore`, `postgres`, `libsql`, `slatedb`. The `just build`/`release` feature lists below omit `turso`, which the broker and storage crates enable by default. Full build: `delta,dynostore,iceberg,libsql,parquet,postgres,slatedb`.
 
 Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topics to data lake tables.
 
@@ -145,7 +145,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 GitHub Actions (`.github/workflows/ci.yml`) runs in two tiers, gated by `ci-gate`, the single required check that fans in every other job:
 
 - **Tier A, every pull_request push:** `fmt`, `clippy` (which also runs `just doc`), `typos`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
-- **Tier B, once per merge-queue entry (`merge_group`) and on push to `main`:** the full `build-storage` / `build-storage-lake` feature matrix, `test` on postgres:16/17/18, the experimental compat legs, `cargo-publish-dry-run`, `src`, `release`, `package`, `smoke` (Java Kafka client, Kafka 3.7/3.8/3.9).
+- **Tier B, once per merge-queue entry (`merge_group`) and on push to `main`:** the `build-storage` matrix (one build per storage engine, `turso` included) and `build-storage-lake` (one build per lake format on `dynostore`), `test` on postgres:16/17/18, the experimental compat legs, `cargo-publish-dry-run`, `src`, `release`, `package`, `smoke` (Java Kafka client, Kafka 3.7/3.8/3.9).
 
 Merging goes through a merge queue: "Merge when ready" queues the PR, the queue re-runs CI on it against the current tip of `main`, and merges with a merge commit if everything is green. Tier B is skipped on same-repo PRs only while the `MERGE_QUEUE` repository variable is `on`; with it unset, they run everything. Fork PRs can't read the variable, so Tier B is always skipped on them and runs in the queue. The other required checks come from `codeql.yml`, `workflow-lint.yml` and `dependencies.yml`.
 

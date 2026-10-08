@@ -11,10 +11,11 @@ name: ci
 # third-party-license and release below (release also skips the cache
 # entirely on tags).
 #
-# Two tiers. The org is on GitHub's Free plan (20 concurrent jobs), and a
-# full run of this workflow is ~60 jobs, 31 of them with no `needs`. Running
-# all of that on every pull_request push starved every other PR of runners.
-# So:
+# Two tiers. The split was made on GitHub's Free plan (20 concurrent jobs),
+# where a full run of this workflow (~60 jobs, 31 of them with no `needs`) on
+# every pull_request push starved every other PR of runners. The org is now
+# on Enterprise (500 concurrent jobs), so the split no longer works around a
+# cap; it keeps per-push runner time and queue time down. So:
 #
 # - Tier A runs on every pull_request push: fmt, clippy, typos,
 #   third-party-license, changelog (advisory only, not in ci-gate's `needs`),
@@ -216,6 +217,7 @@ jobs:
           - libsql
           - postgres
           - slatedb
+          - turso
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -228,7 +230,7 @@ jobs:
           components: clippy, rustfmt
           cache: false
       - run: sudo apt-get update
-      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - run: sudo apt-get install -y libclang-dev
       - run: just build dev ${{matrix.storage}}
   build-storage-lake:
     if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
@@ -239,11 +241,9 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        storage:
-          - dynostore
-          - libsql
-          - postgres
-          - slatedb
+        # The lake features (nisshi-schema) and the storage features
+        # (nisshi-broker, nisshi-storage) are independent, so one storage
+        # covers every lake format.
         lake:
           - delta
           - iceberg
@@ -252,13 +252,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
           cache: false
       - run: sudo apt-get update
-      - run: sudo apt-get install -y libclang-dev libkrb5-dev
-      - run: cargo build --features ${{matrix.storage}} --features ${{matrix.lake}}
+      - run: sudo apt-get install -y libclang-dev
+      # Through the same recipe as build-storage, so only these features are on:
+      # a bare `cargo build --features` keeps every member's defaults enabled.
+      - run: just build dev dynostore,${{matrix.lake}}
   compat-librdkafka:
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
@@ -784,7 +789,7 @@ jobs:
       NEEDS: ${{ toJSON(needs) }}
     steps:
       # This is the one check people land on when an entry is ejected, so
-      # say which job did it rather than making them scan ~60 jobs.
+      # say which job did it rather than making them scan every job.
       - name: Job results
         run: |
           {
