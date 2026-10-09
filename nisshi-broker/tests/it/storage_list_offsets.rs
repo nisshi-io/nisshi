@@ -24,7 +24,9 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
 };
-use nisshi_storage::{ArcDynStorage, CreateTopicsService, ListOffsetsService, Storage};
+use nisshi_storage::{
+    ArcDynStorage, CreateTopicsService, LatencyIntroducingStorage, ListOffsetsService, Storage,
+};
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
@@ -196,6 +198,97 @@ async fn timestamp_no_match(storage: impl Storage + Clone, broker_id: i32) -> Re
     Ok(())
 }
 
+/// Every partition of a request for many partitions answers within the
+/// ListOffsets deadline, in both isolation levels, when each storage call
+/// takes 50 to 150ms.
+async fn many_partitions_with_latency(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
+    const PARTITIONS: i32 = 64;
+
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    let response = CreateTopicsService {
+        storage: storage.clone(),
+    }
+    .serve(RequestInput {
+        request: CreateTopicsRequest::default()
+            .validate_only(Some(false))
+            .topics(Some(
+                [CreatableTopic::default()
+                    .name(topic.into())
+                    .num_partitions(PARTITIONS)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into()))]
+                .into(),
+            )),
+        extensions: extensions.clone(),
+    })
+    .await?;
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let service = ListOffsetsService {
+        storage: LatencyIntroducingStorage::new(storage),
+    };
+
+    for isolation_level in [
+        IsolationLevel::ReadUncommitted,
+        IsolationLevel::ReadCommitted,
+    ] {
+        let partitions = (0..PARTITIONS)
+            .map(|partition_index| {
+                ListOffset::Latest.try_into().map(|timestamp| {
+                    ListOffsetsPartition::default()
+                        .current_leader_epoch(Some(-1))
+                        .partition_index(partition_index)
+                        .timestamp(timestamp)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let response = service
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
+                    .isolation_level(Some(isolation_level.into()))
+                    .replica_id(broker_id)
+                    .topics(Some(
+                        [ListOffsetsTopic::default()
+                            .name(topic.into())
+                            .partitions(Some(partitions))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+        assert_eq!(
+            (0..PARTITIONS)
+                .map(|partition| (partition, ErrorCode::None, Some(0)))
+                .collect::<Vec<_>>(),
+            partitions
+                .iter()
+                .map(
+                    |partition| ErrorCode::try_from(partition.error_code).map(|error_code| (
+                        partition.partition_index,
+                        error_code,
+                        partition.offset
+                    ))
+                )
+                .collect::<Result<Vec<_>, _>>()?,
+            "{isolation_level:?}"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -231,6 +324,20 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::timestamp_no_match(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_partitions_with_latency() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::many_partitions_with_latency(storage, broker_id).await?;
 
         Ok(())
     }
@@ -274,6 +381,20 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn many_partitions_with_latency() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::many_partitions_with_latency(storage, broker_id).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -314,6 +435,20 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn many_partitions_with_latency() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::many_partitions_with_latency(storage, broker_id).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -351,6 +486,20 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::timestamp_no_match(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_partitions_with_latency() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::many_partitions_with_latency(storage, broker_id).await?;
 
         Ok(())
     }

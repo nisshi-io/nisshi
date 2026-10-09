@@ -16,6 +16,7 @@ mod alter_user_scram_credentials;
 mod consumer_group_describe;
 mod create_acls;
 mod create_topics;
+pub mod deadline;
 mod delete_groups;
 mod delete_records;
 mod delete_topics;
@@ -422,8 +423,7 @@ impl Service<Request> for RequestChannelService {
         STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &attributes);
         debug!(operation, capacity);
 
-        self.tx
-            .reserve()
+        deadline::queued(self.tx.reserve())
             .await
             .map(|permit| permit.send((input, resp_tx)))
             .inspect(|_| {
