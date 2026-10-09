@@ -240,9 +240,9 @@ where
                 skip_assignment: *skip_assignment,
                 inception: *inception,
                 state: GroupState::Forming {
-                    protocol_type: state.protocol_type.clone(),
-                    protocol_name: state.protocol_name.clone(),
-                    leader: state.leader.clone(),
+                    protocol_type: state.protocol_type().map(ToOwned::to_owned),
+                    protocol_name: state.protocol_name().map(ToOwned::to_owned),
+                    leader: state.leader().map(ToOwned::to_owned),
                 },
             },
             Wrapper::Formed(Inner {
@@ -320,11 +320,7 @@ where
                         })
                         .collect(),
                     generation_id: gd.generation_id,
-                    state: Forming {
-                        protocol_type,
-                        protocol_name,
-                        leader,
-                    },
+                    state: Forming::from_parts(protocol_type, protocol_name, leader),
                     storage,
                     skip_assignment: gd.skip_assignment,
                     inception: gd.inception,
@@ -395,21 +391,21 @@ where
 
     pub fn protocol_type(&self) -> Option<&str> {
         match self {
-            Self::Forming(inner) => inner.state.protocol_type.as_deref(),
+            Self::Forming(inner) => inner.state.protocol_type(),
             Self::Formed(inner) => Some(inner.state.protocol_type.as_str()),
         }
     }
 
     pub fn protocol_name(&self) -> Option<&str> {
         match self {
-            Self::Forming(inner) => inner.state.protocol_name.as_deref(),
+            Self::Forming(inner) => inner.state.protocol_name(),
             Self::Formed(inner) => Some(inner.state.protocol_name.as_str()),
         }
     }
 
     pub fn leader(&self) -> Option<&str> {
         match self {
-            Self::Forming(inner) => inner.state.leader.as_deref(),
+            Self::Forming(inner) => inner.state.leader(),
             Self::Formed(inner) => Some(inner.state.leader.as_str()),
         }
     }
@@ -470,9 +466,11 @@ where
                         members: inner.members,
                         generation_id: inner.generation_id + 1,
                         state: Forming {
-                            protocol_type: Some(inner.state.protocol_type),
-                            protocol_name: Some(inner.state.protocol_name),
-                            leader,
+                            protocol: Some(Protocol {
+                                protocol_type: inner.state.protocol_type,
+                                protocol_name: inner.state.protocol_name,
+                                leader,
+                            }),
                         },
                         storage: inner.storage,
                         skip_assignment: inner.skip_assignment,
@@ -1565,9 +1563,57 @@ where
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Forming {
-    protocol_type: Option<String>,
-    protocol_name: Option<String>,
+    protocol: Option<Protocol>,
+}
+
+/// The protocol a forming group has settled on, and its leader if it has one.
+///
+/// A group takes its protocol from the first member to join, and only then
+/// chooses a leader, so a leader without a protocol cannot be represented.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct Protocol {
+    protocol_type: String,
+    protocol_name: String,
     leader: Option<String>,
+}
+
+impl Forming {
+    /// Build from the stored group record, which keeps the three parts
+    /// separately. A record without both a type and a name has no protocol,
+    /// and so no leader.
+    fn from_parts(
+        protocol_type: Option<String>,
+        protocol_name: Option<String>,
+        leader: Option<String>,
+    ) -> Self {
+        Self {
+            protocol: protocol_type
+                .zip(protocol_name)
+                .map(|(protocol_type, protocol_name)| Protocol {
+                    protocol_type,
+                    protocol_name,
+                    leader,
+                }),
+        }
+    }
+
+    fn protocol_type(&self) -> Option<&str> {
+        self.protocol
+            .as_ref()
+            .map(|protocol| protocol.protocol_type.as_str())
+    }
+
+    fn protocol_name(&self) -> Option<&str> {
+        self.protocol
+            .as_ref()
+            .map(|protocol| protocol.protocol_name.as_str())
+    }
+
+    fn leader(&self) -> Option<&str> {
+        self.protocol
+            .as_ref()
+            .and_then(|protocol| protocol.leader.as_deref())
+    }
 }
 
 impl fmt::Display for Forming {
@@ -1575,9 +1621,9 @@ impl fmt::Display for Forming {
         write!(
             f,
             "Forming({}/{}/{})",
-            self.protocol_type.as_deref().unwrap_or("?"),
-            self.protocol_name.as_deref().unwrap_or("?"),
-            self.leader.as_deref().unwrap_or("?")
+            self.protocol_type().unwrap_or("?"),
+            self.protocol_name().unwrap_or("?"),
+            self.leader().unwrap_or("?")
         )
     }
 }
@@ -1700,8 +1746,7 @@ where
                     {
                         if self
                             .state
-                            .leader
-                            .as_ref()
+                            .leader()
                             .is_some_and(|leader| leader == member_id)
                         {
                             info!(
@@ -1710,7 +1755,9 @@ where
                                 duration.as_millis()
                             );
 
-                            _ = self.state.leader.take();
+                            if let Some(protocol) = self.state.protocol.as_mut() {
+                                _ = protocol.leader.take();
+                            }
                         } else {
                             info!(
                                 "eviction of: {member_id}, in generation: {}, after {}ms",
@@ -2129,7 +2176,7 @@ where
                 .throttle_time_ms(Some(0))
                 .error_code(ErrorCode::InvalidRequest.into())
                 .generation_id(self.generation_id)
-                .protocol_type(self.state.protocol_type.clone())
+                .protocol_type(self.state.protocol_type().map(ToOwned::to_owned))
                 .protocol_name(Some("".into()))
                 .leader("".into())
                 .skip_assignment(self.skip_assignment)
@@ -2139,7 +2186,7 @@ where
             return (self, join_group_response.into());
         };
 
-        let protocol = if let Some(protocol_name) = self.state.protocol_name.as_deref() {
+        let protocol = if let Some(protocol_name) = self.state.protocol_name() {
             debug!(protocol_name);
 
             if let Some(protocol) = protocols
@@ -2157,7 +2204,7 @@ where
                     .error_code(ErrorCode::InconsistentGroupProtocol.into())
                     .generation_id(self.generation_id)
                     .protocol_type(Some(protocol_type.into()))
-                    .protocol_name(self.state.protocol_name.clone())
+                    .protocol_name(self.state.protocol_name().map(ToOwned::to_owned))
                     .leader("".into())
                     .skip_assignment(self.skip_assignment)
                     .member_id("".into())
@@ -2185,8 +2232,11 @@ where
 
             return (self, join_group_response.into());
         } else {
-            self.state.protocol_type = Some(protocol_type.to_owned());
-            self.state.protocol_name = Some(protocols[0].name.as_str().to_owned());
+            self.state.protocol = Some(Protocol {
+                protocol_type: protocol_type.to_owned(),
+                protocol_name: protocols[0].name.as_str().to_owned(),
+                leader: None,
+            });
 
             self.session_timeout_ms = session_timeout_ms;
             self.rebalance_timeout_ms = rebalance_timeout_ms;
@@ -2206,7 +2256,7 @@ where
                 .throttle_time_ms(Some(0))
                 .error_code(ErrorCode::MemberIdRequired.into())
                 .generation_id(-1)
-                .protocol_type(self.state.protocol_type.clone())
+                .protocol_type(self.state.protocol_type().map(ToOwned::to_owned))
                 .protocol_name(Some("".into()))
                 .leader("".into())
                 .skip_assignment(self.skip_assignment)
@@ -2296,30 +2346,26 @@ where
 
         debug!(?member_id, ?self.members);
 
-        if self.state.leader.is_none() {
+        if let Some(protocol) = self.state.protocol.as_mut()
+            && protocol.leader.is_none()
+        {
             info!(member_id, group_id, self.generation_id);
 
-            _ = self.state.leader.replace(member_id.clone());
+            protocol.leader = Some(member_id.clone());
         }
 
         let join_group_response = JoinGroupResponse::default()
             .throttle_time_ms(Some(0))
             .error_code(ErrorCode::None.into())
             .generation_id(self.generation_id)
-            .protocol_type(self.state.protocol_type.clone())
-            .protocol_name(self.state.protocol_name.clone())
-            .leader(
-                self.state
-                    .leader
-                    .as_ref()
-                    .map_or(String::from(""), |leader| leader.clone()),
-            )
+            .protocol_type(self.state.protocol_type().map(ToOwned::to_owned))
+            .protocol_name(self.state.protocol_name().map(ToOwned::to_owned))
+            .leader(self.state.leader().unwrap_or_default().to_owned())
             .skip_assignment(self.skip_assignment)
             .members(Some(
                 if self
                     .state
-                    .leader
-                    .as_ref()
+                    .leader()
                     .is_some_and(|leader| leader == member_id.as_str())
                 {
                     self.members
@@ -2365,8 +2411,8 @@ where
             let sync_group_response = SyncGroupResponse::default()
                 .throttle_time_ms(Some(0))
                 .error_code(ErrorCode::UnknownMemberId.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
+                .protocol_type(self.state.protocol_type().map(ToOwned::to_owned))
+                .protocol_name(self.state.protocol_name().map(ToOwned::to_owned))
                 .assignment(Bytes::from_static(b""));
 
             return (self.into(), sync_group_response.into());
@@ -2380,8 +2426,8 @@ where
             let sync_group_response = SyncGroupResponse::default()
                 .throttle_time_ms(Some(0))
                 .error_code(ErrorCode::IllegalGeneration.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
+                .protocol_type(self.state.protocol_type().map(ToOwned::to_owned))
+                .protocol_name(self.state.protocol_name().map(ToOwned::to_owned))
                 .assignment(Bytes::from_static(b""));
 
             return (self.into(), sync_group_response.into());
@@ -2393,18 +2439,22 @@ where
             let sync_group_response = SyncGroupResponse::default()
                 .throttle_time_ms(Some(0))
                 .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
+                .protocol_type(self.state.protocol_type().map(ToOwned::to_owned))
+                .protocol_name(self.state.protocol_name().map(ToOwned::to_owned))
                 .assignment(Bytes::from_static(b""));
 
             return (self.into(), sync_group_response.into());
         }
 
-        let is_leader = self
+        // The leader is only ever set alongside the protocol, so being the
+        // leader implies there is a protocol to form the group with.
+        let leader_protocol = self
             .state
-            .leader
+            .protocol
             .as_ref()
-            .is_some_and(|leader_id| member_id == leader_id.as_str());
+            .filter(|protocol| protocol.leader.as_deref() == Some(member_id));
+
+        let is_leader = leader_protocol.is_some();
 
         let is_assignments_for_all_members = {
             let assignments_for = assignments
@@ -2427,27 +2477,18 @@ where
 
         debug!(is_leader, is_assignments_for_all_members);
 
-        if !is_leader || !is_assignments_for_all_members {
-            debug!(?self.state.leader, sync_outcome = ?ErrorCode::RebalanceInProgress);
+        let leader_protocol = leader_protocol
+            .filter(|_| is_assignments_for_all_members)
+            .cloned();
+
+        let (Some(protocol), Some(assignments)) = (leader_protocol, assignments) else {
+            debug!(?self.state, sync_outcome = ?ErrorCode::RebalanceInProgress);
 
             let sync_group_response = SyncGroupResponse::default()
                 .throttle_time_ms(Some(0))
                 .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
-
-            return (self.into(), sync_group_response.into());
-        }
-
-        let Some(assignments) = assignments else {
-            debug!(sync_outcome = ?ErrorCode::RebalanceInProgress);
-
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
+                .protocol_type(self.state.protocol_type().map(ToOwned::to_owned))
+                .protocol_name(self.state.protocol_name().map(ToOwned::to_owned))
                 .assignment(Bytes::from_static(b""));
 
             return (self.into(), sync_group_response.into());
@@ -2466,37 +2507,17 @@ where
             .map(|assignment| (assignment.member_id.clone(), assignment.assignment.clone()))
             .collect::<BTreeMap<_, _>>();
 
-        let Some(protocol_type) = self.state.protocol_type.clone() else {
-            debug!(sync_outcome = ?ErrorCode::InconsistentGroupProtocol);
-
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::InconsistentGroupProtocol.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
-
-            return (self.into(), sync_group_response.into());
-        };
-
-        let Some(protocol_name) = self.state.protocol_name.clone() else {
-            debug!(sync_outcome = ?ErrorCode::InconsistentGroupProtocol);
-
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::InconsistentGroupProtocol.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
-
-            return (self.into(), sync_group_response.into());
-        };
+        let Protocol {
+            protocol_type,
+            protocol_name,
+            ..
+        } = protocol;
 
         let sync_group_response = SyncGroupResponse::default()
             .throttle_time_ms(Some(0))
             .error_code(ErrorCode::None.into())
-            .protocol_type(self.state.protocol_type.clone())
-            .protocol_name(self.state.protocol_name.clone())
+            .protocol_type(Some(protocol_type.clone()))
+            .protocol_name(Some(protocol_name.clone()))
             .assignment(
                 assignments
                     .get(member_id)
@@ -2815,9 +2836,11 @@ where
 
                     members: self.members,
                     state: Forming {
-                        protocol_type: Some(self.state.protocol_type),
-                        protocol_name: Some(self.state.protocol_name),
-                        leader: Some(self.state.leader),
+                        protocol: Some(Protocol {
+                            protocol_type: self.state.protocol_type,
+                            protocol_name: self.state.protocol_name,
+                            leader: Some(self.state.leader),
+                        }),
                     },
                     storage: self.storage,
                     skip_assignment: self.skip_assignment,
@@ -2915,9 +2938,11 @@ where
 
                     members: self.members,
                     state: Forming {
-                        protocol_type: Some(self.state.protocol_type),
-                        protocol_name: Some(self.state.protocol_name),
-                        leader: Some(self.state.leader),
+                        protocol: Some(Protocol {
+                            protocol_type: self.state.protocol_type,
+                            protocol_name: self.state.protocol_name,
+                            leader: Some(self.state.leader),
+                        }),
                     },
                     storage: self.storage,
                     skip_assignment: self.skip_assignment,
@@ -2984,9 +3009,11 @@ where
 
                     members: self.members,
                     state: Forming {
-                        protocol_type: Some(self.state.protocol_type),
-                        protocol_name: Some(self.state.protocol_name),
-                        leader: Some(self.state.leader),
+                        protocol: Some(Protocol {
+                            protocol_type: self.state.protocol_type,
+                            protocol_name: self.state.protocol_name,
+                            leader: Some(self.state.leader),
+                        }),
                     },
                     storage: self.storage,
                     skip_assignment: self.skip_assignment,
@@ -3224,9 +3251,11 @@ where
 
                 members: self.members,
                 state: Forming {
-                    protocol_type: Some(self.state.protocol_type),
-                    protocol_name: Some(self.state.protocol_name),
-                    leader,
+                    protocol: Some(Protocol {
+                        protocol_type: self.state.protocol_type,
+                        protocol_name: self.state.protocol_name,
+                        leader,
+                    }),
                 },
                 storage: self.storage,
                 skip_assignment: self.skip_assignment,
@@ -3331,6 +3360,29 @@ fn offset_commit_response(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forming_without_a_protocol_has_no_leader() {
+        let forming = Forming::from_parts(None, None, Some("member".into()));
+        assert_eq!(None, forming.leader());
+        assert_eq!(None, forming.protocol_type());
+
+        let forming = Forming::from_parts(Some("consumer".into()), None, Some("member".into()));
+        assert_eq!(None, forming.leader());
+    }
+
+    #[test]
+    fn forming_keeps_the_leader_with_its_protocol() {
+        let forming = Forming::from_parts(
+            Some("consumer".into()),
+            Some("range".into()),
+            Some("member".into()),
+        );
+
+        assert_eq!(Some("consumer"), forming.protocol_type());
+        assert_eq!(Some("range"), forming.protocol_name());
+        assert_eq!(Some("member"), forming.leader());
+    }
     use nisshi_sans_io::{
         consumer::{
             Assignor, CONSUMER, ConsumerProtocolAssignment, ConsumerProtocolSubscription,
