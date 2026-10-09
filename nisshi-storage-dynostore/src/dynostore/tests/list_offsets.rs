@@ -1138,6 +1138,49 @@ async fn backfill_completes_past_a_settled_gap() -> Result<()> {
     Ok(())
 }
 
+/// A gap after the last listed batch has no later batch to settle it,
+/// however old the listed batches are, so the backfill leaves the index
+/// incomplete and answers from the listed batches. The lookup after the
+/// batch lands lists again and completes the index.
+#[tokio::test]
+async fn backfill_is_left_incomplete_by_a_gap_after_the_last_listed_batch() -> Result<()> {
+    let _guard = init_tracing()?;
+    let faulty = Faulty::default();
+    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let topic = "trailing-gap";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+
+    write_legacy_batch(&storage, &topition, 0, T0).await?;
+    write_legacy_batch(&storage, &topition, 1, T0 + 100).await?;
+
+    // Offset 2 has assigned its offset and not yet written its batch
+    // object.
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(3);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+    faulty.age_listing();
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(1), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+    assert!(!time_index_complete(&storage, &topition).await?);
+
+    write_legacy_batch(&storage, &topition, 2, T0 + 200).await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 150).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 200), timestamp);
+    assert!(time_index_complete(&storage, &topition).await?);
+
+    Ok(())
+}
+
 /// A binary without the index rewrites the watermark document without it,
 /// and with the batch it produced in neither the backfill's listing nor
 /// the live index. A commit that finds its token gone leaves the index
