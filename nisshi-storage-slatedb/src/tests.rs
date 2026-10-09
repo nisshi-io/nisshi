@@ -2092,6 +2092,52 @@ mod time_index {
         assert_eq!(1, time_index_count(&engine, topic2, 0).await);
     }
 
+    /// The lookup reads the watermark, the time index and the batches from
+    /// one snapshot, so a prune that commits during the lookup cannot move
+    /// the index read out from under the start point. A lookup through a
+    /// snapshot taken before `delete_records` answers from the state before
+    /// it; a lookup that read the live index would start at the first
+    /// surviving batch.
+    #[tokio::test]
+    async fn timestamp_lookup_reads_through_one_snapshot() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-snapshot").await;
+        let topic = topic_uuid(&engine, "time-index-snapshot").await;
+
+        for batch in [
+            keyed_batch(b"a", b"v", 100),
+            keyed_batch(b"b", b"v", 200),
+            keyed_batch(b"c", b"v", 300),
+        ] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        let snapshot = engine.db.snapshot().await.unwrap();
+        let watermark: Watermark = {
+            let key = postcard::to_stdvec(&WatermarkKey::new(topic, 0)).unwrap();
+            postcard::from_bytes(&snapshot.get(&key).await.unwrap().unwrap()).unwrap()
+        };
+
+        let delete_request = vec![
+            DeleteRecordsTopic::default()
+                .name("time-index-snapshot".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(2),
+                ])),
+        ];
+        let _ = engine.delete_records(&delete_request).await.unwrap();
+        assert_eq!(1, time_index_count(&engine, topic, 0).await);
+
+        let response = engine
+            .list_offset_for_timestamp(&snapshot, topic, 0, 150, &watermark, false)
+            .await
+            .unwrap();
+        assert_eq!(Some(1), response.offset);
+        assert_eq!(200, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
     async fn list_offsets_latest(engine: &Engine, topition: &Topition) -> ListOffsetResponse {
         engine
             .list_offsets(

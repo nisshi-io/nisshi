@@ -342,8 +342,18 @@ impl Engine {
     ///    offset.
     /// 3. Sequentially scan `b/` batches forward from there
     ///    (`Self::sequential_timestamp_scan`).
-    async fn list_offset_for_timestamp(
+    ///
+    /// Every read goes through `snapshot`, which must be the snapshot that
+    /// `watermark` was read from. The index is read twice, for its first
+    /// entry and for the ceiling entry, and the choice to trust the ceiling
+    /// depends on the first entry. A prune that commits between two reads of
+    /// the live database removes the entries below the new log start from
+    /// the second read only, so the ceiling then skips the batches between
+    /// the new log start and the first surviving entry, and the lookup
+    /// answers a later offset than the first match.
+    pub(super) async fn list_offset_for_timestamp(
         &self,
+        snapshot: &slatedb::DbSnapshot,
         topic: Uuid,
         partition: i32,
         target_millis: i64,
@@ -362,7 +372,7 @@ impl Engine {
 
         let first_indexed = {
             let from = postcard::to_stdvec(&TimeIndexKey::scan_from(topic, partition, 0))?;
-            let mut scan = self.db.scan(from..).await?;
+            let mut scan = snapshot.scan(from..).await?;
             match scan.next().await? {
                 Some(kv) if kv.key.starts_with(&index_prefix) => {
                     Some(postcard::from_bytes::<TimeIndexKey>(&kv.key)?.timestamp)
@@ -377,7 +387,7 @@ impl Engine {
             Some(first_ts) if first_ts < target_millis => {
                 let from =
                     postcard::to_stdvec(&TimeIndexKey::scan_from(topic, partition, target_millis))?;
-                let mut scan = self.db.scan(from..).await?;
+                let mut scan = snapshot.scan(from..).await?;
                 match scan.next().await? {
                     Some(kv) if kv.key.starts_with(&index_prefix) => {
                         Some(postcard::from_bytes::<i64>(&kv.value)?)
@@ -395,14 +405,14 @@ impl Engine {
                 // base of that batch, and `Self::sequential_timestamp_scan`
                 // drops each record below `low`.
                 let batch_prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic, partition))?;
-                self.batch_base_at_or_before(&batch_prefix, topic, partition, low)
+                Self::batch_base_at_or_before(snapshot, &batch_prefix, topic, partition, low)
                     .await?
                     .unwrap_or(low)
             }
         };
 
         match self
-            .sequential_timestamp_scan(topic, partition, start_offset, low, target_millis)
+            .sequential_timestamp_scan(snapshot, topic, partition, start_offset, low, target_millis)
             .await?
         {
             Some((offset, ts)) => Ok(ListOffsetResponse {
@@ -428,6 +438,7 @@ impl Engine {
     /// its records would be the exact bug this scan exists to avoid.
     async fn sequential_timestamp_scan(
         &self,
+        snapshot: &slatedb::DbSnapshot,
         topic: Uuid,
         partition: i32,
         start_offset: i64,
@@ -437,7 +448,7 @@ impl Engine {
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic, partition))?;
         let from = postcard::to_stdvec(&BatchKey::scan_from(topic, partition, start_offset))?;
 
-        let mut scan = self.db.scan(from..).await?;
+        let mut scan = snapshot.scan(from..).await?;
         while let Some(kv) = scan.next().await? {
             if !kv.key.starts_with(&prefix) {
                 break;
@@ -505,15 +516,15 @@ impl Engine {
     /// timestamp.
     async fn timestamp_at_offset(
         &self,
+        snapshot: &slatedb::DbSnapshot,
         topic: Uuid,
         partition: i32,
         offset: i64,
     ) -> Result<Option<SystemTime>> {
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic, partition))?;
 
-        let after = self
-            .batch_base_at_or_after(&prefix, topic, partition, offset)
-            .await?;
+        let after =
+            Self::batch_base_at_or_after(snapshot, &prefix, topic, partition, offset).await?;
 
         // The batch that holds `offset` starts at or before it. When no
         // batch holds `offset`, because compaction removed the batch at the
@@ -521,8 +532,7 @@ impl Engine {
         // after `offset` is in the next batch.
         let bases = match after {
             Some(base) if base == offset => vec![base],
-            _ => self
-                .batch_base_at_or_before(&prefix, topic, partition, offset)
+            _ => Self::batch_base_at_or_before(snapshot, &prefix, topic, partition, offset)
                 .await?
                 .into_iter()
                 .chain(after)
@@ -531,7 +541,7 @@ impl Engine {
 
         for base in bases {
             let Some((deflated, inflated)) = self
-                .inflate_batch_at(&prefix, topic, partition, base)
+                .inflate_batch_at(snapshot, &prefix, topic, partition, base)
                 .await?
             else {
                 return Ok(None);
@@ -555,13 +565,14 @@ impl Engine {
     /// `Self::sequential_timestamp_scan`.
     async fn inflate_batch_at(
         &self,
+        snapshot: &slatedb::DbSnapshot,
         prefix: &[u8],
         topic: Uuid,
         partition: i32,
         base: i64,
     ) -> Result<Option<(Batch, InflatedBatch)>> {
         let from = postcard::to_stdvec(&BatchKey::scan_from(topic, partition, base))?;
-        let mut scan = self.db.scan(from..).await?;
+        let mut scan = snapshot.scan(from..).await?;
 
         let Some(kv) = scan.next().await? else {
             return Ok(None);
@@ -602,7 +613,7 @@ impl Engine {
     /// The least batch base offset at or after `probe` within a partition,
     /// or `None` when no batch starts at or after it.
     async fn batch_base_at_or_after(
-        &self,
+        snapshot: &slatedb::DbSnapshot,
         prefix: &[u8],
         topic: Uuid,
         partition: i32,
@@ -610,7 +621,7 @@ impl Engine {
     ) -> Result<Option<i64>> {
         let from = postcard::to_stdvec(&BatchKey::scan_from(topic, partition, probe))?;
 
-        let mut i = self.db.scan(from..).await?;
+        let mut i = snapshot.scan(from..).await?;
 
         Ok(match i.next().await? {
             Some(kv) if kv.key.starts_with(prefix) => {
@@ -624,7 +635,7 @@ impl Engine {
     /// partition. SlateDB has forward-only iteration, so this is a binary
     /// search over [`Self::batch_base_at_or_after`] successor probes.
     async fn batch_base_at_or_before(
-        &self,
+        snapshot: &slatedb::DbSnapshot,
         prefix: &[u8],
         topic: Uuid,
         partition: i32,
@@ -636,10 +647,7 @@ impl Engine {
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
 
-            match self
-                .batch_base_at_or_after(prefix, topic, partition, mid)
-                .await?
-            {
+            match Self::batch_base_at_or_after(snapshot, prefix, topic, partition, mid).await? {
                 Some(base) if base <= offset => {
                     floor = Some(base);
                     lo = base + 1;
@@ -1537,22 +1545,34 @@ impl Storage for Engine {
         // When no batch starts exactly at the fetch offset, scan from the
         // greatest base offset before it; the loop below drops a batch that
         // ends before the fetch offset.
-        let start = match self
-            .batch_base_at_or_after(&prefix, metadata.id, topition.partition, offset)
-            .await?
+        let snapshot = self.db.snapshot().await?;
+
+        let start = match Self::batch_base_at_or_after(
+            &snapshot,
+            &prefix,
+            metadata.id,
+            topition.partition,
+            offset,
+        )
+        .await?
         {
             Some(base) if base == offset => offset,
-            _ => self
-                .batch_base_at_or_before(&prefix, metadata.id, topition.partition, offset)
-                .await?
-                .unwrap_or(offset),
+            _ => Self::batch_base_at_or_before(
+                &snapshot,
+                &prefix,
+                metadata.id,
+                topition.partition,
+                offset,
+            )
+            .await?
+            .unwrap_or(offset),
         };
 
         let mut i = {
             let from =
                 postcard::to_stdvec(&BatchKey::scan_from(metadata.id, topition.partition, start))?;
 
-            self.db.scan(from..).await?
+            snapshot.scan(from..).await?
         };
 
         let mut batches = vec![];
@@ -1801,6 +1821,11 @@ impl Storage for Engine {
         let topics = self.get_topics().await?;
         let mut responses = Vec::with_capacity(offsets.len());
 
+        // One snapshot serves every partition in the request, so each answer
+        // comes from one consistent state of the watermark, the time index
+        // and the batches (see `Self::list_offset_for_timestamp`).
+        let snapshot = self.db.snapshot().await?;
+
         for (topition, list_offset) in offsets {
             let Some(metadata) = topics.get(&topition.topic[..]) else {
                 responses.push((
@@ -1830,7 +1855,7 @@ impl Storage for Engine {
                 postcard::to_stdvec(&WatermarkKey::new(metadata.id, topition.partition))?;
 
             let (watermark, legacy) =
-                match self.db.get(&watermark_key).await.map_err(Error::from)? {
+                match snapshot.get(&watermark_key).await.map_err(Error::from)? {
                     Some(encoded) => Self::decode_watermark(&encoded)?,
                     None => (Watermark::default(), false),
                 };
@@ -1839,7 +1864,7 @@ impl Storage for Engine {
                 ListOffset::Earliest => {
                     let offset = watermark.low.unwrap_or(0);
                     let timestamp = self
-                        .timestamp_at_offset(metadata.id, topition.partition, offset)
+                        .timestamp_at_offset(&snapshot, metadata.id, topition.partition, offset)
                         .await?;
 
                     ListOffsetResponse {
@@ -1879,6 +1904,7 @@ impl Storage for Engine {
 
                     let found = self
                         .list_offset_for_timestamp(
+                            &snapshot,
                             metadata.id,
                             topition.partition,
                             target_millis,
