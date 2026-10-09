@@ -2046,12 +2046,23 @@ mod tests {
         max_wait: Duration,
         topics: &[(&str, &[i32])],
     ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
+        fetch_isolated(storage, max_wait, IsolationLevel::ReadUncommitted, topics).await
+    }
+
+    /// As [`fetch_topics`], with the given isolation level.
+    async fn fetch_isolated(
+        storage: Partitions,
+        max_wait: Duration,
+        isolation: IsolationLevel,
+        topics: &[(&str, &[i32])],
+    ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
         let started_at = Instant::now();
 
         let response = FetchService { storage }
             .serve(
                 FetchRequest::default()
                     .max_wait_ms(i32::try_from(max_wait.as_millis())?)
+                    .isolation_level(Some(isolation.into()))
                     .min_bytes(1)
                     .max_bytes(Some(MAX_BYTES))
                     .topics(Some(
@@ -2176,34 +2187,47 @@ mod tests {
     /// A partition that stalls after reading some batches returns them,
     /// with the stage read before them raised to cover them rather than
     /// read again, and the bytes they took are not given again to the
-    /// partitions after it.
+    /// partitions after it. Under `ReadCommitted` the engine returns only
+    /// committed records, so the last stable offset is raised to cover
+    /// them too.
     #[tokio::test(start_paused = true)]
     async fn a_partition_that_stalls_keeps_what_it_read() -> Result<()> {
-        // the records reach past the high watermark the stage read before
-        // them holds
-        let first = batch(1_000, &[0, 1])?;
-        let size = u32::try_from(first.record_data.len())?;
+        for (isolation, last_stable) in [
+            (IsolationLevel::ReadUncommitted, 1_000),
+            (IsolationLevel::ReadCommitted, 1_002),
+        ] {
+            // the records reach past the high watermark the stage read
+            // before them holds
+            let first = batch(1_000, &[0, 1])?;
+            let size = u32::try_from(first.record_data.len())?;
 
-        let storage = Partitions::new([
-            (0, vec![Read::Batch(first), Read::Stall]),
-            (1, vec![Read::Batch(batch(0, &[0])?)]),
-        ]);
+            let storage = Partitions::new([
+                (0, vec![Read::Batch(first), Read::Stall]),
+                (1, vec![Read::Batch(batch(0, &[0])?)]),
+            ]);
 
-        let (partitions, elapsed) = fetch(storage.clone(), &[0, 1]).await?;
+            let (mut topics, elapsed) =
+                fetch_isolated(storage.clone(), MAX_WAIT, isolation, &[(TOPIC, &[0, 1])]).await?;
+            let partitions = topics.remove(0);
 
-        assert_eq!(READ_DEADLINE / 2, elapsed);
+            assert_eq!(READ_DEADLINE / 2, elapsed, "{isolation:?}");
 
-        assert_eq!(1, batches(&partitions[0]));
-        assert_eq!(1_002, partitions[0].high_watermark);
-        assert_eq!(Some(1_000), partitions[0].last_stable_offset);
-        assert_eq!(Some(0), partitions[0].log_start_offset);
-        assert_eq!(1, storage.offset_stage_reads(0));
+            assert_eq!(1, batches(&partitions[0]), "{isolation:?}");
+            assert_eq!(1_002, partitions[0].high_watermark, "{isolation:?}");
+            assert_eq!(
+                Some(last_stable),
+                partitions[0].last_stable_offset,
+                "{isolation:?}"
+            );
+            assert_eq!(Some(0), partitions[0].log_start_offset, "{isolation:?}");
+            assert_eq!(1, storage.offset_stage_reads(0), "{isolation:?}");
 
-        assert_eq!(1, batches(&partitions[1]));
+            assert_eq!(1, batches(&partitions[1]), "{isolation:?}");
 
-        let max_bytes = u32::try_from(MAX_BYTES)?;
-        assert_eq!(max_bytes - size, storage.calls(0)[1].max_bytes);
-        assert_eq!(max_bytes - size, storage.calls(1)[0].max_bytes);
+            let max_bytes = u32::try_from(MAX_BYTES)?;
+            assert_eq!(max_bytes - size, storage.calls(0)[1].max_bytes);
+            assert_eq!(max_bytes - size, storage.calls(1)[0].max_bytes);
+        }
 
         Ok(())
     }
@@ -2264,31 +2288,43 @@ mod tests {
     /// An offset stage read again after records reached past it, and that
     /// never answers, is abandoned at a fresh share of the time left after
     /// the read. The partition keeps its batches, and the stage read before
-    /// them answers, raised to cover the records.
+    /// them answers, raised to cover the records: the last stable offset
+    /// too, under `ReadCommitted`.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_offset_stage_is_abandoned_at_its_own_share() -> Result<()> {
-        // the record is at the high watermark the stage read before the
-        // records holds, so the stage is read again
-        let storage = Partitions::new([
-            (0, vec![Read::Assemble(batch(1_000, &[0])?, OVERSHOOT)]),
-            (1, vec![Read::Batch(batch(0, &[0])?)]),
-        ])
-        .stall_offset_stage(0, 2);
+        for (isolation, last_stable) in [
+            (IsolationLevel::ReadUncommitted, 1_000),
+            (IsolationLevel::ReadCommitted, 1_001),
+        ] {
+            // the record is at the high watermark the stage read before the
+            // records holds, so the stage is read again
+            let storage = Partitions::new([
+                (0, vec![Read::Assemble(batch(1_000, &[0])?, OVERSHOOT)]),
+                (1, vec![Read::Batch(batch(0, &[0])?)]),
+            ])
+            .stall_offset_stage(0, 2);
 
-        let (partitions, elapsed) = fetch(storage, &[0, 1]).await?;
+            let (mut topics, elapsed) =
+                fetch_isolated(storage, MAX_WAIT, isolation, &[(TOPIC, &[0, 1])]).await?;
+            let partitions = topics.remove(0);
 
-        // The read spends the client's max_wait and its overshoot, then
-        // the offset stage gets half of the time left
-        let read = MAX_WAIT + OVERSHOOT;
-        assert_eq!(read + (READ_DEADLINE - read) / 2, elapsed);
+            // The read spends the client's max_wait and its overshoot, then
+            // the offset stage gets half of the time left
+            let read = MAX_WAIT + OVERSHOOT;
+            assert_eq!(read + (READ_DEADLINE - read) / 2, elapsed, "{isolation:?}");
 
-        assert_eq!(1, batches(&partitions[0]));
-        assert_eq!(1_001, partitions[0].high_watermark);
-        assert_eq!(Some(1_000), partitions[0].last_stable_offset);
-        assert_eq!(Some(0), partitions[0].log_start_offset);
+            assert_eq!(1, batches(&partitions[0]), "{isolation:?}");
+            assert_eq!(1_001, partitions[0].high_watermark, "{isolation:?}");
+            assert_eq!(
+                Some(last_stable),
+                partitions[0].last_stable_offset,
+                "{isolation:?}"
+            );
+            assert_eq!(Some(0), partitions[0].log_start_offset, "{isolation:?}");
 
-        assert_eq!(1, batches(&partitions[1]));
-        assert_eq!(1_000, partitions[1].high_watermark);
+            assert_eq!(1, batches(&partitions[1]), "{isolation:?}");
+            assert_eq!(1_000, partitions[1].high_watermark, "{isolation:?}");
+        }
 
         Ok(())
     }
