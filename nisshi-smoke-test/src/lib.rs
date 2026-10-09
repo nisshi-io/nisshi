@@ -58,6 +58,15 @@ pub fn unique_name(prefix: &str) -> String {
     format!("{prefix}-{}", nanoid!(21, &alphabet))
 }
 
+/// Returns a random password for a SCRAM user that a test creates.
+///
+/// The password is a random number in decimal. CodeQL reports a password built from any constant,
+/// such as a literal or the alphabet that [`unique_name`] picks from, as a hard-coded cryptographic
+/// value, so this one is built from none.
+pub fn random_password() -> String {
+    rand::random::<u128>().to_string()
+}
+
 /// The time now, in milliseconds since the Unix epoch, as Kafka gives record timestamps.
 pub fn now_in_millis() -> i64 {
     SystemTime::now()

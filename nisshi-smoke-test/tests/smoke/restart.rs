@@ -23,7 +23,8 @@
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod persistence {
     use nisshi_smoke_test::{
-        Broker, KafkaCli, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism, unique_name,
+        Broker, KafkaCli, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism,
+        random_password, unique_name,
     };
 
     /// A topic config that isn't the default, to find after the restart.
@@ -140,7 +141,7 @@ mod persistence {
         let cli = KafkaCli::new(broker.bootstrap());
         let login = ScramLogin {
             user: unique_name("user"),
-            password: unique_name("password"),
+            password: random_password(),
             mechanism,
         };
 
@@ -177,7 +178,7 @@ mod persistence {
         let cli = KafkaCli::new(broker.bootstrap());
         let login = ScramLogin {
             user: unique_name("user"),
-            password: unique_name("password"),
+            password: random_password(),
             mechanism: ScramMechanism::Sha256,
         };
 
@@ -185,7 +186,7 @@ mod persistence {
 
         let broker = broker.restart_requiring_login(&login);
         let wrong_login = ScramLogin {
-            password: unique_name("wrong-password"),
+            password: random_password(),
             ..login
         };
         let cli = KafkaCli::logged_in_as(broker.bootstrap(), &wrong_login);

@@ -26,6 +26,7 @@ sqlite = []
 [dependencies]
 clap.workspace = true
 nanoid.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true
