@@ -37,9 +37,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use nisshi_sans_io::{
-    IsolationLevel, ListOffset, create_topics_request::CreatableTopic, to_system_time, to_timestamp,
+    ErrorCode, IsolationLevel, ListOffset, create_topics_request::CreatableTopic, to_system_time,
+    to_timestamp,
 };
-use nisshi_storage::{Error, Result, Storage, Topition, TxnState};
+use nisshi_storage::{Error, ListOffsetResponse, Result, Storage, Topition, TxnState};
 use object_store::{
     Attributes, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -195,32 +196,81 @@ async fn list_offsets_timestamp(
     list_offsets_timestamp_at(storage, IsolationLevel::ReadUncommitted, topition, target).await
 }
 
+/// The offset and timestamp a lookup answers, after checking that it
+/// answered without an error.
 async fn list_offsets_timestamp_at(
     storage: &DynoStore,
     isolation_level: IsolationLevel,
     topition: &Topition,
     target: i64,
 ) -> Result<(Option<i64>, Option<i64>)> {
-    let responses = storage
-        .list_offsets(
-            isolation_level,
-            &[(
-                topition.to_owned(),
-                ListOffset::Timestamp(to_system_time(target)?),
-            )],
-        )
-        .await?;
+    let responses =
+        list_offsets_timestamp_responses(storage, isolation_level, &[(topition, target)]).await?;
 
     assert_eq!(1, responses.len());
+    assert_eq!(ErrorCode::None, responses[0].error_code);
 
     Ok((
-        responses[0].1.offset,
+        responses[0].offset,
         responses[0]
-            .1
             .timestamp
             .map(|t| to_timestamp(&t))
             .transpose()?,
     ))
+}
+
+/// One `ListOffsets` request with a timestamp `target` for each partition
+/// of `lookups`, answered in the same order.
+async fn list_offsets_timestamp_responses(
+    storage: &DynoStore,
+    isolation_level: IsolationLevel,
+    lookups: &[(&Topition, i64)],
+) -> Result<Vec<ListOffsetResponse>> {
+    let offsets = lookups
+        .iter()
+        .map(|&(topition, target)| {
+            to_system_time(target)
+                .map(|target| (topition.to_owned(), ListOffset::Timestamp(target)))
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let responses = storage.list_offsets(isolation_level, &offsets).await?;
+
+    assert_eq!(
+        offsets
+            .iter()
+            .map(|(topition, _)| topition)
+            .collect::<Vec<_>>(),
+        responses
+            .iter()
+            .map(|(topition, _)| topition)
+            .collect::<Vec<_>>()
+    );
+
+    Ok(responses
+        .into_iter()
+        .map(|(_, response)| response)
+        .collect())
+}
+
+/// The error code a lookup answers for its partition.
+async fn list_offsets_timestamp_error(
+    storage: &DynoStore,
+    topition: &Topition,
+    target: i64,
+) -> Result<ErrorCode> {
+    let responses = list_offsets_timestamp_responses(
+        storage,
+        IsolationLevel::ReadUncommitted,
+        &[(topition, target)],
+    )
+    .await?;
+
+    assert_eq!(1, responses.len());
+    assert_eq!(None, responses[0].offset);
+
+    Ok(responses[0].error_code)
 }
 
 /// Splits the backfill into its two steps and interleaves a concurrent
@@ -937,9 +987,10 @@ async fn backfill_merge_drops_a_live_entry_below_an_unindexed_legacy_batch() -> 
     Ok(())
 }
 
-/// A backfill that cannot read a batch fails the request and leaves the
-/// index incomplete, so the next request runs the backfill again. An index
-/// committed without offset 1 would answer no match for this target.
+/// A backfill that cannot read a batch answers an error for the partition
+/// and leaves the index incomplete, so the next request runs the backfill
+/// again. An index committed without offset 1 would answer no match for
+/// this target.
 #[tokio::test]
 async fn backfill_get_failure_leaves_the_index_incomplete() -> Result<()> {
     let _guard = init_tracing()?;
@@ -949,10 +1000,9 @@ async fn backfill_get_failure_leaves_the_index_incomplete() -> Result<()> {
 
     faulty.arm(storage.batch_path(&topition, 1), Fault::Unavailable)?;
 
-    assert!(
-        list_offsets_timestamp(&storage, &topition, T0 + 60)
-            .await
-            .is_err()
+    assert_eq!(
+        ErrorCode::UnknownServerError,
+        list_offsets_timestamp_error(&storage, &topition, T0 + 60).await?
     );
     assert!(!time_index_complete(&storage, &topition).await?);
 
@@ -983,10 +1033,10 @@ async fn backfill_skips_a_batch_deleted_after_listing() -> Result<()> {
     Ok(())
 }
 
-/// A scan that cannot read a batch fails the request, instead of answering
-/// a later offset from the next batch.
+/// A scan that cannot read a batch answers an error for the partition,
+/// instead of answering a later offset from the next batch.
 #[tokio::test]
-async fn scan_get_failure_fails_the_request() -> Result<()> {
+async fn scan_get_failure_answers_an_error_for_the_partition() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
     let storage = DynoStore::new("nisshi", 111, faulty.clone());
@@ -1000,15 +1050,47 @@ async fn scan_get_failure_fails_the_request() -> Result<()> {
 
     faulty.arm(storage.batch_path(&topition, 1), Fault::Unavailable)?;
 
-    assert!(
-        list_offsets_timestamp(&storage, &topition, T0 + 25)
-            .await
-            .is_err()
+    assert_eq!(
+        ErrorCode::UnknownServerError,
+        list_offsets_timestamp_error(&storage, &topition, T0 + 25).await?
     );
 
     let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 25).await?;
     assert_eq!(Some(1), offset);
     assert_eq!(Some(T0 + 50), timestamp);
+
+    Ok(())
+}
+
+/// A lookup that fails answers the error in its own partition's
+/// `error_code`, as Kafka does, and the other partitions of the same
+/// request still get their answers.
+#[tokio::test]
+async fn failed_lookup_answers_only_its_own_partition_with_an_error() -> Result<()> {
+    let _guard = init_tracing()?;
+    let faulty = Faulty::default();
+    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let topic = "partial-failure";
+    let failing = Topition::new(topic, 0);
+    let healthy = Topition::new(topic, 1);
+
+    create_topic(&storage, topic, 2).await?;
+    assert_eq!(0, produce(&storage, &failing, &[T0]).await?);
+    assert_eq!(0, produce(&storage, &healthy, &[T0]).await?);
+
+    faulty.arm(storage.batch_path(&failing, 0), Fault::Unavailable)?;
+
+    let responses = list_offsets_timestamp_responses(
+        &storage,
+        IsolationLevel::ReadUncommitted,
+        &[(&failing, T0), (&healthy, T0)],
+    )
+    .await?;
+
+    assert_eq!(ErrorCode::UnknownServerError, responses[0].error_code);
+    assert_eq!(None, responses[0].offset);
+    assert_eq!(ErrorCode::None, responses[1].error_code);
+    assert_eq!(Some(0), responses[1].offset);
 
     Ok(())
 }

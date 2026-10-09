@@ -1016,6 +1016,53 @@ impl DynoStore {
         Ok(None)
     }
 
+    /// Answers `ListOffsets(Timestamp)` for one partition: the first record
+    /// at or after `target`, below `last_stable` when the lookup is under
+    /// `READ_COMMITTED` and the partition has an open transaction, or no
+    /// match. Runs the time index backfill first when the index is
+    /// incomplete (see [`DynoStore::time_index_for_lookup`]).
+    async fn timestamp_lookup(
+        &self,
+        topition: &Topition,
+        target: i64,
+        last_stable: Option<i64>,
+    ) -> Result<ListOffsetResponse> {
+        let (time_index, low) = self.time_index_for_lookup(topition).await?;
+
+        // No record is at or after a target above the greatest timestamp of
+        // every batch, so there is no scan to run.
+        if target > time_index.max_timestamp() {
+            return Ok(ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: None,
+                ..Default::default()
+            });
+        }
+
+        let start_offset = time_index.floor_offset(target);
+
+        // Under READ_COMMITTED, Kafka answers only a record before the last
+        // stable offset, and answers no match otherwise
+        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589).
+        let found = self
+            .sequential_timestamp_scan(topition, start_offset, target, low)
+            .await?
+            .filter(|(offset, _)| last_stable.is_none_or(|last_stable| *offset < last_stable));
+
+        Ok(match found {
+            Some((offset, timestamp)) => ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: Some(offset),
+                timestamp: Some(to_system_time(timestamp)?),
+            },
+            None => ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: None,
+                ..Default::default()
+            },
+        })
+    }
+
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
     where
         V: DeserializeOwned,
@@ -1884,55 +1931,27 @@ impl Storage for DynoStore {
         for (topition, offset_request) in offsets {
             if let ListOffset::Timestamp(system_time) = offset_request {
                 let target = to_timestamp(system_time)?;
-                let (time_index, low) = self.time_index_for_lookup(topition).await?;
 
-                // No record is at or after a target above the greatest
-                // timestamp of every batch, so there is no scan to run.
-                if target > time_index.max_timestamp() {
-                    responses.push((
-                        topition.to_owned(),
+                // A lookup that fails answers the error in its own
+                // partition, as Kafka does, so the other partitions of the
+                // request still get their answers.
+                let response = self
+                    .timestamp_lookup(topition, target, stable.get(topition).copied())
+                    .await
+                    .unwrap_or_else(|error| {
+                        error!(?error, ?topition, target, "list offsets by timestamp");
+
                         ListOffsetResponse {
-                            error_code: ErrorCode::None,
+                            error_code: match error {
+                                Error::Api(error_code) => error_code,
+                                _ => ErrorCode::UnknownServerError,
+                            },
                             offset: None,
                             ..Default::default()
-                        },
-                    ));
-                    continue;
-                }
-
-                let start_offset = time_index.floor_offset(target);
-
-                // Under READ_COMMITTED, Kafka answers only a record before the
-                // last stable offset, and answers no match otherwise
-                // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589).
-                // `stable` holds the last stable offset only for a partition
-                // with an open transaction, and it is empty under
-                // READ_UNCOMMITTED.
-                let found = self
-                    .sequential_timestamp_scan(topition, start_offset, target, low)
-                    .await?
-                    .filter(|(offset, _)| {
-                        stable
-                            .get(topition)
-                            .is_none_or(|last_stable| offset < last_stable)
+                        }
                     });
 
-                responses.push((
-                    topition.to_owned(),
-                    match found {
-                        Some((offset, timestamp)) => ListOffsetResponse {
-                            error_code: ErrorCode::None,
-                            offset: Some(offset),
-                            timestamp: Some(to_system_time(timestamp)?),
-                        },
-                        None => ListOffsetResponse {
-                            error_code: ErrorCode::None,
-                            offset: None,
-                            ..Default::default()
-                        },
-                    },
-                ));
-
+                responses.push((topition.to_owned(), response));
                 continue;
             }
 
