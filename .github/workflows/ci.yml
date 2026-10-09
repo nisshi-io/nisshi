@@ -9,9 +9,10 @@ name: ci
 # by entries on refs nothing else can restore from. Applies to fmt, clippy,
 # test (its postgres:17 leg only), cargo-publish-dry-run,
 # third-party-license, smoke (one sqlite leg per os), release and macos below
-# (release and macos also skip the cache entirely on tags). build-storage,
-# build-storage-lake and both compat jobs only restore test's entry, through
-# the `dev` shared key, and never save.
+# (release and macos also skip the cache entirely on tags). The two compat
+# jobs only restore test's entry, through the `dev` shared key, and never
+# save. build-storage and build-storage-lake use no cache: they run `cargo
+# check`, which reuses little of a full build's artifacts.
 #
 # Two tiers. The split was made on GitHub's Free plan (20 concurrent jobs),
 # where a full run of this workflow (~60 jobs, 31 of them with no `needs`) on
@@ -27,14 +28,14 @@ name: ci
 #   the experimental compat legs, cargo-publish-dry-run, src, release,
 #   macos, smoke, smoke-oldest-client, smoke-report.
 #
-# Only `src` and `typos` run ahead of `release`, and only `release` runs ahead
-# of `smoke`, so the release -> smoke chain starts with the rest of the run.
+# Only `typos` runs ahead of `release`, and only `release` runs ahead of
+# `smoke`, so the release -> smoke chain starts with the rest of the run.
 # `macos` is a compile-only check except on a `v*` tag, where it builds the
-# release tarball. smoke builds its image locally from release's binaries and
-# pushes nothing. `publish` (push only: main and `v*` tags) needs every job
-# ci-gate does and is the only job that pushes an image or creates a release,
-# so no image reaches the registry untested. It is outside ci-gate, see its
-# comment.
+# release tarball (tier-c.yml builds the macOS release nightly). smoke builds its image locally from release's binaries
+# and pushes nothing. `publish` (push only) needs every job ci-gate does and
+# is the only job that pushes an image, so no image reaches the registry
+# untested. `publish-release` attaches the tarballs on a tag, after publish.
+# Both are outside ci-gate, see their comments.
 #
 # On top of the tiers, the `changes` job skips every Rust job on a
 # pull_request that only touches CI config this workflow doesn't read, or
@@ -193,8 +194,8 @@ jobs:
         with:
           components: clippy, rustfmt
           # Every pg leg shares one entry, and only one of them should save
-          # it: pg17, the leg that runs in both tiers. build-storage*, and
-          # compat-* restore this entry under the same key and never save it.
+          # it: pg17, the leg that runs in both tiers. The compat jobs restore
+          # this entry under the same key and never save it.
           cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.pg == 'postgres:17' }}
           cache-shared-key: dev
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
@@ -293,8 +294,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache-shared-key: dev
-          cache-save-if: false
+          cache: false
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev
       # This leg only proves the feature compiles, so check skips codegen
@@ -324,8 +324,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache-shared-key: dev
-          cache-save-if: false
+          cache: false
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev
       # The same flags as build-storage, so only these features are on: a
@@ -786,10 +785,11 @@ jobs:
   # wait for it.
   release:
     if: *tier_b
-    # test and the build matrices are not here, so this leg starts with the
-    # rest of the run and release -> smoke is the longest chain. publish
-    # needs them, so a failure there still blocks every image and tag.
-    needs: [changes, src, typos]
+    # test, src and the build matrices are not here, so this leg starts with
+    # the rest of the run. publish needs them, so a failure there still
+    # blocks every image and tag. typos stays: it takes seconds and stops a
+    # run before the expensive jobs.
+    needs: [changes, typos]
     runs-on: ${{matrix.os}}
     timeout-minutes: 45
     strategy:
@@ -873,14 +873,18 @@ jobs:
         with:
           name: image-${{matrix.target}}
           path: dist/
-          retention-days: 1
+          # publish reads this on a push, and a re-run of it can come days
+          # later. Other runs only need it for smoke.
+          retention-days: ${{ github.event_name == 'push' && 3 || 1 }}
           if-no-files-found: error
-  # The full release build runs on a `v*` tag only, because it takes about
-  # 20 minutes. Every other run compiles the binary without optimizing or
-  # linking it, which catches a break in the macOS build far sooner.
+  # The full release build (about 20 minutes) runs on a `v*` tag only. Every
+  # other run compiles the binary without optimizing or linking it, which
+  # keeps the queue's critical path and the `main` image short. The nightly
+  # macos-release job in tier-c.yml builds the release on main's tip, so a
+  # link or release-profile break shows up before a tag.
   macos:
     if: *tier_b
-    needs: [changes, src, typos]
+    needs: [changes, typos]
     runs-on: macos-latest
     timeout-minutes: 45
     env:
@@ -993,8 +997,8 @@ jobs:
         run: |
           skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
-  # The only job that pushes an image or creates a release. It needs every job
-  # ci-gate does, so a red or skipped job anywhere stops it. It is not in
+  # The only job that pushes an image, and it holds only `packages: write`. It
+  # needs every job ci-gate does, so a red or skipped job anywhere stops it. It is not in
   # ci-gate's `needs`: it runs on push only, and ci-gate's "Nothing skipped
   # off pull_request" step would fail every merge_group run. A `v*` tag isn't
   # covered by the main ruleset, so this `needs` list is the only gate a tag
@@ -1005,7 +1009,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: write
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1017,18 +1020,6 @@ jobs:
           pattern: image-*
           merge-multiple: true
           path: dist
-      # The release goes first, so a failed upload can't leave a public
-      # image with no release.
-      - if: ${{github.ref_type == 'tag'}}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: nisshi-*
-          merge-multiple: true
-          path: tarballs
-      - if: ${{github.ref_type == 'tag'}}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: tarballs/*.tar.gz
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
@@ -1054,3 +1045,33 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+  # Attaches the tarballs to the GitHub release. It is a job of its own so
+  # that `contents: write`, which can create tags the main ruleset doesn't
+  # cover, is held only on a tag run, and the `release` environment's
+  # deployment policy (`v*` tags) is a second, server-side check on the ref.
+  # It needs publish, so it never runs unless every gate passed. The image is
+  # pushed first, so a failed upload leaves an image without a release page
+  # until this job is re-run. The tarballs it reads keep the default artifact
+  # retention.
+  # Release first would put a `needs` on a job that is skipped on main pushes,
+  # which skips publish there.
+  publish-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [publish]
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          # Two hyphens: the tarballs are nisshi-<target>, and docker
+          # build-push-action's build record is `nisshi-io~nisshi~<id>.dockerbuild`.
+          pattern: nisshi-*-*
+          merge-multiple: true
+          path: tarballs
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: tarballs/*.tar.gz
+          fail_on_unmatched_files: true
