@@ -127,11 +127,11 @@ nanoid = "0.5.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
-opentelemetry = "0.32.0"
-opentelemetry-otlp = "0.32.0"
+opentelemetry = "0.33.0"
+opentelemetry-otlp = "0.33.0"
 opentelemetry-semantic-conventions = "0.33.0"
-opentelemetry-stdout = "0.32.0"
-opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
+opentelemetry-stdout = "0.33.0"
+opentelemetry_sdk = { version = "0.33.0", features = ["testing"] }
 ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
 parquet = {version = "58", features = ["async"]}
