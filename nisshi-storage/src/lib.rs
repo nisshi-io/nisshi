@@ -221,6 +221,17 @@ pub enum Error {
 
     Api(ErrorCode),
 
+    /// An `acks=0` Produce request had at least one non-`None` error code
+    /// among its partition responses. The client reads no response either
+    /// way under `acks=0`, so the caller closes the connection instead of
+    /// silently dropping the batch, carrying the first failing partition's
+    /// context for an operator reading the log.
+    AcksZeroProduceFailed {
+        topic: String,
+        partition: i32,
+        error_code: ErrorCode,
+    },
+
     ChronoParse(#[from] chrono::ParseError),
 
     #[cfg(any(feature = "postgres", feature = "libsql"))]
@@ -2407,12 +2418,28 @@ pub static METER: LazyLock<Meter> = LazyLock::new(|| {
     )
 });
 
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// A stored SCRAM credential (RFC 5802).
+///
+/// `Debug` writes `stored_key` and `server_key` as `[hidden]`. With the salt and
+/// iteration count, the stored key allows an offline dictionary attack on the
+/// password, and the server key allows a client to impersonate the server.
+#[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ScramCredential {
     pub salt: Bytes,
     pub iterations: i32,
     pub stored_key: Bytes,
     pub server_key: Bytes,
+}
+
+impl Debug for ScramCredential {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScramCredential")
+            .field("salt", &self.salt)
+            .field("iterations", &self.iterations)
+            .field("stored_key", &format_args!("[hidden]"))
+            .field("server_key", &format_args!("[hidden]"))
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -2436,6 +2463,24 @@ mod tests {
         assert_eq!("test-topic-0000000-eFC79C8", topition.topic());
         assert_eq!(i32::MAX, topition.partition());
         Ok(())
+    }
+
+    #[test]
+    fn scram_credential_debug_hides_keys() {
+        let credential = ScramCredential {
+            salt: Bytes::from_static(b"salt-marker"),
+            iterations: 4096,
+            stored_key: Bytes::from_static(b"stored-key-secret"),
+            server_key: Bytes::from_static(b"server-key-secret"),
+        };
+
+        let debug = format!("{credential:?}");
+
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(debug.contains("stored_key: [hidden]"), "{debug}");
+        assert!(debug.contains("server_key: [hidden]"), "{debug}");
+        assert!(debug.contains("salt-marker"), "{debug}");
+        assert!(debug.contains("iterations: 4096"), "{debug}");
     }
 
     #[test]

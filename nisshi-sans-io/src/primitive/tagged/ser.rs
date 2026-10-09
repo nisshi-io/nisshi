@@ -154,7 +154,7 @@ impl Serializer for &mut Encoder<'_> {
         Err(Error::UnexpectedType(format!("{v:?}")))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(len = v.len()))]
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
         (v.len() + 1)
             .try_into()
@@ -163,7 +163,7 @@ impl Serializer for &mut Encoder<'_> {
         self.writer.write_all(v.as_bytes()).map_err(Into::into)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(len = v.len()))]
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
         (v.len() + 1)
             .try_into()
