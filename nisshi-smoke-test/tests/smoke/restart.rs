@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! Tests that a broker stopped with SIGTERM and started again on the same storage still has
-//! everything clients stored before: topics, records, committed group offsets, topic configs and
-//! SCRAM users. A user who restarts the broker, for example to upgrade it, must lose none of it.
+//! everything clients stored before: topics, records, committed group offsets and topic configs. A
+//! user who restarts the broker, for example to upgrade it, must lose none of it.
 //!
 //! Memory storage keeps nothing, so on memory the tests check only that the broker starts again,
 //! empty and without errors.
@@ -22,10 +22,7 @@
 /// What clients stored survives a restart, on the engines that keep it.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod persistence {
-    use nisshi_smoke_test::{
-        Broker, KafkaCli, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism,
-        random_password, unique_name,
-    };
+    use nisshi_smoke_test::{Broker, KafkaCli, unique_name};
 
     /// A topic config that isn't the default, to find after the restart.
     const NON_DEFAULT_RETENTION: &str = "retention.ms=123456";
@@ -131,70 +128,6 @@ mod persistence {
         assert!(
             configs.succeeded().describes_config(NON_DEFAULT_RETENTION),
             "the output does not contain {NON_DEFAULT_RETENTION}: {configs}"
-        );
-    }
-
-    /// A SCRAM user whose credentials vanish on a restart can no longer log in. The broker starts
-    /// again with `--authentication`, so a client must log in as the user to reach it.
-    fn scram_user_logs_in_after_restart(mechanism: ScramMechanism) {
-        let broker = Broker::isolated();
-        let cli = KafkaCli::new(broker.bootstrap());
-        let login = ScramLogin {
-            user: unique_name("user"),
-            password: random_password(),
-            mechanism,
-        };
-
-        _ = cli.add_scram_user(&login.user, &login.password).succeeded();
-
-        let broker = broker.restart_requiring_login(&login);
-        let cli = KafkaCli::logged_in_as(broker.bootstrap(), &login);
-
-        let listed = cli.list_topics();
-        assert_eq!(
-            listed.code,
-            Some(0),
-            "{} can't log in: {listed}",
-            login.user
-        );
-    }
-
-    #[test]
-    fn scram_sha_256_user_logs_in_after_restart() {
-        scram_user_logs_in_after_restart(ScramMechanism::Sha256);
-    }
-
-    #[test]
-    fn scram_sha_512_user_logs_in_after_restart() {
-        scram_user_logs_in_after_restart(ScramMechanism::Sha512);
-    }
-
-    /// After a restart, the broker must still check a SCRAM user's password, and refuse a client
-    /// that logs in with the wrong one. A broker that accepts any password lets anyone log in as
-    /// the user, and a client that logs in with the right password can't tell.
-    #[test]
-    fn wrong_password_is_refused_after_restart() {
-        let broker = Broker::isolated();
-        let cli = KafkaCli::new(broker.bootstrap());
-        let login = ScramLogin {
-            user: unique_name("user"),
-            password: random_password(),
-            mechanism: ScramMechanism::Sha256,
-        };
-
-        _ = cli.add_scram_user(&login.user, &login.password).succeeded();
-
-        let broker = broker.restart_requiring_login(&login);
-        let wrong_login = ScramLogin {
-            password: random_password(),
-            ..login
-        };
-        let cli = KafkaCli::logged_in_as(broker.bootstrap(), &wrong_login);
-
-        let listed = cli.list_topics();
-        assert!(
-            listed.code != Some(0) && listed.mentions(SASL_AUTHENTICATION_EXCEPTION),
-            "the broker didn't refuse the wrong password: {listed}"
         );
     }
 }

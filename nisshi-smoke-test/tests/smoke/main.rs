@@ -21,6 +21,7 @@ pub mod offsets;
 pub mod produce;
 pub mod restart;
 pub mod retention;
+pub mod scram;
 pub mod storage_url;
 pub mod topic_lifecycle;
 pub mod topics;
