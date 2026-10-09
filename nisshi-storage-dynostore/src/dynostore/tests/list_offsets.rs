@@ -1014,7 +1014,7 @@ async fn backfill_get_failure_leaves_the_index_incomplete() -> Result<()> {
     faulty.arm(storage.batch_path(&topition, 1), Fault::Unavailable)?;
 
     assert_eq!(
-        ErrorCode::UnknownServerError,
+        ErrorCode::KafkaStorageError,
         list_offsets_timestamp_error(&storage, &topition, T0 + 60).await?
     );
     assert!(!time_index_complete(&storage, &topition).await?);
@@ -1064,7 +1064,7 @@ async fn scan_get_failure_answers_an_error_for_the_partition() -> Result<()> {
     faulty.arm(storage.batch_path(&topition, 1), Fault::Unavailable)?;
 
     assert_eq!(
-        ErrorCode::UnknownServerError,
+        ErrorCode::KafkaStorageError,
         list_offsets_timestamp_error(&storage, &topition, T0 + 25).await?
     );
 
@@ -1100,7 +1100,7 @@ async fn failed_lookup_answers_only_its_own_partition_with_an_error() -> Result<
     )
     .await?;
 
-    assert_eq!(ErrorCode::UnknownServerError, responses[0].error_code);
+    assert_eq!(ErrorCode::KafkaStorageError, responses[0].error_code);
     assert_eq!(None, responses[0].offset);
     assert_eq!(ErrorCode::None, responses[1].error_code);
     assert_eq!(Some(0), responses[1].offset);
