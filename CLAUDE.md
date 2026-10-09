@@ -24,6 +24,7 @@ just test-doc        # cargo test --workspace --doc --all-features
 just doc             # rustdoc, warnings denied, private items too; pass --open to browse
 just clippy          # cargo clippy --workspace --all-features --all-targets -- -D warnings
 just fmt             # cargo fmt --all --check
+just shellcheck      # shellcheck every tracked *.sh / *.bash script
 just check           # cargo check --workspace --all-features --all-targets
 just smoke <engine>  # Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3; starts and removes its own broker and services
 just ci              # (re)starts the docker compose services (postgres, minio, lakehouse) that integration tests depend on - safe to rerun if services are in a bad state
@@ -146,7 +147,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 
 GitHub Actions (`.github/workflows/ci.yml`) runs in two tiers, gated by `ci-gate`, the single required check that fans in every other job:
 
-- **Tier A, every pull_request push:** `fmt`, `clippy` (which also runs `just doc`), `typos`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
+- **Tier A, every pull_request push:** `fmt`, `clippy` (which also runs `just doc`), `typos`, `shellcheck`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
 - **Tier B, once per merge-queue entry (`merge_group`) and on push to `main`:** the `build-storage` matrix (one build per storage engine, `turso` included) and `build-storage-lake` (one build per lake format on `dynostore`), `test` on postgres:16/17/18, the experimental compat legs, `cargo-publish-dry-run`, `src`, `release`, `package`, `smoke` (the `nisshi-smoke-test` suite: Kafka CLI tools from Kafka 3.9 and 4.3 against the packaged image on postgres, memory and s3, and against a source build on sqlite until #796 is fixed, on x86 and arm), `smoke-oldest-client` (the same suite with the Kafka 3.7 CLI tools, the oldest client CI tests, on every engine on x86 only); `smoke-report` puts every leg of both in one pass/fail grid in the step summary.
 
 Merging goes through a merge queue: "Merge when ready" queues the PR, the queue re-runs CI on it against the current tip of `main`, and squash-merges it if everything is green: the PR title becomes the commit's subject and the PR description its body. Tier B is skipped on same-repo PRs only while the `MERGE_QUEUE` repository variable is `on`; with it unset, they run everything. Fork PRs can't read the variable, so Tier B is always skipped on them and runs in the queue. The other required checks come from `codeql.yml`, `workflow-lint.yml`, `dependencies.yml` and `pr-title.yml` (the PR title must follow Conventional Commits; see `CONTRIBUTING.md`).
