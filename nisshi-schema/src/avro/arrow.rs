@@ -16,7 +16,7 @@ use std::{collections::HashMap, iter::zip};
 
 use apache_avro::{
     Reader,
-    schema::{ArraySchema, MapSchema, RecordSchema, Schema as AvroSchema, UnionSchema},
+    schema::{ArraySchema, MapSchema, RecordSchema, Schema as AvroSchema, SchemaKind, UnionSchema},
     types::Value,
 };
 use arrow::{
@@ -36,7 +36,6 @@ use arrow::{
 use bytes::Bytes;
 use chrono::{DateTime, Datelike};
 use nisshi_sans_io::{ErrorCode, record::inflated::Batch};
-use num_bigint::BigInt;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use tracing::{debug, error, instrument};
 
@@ -420,7 +419,7 @@ macro_rules! try_as {
             if let $pattern(value) = value {
                 Ok(value)
             } else {
-                Err(Error::InvalidValue(value))
+                Err(Error::InvalidValue(SchemaKind::from(&value)))
             }
         }
     };
@@ -446,7 +445,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<NullBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -460,7 +459,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<BooleanBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -474,7 +473,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<Int32Builder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -488,7 +487,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<Int64Builder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -502,7 +501,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<Float32Builder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -516,7 +515,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<Float64Builder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -530,7 +529,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<LargeBinaryBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -548,7 +547,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<StringBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -570,7 +569,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<StructBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -595,7 +594,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<Date32Builder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -613,7 +612,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<Time32MillisecondBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -631,7 +630,7 @@ fn append_list_builder(
             .as_any_mut()
             .downcast_mut::<Time64MicrosecondBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| {
                 values
                     .into_iter()
@@ -667,7 +666,7 @@ fn append_map_builder(
     values: HashMap<String, Value>,
     builder: &mut MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>,
 ) -> Result<()> {
-    debug!(?schema, ?values);
+    debug!(?schema, values = values.len());
 
     for (key, value) in values {
         append_value(None, Value::String(key), builder.keys())?;
@@ -683,7 +682,7 @@ fn append_struct_builder(
     builder: &mut StructBuilder,
 ) -> Result<()> {
     for (index, (field, (name, value))) in zip(schema.fields.as_slice(), items).enumerate() {
-        debug!(?index, ?field, ?name, ?value);
+        debug!(?index, ?field, ?name);
 
         match (&field.schema, value) {
             (AvroSchema::Null, Value::Null) => builder
@@ -730,13 +729,13 @@ fn append_struct_builder(
             (AvroSchema::Array(schema), Value::Array(values)) => builder
                 .field_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(index)
                 .ok_or(Error::BadDowncast { field: name })
-                .inspect_err(|err| error!(?err, ?schema, ?values))
+                .inspect_err(|err| error!(?err, ?schema, values = values.len()))
                 .and_then(|builder| append_list_builder(schema, values, builder))?,
 
             (AvroSchema::Map(schema), Value::Map(values)) => builder
                 .field_builder::<MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>>(index)
                 .ok_or(Error::BadDowncast { field: name })
-                .inspect_err(|err| error!(?err, ?schema, ?values))
+                .inspect_err(|err| error!(?err, ?schema, values = values.len()))
                 .and_then(|builder| append_map_builder(schema, values, builder))?,
 
             (AvroSchema::Union(_schema), Value::Union(_, _value)) => {
@@ -795,7 +794,9 @@ fn append_struct_builder(
                 let _ = name;
                 todo!();
             }
-            (schema, value) => unimplemented!("schema: {schema:?}, value: {value:?}"),
+            (schema, value) => {
+                unimplemented!("schema: {schema:?}, value: {:?}", SchemaKind::from(&value))
+            }
         }
     }
 
@@ -808,8 +809,6 @@ fn append_value(
     value: Value,
     column: &mut Box<dyn ArrayBuilder>,
 ) -> Result<()> {
-    debug!(?value);
-
     match (schema, value) {
         (Some(AvroSchema::Boolean), Value::Null) => column
             .as_any_mut()
@@ -978,7 +977,7 @@ fn append_value(
             .map(|builder| builder.append_value(value)),
 
         (Some(AvroSchema::Union(schema)), Value::Union(_, value)) => {
-            debug!(?schema, ?value);
+            debug!(?schema);
 
             if let Some(schema) = schema.nullable_variant() {
                 append_value(Some(schema), *value, column)
@@ -991,7 +990,7 @@ fn append_value(
             .as_any_mut()
             .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
             .and_then(|builder| append_list_builder(schema, values, builder)),
 
         (Some(AvroSchema::Record(schema)), Value::Record(items)) => column
@@ -1004,8 +1003,8 @@ fn append_value(
             .as_any_mut()
             .downcast_mut::<MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?schema, ?values))
-            .inspect(|_| debug!(?schema, ?values))
+            .inspect_err(|err| error!(?err, ?schema, values = values.len()))
+            .inspect(|_| debug!(?schema, values = values.len()))
             .and_then(|builder| append_map_builder(schema, values, builder)),
 
         (Some(AvroSchema::Date), Value::Date(value)) => column
@@ -1014,12 +1013,9 @@ fn append_value(
             .ok_or(Error::Downcast)
             .map(|builder| builder.append_value(value)),
 
-        (schema, Value::Decimal(value)) => {
-            let big_int = BigInt::from(value);
-            todo!("schema: {schema:?}, value: {big_int:?}")
-        }
+        (schema, Value::Decimal(_)) => todo!("schema: {schema:?}, value: decimal"),
 
-        (schema, Value::BigDecimal(value)) => todo!("schema: {schema:?}, value: {value:?}"),
+        (schema, Value::BigDecimal(_)) => todo!("schema: {schema:?}, value: big decimal"),
 
         (_, Value::TimeMillis(value)) => column
             .as_any_mut()
@@ -1051,17 +1047,17 @@ fn append_value(
             .ok_or(Error::Downcast)
             .map(|builder| builder.append_value(value)),
 
-        (schema, Value::LocalTimestampMillis(value)) => {
-            todo!("schema: {schema:?}, value: {value:?}")
+        (schema, Value::LocalTimestampMillis(_)) => {
+            todo!("schema: {schema:?}, value: local timestamp millis")
         }
-        (schema, Value::LocalTimestampMicros(value)) => {
-            todo!("schema: {schema:?}, value: {value:?}")
+        (schema, Value::LocalTimestampMicros(_)) => {
+            todo!("schema: {schema:?}, value: local timestamp micros")
         }
-        (schema, Value::LocalTimestampNanos(value)) => {
-            todo!("schema: {schema:?}, value: {value:?}")
+        (schema, Value::LocalTimestampNanos(_)) => {
+            todo!("schema: {schema:?}, value: local timestamp nanos")
         }
 
-        (schema, Value::Duration(value)) => todo!("schema: {schema:?}, value: {value:?}"),
+        (schema, Value::Duration(_)) => todo!("schema: {schema:?}, value: duration"),
 
         (_, Value::Uuid(value)) => column
             .as_any_mut()
@@ -1069,7 +1065,9 @@ fn append_value(
             .ok_or(Error::Downcast)
             .map(|builder| builder.append_value(value.to_string())),
 
-        (schema, value) => unimplemented!("schema: {schema:?}, value: {value:?}"),
+        (schema, value) => {
+            unimplemented!("schema: {schema:?}, value: {:?}", SchemaKind::from(&value))
+        }
     }
 }
 
@@ -1088,12 +1086,10 @@ where
             .and_then(|builder| {
                 encoded
                     .map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
-                        Reader::with_schema(schema, &encoded[..])?
-                            .next()
-                            .transpose()
-                            .map_err(Into::into)
+                        Reader::with_schema(schema, &encoded[..])
+                            .and_then(|mut reader| reader.next().transpose())
+                            .map_err(|_| Error::AvroRecord)
                     })
-                    .inspect(|value| debug!(?value))
                     .and_then(|value| value.ok_or(Error::Api(ErrorCode::InvalidRecord)))
                     .and_then(|value| append_value(Some(schema), value, builder))
                     .inspect_err(|err| error!(?err, ?schema))
@@ -1102,7 +1098,7 @@ where
 }
 
 impl AsArrow for Schema {
-    #[instrument(skip(self, batch), ret)]
+    #[instrument(skip(self, batch))]
     async fn as_arrow(
         &self,
         topic: &str,
