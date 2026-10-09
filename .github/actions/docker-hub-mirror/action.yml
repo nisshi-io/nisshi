@@ -1,0 +1,26 @@
+name: Docker Hub mirror
+description: Pulls Docker Hub images through mirror.gcr.io, so CI does not hit Docker Hub's anonymous pull limit.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        conf=/etc/docker/daemon.json
+        tmp=$(mktemp)
+        merged=$(mktemp)
+        # Keep any settings the runner image already has.
+        if sudo test -s "${conf}"; then
+          sudo cat "${conf}" >"${tmp}"
+        else
+          echo '{}' >"${tmp}"
+        fi
+        jq '(."registry-mirrors" // []) as $m | ."registry-mirrors" = $m + (["https://mirror.gcr.io"] - $m)' "${tmp}" >"${merged}"
+        sudo install -D -m 644 "${merged}" "${conf}"
+        rm -f "${tmp}" "${merged}"
+        sudo systemctl restart docker
+        # The daemon pulls from the mirror first and falls back to Docker Hub
+        # when the mirror misses or is down. Fail here, not on a later 429, if
+        # the setting did not take.
+        docker info | grep -A2 'Registry Mirrors'
+        docker info --format '{{range .RegistryConfig.Mirrors}}{{println .}}{{end}}' | grep -q 'mirror.gcr.io'
