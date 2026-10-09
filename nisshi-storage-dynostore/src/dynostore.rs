@@ -684,7 +684,7 @@ impl DynoStore {
         list_stream
             .map_err(move |error| {
                 error!(?error, ?topition, start_offset, "listing batches");
-                Error::Api(ErrorCode::UnknownServerError)
+                Error::Api(ErrorCode::KafkaStorageError)
             })
             .try_filter_map(move |meta| {
                 ready(Ok(Self::batch_base_offset(&meta)
@@ -741,7 +741,7 @@ impl DynoStore {
             .and_then(|encoded| self.decode(encoded))
             .map(Some)
             .inspect_err(|error| error!(?error, ?topition, base_offset, "reading batch"))
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+            .map_err(|_| Error::Api(ErrorCode::KafkaStorageError))
     }
 
     /// Marks a backfill of `topition`'s time index in progress, with a CAS
@@ -998,7 +998,7 @@ impl DynoStore {
 
             let inflated = inflated::Batch::try_from(&deflated)
                 .inspect_err(|error| error!(?error, ?topition, base_offset, "inflating batch"))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
+                .map_err(|_| Error::Api(ErrorCode::KafkaStorageError))?;
 
             for record in &inflated.records {
                 let offset = base_offset + i64::from(record.offset_delta);
