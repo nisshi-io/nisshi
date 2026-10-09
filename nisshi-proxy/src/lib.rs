@@ -123,6 +123,15 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
     )
 });
 
+/// The maximum number of connections from the proxy to its origin.
+///
+/// Every client of the proxy shares these connections, and the origin holds a fetch or a
+/// JoinGroup on its connection until it answers. So the pool needs about one connection
+/// for each client that waits on the origin at the same time. The pool opens a connection
+/// only when a request needs one, so a large maximum costs nothing while the proxy is
+/// quiet.
+const ORIGIN_POOL_MAX_SIZE: usize = 256;
+
 #[derive(Clone, Debug)]
 pub struct Proxy {
     listener: Url,
@@ -150,6 +159,7 @@ impl Proxy {
 
         let pool = ConnectionManager::builder(self.origin.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
+            .max_size(ORIGIN_POOL_MAX_SIZE)
             .build()
             .await
             .inspect(|pool| debug!(?pool))?;
