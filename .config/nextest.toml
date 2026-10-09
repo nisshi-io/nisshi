@@ -4,3 +4,10 @@
 # new_cg::pg::consumer_next_action_32c, takes about 62 s.
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# `just smoke <engine>` runs the smoke suite (nisshi-smoke-test) with this
+# profile. Each Kafka CLI call has its own timeout; this one catches a test
+# that hangs anywhere else.
+[profile.smoke]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5 }

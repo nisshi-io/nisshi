@@ -16,6 +16,7 @@ members = [
     "nisshi-sans-io",
     "nisshi-schema",
     "nisshi-service",
+    "nisshi-smoke-test",
     "nisshi-storage",
     "nisshi-storage-dynostore",
     "nisshi-storage-null",

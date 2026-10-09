@@ -19,12 +19,13 @@ just                 # default: fmt, build, test, clippy
 just build           # build with all features (dev profile)
 just build-all       # build every target (bins, examples, tests, benches) with all features - use this to verify a change builds cleanly workspace-wide
 just test            # nextest + doc tests - use this to rerun the full test suite after a change
-just test-workspace  # cargo nextest run --workspace --all-targets --all-features
+just test-workspace  # cargo nextest run --workspace --all-targets --all-features, excluding fuzz and nisshi-smoke-test
 just test-doc        # cargo test --workspace --doc --all-features
 just doc             # rustdoc, warnings denied, private items too; pass --open to browse
 just clippy          # cargo clippy --workspace --all-features --all-targets -- -D warnings
 just fmt             # cargo fmt --all --check
 just check           # cargo check --workspace --all-features --all-targets
+just smoke <engine>  # Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3; starts and removes its own broker and services
 just ci              # (re)starts the docker compose services (postgres, minio, lakehouse) that integration tests depend on - safe to rerun if services are in a bad state
 ```
 
@@ -138,6 +139,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 - Tests in `nisshi-broker` run against multiple backends: InMemory, Lite (libSQL), Postgres, SlateDb
 - `nisshi-broker`, `nisshi-sans-io` and `nisshi-service` each build one integration-test binary, `it`. To add a test file, create `tests/it/<name>.rs` and declare it with `pub mod <name>;` in `tests/it/main.rs`; Cargo ignores undeclared files, and the `every_test_file_is_declared` test fails if one is missed. Gate backend-specific tests with `#[cfg(feature = "...")]` on a module, not `required-features`. Run one file's tests with a name filter, e.g. `cargo nextest run -p nisshi-broker --all-features -E 'test(/^fetch::/)'`
 - Give each feature its own test file. Put the tests of one feature or one Kafka API in one file under `tests/it/`, named after it. Tests for a new feature go in a new file, not at the end of a file about another subject. A reader then finds them by name, and a name filter on the module selects them.
+- `nisshi-smoke-test` runs the real Kafka CLI tools (in a `$KAFKA_IMAGE` container) against a broker, and stays out of `just test`; run it with `just smoke <engine>`. Its containers use the host network, so on macOS it needs Docker Desktop with host networking turned on. Its tests talk to the shared broker through `Broker::shared()`, or start their own with `Broker::isolated()`, and each uses its own topic and group names (`nisshi_smoke_test::unique_name`). A test that fails because of an open bug is marked `#[ignore = "<what is broken>"]`, or `#[cfg_attr(feature = "<engine>", ignore = "...")]` when it fails only on some engines. CI skips it, local runs still run it (`run.sh` passes `--run-ignored all` outside CI), and the change that fixes the bug removes the attribute
 - Single-file test targets with specific feature requirements (e.g. `nisshi-schema`'s `berg`) use `required-features` in their `Cargo.toml`
 
 ## CI Pipeline
@@ -145,7 +147,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 GitHub Actions (`.github/workflows/ci.yml`) runs in two tiers, gated by `ci-gate`, the single required check that fans in every other job:
 
 - **Tier A, every pull_request push:** `fmt`, `clippy` (which also runs `just doc`), `typos`, `third-party-license`, `test` (postgres:17 only), one non-experimental leg each of `compat-librdkafka` / `compat-franz-go`.
-- **Tier B, once per merge-queue entry (`merge_group`) and on push to `main`:** the `build-storage` matrix (one build per storage engine, `turso` included) and `build-storage-lake` (one build per lake format on `dynostore`), `test` on postgres:16/17/18, the experimental compat legs, `cargo-publish-dry-run`, `src`, `release`, `package`, `smoke` (Java Kafka client, Kafka 3.7/3.8/3.9).
+- **Tier B, once per merge-queue entry (`merge_group`) and on push to `main`:** the `build-storage` matrix (one build per storage engine, `turso` included) and `build-storage-lake` (one build per lake format on `dynostore`), `test` on postgres:16/17/18, the experimental compat legs, `cargo-publish-dry-run`, `src`, `release`, `package`, `smoke` (the `nisshi-smoke-test` suite: Kafka CLI tools from Kafka 3.9 and 4.3 against the packaged image on postgres, memory and s3, and against a source build on sqlite until #796 is fixed, on x86 and arm), `smoke-oldest-client` (the same suite with the Kafka 3.7 CLI tools, the oldest client CI tests, on every engine on x86 only); `smoke-report` puts every leg of both in one pass/fail grid in the step summary.
 
 Merging goes through a merge queue: "Merge when ready" queues the PR, the queue re-runs CI on it against the current tip of `main`, and squash-merges it if everything is green: the PR title becomes the commit's subject and the PR description its body. Tier B is skipped on same-repo PRs only while the `MERGE_QUEUE` repository variable is `on`; with it unset, they run everything. Fork PRs can't read the variable, so Tier B is always skipped on them and runs in the queue. The other required checks come from `codeql.yml`, `workflow-lint.yml`, `dependencies.yml` and `pr-title.yml` (the PR title must follow Conventional Commits; see `CONTRIBUTING.md`).
 

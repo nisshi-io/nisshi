@@ -8,8 +8,8 @@ name: ci
 # ref) - it's hygiene, keeping the repo's cache budget from being consumed
 # by entries on refs nothing else can restore from. Applies to fmt, clippy,
 # test (its postgres:17 leg only), cargo-publish-dry-run,
-# third-party-license and release below (release also skips the cache
-# entirely on tags).
+# third-party-license, smoke (one sqlite leg per os) and release below
+# (release also skips the cache entirely on tags).
 #
 # Two tiers. The split was made on GitHub's Free plan (20 concurrent jobs),
 # where a full run of this workflow (~60 jobs, 31 of them with no `needs`) on
@@ -23,7 +23,7 @@ name: ci
 # - Tier B runs once per merge-queue entry (`merge_group`) and on push:
 #   the full build-storage/build-storage-lake matrix, `test` on pg16/pg18,
 #   the experimental compat legs, cargo-publish-dry-run, src, package,
-#   smoke, release.
+#   smoke, smoke-oldest-client, smoke-report, release.
 #
 # Tier B jobs carry `if: github.event_name != 'pull_request' ||
 # (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, and the trimmed matrices pick the smaller list
@@ -536,6 +536,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+  # Runs the nisshi-smoke-test suite (`just smoke <storage>`): the Kafka CLI
+  # tools from each Kafka image against the packaged image on each storage engine.
   smoke:
     if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     needs: [package]
@@ -546,28 +548,20 @@ jobs:
           - ubuntu-latest
           - ubuntu-24.04-arm
         storage:
-          - s3://nisshi/
-          - postgres://postgres:postgres@db
-          - sqlite://nisshi.db
+          - postgres
+          - sqlite
+          - memory
+          - s3
         kafka:
-          - apache/kafka:3.9.0
-          - apache/kafka:3.8.1
-          - apache/kafka:3.7.0
+          - apache/kafka:3.9.2
+          - apache/kafka:4.3.1
     runs-on: ${{matrix.os}}
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
-      ADVERTISED_LISTENER_URL: tcp://nisshi:9092
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_ALLOW_HTTP: true
-      AWS_DEFAULT_REGION: auto
-      AWS_ENDPOINT: http://minio:9000
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      CLUSTER_ID: kafka-python-integration
       KAFKA_IMAGE: ${{matrix.kafka}}
-      PROMETHEUS_LISTENER_URL: tcp://localhost:9100
       RUST_BACKTRACE: 1
       RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
-      STORAGE_ENGINE: ${{matrix.storage}}
+      STORAGE: ${{matrix.storage}}
     steps:
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
@@ -578,59 +572,154 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      # Pinned: smoke gates every merge, so a push to example-java's default
-      # branch must not change this repo's gate without a reviewed bump here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          repository: nisshi-io/example-java
-          ref: 65bfbfdfd1dd77420b6af3b5d616ba7ae8b35b33 # 2026-09-29, minio from pgsty/silo (#5)
-          path: integration
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - if: matrix.storage == 'sqlite'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # Only the sqlite legs build the broker, so only they use the
+          # cache, and one of them per os saves it.
+          cache: ${{ matrix.storage == 'sqlite' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.storage == 'sqlite' && matrix.kafka == 'apache/kafka:3.9.2' }}
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+      # The leg name is one word: the report reads the storage column from
+      # the results file name with `(\w+).csv`.
+      - env:
+          IMAGE: ${{env.REGISTRY}}/${{github.repository}}:${{steps.meta.outputs.version}}
+        run: |
+          kafka=${KAFKA_IMAGE#*:}
+          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
+          # The packaged image crashes at startup on sqlite:// (#796), so
+          # the sqlite legs build the broker from source instead, and say
+          # nothing about the image on sqlite. The fix for #796 removes this
+          # and the sqlite-only setup steps above.
+          if [[ "${STORAGE}" != sqlite ]]; then
+            echo "NISSHI_SMOKE_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          fi
+      - run: just smoke "${STORAGE}"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/results-*.csv
+          if-no-files-found: warn
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/*.log
+          if-no-files-found: warn
+  # Runs the smoke suite with the Kafka CLI tools from the oldest Kafka release that CI tests, so
+  # CI checks that an older Java client still negotiates API versions with the broker.
+  smoke-oldest-client:
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [package]
+    strategy:
+      fail-fast: false
+      # The job runs on every storage engine, because an older client can call other APIs than a
+      # newer one, and each engine implements those APIs in its own code.
+      matrix:
+        storage:
+          - postgres
+          - sqlite
+          - memory
+          - s3
+    # A Java client sends the same requests on any CPU, so this job runs on x86 only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KAFKA_IMAGE: apache/kafka:3.7.2
+      RUST_BACKTRACE: 1
+      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
+      STORAGE: ${{matrix.storage}}
+    steps:
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{env.REGISTRY}}/${{github.repository}}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - if: matrix.storage == 'sqlite'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # The sqlite leg reads the cache that the smoke job saves.
+          cache: ${{ matrix.storage == 'sqlite' }}
+          cache-save-if: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+      # The leg name is one word: the report reads the storage column from
+      # the results file name with `(\w+).csv`.
+      - env:
+          IMAGE: ${{env.REGISTRY}}/${{github.repository}}:${{steps.meta.outputs.version}}
+        run: |
+          kafka=${KAFKA_IMAGE#*:}
+          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
+          # The packaged image crashes at startup on sqlite:// (#796), so
+          # the sqlite leg builds the broker from source instead.
+          if [[ "${STORAGE}" != sqlite ]]; then
+            echo "NISSHI_SMOKE_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          fi
+      - run: just smoke "${STORAGE}"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/results-*.csv
+          if-no-files-found: warn
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/*.log
+          if-no-files-found: warn
+  smoke-report:
+    if: always() && (needs.smoke.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped')
+    needs: [smoke, smoke-oldest-client]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: |
-            etc/initdb.d/010-schema.sql
+            .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
-          path: initdb
-      - run: ls -lR
-      - run: cp -v initdb/etc/initdb.d/010-schema.sql integration/etc/initdb.d
-      # nisshi exits at startup when it cannot list its bucket, so minio and
-      # the bucket must exist before the full stack starts.
-      - run: docker compose --ansi never --progress plain up --no-color --quiet-pull --detach minio
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never exec minio /usr/bin/mc ready local
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never exec minio /usr/bin/mc alias set local http://localhost:9000 ${{ env.AWS_ACCESS_KEY_ID }} ${{ env.AWS_SECRET_ACCESS_KEY }}
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never exec minio /usr/bin/mc mb local/nisshi
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never --progress plain up --no-color --quiet-pull --detach
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
-      - run: sudo apt-get update
-      - run: sudo apt-get install -y bats
-      - run: docker compose exec db /usr/bin/pg_isready --timeout=60
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
-      - run: docker compose logs
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
-      - run: bats --trace --verbose-run tests
-        working-directory: integration
-        env:
-          NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
+          path: reports
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: smoke-results-*
+          path: results
+          merge-multiple: true
+      - name: Install duckdb (pinned version, checksum-verified)
+        run: |
+          curl -fsSL -o duckdb_cli.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.gz"
+          echo "${DUCKDB_SHA256}  duckdb_cli.gz" | sha256sum -c -
+          mkdir -p "${DUCKDB_CLI}"
+          gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
+          chmod +x "${DUCKDB_CLI}/duckdb"
+      - run: echo "## Smoke report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   release:
     if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     # build-storage/build-storage-lake are here (not on `test`, which is Tier
@@ -764,6 +853,7 @@ jobs:
       - src
       - package
       - smoke
+      - smoke-oldest-client
       - release
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -799,7 +889,7 @@ jobs:
       - name: Tier A ran on pull_request
         if: github.event_name == 'pull_request'
         env:
-          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src package smoke release
+          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src package smoke smoke-oldest-client release
         run: |
           skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
