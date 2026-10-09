@@ -6139,6 +6139,7 @@ version = "0.7.0-pre.3"
 dependencies = [
  "clap",
  "nanoid",
+ "rand 0.10.3",
 ]
 
 [[package]]

@@ -12,7 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod broker;
+pub mod configs;
+pub mod consume;
+pub mod offsets;
+pub mod produce;
+pub mod restart;
+pub mod storage_url;
 pub mod topic_lifecycle;
+pub mod topics;
 
 // Cargo only builds the modules declared above, so a file in `tests/smoke/` without a
 // `pub mod` line would never compile or run. Fail instead of skipping it silently.

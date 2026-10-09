@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A Kafka record (headers, key and value) and the one-line text form that
-//! the Kafka console producer reads and the console consumer prints.
+//! A Kafka record (headers, key and value) and the one-line text form that the Kafka console
+//! producer reads and the console consumer prints.
 
 /// A Kafka record with headers, a key and a value.
 #[derive(Clone, Copy, Debug)]

@@ -15,25 +15,34 @@
 //! Harness for the smoke suite: run the real Kafka CLI tools against a
 //! broker on a chosen storage engine, the way a user would.
 //!
-//! Configuration comes from the environment, which `just smoke <engine>` sets up:
-//!
-//! - `NISSHI_SMOKE_BOOTSTRAP`: the shared broker's address
-//! - `NISSHI_SMOKE_STORAGE`: the storage engine URL
-//! - `NISSHI_SMOKE_BIN` or `NISSHI_SMOKE_IMAGE`: what [`Broker::isolated`] launches
-//! - `NISSHI_SMOKE_KAFKA`: the running container with the Kafka CLI tools
-//! - `NISSHI_SMOKE_RUN`: the run's id, which labels every container and
-//!   volume the suite creates, so a run removes only its own
+//! `just smoke <engine>` passes the suite its configuration through the environment, which
+//! [`settings`] reads.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nanoid::nanoid;
 
-mod broker;
+pub mod broker;
 mod kafka_cli;
 mod record;
+pub mod settings;
+mod storage_url;
 mod timed_command;
 
 pub use broker::{Broker, LaunchOptions, free_port};
-pub use kafka_cli::{KafkaCli, Output};
+pub use kafka_cli::{
+    Acks, AnyCommand, ApiVersions, ClusterId, Consume, ConsumeMatching, ConsumedRecord,
+    CreateTopic, DeleteTopic, DescribeConfigs, DescribeGroup, DescribeGroupState, DescribeTopic,
+    GetOffsets, GroupOffsets, KafkaCli, LOG_APPEND_TIME, ListTopics, Output, PartitionReplicas,
+    PrintsPartitionLines, RECORD_TOO_LARGE_EXCEPTION, RequiresExistingTopic,
+    SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism, TOPIC_EXISTS_EXCEPTION,
+    UNSUPPORTED_VERSION_EXCEPTION, VerifiableProduce, verifiable_producer_values,
+};
 pub use record::Record;
+pub use storage_url::StorageUrl;
+
+/// The cluster id of the broker that all tests share.
+pub const SHARED_CLUSTER_ID: &str = "nisshi-smoke";
 
 /// Returns a name that no other test, process or earlier run uses, so tests can share one broker
 /// and one database.
@@ -49,16 +58,26 @@ pub fn unique_name(prefix: &str) -> String {
     format!("{prefix}-{}", nanoid!(21, &alphabet))
 }
 
-/// The `docker --label` on every container and volume this run creates.
-fn label() -> String {
-    format!(
-        "--label=nisshi-smoke={}",
-        env("NISSHI_SMOKE_RUN").unwrap_or_else(|| "local".to_owned())
-    )
+/// Returns a random password for a SCRAM user that a test creates.
+///
+/// The password is a random number in decimal. CodeQL reports a password built from any constant,
+/// such as a literal or the alphabet that [`unique_name`] picks from, as a hard-coded cryptographic
+/// value, so this one is built from none.
+pub fn random_password() -> String {
+    rand::random::<u128>().to_string()
 }
 
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+/// The time now, in milliseconds since the Unix epoch, as Kafka gives record timestamps.
+pub fn now_in_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// The `docker --label` on every container and volume this run creates.
+fn label() -> String {
+    format!("--label=nisshi-smoke={}", settings::run_id())
 }
 
 #[cfg(test)]

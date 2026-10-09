@@ -5,9 +5,17 @@
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-# `just smoke <engine>` runs the smoke suite (nisshi-smoke-test) with this
-# profile. Each Kafka CLI call has its own timeout; this one catches a test
-# that hangs anywhere else.
+# The settings of the smoke suite (nisshi-smoke-test). Each Kafka CLI call has
+# its own timeout, and `slow-timeout` stops a test that hangs anywhere else.
 [profile.smoke]
 fail-fast = false
+# Each test starts Kafka CLI JVMs, so memory limits how many tests can run.
+test-threads = 4
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# S3 runs only the topic lifecycle tests, which check that a broker on S3
+# stores and serves topics and records. Every other engine runs every test that
+# its feature compiles.
+[profile.smoke-s3]
+inherits = "smoke"
+default-filter = "test(/^topic_lifecycle::/) | test(=every_test_file_is_declared)"
