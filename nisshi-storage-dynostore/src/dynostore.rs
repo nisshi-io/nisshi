@@ -716,7 +716,10 @@ impl DynoStore {
     /// A missing object is a batch that was deleted after a LIST returned
     /// it, so a caller can skip it. Every other failure is an error, because
     /// a caller that skips a batch after a transient GET failure answers
-    /// from an incomplete log and gives no sign of it.
+    /// from an incomplete log and gives no sign of it. The error is
+    /// `KAFKA_STORAGE_ERROR`, the code Kafka answers for a log it cannot
+    /// read, which a client retries; `UNKNOWN_SERVER_ERROR` would make it
+    /// give up.
     async fn read_batch(
         &self,
         topition: &Topition,
@@ -815,7 +818,8 @@ impl DynoStore {
         let mut candidate = TimeIndex::default();
 
         // The offset after the last batch read, or `None` after a batch
-        // deleted between the listing and its read, whose length is unknown.
+        // deleted between the listing and its read, whose length is unknown,
+        // so the gap check is off for the batch after it.
         let mut next_offset = Some(backfill.low);
         let mut settled = true;
 
@@ -863,7 +867,11 @@ impl DynoStore {
         // A gap after the last listed batch has no later batch to settle it,
         // so it is in flight until a later batch is written and ages. A
         // partition whose newest produce failed in between therefore lists
-        // again on each lookup until its next produce.
+        // again on each lookup until its next produce. An empty listing is
+        // taken as complete, so that a partition without batch objects (a
+        // lake sink's) does not list again on every lookup; the one case
+        // this misses is a partition's first produce from a binary without
+        // the index, still in flight during this listing.
         if batches > 0 && next_offset.is_some_and(|expected| expected < backfill.high) {
             settled = false;
         }
@@ -955,9 +963,10 @@ impl DynoStore {
             "time index backfill: committed"
         );
 
-        // `low` can have moved (e.g. a concurrent DeleteRecords) between the
-        // read above and the backfill commit; re-read it fresh rather than
-        // answer with a value that might already be stale.
+        // The log start is read after the commit, not taken from the read
+        // before the backfill, so that a lookup never filters with a log
+        // start older than its index. Nothing moves the log start today;
+        // DeleteRecords will.
         let low = self
             .watermark_for(topition)?
             .with(&self.object_store, |w| Ok(w.low.unwrap_or(0)))
@@ -967,14 +976,13 @@ impl DynoStore {
     }
 
     /// Forward sequential scan of real batch objects in `topition`, starting
-    /// at `start_offset`, for the first logical record - one whose offset is
-    /// `>= low`, so a record `DeleteRecords` has logically removed is never
-    /// answered as a match even if its batch object hasn't been physically
-    /// reclaimed yet - whose timestamp is `>= target`.
-    /// Decodes individual records rather than
-    /// trusting a batch header's `max_timestamp` alone, since that header is
-    /// only ever a ceiling hint and can be stale/overstated once anything
-    /// prunes or compacts a partition's batches.
+    /// at `start_offset`, for the first logical record, one whose offset is
+    /// `>= low` (so a record `DeleteRecords` has logically removed is never
+    /// answered as a match, even if its batch object is still there) and
+    /// whose timestamp is `>= target`. The scan decodes the records of each
+    /// batch, because the answer is the first record at or after the target
+    /// and a batch header's `max_timestamp` cannot place it inside the
+    /// batch.
     ///
     /// Returns `Ok(None)` - not an error - when nothing qualifies: an empty
     /// partition, a `start_offset` past every real batch (the lake-sink
