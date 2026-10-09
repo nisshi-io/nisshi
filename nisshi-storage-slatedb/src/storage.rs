@@ -594,6 +594,10 @@ impl Engine {
 
     /// Apply the `delete` cleanup policy: remove the prefix of each partition
     /// where every batch is older than the topic's `retention.ms`.
+    ///
+    /// A partition whose transaction loses a conflict is skipped until the
+    /// next tick (`Self::commit_maintenance`), so the count covers only the
+    /// partitions that committed.
     async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
         let Some(now_ms) = now
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -610,10 +614,6 @@ impl Engine {
             .values()
             .filter(|metadata| Self::has_cleanup_policy(metadata, DELETE))
         {
-            let retention_ms = Self::topic_config(metadata, RETENTION_MS)
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(DEFAULT_RETENTION.as_millis() as i64);
-
             for partition in 0..metadata.topic.num_partitions {
                 let tx = self
                     .db
@@ -621,65 +621,92 @@ impl Engine {
                     .await
                     .inspect_err(|err| debug!(?err))?;
 
-                let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, partition))?;
-                let scan_start =
-                    postcard::to_stdvec(&BatchKey::scan_from(metadata.id, partition, 0))?;
-
-                let mut scan = self.db.scan(scan_start..).await?;
-                let mut removed = 0;
-                let mut first_remaining = None;
-
-                while let Some(kv) = scan.next().await? {
-                    if !kv.key.starts_with(&prefix) {
-                        break;
-                    }
-
-                    let key: BatchKey = postcard::from_bytes(&kv.key)?;
-                    let batch = self.decode(kv.value)?;
-
-                    // Only a prefix of the log is removed: deletion stops at
-                    // the first batch within the retention period.
-                    if now_ms.saturating_sub(batch.max_timestamp) <= retention_ms {
-                        first_remaining = Some(key.offset);
-                        break;
-                    }
-
-                    tx.delete(&kv.key)?;
-                    removed += 1;
-                }
+                let removed = self
+                    .delete_expired_prefix(&tx, metadata, partition, now_ms)
+                    .await?;
 
                 if removed == 0 {
                     continue;
                 }
 
-                let mut watermark = self
-                    .partition_watermark(&tx, metadata.id, partition)
-                    .await?;
-
-                // When the partition is now empty the log start meets the
-                // high watermark: offsets are never reused.
-                let low = first_remaining.unwrap_or_else(|| watermark.high.unwrap_or(0));
-                watermark.low = Some(low);
-
-                self.prune_time_index_below(&tx, metadata.id, partition, low)
-                    .await?;
-                Self::clear_time_index_state_if_partition_empty(&mut watermark);
-
-                let watermark_key =
-                    postcard::to_stdvec(&WatermarkKey::new(metadata.id, partition))?;
-                tx.put(&watermark_key, postcard::to_stdvec(&watermark)?)?;
-                _ = tx.commit().await.map_err(Error::from)?;
-
-                deleted += removed;
+                if Self::commit_maintenance(tx, &metadata.topic.name, partition).await? {
+                    deleted += removed;
+                }
             }
         }
 
         Ok(deleted)
     }
 
+    /// Delete, through `tx`, the batches of `partition` that are older than
+    /// the topic's `retention.ms` at `now_ms`, move the log start past them,
+    /// and return how many batches it deleted. Nothing is written to `tx`
+    /// when no batch is expired.
+    pub(super) async fn delete_expired_prefix(
+        &self,
+        tx: &slatedb::DbTransaction,
+        metadata: &TopicMetadata,
+        partition: i32,
+        now_ms: i64,
+    ) -> Result<u64> {
+        let retention_ms = Self::topic_config(metadata, RETENTION_MS)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_RETENTION.as_millis() as i64);
+
+        let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, partition))?;
+        let scan_start = postcard::to_stdvec(&BatchKey::scan_from(metadata.id, partition, 0))?;
+
+        let mut scan = self.db.scan(scan_start..).await?;
+        let mut removed = 0;
+        let mut first_remaining = None;
+
+        while let Some(kv) = scan.next().await? {
+            if !kv.key.starts_with(&prefix) {
+                break;
+            }
+
+            let key: BatchKey = postcard::from_bytes(&kv.key)?;
+            let batch = self.decode(kv.value)?;
+
+            // Only a prefix of the log is removed: deletion stops at
+            // the first batch within the retention period.
+            if now_ms.saturating_sub(batch.max_timestamp) <= retention_ms {
+                first_remaining = Some(key.offset);
+                break;
+            }
+
+            tx.delete(&kv.key)?;
+            removed += 1;
+        }
+
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        let mut watermark = self.partition_watermark(tx, metadata.id, partition).await?;
+
+        // When the partition is now empty the log start meets the
+        // high watermark: offsets are never reused.
+        let low = first_remaining.unwrap_or_else(|| watermark.high.unwrap_or(0));
+        watermark.low = Some(low);
+
+        self.prune_time_index_below(tx, metadata.id, partition, low)
+            .await?;
+        Self::clear_time_index_state_if_partition_empty(&mut watermark);
+
+        let watermark_key = postcard::to_stdvec(&WatermarkKey::new(metadata.id, partition))?;
+        tx.put(&watermark_key, postcard::to_stdvec(&watermark)?)?;
+
+        Ok(removed)
+    }
+
     /// Apply the `compact` cleanup policy: for each record key, retain only
     /// the most recent record in the partition. Batches that become empty
     /// are removed; control batches are left untouched.
+    ///
+    /// A partition whose transaction loses a conflict is skipped until the
+    /// next tick (`Self::commit_maintenance`), so the count covers only the
+    /// partitions that committed.
     async fn policy_compact(&self) -> Result<u64> {
         let topics = self.get_topics().await?;
         let mut compacted = 0;
@@ -695,130 +722,177 @@ impl Engine {
                     .await
                     .inspect_err(|err| debug!(?err))?;
 
-                // The compaction reads the batches, and later the time
-                // index, through `tx`, never through `self.db`. A read
-                // through `tx` registers its range for conflict detection,
-                // so a produce that commits to this partition during the
-                // compaction makes `tx` fail to commit. A read through
-                // `self.db` sees that produce's batch nowhere and its `t/`
-                // entry in the index, so the rebuild below deletes the
-                // entry and never adds it back.
-                let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, partition))?;
-
-                let mut batches = vec![];
-                let mut scan = tx.scan_prefix(&prefix, ..).await?;
-                while let Some(kv) = scan.next().await? {
-                    let key: BatchKey = postcard::from_bytes(&kv.key)?;
-                    let batch = self.decode(kv.value)?;
-                    batches.push((kv.key, key.offset, batch));
-                }
-
-                // Working from the newest batch to the oldest, a record is
-                // dropped when its key reappears in a newer batch.
-                let mut head = BTreeSet::new();
-                let mut removed_offsets = BTreeSet::new();
-                let mut removed_records = 0;
-
-                for (raw_key, offset, deflated) in batches.iter().rev() {
-                    // A stored batch that cannot be inflated (malformed, or
-                    // over the decoded-size limit) is left as it is rather
-                    // than failing the whole pass. Its keys are unknown, so
-                    // older records it may supersede are kept: the
-                    // conservative outcome, and every other batch is still
-                    // compacted.
-                    let inflated = match InflatedBatch::try_from(deflated.clone()) {
-                        Ok(inflated) => inflated,
-                        Err(error) => {
-                            warn!(
-                                topic = %metadata.topic.name,
-                                partition,
-                                offset,
-                                ?error,
-                                "compaction is skipping a batch it cannot inflate"
-                            );
-                            continue;
-                        }
-                    };
-
-                    if BatchAttribute::try_from(inflated.attributes)?.control {
-                        continue;
-                    }
-
-                    let keys = inflated.keys();
-                    let compaction = inflated.compact(&head)?;
-                    head.extend(keys);
-
-                    if compaction.records == 0 {
-                        continue;
-                    }
-
-                    removed_records += compaction.records as u64;
-
-                    if compaction.batch.records.is_empty() {
-                        tx.delete(raw_key)?;
-                        _ = removed_offsets.insert(*offset);
-                    } else {
-                        let rewritten: Batch = compaction.batch.try_into()?;
-
-                        let encoded = {
-                            let mut encoder = RecordBatchEncoder::new(BytesMut::new());
-                            rewritten.serialize(&mut encoder)?;
-                            Bytes::from(encoder)
-                        };
-
-                        tx.put(raw_key, &encoded[..])?;
-                    }
-                }
+                let removed_records = self.compact_partition(&tx, metadata, partition).await?;
 
                 if removed_records == 0 {
                     continue;
                 }
 
-                let mut watermark = self
-                    .partition_watermark(&tx, metadata.id, partition)
-                    .await?;
-
-                // Compaction leaves the log start where it is, as in Kafka,
-                // whose cleaner never moves it: a fetch below the first
-                // surviving batch steps over the gap to it, where moving the
-                // log start would answer OFFSET_OUT_OF_RANGE and reset the
-                // consumer. Only retention and DeleteRecords move it.
-
-                // The compaction rebuilds the time index from the surviving
-                // batches, in offset order, instead of deleting only the
-                // entries of removed batches. A removed batch can hold the
-                // only entry that covers a later, unindexed survivor, so a
-                // per-entry delete leaves a gap in the index. Kafka's
-                // LogCleaner also rebuilds the time index of a segment that
-                // it compacts.
-                self.delete_time_index(&tx, metadata.id, partition).await?;
-                watermark.latest_indexed_timestamp = None;
-                watermark.last_batch_max_timestamp = None;
-
-                for (_, offset, batch) in batches
-                    .iter()
-                    .filter(|(_, offset, _)| !removed_offsets.contains(offset))
-                {
-                    Self::append_time_index(
-                        &tx,
-                        metadata.id,
-                        partition,
-                        *offset,
-                        batch.max_timestamp,
-                        &mut watermark,
-                    )?;
+                if Self::commit_maintenance(tx, &metadata.topic.name, partition).await? {
+                    compacted += removed_records;
                 }
-
-                let watermark_key =
-                    postcard::to_stdvec(&WatermarkKey::new(metadata.id, partition))?;
-                tx.put(&watermark_key, postcard::to_stdvec(&watermark)?)?;
-                _ = tx.commit().await.map_err(Error::from)?;
-
-                compacted += removed_records;
             }
         }
 
         Ok(compacted)
+    }
+
+    /// Compact `partition` through `tx`: for each record key, retain only
+    /// the most recent record, remove the batches that become empty, rebuild
+    /// the time index from the surviving batches, and return how many
+    /// records it removed. Nothing is written to `tx` when no record is
+    /// superseded.
+    ///
+    /// Every read goes through `tx`, never through `self.db`. A read through
+    /// `tx` registers its range for conflict detection, so a produce that
+    /// commits to this partition during the compaction makes `tx` fail to
+    /// commit. A read through `self.db` sees that produce's batch nowhere
+    /// and its `t/` entry in the index, so the rebuild deletes the entry and
+    /// never adds it back.
+    pub(super) async fn compact_partition(
+        &self,
+        tx: &slatedb::DbTransaction,
+        metadata: &TopicMetadata,
+        partition: i32,
+    ) -> Result<u64> {
+        let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, partition))?;
+
+        let mut batches = vec![];
+        let mut scan = tx.scan_prefix(&prefix, ..).await?;
+        while let Some(kv) = scan.next().await? {
+            let key: BatchKey = postcard::from_bytes(&kv.key)?;
+            let batch = self.decode(kv.value)?;
+            batches.push((kv.key, key.offset, batch));
+        }
+
+        // Working from the newest batch to the oldest, a record is
+        // dropped when its key reappears in a newer batch.
+        let mut head = BTreeSet::new();
+        let mut removed_offsets = BTreeSet::new();
+        let mut removed_records = 0;
+
+        for (raw_key, offset, deflated) in batches.iter().rev() {
+            // A stored batch that cannot be inflated (malformed, or
+            // over the decoded-size limit) is left as it is rather
+            // than failing the whole pass. Its keys are unknown, so
+            // older records it may supersede are kept: the
+            // conservative outcome, and every other batch is still
+            // compacted.
+            let inflated = match InflatedBatch::try_from(deflated.clone()) {
+                Ok(inflated) => inflated,
+                Err(error) => {
+                    warn!(
+                        topic = %metadata.topic.name,
+                        partition,
+                        offset,
+                        ?error,
+                        "compaction is skipping a batch it cannot inflate"
+                    );
+                    continue;
+                }
+            };
+
+            if BatchAttribute::try_from(inflated.attributes)?.control {
+                continue;
+            }
+
+            let keys = inflated.keys();
+            let compaction = inflated.compact(&head)?;
+            head.extend(keys);
+
+            if compaction.records == 0 {
+                continue;
+            }
+
+            removed_records += compaction.records as u64;
+
+            if compaction.batch.records.is_empty() {
+                tx.delete(raw_key)?;
+                _ = removed_offsets.insert(*offset);
+            } else {
+                let rewritten: Batch = compaction.batch.try_into()?;
+
+                let encoded = {
+                    let mut encoder = RecordBatchEncoder::new(BytesMut::new());
+                    rewritten.serialize(&mut encoder)?;
+                    Bytes::from(encoder)
+                };
+
+                tx.put(raw_key, &encoded[..])?;
+            }
+        }
+
+        if removed_records == 0 {
+            return Ok(0);
+        }
+
+        let mut watermark = self.partition_watermark(tx, metadata.id, partition).await?;
+
+        // Compaction leaves the log start where it is, as in Kafka,
+        // whose cleaner never moves it: a fetch below the first
+        // surviving batch steps over the gap to it, where moving the
+        // log start would answer OFFSET_OUT_OF_RANGE and reset the
+        // consumer. Only retention and DeleteRecords move it.
+
+        // The compaction rebuilds the time index from the surviving
+        // batches, in offset order, instead of deleting only the
+        // entries of removed batches. A removed batch can hold the
+        // only entry that covers a later, unindexed survivor, so a
+        // per-entry delete leaves a gap in the index. Kafka's
+        // LogCleaner also rebuilds the time index of a segment that
+        // it compacts.
+        self.delete_time_index(tx, metadata.id, partition).await?;
+        watermark.latest_indexed_timestamp = None;
+        watermark.last_batch_max_timestamp = None;
+
+        for (_, offset, batch) in batches
+            .iter()
+            .filter(|(_, offset, _)| !removed_offsets.contains(offset))
+        {
+            Self::append_time_index(
+                tx,
+                metadata.id,
+                partition,
+                *offset,
+                batch.max_timestamp,
+                &mut watermark,
+            )?;
+        }
+
+        let watermark_key = postcard::to_stdvec(&WatermarkKey::new(metadata.id, partition))?;
+        tx.put(&watermark_key, postcard::to_stdvec(&watermark)?)?;
+
+        Ok(removed_records)
+    }
+
+    /// Commit a maintenance transaction on `partition` and return whether
+    /// it committed.
+    ///
+    /// A write that commits to the partition while the transaction is open
+    /// makes the commit fail with a conflict. The conflict is logged at
+    /// `warn` and answered as `false`, instead of returned as an error,
+    /// because an error ends the tick before the partitions after this one
+    /// and before lake maintenance, so a partition under steady writes
+    /// would hold back the same partitions on every tick. The next tick
+    /// retries this partition. Any other error is returned.
+    pub(super) async fn commit_maintenance(
+        tx: slatedb::DbTransaction,
+        topic: &str,
+        partition: i32,
+    ) -> Result<bool> {
+        match tx.commit().await {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
+                warn!(
+                    topic,
+                    partition,
+                    ?err,
+                    "maintenance lost a conflict with a concurrent write; retrying on the next tick"
+                );
+                Ok(false)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }
 

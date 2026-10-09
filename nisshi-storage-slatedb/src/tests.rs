@@ -2649,6 +2649,138 @@ mod time_index {
         assert_eq!(Some(0), response.offset);
         assert_eq!(60, millis_since_epoch(response.timestamp.unwrap()));
     }
+
+    /// A produce that commits to the partition while the compaction reads
+    /// it makes the compaction's commit fail. The produce's batch and its
+    /// `t/` entry survive, nothing of the compaction is applied, and the
+    /// next tick compacts the partition.
+    #[tokio::test]
+    async fn compaction_that_loses_to_a_concurrent_produce_keeps_its_time_index_entry() {
+        let engine = create_test_engine().await;
+        let topition = topic_with_policy(
+            &engine,
+            "time-index-compact-conflict",
+            &[("cleanup.policy", "compact")],
+        )
+        .await;
+        let topic = topic_uuid(&engine, "time-index-compact-conflict").await;
+
+        for batch in [
+            keyed_batch(b"x", b"old", 100),
+            keyed_batch(b"y", b"only", 90),
+            keyed_batch(b"x", b"new", 110),
+        ] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        let topics = engine.get_topics().await.unwrap();
+        let metadata = topics.get("time-index-compact-conflict").unwrap();
+
+        let tx = engine
+            .db
+            .begin(slatedb::IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        assert_eq!(1, engine.compact_partition(&tx, metadata, 0).await.unwrap());
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"z", b"v", 120))
+            .await
+            .unwrap();
+
+        assert!(
+            !Engine::commit_maintenance(tx, &metadata.topic.name, 0)
+                .await
+                .unwrap()
+        );
+
+        // Offset 0 is still there, and the index holds the produce's entry:
+        // {100->0, 110->2, 120->3}.
+        assert_eq!(4, fetch_all(&engine, &topition).await.len());
+        assert_eq!(3, time_index_count(&engine, topic, 0).await);
+
+        let response = list_offsets_timestamp(&engine, &topition, 115).await;
+        assert_eq!(Some(3), response.offset);
+        assert_eq!(120, millis_since_epoch(response.timestamp.unwrap()));
+
+        engine.maintain(SystemTime::now()).await.unwrap();
+
+        // The next tick removes offset 0 and rebuilds the index from the
+        // survivors: {90->1, 110->2, 120->3}.
+        let batches = fetch_all(&engine, &topition).await;
+        assert_eq!(3, batches.len());
+        assert!(batches.iter().all(|batch| batch.base_offset != 0));
+        assert_eq!(3, time_index_count(&engine, topic, 0).await);
+
+        let response = list_offsets_timestamp(&engine, &topition, 115).await;
+        assert_eq!(Some(3), response.offset);
+        assert_eq!(120, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
+    /// A produce that commits to the partition while retention reads it
+    /// makes the retention's commit fail. The produce's batch and its `t/`
+    /// entry survive, the expired batches stay until the next tick, and the
+    /// next tick removes them.
+    #[tokio::test]
+    async fn retention_that_loses_to_a_concurrent_produce_keeps_its_time_index_entry() {
+        let engine = create_test_engine().await;
+        let topition = topic_with_policy(
+            &engine,
+            "time-index-retention-conflict",
+            &[("cleanup.policy", "delete"), ("retention.ms", "1000")],
+        )
+        .await;
+        let topic = topic_uuid(&engine, "time-index-retention-conflict").await;
+
+        for batch in [keyed_batch(b"a", b"v", 100), keyed_batch(b"b", b"v", 200)] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        let topics = engine.get_topics().await.unwrap();
+        let metadata = topics.get("time-index-retention-conflict").unwrap();
+        let now_ms = 10_000;
+
+        let tx = engine
+            .db
+            .begin(slatedb::IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            2,
+            engine
+                .delete_expired_prefix(&tx, metadata, 0, now_ms)
+                .await
+                .unwrap()
+        );
+
+        let _ = engine
+            .produce(None, &topition, keyed_batch(b"c", b"v", now_ms))
+            .await
+            .unwrap();
+
+        assert!(
+            !Engine::commit_maintenance(tx, &metadata.topic.name, 0)
+                .await
+                .unwrap()
+        );
+
+        // Nothing is deleted, and the index holds the produce's entry:
+        // {100->0, 200->1, 10000->2}.
+        assert_eq!(0, engine.offset_stage(&topition).await.unwrap().log_start);
+        assert_eq!(3, fetch_all(&engine, &topition).await.len());
+        assert_eq!(3, time_index_count(&engine, topic, 0).await);
+
+        engine.maintain(at_millis(now_ms)).await.unwrap();
+
+        // The next tick removes offsets 0 and 1 and prunes their entries.
+        assert_eq!(2, engine.offset_stage(&topition).await.unwrap().log_start);
+        assert_eq!(1, fetch_all(&engine, &topition).await.len());
+        assert_eq!(1, time_index_count(&engine, topic, 0).await);
+
+        let response = list_offsets_timestamp(&engine, &topition, 150).await;
+        assert_eq!(Some(2), response.offset);
+        assert_eq!(now_ms, millis_since_epoch(response.timestamp.unwrap()));
+    }
 }
 
 // ========== Builder Pattern Tests ==========
