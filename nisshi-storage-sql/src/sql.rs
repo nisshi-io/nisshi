@@ -363,6 +363,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/txn_select_name.sql"),
         ),
         (
+            "txn_select_name_for_update.sql",
+            include_sql!("sql/txn_select_name_for_update.sql"),
+        ),
+        (
             "txn_select_produced_topitions.sql",
             include_sql!("sql/txn_select_produced_topitions.sql"),
         ),

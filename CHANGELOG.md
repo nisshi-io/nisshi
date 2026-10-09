@@ -45,6 +45,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Logs write `[hidden]` in place of SASL auth bytes, SCRAM salted passwords, delegation token HMACs, stored SCRAM keys, and config values in `AlterConfigs` and `IncrementalAlterConfigs` requests, at every log level. Frames, record batches, record keys and values, and record header values are logged with the length of their bytes, not the bytes. SQL statements are logged without their parameters, and schema validation and lake conversion log the field and the kind of value, not the value.
 - `nisshi_schema::Error`: `AvroToJson` and `InvalidValue` hold an Avro `SchemaKind`, and `JsonToAvro` and `UnsupportedSchemaRuntimeValue` hold the kind of JSON value, in place of the value. `JsonToAvroFieldNotFound` no longer has a `value` field. The new `AvroRecord` variant reports an Avro record that fails to read or write against its schema, without the `apache_avro` error, whose message holds the record's values.
 - A broker on S3 or Google Cloud Storage exits at startup when it cannot list its cluster's prefix in the bucket, or when its AWS credential provider does not return a credential. The error names the storage URL and the cause. Previously the broker started and failed on its first request.
+- InitProducerId follows Apache Kafka 3.9.1 on every storage engine when a producer
+  sends its current producer ID and epoch to bump its epoch after an error (KIP-360):
+  - Without a transactional ID, the producer gets a new producer ID, whatever it
+    sends.
+  - With a transactional ID that has no producer yet, the broker creates one.
+  - With a transactional ID that has a producer, the broker bumps the epoch only
+    when the request has that producer's ID and current epoch. Otherwise it
+    answers `PRODUCER_FENCED`. On PostgreSQL, this replaces `UNKNOWN_PRODUCER_ID`
+    for an unknown producer ID.
+  - A request that sets only one of producer ID and epoch to -1 gets
+    `INVALID_REQUEST`.
+  - A failed InitProducerId answers producer ID and epoch -1, and the broker logs
+    the request at info.
+- Two differences from Apache Kafka remain. Kafka also accepts the previous epoch,
+  from a producer that retries a bump whose response it lost; the broker answers
+  `PRODUCER_FENCED`, and the producer must initialise again. Kafka answers
+  `INVALID_PRODUCER_EPOCH` instead of `PRODUCER_FENCED` to InitProducerId v3 and
+  older; the broker answers `PRODUCER_FENCED` at every version.
 - Releases no longer include an `x86_64-apple-darwin` (Intel macOS) binary. Apple silicon (`aarch64-apple-darwin`) is the only macOS build.
 
 ### Security
@@ -103,6 +121,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The broker no longer writes a Produce response for an `acks=0` request. A storage or validation failure on an `acks=0` Produce now closes the connection (matching Apache Kafka) instead of silently dropping the batch.
 - ListOffsets by timestamp now answers offset -1 and timestamp -1 with error NONE when no record has a timestamp at or after the target, as Apache Kafka does. The broker answered offset 0 before. That made the Java consumer's `offsetsForTimes()` throw `IllegalArgumentException: Invalid negative timestamp`, and it sent a client that seeks to the returned offset back to the start of the partition. A partition answered with an error code now also carries offset -1 instead of 0.
 - Fetch for a topic name that doesn't exist now answers `UNKNOWN_TOPIC_OR_PARTITION`. Before, `postgres://`, `sqlite://` and `slatedb://` brokers closed the connection, and `memory://` and `s3://` brokers waited out `max_wait` and then answered with no error. A fetch that names only unknown topics answers at once; one that also names an existing topic waits for that topic's data as usual. A fetch by topic id for an id that doesn't exist gets its requested id back instead of the null id, so a Java consumer on a deleted topic refreshes its metadata instead of fetching again.
+- InitProducerId v0 to v2 works on every storage engine. These versions do not
+  carry a producer ID or epoch. libSQL and Turso panicked on them, and on a
+  KIP-360 epoch bump, ending the connection. The object store engines
+  (`memory://`, `s3://`, `gs://`) answered `UNKNOWN_SERVER_ERROR`, and so did
+  SlateDB without a transactional ID.
+- On PostgreSQL, concurrent InitProducerId requests for one transactional ID
+  bump its epoch one at a time. Before, two of them could both succeed, and one
+  could fail with a storage error.
 - Fetch checks the fetch offset before it reaches the storage engine, so a storage engine never receives an offset such as `i64::MAX`. Above the high watermark, Fetch answers `NONE` with no records on every engine. Apache Kafka answers `NONE` only up to the log end offset and `OFFSET_OUT_OF_RANGE` above it; Nisshi answers `NONE` because a broker on dynostore can read a high watermark that lags a write through another broker. A consumer whose position is past the end of the log therefore waits there instead of applying `auto.offset.reset`. Such a consumer shows in `nisshi_fetch_offset_out_of_bounds` with `bound` set to `above_high_watermark`, counted once per poll round of a Fetch, so the counter shows whether parked fetches exist rather than how many; a short burst on dynostore with several brokers is expected.
 - SlateDB compaction no longer moves a partition's log start offset, as in Apache Kafka, whose cleaner never does. ListOffsets `earliest` and the `log_start_offset` in Fetch now stay at the log start through compaction, rather than moving to the first surviving batch.
 - Fetch no longer sends a `current_leader` hint with `UNKNOWN_TOPIC_OR_PARTITION`, as in Apache Kafka.
