@@ -110,35 +110,6 @@ fn producing_to_deleted_topic_recreates_it_empty() {
     );
 }
 
-/// Adding partitions must not move existing records, or a consumer that tracks its offset on
-/// each partition would skip records or read them twice. The new partitions start empty.
-#[test]
-#[ignore = "the broker doesn't support CreatePartitions"]
-fn alter_partitions_keeps_records_in_place() {
-    let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(3, &[]);
-
-    _ = cli.produce_keyed(
-        &topic,
-        &[("k0", Some("v0")), ("k1", Some("v1")), ("k2", Some("v2"))],
-    );
-
-    let before = records_on_each_partition(&cli, &topic);
-
-    _ = cli.alter_partitions(&topic, 6).succeeded();
-
-    let described = cli.describe_topic(&topic);
-    assert_eq!(
-        described.succeeded().partition_count(),
-        Some(6),
-        "{described}"
-    );
-
-    let after = records_on_each_partition(&cli, &topic);
-    assert_eq!(after[..3], before[..], "{after:?}");
-    assert!(after[3..].iter().all(Vec::is_empty), "{after:?}");
-}
-
 /// Like Apache Kafka with its default settings, the broker creates a topic when a producer writes
 /// to one that doesn't exist. It gives the topic [`AUTO_CREATE_PARTITIONS`] partitions, where
 /// Kafka gives it 1.

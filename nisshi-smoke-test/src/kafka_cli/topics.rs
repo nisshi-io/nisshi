@@ -100,14 +100,6 @@ impl KafkaCli {
         self.run(Tool::Topics, &["--describe", "--topic", topic])
     }
 
-    /// Raises `topic`'s partition count to `partitions`.
-    ///
-    /// Sends `CreatePartitions`.
-    pub fn alter_partitions(&self, topic: &str, partitions: u32) -> Output {
-        let partitions = format!("--partitions={partitions}");
-        self.run(Tool::Topics, &["--alter", "--topic", topic, &partitions])
-    }
-
     /// Sends `DeleteTopics`.
     pub fn delete_topic(&self, topic: &str) -> Output<DeleteTopic> {
         self.run(Tool::Topics, &["--delete", "--topic", topic])
