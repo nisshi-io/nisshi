@@ -216,7 +216,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
                     produce.serve(RequestInput {
                         request: ProduceRequest::default()
                             .transactional_id(None)
-                            .acks(0)
+                            .acks(1)
                             .timeout_ms(0)
                             .topic_data(batch_data(
                                 &topic,
@@ -716,7 +716,7 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
                     produce.serve(RequestInput {
                         request: ProduceRequest::default()
                             .transactional_id(None)
-                            .acks(0)
+                            .acks(1)
                             .timeout_ms(0)
                             .topic_data(batch_data(
                                 &topic,

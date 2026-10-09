@@ -298,7 +298,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
                     produce.serve(RequestInput {
                         request: ProduceRequest::default()
                             .transactional_id(None)
-                            .acks(0)
+                            .acks(1)
                             .timeout_ms(0)
                             .topic_data(batch_data(
                                 &topic,
@@ -334,7 +334,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
                     produce.serve(RequestInput {
                         request: ProduceRequest::default()
                             .transactional_id(None)
-                            .acks(0)
+                            .acks(1)
                             .timeout_ms(0)
                             .topic_data(batch_data(
                                 &topic,
@@ -372,7 +372,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
                     produce.serve(RequestInput {
                         request: ProduceRequest::default()
                             .transactional_id(None)
-                            .acks(0)
+                            .acks(1)
                             .timeout_ms(0)
                             .topic_data(batch_data(
                                 &topic,
