@@ -43,6 +43,16 @@ use crate::{KafkaCli, ScramLogin, StorageUrl, label, settings, timed_command, un
 /// How long a broker has to exit after SIGTERM.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long `docker run` has to start a broker container. `run.sh` pulls the image before the
+/// tests run, so this covers only creating and starting the container, and stays well under the
+/// time nextest gives a test before it kills it.
+const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The file in a process broker's directory that holds its process id until the harness has
+/// stopped it. nextest kills a test that runs too long with SIGKILL, which skips `Drop` and leaves
+/// the broker running; `run.sh` stops every broker whose file is still there when the run ends.
+const PID_FILE: &str = "broker.pid";
+
 /// A broker the tests talk to: the shared one `just smoke` started, or one
 /// of their own from [`Broker::isolated`].
 #[derive(Debug)]
@@ -389,6 +399,7 @@ impl Deployment {
         match self.host {
             Host::Process(mut child) => {
                 stop_process(&mut child, &mut failures);
+                _ = fs::remove_file(self.files.dir.join(PID_FILE));
             }
 
             Host::Container { name } => {
@@ -438,7 +449,9 @@ impl Deployment {
                     _ = child.kill();
                 }
 
-                child.wait().ok().and_then(|status| status.code())
+                let code = child.wait().ok().and_then(|status| status.code());
+                _ = fs::remove_file(self.files.dir.join(PID_FILE));
+                code
             }
 
             Host::Container { name } => {
@@ -575,10 +588,14 @@ fn launch_process(options: &LaunchOptions, dir: &Path, log: &Path) -> Result<Hos
         .stdout(output)
         .stderr(errors);
 
-    command
+    let child = command
         .spawn()
-        .map(Host::Process)
-        .map_err(|err| format!("could not start {}: {err}", binary.display()))
+        .map_err(|err| format!("could not start {}: {err}", binary.display()))?;
+
+    fs::write(dir.join(PID_FILE), child.id().to_string())
+        .unwrap_or_else(|err| panic!("{}: {err}", dir.join(PID_FILE).display()));
+
+    Ok(Host::Process(child))
 }
 
 /// Starts `image` in a container, with a SQLite broker's `volume` as its working directory.
@@ -613,7 +630,7 @@ fn launch_container(
 
     _ = command.arg(image).args(broker_args(options));
 
-    let started = timed_command::run(&mut command, None, Duration::from_secs(300));
+    let started = timed_command::run(&mut command, None, CONTAINER_START_TIMEOUT);
 
     if !matches!(&started, Ok(started) if started.code == Some(0)) {
         remove_container(&name);

@@ -67,8 +67,8 @@ started=false
 step="build the broker and the tests"
 
 # Writes one `name,PASS|FAIL|SKIP` row per test, the format the compat
-# suites' report reads. nextest prints a status line per test; the last one
-# wins. smoke-broker adds a shared_broker row for the broker and a suite row
+# suites' report reads. nextest prints a status line per test; a test with a
+# FAIL line stays failed whatever follows it. smoke-broker adds a shared_broker row for the broker and a suite row
 # for the nextest run as a whole. A run that stopped before it could write
 # them gets FAIL for both, so the file never shows a failed leg as green. A
 # run that stopped before nextest started also gets a FAIL row named for its step.
@@ -85,7 +85,9 @@ write_results() {
     awk -v failed_step="${failed_step}" '
         $1 ~ /^(PASS|FAIL|FLAKY|SKIP|TIMEOUT|ABORT|LEAK|LEAK-FAIL|SIG[A-Z]+)$/ && $2 ~ /^\[/ {
             outcome = ($1 == "PASS" || $1 == "FLAKY") ? "PASS" : ($1 == "SKIP" ? "SKIP" : "FAIL")
-            result[$NF] = outcome
+            # A test that failed once stays failed, even if a later line for the same name passes.
+            if (result[$NF] != "FAIL") result[$NF] = outcome
+            if (outcome == "PASS") passed++
             tests++
         }
         $1 == "smoke-broker:" && $2 == "result" { split($3, row, ","); result[row[1]] = row[2] }
@@ -95,6 +97,8 @@ write_results() {
             # release can change them. The leg fails when no line matches,
             # instead of showing green with no tests.
             else if (tests == 0) result["results: no test status line in the nextest log"] = "FAIL"
+            # A leg whose tests were all skipped checked nothing.
+            else if (passed == 0) result["results: no test passed"] = "FAIL"
             if (!("shared_broker" in result)) result["shared_broker"] = "FAIL"
             if (!("suite" in result)) result["suite"] = "FAIL"
             for (name in result) print name "," result[name]
@@ -119,6 +123,7 @@ write_results() {
 cleanup() (
     set +e
     write_results
+    stop_leftover_brokers
     docker ps --all --filter "label=nisshi-smoke=${NISSHI_SMOKE_RUN}" --filter name=nisshi-smoke-broker --format '{{.Names}}' |
         while read -r name; do
             docker logs "${name}" >"${results}/${name}.log" 2>&1
@@ -132,6 +137,26 @@ cleanup() (
 )
 trap cleanup EXIT
 
+# nextest kills a test that runs too long with SIGKILL, so the harness can't stop the broker
+# processes the test launched. Each process broker keeps its process id in a file in its directory
+# until the harness has stopped it, so a file still there names a broker that is still running.
+# Only cleanup calls stop_leftover_brokers (koalaman/shellcheck#2542).
+# shellcheck disable=SC2329
+stop_leftover_brokers() {
+    local pid_file pid
+    for pid_file in "${NISSHI_SMOKE_WORK_DIR:-${results}/brokers-${leg}}"/*/broker.pid; do
+        [[ -f "${pid_file}" ]] || continue
+        pid=$(<"${pid_file}")
+        # The process id can belong to another process by now, so only a broker is stopped.
+        case "$(ps -p "${pid}" -o command= 2>/dev/null)" in
+            *" broker --cluster-id="*)
+                echo "a test was killed while its broker ran as process ${pid} (${pid_file%/*}): stopping it" >&2
+                kill -KILL "${pid}"
+                ;;
+        esac
+    done
+}
+
 # Build before starting anything, so a slow build doesn't count against
 # a broker or a service that is already running.
 if [[ -z "${NISSHI_SMOKE_IMAGE:-}" && -z "${NISSHI_SMOKE_BIN:-}" ]]; then
@@ -140,6 +165,13 @@ if [[ -z "${NISSHI_SMOKE_IMAGE:-}" && -z "${NISSHI_SMOKE_BIN:-}" ]]; then
 fi
 # Building the tests also builds smoke-broker.
 cargo nextest run -p nisshi-smoke-test --features "${engine}" --no-run
+
+# The harness gives `docker run` a minute to start a broker container, which isn't enough to pull
+# the image as well, so the image is pulled here.
+step="pull the broker image"
+if [[ -n "${NISSHI_SMOKE_IMAGE:-}" ]] && ! docker image inspect "${NISSHI_SMOKE_IMAGE}" >/dev/null 2>&1; then
+    docker pull --quiet "${NISSHI_SMOKE_IMAGE}"
+fi
 
 # The services publish the same host ports as the default compose project,
 # so if the services from `just ci`, or another run on this engine, are
@@ -211,6 +243,7 @@ fi
 set +e
 "${target_dir}/debug/smoke-broker" -- \
     cargo nextest run -p nisshi-smoke-test --features "${engine}" --profile "${profile}" --run-ignored "${run_ignored}" \
+        --no-tests=fail \
         --color never --status-level all --final-status-level none \
     2>&1 | tee "${results}/nextest-${leg}.log"
 status=${PIPESTATUS[0]}
