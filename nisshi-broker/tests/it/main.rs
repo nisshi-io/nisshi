@@ -54,6 +54,7 @@ pub mod produce;
 pub mod produce_acks_zero;
 pub mod produce_fetch;
 pub mod sasl_scram_enforcement;
+pub mod startup_failure;
 pub mod storage_describe_cluster;
 pub mod storage_describe_configs;
 pub mod storage_fetch;

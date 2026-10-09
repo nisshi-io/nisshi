@@ -248,15 +248,26 @@ where
 
         let meter_provider = self.meter_provider.take();
 
-        _ = set.spawn(async move {
-            if let Err(err) = self.serve(started).await {
-                error!(?err);
-            }
-        });
+        _ = set.spawn(async move { self.serve(started).await });
+
+        // A serve task that ends on its own is a failed (or lost) broker: the
+        // process must exit non-zero so a supervisor restarts it.
+        let mut failure = None;
 
         let kind = tokio::select! {
             v = set.join_next() => {
                 debug!(?v);
+                failure = match v {
+                    Some(Ok(Err(err))) => {
+                        error!(?err);
+                        Some(err)
+                    }
+                    Some(Err(err)) => {
+                        error!(?err);
+                        Some(Error::from(err))
+                    }
+                    Some(Ok(Ok(()))) | None => None,
+                };
                 None
             }
 
@@ -320,7 +331,7 @@ where
             }
         }
 
-        Ok(ErrorCode::None)
+        failure.map_or(Ok(ErrorCode::None), Err)
     }
 
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
