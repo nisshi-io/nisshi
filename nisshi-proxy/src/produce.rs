@@ -24,7 +24,7 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    ProduceRequest, ProduceResponse, RequestInput,
+    Ack, ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::{
@@ -536,6 +536,8 @@ impl IntoIterator for BatchPartitionProduceResponse {
 fn produce_request(requests: Vec<BatchRequest>) -> ProduceRequest {
     debug!(?requests);
 
+    let acks = batch_acks(&requests);
+
     let mut run = TopicPartitionBatch::default();
     for request in requests {
         debug!(?request);
@@ -560,8 +562,26 @@ fn produce_request(requests: Vec<BatchRequest>) -> ProduceRequest {
     }
 
     ProduceRequest::default()
+        .acks(acks.into())
         .topic_data(Some(run.into_iter().collect::<Vec<_>>()))
         .timeout_ms(5_000)
+}
+
+/// Returns the `acks` for a batch: the strictest that any of its requests
+/// asked for, and at least [`Ack::Leader`].
+///
+/// The proxy waits for the origin's response to each batch, and an origin
+/// does not answer an `acks=0` Produce, so a batch never goes out at
+/// `acks=0`.
+fn batch_acks(requests: &[BatchRequest]) -> Ack {
+    if requests
+        .iter()
+        .any(|request| request.request.acks == i16::from(Ack::FullIsr))
+    {
+        Ack::FullIsr
+    } else {
+        Ack::Leader
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -949,7 +969,7 @@ mod tests {
             vec![
                 ProduceRequest::default()
                     .transactional_id(None)
-                    .acks(0)
+                    .acks(1)
                     .timeout_ms(5000)
                     .topic_data(Some(
                         [TopicProduceData::default()
@@ -1093,7 +1113,7 @@ mod tests {
             vec![
                 ProduceRequest::default()
                     .transactional_id(None)
-                    .acks(0)
+                    .acks(1)
                     .timeout_ms(5000)
                     .topic_data(Some(
                         [
@@ -1310,7 +1330,7 @@ mod tests {
             vec![
                 ProduceRequest::default()
                     .transactional_id(None)
-                    .acks(0)
+                    .acks(1)
                     .timeout_ms(5000)
                     .topic_data(Some(
                         [TopicProduceData::default()
@@ -1412,5 +1432,33 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn batch_request(acks: Ack) -> BatchRequest {
+        BatchRequest {
+            id: Uuid::now_v7(),
+            request: ProduceRequest::default().acks(acks.into()),
+        }
+    }
+
+    #[test]
+    fn batch_acks_is_at_least_leader() {
+        assert_eq!(Ack::Leader, batch_acks(&[batch_request(Ack::None)]));
+        assert_eq!(
+            Ack::Leader,
+            batch_acks(&[batch_request(Ack::None), batch_request(Ack::Leader)])
+        );
+    }
+
+    #[test]
+    fn batch_acks_is_the_strictest_in_the_batch() {
+        assert_eq!(
+            Ack::FullIsr,
+            batch_acks(&[
+                batch_request(Ack::None),
+                batch_request(Ack::FullIsr),
+                batch_request(Ack::Leader),
+            ])
+        );
     }
 }

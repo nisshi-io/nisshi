@@ -15,9 +15,16 @@
 use crate::{ByteSize, Decode, Encode, Result, record::codec::Octets};
 use bytes::{BufMut as _, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tracing::instrument;
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+/// A record header.
+///
+/// `Debug` writes `key` in full, because a header key names the header, and
+/// writes the length of `value`, not its content, as
+/// [`Record`](crate::record::Record) does. Kafka's `RecordHeader.toString`
+/// writes the value too; we don't, because a header value is record data.
+#[derive(Clone, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Header {
     #[serde(serialize_with = "Octets::serialize")]
     #[serde(deserialize_with = "Octets::deserialize")]
@@ -26,6 +33,15 @@ pub struct Header {
     #[serde(serialize_with = "Octets::serialize")]
     #[serde(deserialize_with = "Octets::deserialize")]
     pub value: Option<Bytes>,
+}
+
+impl fmt::Debug for Header {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Header")
+            .field("key", &self.key)
+            .field("value_len", &self.value.as_ref().map(Bytes::len))
+            .finish()
+    }
 }
 
 impl ByteSize for Header {

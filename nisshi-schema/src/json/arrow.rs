@@ -120,12 +120,12 @@ impl Schema {
                 .map(Fields::from)
                 .map(DataType::Struct),
         }
-        .inspect(|data_type| debug!(?path, ?value, ?data_type))
-        .inspect_err(|err| error!(?err, ?value))
+        .inspect(|data_type| debug!(?path, ?data_type))
+        .inspect_err(|err| error!(?err, ?path))
     }
 
     fn common_data_type(&self, path: &[&str], values: &[Value]) -> Result<DataType> {
-        debug!(?path, ?values);
+        debug!(?path, values = values.len());
 
         values
             .iter()
@@ -143,8 +143,8 @@ impl Schema {
                     Ok(DataType::Null)
                 }
             })
-            .inspect(|data_type| debug!(?path, ?values, ?data_type))
-            .inspect_err(|err| error!(?err, ?values))
+            .inspect(|data_type| debug!(?path, ?data_type))
+            .inspect_err(|err| error!(?err, ?path))
     }
 
     fn data_type_builder(&self, path: &[&str], data_type: &DataType) -> Box<dyn ArrayBuilder> {
@@ -227,7 +227,7 @@ fn append_list_builder(
                         builder.append_null()
                     }
                 })
-                .inspect_err(|err| error!(?value, ?err))?,
+                .inspect_err(|err| error!(?err))?,
 
             (DataType::Int64, Value::Number(value)) if value.is_i64() => values
                 .downcast_mut::<Int64Builder>()
@@ -239,7 +239,7 @@ fn append_list_builder(
                         builder.append_null()
                     }
                 })
-                .inspect_err(|err| error!(?value, ?err))?,
+                .inspect_err(|err| error!(?err))?,
 
             (DataType::Float64, Value::Number(value)) if value.is_f64() => values
                 .downcast_mut::<Float64Builder>()
@@ -251,7 +251,7 @@ fn append_list_builder(
                         builder.append_null()
                     }
                 })
-                .inspect_err(|err| error!(?value, ?err))?,
+                .inspect_err(|err| error!(?err))?,
 
             (_, Value::String(value)) => values
                 .downcast_mut::<StringBuilder>()
@@ -261,18 +261,18 @@ fn append_list_builder(
             (DataType::List(element), Value::Array(items)) => values
                 .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
                 .ok_or(Error::Downcast)
-                .inspect_err(|err| error!(?err, ?element, ?items))
+                .inspect_err(|err| error!(?err, ?element, items = items.len()))
                 .and_then(|builder| append_list_builder(element.to_owned(), items, builder))?,
 
             (DataType::Struct(fields), Value::Object(object)) => values
                 .downcast_mut::<StructBuilder>()
                 .ok_or(Error::Downcast)
-                .inspect_err(|err| error!(?err, ?fields, ?object))
+                .inspect_err(|err| error!(?err, ?fields, object = object.len()))
                 .and_then(|builder| append_struct_builder(fields, object, builder))?,
 
             (data_type, value) => Err(Error::UnsupportedSchemaRuntimeValue(
                 data_type.to_owned(),
-                value,
+                crate::json_kind(&value),
             ))?,
         }
     }
@@ -287,7 +287,7 @@ fn append_struct_builder(
     mut object: Map<String, Value>,
     builder: &mut StructBuilder,
 ) -> Result<()> {
-    debug!(?fields, ?object);
+    debug!(?fields, object = object.len());
 
     for (index, field) in fields.iter().enumerate() {
         if let Some(value) = object.remove(field.name()) {
@@ -314,7 +314,7 @@ fn append_struct_builder(
                             builder.append_null()
                         }
                     })
-                    .inspect_err(|err| error!(?field, ?value, ?err))?,
+                    .inspect_err(|err| error!(?field, ?err))?,
 
                 (DataType::Int64, Value::Number(value)) if value.is_i64() => builder
                     .field_builder::<Int64Builder>(index)
@@ -358,7 +358,7 @@ fn append_struct_builder(
 
                 (data_type, value) => Err(Error::UnsupportedSchemaRuntimeValue(
                     data_type.to_owned(),
-                    value,
+                    crate::json_kind(&value),
                 ))?,
             }
         }
@@ -370,7 +370,7 @@ fn append_struct_builder(
 }
 
 fn append(field: &Field, value: Value, builder: &mut dyn ArrayBuilder) -> Result<()> {
-    debug!(?field, ?value, builder = type_name_of_val(builder));
+    debug!(?field, builder = type_name_of_val(builder));
 
     match (field.data_type(), value) {
         (DataType::Null, _) => builder
@@ -396,7 +396,7 @@ fn append(field: &Field, value: Value, builder: &mut dyn ArrayBuilder) -> Result
                     builder.append_null()
                 }
             })
-            .inspect_err(|err| error!(?field, ?value, ?err)),
+            .inspect_err(|err| error!(?field, ?err)),
 
         (DataType::Int64, Value::Number(value)) if value.is_i64() => builder
             .as_any_mut()
@@ -432,25 +432,25 @@ fn append(field: &Field, value: Value, builder: &mut dyn ArrayBuilder) -> Result
             .as_any_mut()
             .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?element, ?items))
+            .inspect_err(|err| error!(?err, ?element, items = items.len()))
             .and_then(|builder| append_list_builder(element.to_owned(), items, builder)),
 
         (DataType::Struct(fields), Value::Object(object)) => builder
             .as_any_mut()
             .downcast_mut::<StructBuilder>()
             .ok_or(Error::Downcast)
-            .inspect_err(|err| error!(?err, ?fields, ?object))
+            .inspect_err(|err| error!(?err, ?fields, object = object.len()))
             .and_then(|builder| append_struct_builder(fields, object, builder)),
 
         (data_type, value) => Err(Error::UnsupportedSchemaRuntimeValue(
             data_type.to_owned(),
-            value,
+            crate::json_kind(&value),
         ))?,
     }
 }
 
 impl AsArrow for Schema {
-    #[instrument(skip(self, batch), ret)]
+    #[instrument(skip(self, batch))]
     async fn as_arrow(
         &self,
         topic: &str,
@@ -581,7 +581,7 @@ impl AsArrow for Schema {
                 let (field, builder) = i
                     .next()
                     .ok_or_else(|| Error::Message("fields/builders out of sync".into()))?;
-                debug!(%key, ?field);
+                debug!(?field);
                 append(field, key, builder)?;
             }
 
@@ -589,7 +589,7 @@ impl AsArrow for Schema {
                 let (field, builder) = i
                     .next()
                     .ok_or_else(|| Error::Message("fields/builders out of sync".into()))?;
-                debug!(%value, ?field);
+                debug!(?field);
                 append(field, value, builder)?;
             }
         }

@@ -1,0 +1,290 @@
+---
+name: tier-c
+
+# Tier C is the optional nightly tier. It runs the checks that are too slow
+# or too unstable to gate a merge: the compat suites on the S3 engine, and
+# the `test` suite on more Postgres versions, including one beta.
+#
+# Tier C does not gate anything. It is not in the `needs` of ci-gate and it is
+# not a required check. A red run opens or updates one GitHub issue with the
+# `nightly-failure` label. The next green run closes that issue.
+#
+# The workflow runs on main only. Each job checks the ref, so a manual run
+# from another ref does nothing.
+permissions:
+  contents: read
+on:
+  schedule:
+    # 03:17 UTC. An off-peak hour that is not on the hour, so the run does
+    # not queue with the many scheduled workflows that start at :00.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+# Two Tier C runs on one ref must not overlap: both write to the same issue.
+# A run that arrives while another runs waits. GitHub keeps one waiting run
+# per group, so a newer run replaces the one that waits. A running job is
+# never cancelled. The group includes the ref, so a manual run from another
+# ref cannot replace the scheduled run on main.
+concurrency:
+  group: tier-c-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CLICOLOR: 1
+  # A pinned release and its published checksum for duckdb_cli-linux-amd64.gz,
+  # the same pin that ci.yml uses for its report jobs.
+  DUCKDB_VERSION: "1.5.6"
+  DUCKDB_SHA256: cce2687a38681db644c248198b99ecd86170ff47e324c5f33e50c0042f142839
+jobs:
+  test:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # A beta image can fail for a reason that is not a defect in nisshi. The
+    # beta leg reports its result and does not turn the run red.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pg: postgres:16
+            experimental: false
+          - pg: postgres:17
+            experimental: false
+          # Docker Hub has no tag that follows the latest beta, so a person
+          # moves this tag to the next beta, and to the release when it ships.
+          - pg: postgres:19beta4
+            experimental: true
+    env:
+      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: true
+      AWS_DEFAULT_REGION: eu-west-2
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLUSTER_ID: nisshi-ci
+      DATA_LAKE: s3://lake
+      ICEBERG_CATALOG: http://localhost:8181/catalog
+      ICEBERG_WAREHOUSE: nisshi
+      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
+      NEXTEST_PROFILE: ci
+      POSTGRES_IMAGE: ${{matrix.pg}}
+      PROMETHEUS_LISTENER_URL: tcp://[::]:9100
+      RUST_BACKTRACE: 1
+      RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
+      SCHEMA_REGISTRY: file://./etc/schema
+      STORAGE_ENGINE: s3://nisshi/
+      NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi
+    steps:
+      - run: echo "PG_IMAGE_DASH=${POSTGRES_IMAGE/:/-}" >> "$GITHUB_ENV"
+      - run: df -h
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - run: just ci
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy, rustfmt
+          # These legs read the cache that the `test` job in ci.yml saves on
+          # main. That needs the same job id, `test`, and the same values of
+          # every `RUST*` and `CARGO*` variable as that job, because the
+          # cache key hashes them. A mismatch gives a cold build. This
+          # workflow never saves, because a save here would replace the cache
+          # that ci.yml restores on every pull request.
+          cache-save-if: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+      - run: just test
+      - run: df -h
+        if: always()
+      - run: tar --create --verbose --gzip --file="logs-${PG_IMAGE_DASH}.tar.gz" logs
+        if: always()
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: logs-${{env.PG_IMAGE_DASH}}.tar.gz
+          path: logs-${{env.PG_IMAGE_DASH}}.tar.gz
+          if-no-files-found: error
+  compat-librdkafka:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: true
+      AWS_DEFAULT_REGION: eu-west-2
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLUSTER_ID: librdkafka-integration
+      LAKEKEEPER_IMAGE: unused
+      RESULTS_FILE: results-s3.csv
+      RUST_BACKTRACE: 1
+      RUST_LOG: warn
+      STORAGE_ENGINE: s3://nisshi/
+      STORAGE_FEATURES: dynostore
+      NISSHI_IMAGE: hello-world
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+      - run: just compat-infra-up
+      - run: just compat-librdkafka "$STORAGE_ENGINE" "$STORAGE_FEATURES"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compat-librdkafka-results-s3
+          path: ${{env.RESULTS_FILE}}
+          if-no-files-found: warn
+  compat-librdkafka-report:
+    if: always() && github.ref == 'refs/heads/main'
+    needs: [compat-librdkafka]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/scripts/pivot-integration-report.sql
+          sparse-checkout-cone-mode: false
+          path: reports
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: compat-librdkafka-results-*
+          path: results
+          merge-multiple: true
+      - name: Install duckdb (pinned version, checksum-verified)
+        run: |
+          curl -fsSL -o duckdb_cli.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.gz"
+          echo "${DUCKDB_SHA256}  duckdb_cli.gz" | sha256sum -c -
+          mkdir -p "${DUCKDB_CLI}"
+          gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
+          chmod +x "${DUCKDB_CLI}/duckdb"
+      - run: echo "## librdkafka compatibility report card (s3)" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
+  compat-franz-go:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: true
+      AWS_DEFAULT_REGION: eu-west-2
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLUSTER_ID: librdkafka-integration
+      LAKEKEEPER_IMAGE: unused
+      RESULTS_FILE: results-s3.csv
+      RUST_BACKTRACE: 1
+      RUST_LOG: warn
+      STORAGE_ENGINE: s3://nisshi/
+      STORAGE_FEATURES: dynostore
+      NISSHI_IMAGE: hello-world
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+      - run: just compat-infra-up
+      - run: just compat-franz-go "$STORAGE_ENGINE" "$STORAGE_FEATURES"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compat-franz-go-results-s3
+          path: ${{env.RESULTS_FILE}}
+          if-no-files-found: warn
+  compat-franz-go-report:
+    if: always() && github.ref == 'refs/heads/main'
+    needs: [compat-franz-go]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/scripts/pivot-integration-report.sql
+          sparse-checkout-cone-mode: false
+          path: reports
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: compat-franz-go-results-*
+          path: results
+          merge-multiple: true
+      - name: Install duckdb (pinned version, checksum-verified)
+        run: |
+          curl -fsSL -o duckdb_cli.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.gz"
+          echo "${DUCKDB_SHA256}  duckdb_cli.gz" | sha256sum -c -
+          mkdir -p "${DUCKDB_CLI}"
+          gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
+          chmod +x "${DUCKDB_CLI}/duckdb"
+      - run: echo "## franz-go compatibility report card (s3)" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
+  alert:
+    # This job reads the result of each job above. A beta leg that fails does
+    # not change the result of `test`, so it does not raise an alert.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    needs: [test, compat-librdkafka, compat-franz-go]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The job writes to issues and nothing else. It has no checkout, so
+    # `gh` gets the repository from GH_REPO.
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      NEEDS_JSON: ${{ toJSON(needs) }}
+      LABEL: nightly-failure
+    steps:
+      - name: Open, update, or close the nightly-failure issue
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          failed="$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"${NEEDS_JSON}")"
+          open_issue="$(gh issue list --label "${LABEL}" --state open --limit 1 --json number --jq '.[0].number // empty')"
+
+          if [ -n "${failed}" ]; then
+            gh label create "${LABEL}" --force \
+              --color B60205 \
+              --description "The nightly Tier C run failed"
+            body="The nightly run failed in: $(tr '\n' ' ' <<<"${failed}")"$'\n\n'"Run: ${run_url}"
+            if [ -n "${open_issue}" ]; then
+              gh issue comment "${open_issue}" --body "${body}"
+            else
+              gh issue create --label "${LABEL}" \
+                --title "Nightly Tier C run failed" \
+                --body "${body}"$'\n\n'"This issue closes when a nightly run passes. Later failures add a comment here."
+            fi
+          elif [ -n "${open_issue}" ]; then
+            gh issue close "${open_issue}" --comment "The nightly run passed: ${run_url}"
+          fi

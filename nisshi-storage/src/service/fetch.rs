@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::min, time::SystemTime};
+use std::{cmp::min, sync::LazyLock, time::SystemTime};
 
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput,
@@ -21,11 +21,31 @@ use nisshi_sans_io::{
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
+use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, METER, OffsetStage, Result, Storage, Topition};
+
+/// Partition reads whose fetch offset falls outside the partition, by
+/// `topic` and by `bound`: `below_log_start` (answered with
+/// `OFFSET_OUT_OF_RANGE`, once per Fetch) or `above_high_watermark`
+/// (answered with `NONE` and no records). The second does not end the wait
+/// for `max_wait`, so one Fetch counts once per poll round: its rate follows
+/// storage latency, not the number of parked consumers, and on dynostore
+/// with several brokers it also counts, for the life of a cached high
+/// watermark, consumers that are only ahead of a stale one.
+static FETCH_OFFSET_OUT_OF_BOUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_fetch_offset_out_of_bounds")
+        .with_description(
+            "Partition reads whose fetch offset is below the log start (once per Fetch) or above \
+             the high watermark (once per poll round: shows only whether parked fetches exist; \
+             a short burst on multi-broker dynostore is expected)",
+        )
+        .build()
+});
 
 /// A [`Service`] using its [`Storage`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```no_run
@@ -143,9 +163,81 @@ where
         let partition_index = fetch_partition.partition;
         let tp = Topition::new(topic, partition_index);
 
+        // The fetch offset comes from the client, and storage may build a key
+        // range from it, so the offset is checked against the partition
+        // before it reaches storage. The bounds are the same for every
+        // isolation level, as in Kafka.
+        let offset_stage = self
+            .storage
+            .offset_stage(&tp)
+            .await
+            .inspect_err(|error| error!(?error, ?tp))?;
+
+        let fetch_offset = fetch_partition.fetch_offset;
+
+        // Below the log start offset the records are gone, so Kafka answers
+        // OFFSET_OUT_OF_RANGE, and the client applies `auto.offset.reset`.
+        // The answer does not wait for `max_wait`, so a client that keeps
+        // fetching this offset does so at round-trip speed: the counter, not
+        // a log line per fetch, is what makes it visible.
+        if fetch_offset < offset_stage.log_start() {
+            debug!(
+                topic,
+                partition = partition_index,
+                fetch_offset,
+                log_start = offset_stage.log_start(),
+                high_watermark = offset_stage.high_watermark(),
+                "fetch offset is below the log start",
+            );
+
+            FETCH_OFFSET_OUT_OF_BOUNDS.add(
+                1,
+                &[
+                    KeyValue::new("topic", topic.to_owned()),
+                    KeyValue::new("bound", "below_log_start"),
+                ],
+            );
+
+            return Ok(Self::offset_out_of_range(partition_index));
+        }
+
+        // Above the high watermark, every engine answers NONE with no
+        // records. Kafka does so only up to the log end offset, and answers
+        // OFFSET_OUT_OF_RANGE above it:
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L368-L371
+        // This is a deliberate difference. On dynostore, the high watermark
+        // that this broker reads can lag a write through another broker, so
+        // a client can be ahead of it, and an error would reset the client's
+        // position. One rule for every engine keeps the answer independent
+        // of the engine. The consequence: a consumer whose position is past
+        // the end of the log (after a restore, or a seek past the end) never
+        // applies `auto.offset.reset`. It resumes at its position once the
+        // log reaches it, and skips the records written below that position.
+        // The counter makes such a parked consumer visible.
+        if fetch_offset > offset_stage.high_watermark() {
+            debug!(
+                topic,
+                partition = partition_index,
+                fetch_offset,
+                log_start = offset_stage.log_start(),
+                high_watermark = offset_stage.high_watermark(),
+                "fetch offset is above the high watermark",
+            );
+
+            FETCH_OFFSET_OUT_OF_BOUNDS.add(
+                1,
+                &[
+                    KeyValue::new("topic", topic.to_owned()),
+                    KeyValue::new("bound", "above_high_watermark"),
+                ],
+            );
+
+            return Ok(Self::partition_data(partition_index, offset_stage, vec![]));
+        }
+
         let mut batches = Vec::new();
 
-        let mut offset = fetch_partition.fetch_offset;
+        let mut offset = fetch_offset;
 
         loop {
             if *max_bytes == 0 {
@@ -200,13 +292,38 @@ where
             }
         }
 
-        let offset_stage = self
-            .storage
-            .offset_stage(&tp)
-            .await
-            .inspect_err(|error| error!(?error, ?tp))?;
+        // While there are no records, or they end at or below the stage read
+        // before the fetch (a consumer catching up), that stage answers
+        // the client: its offsets only grow, and the next fetch reads them
+        // again. The bound is the one the engine reads to: the last stable
+        // offset under ReadCommitted, which a transaction completing during
+        // the fetch can move, and the high watermark otherwise. Records past
+        // it were written or committed since, so the stage is read again,
+        // so that the answer covers them.
+        let covered_to = match isolation {
+            IsolationLevel::ReadCommitted => offset_stage.last_stable(),
+            IsolationLevel::ReadUncommitted => offset_stage.high_watermark(),
+        };
 
-        Ok(PartitionData::default()
+        let offset_stage = if batches.is_empty() || offset <= covered_to {
+            offset_stage
+        } else {
+            self.storage
+                .offset_stage(&tp)
+                .await
+                .inspect_err(|error| error!(?error, ?tp))?
+        };
+
+        Ok(Self::partition_data(partition_index, offset_stage, batches))
+            .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+    }
+
+    fn partition_data(
+        partition_index: i32,
+        offset_stage: OffsetStage,
+        batches: Vec<Batch>,
+    ) -> PartitionData {
+        PartitionData::default()
             .partition_index(partition_index)
             .error_code(ErrorCode::None.into())
             .high_watermark(offset_stage.high_watermark())
@@ -221,8 +338,24 @@ where
                 None
             } else {
                 Some(Frame { batches })
-            }))
-        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+            })
+    }
+
+    /// The partition answer for a fetch offset outside the partition, with
+    /// the unknown (-1) offsets that Kafka sends alongside this error.
+    fn offset_out_of_range(partition_index: i32) -> PartitionData {
+        PartitionData::default()
+            .partition_index(partition_index)
+            .error_code(ErrorCode::OffsetOutOfRange.into())
+            .high_watermark(-1)
+            .last_stable_offset(Some(-1))
+            .log_start_offset(Some(-1))
+            .diverging_epoch(None)
+            .current_leader(None)
+            .snapshot_id(None)
+            .aborted_transactions(Some([].into()))
+            .preferred_read_replica(Some(-1))
+            .records(None)
     }
 
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
@@ -570,7 +703,10 @@ impl ByteSize for FetchableTopicResponse {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::SystemTime,
     };
 
@@ -596,6 +732,8 @@ mod tests {
     use tokio::time::{Duration, advance};
     use url::Url;
     use uuid::Uuid;
+
+    use nisshi_sans_io::fetch_response::PartitionData;
 
     use super::FetchService;
     use crate::{
@@ -630,16 +768,41 @@ mod tests {
     /// and remaining `max_wait` of each call, and optionally advances the
     /// (paused) clock past the deadline on the first call, as an engine
     /// that spends the whole budget assembling one truncated batch does.
+    /// Each read of the offset stage moves its last stable offset and high
+    /// watermark up by `stage_growth`, as writes during a fetch do, so a
+    /// test can tell which read answered.
     #[derive(Clone, Debug)]
     struct Scripted {
         responses: Arc<Mutex<Vec<Vec<deflated::Batch>>>>,
         calls: Arc<Mutex<Vec<(i64, Duration)>>>,
         consume_budget_on_first_call: Option<Duration>,
+        offset_stage: OffsetStage,
+        offset_stage_reads: Arc<AtomicUsize>,
+        stage_growth: i64,
     }
 
     impl Scripted {
+        fn new(responses: Vec<Vec<deflated::Batch>>, offset_stage: OffsetStage) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+                calls: Arc::new(Mutex::new(vec![])),
+                consume_budget_on_first_call: None,
+                offset_stage,
+                offset_stage_reads: Arc::new(AtomicUsize::new(0)),
+                stage_growth: 0,
+            }
+        }
+
         fn calls(&self) -> Vec<(i64, Duration)> {
             self.calls.lock().expect("calls").clone()
+        }
+
+        fn call_offsets(&self) -> Vec<i64> {
+            self.calls().into_iter().map(|(offset, _)| offset).collect()
+        }
+
+        fn offset_stage_reads(&self) -> usize {
+            self.offset_stage_reads.load(Ordering::SeqCst)
         }
     }
 
@@ -682,10 +845,13 @@ mod tests {
         }
 
         async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
+            let reads = self.offset_stage_reads.fetch_add(1, Ordering::SeqCst);
+            let growth = self.stage_growth * i64::try_from(reads)?;
+
             Ok(OffsetStage {
-                last_stable: 1_000,
-                high_watermark: 1_000,
-                log_start: 0,
+                last_stable: self.offset_stage.last_stable + growth,
+                high_watermark: self.offset_stage.high_watermark + growth,
+                ..self.offset_stage
             })
         }
 
@@ -917,11 +1083,19 @@ mod tests {
         }
     }
 
-    async fn fetch_partition(
+    const OFFSET_STAGE: OffsetStage = OffsetStage {
+        last_stable: 1_000,
+        high_watermark: 1_000,
+        log_start: 0,
+    };
+
+    async fn fetch_partition_at(
         storage: Scripted,
         max_wait: Duration,
         max_bytes: u32,
-    ) -> Result<Vec<deflated::Batch>> {
+        isolation: IsolationLevel,
+        fetch_offset: i64,
+    ) -> Result<PartitionData> {
         let mut remaining = max_bytes;
 
         FetchService { storage }
@@ -929,20 +1103,35 @@ mod tests {
                 max_wait,
                 1,
                 &mut remaining,
-                IsolationLevel::ReadUncommitted,
+                isolation,
                 "abc",
                 &FetchPartition::default()
                     .partition(0)
-                    .fetch_offset(0)
+                    .fetch_offset(fetch_offset)
                     .partition_max_bytes(max_bytes as i32),
             )
             .await
-            .map(|partition| {
-                partition
-                    .records
-                    .map(|frame| frame.batches)
-                    .unwrap_or_default()
-            })
+    }
+
+    async fn fetch_partition(
+        storage: Scripted,
+        max_wait: Duration,
+        max_bytes: u32,
+    ) -> Result<Vec<deflated::Batch>> {
+        fetch_partition_at(
+            storage,
+            max_wait,
+            max_bytes,
+            IsolationLevel::ReadUncommitted,
+            0,
+        )
+        .await
+        .map(|partition| {
+            partition
+                .records
+                .map(|frame| frame.batches)
+                .unwrap_or_default()
+        })
     }
 
     /// Engines that rebuild batches from rows stop assembling at the
@@ -961,9 +1150,8 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
 
         let storage = Scripted {
-            responses: Arc::new(Mutex::new(responses)),
-            calls: Arc::new(Mutex::new(vec![])),
             consume_budget_on_first_call: Some(max_wait),
+            ..Scripted::new(responses, OFFSET_STAGE)
         };
 
         let batches = fetch_partition(storage.clone(), max_wait, 1024 * 1024).await?;
@@ -989,23 +1177,327 @@ mod tests {
         // records at offsets 0 and 3 (1 and 2 compacted away), then nothing
         let responses = vec![vec![batch(0, &[0, 3])?], vec![]];
 
-        let storage = Scripted {
-            responses: Arc::new(Mutex::new(responses)),
-            calls: Arc::new(Mutex::new(vec![])),
-            consume_budget_on_first_call: None,
-        };
+        let storage = Scripted::new(responses, OFFSET_STAGE);
 
         let batches = fetch_partition(storage.clone(), max_wait, 1024 * 1024).await?;
 
         assert_eq!(1, batches.len());
-        assert_eq!(
-            vec![0, 4],
-            storage
-                .calls()
-                .into_iter()
-                .map(|(offset, _)| offset)
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(vec![0, 4], storage.call_offsets());
+
+        Ok(())
+    }
+
+    /// A partition whose log starts at 100, whose last stable offset is
+    /// 500, and whose high watermark is 1,000.
+    fn bounded() -> Scripted {
+        Scripted::new(
+            vec![],
+            OffsetStage {
+                last_stable: 500,
+                high_watermark: 1_000,
+                log_start: 100,
+            },
+        )
+    }
+
+    /// A fetch offset below the log start is answered with
+    /// `OFFSET_OUT_OF_RANGE` and never reaches storage, which may build an
+    /// invalid key range from it (a negative offset, as a big-endian key).
+    #[tokio::test(start_paused = true)]
+    async fn below_log_start_is_out_of_range() -> Result<()> {
+        for fetch_offset in [i64::MIN, -5, -1, 0, 99] {
+            let storage = bounded();
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                IsolationLevel::ReadUncommitted,
+                fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::OffsetOutOfRange,
+                ErrorCode::try_from(partition.error_code)?,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(-1, partition.high_watermark, "fetch at {fetch_offset}");
+            assert_eq!(
+                Some(-1),
+                partition.last_stable_offset,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(
+                Some(-1),
+                partition.log_start_offset,
+                "fetch at {fetch_offset}"
+            );
+            assert!(partition.records.is_none(), "fetch at {fetch_offset}");
+            assert!(
+                storage.calls().is_empty(),
+                "fetch at {fetch_offset} reached storage: {:?}",
+                storage.calls()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A fetch offset above the high watermark is answered with `NONE` and
+    /// no records, on every engine. Kafka does so only up to the log end
+    /// offset; here the high watermark that a broker reads can lag a write
+    /// through another broker (dynostore). The offset never reaches
+    /// storage, which may build an invalid key range from it (`i64::MAX`,
+    /// as a big-endian key).
+    #[tokio::test(start_paused = true)]
+    async fn above_high_watermark_answers_none_without_storage() -> Result<()> {
+        for fetch_offset in [1_001, i64::MAX] {
+            let storage = bounded();
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                IsolationLevel::ReadUncommitted,
+                fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(partition.error_code)?,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(1_000, partition.high_watermark, "fetch at {fetch_offset}");
+            assert_eq!(Some(500), partition.last_stable_offset);
+            assert_eq!(Some(100), partition.log_start_offset);
+            assert!(partition.records.is_none(), "fetch at {fetch_offset}");
+            assert!(
+                storage.calls().is_empty(),
+                "fetch at {fetch_offset} reached storage: {:?}",
+                storage.calls()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The log start offset and the high watermark are both valid fetch
+    /// offsets: the first is the oldest record, the second the next one to
+    /// be written, where a caught-up consumer waits.
+    #[tokio::test(start_paused = true)]
+    async fn boundary_offsets_reach_storage() -> Result<()> {
+        for fetch_offset in [100, 1_000] {
+            let storage = bounded();
+            storage.responses.lock()?.push(vec![]);
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                IsolationLevel::ReadUncommitted,
+                fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(partition.error_code)?,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(1_000, partition.high_watermark);
+            assert_eq!(Some(100), partition.log_start_offset);
+            assert_eq!(vec![fetch_offset], storage.call_offsets());
+        }
+
+        Ok(())
+    }
+
+    /// The upper bound is the high watermark for every isolation level: a
+    /// `ReadCommitted` fetch between the last stable offset and the high
+    /// watermark reaches storage, which bounds it by the last stable offset.
+    #[tokio::test(start_paused = true)]
+    async fn read_committed_above_last_stable_reaches_storage() -> Result<()> {
+        for fetch_offset in [700, 1_000] {
+            let storage = bounded();
+            storage.responses.lock()?.push(vec![]);
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                IsolationLevel::ReadCommitted,
+                fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(partition.error_code)?,
+                "fetch at {fetch_offset}"
+            );
+            assert_eq!(vec![fetch_offset], storage.call_offsets());
+        }
+
+        Ok(())
+    }
+
+    /// A fetch whose records end at or below the high watermark read for
+    /// the bounds check (none at all, as for an idle consumer on every long
+    /// poll, or a consumer catching up) reads the offset stage once, for
+    /// both the check and the answer. A fetch whose records reach past that
+    /// high watermark reads the stage again, so that the answer covers them.
+    /// The stage grows by 10 on each read, so the answered offsets show
+    /// which read answered.
+    #[tokio::test(start_paused = true)]
+    async fn offset_stage_reads() -> Result<()> {
+        const GROWTH: i64 = 10;
+
+        struct Case {
+            name: &'static str,
+            responses: Vec<Vec<deflated::Batch>>,
+            stage: OffsetStage,
+            isolation: IsolationLevel,
+            fetch_offset: i64,
+            reads: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "idle",
+                responses: vec![vec![]],
+                stage: OFFSET_STAGE,
+                isolation: IsolationLevel::ReadUncommitted,
+                fetch_offset: 1_000,
+                reads: 1,
+            },
+            Case {
+                name: "catching up",
+                responses: vec![vec![batch(0, &[0])?], vec![]],
+                stage: OFFSET_STAGE,
+                isolation: IsolationLevel::ReadUncommitted,
+                fetch_offset: 0,
+                reads: 1,
+            },
+            // records up to offset 3, past a high watermark of 1
+            Case {
+                name: "past the high watermark",
+                responses: vec![vec![batch(0, &[0, 3])?], vec![]],
+                stage: OffsetStage {
+                    last_stable: 1,
+                    high_watermark: 1,
+                    log_start: 0,
+                },
+                isolation: IsolationLevel::ReadUncommitted,
+                fetch_offset: 0,
+                reads: 2,
+            },
+            // the last record is at 999, so the next offset is the high
+            // watermark, which covers it
+            Case {
+                name: "ending at the high watermark",
+                responses: vec![vec![batch(996, &[0, 3])?], vec![]],
+                stage: OFFSET_STAGE,
+                isolation: IsolationLevel::ReadUncommitted,
+                fetch_offset: 996,
+                reads: 1,
+            },
+            // the last record is at 1,000, one past what the high watermark
+            // covers
+            Case {
+                name: "ending one past the high watermark",
+                responses: vec![vec![batch(997, &[0, 3])?], vec![]],
+                stage: OFFSET_STAGE,
+                isolation: IsolationLevel::ReadUncommitted,
+                fetch_offset: 997,
+                reads: 2,
+            },
+            // under ReadCommitted, records past the last stable offset read
+            // before the fetch (a transaction completed meanwhile) read the
+            // stage again, though they end below the high watermark
+            Case {
+                name: "committed during the fetch",
+                responses: vec![vec![batch(0, &[0, 3])?], vec![]],
+                stage: OffsetStage {
+                    last_stable: 1,
+                    high_watermark: 1_000,
+                    log_start: 0,
+                },
+                isolation: IsolationLevel::ReadCommitted,
+                fetch_offset: 0,
+                reads: 2,
+            },
+            // under ReadCommitted, a fetch between the last stable offset
+            // and the high watermark returns nothing, and the first read
+            // answers it
+            Case {
+                name: "ReadCommitted above the last stable offset",
+                responses: vec![vec![]],
+                stage: OffsetStage {
+                    last_stable: 500,
+                    high_watermark: 1_000,
+                    log_start: 0,
+                },
+                isolation: IsolationLevel::ReadCommitted,
+                fetch_offset: 700,
+                reads: 1,
+            },
+        ];
+
+        for case in cases {
+            let storage = Scripted {
+                stage_growth: GROWTH,
+                ..Scripted::new(case.responses, case.stage)
+            };
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                case.isolation,
+                case.fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(case.reads, storage.offset_stage_reads(), "{}", case.name);
+
+            // the answer comes from the last read
+            let growth = GROWTH * i64::try_from(case.reads - 1)?;
+            assert_eq!(
+                case.stage.high_watermark + growth,
+                partition.high_watermark,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                Some(case.stage.last_stable + growth),
+                partition.last_stable_offset,
+                "{}",
+                case.name
+            );
+
+            // the answered bound covers every record returned
+            let next_offset = partition
+                .records
+                .iter()
+                .flat_map(|frame| &frame.batches)
+                .map(|batch| batch.max_offset() + 1)
+                .max();
+
+            if let Some(next_offset) = next_offset {
+                let covered_to = match case.isolation {
+                    IsolationLevel::ReadCommitted => partition.last_stable_offset,
+                    IsolationLevel::ReadUncommitted => Some(partition.high_watermark),
+                };
+
+                assert!(
+                    covered_to.is_some_and(|covered_to| next_offset <= covered_to),
+                    "{}: records end at {next_offset}, answer covers {covered_to:?}",
+                    case.name
+                );
+            }
+        }
 
         Ok(())
     }

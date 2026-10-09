@@ -377,9 +377,9 @@ impl PoolConnection {
     async fn query<P>(&self, sql: &str, params: P) -> result::Result<Rows, libsql::Error>
     where
         P: IntoParams,
-        P: Debug,
     {
-        debug!(sql, ?params);
+        // The params hold record data and SCRAM credentials, so we log only the SQL.
+        debug!(sql);
 
         let start = SystemTime::now();
 
@@ -409,9 +409,9 @@ impl PoolConnection {
     async fn execute<P>(&self, sql: &str, params: P) -> result::Result<usize, libsql::Error>
     where
         P: IntoParams,
-        P: Debug,
     {
-        debug!(sql, ?params);
+        // The params hold record data and SCRAM credentials, so we log only the SQL.
+        debug!(sql);
         let start = SystemTime::now();
 
         let statement = self.prepared_statement(sql).await?;
@@ -437,9 +437,9 @@ impl PoolConnection {
     async fn query_opt<P>(&self, sql: &str, params: P) -> result::Result<Option<Row>, libsql::Error>
     where
         P: IntoParams,
-        P: Debug,
     {
-        debug!(sql, ?params);
+        // The params hold record data and SCRAM credentials, so we log only the SQL.
+        debug!(sql);
 
         let start = SystemTime::now();
 
@@ -467,9 +467,9 @@ impl PoolConnection {
     async fn query_one<P>(&self, sql: &str, params: P) -> result::Result<Row, libsql::Error>
     where
         P: IntoParams,
-        P: Debug,
     {
-        debug!(sql, ?params);
+        // The params hold record data and SCRAM credentials, so we log only the SQL.
+        debug!(sql);
 
         let start = SystemTime::now();
 
@@ -803,7 +803,7 @@ impl Delegate {
                         ),
                     )
                     .await
-                    .inspect_err(|err| error!(?err, ?topic, ?partition, ?offset, ?key, ?value))
+                    .inspect_err(|err| error!(?err, ?topic, ?partition, ?offset, key_len = ?key.map(<[u8]>::len), value_len = ?value.map(<[u8]>::len)))
                     .map_err(unique_constraint(ErrorCode::UnknownServerError))?;
 
                 debug!(delta, after_record_insert = elapsed_millis(start));
@@ -828,7 +828,7 @@ impl Delegate {
                         )
                         .await
                         .inspect_err(|err| {
-                            error!(?err, ?topic, ?partition, ?offset, ?key, ?value);
+                            error!(?err, ?topic, ?partition, ?offset, key_len = ?key.map(<[u8]>::len), value_len = ?value.map(<[u8]>::len));
                         });
                 }
 
@@ -1164,7 +1164,7 @@ impl Delegate {
             .map_err(Into::into)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, key))]
     async fn policy_compact_compaction(
         &self,
         topition: i64,
@@ -1190,7 +1190,7 @@ impl Delegate {
         Ok(offsets)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, key))]
     async fn policy_compact_max_offset_id(&self, topition: i64, key: &[u8]) -> Result<Option<i64>> {
         let pc = self.connection().await?;
 
@@ -1270,7 +1270,7 @@ impl Delegate {
                     debug!(topition);
 
                     for key in self.policy_compact_distinct_k(topition).await? {
-                        debug!(key = ?&key[..]);
+                        debug!(key_len = key.len());
 
                         if let Some(max_offset_id) = self
                             .policy_compact_max_offset_id(topition, &key[..])
@@ -2824,13 +2824,13 @@ impl Storage for Delegate {
                     .key(
                         row.get::<Option<Vec<u8>>>(3)
                             .map(|o| o.map(Bytes::from))
-                            .inspect(|k| debug!(?k))
+                            .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
                             .inspect_err(|err| error!(?err))?,
                     )
                     .value(
                         row.get::<Option<Vec<u8>>>(4)
                             .map(|o| o.map(Bytes::from))
-                            .inspect(|v| debug!(?v))
+                            .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                             .inspect_err(|err| error!(?err))?,
                     );
 
@@ -2964,13 +2964,13 @@ impl Storage for Delegate {
                         .key(
                             row.get::<Option<Vec<u8>>>(3)
                                 .map(|o| o.map(Bytes::from))
-                                .inspect(|k| debug!(?k))
+                                .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
                                 .inspect_err(|err| error!(?err))?,
                         )
                         .value(
                             row.get::<Option<Vec<u8>>>(4)
                                 .map(|o| o.map(Bytes::from))
-                                .inspect(|v| debug!(?v))
+                                .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                                 .inspect_err(|err| error!(?err))?,
                         );
 
@@ -4139,12 +4139,21 @@ impl Storage for Delegate {
                     .await
                     .inspect_err(|err| error!(?err, group_id))?
                 {
-                    let current = row
-                        .get_str(1)
+                    // A group row with no detail row (e.g. a group that only ever
+                    // committed offsets, never a JoinGroup) joins to a NULL
+                    // `detail` column here: that group exists and is empty, not
+                    // an error.
+                    let current = match row
+                        .get::<Option<String>>(1)
                         .map_err(Error::from)
-                        .and_then(|s| serde_json::from_str::<GroupDetail>(s).map_err(Into::into))
-                        .inspect(|current| debug!(?current))
-                        .inspect_err(|err| error!(?err, group_id))?;
+                        .inspect_err(|err| error!(?err, group_id))?
+                    {
+                        Some(s) => serde_json::from_str::<GroupDetail>(&s)
+                            .map_err(Error::from)
+                            .inspect(|current| debug!(?current))
+                            .inspect_err(|err| error!(?err, group_id))?,
+                        None => GroupDetail::default(),
+                    };
 
                     results.push(NamedGroupDetail::found(group_id.into(), current));
                 } else {

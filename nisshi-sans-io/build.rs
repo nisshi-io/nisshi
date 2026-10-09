@@ -33,6 +33,254 @@ use std::{
 };
 use syn::{Expr, Type};
 
+/// Fields whose values are secrets, as `(message, struct, field)` using the
+/// names in the message descriptors. The generated `Debug` writes these as
+/// `[hidden]`, so logging a message, `Body` or `Frame` doesn't log them.
+///
+/// Kafka 3.9.1 keeps SASL auth bytes out of its logs by never passing them to
+/// the request logger
+/// (<https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/authenticator/SaslServerAuthenticator.java#L425-L504>).
+/// It does log `SaltedPassword` and delegation token `Hmac` values, since its
+/// request logger only redacts configs
+/// (<https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/RequestChannel.scala#L186-L212>).
+/// We hide those as well, following `DelegationToken.toString`
+/// (<https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/token/delegation/DelegationToken.java#L74-L79>).
+///
+/// Kafka hides an `AlterConfigs` or `IncrementalAlterConfigs` value only when
+/// the config it names is sensitive, such as a password. We hide every value,
+/// topic configs included, because we keep no list of sensitive config names.
+///
+/// The build fails if an entry matches no field, so a renamed field can't
+/// silently stop being hidden.
+const SENSITIVE_FIELDS: &[(&str, &str, &str)] = &[
+    ("AlterConfigsRequest", "AlterableConfig", "Value"),
+    ("IncrementalAlterConfigsRequest", "AlterableConfig", "Value"),
+    (
+        "SaslAuthenticateRequest",
+        "SaslAuthenticateRequest",
+        "AuthBytes",
+    ),
+    (
+        "SaslAuthenticateResponse",
+        "SaslAuthenticateResponse",
+        "AuthBytes",
+    ),
+    (
+        "AlterUserScramCredentialsRequest",
+        "ScramCredentialUpsertion",
+        "SaltedPassword",
+    ),
+    (
+        "CreateDelegationTokenResponse",
+        "CreateDelegationTokenResponse",
+        "Hmac",
+    ),
+    (
+        "DescribeDelegationTokenResponse",
+        "DescribedDelegationToken",
+        "Hmac",
+    ),
+    (
+        "ExpireDelegationTokenRequest",
+        "ExpireDelegationTokenRequest",
+        "Hmac",
+    ),
+    (
+        "RenewDelegationTokenRequest",
+        "RenewDelegationTokenRequest",
+        "Hmac",
+    ),
+];
+
+/// `bytes` fields that hold no secret, so the derived `Debug` may log them.
+///
+/// The build fails on a `bytes` field that is in neither this list nor
+/// [`SENSITIVE_FIELDS`], so a new descriptor can't add a secret that we log.
+const LOGGABLE_BYTES_FIELDS: &[(&str, &str, &str)] = &[
+    // The server sends the salt to the client in the clear during SCRAM.
+    (
+        "AlterUserScramCredentialsRequest",
+        "ScramCredentialUpsertion",
+        "Salt",
+    ),
+    (
+        "DescribeGroupsResponse",
+        "DescribedGroupMember",
+        "MemberMetadata",
+    ),
+    (
+        "DescribeGroupsResponse",
+        "DescribedGroupMember",
+        "MemberAssignment",
+    ),
+    ("JoinGroupRequest", "JoinGroupRequestProtocol", "Metadata"),
+    ("JoinGroupResponse", "JoinGroupResponseMember", "Metadata"),
+    ("PushTelemetryRequest", "PushTelemetryRequest", "Metrics"),
+    (
+        "SyncGroupRequest",
+        "SyncGroupRequestAssignment",
+        "Assignment",
+    ),
+    ("SyncGroupResponse", "SyncGroupResponse", "Assignment"),
+];
+
+fn is_sensitive(module: &syn::Path, name: &Type, field: &Field) -> bool {
+    let module = module.to_token_stream().to_string();
+    let name = name.to_token_stream().to_string();
+
+    SENSITIVE_FIELDS
+        .iter()
+        .any(|(m, s, f)| m.to_case(Case::Snake) == module && *s == name && *f == field.name())
+}
+
+/// The derive attribute for a generated struct. `Debug` is left out when the
+/// struct has a sensitive field: [`debug_impl`] writes it instead.
+fn derived(module: &syn::Path, name: &Type, fields: &[Field]) -> TokenStream {
+    let debug =
+        (!fields.iter().any(|field| is_sensitive(module, name, field))).then(|| quote!(Debug,));
+
+    if fields.iter().any(Field::has_float) {
+        quote! {
+            #[derive(Clone, #debug Default, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
+        }
+    } else {
+        quote! {
+            #[derive(Clone, #debug Default, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
+        }
+    }
+}
+
+/// A `Debug` impl for a struct with a sensitive field, matching the derived
+/// output except that sensitive fields are written as `[hidden]`.
+fn debug_impl(
+    module: &syn::Path,
+    name: &Type,
+    fields: &[Field],
+    include_tag: bool,
+) -> Option<TokenStream> {
+    fields
+        .iter()
+        .any(|field| is_sensitive(module, name, field))
+        .then(|| {
+            let label = name.to_token_stream().to_string();
+
+            let entries = fields
+                .iter()
+                .filter(|field| include_tag || field.tag().is_none())
+                .map(|field| {
+                    let ident = field.ident();
+                    let label = syn::ext::IdentExt::unraw(&ident).to_string();
+
+                    if is_sensitive(module, name, field) {
+                        quote! {
+                            .field(#label, &crate::Redacted)
+                        }
+                    } else {
+                        quote! {
+                            .field(#label, &self.#ident)
+                        }
+                    }
+                })
+                .chain((!include_tag).then(|| {
+                    quote! {
+                        .field("tag_buffer", &self.tag_buffer)
+                    }
+                }));
+
+            quote! {
+                impl ::std::fmt::Debug for #name {
+                    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                        f.debug_struct(#label)
+                            #(#entries)*
+                            .finish()
+                    }
+                }
+            }
+        })
+}
+
+/// Panics if a [`SENSITIVE_FIELDS`] or [`LOGGABLE_BYTES_FIELDS`] entry matches
+/// no field in `messages`, if a `bytes` field is in neither list, or if a
+/// [`SENSITIVE_FIELDS`] entry is a tagged field.
+fn check_sensitive_fields(messages: &[Message]) {
+    struct Found {
+        message: String,
+        name: String,
+        field: String,
+        bytes: bool,
+        tagged: bool,
+    }
+
+    impl Found {
+        fn is(&self, (message, name, field): &(&str, &str, &str)) -> bool {
+            self.message == *message && self.name == *name && self.field == *field
+        }
+    }
+
+    fn walk(message: &str, name: &str, fields: &[Field], found: &mut Vec<Found>) {
+        for field in fields {
+            found.push(Found {
+                message: message.into(),
+                name: name.into(),
+                field: field.name().into(),
+                bytes: field.kind().name().trim_start_matches("[]") == "bytes",
+                tagged: field.tag().is_some(),
+            });
+
+            if let Some(children) = field.fields() {
+                let child = field.kind().type_name().to_token_stream().to_string();
+                walk(message, &child, children, found);
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+
+    for message in messages {
+        walk(message.name(), message.name(), message.fields(), &mut found);
+
+        for cs in message.common_structs().unwrap_or(&[][..]) {
+            walk(message.name(), cs.name(), cs.fields(), &mut found);
+        }
+    }
+
+    for (list, entries) in [
+        ("SENSITIVE_FIELDS", SENSITIVE_FIELDS),
+        ("LOGGABLE_BYTES_FIELDS", LOGGABLE_BYTES_FIELDS),
+    ] {
+        for entry in entries {
+            let (message, name, field) = entry;
+
+            assert!(
+                found.iter().any(|found| found.is(entry)),
+                "{list}: no field {field} in struct {name} of message {message}; \
+                 update the entry to match the descriptor"
+            );
+        }
+    }
+
+    for found in &found {
+        let sensitive = SENSITIVE_FIELDS.iter().any(|entry| found.is(entry));
+        let (message, name, field) = (&found.message, &found.name, &found.field);
+
+        assert!(
+            !found.bytes || sensitive || LOGGABLE_BYTES_FIELDS.iter().any(|entry| found.is(entry)),
+            "bytes field {field} in struct {name} of message {message} is in neither \
+             SENSITIVE_FIELDS nor LOGGABLE_BYTES_FIELDS; add it to SENSITIVE_FIELDS if it \
+             holds a secret, or to LOGGABLE_BYTES_FIELDS if it may be logged"
+        );
+
+        // The internal (mezzanine) struct keeps a tagged field's encoded value
+        // in `tag_buffer`, which its `Debug` writes in full, so the generated
+        // `Debug` can't hide a tagged field.
+        assert!(
+            !(sensitive && found.tagged),
+            "SENSITIVE_FIELDS: field {field} in struct {name} of message {message} is \
+             tagged, and the generated Debug can't hide a tagged field"
+        );
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 enum Error {
@@ -613,15 +861,8 @@ fn message_struct(
             }
         });
 
-        let derived = if fields.iter().any(Field::has_float) {
-            quote! {
-                #[derive(Clone, Debug, Default, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        } else {
-            quote! {
-                #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        };
+        let derived = derived(module, name, fields);
+        let debug_impl = debug_impl(module, name, fields, include_tag);
 
         let visibility = if include_tag {
             quote! {
@@ -641,6 +882,8 @@ fn message_struct(
             #visibility struct #name {
                 #(#vfk,)*
             }
+
+            #debug_impl
 
             #from_mezzanine
 
@@ -772,15 +1015,8 @@ fn message_struct(
             }
         });
 
-        let derived = if fields.iter().any(Field::has_float) {
-            quote! {
-                #[derive(Clone, Debug, Default, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        } else {
-            quote! {
-                #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        };
+        let derived = derived(module, name, fields);
+        let debug_impl = debug_impl(module, name, fields, include_tag);
 
         quote! {
             #derived
@@ -788,6 +1024,8 @@ fn message_struct(
                 #(#vfk,)*
                 pub tag_buffer: Option<crate::primitive::tagged::TagBuffer>,
             }
+
+            #debug_impl
 
             #from_tagged
 
@@ -879,15 +1117,8 @@ fn common_struct(
         ))
         .unwrap();
 
-        let derived = if fields.iter().any(Field::has_float) {
-            quote! {
-                #[derive(Clone, Debug, Default, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        } else {
-            quote! {
-                #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        };
+        let derived = derived(module, name, fields);
+        let debug_impl = debug_impl(module, name, fields, include_tag);
 
         let visibility = if include_tag {
             quote! {
@@ -905,6 +1136,8 @@ fn common_struct(
             #visibility struct #name {
                 #(#vfk,)*
             }
+
+            #debug_impl
 
             impl #name {
                 #(#builders)*
@@ -1010,15 +1243,8 @@ fn common_struct(
         ))
         .unwrap();
 
-        let derived = if fields.iter().any(Field::has_float) {
-            quote! {
-                #[derive(Clone, Debug, Default, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        } else {
-            quote! {
-                #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
-            }
-        };
+        let derived = derived(module, name, fields);
+        let debug_impl = debug_impl(module, name, fields, include_tag);
 
         quote! {
             #derived
@@ -1026,6 +1252,8 @@ fn common_struct(
                 #(#vfk,)*
                 pub tag_buffer: Option<crate::primitive::tagged::TagBuffer>,
             }
+
+            #debug_impl
 
             impl From<#from> for #name {
                 fn from(value: #from) -> Self {
@@ -1356,6 +1584,8 @@ pub fn main() {
             broker_api_keys.contains(&message.api_key()) && !message.fields().is_empty()
         })
         .collect::<Vec<_>>();
+
+    check_sensitive_fields(&broker_messages);
 
     let tagged = process(&broker_messages, true);
     let untagged = process(&broker_messages, false);

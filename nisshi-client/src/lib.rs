@@ -720,7 +720,7 @@ impl BytesConnectionService {
         frame: Bytes,
         attributes: &[KeyValue],
     ) -> Result<(), Error> {
-        debug!(frame = ?&frame[..]);
+        debug!(len = frame.len());
 
         let start = SystemTime::now();
 
@@ -768,7 +768,7 @@ impl BytesConnectionService {
                 TCP_RECEIVE_ERRORS.add(1, attributes);
             })?;
 
-        Ok(Bytes::from(buffer)).inspect(|frame| debug!(frame = ?&frame[..]))
+        Ok(Bytes::from(buffer)).inspect(|frame| debug!(len = frame.len()))
     }
 }
 

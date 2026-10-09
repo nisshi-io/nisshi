@@ -553,7 +553,7 @@ impl Storage for Engine {
         })
     }
 
-    #[instrument(ret)]
+    #[instrument(skip(_credential), ret)]
     async fn upsert_user_scram_credential(
         &self,
         user: &str,
