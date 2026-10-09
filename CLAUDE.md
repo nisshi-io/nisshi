@@ -149,6 +149,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs in two tiers, gated by `ci-gate
 
 Merging goes through a merge queue: "Merge when ready" queues the PR, the queue re-runs CI on it against the current tip of `main`, and squash-merges it if everything is green: the PR title becomes the commit's subject and the PR description its body. Tier B is skipped on same-repo PRs only while the `MERGE_QUEUE` repository variable is `on`; with it unset, they run everything. Fork PRs can't read the variable, so Tier B is always skipped on them and runs in the queue. The other required checks come from `codeql.yml`, `workflow-lint.yml`, `dependencies.yml` and `pr-title.yml` (the PR title must follow Conventional Commits; see `CONTRIBUTING.md`).
 
+On a pull_request, a `changes` job in `ci.yml`, `codeql.yml` and `dependencies.yml` skips the Rust jobs when every changed path is CI config those workflows don't read, or prose. The skip list is `.github/scripts/ci-changes.sh`, tested by `ci-changes.test.sh`; the `changes` jobs run the base branch's copy, so a PR can't widen its own skip list.
+
 ## Key Files
 
 | File | Purpose |
