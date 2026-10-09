@@ -555,6 +555,25 @@ where
                                 );
                             }
 
+                            // An acks=0 Produce that fails closes the connection. This arm
+                            // logs that close at `info`, as Kafka does ("Closing connection
+                            // due to error during produce request"), because the cause is
+                            // usually the client's input. `TcpBytesService` has already
+                            // logged the same error at `error`; this arm sets the level of
+                            // the broker's connection-level line only.
+                            Err(Error::Storage(nisshi_storage::Error::AcksZeroProduceFailed {
+                                ref topic,
+                                partition,
+                                error_code,
+                            })) => {
+                                info!(
+                                    topic,
+                                    partition,
+                                    ?error_code,
+                                    "closing connection: acks=0 produce failed"
+                                );
+                            }
+
                             Err(error) => {
                                 error!(?error);
                             },

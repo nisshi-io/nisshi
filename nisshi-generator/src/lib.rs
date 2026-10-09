@@ -30,7 +30,7 @@ use governor::{InsufficientCapacity, Jitter, Quota, RateLimiter};
 use nisshi_client::{Client, ConnectionManager};
 use nisshi_otel::meter_provider;
 use nisshi_sans_io::{
-    ByteSize, ErrorCode, ProduceRequest,
+    Ack, ByteSize, ErrorCode, ProduceRequest,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{deflated, inflated},
 };
@@ -213,15 +213,17 @@ pub async fn produce(
         KeyValue::new("batch_size", batch_size.to_string()),
     ];
 
-    let req = ProduceRequest::default().topic_data(Some(
-        [TopicProduceData::default().name(name).partition_data(Some(
-            [PartitionProduceData::default()
-                .index(index)
-                .records(Some(frame))]
+    let req = ProduceRequest::default()
+        .acks(Ack::Leader.into())
+        .topic_data(Some(
+            [TopicProduceData::default().name(name).partition_data(Some(
+                [PartitionProduceData::default()
+                    .index(index)
+                    .records(Some(frame))]
+                .into(),
+            ))]
             .into(),
-        ))]
-        .into(),
-    ));
+        ));
 
     let start = SystemTime::now();
 

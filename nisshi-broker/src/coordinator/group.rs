@@ -88,4 +88,9 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
         groups: Option<&[OffsetFetchRequestGroup]>,
         require_stable: Option<bool>,
     ) -> Result<Body>;
+
+    /// Deletes one or more groups, refusing any that still has members
+    /// (`NON_EMPTY_GROUP`), and forgetting the in-memory state that this
+    /// coordinator held for each group it deletes.
+    async fn delete_groups(&self, group_ids: &[String]) -> Result<Body>;
 }
