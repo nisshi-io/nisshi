@@ -3,8 +3,9 @@ name: tier-c
 
 # Tier C is the optional nightly tier. It runs the checks that are too slow
 # or too unstable to gate a merge: the compat suites on the S3 engine, the
-# `test` suite on more Postgres versions, including one beta, and the build
-# on Windows.
+# `test` suite on more Postgres versions, including one beta, the build on
+# Windows, and the full macOS release build (ci.yml only checks macOS, except
+# on a `v*` tag).
 #
 # Tier C does not gate anything. It is not in the `needs` of ci-gate and it is
 # not a required check. A red run opens or updates one GitHub issue with the
@@ -69,8 +70,6 @@ jobs:
       NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
-      RUST_BACKTRACE: 1
-      RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
       SCHEMA_REGISTRY: file://./etc/schema
       STORAGE_ENGINE: s3://nisshi/
       NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi
@@ -90,16 +89,21 @@ jobs:
         with:
           components: clippy, rustfmt
           # These legs read the cache that the `test` job in ci.yml saves on
-          # main. That needs the same job id, `test`, and the same values of
-          # every `RUST*` and `CARGO*` variable as that job, because the
+          # main. That needs the same shared key, `dev`, and the same values
+          # of every `RUST*` and `CARGO*` variable as that job, because the
           # cache key hashes them. A mismatch gives a cold build. This
           # workflow never saves, because a save here would replace the cache
           # that ci.yml restores on every pull request.
+          cache-shared-key: dev
           cache-save-if: false
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest@0.9.146
+      # Set on the step, as in ci.yml: the cache key hashes `RUST*` variables.
       - run: just test
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
       - run: df -h
         if: always()
       - run: tar --create --verbose --gzip --file="logs-${PG_IMAGE_DASH}.tar.gz" logs
@@ -264,11 +268,35 @@ jobs:
         with:
           cache: false
       - run: just build dev
+  # The release profile, the linker and cargo-auditable, which the `macos`
+  # job in ci.yml skips off a tag. It uploads nothing.
+  macos-release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # The same settings as the release build in ci.yml.
+          rustflags: ""
+          build-warnings: ""
+          cache: false
+      - run: rustup target add "$TARGET"
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-auditable@0.7.6
+          fallback: none
+      - run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
   alert:
     # This job reads the result of each job above. A beta leg that fails does
     # not change the result of `test`, so it does not raise an alert.
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
-    needs: [test, compat-librdkafka, compat-franz-go, build-windows]
+    needs: [test, compat-librdkafka, compat-franz-go, build-windows, macos-release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # The job writes to issues and nothing else. It has no checkout, so
