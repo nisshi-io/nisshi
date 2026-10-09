@@ -16,6 +16,7 @@ pub mod broker;
 pub mod compaction;
 pub mod configs;
 pub mod consume;
+pub mod delete_records;
 pub mod offsets;
 pub mod produce;
 pub mod restart;
