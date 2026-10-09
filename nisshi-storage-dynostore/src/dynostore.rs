@@ -127,14 +127,24 @@ const APPLICATION_JSON: &str = "application/json";
 ///   which is a different string to the sentinel.
 const EMPTY_GROUP_SENTINEL: &str = "%empty";
 
-/// How long after a batch object's write every produce below it is taken
-/// to have written its own batch object or failed.
+/// How long after a batch object's write, on the store's clock, every
+/// produce below it is taken to have written its own batch object or
+/// failed.
 ///
 /// A produce assigns its offset in the watermark document before it writes
 /// its batch object, so a listing can see a later batch and not an earlier
-/// one that is still in flight. The produce holds the request open for
-/// that whole time, so a gap below a batch written this long ago belongs
-/// to a produce that failed in between, which holds no records.
+/// one that is still in flight. A gap below a batch written this long ago
+/// is taken as a produce that failed in between, which holds no records,
+/// and the backfill logs a warning for it. The broker does not enforce
+/// this bound: the batch object's PUT gives up after the object store
+/// client's retry timeout, three minutes by default, and a lake commit or
+/// a transaction CAS between the two writes has no limit of its own. A
+/// produce that overruns this margin is indexed past, and nothing rebuilds
+/// a complete index.
+///
+/// The age is the difference between two write times that the store
+/// reports, the batch object's and the watermark document's, so the
+/// broker's clock does not enter into it.
 const BATCH_SETTLED_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// A backfill of one partition's time index in progress (see
@@ -148,6 +158,9 @@ struct Backfill {
     /// The partition's high watermark when the backfill began: every batch
     /// below it had assigned its offset before the backfill's listing.
     high: i64,
+    /// When the backfill began, on the store's clock: the write time the
+    /// store reports for the watermark document after the begin CAS.
+    began: SystemTime,
 }
 
 /// Encode a Kafka group id as a single, opaque `object_store` path segment.
@@ -697,15 +710,6 @@ impl DynoStore {
             .await
     }
 
-    /// Returns whether a batch object written at `written` is older than
-    /// [`BATCH_SETTLED_AFTER`], so that every produce whose offset is below
-    /// its base offset has either written its batch object or failed.
-    fn batch_is_settled(written: SystemTime) -> bool {
-        SystemTime::now()
-            .duration_since(written)
-            .is_ok_and(|age| age >= BATCH_SETTLED_AFTER)
-    }
-
     /// Reads and decodes the batch object at `base_offset`, or returns
     /// `Ok(None)` when the object does not exist.
     ///
@@ -743,22 +747,40 @@ impl DynoStore {
     /// Marks a backfill of `topition`'s time index in progress, with a CAS
     /// write of its token (see [`TimeIndex::begin_backfill`]), and returns
     /// the token with the partition's log start and high watermark at that
-    /// moment. The three steps of a backfill are this, then
-    /// [`DynoStore::collect_time_index_candidate`], then
-    /// [`DynoStore::commit_time_index_backfill`], so that a produce landing
-    /// between any two of them is never lost (see [`TimeIndex::merge`]).
+    /// moment, and the store's write time of that CAS. The three steps of a
+    /// backfill are this, then [`DynoStore::collect_time_index_candidate`],
+    /// then [`DynoStore::commit_time_index_backfill`], so that a produce
+    /// landing between any two of them is never lost (see
+    /// [`TimeIndex::merge`]).
     async fn begin_time_index_backfill(&self, topition: &Topition) -> Result<Backfill> {
         let token = rng().random::<u64>();
+        let watermark = self.watermark_for(topition)?;
 
-        self.watermark_for(topition)?
+        let (token, low, high) = watermark
             .with_mut(&self.object_store, |w| {
-                Ok(Backfill {
-                    token: w.time_index.begin_backfill(token),
-                    low: w.low.unwrap_or(0),
-                    high: w.high.unwrap_or(0),
-                })
+                Ok((
+                    w.time_index.begin_backfill(token),
+                    w.low.unwrap_or(0),
+                    w.high.unwrap_or(0),
+                ))
             })
+            .await?;
+
+        // The store's write time of the document the CAS just wrote is the
+        // backfill's start on the store's clock, the clock that stamps every
+        // batch object's write time as well.
+        let began = self
+            .object_store
+            .head(watermark.location())
             .await
+            .map(|meta| SystemTime::from(meta.last_modified))?;
+
+        Ok(Backfill {
+            token,
+            low,
+            high,
+            began,
+        })
     }
 
     /// Lists every batch object of `topition` below the high watermark of
@@ -799,10 +821,25 @@ impl DynoStore {
 
         for (base_offset, written) in listed {
             if settled
-                && next_offset.is_some_and(|expected| base_offset > expected)
-                && !Self::batch_is_settled(written)
+                && let Some(expected) = next_offset.filter(|&expected| base_offset > expected)
             {
-                settled = false;
+                // The batch's age when the backfill began, both times the
+                // store's own, so the broker's clock does not enter into it.
+                let age = backfill
+                    .began
+                    .duration_since(written)
+                    .unwrap_or(Duration::ZERO);
+
+                if age >= BATCH_SETTLED_AFTER {
+                    warn!(
+                        ?topition,
+                        gap = ?(expected..base_offset),
+                        age_secs = age.as_secs(),
+                        "time index backfill: taking a gap below a settled batch as a failed produce"
+                    );
+                } else {
+                    settled = false;
+                }
             }
 
             let Some(batch) = self.read_batch(topition, base_offset).await? else {
