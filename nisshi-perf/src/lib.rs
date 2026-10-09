@@ -53,11 +53,9 @@ use opentelemetry_sdk::{
     },
 };
 use opentelemetry_semantic_conventions::SCHEMA_URL;
-use tokio::{
-    signal::unix::{SignalKind, signal},
-    task::JoinSet,
-    time::sleep,
-};
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::{task::JoinSet, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument};
 use url::Url;
@@ -275,10 +273,20 @@ impl Perf {
             meter_provider
         };
 
+        #[cfg(unix)]
         let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+        #[cfg(windows)]
+        let mut interrupt_signal = tokio::signal::windows::ctrl_c().unwrap();
         debug!(?interrupt_signal);
 
+        #[cfg(unix)]
         let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+        // Windows has no SIGTERM for a console program, so this listens for the nearest event: the
+        // user closing the console window, or ending the task in Task Manager. A service manager's
+        // stop request doesn't send it. Windows ends the process 5 seconds after the event by
+        // default, whether or not shutdown has finished.
+        #[cfg(windows)]
+        let mut terminate_signal = tokio::signal::windows::ctrl_close().unwrap();
         debug!(?terminate_signal);
 
         let rate_limiter = self

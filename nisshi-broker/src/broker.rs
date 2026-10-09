@@ -44,9 +44,10 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
     net::TcpListener,
-    signal::unix::{SignalKind, signal},
     task::{AbortHandle, JoinSet},
     time::{self, Instant, sleep, timeout},
 };
@@ -255,10 +256,20 @@ where
 
         let mut set = JoinSet::new();
 
+        #[cfg(unix)]
         let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+        #[cfg(windows)]
+        let mut interrupt_signal = tokio::signal::windows::ctrl_c().unwrap();
         debug!(?interrupt_signal);
 
+        #[cfg(unix)]
         let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+        // Windows has no SIGTERM for a console program, so this listens for the nearest event: the
+        // user closing the console window, or ending the task in Task Manager. A service manager's
+        // stop request doesn't send it. Windows ends the process 5 seconds after the event by
+        // default, whether or not shutdown has finished.
+        #[cfg(windows)]
+        let mut terminate_signal = tokio::signal::windows::ctrl_close().unwrap();
         debug!(?terminate_signal);
 
         let silent = self.silent;
