@@ -3,6 +3,7 @@ accepted = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSD-4-Clause",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
@@ -35,3 +36,9 @@ license = "Apache-2.0"
 [[deadpool-postgres.clarify.files]]
 path = "LICENSE-APACHE"
 checksum = "23fac4edada8cdd75ecd793864bfb3a60ef59da853425ed3e2b3d030dc730aa6"
+
+[libbz2-rs-sys.clarify]
+license = "BSD-4-Clause"
+[[libbz2-rs-sys.clarify.files]]
+path = "LICENSE"
+checksum = "54e1fd7bd53273e601c9599eb162a004dacddee031ae297ee7109a7beb93b1c2"

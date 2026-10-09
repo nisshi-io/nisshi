@@ -1,0 +1,26 @@
+{
+  "title": "Telemetry",
+  "type": "object",
+  "properties": {
+    "key": {
+      "type": "string"
+    },
+    "value": {
+      "type": "object",
+      "properties": {
+        "latitude": {
+          "type": "number",
+          "description": "latitude"
+        },
+        "longitude": {
+          "type": "number",
+          "description": "longitude"
+        },
+        "altitude": {
+          "description": "altitude",
+          "type": "number"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,111 @@
+---
+# CodeQL "advanced setup". Replaces the repository-settings "default setup",
+# which never scans pull requests opened from forks. This workflow reproduces
+# the default setup's coverage exactly: the `rust` and `actions` languages,
+# both in build-mode `none`.
+#
+# A green `Analyze` job means the scan uploaded, not that it found nothing.
+# Findings appear in the Security tab and on the `github-advanced-security`
+# pull request check.
+name: CodeQL
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  # `Analyze (rust)` / `Analyze (actions)` are required checks; the merge
+  # queue tests each entry on a `gh-readonly-queue/...` branch, and without
+  # this trigger they'd never report there and every entry would hang.
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    # Weekly, Monday 06:23 UTC. Off the hour to avoid the top-of-hour rush.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+# Same grouping as ci.yml: `ref@sha` off pull_request, because a merge_group
+# run and the post-merge push run share a sha and must not share a group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+jobs:
+  # Whether a pull_request run needs the rust analysis. Same job as ci.yml's;
+  # see the comment there.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          run_all() { echo "$1, running everything"; echo "rust=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          [ "$EVENT_NAME" = pull_request ] || run_all "$EVENT_NAME run"
+          [ -f .github/scripts/ci-changes.sh ] || run_all "base has no ci-changes.sh"
+          bash .github/scripts/ci-changes.test.sh
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > "$RUNNER_TEMP/files"
+          listed=$(wc -l < "$RUNNER_TEMP/files")
+          # The files API stops at 3000; a short list could hide a Rust change.
+          [ "$listed" -eq "$CHANGED_FILES" ] || run_all "listed $listed of $CHANGED_FILES changed files"
+          bash .github/scripts/ci-changes.sh < "$RUNNER_TEMP/files"
+  # One job per language rather than a matrix, so only the rust one waits on
+  # `changes`. Each keeps its matrix-era name, which the required checks match on.
+  analyze-actions:
+    name: Analyze (actions)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: actions
+          build-mode: none
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: "/language:actions"
+  analyze-rust:
+    name: Analyze (rust)
+    # Runs unless `changes` said false, so a failed `changes` job can't
+    # turn this required check into a passing skip.
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    needs: [changes]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: rust
+          build-mode: none
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: "/language:rust"

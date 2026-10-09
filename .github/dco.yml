@@ -1,0 +1,2 @@
+# CNCF dco2 App config (read from the default branch only): hide the "Set DCO to pass" override button.
+allowOverrideAction: false

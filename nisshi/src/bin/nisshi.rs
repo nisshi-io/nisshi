@@ -1,0 +1,139 @@
+// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use dotenv::dotenv;
+use nisshi_broker::{TracingFormat, otel};
+use nisshi_cli::{Cli, Result};
+use nisshi_sans_io::ErrorCode;
+use tracing::{debug, error};
+
+const CLIENT_ERROR_MESSAGE: &str = "A client error occurred. Possible causes:
+  • No network connection
+  • The server is down or unreachable
+  • Incorrect hostname or port
+  • Firewall or proxy blocking the connection
+  • TLS/SSL certificate issues (if applicable)
+
+Check your internet connection, verify the server address, and try again.";
+
+/// Returns advice for a storage startup check failure, for the storage URL
+/// scheme.
+fn startup_check_hint(scheme: &str) -> &'static str {
+    match scheme {
+        "s3" => {
+            ". Check that the bucket exists, that AWS_ENDPOINT and AWS_REGION are correct, and that the AWS credentials allow listing the cluster's prefix in the bucket."
+        }
+        "gs" => {
+            ". Check that the bucket exists, and that the Google Cloud credentials allow listing the cluster's prefix in the bucket."
+        }
+        _ => "",
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<ErrorCode> {
+    _ = dotenv().ok();
+
+    let _guard = otel::init(TracingFormat::Text)?;
+
+    Cli::main()
+        .await
+        .inspect(|error_code| match error_code {
+            ErrorCode::None => debug!("{}", error_code),
+            _ => error!("{}", error_code),
+        })
+        .inspect_err(|err| match err {
+            nisshi_cli::Error::Cat(error) => match &**error {
+                nisshi_cat::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
+                _ => error!("Unknown error occurred during command: {}", error),
+            },
+            nisshi_cli::Error::Generate(error) => match error {
+                nisshi_generator::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
+                _ => error!("Unknown error occurred during command: {}", error),
+            },
+            nisshi_cli::Error::Perf(error) => match error {
+                nisshi_perf::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
+                _ => error!("Unknown error occurred during command: {}", error),
+            },
+            nisshi_cli::Error::Proxy(error) => match error {
+                nisshi_proxy::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
+                _ => error!("Unknown error occurred during command: {}", error),
+            },
+            nisshi_cli::Error::Topic(error) => match error {
+                nisshi_topic::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
+                _ => error!("Unknown error occurred during command: {}", error),
+            },
+            nisshi_cli::Error::Server(error) => match &**error {
+                #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+                nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
+                    error!(
+                        "could not get AWS credentials from the configured provider: {source}. AWS credentials come from static keys (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY), a web identity token (AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN), an ECS or EKS container credential endpoint, or the EC2 instance metadata service."
+                    )
+                }
+                nisshi_broker::Error::Storage(nisshi_storage::Error::StartupCheck {
+                    storage,
+                    source,
+                }) => error!(
+                    "storage {storage} failed its startup check: {source}{}",
+                    startup_check_hint(storage.scheme())
+                ),
+                nisshi_broker::Error::InvalidStorageOptionValue { option, value } => error!(
+                    "storage option {option}={value} is not a valid interval: give a non-zero duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"
+                ),
+                nisshi_broker::Error::Storage(nisshi_storage::Error::UnrecognizedStorageOption {
+                    scheme,
+                    option,
+                }) => error!("storage option {option} is not recognised by the {scheme} engine"),
+                _ => error!("Unknown error occurred during command: {}", err),
+            },
+            nisshi_cli::Error::TlsCertificate { path, source } => error!(
+                "TLS certificate {} could not be loaded: {source}. Expected one or more PEM certificates (--cert).",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsPrivateKey { path, source } => error!(
+                "TLS private key {} could not be loaded: {source}. Expected a PKCS#8, SEC1 or RSA PEM key (--key).",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyPassphraseRequired { path } => error!(
+                "TLS private key {} is encrypted: pass --key-passphrase-file <file>.",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyDecrypt { path, source } => error!(
+                "TLS private key {} could not be decrypted: {source}. Check the passphrase in --key-passphrase-file.",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyUnsupportedEncryption { path, algorithm } => error!(
+                "TLS private key {} is encrypted with {algorithm}, which is not supported. Supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES. Re-encrypt it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem -v2 aes-256-cbc -v2prf hmacWithSHA256",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => error!(
+                "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
+                path.display()
+            ),
+            nisshi_cli::Error::TlsKeyPassphraseFile { path, source } => error!(
+                "TLS key passphrase file {} could not be read: {source}.",
+                path.display()
+            ),
+            nisshi_cli::Error::Tls(error) => error!(
+                "TLS configuration rejected: {error}. Check that --key is the private key for the certificate in --cert and, for an encrypted key, that the passphrase is correct."
+            ),
+            nisshi_cli::Error::TlsRequiresCertAndKey => {
+                error!("TLS requires both --cert and --key.")
+            }
+            nisshi_cli::Error::LakeRequiresSchemaRegistry { lake } => error!(
+                "{lake} requires --schema-registry: a data lake writer validates every record against a schema."
+            ),
+            _ => error!("Unknown error occurred during command: {}", err),
+        })
+}
