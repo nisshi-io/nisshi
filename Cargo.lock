@@ -4026,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "fuzz"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "bytes",
  "libfuzzer-sys",
@@ -5739,7 +5739,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "dotenv",
  "nisshi-broker",
@@ -5758,7 +5758,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-auth"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "bytes",
  "nisshi-sans-io",
@@ -5772,7 +5772,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-broker"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -5832,7 +5832,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-cat"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "bytes",
  "futures",
@@ -5852,7 +5852,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-cli"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "bytes",
  "clap",
@@ -5892,7 +5892,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-client"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "anyhow",
  "backoff",
@@ -5916,7 +5916,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-generator"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "futures",
  "futures-core",
@@ -5943,7 +5943,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-model"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "convert_case 0.12.0",
  "lazy_static",
@@ -5958,7 +5958,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-otel"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
@@ -5972,7 +5972,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-perf"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "bytes",
  "futures",
@@ -6001,7 +6001,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-proxy"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6031,7 +6031,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-sans-io"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "bytes",
  "cap",
@@ -6061,7 +6061,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-schema"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6109,7 +6109,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-service"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6135,7 +6135,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -6188,7 +6188,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-dynostore"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6220,7 +6220,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-null"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "async-trait",
  "nisshi-sans-io",
@@ -6234,7 +6234,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-slatedb"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6253,7 +6253,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-sql"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6291,7 +6291,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-topic"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 dependencies = [
  "futures",
  "futures-core",
