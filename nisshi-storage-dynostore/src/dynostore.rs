@@ -60,7 +60,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, config::apply_op,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -296,68 +296,49 @@ impl Meta {
     }
 
     fn alter_topic(&mut self, topic: &str, changes: &[AlterableConfig]) -> Result<()> {
-        if let Some(metadata) = self.topics.get_mut(topic) {
-            let mut configuration = metadata
-                .topic
-                .configs
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .fold(BTreeMap::new(), |mut acc, item| {
-                    _ = acc.insert(item.name.clone(), item.value.clone());
-                    acc
-                });
+        let metadata = self
+            .topics
+            .get_mut(topic)
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))?;
 
-            for change in changes {
-                match OpType::try_from(change.config_operation)? {
-                    OpType::Set => {
-                        _ = configuration.insert(change.name.clone(), change.value.clone());
-                    }
-                    OpType::Delete => {
-                        _ = configuration.remove(change.name.as_str());
-                    }
-                    // append to, or subtract from, a comma separated list
-                    OpType::Append => {
-                        let appended = change.value.as_deref().unwrap_or_default();
+        let mut configuration = metadata
+            .topic
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .fold(BTreeMap::new(), |mut acc, item| {
+                _ = acc.insert(item.name.clone(), item.value.clone());
+                acc
+            });
 
-                        _ = configuration
-                            .entry(change.name.clone())
-                            .and_modify(|value| match value {
-                                Some(current) if !current.is_empty() => {
-                                    if !current.split(',').any(|item| item == appended) {
-                                        *current = format!("{current},{appended}");
-                                    }
-                                }
-                                _ => *value = Some(appended.to_owned()),
-                            })
-                            .or_insert_with(|| Some(appended.to_owned()));
-                    }
-                    OpType::Subtract => {
-                        let subtracted = change.value.as_deref().unwrap_or_default();
+        for change in changes {
+            let op = OpType::try_from(change.config_operation)?;
+            let current = configuration.get(&change.name).and_then(Option::as_deref);
 
-                        if let Some(Some(current)) = configuration.get_mut(change.name.as_str()) {
-                            *current = current
-                                .split(',')
-                                .filter(|item| *item != subtracted)
-                                .collect::<Vec<_>>()
-                                .join(",");
-                        }
-                    }
-                }
+            match apply_op(
+                ConfigResource::Topic,
+                &change.name,
+                current,
+                op,
+                change.value.as_deref(),
+            )? {
+                Some(value) => _ = configuration.insert(change.name.clone(), Some(value)),
+                None => _ = configuration.remove(change.name.as_str()),
             }
-
-            _ = metadata
-                .topic
-                .configs
-                .replace(
-                    configuration
-                        .into_iter()
-                        .fold(Vec::new(), |mut acc, (key, value)| {
-                            acc.push(CreatableTopicConfig::default().name(key).value(value));
-                            acc
-                        }),
-                );
         }
+
+        _ = metadata
+            .topic
+            .configs
+            .replace(
+                configuration
+                    .into_iter()
+                    .fold(Vec::new(), |mut acc, (key, value)| {
+                        acc.push(CreatableTopicConfig::default().name(key).value(value));
+                        acc
+                    }),
+            );
 
         Ok(())
     }
@@ -1593,8 +1574,7 @@ impl Storage for DynoStore {
                 .await
                 .inspect(|meta| debug!(?meta))
                 .transpose()
-                .inspect_err(|error| error!(?error))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .inspect_err(|error| error!(?error))?
             {
                 debug!(?meta);
 
@@ -1614,8 +1594,15 @@ impl Storage for DynoStore {
                 let Some(partition) = parts
                     .nth(1)
                     .inspect(|partition| debug!(?partition))
-                    .map(|partition| i32::from_str(&partition.as_ref()[0..10]))
-                    .transpose()?
+                    .map(|partition| {
+                        partition
+                            .as_ref()
+                            .get(0..10)
+                            .and_then(|partition| i32::from_str(partition).ok())
+                            .ok_or(Error::Api(ErrorCode::UnknownServerError))
+                    })
+                    .transpose()
+                    .inspect_err(|error| error!(?error, ?meta))?
                 else {
                     continue;
                 };
@@ -1642,24 +1629,27 @@ impl Storage for DynoStore {
             for topition in topics {
                 let location = self.committed_offset_location(group_id, topition)?;
 
+                // An object store failure may clear on a retry, so it stays a
+                // plain error. An offset that doesn't decode won't, so it is
+                // UNKNOWN_SERVER_ERROR.
                 let offset = match self.object_store.get(&location).await {
-                    Ok(get_result) => get_result
-                        .bytes()
-                        .await
-                        .map_err(Error::from)
-                        .and_then(|encoded| {
-                            serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
-                                .map_err(Error::from)
-                        })
-                        .map(|commit| commit.offset)
-                        .inspect_err(|error| error!(?error, ?group_id, ?topition))
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError)),
+                    Ok(get_result) => {
+                        let encoded = get_result
+                            .bytes()
+                            .await
+                            .inspect_err(|error| error!(?error, ?group_id, ?topition))?;
+
+                        serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
+                            .map(|commit| commit.offset)
+                            .inspect_err(|error| error!(?error, ?group_id, ?topition))
+                            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                    }
 
                     Err(object_store::Error::NotFound { .. }) => Ok(-1),
 
                     Err(error) => {
                         error!(?error, ?group_id, ?topition);
-                        Err(Error::Api(ErrorCode::UnknownServerError))
+                        Err(Error::from(error))
                     }
                 }?;
 

@@ -41,6 +41,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nisshi_schema::Error`: `AvroToJson` and `InvalidValue` hold an Avro `SchemaKind`, and `JsonToAvro` and `UnsupportedSchemaRuntimeValue` hold the kind of JSON value, in place of the value. `JsonToAvroFieldNotFound` no longer has a `value` field. The new `AvroRecord` variant reports an Avro record that fails to read or write against its schema, without the `apache_avro` error, whose message holds the record's values.
 - A broker on S3 or Google Cloud Storage exits at startup when it cannot list its cluster's prefix in the bucket, or when its AWS credential provider does not return a credential. The error names the storage URL and the cause. Previously the broker started and failed on its first request.
 - Releases no longer include an `x86_64-apple-darwin` (Intel macOS) binary. Apple silicon (`aarch64-apple-darwin`) is the only macOS build.
+- IncrementalAlterConfigs checks each resource the way Apache Kafka 3.9.1
+  does, and answers each failing resource with its own error, without
+  closing the connection:
+  - `INVALID_REQUEST` for a resource that appears twice, duplicate config
+    keys, a null value on any operation except `DELETE`, or an unknown
+    operation;
+  - `INVALID_CONFIG` for `APPEND` or `SUBTRACT` on a key whose type isn't a
+    list. The topic list keys are `cleanup.policy`,
+    `leader.replication.throttled.replicas` and
+    `follower.replication.throttled.replicas`;
+  - `UNKNOWN_TOPIC_OR_PARTITION` for a topic that doesn't exist, on every
+    storage engine. The memory, S3, GCS and SlateDB engines used to report
+    success.
+- IncrementalAlterConfigs with `validate_only` no longer changes anything.
+  It used to apply the changes.
+- A topic applies all the changes of one IncrementalAlterConfigs resource,
+  or none of them. A storage failure fails only that resource, with
+  `UNKNOWN_SERVER_ERROR`.
+- `APPEND` and `SUBTRACT` follow Kafka: each item of a comma-separated value
+  is added if missing, or its first occurrence is removed. An unset value is
+  an empty list. Kafka starts from the key's default instead, so `APPEND
+  compact` to an unset `cleanup.policy` gives `compact` here and
+  `delete,compact` in Kafka. Nisshi deletes old records only when
+  `cleanup.policy` contains `delete`.
 
 ### Security
 
@@ -73,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   find.
 - On S3 and in-memory storage, DeleteGroups accepts the empty group id, as
   the other storage engines do, instead of answering `INVALID_GROUP_ID`.
+- IncrementalAlterConfigs `APPEND` and `SUBTRACT` on a topic no longer panic
+  the connection on the PostgreSQL, SQLite and Turso engines, and are no
+  longer ignored on SlateDB.
+- An OffsetFetch whose storage fails no longer panics the connection. The
+  response reports `COORDINATOR_NOT_AVAILABLE`, which clients retry, for a
+  transient failure, or the storage's own error code. From version 8 each
+  group reports its own error, and the other groups still get their offsets.
 - A Snappy batch with a truncated xerial header is rejected with an error
   instead of panicking the decoder.
 - CreateTopics rejects a `replication_factor` of 0 or below -1 with `INVALID_REPLICATION_FACTOR` (38), as Apache Kafka does. -1 still selects the default (1).

@@ -43,6 +43,7 @@ pub mod list_offsets;
 pub mod log_redaction;
 pub mod metadata;
 pub mod new_cg;
+pub mod offset_fetch_storage_error;
 pub mod person;
 pub mod pg_init_producer;
 pub mod pg_txn;

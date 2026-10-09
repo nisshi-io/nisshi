@@ -56,7 +56,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
     ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel,
+    bounded_channel, config::apply_op,
 };
 use opentelemetry::{
     KeyValue,
@@ -546,6 +546,68 @@ impl managed::Manager for ConnectionManager {
 pub(crate) type Pool = managed::Pool<ConnectionManager>;
 
 impl Delegate {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        let topic = resource.resource_name.as_str();
+
+        if c.query_opt("topic_select_name.sql", (self.cluster.as_str(), topic))
+            .await?
+            .is_none()
+        {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        for config in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(config.config_operation)?;
+            let name = config.name.as_str();
+
+            let current = if matches!(op, OpType::Append | OpType::Subtract) {
+                c.query_opt(
+                    "topic_configuration_select_name.sql",
+                    (self.cluster.as_str(), topic, name),
+                )
+                .await?
+                .map(|row| row.get::<Option<String>>(0))
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+
+            match apply_op(
+                ConfigResource::Topic,
+                name,
+                current.as_deref(),
+                op,
+                config.value.as_deref(),
+            )? {
+                Some(value) => {
+                    _ = c
+                        .query_opt(
+                            "topic_configuration_upsert.sql",
+                            (self.cluster.as_str(), topic, name, value.as_str()),
+                        )
+                        .await?;
+                }
+
+                None => {
+                    _ = c
+                        .query_opt(
+                            "topic_configuration_delete.sql",
+                            (self.cluster.as_str(), topic, name),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        c.commit(tx).await
+    }
+
     #[instrument(skip_all)]
     async fn connection(&self) -> Result<managed::Object<ConnectionManager>> {
         let start = SystemTime::now();
@@ -2606,56 +2668,10 @@ impl Storage for Delegate {
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
             ConfigResource::Topic => {
-                let mut error_code = ErrorCode::None;
-
-                for config in resource.configs.unwrap_or_default() {
-                    match OpType::try_from(config.config_operation)? {
-                        OpType::Set => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                "topic_configuration_upsert.sql",
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                    config.value.as_deref(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Delete => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                "topic_configuration_delete.sql",
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Append => todo!(),
-                        OpType::Subtract => todo!(),
-                    }
-                }
+                self.alter_topic(&resource).await?;
 
                 Ok(AlterConfigsResourceResponse::default()
-                    .error_code(error_code.into())
+                    .error_code(ErrorCode::None.into())
                     .error_message(Some("".into()))
                     .resource_type(resource.resource_type)
                     .resource_name(resource.resource_name))

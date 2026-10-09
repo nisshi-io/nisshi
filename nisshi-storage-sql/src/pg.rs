@@ -65,7 +65,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, config::apply_op,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -286,6 +286,75 @@ impl TryFrom<Row> for Txn {
 }
 
 impl Postgres {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let mut c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        let topic = &resource.resource_name;
+
+        if self
+            .tx_prepare_query_opt(
+                &tx,
+                "topic_select_name_for_update.sql",
+                &[&self.cluster, topic],
+            )
+            .await?
+            .is_none()
+        {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        for config in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(config.config_operation)?;
+
+            let current = if matches!(op, OpType::Append | OpType::Subtract) {
+                self.tx_prepare_query_opt(
+                    &tx,
+                    "topic_configuration_select_name.sql",
+                    &[&self.cluster, topic, &config.name],
+                )
+                .await?
+                .map(|row| row.try_get::<_, Option<String>>(0))
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+
+            match apply_op(
+                ConfigResource::Topic,
+                &config.name,
+                current.as_deref(),
+                op,
+                config.value.as_deref(),
+            )? {
+                Some(value) => {
+                    _ = self
+                        .tx_prepare_query_opt(
+                            &tx,
+                            "topic_configuration_upsert.sql",
+                            &[&self.cluster, topic, &config.name, &value],
+                        )
+                        .await?;
+                }
+
+                None => {
+                    _ = self
+                        .tx_prepare_execute(
+                            &tx,
+                            "topic_configuration_delete.sql",
+                            &[&self.cluster, topic, &config.name],
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(Into::into)
+    }
+
     pub fn builder(
         connection: &str,
     ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, Pool>> {
@@ -2072,6 +2141,14 @@ impl Storage for Postgres {
 
         let topic_name = row.try_get::<_, String>(1)?;
 
+        _ = self
+            .tx_prepare_query_opt(
+                &tx,
+                "topic_select_name_for_update.sql",
+                &[&self.cluster, &topic_name],
+            )
+            .await?;
+
         for (description, sql) in [
             ("consumer_offsets", "consumer_offset_delete_by_topic.sql"),
             (
@@ -2139,56 +2216,10 @@ impl Storage for Postgres {
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
             ConfigResource::Topic => {
-                let mut error_code = ErrorCode::None;
-
-                for config in resource.configs.unwrap_or_default() {
-                    match OpType::try_from(config.config_operation)? {
-                        OpType::Set => {
-                            let c = self.connection().await?;
-
-                            if self
-                                .prepare_query(
-                                    &c,
-                                    "topic_configuration_upsert.sql",
-                                    &[
-                                        &self.cluster,
-                                        &resource.resource_name,
-                                        &config.name,
-                                        &config.value,
-                                    ],
-                                )
-                                .await
-                                .inspect_err(|err| error!(?err))
-                                .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Delete => {
-                            let c = self.connection().await?;
-
-                            if self
-                                .prepare_query(
-                                    &c,
-                                    "topic_configuration_delete.sql",
-                                    &[&self.cluster, &resource.resource_name, &config.name],
-                                )
-                                .await
-                                .inspect_err(|err| error!(?err))
-                                .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Append => todo!(),
-                        OpType::Subtract => todo!(),
-                    }
-                }
+                self.alter_topic(&resource).await?;
 
                 Ok(AlterConfigsResourceResponse::default()
-                    .error_code(error_code.into())
+                    .error_code(ErrorCode::None.into())
                     .error_message(Some("".into()))
                     .resource_type(resource.resource_type)
                     .resource_name(resource.resource_name))
