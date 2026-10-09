@@ -70,7 +70,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-assert_matches.workspace = true
 object_store.workspace = true
 pbkdf2.workspace = true
 rcgen.workspace = true
@@ -80,3 +79,5 @@ pretty_assertions.workspace = true
 slatedb.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage.workspace = true
+nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
+traceforge.workspace = true

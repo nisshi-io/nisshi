@@ -75,7 +75,6 @@ private_intra_doc_links = "deny"
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
 arrow = { version = "58" }
-assert_matches = "1.5.0"
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}
 bytes = { version = "1", features = ["serde"] }
@@ -191,6 +190,7 @@ tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1","with-uui
 tokio-postgres-rustls = "0.13.0"
 tokio-rustls = "0.26.4"
 tokio-util = { version = "0.7", features = ["full"] }
+traceforge = "0.2"
 tracing = "0.1"
 tracing-core = { version = "0.1" }
 tracing-opentelemetry = "0.34.0"
