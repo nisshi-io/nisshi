@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Nisshi Message Generator
 //!
 //! Generate fake data for schema backed topics.
@@ -294,10 +295,10 @@ impl Generate {
             ));
         };
 
-        let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+        let mut interrupt_signal = signal(SignalKind::interrupt())?;
         debug!(?interrupt_signal);
 
-        let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+        let mut terminate_signal = signal(SignalKind::terminate())?;
         debug!(?terminate_signal);
 
         let rate_limiter = self

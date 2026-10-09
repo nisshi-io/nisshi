@@ -427,55 +427,60 @@ impl Arg {
         require_schema_registry(&self.command, schema_registry.is_some())?;
 
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-        let lake_house =
-            match self.command {
-                #[cfg(feature = "iceberg")]
-                Some(Lake::Iceberg {
-                    location,
-                    catalog,
-                    namespace,
-                    warehouse,
-                }) => Some(
-                    nisshi_schema::lake::House::iceberg()
-                        .location(location.into_inner())
-                        .catalog(catalog.into_inner())
-                        .schema_registry(schema_registry.clone().expect(
-                            "require_schema_registry already checked a lake command has one",
-                        ))
-                        .namespace(namespace)
-                        .warehouse(warehouse)
-                        .build()
-                        .await?,
-                ),
+        let lake_house = match self.command {
+            #[cfg(feature = "iceberg")]
+            Some(Lake::Iceberg {
+                location,
+                catalog,
+                namespace,
+                warehouse,
+            }) => Some(
+                nisshi_schema::lake::House::iceberg()
+                    .location(location.into_inner())
+                    .catalog(catalog.into_inner())
+                    .schema_registry(
+                        schema_registry
+                            .clone()
+                            .ok_or(Error::LakeRequiresSchemaRegistry { lake: "iceberg" })?,
+                    )
+                    .namespace(namespace)
+                    .warehouse(warehouse)
+                    .build()
+                    .await?,
+            ),
 
-                #[cfg(feature = "delta")]
-                Some(Lake::Delta {
-                    location,
-                    database,
-                    records_per_second,
-                }) => Some(
-                    nisshi_schema::lake::House::delta()
-                        .location(location.into_inner())
-                        .schema_registry(schema_registry.clone().expect(
-                            "require_schema_registry already checked a lake command has one",
-                        ))
-                        .database(database)
-                        .records_per_second(records_per_second)
-                        .build()?,
-                ),
+            #[cfg(feature = "delta")]
+            Some(Lake::Delta {
+                location,
+                database,
+                records_per_second,
+            }) => Some(
+                nisshi_schema::lake::House::delta()
+                    .location(location.into_inner())
+                    .schema_registry(
+                        schema_registry
+                            .clone()
+                            .ok_or(Error::LakeRequiresSchemaRegistry { lake: "delta" })?,
+                    )
+                    .database(database)
+                    .records_per_second(records_per_second)
+                    .build()?,
+            ),
 
-                #[cfg(feature = "parquet")]
-                Some(Lake::Parquet { location }) => Some(
-                    nisshi_schema::lake::House::parquet()
-                        .location(location.into_inner())
-                        .schema_registry(schema_registry.clone().expect(
-                            "require_schema_registry already checked a lake command has one",
-                        ))
-                        .build()?,
-                ),
+            #[cfg(feature = "parquet")]
+            Some(Lake::Parquet { location }) => Some(
+                nisshi_schema::lake::House::parquet()
+                    .location(location.into_inner())
+                    .schema_registry(
+                        schema_registry
+                            .clone()
+                            .ok_or(Error::LakeRequiresSchemaRegistry { lake: "parquet" })?,
+                    )
+                    .build()?,
+            ),
 
-                None => None,
-            };
+            None => None,
+        };
 
         let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
             .node_id(NODE_ID)

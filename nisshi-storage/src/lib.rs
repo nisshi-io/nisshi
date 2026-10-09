@@ -111,6 +111,7 @@
 //! ```
 //!
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use async_trait::async_trait;
 use bytes::{Bytes, TryGetError};
 
@@ -189,11 +190,13 @@ use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
 
+mod assignment;
 mod batch;
 mod latency;
 mod proxy;
 mod service;
 
+pub use assignment::assign_replicas;
 pub use batch::ProduceRequestBatcher;
 pub use latency::LatencyIntroducingStorage;
 pub use proxy::SemaphoreProxy;
@@ -307,6 +310,8 @@ pub enum Error {
     #[cfg(feature = "slatedb")]
     Postcard(#[from] postcard::Error),
 
+    ProgressStyleTemplate(Arc<indicatif::style::TemplateError>),
+
     Regex(#[from] regex::Error),
 
     SansIo(#[from] nisshi_sans_io::Error),
@@ -387,6 +392,12 @@ impl<T> From<PoisonError<T>> for Error {
 impl From<AcquireError> for Error {
     fn from(value: AcquireError) -> Self {
         Self::Acquire(Arc::new(value))
+    }
+}
+
+impl From<indicatif::style::TemplateError> for Error {
+    fn from(value: indicatif::style::TemplateError) -> Self {
+        Self::ProgressStyleTemplate(Arc::new(value))
     }
 }
 
@@ -2385,8 +2396,7 @@ impl Builder<i32, String, Url, Url> {
         } else {
             let pb = ProgressBar::new(1);
             pb.set_style(
-                ProgressStyle::with_template("[{elapsed}] {bar:40.cyan/blue} {msg}")
-                    .unwrap()
+                ProgressStyle::with_template("[{elapsed}] {bar:40.cyan/blue} {msg}")?
                     .progress_chars("##-"),
             );
 

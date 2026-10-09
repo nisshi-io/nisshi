@@ -150,7 +150,7 @@ async fn ping_propagates_list_error() -> Result<(), Error> {
     let object_store = FailingListObjectStore::new(InMemory::new());
 
     let storage =
-        DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
+        DynoStore::new("nisshi", 12321, object_store)?.advertised_listener(advertised_listener);
 
     assert!(storage.ping().await.is_err());
 
@@ -165,7 +165,7 @@ async fn ping_ok_on_healthy_store() -> Result<(), Error> {
     let advertised_listener = Url::parse("tcp://localhost:9092")?;
 
     let storage =
-        DynoStore::new("nisshi", 12322, InMemory::new()).advertised_listener(advertised_listener);
+        DynoStore::new("nisshi", 12322, InMemory::new())?.advertised_listener(advertised_listener);
 
     assert!(storage.ping().await.is_ok());
 
@@ -183,7 +183,7 @@ async fn ping_lists_only_the_cluster_prefix() -> Result<(), Error> {
     let object_store = FailingListObjectStore::allow_prefix(InMemory::new(), "clusters/nisshi/");
 
     let storage =
-        DynoStore::new("nisshi", 12323, object_store).advertised_listener(advertised_listener);
+        DynoStore::new("nisshi", 12323, object_store)?.advertised_listener(advertised_listener);
 
     assert!(storage.ping().await.is_ok());
 

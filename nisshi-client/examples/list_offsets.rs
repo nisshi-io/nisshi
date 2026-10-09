@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
                 None
             }
         })
-        .expect("topic not found in metadata");
+        .ok_or_else(|| Error::Message(format!("topic not found in metadata: {}", arg.topic)))?;
 
     let timestamp = arg.offset.try_into()?;
 

@@ -74,7 +74,8 @@ impl StorageFactory for EngineFactory {
             .build()
             .await
             .map(Arc::new)
-            .map(|db| {
+            .map_err(Into::into)
+            .and_then(|db| {
                 Engine::builder()
                     .cluster(configuration.cluster)
                     .node(configuration.node_id)
@@ -86,7 +87,6 @@ impl StorageFactory for EngineFactory {
             })
             .map(Box::new)
             .map(|storage| Arc::new(storage) as ArcDynStorage)
-            .map_err(Into::into)
     }
 }
 

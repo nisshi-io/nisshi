@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use dotenv::dotenv;
 use nisshi_broker::{TracingFormat, otel};
 use nisshi_cli::{Cli, Result};

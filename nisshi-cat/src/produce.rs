@@ -283,13 +283,18 @@ impl Produce {
         let TopicProduceResponse {
             partition_responses,
             ..
-        } = responses.first().expect("responses: {responses:?}");
+        } = responses.first().ok_or_else(|| {
+            Error::Message(format!("expected exactly one response: {responses:?}"))
+        })?;
         let partition_responses = partition_responses.as_deref().unwrap_or_default();
         assert_eq!(1, partition_responses.len());
 
-        let PartitionProduceResponse { error_code, .. } = partition_responses
-            .first()
-            .expect("partition_responses: {partition_responses:?}");
+        let PartitionProduceResponse { error_code, .. } =
+            partition_responses.first().ok_or_else(|| {
+                Error::Message(format!(
+                    "expected exactly one partition response: {partition_responses:?}"
+                ))
+            })?;
 
         ErrorCode::try_from(*error_code).map_err(Into::into)
     }

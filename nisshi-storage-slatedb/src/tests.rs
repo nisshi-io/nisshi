@@ -1319,7 +1319,8 @@ async fn test_builder_pattern() {
         .db(Arc::new(db))
         .schemas(None)
         .lake(None)
-        .build();
+        .build()
+        .unwrap();
 
     assert_eq!("builder-cluster", engine.cluster_id().await.unwrap());
     assert_eq!(42, engine.node().await.unwrap());

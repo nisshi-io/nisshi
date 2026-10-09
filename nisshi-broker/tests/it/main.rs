@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 mod common;
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
@@ -53,6 +54,7 @@ pub mod produce;
 pub mod produce_acks_zero;
 pub mod produce_fetch;
 pub mod sasl_scram_enforcement;
+pub mod startup_failure;
 pub mod storage_describe_cluster;
 pub mod storage_describe_configs;
 pub mod storage_fetch;

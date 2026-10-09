@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Nisshi Cat
 //!
 //! Fetch or Produce (with validation when backed by a schema) messages to a topic
@@ -34,6 +35,7 @@ pub enum Error {
     Client(#[from] nisshi_client::Error),
     Io(Arc<io::Error>),
     LinesCodec(#[from] LinesCodecError),
+    Message(String),
     Protocol(#[from] nisshi_sans_io::Error),
     Schema(#[from] nisshi_schema::Error),
     SerdeJson(#[from] serde_json::Error),

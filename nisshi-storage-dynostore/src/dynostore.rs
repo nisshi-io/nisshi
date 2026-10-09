@@ -48,7 +48,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated, inflated},
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
@@ -457,11 +457,11 @@ fn json_content_type() -> Attributes {
 }
 
 impl DynoStore {
-    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
-        Self {
+    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Result<Self> {
+        Ok(Self {
             cluster: cluster.into(),
             node,
-            advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
+            advertised_listener: Url::parse("tcp://127.0.0.1/")?,
             schemas: None,
 
             lake: None,
@@ -471,8 +471,8 @@ impl DynoStore {
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
                 Duration::from_millis(5_000),
-            )),
-        }
+            )?),
+        })
     }
 
     pub(crate) fn advertised_listener(self, advertised_listener: Url) -> Self {
@@ -1716,31 +1716,13 @@ impl Storage for DynoStore {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
-
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
-
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
-
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
+                            let partitions = Some(nisshi_storage::assign_replicas(
+                                &broker_ids,
+                                partitions,
+                                replication_factor,
+                                error_code,
+                                0,
+                            )?);
 
                             MetadataResponseTopic::default()
                                 .error_code(error_code)
@@ -1815,31 +1797,13 @@ impl Storage for DynoStore {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
-
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
-
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
-
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
+                            let partitions = Some(nisshi_storage::assign_replicas(
+                                &broker_ids,
+                                partitions,
+                                replication_factor,
+                                error_code,
+                                0,
+                            )?);
 
                             responses.push(
                                 MetadataResponseTopic::default()

@@ -30,6 +30,7 @@ use tracing::debug;
 /// of these ever originates from us: topic configuration can currently be
 /// set by any connected client (a separate, known authorization gap), so
 /// both strings must be treated as untrusted input.
+#[allow(clippy::unwrap_used)]
 static SAFE_IDENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
 

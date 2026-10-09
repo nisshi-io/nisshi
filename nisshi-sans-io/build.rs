@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// This build script only ever runs at compile time, generating this crate's protocol
+// types from the upstream Kafka JSON descriptors in `message/`; a panic here fails the
+// build, not a shipped binary, so it follows the same convention as the hand-written
+// codegen in `nisshi-model` (see e.g. `nisshi-model/src/lib.rs`'s `ToTokens` impls).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use convert_case::{Case, Casing};
 use nisshi_model::{CommonStruct, Field, Listener, Message, MessageKind, wv::Wv};
 use proc_macro2::TokenStream;

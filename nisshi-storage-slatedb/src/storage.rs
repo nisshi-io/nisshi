@@ -1914,7 +1914,9 @@ impl Storage for Engine {
 
             // Check if transaction already exists
             if transactions.contains_key(transaction_id) {
-                let existing_txn = transactions.get_mut(transaction_id).unwrap();
+                let existing_txn = transactions
+                    .get_mut(transaction_id)
+                    .ok_or_else(|| Error::Message("transaction not found".into()))?;
                 let producer_id = existing_txn.producer;
 
                 // Check if there's an active epoch that needs to be aborted
@@ -2011,7 +2013,9 @@ impl Storage for Engine {
                 let new_epoch = old_epoch + 1;
 
                 // Re-get mutable reference after potential modification
-                let existing_txn = transactions.get_mut(transaction_id).unwrap();
+                let existing_txn = transactions
+                    .get_mut(transaction_id)
+                    .ok_or_else(|| Error::Message("transaction not found".into()))?;
                 _ = existing_txn.epochs.insert(
                     new_epoch,
                     TxnDetail {
@@ -2649,8 +2653,13 @@ impl Storage for Engine {
 
             // Mark current transaction as complete
             {
-                let transaction = transactions.get_mut(transaction_id).unwrap();
-                let txn_detail = transaction.epochs.get_mut(&producer_epoch).unwrap();
+                let transaction = transactions
+                    .get_mut(transaction_id)
+                    .ok_or_else(|| Error::Message("transaction not found".into()))?;
+                let txn_detail = transaction
+                    .epochs
+                    .get_mut(&producer_epoch)
+                    .ok_or_else(|| Error::Message("transaction epoch not found".into()))?;
                 txn_detail.state = Some(if committed {
                     TxnState::Committed
                 } else {
