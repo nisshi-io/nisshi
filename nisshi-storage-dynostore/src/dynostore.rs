@@ -512,7 +512,7 @@ impl DynoStore {
     }
 
     fn decode(&self, encoded: Bytes) -> Result<deflated::Batch> {
-        debug!(encoded = ?&encoded[..]);
+        debug!(encoded = encoded.len());
         deflated::Batch::try_from(encoded)
             .inspect_err(|err| debug!(?err))
             .map_err(Into::into)

@@ -57,21 +57,26 @@ impl AsRef<str> for MessageKind {
 }
 
 fn validate(validator: Option<&jsonschema::Validator>, encoded: Option<Bytes>) -> Result<()> {
-    debug!(validator = ?validator, ?encoded);
+    debug!(validator = ?validator, len = ?encoded.as_ref().map(Bytes::len));
 
     validator
         .map_or(Ok(()), |validator| {
             encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
                 serde_json::from_reader(&encoded[..])
                     .map_err(|err| {
-                        warn!(?err, ?encoded);
+                        warn!(?err, len = encoded.len());
                         Error::Api(ErrorCode::InvalidRecord)
                     })
-                    .inspect(|instance| debug!(?instance))
                     .and_then(|instance| {
                         validator
                             .validate(&instance)
-                            .inspect_err(|err| warn!(?err, ?validator, %instance))
+                            .inspect_err(|err| {
+                                warn!(
+                                    instance_path = %err.instance_path(),
+                                    schema_path = %err.schema_path(),
+                                    ?validator
+                                );
+                            })
                             .map_err(|_err| Error::Api(ErrorCode::InvalidRecord))
                     })
             })
@@ -136,21 +141,16 @@ impl AsKafkaRecord for Schema {
     fn as_kafka_record(&self, value: &Value) -> Result<nisshi_sans_io::record::Builder> {
         let mut builder = nisshi_sans_io::record::Record::builder();
 
-        if let Some(value) = value.get(MessageKind::Key.as_ref()) {
-            debug!(?value);
-
-            if self.key.is_some() {
-                builder = builder.key(serde_json::to_vec(value).map(Bytes::from).map(Into::into)?);
-            }
+        if let Some(value) = value.get(MessageKind::Key.as_ref())
+            && self.key.is_some()
+        {
+            builder = builder.key(serde_json::to_vec(value).map(Bytes::from).map(Into::into)?);
         }
 
-        if let Some(value) = value.get(MessageKind::Value.as_ref()) {
-            debug!(?value);
-
-            if self.value.is_some() {
-                builder =
-                    builder.value(serde_json::to_vec(value).map(Bytes::from).map(Into::into)?);
-            }
+        if let Some(value) = value.get(MessageKind::Value.as_ref())
+            && self.value.is_some()
+        {
+            builder = builder.value(serde_json::to_vec(value).map(Bytes::from).map(Into::into)?);
         }
 
         Ok(builder)

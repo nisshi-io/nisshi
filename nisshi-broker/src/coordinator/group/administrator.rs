@@ -25,8 +25,9 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use nisshi_sans_io::{
-    Body, ErrorCode,
+    Body, DeleteGroupsResponse, ErrorCode,
     consumer::{MemberAssignment, MemberMetadata},
+    delete_groups_response::DeletableGroupResult,
     heartbeat_response::HeartbeatResponse,
     join_group_request::JoinGroupRequestProtocol,
     join_group_response::{JoinGroupResponse, JoinGroupResponseMember},
@@ -44,8 +45,8 @@ use nisshi_sans_io::{
     sync_group_response::SyncGroupResponse,
 };
 use nisshi_storage::{
-    GroupDetail, GroupMember, GroupState, OffsetCommitRequest, Storage, Topition, UpdateError,
-    Version,
+    GroupDetail, GroupDetailResponse, GroupMember, GroupState, OffsetCommitRequest, Storage,
+    Topition, UpdateError, Version,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::time::{Duration, sleep};
@@ -1458,6 +1459,107 @@ where
                 }
             }
         }
+    }
+
+    /// Deletes every named group that has no members, and refuses each other
+    /// group with `NON_EMPTY_GROUP`.
+    ///
+    /// The decision comes from storage, not from this broker's cache, because
+    /// another broker that shares the storage can hold the group's members.
+    /// This broker forgets its cached state for each group that it deletes.
+    /// A known race remains: a concurrent request for the same group can
+    /// write the group's detail again after the delete, because the
+    /// `Storage` delete does not check the version of the group's detail.
+    #[instrument(skip(self))]
+    async fn delete_groups(&self, group_ids: &[String]) -> Result<Body> {
+        debug!(?group_ids);
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "delete_groups")]);
+
+        // Kafka processes each distinct group id once, and answers it once:
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1891
+        let mut seen = HashSet::with_capacity(group_ids.len());
+        let group_ids = group_ids
+            .iter()
+            .filter(|group_id| seen.insert(group_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut described = self
+            .storage
+            .describe_groups(Some(&group_ids), false)
+            .await?
+            .into_iter()
+            .map(|named| (named.name, named.response))
+            .collect::<BTreeMap<_, _>>();
+
+        let now = SystemTime::now();
+        let mut results = Vec::with_capacity(group_ids.len());
+        let mut deletable = Vec::with_capacity(group_ids.len());
+
+        for group_id in group_ids {
+            let refusal = match described.remove(&group_id) {
+                Some(GroupDetailResponse::Found(detail)) => {
+                    // The coordinator removes each member whose session
+                    // timeout has expired, so that a member that never sent
+                    // `LeaveGroup` does not keep the group alive.
+                    let wrapper = Wrapper::with_storage_group_detail(self.storage.clone(), detail)
+                        .missed_heartbeat(&group_id, "", now);
+
+                    (!wrapper.members().is_empty()).then_some(ErrorCode::NonEmptyGroup)
+                }
+
+                // `Storage::delete_groups` answers for a group that does not
+                // exist and for an invalid group id.
+                Some(GroupDetailResponse::ErrorCode(
+                    ErrorCode::GroupIdNotFound | ErrorCode::InvalidGroupId,
+                )) => None,
+
+                // The coordinator keeps a group whose state it cannot read,
+                // because an unread group can still have members.
+                Some(GroupDetailResponse::ErrorCode(error_code)) => {
+                    warn!(
+                        group_id,
+                        ?error_code,
+                        "describe groups failed, not deleting"
+                    );
+                    Some(error_code)
+                }
+
+                None => {
+                    warn!(group_id, "describe groups omitted group, not deleting");
+                    Some(ErrorCode::UnknownServerError)
+                }
+            };
+
+            match refusal {
+                None => deletable.push(group_id),
+                Some(error_code) => results.push(
+                    DeletableGroupResult::default()
+                        .group_id(group_id)
+                        .error_code(error_code.into()),
+                ),
+            }
+        }
+
+        if !deletable.is_empty() {
+            let deleted = self.storage.delete_groups(Some(&deletable)).await?;
+
+            _ = self.wrappers.lock().map(|mut wrappers| {
+                for result in &deleted {
+                    if result.error_code == i16::from(ErrorCode::None) {
+                        _ = wrappers.remove(&result.group_id);
+                    }
+                }
+            })?;
+
+            results.extend(deleted);
+        }
+
+        Ok(Body::DeleteGroupsResponse(
+            DeleteGroupsResponse::default()
+                .throttle_time_ms(0)
+                .results(Some(results)),
+        ))
     }
 }
 
