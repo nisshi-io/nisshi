@@ -1,0 +1,125 @@
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Leader and replica assignment for topic metadata.
+
+use nisshi_sans_io::metadata_response::MetadataResponsePartition;
+
+use crate::{Error, Result};
+
+/// Assign a leader and replicas to each partition, round robin over `broker_ids`.
+///
+/// Each partition takes `1 + replication_factor` consecutive brokers: the
+/// first leads and the rest are its replicas (also reported as in sync). A
+/// replication factor below one gives a partition no replicas beyond its
+/// leader. Every storage backend builds metadata through this one function.
+pub fn assign_replicas(
+    broker_ids: &[i32],
+    partitions: i32,
+    replication_factor: impl Into<i32>,
+    error_code: i16,
+    leader_epoch: i32,
+) -> Result<Vec<MetadataResponsePartition>> {
+    if broker_ids.is_empty() {
+        return Err(Error::Message(
+            "no brokers available for partition assignment".into(),
+        ));
+    }
+
+    let replicas = usize::try_from(replication_factor.into()).unwrap_or_default();
+    let per_partition = 1 + replicas;
+
+    Ok((0..partitions)
+        .map(|partition_index| {
+            let base = usize::try_from(partition_index).unwrap_or_default() * per_partition;
+            let leader_id = broker_ids[base % broker_ids.len()];
+
+            let replica_nodes: Vec<i32> = (0..replicas)
+                .map(|replica| broker_ids[(base + 1 + replica) % broker_ids.len()])
+                .collect();
+
+            MetadataResponsePartition::default()
+                .error_code(error_code)
+                .partition_index(partition_index)
+                .leader_id(leader_id)
+                .leader_epoch(Some(leader_epoch))
+                .replica_nodes(Some(replica_nodes.clone()))
+                .isr_nodes(Some(replica_nodes))
+                .offline_replicas(Some([].into()))
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nodes(partition: &MetadataResponsePartition) -> Vec<i32> {
+        partition.replica_nodes.clone().unwrap_or_default()
+    }
+
+    #[test]
+    fn no_brokers_is_an_error() {
+        assert!(assign_replicas(&[], 1, 1, 0, 0).is_err());
+    }
+
+    #[test]
+    fn leaders_and_replicas_are_consecutive_brokers() -> Result<()> {
+        let partitions = assign_replicas(&[10, 20, 30], 3, 1, 0, 0)?;
+
+        let assigned: Vec<_> = partitions
+            .iter()
+            .map(|partition| (partition.leader_id, nodes(partition)))
+            .collect();
+
+        assert_eq!(
+            vec![(10, vec![20]), (30, vec![10]), (20, vec![30])],
+            assigned
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn isr_matches_replicas_and_epoch_is_passed_through() -> Result<()> {
+        let partitions = assign_replicas(&[1, 2], 2, 1, 0, -1)?;
+
+        for partition in &partitions {
+            assert_eq!(partition.replica_nodes, partition.isr_nodes);
+            assert_eq!(Some(-1), partition.leader_epoch);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn negative_replication_factor_has_no_replicas_and_does_not_overflow() -> Result<()> {
+        let partitions = assign_replicas(&[1, 2, 3], 5, -2, 0, 0)?;
+
+        assert_eq!(5, partitions.len());
+        assert!(
+            partitions
+                .iter()
+                .all(|partition| nodes(partition).is_empty())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replicas_wrap_over_fewer_brokers_than_the_factor() -> Result<()> {
+        let partitions = assign_replicas(&[1, 2], 1, 3, 0, 0)?;
+
+        assert_eq!(1, partitions[0].leader_id);
+        assert_eq!(vec![2, 1, 2], nodes(&partitions[0]));
+        Ok(())
+    }
+}

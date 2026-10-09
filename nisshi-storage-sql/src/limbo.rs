@@ -47,7 +47,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
     to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
@@ -2195,43 +2195,13 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    if broker_ids.is_empty() {
-                                        return Err(Error::Message(
-                                            "no brokers available for partition assignment".into(),
-                                        ));
-                                    }
-
-                                    let per_partition = 1 + replication_factor as usize;
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let base = partition_index as usize * per_partition;
-                                                let leader_id = broker_ids[base % broker_ids.len()];
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|replica| {
-                                                            broker_ids[(base
-                                                                + 1
-                                                                + replica as usize)
-                                                                % broker_ids.len()]
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -2332,43 +2302,13 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    if broker_ids.is_empty() {
-                                        return Err(Error::Message(
-                                            "no brokers available for partition assignment".into(),
-                                        ));
-                                    }
-
-                                    let per_partition = 1 + replication_factor as usize;
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let base = partition_index as usize * per_partition;
-                                                let leader_id = broker_ids[base % broker_ids.len()];
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|replica| {
-                                                            broker_ids[(base
-                                                                + 1
-                                                                + replica as usize)
-                                                                % broker_ids.len()]
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -2468,41 +2408,13 @@ impl Storage for Engine {
                         brokers.iter().map(|broker| broker.node_id).collect();
                     broker_ids.shuffle(&mut rng);
 
-                    if broker_ids.is_empty() {
-                        return Err(Error::Message(
-                            "no brokers available for partition assignment".into(),
-                        ));
-                    }
-
-                    let per_partition = 1 + replication_factor as usize;
-
-                    let partitions = Some(
-                        (0..partitions)
-                            .map(|partition_index| {
-                                let base = partition_index as usize * per_partition;
-                                let leader_id = broker_ids[base % broker_ids.len()];
-
-                                let replica_nodes = Some(
-                                    (0..replication_factor)
-                                        .map(|replica| {
-                                            broker_ids
-                                                [(base + 1 + replica as usize) % broker_ids.len()]
-                                        })
-                                        .collect(),
-                                );
-                                let isr_nodes = replica_nodes.clone();
-
-                                MetadataResponsePartition::default()
-                                    .error_code(error_code)
-                                    .partition_index(partition_index)
-                                    .leader_id(leader_id)
-                                    .leader_epoch(Some(-1))
-                                    .replica_nodes(replica_nodes)
-                                    .isr_nodes(isr_nodes)
-                                    .offline_replicas(Some([].into()))
-                            })
-                            .collect(),
-                    );
+                    let partitions = Some(nisshi_storage::assign_replicas(
+                        &broker_ids,
+                        partitions,
+                        replication_factor,
+                        error_code,
+                        -1,
+                    )?);
 
                     responses.push(
                         MetadataResponseTopic::default()
