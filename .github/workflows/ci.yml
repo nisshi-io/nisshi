@@ -589,8 +589,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           # Only the sqlite legs build the broker, so only they use the
-          # cache, and one of them per os saves it.
+          # cache, and one of them per os saves it. The key replaces the
+          # default, which includes the job id, so smoke-oldest-client
+          # restores this cache too.
           cache: ${{ matrix.storage == 'sqlite' }}
+          cache-shared-key: smoke-sqlite
           cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.storage == 'sqlite' && matrix.kafka == 'apache/kafka:3.9.2' }}
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -605,7 +608,10 @@ jobs:
           if [[ "${STORAGE}" != sqlite ]]; then
             echo "NISSHI_SMOKE_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
           fi
+      # The step stops well before the job's timeout, so the steps that
+      # upload the results and logs still run when the suite hangs.
       - run: just smoke "${STORAGE}"
+        timeout-minutes: 20
       # `just smoke` writes the results file even when it fails. A leg that
       # failed before `just smoke` ran gets a failed row here instead, so it
       # still has a column in the report.
@@ -626,7 +632,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
-          path: target/smoke/*.log
+          path: |
+            target/smoke/*.log
+            target/smoke/brokers-*/*/*.log
           if-no-files-found: warn
   # Runs the smoke suite with the Kafka CLI tools from the oldest Kafka release that CI tests, so
   # CI checks that an older Java client still negotiates API versions with the broker.
@@ -679,6 +687,7 @@ jobs:
         with:
           # The sqlite leg reads the cache that the smoke job saves.
           cache: ${{ matrix.storage == 'sqlite' }}
+          cache-shared-key: smoke-sqlite
           cache-save-if: false
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -691,7 +700,10 @@ jobs:
           if [[ "${STORAGE}" != sqlite ]]; then
             echo "NISSHI_SMOKE_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
           fi
+      # The step stops well before the job's timeout, so the steps that
+      # upload the results and logs still run when the suite hangs.
       - run: just smoke "${STORAGE}"
+        timeout-minutes: 20
       # `just smoke` writes the results file even when it fails. A leg that
       # failed before `just smoke` ran gets a failed row here instead, so it
       # still has a column in the report.
