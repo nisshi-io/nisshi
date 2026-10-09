@@ -1328,7 +1328,7 @@ mod time_index {
     use std::time::{Duration, SystemTime};
 
     use nisshi_sans_io::{
-        IsolationLevel, ListOffset,
+        BatchAttribute, Compression, IsolationLevel, ListOffset,
         create_topics_request::CreatableTopicConfig,
         delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
         record::{Record, inflated},
@@ -1412,6 +1412,43 @@ mod time_index {
             record_count: last_offset_delta as u32 + 1,
             record_data: Bytes::new(),
         }
+    }
+
+    /// Five records at offset deltas 0-4, with timestamps `base_timestamp`
+    /// plus 0, 10, 20, 30 and 40, built via the real encoder so the batch
+    /// can be inflated.
+    fn five_record_batch(base_timestamp: i64) -> Batch {
+        let mut builder = inflated::Batch::builder()
+            .base_timestamp(base_timestamp)
+            .max_timestamp(base_timestamp + 40)
+            .last_offset_delta(4);
+
+        for delta in 0..5 {
+            builder = builder.record(
+                Record::builder()
+                    .key(None)
+                    .value(Some(Bytes::from_static(b"v")))
+                    .offset_delta(delta)
+                    .timestamp_delta(i64::from(delta) * 10),
+            );
+        }
+
+        builder.build().and_then(Batch::try_from).unwrap()
+    }
+
+    /// Move the log start of `topic`'s partition 0 to `low` and keep every
+    /// batch. `delete_records` removes a batch whose base offset is below
+    /// the new log start, so a log start inside a batch can only be set by
+    /// writing the watermark directly.
+    async fn set_log_start(engine: &Engine, topic: uuid::Uuid, low: i64) {
+        let mut watermark = watermark_of(engine, topic, 0).await;
+        watermark.low = Some(low);
+        let watermark_key = postcard::to_stdvec(&WatermarkKey::new(topic, 0)).unwrap();
+        let _ = engine
+            .db
+            .put(watermark_key, postcard::to_stdvec(&watermark).unwrap())
+            .await
+            .unwrap();
     }
 
     fn at_millis(millis: i64) -> SystemTime {
@@ -1558,35 +1595,12 @@ mod time_index {
         let topic = topic_uuid(&engine, "time-index-straddle").await;
 
         // One batch: offsets 0-4, timestamps 10, 20, 30, 40, 50.
-        let batch = {
-            let mut builder = inflated::Batch::builder()
-                .base_timestamp(10)
-                .max_timestamp(50)
-                .last_offset_delta(4);
-
-            for delta in 0..5 {
-                builder = builder.record(
-                    Record::builder()
-                        .key(None)
-                        .value(Some(Bytes::from_static(b"v")))
-                        .offset_delta(delta)
-                        .timestamp_delta(i64::from(delta) * 10),
-                );
-            }
-
-            builder.build().and_then(Batch::try_from).unwrap()
-        };
-        let _ = engine.produce(None, &topition, batch).await.unwrap();
-
-        // The test moves the log start to offset 2 and keeps the batch.
-        let mut watermark = watermark_of(&engine, topic, 0).await;
-        watermark.low = Some(2);
-        let watermark_key = postcard::to_stdvec(&WatermarkKey::new(topic, 0)).unwrap();
         let _ = engine
-            .db
-            .put(watermark_key, postcard::to_stdvec(&watermark).unwrap())
+            .produce(None, &topition, five_record_batch(10))
             .await
             .unwrap();
+
+        set_log_start(&engine, topic, 2).await;
 
         // Offset 1 (ts 20) is the first match in the batch, but it is below
         // the log start, so the answer is offset 2 (ts 30).
@@ -2548,6 +2562,92 @@ mod time_index {
         let uncommitted = list_offsets_timestamp(&engine, &topition, 150).await;
         assert_eq!(Some(1), uncommitted.offset);
         assert_eq!(200, millis_since_epoch(uncommitted.timestamp.unwrap()));
+    }
+
+    async fn list_offsets_earliest(engine: &Engine, topition: &Topition) -> ListOffsetResponse {
+        engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), ListOffset::Earliest)],
+            )
+            .await
+            .unwrap()
+            .remove(0)
+            .1
+    }
+
+    /// The log start falls inside the first batch, and a second batch
+    /// follows it. The Earliest timestamp is the first record at or after
+    /// the log start inside the straddling batch, not the first record of
+    /// the next batch.
+    #[tokio::test]
+    async fn earliest_timestamp_from_batch_that_straddles_the_log_start() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-earliest-straddle").await;
+        let topic = topic_uuid(&engine, "time-index-earliest-straddle").await;
+
+        // Offsets 0-4 carry timestamps 10-50; offset 5 carries 60.
+        for batch in [five_record_batch(10), keyed_batch(b"b", b"v", 60)] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        set_log_start(&engine, topic, 2).await;
+
+        let response = list_offsets_earliest(&engine, &topition).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(2), response.offset);
+        assert_eq!(30, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
+    /// The batch that straddles the log start cannot be inflated. The
+    /// Earliest timestamp then comes from the next batch, as the lookup
+    /// scan steps over a corrupt batch, instead of being missing.
+    #[tokio::test]
+    async fn earliest_timestamp_skips_a_corrupt_batch_that_straddles_the_log_start() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-earliest-corrupt").await;
+        let topic = topic_uuid(&engine, "time-index-earliest-corrupt").await;
+
+        // Plain record data labelled as zstd is stored as it is and can
+        // never be inflated.
+        let mut corrupt = five_record_batch(10);
+        corrupt.attributes = BatchAttribute::default()
+            .compression(Compression::Zstd)
+            .into();
+
+        for batch in [corrupt, keyed_batch(b"b", b"v", 60)] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        set_log_start(&engine, topic, 2).await;
+
+        let response = list_offsets_earliest(&engine, &topition).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(2), response.offset);
+        assert_eq!(60, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
+    /// The batch that starts at the log start cannot be inflated. The
+    /// Earliest timestamp comes from the next batch, as when the corrupt
+    /// batch straddles the log start.
+    #[tokio::test]
+    async fn earliest_timestamp_skips_a_corrupt_batch_at_the_log_start() {
+        let engine = create_test_engine().await;
+        let topition = create_topic(&engine, "time-index-earliest-corrupt-base").await;
+
+        let mut corrupt = keyed_batch(b"a", b"v", 10);
+        corrupt.attributes = BatchAttribute::default()
+            .compression(Compression::Zstd)
+            .into();
+
+        for batch in [corrupt, keyed_batch(b"b", b"v", 60)] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        let response = list_offsets_earliest(&engine, &topition).await;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(0), response.offset);
+        assert_eq!(60, millis_since_epoch(response.timestamp.unwrap()));
     }
 }
 
