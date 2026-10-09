@@ -16,10 +16,23 @@
 
 use super::{KafkaCli, Output, ScramMechanism, Tool};
 
+/// How `kafka-configs --describe --entity-type users` starts the line that lists a user's SCRAM
+/// mechanisms, before the user's name.
+const SCRAM_CREDENTIALS_LINE_PREFIX: &str = "SCRAM credential configs for user-principal '";
+/// What `kafka-configs --describe --entity-type users` prints between the user's name and the
+/// mechanisms, which it separates with [`SCRAM_MECHANISM_SEPARATOR`].
+const SCRAM_CREDENTIALS_LINE_INFIX: &str = "' are ";
+/// What `kafka-configs --describe --entity-type users` prints between a user's mechanisms.
+const SCRAM_MECHANISM_SEPARATOR: &str = ", ";
+
 /// The command of the [`Output`] of `kafka-configs --describe`, from
 /// [`KafkaCli::describe_topic_configs`] or [`KafkaCli::describe_broker_defaults`].
 #[derive(Clone, Copy, Debug)]
 pub enum DescribeConfigs {}
+
+/// The command of [`KafkaCli::describe_users`]'s [`Output`].
+#[derive(Clone, Copy, Debug)]
+pub enum DescribeUsers {}
 
 impl KafkaCli {
     /// Describes `topic`'s config overrides, one `<name>=<value> sensitive=<bool> synonyms={...}`
@@ -117,6 +130,35 @@ impl KafkaCli {
                 &credentials,
             ],
         )
+    }
+
+    /// Describes every user's SCRAM credentials, with one
+    /// `SCRAM credential configs for user-principal '<user>' are <mechanism>=iterations=<n>, ...`
+    /// line per user.
+    ///
+    /// Sends `DescribeUserScramCredentials`.
+    pub fn describe_users(&self) -> Output<DescribeUsers> {
+        self.run(Tool::Configs, &["--entity-type", "users", "--describe"])
+    }
+}
+
+impl Output<DescribeUsers> {
+    /// Returns the names of the SCRAM mechanisms that `user` has credentials for, such as
+    /// `SCRAM-SHA-256`, or `None` if the output doesn't list `user`.
+    pub fn scram_mechanisms(&self, user: &str) -> Option<Vec<&str>> {
+        let user_line_start =
+            format!("{SCRAM_CREDENTIALS_LINE_PREFIX}{user}{SCRAM_CREDENTIALS_LINE_INFIX}");
+
+        self.lines().iter().find_map(|line| {
+            let mechanisms = line.strip_prefix(&user_line_start)?;
+
+            Some(
+                mechanisms
+                    .split(SCRAM_MECHANISM_SEPARATOR)
+                    .filter_map(|mechanism| Some(mechanism.split_once('=')?.0))
+                    .collect(),
+            )
+        })
     }
 }
 

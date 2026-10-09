@@ -52,6 +52,7 @@ mod configs;
 mod console_consumer;
 mod console_producer;
 mod consumer_groups;
+mod delete_records;
 mod offsets;
 mod topics;
 mod verifiable_producer;
@@ -68,11 +69,12 @@ pub const SASL_AUTHENTICATION_EXCEPTION: &str = "SaslAuthenticationException";
 const CONSOLE_PRODUCER_SEND_ERROR: &str = "Error when sending message";
 
 pub use cluster::{ApiVersions, ClusterId};
-pub use configs::DescribeConfigs;
+pub use configs::{DescribeConfigs, DescribeUsers};
 pub use console_consumer::{
-    Consume, ConsumeMatching, ConsumedRecord, LOG_APPEND_TIME, PrintsPartitionLines,
+    Consume, ConsumeMatching, ConsumedRecord, LOG_APPEND_TIME, PRINTED_NULL, PrintsPartitionLines,
 };
 pub use consumer_groups::{DescribeGroup, DescribeGroupState, GroupOffsets};
+pub use delete_records::DeleteRecords;
 pub use offsets::GetOffsets;
 pub use topics::{
     CreateTopic, DeleteTopic, DescribeTopic, ListTopics, PartitionReplicas, RequiresExistingTopic,
@@ -166,11 +168,41 @@ impl KafkaCli {
         ))
     }
 
+    /// Returns tools for the same broker whose clients give up on a call after `timeout`, instead
+    /// of after the Java client's default of 60 seconds.
+    pub fn with_api_timeout(&self, timeout: Duration) -> Self {
+        let timeout_millis = timeout.as_millis();
+
+        // The admin client raises `default.api.timeout.ms` to `request.timeout.ms`, 30 seconds by
+        // default, when it is lower, so the tools set both.
+        self.with_client_properties(&format!(
+            "default.api.timeout.ms={timeout_millis}\nrequest.timeout.ms={timeout_millis}\n"
+        ))
+    }
+
     /// Returns tools for the same broker whose client config file holds these tools' client
     /// properties, followed by `properties`.
     fn with_client_properties(&self, properties: &str) -> Self {
         let client_properties = format!("{}{properties}", self.client_properties);
-        let path = format!("/tmp/{}.properties", unique_name("client"));
+        let path = self.write_file_in_container("client", "properties", &client_properties);
+
+        Self {
+            container: self.container.clone(),
+            bootstrap: self.bootstrap.clone(),
+            client_properties,
+            client_config: Some(path),
+        }
+    }
+
+    /// Writes `contents` to a new file in the tools' container, and returns the file's path there.
+    /// The file is named `<name_prefix>-<unique part>.<extension>`.
+    fn write_file_in_container(
+        &self,
+        name_prefix: &str,
+        extension: &str,
+        contents: &str,
+    ) -> String {
+        let path = format!("/tmp/{}.{extension}", unique_name(name_prefix));
 
         let written = timed_command::run(
             Command::new("docker").args([
@@ -181,7 +213,7 @@ impl KafkaCli {
                 "-c",
                 &format!("cat > {path}"),
             ]),
-            Some(&client_properties),
+            Some(contents),
             TOOL_TIMEOUT,
         );
 
@@ -191,12 +223,7 @@ impl KafkaCli {
             self.container
         );
 
-        Self {
-            container: self.container.clone(),
-            bootstrap: self.bootstrap.clone(),
-            client_properties,
-            client_config: Some(path),
-        }
+        path
     }
 
     /// Runs `/opt/kafka/bin/<tool>.sh <args> --bootstrap-server <broker>`. The address comes last,
@@ -359,7 +386,7 @@ impl KafkaCli {
             .arg("timeout")
             .arg(format!("--kill-after={}s", KILL_AFTER.as_secs()))
             .arg(format!("{}s", timeout.as_secs()))
-            .arg(format!("/opt/kafka/bin/{}.sh", tool.script()))
+            .arg(format!("/opt/kafka/bin/{}.sh", tool.name()))
             .args(args)
             .args(["--bootstrap-server", &self.bootstrap]);
 
@@ -380,14 +407,16 @@ enum Tool {
     ConsoleConsumer,
     ConsoleProducer,
     ConsumerGroups,
+    DeleteRecords,
     GetOffsets,
     Topics,
     VerifiableProducer,
 }
 
 impl Tool {
-    /// Returns the tool's script name, without `.sh`.
-    fn script(self) -> &'static str {
+    /// Returns the tool's name, which is also its script's file name in `/opt/kafka/bin` without
+    /// `.sh`.
+    fn name(self) -> &'static str {
         match self {
             Self::BrokerApiVersions => "kafka-broker-api-versions",
             Self::Cluster => "kafka-cluster",
@@ -395,6 +424,7 @@ impl Tool {
             Self::ConsoleConsumer => "kafka-console-consumer",
             Self::ConsoleProducer => "kafka-console-producer",
             Self::ConsumerGroups => "kafka-consumer-groups",
+            Self::DeleteRecords => "kafka-delete-records",
             Self::GetOffsets => "kafka-get-offsets",
             Self::Topics => "kafka-topics",
             Self::VerifiableProducer => "kafka-verifiable-producer",
@@ -411,6 +441,7 @@ impl Tool {
             Self::BrokerApiVersions
             | Self::Configs
             | Self::ConsumerGroups
+            | Self::DeleteRecords
             | Self::GetOffsets
             | Self::Topics => "--command-config",
         }
@@ -446,7 +477,7 @@ impl<PrintedBy> Output<PrintedBy> {
         timeout: Option<String>,
     ) -> Self {
         Self {
-            command: format!("{} {}", tool.script(), args.join(" ")),
+            command: format!("{} {}", tool.name(), args.join(" ")),
             code: finished.code,
             stdout: finished.stdout,
             stderr: finished.stderr,

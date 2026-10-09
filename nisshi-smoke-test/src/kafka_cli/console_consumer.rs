@@ -24,6 +24,9 @@ const PARTITION_FIELD_PREFIX: &str = "Partition:";
 const OFFSET_FIELD_PREFIX: &str = "Offset:";
 /// The timestamp type the console consumer prints for a record whose timestamp the broker set.
 pub const LOG_APPEND_TIME: &str = "LogAppendTime";
+/// What the console consumer prints for a record's key or value when it is null, such as a
+/// tombstone's value.
+pub const PRINTED_NULL: &str = "null";
 
 /// The command of [`KafkaCli::consume`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
@@ -98,8 +101,32 @@ impl KafkaCli {
         offset: u64,
         count: usize,
     ) -> Vec<ConsumedRecord> {
+        self.read_records_from(topic, partition, &offset.to_string(), count)
+    }
+
+    /// Like [`KafkaCli::read_records`], but starts at the partition's earliest offset, for a test
+    /// that doesn't know which records retention or compaction left.
+    #[track_caller]
+    pub fn read_records_from_earliest(
+        &self,
+        topic: &str,
+        partition: u32,
+        count: usize,
+    ) -> Vec<ConsumedRecord> {
+        self.read_records_from(topic, partition, "earliest", count)
+    }
+
+    /// Reads `count` records as [`KafkaCli::read_records`] does, from `offset`, which is an
+    /// offset or `earliest`.
+    #[track_caller]
+    fn read_records_from(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: &str,
+        count: usize,
+    ) -> Vec<ConsumedRecord> {
         let partition = partition.to_string();
-        let offset = offset.to_string();
         let max_messages = count.to_string();
 
         let read: Output = self.run(
@@ -114,7 +141,7 @@ impl KafkaCli {
                 "--partition",
                 &partition,
                 "--offset",
-                &offset,
+                offset,
                 "--property",
                 "print.timestamp=true",
                 "--property",
@@ -247,9 +274,9 @@ pub struct ConsumedRecord {
     pub timestamp_type: String,
     pub timestamp: i64,
     pub offset: i64,
-    /// `null` for a record that does not have a key.
+    /// [`PRINTED_NULL`] for a record that does not have a key.
     pub key: String,
-    /// `null` for a record that does not have a value, such as a tombstone.
+    /// [`PRINTED_NULL`] for a record that does not have a value, such as a tombstone.
     pub value: String,
 }
 

@@ -59,22 +59,58 @@ impl KafkaCli {
         acks: Acks,
         value_prefix: u32,
     ) -> Output<VerifiableProduce> {
+        self.run_verifiable_producer(topic, max_messages, acks, value_prefix, &[])
+    }
+
+    /// Produces `max_messages` records timestamped about `create_time_millis`, so a test can
+    /// produce records that are already older than a topic's `retention.ms`.
+    ///
+    /// Record `n`'s value is `0.<n>`. With `repeating_keys` of 2, the keys are `0`, `1`, `0`, `1`,
+    /// and so on; without it, the records have no keys.
+    pub fn verifiable_produce_created_at(
+        &self,
+        topic: &str,
+        max_messages: usize,
+        create_time_millis: i64,
+        repeating_keys: Option<usize>,
+    ) -> Output<VerifiableProduce> {
+        const VALUE_PREFIX: u32 = 0;
+
+        let create_time_millis = create_time_millis.to_string();
+        let mut args = vec!["--message-create-time", &create_time_millis];
+
+        let repeating_keys = repeating_keys.map(|keys| keys.to_string());
+        if let Some(repeating_keys) = &repeating_keys {
+            args.extend(["--repeating-keys", repeating_keys]);
+        }
+
+        self.run_verifiable_producer(topic, max_messages, Acks::FullIsr, VALUE_PREFIX, &args)
+    }
+
+    fn run_verifiable_producer(
+        &self,
+        topic: &str,
+        max_messages: usize,
+        acks: Acks,
+        value_prefix: u32,
+        more_args: &[&str],
+    ) -> Output<VerifiableProduce> {
         let max_messages = max_messages.to_string();
         let value_prefix = value_prefix.to_string();
 
-        self.run(
-            Tool::VerifiableProducer,
-            &[
-                "--topic",
-                topic,
-                "--max-messages",
-                &max_messages,
-                "--acks",
-                acks.setting(),
-                "--value-prefix",
-                &value_prefix,
-            ],
-        )
+        let mut args = vec![
+            "--topic",
+            topic,
+            "--max-messages",
+            &max_messages,
+            "--acks",
+            acks.setting(),
+            "--value-prefix",
+            &value_prefix,
+        ];
+        args.extend(more_args);
+
+        self.run(Tool::VerifiableProducer, &args)
     }
 
     /// Like [`KafkaCli::verifiable_produce`] with [`Acks::FullIsr`], but the producer is
