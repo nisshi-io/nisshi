@@ -246,6 +246,12 @@ impl AuthenticationFrame {
     }
 }
 
+/// Returns the `N` bytes at `offset` in a raw frame, or `None` when the frame
+/// is too short to hold them.
+fn peek<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+    bytes.get(offset..offset + N)?.try_into().ok()
+}
+
 /// A [`Service`] transforming [`Bytes`]s into [`Frame`]s
 #[derive(Clone, Default)]
 pub struct BytesFrameService<S> {
@@ -288,7 +294,7 @@ where
             .map(|v0| v0.unwrap_or_default())
             .unwrap_or_default();
 
-        debug!(request = ?&req.bytes[..], sasl_handshake_v0);
+        debug!(len = req.bytes.len(), sasl_handshake_v0);
 
         let extensions = req.extensions;
 
@@ -326,6 +332,14 @@ where
                 debug!(api_key = peeked_api_key, "request before authentication");
                 return Err(Into::into(nisshi_sans_io::Error::NotAuthenticated));
             }
+
+            // The request header holds no secret, and it identifies a frame
+            // that fails to decode, since we don't log the frame's bytes.
+            debug!(
+                api_key = ?peek::<2>(&req.bytes, 4).map(i16::from_be_bytes),
+                api_version = ?peek::<2>(&req.bytes, 6).map(i16::from_be_bytes),
+                correlation_id = ?peek::<4>(&req.bytes, 8).map(i32::from_be_bytes),
+            );
 
             spawn_blocking(|| Frame::request_from_bytes(req.bytes))
                 .await?
@@ -425,7 +439,7 @@ where
             })
             .await?
             .inspect(|response| {
-                debug!(response = ?response[..]);
+                debug!(len = response.len());
                 API_REQUESTS.add(1, &attributes);
             })
             .inspect_err(|err| {

@@ -14,7 +14,7 @@
 //
 //! Deflated (compressed) Kafka Records
 use std::{
-    fmt::Formatter,
+    fmt::{self, Formatter},
     io::{BufRead, Write},
     result,
 };
@@ -75,8 +75,11 @@ impl TryFrom<crate::record::inflated::Frame> for Frame {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 /// A deflated (compressed) batch of Kafka records
+///
+/// `Debug` writes the length of `record_data`, not its content, so logging a
+/// batch, or a produce or fetch message that holds one, doesn't log records.
+#[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Batch {
     pub base_offset: i64,
     pub batch_length: i32,
@@ -92,6 +95,27 @@ pub struct Batch {
     pub base_sequence: i32,
     pub record_count: u32,
     pub record_data: Bytes,
+}
+
+impl fmt::Debug for Batch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Batch")
+            .field("base_offset", &self.base_offset)
+            .field("batch_length", &self.batch_length)
+            .field("partition_leader_epoch", &self.partition_leader_epoch)
+            .field("magic", &self.magic)
+            .field("crc", &self.crc)
+            .field("attributes", &self.attributes)
+            .field("last_offset_delta", &self.last_offset_delta)
+            .field("base_timestamp", &self.base_timestamp)
+            .field("max_timestamp", &self.max_timestamp)
+            .field("producer_id", &self.producer_id)
+            .field("producer_epoch", &self.producer_epoch)
+            .field("base_sequence", &self.base_sequence)
+            .field("record_count", &self.record_count)
+            .field("record_data_len", &self.record_data.len())
+            .finish()
+    }
 }
 
 impl From<Batch> for Bytes {
@@ -256,7 +280,9 @@ impl Batch {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+/// `Debug` writes the length of `record_data`, not its content, as
+/// [`Batch`] does.
+#[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct CrcData {
     pub attributes: i16,
     pub last_offset_delta: i32,
@@ -318,6 +344,22 @@ impl From<&Batch> for CrcData {
     }
 }
 
+impl fmt::Debug for CrcData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CrcData")
+            .field("attributes", &self.attributes)
+            .field("last_offset_delta", &self.last_offset_delta)
+            .field("base_timestamp", &self.base_timestamp)
+            .field("max_timestamp", &self.max_timestamp)
+            .field("producer_id", &self.producer_id)
+            .field("producer_epoch", &self.producer_epoch)
+            .field("base_sequence", &self.base_sequence)
+            .field("record_count", &self.record_count)
+            .field("record_data_len", &self.record_data.len())
+            .finish()
+    }
+}
+
 impl CrcData {
     fn into_batch(self, base_offset: i64, partition_leader_epoch: i32, magic: i8) -> Result<Batch> {
         let crc = self
@@ -344,7 +386,7 @@ impl CrcData {
 
     fn crc(&self) -> Result<u32> {
         let encoded = Bytes::try_from(self)?;
-        debug!(encoded = ?&encoded[..]);
+        debug!(encoded = encoded.len());
 
         let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
         digest.update(&encoded[..]);
@@ -464,7 +506,7 @@ impl TryFrom<Batch> for Vec<Record> {
         let record_count = usize::try_from(batch.record_count)?;
 
         debug!(?record_count);
-        debug!(?batch.record_data);
+        debug!(record_data_len = batch.record_data.len());
 
         let uncompressed = batch
             .compression()
@@ -558,7 +600,7 @@ impl TryFrom<&Batch> for Vec<Record> {
         let record_count = usize::try_from(batch.record_count)?;
 
         debug!(?record_count);
-        debug!(?batch.record_data);
+        debug!(record_data_len = batch.record_data.len());
 
         if batch.exceeds_decoded_record_count_limit() {
             return Err(Error::MessageMaxSizeExceeded(
@@ -620,7 +662,7 @@ impl<'de> Deserialize<'de> for Batch {
             where
                 E: de::Error,
             {
-                debug!(v = ?v[..]);
+                debug!(len = v.len());
                 Batch::try_from(Bytes::from(v)).map_err(|err| de::Error::custom(err.to_string()))
             }
         }

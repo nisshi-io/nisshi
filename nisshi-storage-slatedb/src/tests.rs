@@ -1085,9 +1085,12 @@ mod cleanup_policy {
 
         engine.maintain(SystemTime::now()).await.unwrap();
 
-        // The batch at offset 0 (key "a", superseded at offset 2) is removed
+        // The batch at offset 0 (key "a", superseded at offset 2) is
+        // removed, but the log start stays at 0, as in Kafka: a consumer at
+        // 0 reads from the first surviving batch, rather than being answered
+        // OFFSET_OUT_OF_RANGE by Fetch and resetting its position
         let stage = engine.offset_stage(&topition).await.unwrap();
-        assert_eq!(1, stage.log_start);
+        assert_eq!(0, stage.log_start);
         assert_eq!(3, stage.high_watermark);
 
         let batches = fetch_all(&engine, &topition).await;

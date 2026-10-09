@@ -328,7 +328,7 @@ impl LakeHouse for Iceberg {
             .as_arrow(topic, partition, inflated, LakeHouseType::Iceberg)
             .await?;
 
-        debug!(?record_batch);
+        debug!(num_rows = record_batch.num_rows());
 
         debug!(schema = ?record_batch.schema());
 
@@ -379,7 +379,7 @@ impl LakeHouse for Iceberg {
         let data_files = data_file_writer
             .close()
             .await
-            .inspect(|data_files| debug!(?data_files))
+            .inspect(|data_files| debug!(data_files = data_files.len()))
             .inspect_err(|err| debug!(?err))?;
 
         let commit_uuid = Uuid::now_v7();

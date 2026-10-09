@@ -11,10 +11,11 @@ name: ci
 # third-party-license and release below (release also skips the cache
 # entirely on tags).
 #
-# Two tiers. The org is on GitHub's Free plan (20 concurrent jobs), and a
-# full run of this workflow is ~60 jobs, 31 of them with no `needs`. Running
-# all of that on every pull_request push starved every other PR of runners.
-# So:
+# Two tiers. The split was made on GitHub's Free plan (20 concurrent jobs),
+# where a full run of this workflow (~60 jobs, 31 of them with no `needs`) on
+# every pull_request push starved every other PR of runners. The org is now
+# on Enterprise (500 concurrent jobs), so the split no longer works around a
+# cap; it keeps per-push runner time and queue time down. So:
 #
 # - Tier A runs on every pull_request push: fmt, clippy, typos,
 #   third-party-license, changelog (advisory only, not in ci-gate's `needs`),
@@ -26,16 +27,24 @@ name: ci
 #   smoke, release.
 #
 # Tier B jobs carry `if: github.event_name != 'pull_request' ||
-# vars.MERGE_QUEUE != 'on'`, and the trimmed matrices pick the smaller list
+# (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, and the trimmed matrices pick the smaller list
 # under the same condition, so a leg's check-run name
 # (`test (ubuntu-latest, postgres:17)`) means the same thing whichever tier
 # produced it. The `MERGE_QUEUE` repository variable is the rollback switch:
 # the split only makes sense while a merge queue runs Tier B before merge,
 # so when the queue is off (variable unset or not `on`) pull_request runs
 # everything, as before the split. Flip the variable together with the
-# ruleset's merge_queue rule, in both directions. No Tier A job may `needs`
-# a Tier B job: GitHub marks a job `skipped` (not `failure`) when its own
-# `needs` didn't run, which would silently skip Tier A on every PR.
+# ruleset's merge_queue rule, in both directions.
+#
+# A pull_request from a fork can't read repository variables, so
+# `vars.MERGE_QUEUE` is empty there and the checks above would run Tier B on
+# every push. A fork PR therefore takes the queue-on path whatever the
+# variable says, as `smoke` already did. With the queue off, a fork PR's
+# Tier B then runs only after it merges.
+#
+# No Tier A job may `needs` a Tier B job: GitHub marks a job `skipped` (not
+# `failure`) when its own `needs` didn't run, which would silently skip Tier A
+# on every PR.
 #
 # `merge_group` is here because the queue tests each entry on a
 # `gh-readonly-queue/...` branch; bound to `pull_request` alone, ci-gate
@@ -92,7 +101,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        pg: ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on') && '["postgres:17"]' || '["postgres:16", "postgres:17", "postgres:18"]') }}
+        pg: ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository)) && '["postgres:17"]' || '["postgres:16", "postgres:17", "postgres:18"]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -195,7 +204,7 @@ jobs:
       # this job instead of in a job of its own.
       - run: just doc
   build-storage:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -208,22 +217,22 @@ jobs:
           - libsql
           - postgres
           - slatedb
+          - turso
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: 1.58.0
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
           cache: false
       - run: sudo apt-get update
-      - run: sudo apt-get install -y libclang-dev libkrb5-dev
-      - run: just build dev ${{matrix.storage}}
+      - run: sudo apt-get install -y libclang-dev
+      # This leg only proves the feature compiles, so check skips codegen
+      # and linking.
+      - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}}
   build-storage-lake:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -231,11 +240,9 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        storage:
-          - dynostore
-          - libsql
-          - postgres
-          - slatedb
+        # The lake features (nisshi-schema) and the storage features
+        # (nisshi-broker, nisshi-storage) are independent, so one storage
+        # covers every lake format.
         lake:
           - delta
           - iceberg
@@ -249,8 +256,11 @@ jobs:
           components: clippy, rustfmt
           cache: false
       - run: sudo apt-get update
-      - run: sudo apt-get install -y libclang-dev libkrb5-dev
-      - run: cargo build --features ${{matrix.storage}} --features ${{matrix.lake}}
+      - run: sudo apt-get install -y libclang-dev
+      # The same flags as build-storage, so only these features are on: a
+      # bare `cargo check --features` keeps every member's defaults enabled.
+      # Check proves the combination compiles without codegen or linking.
+      - run: cargo check --bin nisshi --no-default-features --features dynostore,${{matrix.lake}}
   compat-librdkafka:
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
@@ -263,7 +273,7 @@ jobs:
         # Tier A runs the one non-experimental leg (memory); merge_group/push
         # run all four. Keep this list identical to compat-franz-go's.
         storage: >-
-          ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on')
+          ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
           {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
@@ -344,7 +354,7 @@ jobs:
           - ubuntu-latest
         # Same tiering as compat-librdkafka; keep the two lists identical.
         storage: >-
-          ${{ fromJSON((github.event_name == 'pull_request' && vars.MERGE_QUEUE == 'on')
+          ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
           {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
@@ -416,7 +426,7 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   cargo-publish-dry-run:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -483,7 +493,7 @@ jobs:
           path: THIRD-PARTY-LICENSE.html
           if-no-files-found: error
   src:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -498,7 +508,7 @@ jobs:
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   package:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     needs: [test, cargo-publish-dry-run, typos, release]
     runs-on: ${{matrix.os}}
     timeout-minutes: 15
@@ -541,8 +551,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           # Push on repo-owned refs (push, merge_group) and same-repo PRs.
-          # Fork PRs get a read-only token, so they build without pushing,
-          # and smoke skips them (see its `if:`).
+          # Tier B's `if:` already skips this job on fork PRs; the repo check
+          # stays as a guard, since a fork's token is read-only.
           push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -642,7 +652,7 @@ jobs:
         env:
           NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi:${{steps.meta.outputs.version}}
   release:
-    if: github.event_name != 'pull_request' || vars.MERGE_QUEUE != 'on'
+    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
     # build-storage/build-storage-lake are here (not on `test`, which is Tier
     # A) so a feature combination that doesn't compile stops a queue entry
     # before the release -> package -> smoke chain, and never publishes on a
@@ -664,8 +674,6 @@ jobs:
             platform: linux/arm64
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
     env:
       # cc-rs otherwise looks for aarch64-linux-musl-gcc, which Ubuntu doesn't
       # ship, and falls back to glibc gcc for the C deps (aws-lc-sys, ring,
@@ -686,7 +694,7 @@ jobs:
           build-warnings: ""
           # A tag's release build never restores a cache (cache poisoning).
           cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          # rust-cache keys on job + OS + arch, which both macOS legs share.
+          # Keyed per target so each leg restores its own cache.
           cache-key: ${{ matrix.target }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustc -vV
@@ -778,7 +786,7 @@ jobs:
       NEEDS: ${{ toJSON(needs) }}
     steps:
       # This is the one check people land on when an entry is ejected, so
-      # say which job did it rather than making them scan ~60 jobs.
+      # say which job did it rather than making them scan every job.
       - name: Job results
         run: |
           {

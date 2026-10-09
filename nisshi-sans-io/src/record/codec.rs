@@ -227,7 +227,7 @@ impl Octets {
                         length -= 1;
                     }
 
-                    debug!(?r);
+                    debug!(len = r.len());
 
                     Ok(Some(r.into()))
                 }
@@ -368,7 +368,7 @@ where
 {
     #[instrument(skip_all)]
     fn decode(encoded: &mut Bytes) -> Result<Self> {
-        debug!(encoded = ?encoded[..]);
+        debug!(encoded = encoded.len());
 
         let length = VarInt::decode(encoded)
             .and_then(|length| usize::try_from(length.0).map_err(|_| Error::Overflow))

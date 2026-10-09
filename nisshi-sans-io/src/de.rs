@@ -498,11 +498,9 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.reader.read_exact(&mut buf)?;
         let v = u8::from_be_bytes(buf);
 
-        debug!(
-            "field: {}, value: {v}:{}",
-            self.field_name(),
-            type_name::<V::Value>(),
-        );
+        // A record key, value or header value decodes one u8 at a time, so we
+        // log the field but not the value.
+        debug!("field: {}, {}", self.field_name(), type_name::<V::Value>());
         visitor.visit_u8(v)
     }
 
@@ -613,7 +611,9 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                 self.reader.read_exact(&mut buf)?;
                 from_utf8(buf.as_slice())
                     .map_err(Into::into)
-                    .inspect(|v| debug!("visitor: {}, v: {v}", type_name_of_val(&visitor)))
+                    .inspect(|v| {
+                        debug!("visitor: {}, len: {}", type_name_of_val(&visitor), v.len())
+                    })
                     .and_then(|s| visitor.visit_str(s))
             })
     }
@@ -644,7 +644,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
             String::from_utf8(buf)
                 .map_err(Into::into)
                 .inspect(|v| {
-                    debug!(field = self.field_name(), value = v);
+                    debug!(field = self.field_name(), len = v.len());
                 })
                 .and_then(|s| visitor.visit_string(s))
         } else {
@@ -1096,7 +1096,7 @@ impl<'de> SeqAccess<'de> for Batch {
         debug!(
             seed = type_name::<T>(),
             value = type_name::<T::Value>(),
-            encoded = ?&self.encoded[..]
+            encoded = self.encoded.len()
         );
 
         if self.encoded.has_remaining() {

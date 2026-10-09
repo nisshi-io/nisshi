@@ -28,33 +28,16 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use nisshi_broker::{
-    coordinator::group::{Coordinator as _, administrator::Controller},
-    service::coordinator::services,
-};
-use nisshi_sans_io::{
-    Body, ErrorCode, HeartbeatResponse, JoinGroupResponse, MetadataResponse,
-    metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
-};
-use nisshi_service::{BytesFrameLayer, ConsumerGroupLayer, FrameBytesLayer, FrameRouteService};
+use nisshi_broker::coordinator::group::{Coordinator as _, administrator::Controller};
+use nisshi_sans_io::{Body, ErrorCode, HeartbeatResponse};
 use nisshi_storage::Storage;
-use rama::{Layer as _, Service};
 use rand::{prelude::*, rng};
 use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::common::{
-    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
-    slate_storage,
+    Formed, form_group, init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage,
 };
-
-async fn serve<S>(service: &S, input: Option<Body>) -> Result<Body>
-where
-    S: Service<Option<Body>, Output = Body>,
-    S::Error: Into<anyhow::Error>,
-{
-    service.serve(input).await.map_err(Into::into)
-}
 
 fn heartbeat_error(body: &Body) -> Result<i16> {
     match body {
@@ -77,71 +60,6 @@ fn assert_heartbeats_ok<'a>(
     }
 
     Ok(())
-}
-
-/// A group with one member, formed through a coordinator.
-struct Formed {
-    group: String,
-    generation_id: i32,
-    member_id: String,
-}
-
-async fn form_group<S>(coordinator: &Controller<S>) -> Result<Formed>
-where
-    S: Storage + Clone,
-{
-    let group = alphanumeric_string(15);
-
-    let metadata = MetadataResponse::default().topics(Some(vec![
-        MetadataResponseTopic::default()
-            .name(Some("t".into()))
-            .partitions(Some(
-                (0..3)
-                    .map(|partition_index| {
-                        MetadataResponsePartition::default().partition_index(partition_index)
-                    })
-                    .collect(),
-            )),
-    ]));
-
-    let route = services(
-        FrameRouteService::<nisshi_broker::Error>::builder(),
-        coordinator.clone(),
-    )
-    .and_then(|builder| builder.build().map_err(Into::into))?;
-
-    let consumer = (
-        ConsumerGroupLayer::new(group.clone(), ["t"], metadata),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route);
-
-    // join (member id required), join, sync: a formed group with one member
-    //
-    let member_id_required = serve(&consumer, None).await?;
-    let joined = serve(&consumer, Some(member_id_required)).await?;
-
-    let Body::JoinGroupResponse(JoinGroupResponse {
-        error_code,
-        generation_id,
-        ref member_id,
-        ..
-    }) = joined
-    else {
-        return Err(anyhow!("expecting join response: {joined:?}"));
-    };
-    assert_eq!(i16::from(ErrorCode::None), error_code);
-    let member_id = member_id.clone();
-
-    let synced = serve(&consumer, Some(joined)).await?;
-    assert!(matches!(synced, Body::SyncGroupResponse(_)), "{synced:?}");
-
-    Ok(Formed {
-        group,
-        generation_id,
-        member_id,
-    })
 }
 
 async fn overlapping_heartbeats(storage: impl Storage + Clone, stagger: Duration) -> Result<()> {

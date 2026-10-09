@@ -34,7 +34,7 @@ use human_units::{
 };
 use nisshi_client::{Client, ConnectionManager};
 use nisshi_sans_io::{
-    ByteSize as _, ErrorCode, ProduceRequest,
+    Ack, ByteSize as _, ErrorCode, ProduceRequest,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
 };
@@ -432,17 +432,19 @@ impl Producer {
 
     #[instrument(skip_all)]
     async fn produce(&self, frame: deflated::Frame) -> Result<()> {
-        let req = ProduceRequest::default().topic_data(Some(
-            [TopicProduceData::default()
-                .name(self.topic.clone())
-                .partition_data(Some(
-                    [PartitionProduceData::default()
-                        .index(self.partition)
-                        .records(Some(frame))]
-                    .into(),
-                ))]
-            .into(),
-        ));
+        let req = ProduceRequest::default()
+            .acks(Ack::Leader.into())
+            .topic_data(Some(
+                [TopicProduceData::default()
+                    .name(self.topic.clone())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(self.partition)
+                            .records(Some(frame))]
+                        .into(),
+                    ))]
+                .into(),
+            ));
 
         let response = self.client.call(req).await?;
 
