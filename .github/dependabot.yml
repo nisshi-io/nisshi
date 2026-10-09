@@ -1,4 +1,7 @@
 version: 2
+# Each entry sets `commit-message`, so Dependabot titles its PRs
+# `build(deps): bump ...`. pr-title.yml requires a Conventional Commits
+# title, and Dependabot's default `Bump ...` title fails it.
 updates:
   # The 7-day cooldown gives an upstream CVE or a yanked release time to
   # surface before Dependabot opens a bump PR.
@@ -7,6 +10,9 @@ updates:
     schedule:
       interval: "weekly"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     cooldown:
       default-days: 7
   - package-ecosystem: "cargo"
@@ -14,6 +20,9 @@ updates:
     schedule:
       interval: "weekly"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     ignore:
       # Pinned to 1.1.0 in Cargo.toml: buoyant_kernel 0.22.2 depends on
       # "^1", which resolves to 1.2.0 by default, but 1.2.0 renamed the
@@ -44,6 +53,9 @@ updates:
     schedule:
       interval: "weekly"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     cooldown:
       default-days: 7
   - package-ecosystem: "docker"
@@ -51,5 +63,8 @@ updates:
     schedule:
       interval: "weekly"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     cooldown:
       default-days: 7
