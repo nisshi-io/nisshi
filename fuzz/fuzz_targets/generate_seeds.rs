@@ -14,12 +14,18 @@
 
 //! Seed corpus generator for fuzz targets.
 //!
-//! Run with: cargo +nightly run --manifest-path fuzz/Cargo.toml --bin generate_seeds
+//! Run with: just fuzz-generate-seed (from the repository root)
 //!
 //! Writes binary seed files into fuzz/corpus/{target}/ directories.
 
 use std::fs;
 use std::path::Path;
+
+use bytes::Bytes;
+use nisshi_sans_io::{
+    Compression,
+    record::{Header, Record, deflated, inflated},
+};
 
 fn write_seed(dir: &str, name: &str, data: &[u8]) {
     let path = Path::new(dir).join(name);
@@ -801,5 +807,93 @@ fn main() {
     // Random multi-byte
     write_seed(dir, "random_multi", &[0xD2, 0x85, 0xD8, 0xCC, 0x04]);
 
+    // ── fuzz_batch_records seeds ──────────────────────────────────────
+    //
+    // Layout: codec selector, big-endian u16 record count, record data
+    // (see fuzz_batch_records.rs).
+
+    let dir = "fuzz/corpus/fuzz_batch_records";
+
+    for (selector, name, compression) in [
+        (0u8, "none", Compression::None),
+        (1, "gzip", Compression::Gzip),
+        (2, "snappy", Compression::Snappy),
+        (3, "lz4", Compression::Lz4),
+        (4, "zstd", Compression::Zstd),
+    ] {
+        let batch = encoded_batch(compression);
+        let record_count = u16::try_from(batch.record_count).unwrap();
+        write_seed(
+            dir,
+            name,
+            &batch_records_seed(selector, record_count, &batch.record_data),
+        );
+    }
+
+    // Snappy with xerial (snappy-java) framing: the 8-byte magic, then
+    // version, compatible version and the first chunk's length (4 bytes
+    // each), then that raw snappy chunk.
+    let xerial_magic = b"\x82SNAPPY\0";
+    {
+        let batch = encoded_batch(Compression::Snappy);
+        let mut framed = xerial_magic.to_vec();
+        framed.extend(1i32.to_be_bytes());
+        framed.extend(1i32.to_be_bytes());
+        framed.extend(
+            i32::try_from(batch.record_data.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
+        framed.extend_from_slice(&batch.record_data);
+
+        let record_count = u16::try_from(batch.record_count).unwrap();
+        write_seed(
+            dir,
+            "snappy_xerial",
+            &batch_records_seed(2, record_count, &framed),
+        );
+    }
+
+    // The xerial magic followed by fewer than the 12 header bytes.
+    for short in 0..12 {
+        let mut truncated = xerial_magic.to_vec();
+        truncated.extend(std::iter::repeat_n(0u8, short));
+        write_seed(
+            dir,
+            &format!("snappy_xerial_truncated_{short}"),
+            &batch_records_seed(2, 1, &truncated),
+        );
+    }
+
     println!("\nDone! Seed corpus generated.");
+}
+
+/// A small batch of records, encoded with `compression`.
+fn encoded_batch(compression: Compression) -> deflated::Batch {
+    let mut builder = inflated::Batch::builder().attributes(i16::from(compression));
+
+    for offset_delta in 0..3 {
+        builder = builder.record(
+            Record::builder()
+                .offset_delta(offset_delta)
+                .key(Some(Bytes::from(format!("key-{offset_delta}"))))
+                .value(Some(Bytes::from(
+                    "the quick brown fox jumps over the lazy dog",
+                )))
+                .header(
+                    Header::builder()
+                        .key(Bytes::from("header"))
+                        .value(Bytes::from("value")),
+                ),
+        );
+    }
+
+    builder.build().and_then(deflated::Batch::try_from).unwrap()
+}
+
+fn batch_records_seed(selector: u8, record_count: u16, record_data: &[u8]) -> Vec<u8> {
+    let mut seed = vec![selector];
+    seed.extend(record_count.to_be_bytes());
+    seed.extend_from_slice(record_data);
+    seed
 }

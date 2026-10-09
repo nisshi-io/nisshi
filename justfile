@@ -92,7 +92,10 @@ fuzz-request-decode: (cargo-fuzz "run" "fuzz_request_decode" "--" "-max_total_ti
 
 fuzz-member-metadata: (cargo-fuzz "run" "fuzz_member_metadata" "--" "-max_total_time=60")
 
-fuzz-generate-seed: (cargo-fuzz "run" "--package" "fuzz" "--bin" "generate_seeds")
+fuzz-batch-records: (cargo-fuzz "run" "fuzz_batch_records" "--" "-max_total_time=60")
+
+fuzz-generate-seed:
+    cargo run --package fuzz --bin generate_seeds
 
 check:
     cargo check --workspace --all-features --all-targets
