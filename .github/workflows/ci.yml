@@ -689,9 +689,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
+      # Embeds the crate list so scanners can read the binary's dependencies.
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-auditable@0.7.6
+          fallback: none
       - env:
           TARGET: ${{matrix.target}}
-        run: cargo build --release --bin nisshi --all-features --target "$TARGET"
+        run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
       - if: ${{runner.os == 'Linux'}}
         env:
           TARGET: ${{matrix.target}}
