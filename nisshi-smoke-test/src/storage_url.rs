@@ -35,10 +35,36 @@ impl StorageUrl {
     pub fn is_sqlite(&self) -> bool {
         self.0.starts_with("sqlite:")
     }
+
+    /// Returns the path of a SQLite URL's database, as the broker reads it: the text after
+    /// `sqlite://`, without the query. Returns `None` for a URL of another engine.
+    pub fn sqlite_database_path(&self) -> Option<&str> {
+        let path = self.0.strip_prefix("sqlite://")?;
+        Some(path.split_once('?').map_or(path, |(path, _)| path))
+    }
 }
 
 impl fmt::Display for StorageUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StorageUrl;
+
+    #[test]
+    fn sqlite_database_path_leaves_out_the_query() {
+        let storage = StorageUrl::as_given("sqlite://nisshi.db").with_query_option("vacuum_into=x");
+
+        assert_eq!(storage.sqlite_database_path(), Some("nisshi.db"));
+    }
+
+    #[test]
+    fn sqlite_database_path_is_none_for_another_engine() {
+        let storage = StorageUrl::as_given("postgres://postgres:postgres@localhost");
+
+        assert_eq!(storage.sqlite_database_path(), None);
     }
 }

@@ -18,7 +18,10 @@
 //! `just smoke <engine>` passes the suite its configuration through the environment, which
 //! [`settings`] reads.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use nanoid::nanoid;
 
@@ -29,14 +32,15 @@ pub mod settings;
 mod storage_url;
 mod timed_command;
 
-pub use broker::{Broker, LaunchOptions, free_port};
+pub use broker::{Broker, FREQUENT_MAINTENANCE, LaunchOptions, free_port};
 pub use kafka_cli::{
     Acks, AnyCommand, ApiVersions, ClusterId, Consume, ConsumeMatching, ConsumedRecord,
-    CreateTopic, DeleteTopic, DescribeConfigs, DescribeGroup, DescribeGroupState, DescribeTopic,
-    GetOffsets, GroupOffsets, KafkaCli, LOG_APPEND_TIME, ListTopics, Output, PartitionReplicas,
-    PrintsPartitionLines, RECORD_TOO_LARGE_EXCEPTION, RequiresExistingTopic,
-    SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism, TOPIC_EXISTS_EXCEPTION,
-    UNSUPPORTED_VERSION_EXCEPTION, VerifiableProduce, verifiable_producer_values,
+    CreateTopic, DeleteRecords, DeleteTopic, DescribeConfigs, DescribeGroup, DescribeGroupState,
+    DescribeTopic, DescribeUsers, GetOffsets, GroupOffsets, KafkaCli, LOG_APPEND_TIME, ListTopics,
+    Output, PRINTED_NULL, PartitionReplicas, PrintsPartitionLines, RECORD_TOO_LARGE_EXCEPTION,
+    RequiresExistingTopic, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism,
+    TOPIC_EXISTS_EXCEPTION, UNSUPPORTED_VERSION_EXCEPTION, VerifiableProduce,
+    verifiable_producer_values,
 };
 pub use record::Record;
 pub use storage_url::StorageUrl;
@@ -73,6 +77,27 @@ pub fn now_in_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// Calls `attempt` until it returns `Ok`, and returns that value. Panics with the last `Err` if
+/// `attempt` hasn't returned `Ok` within `timeout`.
+///
+/// A test waits with this for something the broker does in the background, such as a maintenance
+/// run. The test stops as soon as it sees the result, so `timeout` only limits a test that has
+/// already failed.
+#[track_caller]
+pub fn wait_until<T>(timeout: Duration, mut attempt: impl FnMut() -> Result<T, String>) -> T {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match attempt() {
+            Ok(value) => return value,
+            Err(reason) if Instant::now() >= deadline => {
+                panic!("not within {timeout:?}: {reason}");
+            }
+            Err(_) => thread::sleep(Duration::from_millis(500)),
+        }
+    }
 }
 
 /// The `docker --label` on every container and volume this run creates.
