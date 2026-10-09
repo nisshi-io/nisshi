@@ -423,8 +423,7 @@ impl Service<Request> for RequestChannelService {
         STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &attributes);
         debug!(operation, capacity);
 
-        self.tx
-            .reserve()
+        deadline::queued(self.tx.reserve())
             .await
             .map(|permit| permit.send((input, resp_tx)))
             .inspect(|_| {
