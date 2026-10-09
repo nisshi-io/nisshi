@@ -127,7 +127,26 @@ fn arm(socket: Socket, addr: SocketAddr) -> io::Result<Socket> {
 /// Returns `true` when `err` means the host does not support the address family of the
 /// socket, for example IPv6 on a kernel booted with `ipv6.disable=1`.
 fn is_address_family_unsupported(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::EAFNOSUPPORT)
+    err.raw_os_error() == Some(address_family_unsupported_os_error())
+}
+
+/// The OS error code for "address family not supported", as `raw_os_error()` reports it
+/// on this platform.
+///
+/// Unix reports it as the C runtime errno `EAFNOSUPPORT`. Windows reports socket errors
+/// through `WSAGetLastError`, so `raw_os_error()` there is `WSAEAFNOSUPPORT` (10047), a
+/// different number from the C runtime errno that `libc::EAFNOSUPPORT` holds on Windows.
+#[cfg(unix)]
+fn address_family_unsupported_os_error() -> i32 {
+    libc::EAFNOSUPPORT
+}
+
+#[cfg(windows)]
+fn address_family_unsupported_os_error() -> i32 {
+    /// <https://learn.microsoft.com/windows/win32/winsock/windows-sockets-error-codes-2>
+    const WSAEAFNOSUPPORT: i32 = 10047;
+
+    WSAEAFNOSUPPORT
 }
 
 /// Returns the IPv4 address to bind after binding `addr` failed with `err`, or `None` when
@@ -937,7 +956,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{arm, configure_listener, ipv4_fallback};
+    use super::{address_family_unsupported_os_error, arm, configure_listener, ipv4_fallback};
     use socket2::{Domain, Protocol, Socket, Type};
     use std::{
         io,
@@ -1019,7 +1038,7 @@ mod tests {
 
         assert_eq!(
             Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9092))),
-            ipv4_fallback(addr, &os_error(libc::EAFNOSUPPORT)),
+            ipv4_fallback(addr, &os_error(address_family_unsupported_os_error())),
         );
     }
 
@@ -1027,7 +1046,10 @@ mod tests {
     fn explicit_ipv6_address_does_not_fall_back() {
         let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 9092));
 
-        assert_eq!(None, ipv4_fallback(addr, &os_error(libc::EAFNOSUPPORT)));
+        assert_eq!(
+            None,
+            ipv4_fallback(addr, &os_error(address_family_unsupported_os_error()))
+        );
     }
 
     #[test]
@@ -1041,6 +1063,9 @@ mod tests {
     fn ipv4_address_does_not_fall_back() {
         let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9092));
 
-        assert_eq!(None, ipv4_fallback(addr, &os_error(libc::EAFNOSUPPORT)));
+        assert_eq!(
+            None,
+            ipv4_fallback(addr, &os_error(address_family_unsupported_os_error()))
+        );
     }
 }
