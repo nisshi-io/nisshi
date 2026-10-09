@@ -42,7 +42,7 @@ use crate::{
     BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    TxnOffsetCommitRequest, UpdateError, Version, service::deadline,
 };
 
 static SEMAPHORE_ACQUIRE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
@@ -215,12 +215,14 @@ where
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         let start = SystemTime::now();
-        let _permit = self.semaphore.acquire().await.inspect(|_| {
-            SEMAPHORE_ACQUIRE_DURATION.record(
-                elapsed_millis(start),
-                &[KeyValue::new("operation", "list_offsets")],
-            )
-        })?;
+        let _permit = deadline::queued(self.semaphore.acquire())
+            .await
+            .inspect(|_| {
+                SEMAPHORE_ACQUIRE_DURATION.record(
+                    elapsed_millis(start),
+                    &[KeyValue::new("operation", "list_offsets")],
+                )
+            })?;
         self.storage.list_offsets(isolation_level, offsets).await
     }
 

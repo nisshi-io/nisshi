@@ -66,7 +66,8 @@ pub(crate) enum Missed {
     /// call was made.
     NotStarted,
     /// The read was waiting in [`queued`] for its storage engine's limit on
-    /// reads in flight, or for a pooled connection.
+    /// reads in flight, for a pooled connection, or for room on its request
+    /// channel.
     Queued,
     /// The read was in storage.
     Reading,
@@ -88,10 +89,18 @@ tokio::task_local! {
 }
 
 /// Runs `wait`, a storage engine's wait for its own limit on reads in
-/// flight or for a pooled connection, so that a read abandoned during it
-/// is counted under the `queued` stage rather than `reading`.
+/// flight, for a pooled connection, or for room on its request channel, so
+/// that a read abandoned during it is counted under the `queued` stage
+/// rather than `reading`.
+///
+/// The stage is a task-local of the task that called the [`Storage`]
+/// method, so `wait` counts only when it is awaited on that task. A wait on
+/// a task the engine spawns, such as the task that serves the request
+/// channel in `mpsc` mode, is not seen and counts as `reading`.
 ///
 /// Outside a read that a deadline bounds, this only runs `wait`.
+///
+/// [`Storage`]: crate::Storage
 pub async fn queued<F>(wait: F) -> F::Output
 where
     F: Future,

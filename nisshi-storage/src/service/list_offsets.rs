@@ -331,9 +331,12 @@ mod tests {
     use crate::{
         BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
         NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-        ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+        ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
         TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
-        service::deadline::LIST_OFFSETS_READ_DEADLINE,
+        service::{
+            RequestChannelService, bounded_channel,
+            deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
+        },
     };
 
     const TOPIC: &str = "abc";
@@ -804,6 +807,69 @@ mod tests {
         let calls = storage.calls();
         assert!(calls.starts_with(&[0, 1]), "{calls:?}");
         assert!(calls.len() <= 3, "{calls:?}");
+
+        Ok(())
+    }
+
+    /// A read abandoned while it waits for the storage proxy's permit is a
+    /// queued miss, so a libSQL engine in `semaphore` mode whose permit
+    /// Produce and Fetch hold shows as queued, not as a slow engine.
+    #[tokio::test(start_paused = true)]
+    async fn read_waiting_for_the_proxy_permit_is_queued() -> Result<()> {
+        let proxy = SemaphoreProxy::new(Stub::new(&[Answer::Stall, Answer::Stall]));
+
+        let permit_holder = {
+            let proxy = proxy.clone();
+
+            tokio::spawn(async move {
+                proxy
+                    .list_offsets(
+                        IsolationLevel::ReadUncommitted,
+                        &[(Topition::new(TOPIC, 0), ListOffset::Latest)],
+                    )
+                    .await
+            })
+        };
+
+        // The stalled read holds the proxy's only permit once it has run.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let outcome = within(
+            "test",
+            Instant::now() + Duration::from_secs(1),
+            proxy.list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(Topition::new(TOPIC, 1), ListOffset::Latest)],
+            ),
+        )
+        .await;
+        assert!(matches!(outcome, Err(Missed::Queued)), "{outcome:?}");
+
+        permit_holder.abort();
+
+        Ok(())
+    }
+
+    /// A read abandoned while it waits for room on the storage request
+    /// channel is a queued miss, so a libSQL engine in `mpsc` mode behind
+    /// other requests shows as queued, not as a slow engine.
+    #[tokio::test(start_paused = true)]
+    async fn read_waiting_for_the_request_channel_is_queued() -> Result<()> {
+        let (tx, _rx) = bounded_channel(1);
+        let _only_slot = tx.reserve().await.map_err(|_| Error::UnableToSend)?;
+
+        let service = RequestChannelService::new(tx.clone());
+
+        let outcome = within(
+            "test",
+            Instant::now() + Duration::from_secs(1),
+            service.list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(Topition::new(TOPIC, 0), ListOffset::Latest)],
+            ),
+        )
+        .await;
+        assert!(matches!(outcome, Err(Missed::Queued)), "{outcome:?}");
 
         Ok(())
     }
