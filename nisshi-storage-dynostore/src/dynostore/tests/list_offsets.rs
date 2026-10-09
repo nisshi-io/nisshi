@@ -23,9 +23,9 @@ use std::{
     fmt::Display,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use crate::dynostore::{
@@ -727,15 +727,19 @@ enum Fault {
 }
 
 /// An object store that fails the next GET of one armed path, counts the
-/// GETs of batch objects, and once aged lists every object as written
-/// longer than [`BATCH_SETTLED_AFTER`] ago. Every GET first yields to the
-/// runtime, so that concurrent requests in a test interleave.
+/// GETs of batch objects, once aged lists every object as written longer
+/// than [`BATCH_SETTLED_AFTER`] ago, and can report every write time from
+/// a clock behind the test's own. Every GET first yields to the runtime,
+/// so that concurrent requests in a test interleave.
 #[derive(Clone, Debug, Default)]
 struct Faulty {
     inner: Arc<InMemory>,
     armed: Arc<Mutex<Option<(Path, Fault)>>>,
     batch_gets: Arc<AtomicUsize>,
     aged: Arc<AtomicBool>,
+    /// How far the store's clock is behind the test's, in seconds, in every
+    /// write time the store reports.
+    clock_behind_secs: Arc<AtomicU64>,
 }
 
 impl Faulty {
@@ -752,6 +756,18 @@ impl Faulty {
 
     fn age_listing(&self) {
         self.aged.store(true, Ordering::SeqCst);
+    }
+
+    fn set_clock_behind(&self, behind: Duration) {
+        self.clock_behind_secs
+            .store(behind.as_secs(), Ordering::SeqCst);
+    }
+
+    /// Shifts a write time the inner store reports onto this store's
+    /// clock.
+    fn on_store_clock(&self, meta: &mut ObjectMeta) {
+        let behind = Duration::from_secs(self.clock_behind_secs.load(Ordering::SeqCst));
+        meta.last_modified = (SystemTime::from(meta.last_modified) - behind).into();
     }
 }
 
@@ -809,7 +825,14 @@ impl ObjectStore for Faulty {
                 store: "Faulty",
                 source: source(),
             }),
-            None => self.inner.get_opts(location, options).await,
+            None => self
+                .inner
+                .get_opts(location, options)
+                .await
+                .map(|mut get_result| {
+                    self.on_store_clock(&mut get_result.meta);
+                    get_result
+                }),
         }
     }
 
@@ -825,6 +848,7 @@ impl ObjectStore for Faulty {
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         let aged = self.aged.load(Ordering::SeqCst);
+        let faulty = self.clone();
 
         self.inner
             .list(prefix)
@@ -832,6 +856,7 @@ impl ObjectStore for Faulty {
                 if aged {
                     meta.last_modified = (SystemTime::now() - 2 * BATCH_SETTLED_AFTER).into();
                 }
+                faulty.on_store_clock(&mut meta);
                 meta
             })
             .boxed()
@@ -1129,6 +1154,42 @@ async fn backfill_completes_past_a_settled_gap() -> Result<()> {
 
     let fresh = Faulty::default();
     let (storage, topition) = partition_with_a_gap_at_offset_1(&fresh).await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+    assert!(!time_index_complete(&storage, &topition).await?);
+
+    Ok(())
+}
+
+/// The age of a batch below a gap is measured between two write times of
+/// the store, the batch's and the watermark document's, not against the
+/// broker's clock. Here the store's clock is behind the broker's by twice
+/// `BATCH_SETTLED_AFTER`, and both batches were written just now on the
+/// store's clock: the gap between them is in flight, and the index stays
+/// incomplete. An age taken from the broker's clock would settle it.
+#[tokio::test]
+async fn settled_gap_age_is_measured_on_the_store_clock() -> Result<()> {
+    let _guard = init_tracing()?;
+    let faulty = Faulty::default();
+    faulty.set_clock_behind(2 * BATCH_SETTLED_AFTER);
+    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let topic = "store-clock";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+
+    write_legacy_batch(&storage, &topition, 0, T0).await?;
+    write_legacy_batch(&storage, &topition, 2, T0 + 100).await?;
+
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(3);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
 
     let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
     assert_eq!(Some(2), offset);
