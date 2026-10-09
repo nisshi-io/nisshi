@@ -35,7 +35,7 @@ use deadpool_postgres::{
     Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
     Transaction,
 };
-use futures::{FutureExt as _, future::FusedFuture as _, pin_mut};
+use futures::pin_mut;
 use futures_util::future;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
@@ -69,8 +69,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, deadline,
-    producer_claim,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, deadline, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -81,7 +80,7 @@ use tokio::{
     net::{TcpStream, UnixStream},
     runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore},
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_postgres::{
     CancelToken, Config, Row, RowStream,
@@ -93,7 +92,7 @@ use tokio_postgres::{
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tokio_util::either::Either;
-use tracing::{debug, error, instrument, warn};
+use tracing::{Instrument as _, debug, error, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -112,6 +111,9 @@ pub struct Postgres {
     /// Permits for the ListOffsets partition reads in flight, see
     /// [`LIST_OFFSETS_READS`].
     list_offsets_reads: Arc<Semaphore>,
+    /// How long an abandoned statement's connection stays out of the pool
+    /// before it is closed, see [`cancel_and_return`].
+    abandoned_statement_bound: Duration,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -124,6 +126,7 @@ pub struct Builder<C, N, L, P> {
     advertised_listener: L,
     pool: P,
     cancel: Option<CancelRequests>,
+    abandoned_statement_bound: Duration,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -136,6 +139,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             advertised_listener: self.advertised_listener,
             pool: self.pool,
             cancel: self.cancel,
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -148,6 +152,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             advertised_listener: self.advertised_listener,
             pool: self.pool,
             cancel: self.cancel,
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -160,6 +165,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             advertised_listener,
             pool: self.pool,
             cancel: self.cancel,
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -183,6 +189,7 @@ impl Builder<String, i32, Url, Pool> {
             pool: self.pool,
             cancel: self.cancel,
             list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -194,7 +201,8 @@ const POOL_MAX_SIZE: usize = 16;
 
 /// How many ListOffsets partition reads this engine has in flight at once,
 /// across every request, counting an abandoned read until its statement
-/// has been cancelled or its cancel request has been given up on.
+/// has ended, its connection has failed, or the bound on it has passed,
+/// see [`cancel_and_return`].
 ///
 /// Each read holds a pooled connection, so this limit leaves half the pool
 /// for other requests. A read past this limit waits for a permit, and
@@ -203,14 +211,13 @@ const POOL_MAX_SIZE: usize = 16;
 /// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
 const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
 
-/// How long cancelling an abandoned statement may take, from opening the
-/// cancel connection to the statement's end, before the statement's
-/// connection is taken out of the pool rather than returned to it.
+/// How much longer than its connection's `statement_timeout` an abandoned
+/// statement is waited for before its connection is closed, see
+/// [`cancel_and_return`].
 ///
-/// The cancel request is a connection, a TLS handshake and one packet, and
-/// a backend ends its statement at the next interrupt check, so the whole
-/// exchange takes milliseconds on a healthy server.
-const ABANDONED_STATEMENT_GRACE: Duration = Duration::from_secs(2);
+/// The server ends the statement itself at `statement_timeout`, and this
+/// margin gives its answer time to arrive.
+const ABANDONED_STATEMENT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Postgres statement timeout applied to every connection by default, so a stalled query
 /// (e.g. a lock wait) is aborted server-side instead of holding a pooled connection open
@@ -245,6 +252,55 @@ fn merge_statement_timeout_option(existing: Option<&str>, default_ms: u64) -> St
     }
 }
 
+/// Reads the `statement_timeout` that `options`, a libpq options startup
+/// string, sets on each connection: the last one wins, as on the server.
+/// The server reads `-c name=value`, `-cname=value` and `--name=value`.
+///
+/// Returns `None` when `options` sets no timeout, disables it with `0`, or
+/// sets a value the server rejects, in which case no connection opens.
+fn statement_timeout_option(options: &str) -> Option<Duration> {
+    let mut tokens = options.split_whitespace();
+    let mut statement_timeout = None;
+
+    while let Some(token) = tokens.next() {
+        let setting = match token {
+            "-c" => tokens.next(),
+            short if short.starts_with("-c") => short.strip_prefix("-c"),
+            long => long.strip_prefix("--"),
+        };
+
+        if let Some(value) = setting.and_then(|setting| setting.strip_prefix("statement_timeout="))
+        {
+            statement_timeout = Some(statement_timeout_value(value));
+        }
+    }
+
+    statement_timeout
+        .flatten()
+        .filter(|timeout| !timeout.is_zero())
+}
+
+/// Parses a `statement_timeout` value as the server does: a number of
+/// milliseconds, or a number with one of the server's time units, with a
+/// fraction allowed either way.
+fn statement_timeout_value(value: &str) -> Option<Duration> {
+    let number = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &value[number.len()..];
+    let count = number.parse::<f64>().ok()?;
+
+    let seconds = match unit {
+        "us" => count / 1_000_000.0,
+        "" | "ms" => count / 1_000.0,
+        "s" => count,
+        "min" => count * 60.0,
+        "h" => count * 3_600.0,
+        "d" => count * 86_400.0,
+        _ => return None,
+    };
+
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
 impl<C, N> FromStr for Builder<C, N, Url, Pool>
 where
     C: Default,
@@ -257,6 +313,9 @@ where
 
         let options =
             merge_statement_timeout_option(pg_config.get_options(), DEFAULT_STATEMENT_TIMEOUT_MS);
+        let abandoned_statement_bound = statement_timeout_option(&options)
+            .unwrap_or(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
+            + ABANDONED_STATEMENT_MARGIN;
         _ = pg_config.options(options);
         _ = pg_config.connect_timeout(DEFAULT_POOL_CREATE_TIMEOUT);
 
@@ -297,6 +356,7 @@ where
             .map(|pool| Self {
                 pool,
                 cancel,
+                abandoned_statement_bound,
                 advertised_listener,
                 node: N::default(),
                 cluster: C::default(),
@@ -323,9 +383,26 @@ impl Debug for CancelRequests {
     }
 }
 
+/// A cancel request that did not reach the server, and the host it was
+/// sent to.
+#[derive(Debug)]
+struct CancelFailed {
+    host: String,
+    error: Error,
+}
+
+/// A socket to one configured host, with the host name that TLS verifies
+/// and the name a log line gives the host.
+struct CancelSocket {
+    stream: Either<TcpStream, UnixStream>,
+    tls_hostname: Option<String>,
+    host: String,
+}
+
 impl CancelRequests {
     /// Asks the server to cancel the statement that `token` identifies, and
-    /// returns once the server has passed the request on to its backend.
+    /// returns the host it asked once the server has passed the request on
+    /// to its backend.
     ///
     /// [`CancelToken::cancel_query`] returns as soon as it has written the
     /// request, so a statement sent on the connection after it could be the
@@ -339,26 +416,49 @@ impl CancelRequests {
     ///
     /// The request goes to the first configured host that accepts a
     /// connection, as a new connection would. A server other than the one
-    /// running the statement ignores it, and the statement then ends on
-    /// its own or its connection is closed at the grace period.
-    async fn cancel(&self, token: &CancelToken) -> Result<()> {
-        let (stream, hostname) = self.connect().await?;
+    /// running the statement ignores it, and the statement then runs until
+    /// it ends on its own or at `statement_timeout`.
+    async fn cancel(&self, token: &CancelToken) -> std::result::Result<String, CancelFailed> {
+        let CancelSocket {
+            stream,
+            tls_hostname,
+            host,
+        } = self.connect().await?;
 
-        let tls = MakeTlsConnect::<CancelStream>::make_tls_connect(
+        let tls = match MakeTlsConnect::<CancelStream>::make_tls_connect(
             &mut self.tls.clone(),
-            hostname.unwrap_or_default(),
-        )
-        .map_err(io::Error::other)?;
+            tls_hostname.as_deref().unwrap_or_default(),
+        ) {
+            Ok(tls) => tls,
+            Err(err) => {
+                return Err(CancelFailed {
+                    host,
+                    error: io::Error::other(err).into(),
+                });
+            }
+        };
 
-        token
-            .cancel_query_raw(ClosedByPeer::new(stream), tls)
-            .await
-            .map_err(Into::into)
+        match timeout(
+            DEFAULT_POOL_CREATE_TIMEOUT,
+            token.cancel_query_raw(ClosedByPeer::new(stream), tls),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(host),
+            Ok(Err(err)) => Err(CancelFailed {
+                host,
+                error: err.into(),
+            }),
+            Err(elapsed) => Err(CancelFailed {
+                host,
+                error: io::Error::from(elapsed).into(),
+            }),
+        }
     }
 
-    /// Opens a socket to the first configured host that accepts one,
-    /// returning it with the host name that TLS verifies.
-    async fn connect(&self) -> io::Result<(Either<TcpStream, UnixStream>, Option<&str>)> {
+    /// Opens a socket to the first configured host that accepts one. The
+    /// error names the last host tried.
+    async fn connect(&self) -> std::result::Result<CancelSocket, CancelFailed> {
         let hosts = self.config.get_hosts();
         let ports = self.config.get_ports();
         let hostaddrs = self.config.get_hostaddrs();
@@ -368,10 +468,22 @@ impl CancelRequests {
             .copied()
             .unwrap_or(DEFAULT_POOL_CREATE_TIMEOUT);
 
-        let mut last = io::Error::new(io::ErrorKind::NotFound, "no host configured");
+        let mut last = CancelFailed {
+            host: "none".into(),
+            error: io::Error::new(io::ErrorKind::NotFound, "no host configured").into(),
+        };
 
         for (index, host) in hosts.iter().enumerate() {
             let port = ports.get(index).or(ports.first()).copied().unwrap_or(5432);
+
+            let name = match (hostaddrs.get(index), host) {
+                (Some(addr), _) => format!("{addr}:{port}"),
+                (None, Host::Tcp(host)) => format!("{host}:{port}"),
+                #[cfg(unix)]
+                (None, Host::Unix(dir)) => {
+                    dir.join(format!(".s.PGSQL.{port}")).display().to_string()
+                }
+            };
 
             let connect = async {
                 match (hostaddrs.get(index), host) {
@@ -392,18 +504,32 @@ impl CancelRequests {
 
             match timeout(connect_timeout, connect).await {
                 Ok(Ok(stream)) => {
-                    let hostname = match host {
-                        Host::Tcp(hostname) => Some(hostname.as_str()),
+                    let tls_hostname = match host {
+                        Host::Tcp(hostname) => Some(hostname.clone()),
                         #[cfg(unix)]
                         Host::Unix(_) => None,
                     };
 
-                    return Ok((stream, hostname));
+                    return Ok(CancelSocket {
+                        stream,
+                        tls_hostname,
+                        host: name,
+                    });
                 }
 
-                Ok(Err(err)) => last = err,
+                Ok(Err(err)) => {
+                    last = CancelFailed {
+                        host: name,
+                        error: err.into(),
+                    }
+                }
 
-                Err(_) => last = io::Error::new(io::ErrorKind::TimedOut, "connect timed out"),
+                Err(_) => {
+                    last = CancelFailed {
+                        host: name,
+                        error: io::Error::new(io::ErrorKind::TimedOut, "connect timed out").into(),
+                    }
+                }
             }
         }
 
@@ -559,109 +685,80 @@ where
     }
 }
 
-/// Why an abandoned connection was closed instead of returned to the pool.
-#[derive(Debug)]
-enum NotSettled {
-    /// The cancel request did not reach the server.
-    Cancel(Error),
-    /// The connection failed after the cancel request.
-    Probe(Error),
-}
-
-/// Cancels the statement running on an abandoned `connection` and returns
-/// the connection to its pool once that statement has ended, so a
-/// cancelled read costs the server one short cancel connection and the
-/// pool stays within its [`POOL_MAX_SIZE`] server connections.
+/// Cancels the statement running on an abandoned `connection`, and returns
+/// the connection to its pool once that statement has ended, so the pool
+/// stays within its [`POOL_MAX_SIZE`] server connections.
 ///
-/// The cancel request travels on a connection of its own, and returns once
-/// the server has signalled the backend (see [`CancelRequests::cancel`]).
+/// The connection and `permit` are held until the statement has ended,
+/// whether or not the cancel request reached the server, so the statement
+/// counts against [`LIST_OFFSETS_READS`] meanwhile. A cancel request that
+/// misses its statement (a host other than the one running the statement,
+/// or a proxy that does not forward it) then shows as ListOffsets reads
+/// that wait for a permit, under the `queued` stage, rather than as server
+/// connections beyond the pool.
+///
 /// The statement has ended once an empty query on `connection` answers,
-/// because the server runs the two in order. The connection is taken out
-/// of the pool instead, and the pool opens a replacement, when the cancel
-/// request fails or the two together take longer than
-/// [`ABANDONED_STATEMENT_GRACE`], so the pool does not hand out a
-/// connection that is still busy. A cancel request still in flight at
-/// that point is sent anyway, within [`DEFAULT_POOL_CREATE_TIMEOUT`]. A
-/// statement whose cancel request never arrives runs on the server until
-/// `statement_timeout`, and its connection stays open on the server until
-/// then, beside the pool's replacement, because the client closes a
-/// connection only once its last statement has answered.
-///
-/// `permit` is held until the connection goes back or the cancel request
-/// has been given up on, so the statement counts against
-/// [`LIST_OFFSETS_READS`] meanwhile.
+/// because the server runs the two in order. The connection is closed and
+/// taken out of the pool instead, and the pool opens a replacement, when
+/// that query fails or has not answered within `bound`. The bound sits
+/// past the connection's `statement_timeout`
+/// ([`ABANDONED_STATEMENT_MARGIN`]), at which the server ends the statement
+/// itself unless an operator has disabled the timeout. deadpool-postgres
+/// closes a dropped connection's socket at once, and a backend notices a
+/// closed socket only when it next sends a result, so a statement still
+/// running then keeps its backend until it ends.
 async fn cancel_and_return(
     connection: Object,
     cancel: Option<CancelRequests>,
+    bound: Duration,
     permit: OwnedSemaphorePermit,
 ) {
     let _permit = permit;
+    let settle_by = Instant::now() + bound;
 
-    let Some(cancel) = cancel else {
-        drop(Object::take(connection));
-        return;
+    let host = match cancel {
+        Some(cancel) => match cancel.cancel(&connection.cancel_token()).await {
+            Ok(host) => host,
+
+            Err(CancelFailed { host, error }) => {
+                warn!(
+                    host,
+                    ?error,
+                    ?bound,
+                    "the cancel request for an abandoned statement did not reach the server; waiting for the statement to end"
+                );
+                host
+            }
+        },
+
+        None => {
+            warn!(
+                ?bound,
+                "no cancel request is configured for an abandoned statement; waiting for it to end"
+            );
+            "none".into()
+        }
     };
 
-    let token = connection.cancel_token();
-    let cancel = timeout(DEFAULT_POOL_CREATE_TIMEOUT, cancel.cancel(&token)).fuse();
-    pin_mut!(cancel);
-
-    let settled = timeout(ABANDONED_STATEMENT_GRACE, async {
-        match (&mut cancel).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(NotSettled::Cancel(err)),
-            Err(elapsed) => return Err(NotSettled::Cancel(io::Error::from(elapsed).into())),
-        }
-
-        connection
-            .batch_execute("")
-            .await
-            .map_err(|err| NotSettled::Probe(err.into()))
-    })
-    .await;
-
-    match settled {
+    match timeout_at(settle_by, connection.batch_execute("")).await {
         Ok(Ok(())) => drop(connection),
 
-        Ok(Err(NotSettled::Cancel(err))) => {
+        Ok(Err(error)) => {
             warn!(
-                ?err,
-                "the cancel request for an abandoned statement did not reach the server; closing its connection"
+                host,
+                ?error,
+                "an abandoned statement's connection failed before the statement ended; closing it"
             );
             drop(Object::take(connection));
         }
 
-        Ok(Err(NotSettled::Probe(err))) => {
+        Err(_elapsed) => {
             warn!(
-                ?err,
-                "an abandoned statement's connection failed after its cancel request; closing it"
+                host,
+                ?bound,
+                "an abandoned statement did not end within the bound; closing its connection"
             );
             drop(Object::take(connection));
-        }
-
-        Err(_) => {
-            warn!(
-                grace = ?ABANDONED_STATEMENT_GRACE,
-                "an abandoned statement did not end within the grace period; closing its connection"
-            );
-            drop(Object::take(connection));
-
-            // The cancel request is only dropped once it has been sent or
-            // has timed out, so the statement still stops, and the permit
-            // counts it meanwhile.
-            if !cancel.is_terminated() {
-                match cancel.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => warn!(
-                        ?err,
-                        "the cancel request for an abandoned statement did not reach the server after its connection was closed"
-                    ),
-                    Err(_) => warn!(
-                        timeout = ?DEFAULT_POOL_CREATE_TIMEOUT,
-                        "the cancel request for an abandoned statement timed out after its connection was closed"
-                    ),
-                }
-            }
         }
     }
 }
@@ -739,18 +836,23 @@ impl Postgres {
     /// Dropping the guard before [`Abandonable::release`] asks the server to
     /// cancel the statement, so it stops instead of running until
     /// `statement_timeout`, and keeps the connection and the permit until
-    /// the statement has ended (see [`cancel_and_return`]).
+    /// the statement has ended, see [`cancel_and_return`].
     async fn abandonable_connection(
         &self,
         permit: OwnedSemaphorePermit,
     ) -> Result<Abandonable<Manager, impl FnOnce(Object) + use<>>> {
         let cancel = self.cancel.clone();
+        let bound = self.abandoned_statement_bound;
 
         self.connection().await.map(|connection| {
             Abandonable::new(connection, move |connection: Object| {
                 match Handle::try_current() {
+                    // The task keeps the request's span, so its warnings
+                    // name the peer, the correlation id and the partition.
                     Ok(runtime) => {
-                        _ = runtime.spawn(cancel_and_return(connection, cancel, permit));
+                        _ = runtime.spawn(
+                            cancel_and_return(connection, cancel, bound, permit).in_current_span(),
+                        );
                     }
 
                     // Without a runtime the cancel request cannot be sent.
@@ -3273,13 +3375,13 @@ impl Storage for Postgres {
         Ok(offsets)
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(?offsets))]
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        debug!(cluster = self.cluster, ?isolation_level, ?offsets);
+        debug!(cluster = self.cluster, ?isolation_level);
 
         let permit = deadline::queued(self.list_offsets_reads.clone().acquire_owned()).await?;
         let connection = deadline::queued(self.abandonable_connection(permit)).await?;
@@ -4634,6 +4736,87 @@ mod tests {
         );
     }
 
+    /// The last `statement_timeout` in the options wins, as on the server,
+    /// in either spelling and with the server's time units.
+    #[test]
+    fn statement_timeout_option_reads_the_last_setting() {
+        assert_eq!(
+            Some(Duration::from_secs(30)),
+            statement_timeout_option("-c statement_timeout=30000")
+        );
+        assert_eq!(
+            Some(Duration::from_secs(120)),
+            statement_timeout_option("-c statement_timeout=30000 -c statement_timeout=120s")
+        );
+        assert_eq!(
+            Some(Duration::from_secs(120)),
+            statement_timeout_option("-c statement_timeout=30000 --statement_timeout=2min")
+        );
+        assert_eq!(
+            Some(Duration::from_millis(100)),
+            statement_timeout_option(
+                "-c statement_timeout=30000 -c search_path=foo -c statement_timeout=100"
+            )
+        );
+        assert_eq!(
+            Some(Duration::from_secs(120)),
+            statement_timeout_option("-c statement_timeout=30000 -cstatement_timeout=120s")
+        );
+        assert_eq!(
+            Some(Duration::from_secs(150)),
+            statement_timeout_option("-c statement_timeout=2.5min")
+        );
+        assert_eq!(
+            Some(Duration::from_micros(500)),
+            statement_timeout_option("-c statement_timeout=500us")
+        );
+    }
+
+    /// No setting, a disabled timeout and a value the server would reject
+    /// all leave the default in place.
+    #[test]
+    fn statement_timeout_option_without_a_usable_setting() {
+        assert_eq!(None, statement_timeout_option(""));
+        assert_eq!(None, statement_timeout_option("-c search_path=foo"));
+        assert_eq!(
+            None,
+            statement_timeout_option("-c statement_timeout=30000 -c statement_timeout=0")
+        );
+        assert_eq!(None, statement_timeout_option("-c statement_timeout=soon"));
+        assert_eq!(
+            None,
+            statement_timeout_option("-c statement_timeout=5fortnights")
+        );
+        assert_eq!(None, statement_timeout_option("-c statement_timeout=-1"));
+    }
+
+    /// The bound on an abandoned statement follows the connection's
+    /// `statement_timeout`: the default, or an operator's own in the URL.
+    #[test]
+    fn abandoned_statement_bound_follows_the_statement_timeout() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster("default")
+            .node(0)
+            .build();
+        assert_eq!(
+            Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS) + ABANDONED_STATEMENT_MARGIN,
+            storage.abandoned_statement_bound
+        );
+
+        let storage = Postgres::builder(&format!(
+            "{CONNECTION}?options=-c%20statement_timeout%3D120000"
+        ))?
+        .cluster("longer")
+        .node(0)
+        .build();
+        assert_eq!(
+            Duration::from_secs(120) + ABANDONED_STATEMENT_MARGIN,
+            storage.abandoned_statement_bound
+        );
+
+        Ok(())
+    }
+
     /// Regression test for a real blocker found in review: deadpool's `PoolBuilder::build()`
     /// returns `Err(BuildError::NoRuntimeSpecified)` if `wait_timeout`/`create_timeout` are
     /// set without also configuring `.runtime(..)`. This doesn't need a live Postgres:
@@ -4820,13 +5003,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let settled = tokio::time::Instant::now() + Duration::from_secs(5);
+        let settled = Instant::now() + Duration::from_secs(5);
         while storage.pool.status().waiting < LIST_OFFSETS_READS {
-            assert!(
-                tokio::time::Instant::now() < settled,
-                "{:?}",
-                storage.pool.status()
-            );
+            assert!(Instant::now() < settled, "{:?}", storage.pool.status());
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -4901,7 +5080,7 @@ mod tests {
             storage.list_offsets_reads.available_permits()
         );
 
-        let settled = tokio::time::Instant::now() + Duration::from_secs(10);
+        let settled = Instant::now() + Duration::from_secs(10);
         loop {
             let running = monitor
                 .query_one(
@@ -4917,7 +5096,7 @@ mod tests {
             }
 
             assert!(
-                tokio::time::Instant::now() < settled,
+                Instant::now() < settled,
                 "statement still running on {running} backend(s), pool {status:?}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4928,6 +5107,241 @@ mod tests {
             LIST_OFFSETS_READS,
             storage.list_offsets_reads.available_permits()
         );
+
+        Ok(())
+    }
+
+    /// How many backends run a statement marked `marker`, other than
+    /// `monitor`'s own.
+    async fn backends_running(monitor: &Object, marker: &str) -> Result<i64> {
+        monitor
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1 AND pid <> pg_backend_pid()",
+                &[&format!("%{marker}%")],
+            )
+            .await
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(Into::into)
+    }
+
+    /// Ends every statement marked `marker` through the server, as the
+    /// cancel request would have, and returns how many it ended.
+    async fn cancel_backends(monitor: &Object, marker: &str) -> Result<usize> {
+        monitor
+            .query(
+                "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1 AND pid <> pg_backend_pid()",
+                &[&format!("%{marker}%")],
+            )
+            .await
+            .map(|rows| rows.len())
+            .map_err(Into::into)
+    }
+
+    /// Points `storage`'s cancel requests at a port nothing listens on, so
+    /// each one fails without reaching the server, as one sent to a host
+    /// other than the one running the statement would.
+    async fn with_cancel_requests_refused(storage: Postgres) -> Result<Postgres> {
+        let closed_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await?
+            .local_addr()?
+            .port();
+
+        let tls = storage
+            .cancel
+            .as_ref()
+            .expect("cancel requests are configured from a URL")
+            .tls
+            .clone();
+
+        let mut config = Config::new();
+        _ = config.host("127.0.0.1").port(closed_port);
+
+        Ok(Postgres {
+            cancel: Some(CancelRequests { config, tls }),
+            ..storage
+        })
+    }
+
+    /// Runs `SELECT pg_sleep(30)` marked `marker` on an abandonable
+    /// connection and drops the connection mid-statement, returning once the
+    /// cancel task has had time to send its cancel request.
+    async fn abandon_sleeping_statement(storage: &Postgres, marker: &str) -> Result<()> {
+        let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
+
+        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
+        let connection = storage.abandonable_connection(permit).await?;
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                connection.object().batch_execute(&sleep)
+            )
+            .await
+            .is_err(),
+            "pg_sleep(30) is still running"
+        );
+        drop(connection);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        Ok(())
+    }
+
+    /// Waits until `settled` holds, failing after 10 seconds.
+    async fn wait_until(storage: &Postgres, settled: impl Fn(&Postgres) -> bool) {
+        let give_up = Instant::now() + Duration::from_secs(10);
+
+        while !settled(storage) {
+            assert!(
+                Instant::now() < give_up,
+                "pool {:?}, permits {}",
+                storage.pool.status(),
+                storage.list_offsets_reads.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A cancel request that does not reach the server leaves the
+    /// statement running, and the connection and its permit stay held
+    /// until the statement ends; then both come back.
+    #[tokio::test]
+    async fn abandoned_statement_outliving_its_cancel_keeps_its_connection_and_permit() -> Result<()>
+    {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_statement_outliving_its_cancel_keeps_its_connection_and_permit: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let marker = alphanumeric_string(15);
+
+        abandon_sleeping_statement(&storage, &marker).await?;
+
+        assert_eq!(1, backends_running(&monitor, &marker).await?);
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+        assert_eq!(0, storage.pool.status().available);
+        assert_eq!(2, storage.pool.status().size);
+
+        assert_eq!(1, cancel_backends(&monitor, &marker).await?);
+
+        wait_until(&storage, |storage| storage.pool.status().available == 1).await;
+
+        assert_eq!(0, backends_running(&monitor, &marker).await?);
+        assert_eq!(2, storage.pool.status().size);
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// A statement still running at the bound has its connection closed
+    /// and taken out of the pool, and its permit comes back; the backend
+    /// runs on until the statement ends.
+    #[tokio::test]
+    async fn abandoned_statement_still_running_at_the_bound_loses_its_connection() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_statement_still_running_at_the_bound_loses_its_connection: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = Postgres {
+            abandoned_statement_bound: Duration::from_secs(2),
+            ..with_cancel_requests_refused(storage).await?
+        };
+        let marker = alphanumeric_string(15);
+
+        abandon_sleeping_statement(&storage, &marker).await?;
+
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+        assert_eq!(2, storage.pool.status().size);
+
+        wait_until(&storage, |storage| {
+            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+        })
+        .await;
+
+        assert_eq!(1, storage.pool.status().size);
+        assert_eq!(0, storage.pool.status().available);
+        assert_eq!(1, backends_running(&monitor, &marker).await?);
+
+        assert_eq!(1, cancel_backends(&monitor, &marker).await?);
+
+        Ok(())
+    }
+
+    /// A connection that fails while its abandoned statement runs is taken
+    /// out of the pool, and its permit comes back.
+    #[tokio::test]
+    async fn abandoned_statement_whose_connection_fails_loses_it() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!("skipping abandoned_statement_whose_connection_fails_loses_it: {err:?}");
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let marker = alphanumeric_string(15);
+
+        abandon_sleeping_statement(&storage, &marker).await?;
+
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        let terminated = monitor
+            .query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1 AND pid <> pg_backend_pid()",
+                &[&format!("%{marker}%")],
+            )
+            .await?
+            .len();
+        assert_eq!(1, terminated);
+
+        wait_until(&storage, |storage| {
+            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+        })
+        .await;
+
+        assert_eq!(1, storage.pool.status().size);
+        assert_eq!(0, storage.pool.status().available);
+        assert_eq!(0, backends_running(&monitor, &marker).await?);
 
         Ok(())
     }
