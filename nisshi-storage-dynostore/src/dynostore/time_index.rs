@@ -214,8 +214,9 @@ impl TimeIndex {
     }
 
     /// Merges a `candidate` index built from the partition's listed batches
-    /// with the `live` index that produces have maintained meanwhile, into
-    /// a complete index.
+    /// with the `live` index that produces have maintained meanwhile. The
+    /// result keeps the index's guarantee, and is complete only under the
+    /// conditions in the last paragraph.
     ///
     /// The merge is not a union of the two maps. The live index of a
     /// partition that predates the index starts from no maximum timestamp,
