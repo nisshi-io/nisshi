@@ -103,8 +103,10 @@ fn stores_every_record(acks: Acks) {
 }
 
 #[test]
-#[ignore = "the broker answers an acks=0 produce request, so the producer finds a response it \
-            didn't ask for and stops sending"]
+#[cfg_attr(
+    feature = "memory",
+    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
+)]
 fn acks_0_stores_every_record() {
     stores_every_record(Acks::None);
 }

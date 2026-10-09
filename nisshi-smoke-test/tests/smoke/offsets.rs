@@ -73,7 +73,8 @@ fn timestamp_after_last_record_finds_no_offset() {
 /// advertise it, so the tool fails at once with `UnsupportedVersionException` instead of waiting
 /// for an answer that never comes.
 #[test]
-#[ignore = "the broker advertises ListOffsets versions it doesn't support, so the lookup times out"]
+#[ignore = "the broker advertises ListOffsets versions it doesn't support, so the lookup times out \
+            (#849)"]
 fn max_timestamp_lookup_fails_at_once_as_unsupported() {
     let (cli, topic, _) = create_topic_with_records_before_and_after();
 
