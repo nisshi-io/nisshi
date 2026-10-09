@@ -1,5 +1,6 @@
 [package]
 name = "nisshi-storage-dynostore"
+description = "Nisshi storage backend for memory://, s3:// and gs:// via ObjectStore"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

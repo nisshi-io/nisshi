@@ -18,9 +18,8 @@ name: ci
 # cap; it keeps per-push runner time and queue time down. So:
 #
 # - Tier A runs on every pull_request push: fmt, clippy, typos,
-#   third-party-license, changelog (advisory only, not in ci-gate's `needs`),
-#   the single non-experimental leg of each compat suite, `test` on
-#   postgres:17 only (compose.yaml's default), and ci-gate.
+#   third-party-license, the single non-experimental leg of each compat
+#   suite, `test` on postgres:17 only (compose.yaml's default), and ci-gate.
 # - Tier B runs once per merge-queue entry (`merge_group`) and on push:
 #   the full build-storage/build-storage-lake matrix, `test` on pg16/pg18,
 #   the experimental compat legs, cargo-publish-dry-run, src, package,
@@ -454,25 +453,6 @@ jobs:
       - uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3
         with:
           config: typos.toml
-  # Advisory only — warns, never blocks the PR or ci-gate (deliberately absent
-  # from ci-gate's `needs` below). Tier A because it's cheap and every PR
-  # benefits from the reminder.
-  changelog:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Advise on a missing [Unreleased] entry
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          CHANGELOG_GATE_MODE: advisory
-        run: .github/scripts/changelog-check.sh
   third-party-license:
     runs-on: ubuntu-latest
     timeout-minutes: 15
