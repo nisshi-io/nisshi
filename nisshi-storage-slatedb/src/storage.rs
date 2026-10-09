@@ -497,11 +497,12 @@ impl Engine {
     }
 
     /// The real timestamp of the first record at or after `offset` in
-    /// `partition`, or `None` if no batch covers it: an empty partition, or
-    /// a batch whose header fails to decode or whose records fail to
-    /// inflate (corrupt/malformed data; see `Self::sequential_timestamp_scan`
-    /// for why this degrades gracefully rather than failing the call). Used
-    /// for `ListOffsets(Earliest)`'s timestamp.
+    /// `partition`, or `None` when there is no such record: an empty
+    /// partition, or a batch whose header fails to decode or whose records
+    /// fail to inflate (corrupt/malformed data; see
+    /// `Self::sequential_timestamp_scan` for why this degrades gracefully
+    /// rather than failing the call). Used for `ListOffsets(Earliest)`'s
+    /// timestamp.
     async fn timestamp_at_offset(
         &self,
         topic: Uuid,
@@ -510,59 +511,92 @@ impl Engine {
     ) -> Result<Option<SystemTime>> {
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(topic, partition))?;
 
-        let base = match self
+        let after = self
             .batch_base_at_or_after(&prefix, topic, partition, offset)
-            .await?
-        {
-            Some(base) if base == offset => Some(offset),
-            _ => {
-                self.batch_base_at_or_before(&prefix, topic, partition, offset)
-                    .await?
+            .await?;
+
+        // The batch that holds `offset` starts at or before it. When no
+        // batch holds `offset`, because compaction removed the batch at the
+        // log start and left the log start in place, the first record at or
+        // after `offset` is in the next batch.
+        let bases = match after {
+            Some(base) if base == offset => vec![base],
+            _ => self
+                .batch_base_at_or_before(&prefix, topic, partition, offset)
+                .await?
+                .into_iter()
+                .chain(after)
+                .collect(),
+        };
+
+        for base in bases {
+            let Some((deflated, inflated)) = self
+                .inflate_batch_at(&prefix, topic, partition, base)
+                .await?
+            else {
+                return Ok(None);
+            };
+
+            if let Some(record) = inflated
+                .records
+                .iter()
+                .find(|record| base + i64::from(record.offset_delta) >= offset)
+            {
+                return Ok(to_system_time(deflated.base_timestamp + record.timestamp_delta).ok());
             }
-        };
+        }
 
-        let Some(base) = base else {
-            return Ok(None);
-        };
+        Ok(None)
+    }
 
+    /// The stored batch at `base`, decoded and inflated, or `None` when no
+    /// batch starts there or the batch is corrupt. A corrupt batch is
+    /// logged at `warn`, not returned as an error, for the reason given on
+    /// `Self::sequential_timestamp_scan`.
+    async fn inflate_batch_at(
+        &self,
+        prefix: &[u8],
+        topic: Uuid,
+        partition: i32,
+        base: i64,
+    ) -> Result<Option<(Batch, InflatedBatch)>> {
         let from = postcard::to_stdvec(&BatchKey::scan_from(topic, partition, base))?;
         let mut scan = self.db.scan(from..).await?;
 
         let Some(kv) = scan.next().await? else {
             return Ok(None);
         };
-        if !kv.key.starts_with(&prefix) {
+        if !kv.key.starts_with(prefix) {
             return Ok(None);
         }
 
-        let Ok(mut deflated) = self.decode(kv.value) else {
-            tracing::warn!(
-                ?topic,
-                partition,
-                offset = base,
-                "skipping undecodable batch while locating offset timestamp"
-            );
-            return Ok(None);
-        };
-        deflated.base_offset = base;
-
-        let Ok(inflated) = InflatedBatch::try_from(deflated.clone()) else {
-            tracing::warn!(
-                ?topic,
-                partition,
-                offset = base,
-                "skipping un-inflatable batch while locating offset timestamp"
-            );
-            return Ok(None);
+        let deflated = match self.decode(kv.value) {
+            Ok(deflated) => deflated,
+            Err(error) => {
+                tracing::warn!(
+                    ?topic,
+                    partition,
+                    offset = base,
+                    ?error,
+                    "skipping undecodable batch while locating offset timestamp"
+                );
+                return Ok(None);
+            }
         };
 
-        Ok(inflated
-            .records
-            .iter()
-            .find(|record| deflated.base_offset + i64::from(record.offset_delta) >= offset)
-            .and_then(|record| {
-                to_system_time(deflated.base_timestamp + record.timestamp_delta).ok()
-            }))
+        match InflatedBatch::try_from(deflated.clone()) {
+            Ok(inflated) => Ok(Some((deflated, inflated))),
+            Err(error) => {
+                tracing::warn!(
+                    ?topic,
+                    partition,
+                    offset = base,
+                    ?error,
+                    "skipping un-inflatable batch while locating offset timestamp"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// The least batch base offset at or after `probe` within a partition,

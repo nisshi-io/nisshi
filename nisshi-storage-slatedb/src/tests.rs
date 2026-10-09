@@ -1754,6 +1754,52 @@ mod time_index {
         assert_eq!(110, millis_since_epoch(response.timestamp.unwrap()));
     }
 
+    /// Compaction removes the batch at the log start and leaves the log
+    /// start where it is, so no batch holds that offset. The Earliest
+    /// timestamp is then the first record of the next surviving batch, not
+    /// `None`.
+    #[tokio::test]
+    async fn earliest_timestamp_after_compaction_removes_the_first_batch() {
+        let engine = create_test_engine().await;
+        let topition = topic_with_policy(
+            &engine,
+            "time-index-compact-earliest",
+            &[("cleanup.policy", "compact")],
+        )
+        .await;
+
+        for batch in [
+            keyed_batch(b"x", b"old", 100),
+            keyed_batch(b"y", b"only", 90),
+            keyed_batch(b"x", b"new", 110),
+        ] {
+            let _ = engine.produce(None, &topition, batch).await.unwrap();
+        }
+
+        engine.maintain(SystemTime::now()).await.unwrap();
+
+        assert_eq!(0, engine.offset_stage(&topition).await.unwrap().log_start);
+        assert!(
+            fetch_all(&engine, &topition)
+                .await
+                .iter()
+                .all(|batch| batch.base_offset != 0)
+        );
+
+        let response = engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), ListOffset::Earliest)],
+            )
+            .await
+            .unwrap()
+            .remove(0)
+            .1;
+        assert_eq!(ErrorCode::None, response.error_code);
+        assert_eq!(Some(0), response.offset);
+        assert_eq!(90, millis_since_epoch(response.timestamp.unwrap()));
+    }
+
     /// Discriminates the real full-rebuild-from-survivors logic from a
     /// naive per-entry prune (delete the `t/` entries whose `base_offset`
     /// is in the removed set). `compaction_rebuild_finds_correct_entry_after_removal`
