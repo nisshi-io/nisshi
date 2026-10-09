@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+This file is generated from the commit history when a release is cut. Pull
+requests don't edit it; describe user- and operator-visible changes in the
+pull request description instead, which becomes the body of the commit on
+`main`.
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

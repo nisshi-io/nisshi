@@ -48,6 +48,38 @@ architecture overview.
 Keep pull requests focused on one change. A large, mixed-purpose PR is
 harder to review and harder to revert if something goes wrong.
 
+Before you ask for review, check that:
+
+- every commit is signed off (see [below](#sign-off-your-commits-dco));
+- `just fmt`, `just clippy`, and `just test` pass locally;
+- tests cover the behavior you changed;
+- the docs describe any user-facing behavior you changed.
+
+## Pull request titles and merging
+
+Pull requests are squash-merged through the merge queue. Each one becomes a
+single commit on `main`: the PR title is the commit's subject, and the PR
+description is its body. The changelog is generated from these commits when
+a release is cut, so don't edit `CHANGELOG.md` in a pull request. Write the
+description for someone reading `git log`: what a user or operator sees
+differently, and why.
+
+The title must follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/),
+and a check fails the PR until it does:
+
+```text
+type(scope): summary
+```
+
+- `type` is one of `feat`, `fix`, `perf`, `refactor`, `docs`, `test`,
+  `build`, `ci`, `chore`, or `revert`.
+- `scope` is optional. Use the crate or storage backend the change is about,
+  for example `dynostore`, `sql`, or `proxy`.
+- Add `!` after the type or scope for a breaking change, for example
+  `feat(sql)!: summary`, and say what breaks in the description.
+- GitHub's Revert button titles its pull request `Revert "<title>"`, which
+  fails the check. Retitle it `revert: <title>`.
+
 ## Sign off your commits (DCO)
 
 This project's contributor-agreement position is the Developer Certificate
@@ -68,6 +100,10 @@ If you forgot on commits already made:
 ```shell
 git rebase --signoff main
 ```
+
+Pull requests are squash-merged, so the commit on `main` doesn't carry the
+`Signed-off-by` lines. The commits in the pull request are the record, so
+sign off each of them.
 
 This is a new expectation for the project going forward — existing history
 predates it, and there's no automated check enforcing it yet. Please sign
