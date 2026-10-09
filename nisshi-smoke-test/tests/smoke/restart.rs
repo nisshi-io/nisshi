@@ -140,7 +140,7 @@ mod persistence {
         let cli = KafkaCli::new(broker.bootstrap());
         let login = ScramLogin {
             user: unique_name("user"),
-            password: "secret".to_owned(),
+            password: unique_name("password"),
             mechanism,
         };
 
@@ -177,7 +177,7 @@ mod persistence {
         let cli = KafkaCli::new(broker.bootstrap());
         let login = ScramLogin {
             user: unique_name("user"),
-            password: "secret".to_owned(),
+            password: unique_name("password"),
             mechanism: ScramMechanism::Sha256,
         };
 
@@ -185,7 +185,7 @@ mod persistence {
 
         let broker = broker.restart_requiring_login(&login);
         let wrong_login = ScramLogin {
-            password: "not the secret".to_owned(),
+            password: unique_name("wrong-password"),
             ..login
         };
         let cli = KafkaCli::logged_in_as(broker.bootstrap(), &wrong_login);
