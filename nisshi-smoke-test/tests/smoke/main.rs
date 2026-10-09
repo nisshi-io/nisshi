@@ -13,11 +13,13 @@
 // limitations under the License.
 
 pub mod broker;
+pub mod compaction;
 pub mod configs;
 pub mod consume;
 pub mod offsets;
 pub mod produce;
 pub mod restart;
+pub mod retention;
 pub mod storage_url;
 pub mod topic_lifecycle;
 pub mod topics;
