@@ -76,6 +76,11 @@ impl<D> OptiCon<D> {
             data_version: Default::default(),
         }
     }
+
+    /// Returns the location of the document in the object store.
+    pub(super) fn location(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl<D> OptiCon<D>
