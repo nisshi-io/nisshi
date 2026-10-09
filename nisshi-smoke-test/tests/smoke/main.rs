@@ -22,6 +22,7 @@ pub mod produce;
 pub mod restart;
 pub mod retention;
 pub mod scram;
+pub mod sqlite_snapshot;
 pub mod storage_url;
 pub mod topic_lifecycle;
 pub mod topics;
