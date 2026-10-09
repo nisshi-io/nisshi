@@ -20,7 +20,7 @@ use nisshi_smoke_test::{Broker, LaunchOptions, StorageUrl, settings};
 
 /// A storage URL that doesn't parse must stop the broker with a message that names it.
 #[test]
-fn unparseable_storage_url_stops_the_broker() {
+fn unparsable_storage_url_stops_the_broker() {
     Broker::launch_expecting_refusal(LaunchOptions::new(StorageUrl::as_given("not a url")))
         .assert_error_names("not a url");
 }
@@ -28,7 +28,7 @@ fn unparseable_storage_url_stops_the_broker() {
 /// A `maintenance_interval` that doesn't parse must stop the broker with a message that names it,
 /// instead of the broker running with the default interval.
 #[test]
-fn unparseable_maintenance_interval_stops_the_broker() {
+fn unparsable_maintenance_interval_stops_the_broker() {
     let option = "maintenance_interval=banana";
 
     let storage = settings::storage_url_under_test().with_query_option(option);
