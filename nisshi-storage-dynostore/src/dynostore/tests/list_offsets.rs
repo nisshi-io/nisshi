@@ -790,6 +790,8 @@ struct Faulty {
     /// How far the store's clock is behind the test's, in seconds, in every
     /// write time the store reports.
     clock_behind_secs: Arc<AtomicU64>,
+    /// Conditional PUTs that failed because the object had changed.
+    put_conflicts: Arc<AtomicUsize>,
 }
 
 impl Faulty {
@@ -802,6 +804,10 @@ impl Faulty {
 
     fn batch_gets(&self) -> usize {
         self.batch_gets.load(Ordering::SeqCst)
+    }
+
+    fn put_conflicts(&self) -> usize {
+        self.put_conflicts.load(Ordering::SeqCst)
     }
 
     fn age_listing(&self) {
@@ -835,7 +841,14 @@ impl ObjectStore for Faulty {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
-        self.inner.put_opts(location, payload, opts).await
+        self.inner
+            .put_opts(location, payload, opts)
+            .await
+            .inspect_err(|error| {
+                if matches!(error, object_store::Error::Precondition { .. }) {
+                    _ = self.put_conflicts.fetch_add(1, Ordering::SeqCst);
+                }
+            })
     }
 
     async fn put_multipart_opts(
@@ -1320,6 +1333,44 @@ async fn backfill_is_left_incomplete_by_a_gap_after_the_last_listed_batch() -> R
     assert_eq!(Some(2), offset);
     assert_eq!(Some(T0 + 200), timestamp);
     assert!(time_index_complete(&storage, &topition).await?);
+
+    Ok(())
+}
+
+/// A produce from another process between a backfill's listing and its
+/// commit changes the watermark document under the committing process, so
+/// the commit's conditional PUT fails. The commit then reads the document
+/// again and merges against the index that the produce appended to, so
+/// that produce's batch is not lost.
+#[tokio::test]
+async fn backfill_commit_merges_again_after_a_cas_conflict() -> Result<()> {
+    let _guard = init_tracing()?;
+    let faulty = Faulty::default();
+    let committing = DynoStore::new("nisshi", 111, faulty.clone());
+    let producing = DynoStore::new("nisshi", 111, faulty.clone());
+    let topition = legacy_partition_with_max_at_offset_1(&committing, "cas-conflict").await?;
+
+    let backfill = committing.begin_time_index_backfill(&topition).await?;
+    let (candidate, _) = committing
+        .collect_time_index_candidate(&topition, &backfill)
+        .await?;
+    assert!(candidate.is_complete());
+
+    assert_eq!(3, produce(&producing, &topition, &[T0 + 200]).await?);
+
+    let conflicts = faulty.put_conflicts();
+    let merged = committing
+        .commit_time_index_backfill(&topition, &candidate, backfill.token)
+        .await?;
+    assert_eq!(1, faulty.put_conflicts() - conflicts);
+
+    assert!(merged.is_complete());
+    assert_eq!(&BTreeMap::from([(T0, 0), (T0 + 200, 3)]), merged.entries());
+    assert_eq!(T0 + 200, merged.max_timestamp());
+
+    let (offset, timestamp) = list_offsets_timestamp(&committing, &topition, T0 + 150).await?;
+    assert_eq!(Some(3), offset);
+    assert_eq!(Some(T0 + 200), timestamp);
 
     Ok(())
 }
