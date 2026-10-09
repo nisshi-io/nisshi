@@ -25,6 +25,12 @@ name: ci
 #   the experimental compat legs, cargo-publish-dry-run, src, package,
 #   smoke, smoke-oldest-client, smoke-report, release.
 #
+# On top of the tiers, the `changes` job skips every Rust job on a
+# pull_request that only touches CI config this workflow doesn't read, or
+# prose (the list is in .github/scripts/ci-changes.sh). Those jobs carry
+# `needs.changes.outputs.rust == 'true'` in their `if:`, and ci-gate needs
+# `changes` too, so a failed classification fails the gate.
+#
 # Tier B jobs carry `if: github.event_name != 'pull_request' ||
 # (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, and the trimmed matrices pick the smaller list
 # under the same condition, so a leg's check-run name
@@ -88,11 +94,50 @@ env:
   DUCKDB_VERSION: "1.5.6"
   DUCKDB_SHA256: cce2687a38681db644c248198b99ecd86170ff47e324c5f33e50c0042f142839
 jobs:
+  # Whether a pull_request run needs the Rust jobs at all. A PR that only
+  # touches CI config this workflow doesn't read, or prose, skips every job
+  # below except typos and ci-gate (see .github/scripts/ci-changes.sh for the
+  # list). merge_group and push always get rust=true. The classifier is
+  # checked out from the PR's base, so a PR can't widen its own skip list.
+  # The same job is in dependencies.yml and codeql.yml.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          run_all() { echo "$1, running everything"; echo "rust=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          [ "$EVENT_NAME" = pull_request ] || run_all "$EVENT_NAME run"
+          [ -f .github/scripts/ci-changes.sh ] || run_all "base has no ci-changes.sh"
+          bash .github/scripts/ci-changes.test.sh
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > "$RUNNER_TEMP/files"
+          listed=$(wc -l < "$RUNNER_TEMP/files")
+          # The files API stops at 3000; a short list could hide a Rust change.
+          [ "$listed" -eq "$CHANGED_FILES" ] || run_all "listed $listed of $CHANGED_FILES changed files"
+          bash .github/scripts/ci-changes.sh < "$RUNNER_TEMP/files"
   test:
     # Tier A on postgres:17 (compose.yaml's default), full pg matrix on
     # merge_group/push. build-storage/build-storage-lake are Tier B, so they
     # can't be `needs` here (see the header).
-    needs: [fmt, clippy]
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes, fmt, clippy]
     runs-on: ${{matrix.os}}
     timeout-minutes: 45
     strategy:
@@ -162,6 +207,8 @@ jobs:
       - run: docker system df
       - run: df -h
   fmt:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 10
     strategy:
@@ -181,6 +228,8 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just fmt
   clippy:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 15
     strategy:
@@ -203,7 +252,8 @@ jobs:
       # this job instead of in a job of its own.
       - run: just doc
   build-storage:
-    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -231,7 +281,8 @@ jobs:
       # and linking.
       - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}}
   build-storage-lake:
-    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -261,6 +312,8 @@ jobs:
       # Check proves the combination compiles without codegen or linking.
       - run: cargo check --bin nisshi --no-default-features --features dynostore,${{matrix.lake}}
   compat-librdkafka:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
@@ -313,8 +366,8 @@ jobs:
           path: ${{env.RESULTS_FILE}}
           if-no-files-found: warn
   compat-librdkafka-report:
-    if: always()
-    needs: [compat-librdkafka]
+    if: always() && needs.changes.outputs.rust == 'true'
+    needs: [changes, compat-librdkafka]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -343,6 +396,8 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   compat-franz-go:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
@@ -395,8 +450,8 @@ jobs:
           path: ${{env.RESULTS_FILE}}
           if-no-files-found: warn
   compat-franz-go-report:
-    if: always()
-    needs: [compat-franz-go]
+    if: always() && needs.changes.outputs.rust == 'true'
+    needs: [changes, compat-franz-go]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -425,7 +480,8 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   cargo-publish-dry-run:
-    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
     strategy:
@@ -454,6 +510,8 @@ jobs:
         with:
           config: typos.toml
   third-party-license:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -473,7 +531,8 @@ jobs:
           path: THIRD-PARTY-LICENSE.html
           if-no-files-found: error
   src:
-    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -488,8 +547,8 @@ jobs:
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   package:
-    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
-    needs: [test, cargo-publish-dry-run, typos, release]
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: [changes, test, cargo-publish-dry-run, typos, release]
     runs-on: ${{matrix.os}}
     timeout-minutes: 15
     permissions:
@@ -539,8 +598,8 @@ jobs:
   # Runs the nisshi-smoke-test suite (`just smoke <storage>`): the Kafka CLI
   # tools from each Kafka image against the packaged image on each storage engine.
   smoke:
-    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
-    needs: [package]
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: [changes, package]
     strategy:
       fail-fast: false
       matrix:
@@ -759,12 +818,12 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   release:
-    if: github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
     # build-storage/build-storage-lake are here (not on `test`, which is Tier
     # A) so a feature combination that doesn't compile stops a queue entry
     # before the release -> package -> smoke chain, and never publishes on a
     # `v*` tag.
-    needs: [test, src, typos, build-storage, build-storage-lake]
+    needs: [changes, test, src, typos, build-storage, build-storage-lake]
     permissions:
       contents: write
     runs-on: ${{matrix.os}}
@@ -878,6 +937,7 @@ jobs:
   ci-gate:
     if: always()
     needs:
+      - changes
       - fmt
       - clippy
       - build-storage
@@ -924,8 +984,10 @@ jobs:
       # `skipped` if it gains a `needs` on a Tier B job, and without this the
       # PR gate would stay green with no Tier A signal at all. The list names
       # the Tier B exemptions, so a newly added job defaults to must-not-skip.
+      # Skipped when `changes` found no Rust-relevant path, since then
+      # every Tier A job but typos skips by design.
       - name: Tier A ran on pull_request
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
         env:
           TIER_B: build-storage build-storage-lake cargo-publish-dry-run src package smoke smoke-oldest-client release
         run: |
