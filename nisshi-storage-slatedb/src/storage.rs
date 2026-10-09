@@ -411,17 +411,11 @@ impl Engine {
                     postcard::to_stdvec(&WatermarkKey::new(metadata.id, partition))?;
                 let mut watermark = self.partition_watermark(&tx, &watermark_key).await?;
 
-                // The log starts at the first batch that survived compaction.
-                let low = batches
-                    .iter()
-                    .map(|(_, offset, _)| *offset)
-                    .find(|offset| !removed_offsets.contains(offset))
-                    .or(watermark.high);
-
-                if let Some(low) = low {
-                    watermark.low = Some(watermark.low.map_or(low, |current| current.max(low)));
-                }
-
+                // Compaction leaves the log start where it is, as in Kafka,
+                // whose cleaner never moves it: a fetch below the first
+                // surviving batch steps over the gap to it, where moving the
+                // log start would answer OFFSET_OUT_OF_RANGE and reset the
+                // consumer. Only retention and DeleteRecords move it.
                 if let Some(ref mut timestamps) = watermark.timestamps {
                     timestamps.retain(|_, offset| !removed_offsets.contains(offset));
                 }

@@ -15,18 +15,18 @@
 use nisshi_sans_io::{
     AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, AlterUserScramCredentialsRequest,
     ApiKey as _, ConsumerGroupDescribeRequest, CreateAclsRequest, CreateTopicsRequest,
-    DeleteGroupsRequest, DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest,
-    DescribeClusterRequest, DescribeConfigsRequest, DescribeGroupsRequest,
-    DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest, EndTxnRequest,
-    FetchRequest, FindCoordinatorRequest, GetTelemetrySubscriptionsRequest,
-    IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
-    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
+    DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest, DescribeClusterRequest,
+    DescribeConfigsRequest, DescribeGroupsRequest, DescribeTopicPartitionsRequest,
+    DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
+    GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest, InitProducerIdRequest,
+    ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
+    ProduceRequest, TxnOffsetCommitRequest,
 };
 use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
 use nisshi_storage::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
-    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    CreateTopicsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
+    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
     InitProducerIdService, ListGroupsService, ListOffsetsService,
@@ -51,7 +51,6 @@ where
         consumer_group_describe,
         create_acls,
         create_topics,
-        delete_groups,
         delete_records,
         delete_topics,
         describe_acls,
@@ -194,26 +193,6 @@ where
                 FrameRequestLayer::<CreateTopicsRequest>::new(),
             )
                 .into_layer(CreateTopicsService { storage })
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
-pub fn delete_groups<S>(
-    builder: FrameRouteBuilder<Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<Error>, Error>
-where
-    S: Storage,
-{
-    builder
-        .with_route(
-            DeleteGroupsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<DeleteGroupsRequest>::new(),
-            )
-                .into_layer(DeleteGroupsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)

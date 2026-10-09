@@ -288,9 +288,9 @@ impl Engine {
     ) -> result::Result<u64, turso::Error>
     where
         P: IntoParams,
-        P: Debug,
     {
-        debug!(?connection, sql, ?params);
+        // The params hold record data, so we log only the SQL.
+        debug!(?connection, sql);
 
         let mut statement = connection.prepare(sql).await?;
 
@@ -333,9 +333,9 @@ impl Engine {
     ) -> result::Result<Option<Row>, turso::Error>
     where
         P: IntoParams,
-        P: Debug,
     {
-        debug!(?connection, sql, ?params);
+        // The params hold record data, so we log only the SQL.
+        debug!(?connection, sql);
 
         let mut statement = connection.prepare(sql).await?;
 
@@ -374,9 +374,9 @@ impl Engine {
     ) -> result::Result<Row, turso::Error>
     where
         P: IntoParams,
-        P: Debug,
     {
-        debug!(?connection, sql, ?params);
+        // The params hold record data, so we log only the SQL.
+        debug!(?connection, sql);
 
         let mut statement = connection
             .prepare(sql)
@@ -602,7 +602,7 @@ impl Engine {
             let key = record.key.as_deref();
             let value = record.value.as_deref();
 
-            debug!(?delta, ?record, ?offset);
+            debug!(?delta, ?offset);
 
             _ = self
                 .prepare_execute(
@@ -630,7 +630,7 @@ impl Engine {
                     ),
                 )
                 .await
-                .inspect_err(|err| error!(?err, ?topic, ?partition, ?offset, ?key, ?value))
+                .inspect_err(|err| error!(?err, ?topic, ?partition, ?offset, key_len = ?key.map(<[u8]>::len), value_len = ?value.map(<[u8]>::len)))
                 .map_err(unique_constraint(ErrorCode::UnknownServerError))?;
 
             for (ordinal, header) in record.headers.iter().enumerate() {
@@ -654,7 +654,7 @@ impl Engine {
                     )
                     .await
                     .inspect_err(|err| {
-                        error!(?err, ?topic, ?partition, ?offset, ?key, ?value);
+                        error!(?err, ?topic, ?partition, ?offset, key_len = ?key.map(<[u8]>::len), value_len = ?value.map(<[u8]>::len));
                     });
             }
         }
@@ -1512,13 +1512,13 @@ impl Storage for Engine {
                     .key(
                         row.get_value(3)
                             .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
-                            .inspect(|k| debug!(?k))
+                            .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
                             .inspect_err(|err| error!(?err))?,
                     )
                     .value(
                         row.get_value(4)
                             .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
-                            .inspect(|v| debug!(?v))
+                            .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                             .inspect_err(|err| error!(?err))?,
                     );
 
@@ -1695,14 +1695,14 @@ impl Storage for Engine {
                             row.get_value(3)
                                 .map(|value| value.as_blob().cloned())
                                 .map(|o| o.map(Bytes::from))
-                                .inspect(|k| debug!(?k))
+                                .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
                                 .inspect_err(|err| error!(?err))?,
                         )
                         .value(
                             row.get_value(4)
                                 .map(|value| value.as_blob().cloned())
                                 .map(|o| o.map(Bytes::from))
-                                .inspect(|v| debug!(?v))
+                                .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                                 .inspect_err(|err| error!(?err))?,
                         );
 
@@ -2964,18 +2964,28 @@ impl Storage for Engine {
                     .await
                     .inspect_err(|err| error!(?err, group_id))?
                 {
-                    let current = row
+                    // A group row with no detail row (e.g. a group that only ever
+                    // committed offsets, never a JoinGroup) joins to a NULL
+                    // `detail` column here: that group exists and is empty, not
+                    // an error.
+                    let value = row
                         .get_value(1)
                         .map_err(Error::from)
-                        .and_then(|value| {
-                            value
-                                .as_text()
-                                .cloned()
-                                .ok_or(Error::UnexpectedValue(value.clone()))
-                        })
-                        .and_then(|s| serde_json::from_str::<GroupDetail>(&s).map_err(Into::into))
-                        .inspect(|current| debug!(?current))
                         .inspect_err(|err| error!(?err, group_id))?;
+
+                    let current = if value.is_null() {
+                        GroupDetail::default()
+                    } else {
+                        value
+                            .as_text()
+                            .cloned()
+                            .ok_or(Error::UnexpectedValue(value.clone()))
+                            .and_then(|s| {
+                                serde_json::from_str::<GroupDetail>(&s).map_err(Into::into)
+                            })
+                            .inspect(|current| debug!(?current))
+                            .inspect_err(|err| error!(?err, group_id))?
+                    };
 
                     results.push(NamedGroupDetail::found(group_id.into(), current));
                 } else {

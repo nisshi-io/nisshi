@@ -1,5 +1,6 @@
 [package]
 name = "nisshi-storage-slatedb"
+description = "Nisshi storage backend for slatedb:// using SlateDB on object storage"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

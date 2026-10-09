@@ -407,7 +407,7 @@ impl Serializer for &mut Encoder {
         Err(Error::UnexpectedType(format!("{v}")))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(len = v.len()))]
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
         if self.in_header()
             && self.kind.is_some_and(|kind| kind == Kind::Request)
@@ -438,13 +438,9 @@ impl Serializer for &mut Encoder {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(len = v.len()))]
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        debug!(
-            ?v,
-            is_valid = self.is_valid(),
-            is_flexible = self.is_flexible()
-        );
+        debug!(is_valid = self.is_valid(), is_flexible = self.is_flexible());
 
         if self.is_valid() {
             if self.is_flexible() {
@@ -1017,12 +1013,12 @@ impl Serializer for &mut RecordBatchEncoder {
         unimplemented!("{v}")
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(len = v.len()))]
     fn serialize_str(self, v: &str) -> std::result::Result<Self::Ok, Self::Error> {
-        unimplemented!("{v}")
+        unimplemented!("a string of {} bytes", v.len())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(len = v.len()))]
     fn serialize_bytes(self, v: &[u8]) -> std::result::Result<Self::Ok, Self::Error> {
         self.working.put(v);
         Ok(())
