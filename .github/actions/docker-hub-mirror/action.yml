@@ -3,7 +3,8 @@ description: Pulls Docker Hub images through mirror.gcr.io, so CI does not hit D
 runs:
   using: composite
   steps:
-    - shell: bash
+    - name: Configure Docker Hub mirror
+      shell: bash
       run: |
         set -euo pipefail
         conf=/etc/docker/daemon.json
@@ -22,5 +23,7 @@ runs:
         # The daemon pulls from the mirror first and falls back to Docker Hub
         # when the mirror misses or is down. Fail here, not on a later 429, if
         # the setting did not take.
-        docker info | grep -A2 'Registry Mirrors'
-        docker info --format '{{range .RegistryConfig.Mirrors}}{{println .}}{{end}}' | grep -q 'mirror.gcr.io'
+        docker info | grep -A2 'Registry Mirrors' || true
+        mirrors=$(docker info --format '{{range .RegistryConfig.Mirrors}}{{println .}}{{end}}')
+        grep -q 'mirror.gcr.io' <<<"${mirrors}" \
+          || { echo "::error::mirror.gcr.io is not in the Docker daemon config"; exit 1; }
