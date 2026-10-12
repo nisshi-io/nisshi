@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nisshi_storage::{ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration};
+use nisshi_storage::{
+    ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration, reject_unrecognized_options,
+};
 use regex::Regex;
 
 use super::Engine;
@@ -30,6 +32,8 @@ impl StorageFactory for LimboFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+        reject_unrecognized_options(&configuration.storage, &[])?;
+
         Engine::builder()
             .storage(configuration.storage)
             .node(configuration.node_id)

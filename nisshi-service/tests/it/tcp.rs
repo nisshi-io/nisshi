@@ -13,17 +13,24 @@
 // limitations under the License.
 
 use nisshi_sans_io::{ApiKey as _, Frame, FrameInput, Header, MetadataRequest, MetadataResponse};
+use std::io;
+
 use nisshi_service::{
     BytesFrameLayer, BytesTcpService, Error as ServiceError, FrameBytesLayer, FrameService,
-    TcpListenerInput, TcpListenerLayer, TcpStreamLayer,
+    TcpContextLayer, TcpListenerInput, TcpListenerLayer, TcpStreamLayer,
 };
 use rama::{
-    Layer as _, Service as _,
+    Layer as _, Service,
     error::BoxError,
-    extensions::Extensions,
+    extensions::{Extension, Extensions, ExtensionsRef as _},
     tcp::{TcpStream, TokioTcpStream},
 };
-use tokio::{net::TcpListener, task::JoinSet};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpListener,
+    sync::mpsc,
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -119,6 +126,100 @@ async fn tcp_client_server() -> Result<(), BoxError> {
 
     let joined = join.join_all().await;
     debug!(?joined);
+
+    Ok(())
+}
+
+/// Inserted into the listener's extensions, so every connection must see it.
+#[derive(Clone, Debug, Extension)]
+struct Seed;
+
+/// Inserted by each connection, so no other connection may see it.
+#[derive(Clone, Debug, Extension)]
+struct Marker;
+
+#[derive(Debug, PartialEq)]
+struct Seen {
+    seed: bool,
+    marker: bool,
+}
+
+/// Reports which test extensions a connection sees, inserts [`Marker`], then writes one
+/// byte back, so the client reads that byte only after the report is sent.
+#[derive(Clone)]
+struct ReportExtensions(mpsc::UnboundedSender<Seen>);
+
+impl Service<TcpStream> for ReportExtensions {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn serve(&self, mut stream: TcpStream) -> Result<Self::Output, Self::Error> {
+        let extensions = stream.extensions();
+
+        _ = self.0.send(Seen {
+            seed: extensions.contains::<Seed>(),
+            marker: extensions.contains::<Marker>(),
+        });
+
+        _ = extensions.insert(Marker);
+
+        stream.write_all(&[0]).await
+    }
+}
+
+#[tokio::test]
+async fn listener_isolates_connection_extensions() -> Result<(), BoxError> {
+    let _guard = init_tracing()?;
+
+    let cancellation = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let local_addr = listener.local_addr()?;
+
+    let listener_extensions = Extensions::default();
+    _ = listener_extensions.insert(Seed);
+
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+
+    let service = (
+        TcpListenerLayer::new(cancellation.clone()),
+        TcpContextLayer::default(),
+    )
+        .into_layer(ReportExtensions(sender));
+
+    let mut join = JoinSet::new();
+
+    _ = join.spawn({
+        let extensions = listener_extensions.clone();
+        async move {
+            service
+                .serve(TcpListenerInput {
+                    listener,
+                    extensions,
+                })
+                .await
+        }
+    });
+
+    for _ in 0..3 {
+        let mut stream = TokioTcpStream::connect(local_addr).await?;
+        _ = stream.read_u8().await?;
+
+        assert_eq!(
+            Some(Seen {
+                seed: true,
+                marker: false,
+            }),
+            receiver.recv().await
+        );
+    }
+
+    cancellation.cancel();
+
+    for joined in join.join_all().await {
+        joined?;
+    }
+
+    assert_eq!(1, listener_extensions.self_iter_all().count());
 
     Ok(())
 }

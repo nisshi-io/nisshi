@@ -202,6 +202,17 @@ impl<S> Layer<S> for TcpListenerLayer {
 }
 
 /// A [`Service`] that listens for TCP connections
+///
+/// Each accepted connection gets its own fork of the listener's [`Extensions`]. The
+/// connection reads the listener's entries through the fork, and its own inserts land
+/// only on the fork, so per-connection state never reaches the listener's store or
+/// another connection.
+///
+/// The fork isolates only the [`Extensions`]. Every connection gets a clone of the inner
+/// service, so all connections share any state that the service holds itself. A
+/// [`BytesFrameLayer`](crate::BytesFrameLayer) with a SASL config is one example: every
+/// clone shares its authentication stage. A stack that holds per-connection state needs
+/// a new service for each connection.
 #[derive(Clone, Default)]
 pub struct TcpListenerService<S> {
     cancellation: CancellationToken,
@@ -296,7 +307,7 @@ where
     S::Error: error::Error,
 {
     /// Accepts connections from `listener` until cancelled, handing each one to the
-    /// inner service with a clone of `extensions`.
+    /// inner service with a child forked from `extensions`.
     ///
     /// Generic over [`Acceptor`] (rather than taking [`TcpListenerInput`] directly) so a
     /// test can drive the loop with a scripted accept sequence; see the trait docs.
@@ -316,7 +327,7 @@ where
                             debug!(?listener, ?stream, %addr);
 
                             let service = self.inner.clone();
-                            let extensions = extensions.clone();
+                            let extensions = extensions.fork();
 
                             let handle = set.spawn(
                                 async move {

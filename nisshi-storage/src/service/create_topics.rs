@@ -225,6 +225,20 @@ where
                 continue;
             }
 
+            // Replication factor is checked before partition count, matching
+            // Kafka's KRaft controller (ReplicationControlManager), the only
+            // mode from Kafka 4.0. -1 (broker default) was already replaced
+            // above, so anything below 1 is invalid.
+            if replication_factor.is_some_and(|factor| factor < 1) {
+                topics.push(error_result(
+                    name,
+                    num_partitions,
+                    replication_factor,
+                    ErrorCode::InvalidReplicationFactor,
+                ));
+                continue;
+            }
+
             // -1 (broker default) was already replaced above, so anything
             // below 1 is invalid.
             if num_partitions.is_some_and(|partitions| partitions < 1) {

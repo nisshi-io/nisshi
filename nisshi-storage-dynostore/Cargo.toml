@@ -34,6 +34,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 rama.workspace = true
+temp-env = { workspace = true, features = ["async_closure"] }
+tokio-util.workspace = true
 tracing-subscriber.workspace = true
 
 
