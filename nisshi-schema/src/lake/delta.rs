@@ -31,7 +31,6 @@ use arrow::{
 };
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider,
     functions::core::expr_ext::FieldAccessor as _,
     prelude::{Expr, SessionContext, cast, ident},
 };
@@ -646,9 +645,9 @@ impl Delta {
 
         // Build a set of existing column names (order-independent comparison)
         let actual_names: std::collections::HashSet<_> = table
+            .snapshot()?
             .schema()
             .fields()
-            .iter()
             .map(|field| field.name().clone())
             .collect();
         debug!(?actual_names);
@@ -1006,7 +1005,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -1099,7 +1098,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -1203,7 +1202,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -1317,7 +1316,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -1431,19 +1430,22 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
 
             let pretty_results = pretty_format_batches(&results)?.to_string();
 
+            // deltalake 0.32's table provider returns columns in table schema
+            // order. Earlier versions moved partition columns to the end, so
+            // value.vendor_id used to come last here. The data is unchanged.
             let expected = vec![
-                "+----------------+---------------------+-----------+------------+----------+---------------+---------------------+-------------------+---------------------+-----------------+",
-                "| meta.partition | meta.timestamp      | meta.year | meta.month | meta.day | value.trip_id | value.trip_distance | value.fare_amount | value.store_and_fwd | value.vendor_id |",
-                "+----------------+---------------------+-----------+------------+----------+---------------+---------------------+-------------------+---------------------+-----------------+",
-                "| 32123          | 1973-10-17T18:36:57 | 1973      | 10         | 17       | 1000371       | 1.8                 | 15.32             | 0                   | 1               |",
-                "+----------------+---------------------+-----------+------------+----------+---------------+---------------------+-------------------+---------------------+-----------------+",
+                "+----------------+---------------------+-----------+------------+----------+-----------------+---------------+---------------------+-------------------+---------------------+",
+                "| meta.partition | meta.timestamp      | meta.year | meta.month | meta.day | value.vendor_id | value.trip_id | value.trip_distance | value.fare_amount | value.store_and_fwd |",
+                "+----------------+---------------------+-----------+------------+----------+-----------------+---------------+---------------------+-------------------+---------------------+",
+                "| 32123          | 1973-10-17T18:36:57 | 1973      | 10         | 17       | 1               | 1000371       | 1.8                 | 15.32             | 0                   |",
+                "+----------------+---------------------+-----------+------------+----------+-----------------+---------------+---------------------+-------------------+---------------------+",
             ];
 
             assert_eq!(pretty_results.trim().lines().collect::<Vec<_>>(), expected);
@@ -1535,7 +1537,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -1649,7 +1651,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -1873,7 +1875,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -2003,7 +2005,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -2101,7 +2103,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -2193,7 +2195,7 @@ mod tests {
             };
 
             let ctx = SessionContext::new();
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -2259,7 +2261,7 @@ mod tests {
             };
 
             let ctx = SessionContext::new();
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -2326,7 +2328,7 @@ mod tests {
             };
 
             let ctx = SessionContext::new();
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -2478,7 +2480,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;
@@ -2603,7 +2605,7 @@ mod tests {
 
             let ctx = SessionContext::new();
 
-            _ = ctx.register_table("t", Arc::new(table))?;
+            _ = ctx.register_table("t", table.table_provider().await?)?;
 
             let df = ctx.sql("select * from t").await?;
             let results = df.collect().await?;

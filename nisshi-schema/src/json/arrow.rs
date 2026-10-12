@@ -619,7 +619,7 @@ mod tests {
 
     #[cfg(feature = "iceberg")]
     use iceberg::{
-        io::FileIOBuilder,
+        io::FileIO,
         spec::{
             DataFile, DataFileFormat::Parquet, Schema as IcebergSchema,
             SchemaRef as IcebergSchemaRef,
@@ -676,7 +676,7 @@ mod tests {
             .inspect(|schema| debug!(?schema))
             .inspect_err(|err| debug!(?err))?;
 
-        let memory = FileIOBuilder::new("memory").build()?;
+        let memory = FileIO::new_with_memory();
 
         #[derive(Clone)]
         struct Location;
