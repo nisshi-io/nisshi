@@ -44,7 +44,7 @@ impl StorageFactory for MemoryEngineFactory {
                 configuration.cluster.as_str(),
                 configuration.node_id,
                 InMemory::new(),
-            )
+            )?
             .advertised_listener(configuration.advertised_listener.clone())
             .schemas(configuration.schema_registry)
             .lake(configuration.lake_house.clone()),
@@ -97,15 +97,19 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             .with_bucket_name(bucket_name)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
             .build()
-            .map(|object_store| {
+            .map_err(Into::into)
+            .and_then(|object_store| {
                 DynoStore::new(
                     configuration.cluster.as_str(),
                     configuration.node_id,
                     object_store,
                 )
-                .advertised_listener(configuration.advertised_listener.clone())
-                .schemas(configuration.schema_registry)
-                .lake(configuration.lake_house.clone())
+                .map(|storage| {
+                    storage
+                        .advertised_listener(configuration.advertised_listener.clone())
+                        .schemas(configuration.schema_registry)
+                        .lake(configuration.lake_house.clone())
+                })
             })
             .map(|storage| {
                 ProduceRequestBatcher::new(storage)
@@ -114,7 +118,6 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             })
             .map(Box::new)
             .map(|storage| Arc::new(storage) as ArcDynStorage)
-            .map_err(Into::into)
     }
 }
 
@@ -160,20 +163,26 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
         GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket_name)
             .build()
-            .map(|object_store| {
-                PutRateLimiter::new(object_store, Duration::from_mins(5))
-                    .with_rate_per_second(NonZeroU32::new(1))
-                    .with_jitter(Some(Duration::from_millis(50)))
+            .map_err(Into::into)
+            .and_then(|object_store| {
+                PutRateLimiter::new(object_store, Duration::from_mins(5)).map(|object_store| {
+                    object_store
+                        .with_rate_per_second(NonZeroU32::new(1))
+                        .with_jitter(Some(Duration::from_millis(50)))
+                })
             })
-            .map(|object_store| {
+            .and_then(|object_store| {
                 DynoStore::new(
                     configuration.cluster.as_str(),
                     configuration.node_id,
                     object_store,
                 )
-                .advertised_listener(configuration.advertised_listener.clone())
-                .schemas(configuration.schema_registry)
-                .lake(configuration.lake_house.clone())
+                .map(|storage| {
+                    storage
+                        .advertised_listener(configuration.advertised_listener.clone())
+                        .schemas(configuration.schema_registry)
+                        .lake(configuration.lake_house.clone())
+                })
             })
             .map(|storage| {
                 ProduceRequestBatcher::new(storage)
@@ -182,6 +191,5 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
             })
             .map(Box::new)
             .map(|storage| Arc::new(storage) as ArcDynStorage)
-            .map_err(Into::into)
     }
 }

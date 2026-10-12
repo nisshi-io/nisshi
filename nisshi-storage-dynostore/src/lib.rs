@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod dynostore;
 mod factory;
 mod gcs;

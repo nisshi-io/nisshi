@@ -1072,9 +1072,12 @@ impl Builder<String, i32, Url, Url> {
 
         debug!(?path);
 
-        let db = turso::Builder::new_local(path.to_str().unwrap())
-            .build()
-            .await?;
+        let db = turso::Builder::new_local(
+            path.to_str()
+                .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?,
+        )
+        .build()
+        .await?;
 
         let connection = db.connect()?;
 
@@ -1179,9 +1182,13 @@ impl Storage for Engine {
                 .inspect(|row| debug!(?parameters, ?row))
                 .and_then(|row| {
                     row.get_value(0)
-                        .map(|value| value.as_text().cloned().unwrap())
-                        .inspect_err(|err| error!(?err))
                         .map_err(Into::into)
+                        .and_then(|value| {
+                            value.as_text().cloned().ok_or_else(|| {
+                                Error::Message("expected a text column value".into())
+                            })
+                        })
+                        .inspect_err(|err| error!(?err))
                 })
                 .and_then(|id| Uuid::parse_str(id.as_str()).map_err(Into::into))
         }
@@ -2184,17 +2191,27 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
+                                    if broker_ids.is_empty() {
+                                        return Err(Error::Message(
+                                            "no brokers available for partition assignment".into(),
+                                        ));
+                                    }
+
+                                    let per_partition = 1 + replication_factor as usize;
 
                                     let partitions = Some(
                                         (0..partitions)
                                             .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
+                                                let base = partition_index as usize * per_partition;
+                                                let leader_id = broker_ids[base % broker_ids.len()];
 
                                                 let replica_nodes = Some(
                                                     (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
+                                                        .map(|replica| {
+                                                            broker_ids[(base
+                                                                + 1
+                                                                + replica as usize)
+                                                                % broker_ids.len()]
                                                         })
                                                         .collect(),
                                                 );
@@ -2311,17 +2328,27 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
+                                    if broker_ids.is_empty() {
+                                        return Err(Error::Message(
+                                            "no brokers available for partition assignment".into(),
+                                        ));
+                                    }
+
+                                    let per_partition = 1 + replication_factor as usize;
 
                                     let partitions = Some(
                                         (0..partitions)
                                             .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
+                                                let base = partition_index as usize * per_partition;
+                                                let leader_id = broker_ids[base % broker_ids.len()];
 
                                                 let replica_nodes = Some(
                                                     (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
+                                                        .map(|replica| {
+                                                            broker_ids[(base
+                                                                + 1
+                                                                + replica as usize)
+                                                                % broker_ids.len()]
                                                         })
                                                         .collect(),
                                                 );
@@ -2437,16 +2464,26 @@ impl Storage for Engine {
                         brokers.iter().map(|broker| broker.node_id).collect();
                     broker_ids.shuffle(&mut rng);
 
-                    let mut brokers = broker_ids.into_iter().cycle();
+                    if broker_ids.is_empty() {
+                        return Err(Error::Message(
+                            "no brokers available for partition assignment".into(),
+                        ));
+                    }
+
+                    let per_partition = 1 + replication_factor as usize;
 
                     let partitions = Some(
                         (0..partitions)
                             .map(|partition_index| {
-                                let leader_id = brokers.next().expect("cycling");
+                                let base = partition_index as usize * per_partition;
+                                let leader_id = broker_ids[base % broker_ids.len()];
 
                                 let replica_nodes = Some(
                                     (0..replication_factor)
-                                        .map(|_replica| brokers.next().expect("cycling"))
+                                        .map(|replica| {
+                                            broker_ids
+                                                [(base + 1 + replica as usize) % broker_ids.len()]
+                                        })
                                         .collect(),
                                 );
                                 let isr_nodes = replica_nodes.clone();

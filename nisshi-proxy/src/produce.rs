@@ -166,13 +166,14 @@ where
 
         SEND_PENDING_BATCH_COUNTER.add(1, &[]);
 
-        let requests = self
-            .requests
-            .lock()
-            .map(|mut guard| std::mem::take(guard.deref_mut()))
-            .inspect(|request| debug!(?request))
-            .inspect_err(|err| debug!(?err))
-            .expect("poison");
+        let requests = {
+            let mut guard = self
+                .requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(guard.deref_mut())
+        };
+        debug!(?requests);
 
         if requests.is_empty() {
             SEND_PENDING_EMPTY_BATCH_COUNTER.add(1, &[]);
@@ -204,8 +205,7 @@ where
         let mut responses = self
             .responses
             .lock()
-            .inspect_err(|err| debug!(?err))
-            .expect("poison");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut owners = owners.split(produce_response);
         debug!(?owners);
@@ -307,35 +307,32 @@ where
             .inspect(|max_records| debug!(?max_records))
             .unwrap_or(1_000);
 
-        let ticket = self
-            .requests
-            .lock()
-            .map(|mut requests| {
-                let ticket = Ticket::new(self.clone());
-                requests.push(BatchRequest {
-                    id: ticket.id,
-                    request: request.request,
-                });
-                ticket
-            })
-            .expect("poison");
+        let ticket = {
+            let mut requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ticket = Ticket::new(self.clone());
+            requests.push(BatchRequest {
+                id: ticket.id,
+                request: request.request,
+            });
+            ticket
+        };
 
         loop {
             let id = ticket.id;
 
-            if self
+            let num_records = self
                 .requests
                 .lock()
-                .map(|requests| {
-                    requests
-                        .iter()
-                        .map(|batch_request| batch_request.number_of_records())
-                        .sum::<usize>()
-                })
-                .inspect(|num_records| debug!(num_records, max_records))
-                .expect("poison")
-                >= max_records
-            {
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|batch_request| batch_request.number_of_records())
+                .sum::<usize>();
+            debug!(num_records, max_records);
+
+            if num_records >= max_records {
                 BATCH_OVERFLOW_COUNTER.add(1, &[]);
 
                 if let Ok(Some(produce_response)) =

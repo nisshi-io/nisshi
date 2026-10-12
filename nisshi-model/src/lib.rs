@@ -17,6 +17,7 @@
 //! This crate converts Kafka JSON protocol definitions into structures
 //! that can be easily used during the Nisshi Sans I/O build process.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod error;
 pub mod wv;
 

@@ -369,11 +369,11 @@ fn json_content_type() -> Attributes {
 }
 
 impl DynoStore {
-    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
-        Self {
+    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Result<Self> {
+        Ok(Self {
             cluster: cluster.into(),
             node,
-            advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
+            advertised_listener: Url::parse("tcp://127.0.0.1/")?,
             schemas: None,
 
             lake: None,
@@ -383,8 +383,8 @@ impl DynoStore {
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
                 Duration::from_millis(5_000),
-            )),
-        }
+            )?),
+        })
     }
 
     pub(crate) fn advertised_listener(self, advertised_listener: Url) -> Self {
@@ -1539,16 +1539,26 @@ impl Storage for DynoStore {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
+                            if broker_ids.is_empty() {
+                                return Err(Error::Message(
+                                    "no brokers available for partition assignment".into(),
+                                ));
+                            }
+
+                            let per_partition = 1 + replication_factor as usize;
 
                             let partitions = Some(
                                 (0..partitions)
                                     .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
+                                        let base = partition_index as usize * per_partition;
+                                        let leader_id = broker_ids[base % broker_ids.len()];
 
                                         let replica_nodes = Some(
                                             (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
+                                                .map(|replica| {
+                                                    broker_ids[(base + 1 + replica as usize)
+                                                        % broker_ids.len()]
+                                                })
                                                 .collect(),
                                         );
                                         let isr_nodes = replica_nodes.clone();
@@ -1638,16 +1648,26 @@ impl Storage for DynoStore {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
+                            if broker_ids.is_empty() {
+                                return Err(Error::Message(
+                                    "no brokers available for partition assignment".into(),
+                                ));
+                            }
+
+                            let per_partition = 1 + replication_factor as usize;
 
                             let partitions = Some(
                                 (0..partitions)
                                     .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
+                                        let base = partition_index as usize * per_partition;
+                                        let leader_id = broker_ids[base % broker_ids.len()];
 
                                         let replica_nodes = Some(
                                             (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
+                                                .map(|replica| {
+                                                    broker_ids[(base + 1 + replica as usize)
+                                                        % broker_ids.len()]
+                                                })
                                                 .collect(),
                                         );
                                         let isr_nodes = replica_nodes.clone();

@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
         .iter()
         .find(|topic| topic.name.as_deref().is_some_and(|name| name == arg.topic))
         .and_then(|topic| topic.topic_id)
-        .expect("topic id");
+        .ok_or_else(|| Error::Message(format!("topic id not found for {}", arg.topic)))?;
 
     origin
         .call(
