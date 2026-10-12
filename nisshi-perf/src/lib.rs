@@ -618,14 +618,12 @@ impl Display for Info {
             self.current
                 .latency
                 .min
-                .map(|min| min.format_duration())
-                .ok_or(fmt::Error)?,
-            self.current.latency.mean.ok_or(fmt::Error)?,
+                .map_or_else(|| "-".to_owned(), |min| min.format_duration().to_string()),
+            self.current.latency.mean.unwrap_or_default(),
             self.current
                 .latency
                 .max
-                .map(|max| max.format_duration())
-                .ok_or(fmt::Error)?
+                .map_or_else(|| "-".to_owned(), |max| max.format_duration().to_string()),
         )
     }
 }
@@ -781,6 +779,14 @@ impl PushMetricExporter for MetricExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn info_display_without_latency_samples() {
+        let info = Info::new(SystemTime::now());
+        let line = info.to_string();
+        assert!(line.contains("latency: - min"), "{line}");
+        assert!(line.ends_with("- max"), "{line}");
+    }
 
     #[test]
     fn add_assign_observation() {
