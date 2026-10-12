@@ -863,6 +863,26 @@ mod tests {
         Ok(())
     }
 
+    /// The second batch's record is rebuilt with `offset_delta` 64, one byte
+    /// longer as a varint than the 0 it was encoded with, so the combined
+    /// batch must still decode record by record.
+    #[test]
+    fn combine_offset_delta_crossing_varint_width_decodes_by_value() -> Result<(), Error> {
+        let combined = combine(vec![
+            multi_record_batch(&[b"a".as_slice(); 64])?,
+            multi_record_batch(&[b"b"])?,
+        ])?;
+
+        assert_eq!(1, combined.len());
+
+        let records = Vec::<Record>::try_from(combined[0].clone())?;
+        assert_eq!(65, records.len());
+        assert_eq!(64, records[64].offset_delta);
+        assert_eq!(Some(Bytes::from_static(b"b")), records[64].value);
+
+        Ok(())
+    }
+
     fn produce_request(topic: &str, record_data: &'static [u8]) -> Result<ProduceRequest, Error> {
         record_data_batch(record_data).map(|batch| {
             ProduceRequest::default().topic_data(Some(

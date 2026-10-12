@@ -40,6 +40,51 @@ fn error_result(
         .configs(Some([].into()))
 }
 
+/// Kafka 3.9.1 rejects a whole `CreateTopics` request whose topics add up
+/// to more than `MAX_PARTITIONS_PER_BATCH` (10,000) partitions, before any
+/// per-topic validation runs, including the name check
+/// ([ReplicationControlManager.java#L1152-L1169](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L1152-L1169)).
+///
+/// nisshi counts partitions only. Kafka 3.9.1 also caps the metadata
+/// records a request produces at 10,000 (one `TopicRecord` per topic, one
+/// per config, one per partition), so a request for exactly 10,000
+/// partitions fails there with `POLICY_VIOLATION`. nisshi has no metadata
+/// records, so it deliberately allows exactly 10,000 partitions.
+const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
+
+/// Partitions created for a topic whose `num_partitions` is `-1` (the
+/// "use the broker default" sentinel). Shared between the per-topic
+/// substitution in [`CreateTopicsService::serve`] and
+/// [`total_requested_partitions`], which must count a `-1` topic the same
+/// way the substitution below will.
+const BROKER_DEFAULT_NUM_PARTITIONS: i32 = 3;
+
+/// Sum of partitions this request would create, computed before any
+/// per-topic validation runs, counted as Kafka 3.9.1 does: a topic with
+/// manual `assignments` counts one partition per assignment, a topic
+/// requesting the broker default (`-1`) counts as
+/// [`BROKER_DEFAULT_NUM_PARTITIONS`]. A topic whose `num_partitions` is
+/// otherwise invalid (`0`, or another negative value) counts as zero, so it
+/// can't pull the total under the cap; the per-topic check in `serve`
+/// rejects it on its own merits.
+fn total_requested_partitions(
+    topics: &[nisshi_sans_io::create_topics_request::CreatableTopic],
+) -> i64 {
+    topics
+        .iter()
+        .map(
+            |topic| match (topic.assignments.as_deref(), topic.num_partitions) {
+                (Some(assignments), _) if !assignments.is_empty() => {
+                    i64::try_from(assignments.len()).unwrap_or(i64::MAX)
+                }
+                (_, -1) => i64::from(BROKER_DEFAULT_NUM_PARTITIONS),
+                (_, n) if n > 0 => i64::from(n),
+                _ => 0,
+            },
+        )
+        .fold(0i64, i64::saturating_add)
+}
+
 /// A [`Service`] using its [`Storage`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
 /// ```no_run
 /// use rama::Service as _;
@@ -109,6 +154,42 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
+        let requested = input.request.topics.as_deref().unwrap_or(&[]);
+
+        // Reject the whole request, before any per-topic validation or
+        // storage call, when the partitions requested across every topic
+        // exceed the cap. Kafka also runs this before the name check.
+        let total = total_requested_partitions(requested);
+        if total > MAX_PARTITIONS_PER_REQUEST {
+            debug!(
+                total,
+                limit = MAX_PARTITIONS_PER_REQUEST,
+                "rejecting CreateTopics: too many partitions in one request"
+            );
+
+            let message = format!(
+                "Excessively large number of partitions per request: \
+                 {total} requested, limit {MAX_PARTITIONS_PER_REQUEST}."
+            );
+
+            let topics = requested
+                .iter()
+                .map(|topic| {
+                    error_result(
+                        topic.name.clone(),
+                        Some(topic.num_partitions),
+                        Some(topic.replication_factor),
+                        ErrorCode::PolicyViolation,
+                    )
+                    .error_message(Some(message.clone()))
+                })
+                .collect();
+
+            return Ok(CreateTopicsResponse::default()
+                .topics(Some(topics))
+                .throttle_time_ms(Some(0)));
+        }
+
         let mut topics = vec![];
 
         for mut topic in input.request.topics.unwrap_or_default() {
@@ -116,7 +197,7 @@ where
 
             let num_partitions = Some(match topic.num_partitions {
                 -1 => {
-                    topic.num_partitions = 3;
+                    topic.num_partitions = BROKER_DEFAULT_NUM_PARTITIONS;
                     topic.num_partitions
                 }
                 otherwise => otherwise,

@@ -19,3 +19,13 @@ updates:
       # Drop this once deltalake bumps its buoyant_kernel dependency.
       - dependency-name: "buoyant_kernel_derive"
         versions: [">1.1.0"]
+      # rsasl 2.3.1 (the latest release) requires digest 0.10 for its SCRAM
+      # key derivation, and sha2 0.11 depends on digest 0.11 instead, so the
+      # two cannot both appear as the Sha256/Sha512 types
+      # nisshi-storage::alter_user_scram_credentials passes into
+      # rsasl::mechanisms::scram::tools::derive_keys. Dependabot cannot see
+      # that constraint and will keep proposing 0.11.x, which fails to
+      # build. Drop this once rsasl ships a release built against digest
+      # 0.11.
+      - dependency-name: "sha2"
+        versions: [">0.10.9"]

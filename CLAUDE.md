@@ -55,7 +55,7 @@ Note: when running nisshi directly (not via docker compose), set `AWS_ENDPOINT="
 
 ## Architecture
 
-Cargo workspace with 15 member crates, producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `generator`, `perf`, `proxy`.
+Cargo workspace (members, including the `fuzz` harness, are listed in the root `Cargo.toml`), producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `user`, `generator`, `perf`, `proxy`.
 
 ### Key Crates
 
@@ -65,12 +65,22 @@ Cargo workspace with 15 member crates, producing a single binary (`nisshi`) with
 | `nisshi-broker` | Kafka API broker: `Broker<G, S>` generic over Coordinator + Storage |
 | `nisshi-sans-io` | **Code-generated** Kafka wire protocol (pure serde, no I/O) |
 | `nisshi-service` | Network service layers built on `rama` (Layer/Service composition) |
-| `nisshi-storage` | Storage abstraction: `StorageContainer` enum over backends |
+| `nisshi-storage` | Storage abstraction: `Storage`/`StorageFactory` traits, `StorageContainer` builder |
+| `nisshi-storage-dynostore` | Storage factories for `memory://`, `s3://`, `gs://` (ObjectStore-backed) |
+| `nisshi-storage-null` | Storage factory for `null://`, a stub backend with no message persistence |
+| `nisshi-storage-slatedb` | Storage factory for `slatedb://` (SlateDB, a KV store on object storage) |
+| `nisshi-storage-sql` | Storage factories for `postgres://` and `sqlite://` (PostgreSQL, libSQL) |
 | `nisshi-schema` | Schema registry + Iceberg/Delta/Parquet lake integration |
 | `nisshi-client` | Async Kafka protocol client (rama service layers) |
 | `nisshi-model` | Kafka JSON protocol definitions (used in build.rs) |
+| `nisshi-auth` | SASL authentication: mechanism handshake, SCRAM credential verification |
 | `nisshi-cat` | CLI: produce/consume Avro, JSON, Protobuf messages |
 | `nisshi-cli` | Clap-based CLI argument parsing |
+| `nisshi-generator` | CLI: generate fake data for schema-backed topics |
+| `nisshi-otel` | OpenTelemetry common configuration |
+| `nisshi-perf` | CLI: performance producer/consumer |
+| `nisshi-proxy` | Kafka API-compatible proxy |
+| `nisshi-topic` | CLI: create, list, delete topics |
 
 ### Sans-I/O Code Generation (`nisshi-sans-io`)
 
@@ -94,14 +104,14 @@ Two things about `Extensions` are easy to get wrong when touching this code:
 
 Per-handler dependencies (the `Coordinator` in `nisshi-broker/src/broker/group/*.rs`, the `Storage` handle `G` in `nisshi-storage/src/service/*.rs`) are still injected as plain struct fields (`struct FooService<C> { coordinator: C }`) on each handler rather than through the `Extensions` bag — that's deliberate, not a leftover of the migration.
 
-### Storage Backends (`nisshi-storage`)
+### Storage Backends (`nisshi-storage`, `nisshi-storage-dynostore`, `nisshi-storage-null`, `nisshi-storage-slatedb`, `nisshi-storage-sql`)
 
-Selected at compile time via feature flags, dispatched at runtime through `StorageContainer` enum:
-- `memory://` - in-memory (feature: `dynostore`)
-- `s3://` - S3/MinIO (feature: `dynostore`)
-- `postgres://` - PostgreSQL (feature: `postgres`)
-- `sqlite://` - libSQL/SQLite (feature: `libsql`)
-- `slatedb://` - SlateDB KV store (feature: `slatedb`)
+Selected at compile time via feature flags, dispatched at runtime through a `StorageFactory` trait, not an enum: `StorageContainer::builder()` (`nisshi-storage/src/lib.rs`) collects one `Arc<dyn StorageFactory>` per enabled backend, and `.build()` picks the first whose `scheme()` regex matches the configured storage URL. Each backend crate implements the trait in its own `factory.rs`:
+- `memory://`, `s3://`, `gs://` - ObjectStore-backed (`nisshi-storage-dynostore`, feature: `dynostore`)
+- `null://` - stub backend, tracks topic metadata only, no message storage (`nisshi-storage-null`, always compiled in)
+- `postgres://` - PostgreSQL (`nisshi-storage-sql`, feature: `postgres`)
+- `sqlite://` - libSQL/SQLite (`nisshi-storage-sql`, feature: `libsql`)
+- `slatedb://` - SlateDB KV store (`nisshi-storage-slatedb`, feature: `slatedb`)
 
 `RequestChannelService`'s `Storage` trait impl (`nisshi-storage/src/service.rs`) sends a `Request` over a channel and extracts the matching `Response` variant; every method does this via the `serve_and_extract!(self, request_expr, ResponseVariant)` macro rather than repeating the match/unwrap boilerplate - add new methods the same way.
 
