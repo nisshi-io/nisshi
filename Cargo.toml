@@ -16,6 +16,7 @@ members = [
     "nisshi-sans-io",
     "nisshi-schema",
     "nisshi-service",
+    "nisshi-smoke-test",
     "nisshi-storage",
     "nisshi-storage-dynostore",
     "nisshi-storage-null",
@@ -26,7 +27,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.7.0-pre.2"
+version = "0.7.0-pre.3"
 license = "Apache-2.0"
 homepage = "https://nisshi.io"
 repository = "https://github.com/nisshi-io/nisshi"
@@ -124,15 +125,15 @@ libc = "0.2.189"
 libfuzzer-sys = "0.4"
 libsql = { version = "0.9.18", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
-nanoid = "0.4.0"
+nanoid = "0.5.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
-opentelemetry = "0.32.0"
-opentelemetry-otlp = "0.32.0"
+opentelemetry = "0.33.0"
+opentelemetry-otlp = "0.33.0"
 opentelemetry-semantic-conventions = "0.33.0"
-opentelemetry-stdout = "0.32.0"
-opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
+opentelemetry-stdout = "0.33.0"
+opentelemetry_sdk = { version = "0.33.0", features = ["testing"] }
 ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
 parquet = {version = "58", features = ["async"]}
@@ -160,30 +161,30 @@ rustls-native-certs = "0.8.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
-slatedb = "0.14.1"
+slatedb = "0.17.0"
 snap = "1.1.1"
 socket2 = "0.6.5"
 syn = { version = "3.0.3", features = ["extra-traits", "full"] }
-nisshi = { version = "0.7.0-pre.2", path = "nisshi", default-features = false }
-nisshi-auth = { version = "0.7.0-pre.2", path = "nisshi-auth", default-features = false }
-nisshi-broker = { version = "0.7.0-pre.2", path = "nisshi-broker", default-features = false }
-nisshi-cat = { version = "0.7.0-pre.2", path = "nisshi-cat", default-features = false }
-nisshi-cli = { version = "0.7.0-pre.2", path = "nisshi-cli", default-features = false }
-nisshi-client = { version = "0.7.0-pre.2", path = "nisshi-client", default-features = false }
-nisshi-generator = { version = "0.7.0-pre.2", path = "nisshi-generator", default-features = false }
-nisshi-model = { version = "0.7.0-pre.2", path = "nisshi-model", default-features = false }
-nisshi-otel = { version = "0.7.0-pre.2", path = "nisshi-otel", default-features = false }
-nisshi-perf = { version = "0.7.0-pre.2", path = "nisshi-perf", default-features = false }
-nisshi-proxy = { version = "0.7.0-pre.2", path = "nisshi-proxy", default-features = false }
-nisshi-sans-io = { version = "0.7.0-pre.2", path = "nisshi-sans-io", default-features = false }
-nisshi-schema = { version = "0.7.0-pre.2", path = "nisshi-schema", default-features = false }
-nisshi-service = { version = "0.7.0-pre.2", path = "nisshi-service", default-features = false }
-nisshi-storage = { version = "0.7.0-pre.2", path = "nisshi-storage", default-features = false }
-nisshi-storage-dynostore = { version = "0.7.0-pre.2", path = "nisshi-storage-dynostore", default-features = false }
-nisshi-storage-null = { version = "0.7.0-pre.2", path = "nisshi-storage-null", default-features = false }
-nisshi-storage-slatedb = { version = "0.7.0-pre.2", path = "nisshi-storage-slatedb", default-features = false }
-nisshi-storage-sql = { version = "0.7.0-pre.2", path = "nisshi-storage-sql", default-features = false }
-nisshi-topic = { version = "0.7.0-pre.2", path = "nisshi-topic", default-features = false }
+nisshi = { version = "0.7.0-pre.3", path = "nisshi", default-features = false }
+nisshi-auth = { version = "0.7.0-pre.3", path = "nisshi-auth", default-features = false }
+nisshi-broker = { version = "0.7.0-pre.3", path = "nisshi-broker", default-features = false }
+nisshi-cat = { version = "0.7.0-pre.3", path = "nisshi-cat", default-features = false }
+nisshi-cli = { version = "0.7.0-pre.3", path = "nisshi-cli", default-features = false }
+nisshi-client = { version = "0.7.0-pre.3", path = "nisshi-client", default-features = false }
+nisshi-generator = { version = "0.7.0-pre.3", path = "nisshi-generator", default-features = false }
+nisshi-model = { version = "0.7.0-pre.3", path = "nisshi-model", default-features = false }
+nisshi-otel = { version = "0.7.0-pre.3", path = "nisshi-otel", default-features = false }
+nisshi-perf = { version = "0.7.0-pre.3", path = "nisshi-perf", default-features = false }
+nisshi-proxy = { version = "0.7.0-pre.3", path = "nisshi-proxy", default-features = false }
+nisshi-sans-io = { version = "0.7.0-pre.3", path = "nisshi-sans-io", default-features = false }
+nisshi-schema = { version = "0.7.0-pre.3", path = "nisshi-schema", default-features = false }
+nisshi-service = { version = "0.7.0-pre.3", path = "nisshi-service", default-features = false }
+nisshi-storage = { version = "0.7.0-pre.3", path = "nisshi-storage", default-features = false }
+nisshi-storage-dynostore = { version = "0.7.0-pre.3", path = "nisshi-storage-dynostore", default-features = false }
+nisshi-storage-null = { version = "0.7.0-pre.3", path = "nisshi-storage-null", default-features = false }
+nisshi-storage-slatedb = { version = "0.7.0-pre.3", path = "nisshi-storage-slatedb", default-features = false }
+nisshi-storage-sql = { version = "0.7.0-pre.3", path = "nisshi-storage-sql", default-features = false }
+nisshi-topic = { version = "0.7.0-pre.3", path = "nisshi-topic", default-features = false }
 temp-env = "0.3"
 tempfile = "3"
 thiserror = "2.0"

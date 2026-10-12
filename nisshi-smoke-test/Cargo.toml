@@ -1,0 +1,32 @@
+[package]
+name = "nisshi-smoke-test"
+description = "Smoke tests that run the Kafka CLI tools against a broker"
+publish = false
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+authors.workspace = true
+include.workspace = true
+
+# Each storage engine has one feature, and `just smoke <engine>` turns it on. A
+# test that applies only to some engines is compiled only with their features,
+# by `cfg(feature = ...)` or `cfg(any(...))`. Never gate a test with
+# `cfg(not(feature = ...))`: `just clippy` turns every feature on, and would
+# then never compile it. A test that fails on one engine because of a bug uses
+# `cfg_attr` on that feature to ignore itself there.
+[features]
+memory = []
+postgres = []
+s3 = []
+sqlite = []
+
+[dependencies]
+clap.workspace = true
+nanoid.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true

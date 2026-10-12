@@ -193,12 +193,14 @@ use uuid::Uuid;
 mod assignment;
 mod batch;
 mod latency;
+mod producer;
 mod proxy;
 mod service;
 
 pub use assignment::assign_replicas;
 pub use batch::ProduceRequestBatcher;
 pub use latency::LatencyIntroducingStorage;
+pub use producer::{check_claim, producer_claim};
 pub use proxy::SemaphoreProxy;
 
 pub use service::{
@@ -1556,6 +1558,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Version, UpdateError<GroupDetail>>;
 
     /// Initialise a transactional or idempotent producer in this storage.
+    ///
+    /// `producer_id` and `producer_epoch` are fresh or a claim, as [`producer_claim`]
+    /// reads them. A backend checks a claim with [`check_claim`] when the transactional
+    /// ID has a producer, and ignores it otherwise, as Kafka does.
     async fn init_producer(
         &self,
         transaction_id: Option<&str>,
