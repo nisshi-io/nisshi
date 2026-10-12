@@ -163,12 +163,16 @@ use serde::{
     Deserialize, Serialize, Serializer,
     ser::{self, SerializeSeq},
 };
+use std::fmt;
 use tracing::{debug, instrument};
 
 /// A Kafka API Record.
 ///
 /// Note that is structure uses the same variant encoding as protobuf.
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+///
+/// `Debug` writes the length of `key` and `value`, not their content, so
+/// logging a record, or a batch that holds one, doesn't log record data.
+#[derive(Clone, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Record {
     #[serde(serialize_with = "VarInt::serialize")]
     #[serde(deserialize_with = "VarInt::deserialize")]
@@ -195,6 +199,20 @@ pub struct Record {
     #[serde(serialize_with = "VarIntSequence::<Header>::serialize")]
     #[serde(deserialize_with = "VarIntSequence::<Header>::deserialize")]
     pub headers: Vec<Header>,
+}
+
+impl fmt::Debug for Record {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Record")
+            .field("length", &self.length)
+            .field("attributes", &self.attributes)
+            .field("timestamp_delta", &self.timestamp_delta)
+            .field("offset_delta", &self.offset_delta)
+            .field("key_len", &self.key.as_ref().map(Bytes::len))
+            .field("value_len", &self.value.as_ref().map(Bytes::len))
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 impl ByteSize for Record {
@@ -247,7 +265,7 @@ impl Encode for Record {
 impl Decode for Record {
     #[instrument(skip_all)]
     fn decode(encoded: &mut Bytes) -> Result<Self> {
-        debug!(encoded = ?encoded[..]);
+        debug!(encoded = encoded.len());
 
         let length: i32 = VarInt::decode(encoded).map(Into::into)?;
 

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey as _, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest,
-    OffsetFetchRequest, SyncGroupRequest,
+    ApiKey as _, DeleteGroupsRequest, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
+    OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
 };
 use nisshi_service::FrameRouteBuilder;
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
@@ -22,9 +22,9 @@ use rama::{Layer as _, Service as _, layer::MapErrLayer};
 use crate::{
     Error,
     broker::group::{
-        heartbeat::HeartbeatService, join::JoinGroupService, leave::LeaveGroupService,
-        offset_commit::OffsetCommitService, offset_fetch::OffsetFetchService,
-        sync::SyncGroupService,
+        delete::DeleteGroupsService, heartbeat::HeartbeatService, join::JoinGroupService,
+        leave::LeaveGroupService, offset_commit::OffsetCommitService,
+        offset_fetch::OffsetFetchService, sync::SyncGroupService,
     },
     coordinator::group::Coordinator,
 };
@@ -37,6 +37,7 @@ where
     C: Coordinator,
 {
     [
+        delete_groups,
         heartbeat,
         join_group,
         leave_group,
@@ -48,6 +49,23 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, coordinator.clone())
     })
+}
+
+pub fn delete_groups<C>(
+    builder: FrameRouteBuilder<Error>,
+    coordinator: C,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    C: Coordinator,
+{
+    builder
+        .with_route(
+            DeleteGroupsRequest::KEY,
+            (MapErrLayer::new(Error::from),)
+                .into_layer(DeleteGroupsService { coordinator })
+                .boxed(),
+        )
+        .map_err(Into::into)
 }
 
 pub fn heartbeat<C>(

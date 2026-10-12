@@ -90,7 +90,14 @@ pub enum Error {
 
     Avro(Box<apache_avro::Error>),
 
-    AvroToJson(apache_avro::types::Value),
+    /// An Avro record failed to read or write against its schema. This holds
+    /// no detail, because the `apache_avro` error raised for a record writes
+    /// the record's values into its message.
+    AvroRecord,
+
+    /// Holds the kind of the value, not the value, so that logging the error
+    /// doesn't log record data.
+    AvroToJson(apache_avro::schema::SchemaKind),
 
     BadDowncast {
         field: String,
@@ -118,17 +125,20 @@ pub enum Error {
     #[cfg(feature = "iceberg")]
     Iceberg(Box<::iceberg::Error>),
 
-    InvalidValue(apache_avro::types::Value),
+    /// Holds the kind of the value, not the value, as [`Error::AvroToJson`]
+    /// does.
+    InvalidValue(apache_avro::schema::SchemaKind),
 
     InsufficientCapacity(#[from] InsufficientCapacity),
 
     Io(#[from] io::Error),
 
-    JsonToAvro(Box<apache_avro::Schema>, Box<Value>),
+    /// Holds the kind of the JSON value, not the value, as
+    /// [`Error::AvroToJson`] does.
+    JsonToAvro(Box<apache_avro::Schema>, &'static str),
 
     JsonToAvroFieldNotFound {
         schema: Box<apache_avro::Schema>,
-        value: Box<Value>,
         field: String,
     },
 
@@ -175,10 +185,24 @@ pub enum Error {
 
     UnsupportedSchemaRegistryUrl(Url),
 
+    /// Holds the kind of the JSON value, not the value, as
+    /// [`Error::AvroToJson`] does.
     #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-    UnsupportedSchemaRuntimeValue(DataType, Value),
+    UnsupportedSchemaRuntimeValue(DataType, &'static str),
 
     Uuid(#[from] uuid::Error),
+}
+
+/// The kind of a JSON value, for an error that must not hold the value.
+pub(crate) fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 impl Display for Error {
@@ -287,8 +311,6 @@ impl CachedSchema {
 
 impl AsKafkaRecord for Schema {
     fn as_kafka_record(&self, value: &Value) -> Result<nisshi_sans_io::record::Builder> {
-        debug!(?value);
-
         match self {
             Self::Avro(schema) => schema.as_kafka_record(value),
             Self::Json(schema) => schema.as_kafka_record(value),
@@ -310,7 +332,7 @@ impl Validator for Schema {
 
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 impl AsArrow for Schema {
-    #[instrument(skip(self, batch), ret)]
+    #[instrument(skip(self, batch))]
     async fn as_arrow(
         &self,
         topic: &str,
@@ -327,7 +349,7 @@ impl AsArrow for Schema {
 }
 
 impl AsJsonValue for Schema {
-    #[instrument(skip(self, batch), ret)]
+    #[instrument(skip(self, batch))]
     fn as_json_value(&self, batch: &Batch) -> Result<Value> {
         debug!(?batch);
 
@@ -627,7 +649,7 @@ impl Registry {
 
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 impl AsArrow for Registry {
-    #[instrument(skip(self, batch), ret)]
+    #[instrument(skip(self, batch))]
     async fn as_arrow(
         &self,
         topic: &str,

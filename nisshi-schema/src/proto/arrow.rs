@@ -607,7 +607,7 @@ fn arrow_schema(ids: &BTreeMap<String, i32>, schema: &Schema) -> ArrowSchema {
 }
 
 fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) -> Result<()> {
-    debug!(%message, ?builder);
+    debug!(?builder);
     for (index, ref field) in message.descriptor_dyn().fields().enumerate() {
         debug!(field_name = field.name());
 
@@ -690,12 +690,9 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             == GOOGLE_PROTOBUF_TIMESTAMP
                         {
                             let message = print_to_string(message_ref.deref())?;
-                            debug!(message = message.trim_matches('"'));
 
                             let value = DateTime::parse_from_rfc3339(message.trim_matches('"'))
-                                .inspect(|dt| debug!(?dt))
                                 .map(|dt| dt.timestamp_micros())?;
-                            debug!(?value);
 
                             builder
                                 .field_builder::<TimestampMicrosecondBuilder>(index)
@@ -703,7 +700,13 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                                     field: field.name().to_owned(),
                                 })
                                 .map(|builder| builder.append_value(value))
-                                .inspect_err(|err| debug!(?err, ?message_ref, ?builder))?
+                                .inspect_err(|err| {
+                                    debug!(
+                                        ?err,
+                                        message = message_ref.descriptor_dyn().full_name(),
+                                        ?builder
+                                    )
+                                })?
                         } else {
                             builder
                                 .field_builder::<StructBuilder>(index)
@@ -713,7 +716,13 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                                 .and_then(|builder| {
                                     append_struct_builder(message_ref.deref(), builder)
                                 })
-                                .inspect_err(|err| debug!(?err, ?message_ref, ?builder))?
+                                .inspect_err(|err| {
+                                    debug!(
+                                        ?err,
+                                        message = message_ref.descriptor_dyn().full_name(),
+                                        ?builder
+                                    )
+                                })?
                         }
                     }
                 }
@@ -736,7 +745,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .and_then(|builder| {
                                 i32::try_from(value)
                                     .map_err(Into::into)
@@ -748,7 +757,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .and_then(|builder| {
                                 i64::try_from(value)
                                     .map_err(Into::into)
@@ -760,7 +769,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .map(|builder| builder.append_value(value))?,
 
                         ReflectValueRef::I64(value) => values
@@ -768,7 +777,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .map(|builder| builder.append_value(value))?,
 
                         ReflectValueRef::F32(value) => values
@@ -776,7 +785,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .map(|builder| builder.append_value(value))?,
 
                         ReflectValueRef::F64(value) => values
@@ -784,7 +793,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .map(|builder| builder.append_value(value))?,
 
                         ReflectValueRef::Bool(value) => values
@@ -792,7 +801,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .map(|builder| builder.append_value(value))?,
 
                         ReflectValueRef::String(value) => values
@@ -800,7 +809,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .map(|builder| builder.append_value(value))?,
 
                         ReflectValueRef::Bytes(value) => values
@@ -808,7 +817,7 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                             .ok_or(Error::BadDowncast {
                                 field: field.name().to_owned(),
                             })
-                            .inspect_err(|err| error!(?err, ?value, ?repeated))
+                            .inspect_err(|err| error!(?err, ?repeated))
                             .map(|builder| builder.append_value(value))?,
 
                         ReflectValueRef::Message(message_ref) => {
@@ -816,12 +825,9 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                                 == GOOGLE_PROTOBUF_TIMESTAMP
                             {
                                 let message = print_to_string(message_ref.deref())?;
-                                debug!(message = message.trim_matches('"'));
 
                                 let value = DateTime::parse_from_rfc3339(message.trim_matches('"'))
-                                    .inspect(|dt| debug!(?dt))
                                     .map(|dt| dt.timestamp_micros())?;
-                                debug!(?value);
 
                                 values
                                     .downcast_mut::<TimestampMicrosecondBuilder>()
@@ -835,7 +841,12 @@ fn append_struct_builder(message: &dyn MessageDyn, builder: &mut StructBuilder) 
                                     .ok_or(Error::BadDowncast {
                                         field: field.name().to_owned(),
                                     })
-                                    .inspect_err(|err| error!(?err, ?message_ref))
+                                    .inspect_err(|err| {
+                                        error!(
+                                            ?err,
+                                            message = message_ref.descriptor_dyn().full_name()
+                                        )
+                                    })
                                     .and_then(|builder| {
                                         append_struct_builder(message_ref.deref(), builder)
                                     })?
@@ -880,8 +891,6 @@ fn append_map_builder(
 }
 
 fn decode_value(value: ReflectValueRef<'_>, builder: &mut dyn ArrayBuilder) -> Result<()> {
-    debug!(?value);
-
     match value {
         ReflectValueRef::U32(value) => builder
             .as_any_mut()
@@ -948,12 +957,9 @@ fn decode_value(value: ReflectValueRef<'_>, builder: &mut dyn ArrayBuilder) -> R
         ReflectValueRef::Message(message_ref) => {
             if message_ref.descriptor_dyn().full_name() == GOOGLE_PROTOBUF_TIMESTAMP {
                 let message = print_to_string(message_ref.deref())?;
-                debug!(message = message.trim_matches('"'));
 
                 let value = DateTime::parse_from_rfc3339(message.trim_matches('"'))
-                    .inspect(|dt| debug!(?dt))
                     .map(|dt| dt.timestamp_micros())?;
-                debug!(?value);
 
                 builder
                     .as_any_mut()
@@ -965,7 +971,9 @@ fn decode_value(value: ReflectValueRef<'_>, builder: &mut dyn ArrayBuilder) -> R
                     .as_any_mut()
                     .downcast_mut::<StructBuilder>()
                     .ok_or(Error::Downcast)
-                    .inspect_err(|err| error!(?err, ?message_ref))
+                    .inspect_err(|err| {
+                        error!(?err, message = message_ref.descriptor_dyn().full_name())
+                    })
                     .and_then(|builder| append_struct_builder(message_ref.deref(), builder))
             }
         }
@@ -984,7 +992,7 @@ where
         return Ok(());
     };
 
-    debug!(descriptor = descriptor.name(), ?encoded,);
+    debug!(descriptor = descriptor.name(), len = ?encoded.as_ref().map(Bytes::len));
 
     let message = {
         let mut message = descriptor.new_instance();
@@ -1014,7 +1022,7 @@ where
 }
 
 impl AsArrow for Schema {
-    #[instrument(skip(self, batch), ret)]
+    #[instrument(skip(self, batch))]
     async fn as_arrow(
         &self,
         topic: &str,
@@ -1095,7 +1103,7 @@ impl AsArrow for Schema {
             columns.iter_mut().map(|builder| builder.finish()).collect(),
         )
         .inspect_err(|err| debug!(?err))
-        .inspect(|record_batch| debug!(?record_batch))
+        .inspect(|record_batch| debug!(num_rows = record_batch.num_rows()))
         .map_err(Into::into)
     }
 }

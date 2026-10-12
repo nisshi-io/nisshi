@@ -174,11 +174,9 @@ impl Schema {
             .map(|message_descriptor| {
                 serde_json::to_string(json)
                     .map_err(Error::from)
-                    .inspect(|json| debug!(%json))
                     .and_then(|json| {
                         parse_dyn_from_str(&message_descriptor, json.as_str()).map_err(Into::into)
                     })
-                    .inspect(|message| debug!(%message))
                     .and_then(|message| {
                         let mut w = BytesMut::new().writer();
                         message
@@ -629,25 +627,19 @@ fn message_to_bytes(message: Box<dyn MessageDyn>) -> Result<Bytes> {
 
 impl AsKafkaRecord for Schema {
     fn as_kafka_record(&self, value: &Value) -> Result<nisshi_sans_io::record::Builder> {
-        debug!(?value);
-
         let mut builder = nisshi_sans_io::record::Record::builder();
 
-        if let Some(value) = value.get("key") {
-            debug!(?value);
+        if let Some(value) = value.get("key")
+            && let Some(encoded) = self.message_value_as_bytes(MessageKind::Key, value)?
+        {
+            builder = builder.key(encoded.into());
+        }
 
-            if let Some(encoded) = self.message_value_as_bytes(MessageKind::Key, value)? {
-                builder = builder.key(encoded.into());
-            }
-        };
-
-        if let Some(value) = value.get("value") {
-            debug!(?value);
-
-            if let Some(encoded) = self.message_value_as_bytes(MessageKind::Value, value)? {
-                builder = builder.value(encoded.into());
-            }
-        };
+        if let Some(value) = value.get("value")
+            && let Some(encoded) = self.message_value_as_bytes(MessageKind::Value, value)?
+        {
+            builder = builder.value(encoded.into());
+        }
 
         Ok(builder)
     }
@@ -673,7 +665,7 @@ fn decode(
     message_descriptor: Option<MessageDescriptor>,
     encoded: Option<Bytes>,
 ) -> Result<Option<Box<dyn MessageDyn>>> {
-    debug!(?message_descriptor, ?encoded);
+    debug!(?message_descriptor, len = ?encoded.as_ref().map(Bytes::len));
 
     message_descriptor.map_or(Ok(None), |message_descriptor| {
         encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
@@ -684,7 +676,6 @@ fn decode(
                 .inspect_err(|err| error!(?err))
                 .map_err(|_err| Error::Api(ErrorCode::InvalidRecord))
                 .and(Ok(Some(message)))
-                .inspect(|message| debug!(?message))
         })
     })
 }
@@ -806,21 +797,18 @@ impl Schema {
         message_kind: MessageKind,
         encoded: Option<Bytes>,
     ) -> Result<(String, Value)> {
-        decode(self.message_by_package_relative_name(message_kind), encoded)
-            .inspect(|decoded| debug!(?decoded))
-            .and_then(|decoded| {
-                decoded.map_or(
-                    Ok((message_kind.as_ref().to_lowercase(), Value::Null)),
-                    |message| {
-                        print_to_string(message.as_ref())
-                            .inspect(|s| debug!(s))
-                            .map_err(Into::into)
-                            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(Into::into))
-                            .map(|value| (message_kind.as_ref().to_lowercase(), value))
-                            .inspect(|(k, v)| debug!(k, ?v))
-                    },
-                )
-            })
+        decode(self.message_by_package_relative_name(message_kind), encoded).and_then(|decoded| {
+            decoded.map_or(
+                Ok((message_kind.as_ref().to_lowercase(), Value::Null)),
+                |message| {
+                    print_to_string(message.as_ref())
+                        .map_err(Into::into)
+                        .and_then(|s| serde_json::from_str::<Value>(&s).map_err(Into::into))
+                        .map(|value| (message_kind.as_ref().to_lowercase(), value))
+                        .inspect(|(k, _)| debug!(k))
+                },
+            )
+        })
     }
 }
 

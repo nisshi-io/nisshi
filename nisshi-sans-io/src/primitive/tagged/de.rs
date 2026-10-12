@@ -170,7 +170,8 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.reader.read_exact(&mut buf)?;
         let v = u8::from_be_bytes(buf);
 
-        debug!("value: {v}:{}", type_name::<V::Value>(),);
+        // A bytes value can decode one u8 at a time, so we don't log the value.
+        debug!("{}", type_name::<V::Value>());
         visitor.visit_u8(v)
     }
 
@@ -264,7 +265,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                 self.reader.read_exact(&mut buf)?;
                 std::str::from_utf8(buf.as_slice())
                     .map_err(Into::into)
-                    .inspect(|v| debug!("value: {v}:{}", type_name::<V::Value>(),))
+                    .inspect(|v| debug!("len: {}:{}", v.len(), type_name::<V::Value>()))
                     .and_then(|s| visitor.visit_str(s))
             })
     }
@@ -293,7 +294,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
 
                 String::from_utf8(buf)
                     .map_err(Into::into)
-                    .inspect(|v| debug!("value: {v}:{}", type_name::<V::Value>(),))
+                    .inspect(|v| debug!("len: {}:{}", v.len(), type_name::<V::Value>()))
                     .and_then(|s| visitor.visit_string(s))
             })
     }

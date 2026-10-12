@@ -45,7 +45,7 @@
 //! - Bloom filters can efficiently skip unrelated key types
 //! - Range scans for a partition only touch relevant SSTable blocks
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{collections::BTreeMap, fmt, time::SystemTime};
 
 use bytes::Bytes;
 use nisshi_sans_io::{ScramMechanism, create_topics_request::CreatableTopic};
@@ -405,12 +405,26 @@ impl UserScramCredentialKey {
 }
 
 /// Value stored for SASL/SCRAM credentials
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+///
+/// `Debug` writes `stored_key` and `server_key` as `[hidden]`, as
+/// [`ScramCredential`] does.
+#[derive(Clone, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct StoredScramCredential {
     pub salt: Vec<u8>,
     pub iterations: i32,
     pub stored_key: Vec<u8>,
     pub server_key: Vec<u8>,
+}
+
+impl fmt::Debug for StoredScramCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredScramCredential")
+            .field("salt", &self.salt)
+            .field("iterations", &self.iterations)
+            .field("stored_key", &format_args!("[hidden]"))
+            .field("server_key", &format_args!("[hidden]"))
+            .finish()
+    }
 }
 
 impl From<ScramCredential> for StoredScramCredential {
