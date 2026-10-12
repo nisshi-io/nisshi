@@ -190,11 +190,13 @@ use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
 
+mod assignment;
 mod batch;
 mod latency;
 mod proxy;
 mod service;
 
+pub use assignment::assign_replicas;
 pub use batch::ProduceRequestBatcher;
 pub use latency::LatencyIntroducingStorage;
 pub use proxy::SemaphoreProxy;
