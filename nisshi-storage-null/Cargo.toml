@@ -1,5 +1,6 @@
 [package]
 name = "nisshi-storage-null"
+description = "Nisshi null storage backend that tracks topic metadata without persisting messages"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

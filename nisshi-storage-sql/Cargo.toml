@@ -1,5 +1,6 @@
 [package]
 name = "nisshi-storage-sql"
+description = "Nisshi storage backends for PostgreSQL and libSQL (SQLite)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
