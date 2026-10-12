@@ -196,7 +196,7 @@ tracing = "0.1"
 tracing-core = { version = "0.1" }
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-turso = "0.7.1"
+turso = "0.8.1"
 url = { version = "2.5.4", features = ["serde"] }
 zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }
