@@ -565,7 +565,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/docker-hub-mirror
       # release's static musl binaries, as dist/linux/<arch>/nisshi.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -584,7 +583,13 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           buildkitd-flags: --debug
-          # BuildKit pulls base images itself, so it ignores the daemon's mirror.
+          # This job pushes the published image, so the daemon mirror is not set
+          # up here: it would resolve the tag-pinned moby/buildkit builder
+          # through a cache we do not control. The builder pull stays on Docker
+          # Hub, so a 429 on "pulling image moby/buildkit" is that accepted
+          # trade-off. BuildKit pulls the Dockerfile's base image itself, so it
+          # gets the mirror through this config; that image is pinned by
+          # digest, so the pull is verified either way.
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
