@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, InitProducerIdRequest, InitProducerIdResponse, RequestInput};
+use nisshi_sans_io::{
+    ApiKey, ErrorCode, InitProducerIdRequest, InitProducerIdResponse, RequestInput,
+};
 use rama::Service;
-use tracing::instrument;
+use tracing::{info, instrument};
 
-use crate::{Error, Result, Storage};
+use crate::{Error, ProducerIdResponse, Result, Storage, producer_claim};
 
 /// A [`Service`] using its [`Storage`] taking [`InitProducerIdRequest`] returning [`InitProducerIdResponse`].
 /// ```no_run
@@ -101,20 +103,42 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        self.storage
-            .init_producer(
-                input.request.transactional_id.as_deref(),
-                input.request.transaction_timeout_ms,
-                input.request.producer_id,
-                input.request.producer_epoch,
-            )
-            .await
-            .map(|response| {
-                InitProducerIdResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(response.error.into())
-                    .producer_id(response.id)
-                    .producer_epoch(response.epoch)
-            })
+        let response = match producer_claim(input.request.producer_id, input.request.producer_epoch)
+        {
+            Ok(claim) => {
+                // v0-2 have no ProducerId or ProducerEpoch, so a fresh request reaches
+                // storage as -1, the default Kafka gives those fields.
+                let (producer_id, producer_epoch) = claim.unwrap_or((-1, -1));
+
+                self.storage
+                    .init_producer(
+                        input.request.transactional_id.as_deref(),
+                        input.request.transaction_timeout_ms,
+                        Some(producer_id),
+                        Some(producer_epoch),
+                    )
+                    .await?
+            }
+
+            Err(error) => ProducerIdResponse::failed(error),
+        };
+
+        // A failed answer carries producer ID and epoch -1, so this log is the only
+        // record of what the producer claimed.
+        if response.error != ErrorCode::None {
+            info!(
+                transactional_id = input.request.transactional_id,
+                producer_id = input.request.producer_id,
+                producer_epoch = input.request.producer_epoch,
+                error_code = ?response.error,
+                "rejecting init producer id",
+            );
+        }
+
+        Ok(InitProducerIdResponse::default()
+            .throttle_time_ms(0)
+            .error_code(response.error.into())
+            .producer_id(response.id)
+            .producer_epoch(response.epoch))
     }
 }

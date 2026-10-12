@@ -43,6 +43,9 @@ jobs:
       - run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - run: |
           "$(go env GOPATH)/bin/actionlint"
+      # The `changes` jobs run the base branch's copy of ci-changes.sh, so a
+      # PR's edit to it is only tested here.
+      - run: bash .github/scripts/ci-changes.test.sh
 
   zizmor:
     runs-on: ubuntu-latest

@@ -61,7 +61,8 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
     Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -3105,8 +3106,13 @@ impl Storage for Engine {
             cluster = self.cluster,
             transaction_id, transaction_timeout_ms, producer_id, producer_epoch
         );
-        match (producer_id, producer_epoch, transaction_id) {
-            (Some(-1), Some(-1), Some(transaction_id)) => {
+        let claim = match producer_claim(producer_id, producer_epoch) {
+            Ok(claim) => claim,
+            Err(error) => return Ok(ProducerIdResponse::failed(error)),
+        };
+
+        match transaction_id {
+            Some(transaction_id) => {
                 let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
                 let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
@@ -3149,7 +3155,20 @@ impl Storage for Engine {
                         })
                         .inspect_err(|err| error!(?err))?;
 
-                    debug!(transaction_id, id, epoch, ?status);
+                    debug!(transaction_id, id, epoch, ?status, ?claim);
+
+                    if let Some(claim) = claim {
+                        let error = check_claim((id, epoch), claim);
+
+                        if error != ErrorCode::None {
+                            _ = tx
+                                .rollback()
+                                .await
+                                .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
+
+                            return Ok(ProducerIdResponse::failed(error));
+                        }
+                    }
 
                     if let Some(TxnState::Begin) = status {
                         let error = self
@@ -3312,7 +3331,7 @@ impl Storage for Engine {
                 })
             }
 
-            (Some(-1), Some(-1), None) => {
+            None => {
                 let mut connection = self.connection().await.inspect_err(|err| error!(?err))?;
                 let tx = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3403,8 +3422,6 @@ impl Storage for Engine {
                     .inspect(|response| debug!(?response))
                 }
             }
-
-            (_, _, _) => todo!(),
         }
     }
 
