@@ -21,6 +21,7 @@ pub mod consume;
 pub mod consumer_groups;
 pub mod delete_records;
 pub mod durability;
+pub mod group_rebalance;
 pub mod offset_resets;
 pub mod offsets;
 pub mod partition_reassignments;
