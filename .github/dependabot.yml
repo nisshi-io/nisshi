@@ -21,8 +21,9 @@ version: 2
 # not subject to the limit, the cooldown or the groups.
 updates:
   # The 7-day cooldown gives an upstream CVE or a yanked release time to
-  # surface before Dependabot opens a bump PR. A major bump waits 14 days,
-  # because it is the most likely to be broken or followed by a fix.
+  # surface before Dependabot opens a bump PR. A cargo major bump waits 14
+  # days, because it is the most likely to be broken or followed by a fix.
+  # Dependabot rejects the semver cooldown keys for github-actions.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -36,7 +37,6 @@ updates:
       include: "scope"
     cooldown:
       default-days: 7
-      semver-major-days: 14
     groups:
       # The workflows pin init and analyze to the same release.
       codeql:
