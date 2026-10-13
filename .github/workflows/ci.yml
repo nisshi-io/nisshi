@@ -1042,16 +1042,26 @@ jobs:
       # Each push run has a concurrency group of its own, so an older commit's
       # run can finish after a newer one. On main, push only while this commit
       # is still the branch tip, so the `main` image never moves backwards. If
-      # the tip's own run then fails, re-run that run to publish.
+      # the tip's own run then fails, re-run that run to publish; the skip
+      # says so in the step summary, since the job itself ends green.
       - id: tip
         if: github.ref_type == 'branch'
         run: |
           set -euo pipefail
-          tip=$(git ls-remote origin "$GITHUB_REF" | cut -f1)
+          # ls-remote matches a pattern against the tail of a ref name, so
+          # `refs/heads/main` also matches a branch named `x/refs/heads/main`;
+          # awk keeps the exact ref only.
+          tip=$(git ls-remote origin "$GITHUB_REF" | awk -v r="$GITHUB_REF" '$2 == r { print $1 }')
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "stale=false" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::${GITHUB_REF} is at ${tip}, not ${GITHUB_SHA}; the newer run publishes the image"
+            {
+              echo "## publish skipped"
+              echo
+              echo "\`${GITHUB_REF}\` is at \`${tip}\`, not \`${GITHUB_SHA}\`, so this run pushed no image."
+              echo "The run for [\`${tip}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${tip}) publishes the \`main\` image; if that run failed, re-run it."
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi
       # A tag run uses the workflow at the tagged commit, and the `release`
