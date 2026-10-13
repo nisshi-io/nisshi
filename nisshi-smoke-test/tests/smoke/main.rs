@@ -26,6 +26,7 @@ pub mod restart;
 pub mod retention;
 pub mod scram;
 pub mod sqlite_snapshot;
+pub mod storage_down_at_startup;
 pub mod storage_url;
 pub mod topic_lifecycle;
 pub mod topics;
