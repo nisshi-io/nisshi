@@ -1176,6 +1176,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
+      contents: read     # check out the repository, for the local publish-image action
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1185,14 +1186,15 @@ jobs:
       # run can finish after a newer one. On main, push only while this commit
       # is still the branch tip, so the `main` image never moves backwards. If
       # the tip's own run then fails, re-run that run to publish; the skip
-      # says so in the step summary, since the job itself ends green.
+      # says so in the step summary, since the job itself ends green. The tip
+      # comes from the API, not `git ls-remote`, so the read-only token works
+      # whether the repository is public or private.
       - id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # ls-remote matches a pattern against the tail of a ref name, so
-          # `refs/heads/main` also matches a branch named `x/refs/heads/main`;
-          # awk keeps the exact ref only.
-          tip=$(git ls-remote origin "$GITHUB_REF" | awk -v r="$GITHUB_REF" '$2 == r { print $1 }')
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/${GITHUB_REF#refs/}" --jq .object.sha)
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "stale=false" >> "$GITHUB_OUTPUT"
           else
