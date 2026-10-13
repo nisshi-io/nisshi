@@ -5,14 +5,24 @@ version: 2
 #
 # Weekly runs land on the weekend, before working hours (Eastern), so the
 # CI for a burst of bump PRs does not compete with merge-queue runs during
-# the week. Cargo gets its own day because it opens most of the PRs. Each
-# bump stays its own PR (no `groups`), so one change reverts cleanly, and
+# the week. Cargo gets its own day because it opens most of the PRs.
+#
+# Most bumps get their own PR, so one change reverts cleanly. Two kinds of
+# bump share a PR instead. Crates that must move to a new version together
+# share a group, because a PR that bumps only one of them fails to build.
+# Low-risk bumps share one catch-all PR per ecosystem: cargo patch bumps,
+# and action minor and patch bumps. A cargo minor bump stays its own PR,
+# because Cargo treats a 0.x minor bump as breaking. Dependabot puts a
+# dependency in the first group that matches it, so each catch-all group
+# comes last.
+#
 # `open-pull-requests-limit` stays at its default of 5: a low limit would
 # let a few long-open major bumps block newer ones. Security updates are
-# not subject to the limit or the cooldown.
+# not subject to the limit, the cooldown or the groups.
 updates:
   # The 7-day cooldown gives an upstream CVE or a yanked release time to
-  # surface before Dependabot opens a bump PR.
+  # surface before Dependabot opens a bump PR. A major bump waits 14 days,
+  # because it is the most likely to be broken or followed by a fix.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -26,6 +36,14 @@ updates:
       include: "scope"
     cooldown:
       default-days: 7
+      semver-major-days: 14
+    groups:
+      # The workflows pin init and analyze to the same release.
+      codeql:
+        patterns: ["github/codeql-action*"]
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -58,12 +76,49 @@ updates:
         versions: [">0.10.9"]
     cooldown:
       default-days: 7
+      semver-major-days: 14
+    groups:
+      # deltalake, datafusion and the iceberg crates each build against one
+      # arrow, parquet and object_store release, so the stack builds only
+      # when every crate in it moves to a matching set.
+      arrow-lake:
+        patterns:
+          - "arrow"
+          - "datafusion"
+          - "deltalake"
+          - "iceberg*"
+          - "object_store"
+          - "parquet"
+      # The opentelemetry crates and tracing-opentelemetry share trait
+      # types, and each release depends on one matching set of versions.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
+      protobuf:
+        patterns: ["protobuf*"]
+      # deadpool-postgres re-exports the deadpool pool type it builds on.
+      deadpool:
+        patterns: ["deadpool*"]
+      # tokio-rustls and tokio-postgres-rustls each build against one rustls
+      # release, and the broker and the postgres backend pass rustls config
+      # types into them.
+      rustls:
+        patterns:
+          - "rustls*"
+          - "tokio-postgres-rustls"
+          - "tokio-rustls"
+      cargo-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
   # The Dockerfile's alpine base and .devcontainer's rust base are pinned to
   # exact digests. A digest pin only stays current if something deliberately
   # bumps it, so both get the same Dependabot coverage the other ecosystems
   # above already have, rather than freezing in place indefinitely.
   - package-ecosystem: "docker"
-    directory: "/"
+    directories:
+      - "/"
+      - "/.devcontainer"
     schedule:
       interval: "weekly"
       day: "saturday"
@@ -73,18 +128,13 @@ updates:
     commit-message:
       prefix: "build"
       include: "scope"
-    cooldown:
-      default-days: 7
-  - package-ecosystem: "docker"
-    directory: "/.devcontainer"
-    schedule:
-      interval: "weekly"
-      day: "saturday"
-      time: "06:00"
-      timezone: "America/Toronto"
-    target-branch: "main"
-    commit-message:
-      prefix: "build"
-      include: "scope"
+    ignore:
+      # The devcontainer's rust tag must stay equal to the channel in
+      # rust-toolchain.toml, so Dependabot updates only its digest. A
+      # toolchain bump changes both files in one PR.
+      - dependency-name: "rust"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
     cooldown:
       default-days: 7
