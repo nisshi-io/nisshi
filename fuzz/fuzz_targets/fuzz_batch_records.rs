@@ -60,15 +60,28 @@ fuzz_target!(|data: &[u8]| {
     let by_reference = Vec::<Record>::try_from(&batch);
     let by_value = Vec::<Record>::try_from(batch.clone());
 
-    // Differential oracle: the two must agree on whether the batch decodes
-    // and, when it does, on the records. Error variants are not compared.
+    // The two must agree on whether the batch decodes and, when it does, on
+    // the records. Error variants are not compared.
     //
-    // One known difference is allowed. For an uncompressed batch, the
-    // by-value conversion rejects bytes left after the last record, and the
-    // by-reference conversion accepts them. Without this exception the
-    // fuzzer reports it within seconds and finds nothing else. Compressed
-    // batches share one implementation, so they must agree. Remove the
-    // exception once the by-reference conversion rejects trailing bytes.
+    // For a compressed batch both conversions call the same
+    // `inflate_records`, so agreement there shows only that it is
+    // deterministic. For an uncompressed batch the by-value conversion
+    // decodes each record with `Record::decode` and the by-reference
+    // conversion with the serde visitors, so there the comparison is a
+    // differential between the two record decoders.
+    //
+    // The `(Ok, Err)` arm for an uncompressed batch exists because
+    // `Record::decode` rejects what the serde visitors accept in two known
+    // ways: bytes left after the last record, and a record `length` that
+    // does not match its body. Without the arm the fuzzer reports those
+    // within seconds and finds nothing else. The arm accepts more than those
+    // two, though: it accepts every batch that the serde visitors decode and
+    // `Record::decode` rejects. So this target cannot catch a serde visitor
+    // that is more lenient than `Decode`; `fuzz_varint` covers the varint
+    // visitors by comparing the two varint decoders directly, and nothing
+    // covers the key, value and header visitors that way. Remove the arm
+    // once the by-reference conversion rejects trailing bytes and a
+    // mismatched `length`.
     match (&by_reference, &by_value) {
         (Ok(by_reference), Ok(by_value)) => assert_eq!(by_reference, by_value),
         (Err(_), Err(_)) => {}
