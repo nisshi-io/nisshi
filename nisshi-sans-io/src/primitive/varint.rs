@@ -676,6 +676,56 @@ mod tests {
         assert!(LongVarInt::deserialize(&mut decoder).is_err());
     }
 
+    fn deserialize_varint(encoded: &[u8]) -> Result<i32> {
+        let mut reader = std::io::Cursor::new(encoded.to_vec());
+        let mut decoder = crate::de::Decoder::new(&mut reader);
+        VarInt::deserialize(&mut decoder)
+    }
+
+    fn deserialize_long_varint(encoded: &[u8]) -> Result<i64> {
+        let mut reader = std::io::Cursor::new(encoded.to_vec());
+        let mut decoder = crate::de::Decoder::new(&mut reader);
+        LongVarInt::deserialize(&mut decoder)
+    }
+
+    // The extremes of each type take every byte the type allows: five for an
+    // i32 and ten for an i64. One continuation byte more is an error.
+    #[test]
+    fn deserialize_five_byte_varint_extremes() -> Result<()> {
+        let min = [0xff, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(&min, &VarInt(i32::MIN).encode()?[..]);
+        assert_eq!(i32::MIN, deserialize_varint(&min)?);
+
+        let max = [0xfe, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(&max, &VarInt(i32::MAX).encode()?[..]);
+        assert_eq!(i32::MAX, deserialize_varint(&max)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_six_byte_varint_is_an_error() {
+        assert!(deserialize_varint(overlong(5).get_ref()).is_err());
+    }
+
+    #[test]
+    fn deserialize_ten_byte_long_varint_extremes() -> Result<()> {
+        let min = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(&min, &LongVarInt(i64::MIN).encode()?[..]);
+        assert_eq!(i64::MIN, deserialize_long_varint(&min)?);
+
+        let max = [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(&max, &LongVarInt(i64::MAX).encode()?[..]);
+        assert_eq!(i64::MAX, deserialize_long_varint(&max)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_eleven_byte_long_varint_is_an_error() {
+        assert!(deserialize_long_varint(overlong(10).get_ref()).is_err());
+    }
+
     #[test]
     fn encode_decode() -> Result<()> {
         let expected = 1;
