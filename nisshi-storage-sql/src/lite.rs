@@ -1335,19 +1335,23 @@ impl Delegate {
 
         let pc = self.connection().await?;
 
-        pc.execute(
-            "lite/policy_delete.sql",
-            (self.cluster.as_str(), now, retention_ms),
-        )
-        .await
-        .map(|deleted| deleted as u64)
-        .map_err(Into::into)
-        .inspect(|_| {
-            DELEGATE_REQUEST_DURATION.record(
-                elapsed_millis(start),
-                &[KeyValue::new("operation", "policy_delete")],
+        let by_age = pc
+            .execute(
+                "lite/policy_delete.sql",
+                (self.cluster.as_str(), now, retention_ms),
             )
-        })
+            .await?;
+
+        pc.execute("lite/policy_delete_bytes.sql", [self.cluster.as_str()])
+            .await
+            .map(|by_bytes| (by_age + by_bytes) as u64)
+            .map_err(Into::into)
+            .inspect(|_| {
+                DELEGATE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[KeyValue::new("operation", "policy_delete")],
+                )
+            })
     }
 
     async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {

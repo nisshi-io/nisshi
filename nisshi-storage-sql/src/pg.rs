@@ -1774,7 +1774,14 @@ impl Postgres {
             )
             .await?;
 
-        tx.commit().await.map_err(Into::into).and(Ok(deleted))
+        let deleted_by_bytes = self
+            .tx_prepare_execute(&tx, "policy_delete_bytes.sql", &[&self.cluster])
+            .await?;
+
+        tx.commit()
+            .await
+            .map_err(Into::into)
+            .and(Ok(deleted + deleted_by_bytes))
     }
 
     async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {
