@@ -321,12 +321,17 @@ async fn unknown_compression_codec(storage: impl Storage + Clone) -> Result<()> 
 /// request is rejected before either is stored, including when both batches
 /// are well formed. A zero-length records field, which decodes to `None`, is
 /// rejected the same way.
+///
+/// The count is checked before any batch is validated, as Kafka does. The
+/// case with an unknown codec in the second batch pins that order: its
+/// message would name the codec if the batches were validated first.
 async fn not_exactly_one_batch(storage: impl Storage + Clone) -> Result<()> {
     let name = &alphanumeric_string(15)[..];
     create_topic(&storage, name).await?;
 
     for records in [
         Some(vec![well_formed(b"first")?, truncated_record()?]),
+        Some(vec![well_formed(b"first")?, unknown_codec()?]),
         Some(vec![well_formed(b"first")?, well_formed(b"second")?]),
         Some(vec![]),
         None,
