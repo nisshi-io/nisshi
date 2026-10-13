@@ -1732,6 +1732,60 @@ async fn produce_rejects_corrupt_batch_before_rewrite(storage: impl Storage + Cl
     assert_accepted_at(0, &well_formed)
 }
 
+/// A compressed `CreateTime` batch whose records decode to more than the
+/// decoded-size limit is rejected with `MESSAGE_TOO_LARGE`, not
+/// `INVALID_RECORD`, because a producer recovers from `MESSAGE_TOO_LARGE` by
+/// splitting the batch. The timestamp rewrite decodes the batch, so it must
+/// keep the error code that any other produce path answers.
+///
+/// The broker rejects the batch before it writes anything, so the test runs
+/// on the memory backend only: decoding 100 MiB takes seconds in a debug
+/// build, and another backend would not change the result.
+async fn produce_rejects_batch_over_decoded_size_limit_as_too_large(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    // `nisshi_sans_io` caps a decoded batch at 100 MiB. The test does not
+    // reach that constant, so it must exceed the cap on its own.
+    const DECODED_BATCH_LIMIT: usize = 100 * 1024 * 1024;
+
+    let topic = create_topic_with_configs(storage.clone(), &[]).await?;
+    let index = 0;
+    let now = now_ms()?;
+
+    // One record whose value alone is a byte over the limit. Zstd packs the
+    // zeros into a few KiB, so the batch is small on the wire, and decodes
+    // as far as the limit allows.
+    let oversized = inflated::Batch::builder()
+        .attributes(
+            BatchAttribute::default()
+                .compression(Compression::Zstd)
+                .into(),
+        )
+        .base_timestamp(now)
+        .max_timestamp(-1)
+        .record(Record::builder().value(Bytes::from(vec![0u8; DECODED_BATCH_LIMIT + 1]).into()))
+        .build()
+        .and_then(deflated::Batch::try_from)?;
+
+    let rejected = produce_batches(storage.clone(), &topic, index, vec![oversized]).await?;
+
+    assert_eq!(
+        ErrorCode::MessageTooLarge,
+        ErrorCode::try_from(rejected.error_code)?
+    );
+    assert_eq!(-1, rejected.base_offset);
+
+    let well_formed = produce_batches(
+        storage,
+        &topic,
+        index,
+        vec![create_time_batch(Compression::Zstd, now, now, &[0])?],
+    )
+    .await?;
+
+    assert_accepted_at(0, &well_formed)
+}
+
 /// SlateDB retention deletes a batch whose `max_timestamp` is older than
 /// `retention.ms`. A header of -1 stored as sent makes a new batch eligible
 /// at once, so the stored header must hold the largest record timestamp.
@@ -1988,6 +2042,18 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::produce_rejects_corrupt_batch_before_rewrite(storage).await
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_batch_over_decoded_size_limit_as_too_large() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_batch_over_decoded_size_limit_as_too_large(storage).await
     }
 }
 

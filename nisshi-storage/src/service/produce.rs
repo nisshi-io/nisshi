@@ -370,27 +370,13 @@ impl From<(ErrorCode, &'static str)> for Rejection {
 /// [`TIMESTAMP_AFTER_MAX_MS`] set around `now`, a timestamp that overflows,
 /// a batch that does not decode, or a header rewrite on a batch whose CRC
 /// does not match its contents. `Err` is a broker-side failure.
+///
+/// The batch decodes through [`inflate_produced`], so a batch that does not
+/// decode gets the same error code here as on every other produce path.
 fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<Rejection>> {
-    let inflated = match inflated::Batch::try_from(&*batch) {
+    let inflated = match inflate_produced(&*batch) {
         Ok(inflated) => inflated,
-        Err(error) => {
-            let compression = BatchAttribute::try_from(batch.attributes)
-                .map(|attributes| attributes.compression)
-                .ok();
-
-            warn!(?compression, ?error, "produce batch does not decode");
-
-            return Ok(Some(
-                if matches!(error, nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) {
-                    Rejection::new(
-                        ErrorCode::MessageTooLarge,
-                        "batch exceeds the maximum decoded batch size",
-                    )
-                } else {
-                    Rejection::new(ErrorCode::InvalidRecord, "batch could not be decoded")
-                },
-            ));
-        }
+        Err(error) => return Ok(Some(undecodable_batch(&error))),
     };
 
     let lower = now.saturating_sub(TIMESTAMP_BEFORE_MAX_MS);
@@ -450,6 +436,22 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// The rejection for a client batch that [`inflate_produced`] did not decode,
+/// with the error code [`storage_error_code`] gives `error`: `MESSAGE_TOO_LARGE`
+/// for a batch over the decoded-size limit, which a producer recovers from by
+/// splitting the batch, and `INVALID_RECORD` for any other decode failure.
+fn undecodable_batch(error: &Error) -> Rejection {
+    let error_code = storage_error_code(error);
+
+    let message = if error_code == ErrorCode::MessageTooLarge {
+        "batch exceeds the maximum decoded batch size"
+    } else {
+        "batch could not be decoded"
+    };
+
+    Rejection::new(error_code, message)
 }
 
 /// The rejection for a batch whose CRC does not match its contents. Kafka
@@ -801,6 +803,7 @@ where
             topic = name,
             partition = index,
             producer_id = batch.producer_id,
+            attributes = batch.attributes,
             record_count = batch.record_count,
             last_offset_delta = batch.last_offset_delta,
             base_timestamp = batch.base_timestamp,
