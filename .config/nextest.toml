@@ -5,6 +5,11 @@
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# The durability tests are the heaviest tests, and the most sensitive to
+# timing, so a run starts them one at a time.
+[test-groups]
+durability = { max-threads = 1 }
+
 # The settings of the smoke suite (nisshi-smoke-test). Each Kafka CLI call has
 # its own timeout, and `slow-timeout` stops a test that hangs anywhere else.
 [profile.smoke]
@@ -12,6 +17,13 @@ fail-fast = false
 # Each test starts Kafka CLI JVMs, so memory limits how many tests can run.
 test-threads = 4
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The durability tests run clients around a broker kill or a storage outage,
+# and then read back every record, so they get longer than the other tests.
+[[profile.smoke.overrides]]
+filter = "test(/^durability::/)"
+test-group = "durability"
+slow-timeout = { period = "60s", terminate-after = 8 }
 
 # S3 runs only the topic lifecycle tests, which check that a broker on S3
 # stores and serves topics and records. Every other engine runs every test that

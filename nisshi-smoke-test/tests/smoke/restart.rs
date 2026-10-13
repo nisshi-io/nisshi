@@ -30,6 +30,9 @@ mod persistence {
     const PRODUCED_RECORDS: [(&str, Option<&str>); 3] =
         [("k0", Some("v0")), ("k1", Some("v1")), ("k2", Some("v2"))];
 
+    /// The values that the test produces after the restart, for the group to read.
+    const VALUES_AFTER_RESTART: [&str; 2] = ["after-0", "after-1"];
+
     /// Where a client stored data before the broker restarted: a topic created with
     /// [`NON_DEFAULT_RETENTION`] that holds [`PRODUCED_RECORDS`], and a group that consumed them.
     struct StoredBeforeRestart {
@@ -111,6 +114,23 @@ mod persistence {
                 .map(|offsets| offsets.committed),
             Some(PRODUCED_RECORDS.len() as u64),
             "{described}"
+        );
+    }
+
+    /// A consumer group that rejoins after the restart resumes at its committed offset. The group
+    /// committed every record before the restart, so it reads exactly the records produced after it.
+    #[test]
+    fn group_resumes_after_restart() {
+        let (broker, StoredBeforeRestart { topic, group }) = &store_data_and_restart();
+        let cli = KafkaCli::new(broker.bootstrap());
+
+        _ = cli.produce_values(topic, &VALUES_AFTER_RESTART);
+        let resumed = cli.consume(topic, group, VALUES_AFTER_RESTART.len());
+
+        assert_eq!(
+            resumed.succeeded().consumed_values(),
+            VALUES_AFTER_RESTART,
+            "{resumed}"
         );
     }
 
