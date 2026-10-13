@@ -32,7 +32,6 @@ use deadpool_postgres::{
     Transaction,
 };
 use futures::pin_mut;
-use futures_util::future;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -1895,28 +1894,22 @@ impl Storage for Postgres {
         debug!(?topic_uuid, cluster = self.cluster, ?topic);
 
         // The watermark insert selects the topition rows that the topition insert creates, so
-        // every topition insert must finish before the first watermark insert is sent. A
-        // statement that is not yet prepared on this connection takes a round trip first,
-        // which would otherwise let a watermark insert overtake its topition and match no
-        // rows, leaving a topic that rejects every produce.
+        // every topition insert must finish before the first watermark insert is sent. Each
+        // statement is awaited before the next one is sent on this transaction's connection,
+        // which keeps that order. A watermark insert that finds no topition row matches no
+        // rows without an error, leaving a topic that rejects every produce.
         for sql in ["topition_insert.sql", "watermark_insert.sql"] {
-            let inserted = future::try_join_all((0..topic.num_partitions).map(|partition| {
-                let tx = &tx;
-                let cluster = &self.cluster;
-                let name = &topic.name;
+            for partition in 0..topic.num_partitions {
+                let inserted = self
+                    .tx_prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
+                    .await?;
 
-                async move {
-                    self.tx_prepare_execute(tx, sql, &[cluster, name, &partition])
-                        .await
+                if inserted != 1 {
+                    return Err(Error::Message(format!(
+                        "{sql} did not insert one row per partition of {} in {}",
+                        topic.name, self.cluster
+                    )));
                 }
-            }))
-            .await?;
-
-            if inserted.iter().any(|rows| *rows != 1) {
-                return Err(Error::Message(format!(
-                    "{sql} did not insert one row per partition of {} in {}",
-                    topic.name, self.cluster
-                )));
             }
         }
 
@@ -4111,6 +4104,7 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
     use rand::distr::Alphanumeric;
 
