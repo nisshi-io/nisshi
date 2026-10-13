@@ -37,7 +37,7 @@ where
     type Output = Frame;
     type Error = Error;
 
-    #[instrument(skip(req))]
+    #[instrument(skip(self, req))]
     async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
         let correlation_id = req.frame.correlation_id()?;
 
