@@ -1626,6 +1626,55 @@ mod tests {
         Ok(())
     }
 
+    /// A compressed record whose `length` varint has a sixth byte, one more
+    /// than an `i32` can hold, is rejected by every conversion that decodes
+    /// compressed records. The record is otherwise valid, so only the
+    /// overlong varint can reject it: a record decoder that let the serde
+    /// visitor wrap the value would decode this batch.
+    #[test]
+    fn overlong_varint_in_a_compressed_record_is_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut record = BytesMut::new();
+        record.put_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0x01]); // length, overlong
+        record.put_u8(0); // attributes
+        record.put(LongVarInt(0).encode()?); // timestamp delta
+        record.put(VarInt(0).encode()?); // offset delta
+        record.put(VarInt(-1).encode()?); // null key
+        record.put(VarInt(-1).encode()?); // null value
+        record.put(VarInt(0).encode()?); // no headers
+
+        let mut gz = GzEncoder::new(BytesMut::new().writer(), flate2::Compression::default());
+        gz.write_all(&record)?;
+        let record_data = gz.finish().map(|w| w.into_inner().freeze())?;
+
+        let batch = Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::Gzip)
+                .into(),
+            record_count: 1,
+            record_data,
+            ..Default::default()
+        };
+
+        let err = Vec::<Record>::try_from(&batch)
+            .expect_err("an overlong varint must be rejected by reference");
+        assert!(
+            matches!(&err, Error::Message(message) if message == "varint is too long"),
+            "{err:?}"
+        );
+        assert!(
+            Vec::<Record>::try_from(batch.clone()).is_err(),
+            "an overlong varint must be rejected by value"
+        );
+        assert!(
+            inflated::Batch::try_from(&batch).is_err(),
+            "an overlong varint must be rejected when inflating"
+        );
+
+        Ok(())
+    }
+
     /// A header count that outruns this record's own declared length is
     /// rejected at the record's boundary, instead of reading into the bytes
     /// that follow it in the batch (here, two bytes that belong to no
