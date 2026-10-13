@@ -32,10 +32,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 engine=${1:-}
 case "${engine}" in
-    postgres) feature=postgres storage=postgres://postgres:postgres@localhost services=db ports=5432 ;;
-    sqlite) feature=libsql storage=sqlite://nisshi.db services='' ports='' ;;
-    memory) feature=dynostore storage=memory://nisshi/ services='' ports='' ;;
-    s3) feature=dynostore storage=s3://nisshi/ services=minio ports="9000 9001" ;;
+    # The postgres leg's storage URL names the port that Docker picks for the
+    # service, so the script sets it once the service has started.
+    postgres) feature=postgres storage='' services=db ;;
+    sqlite) feature=libsql storage=sqlite://nisshi.db services='' ;;
+    memory) feature=dynostore storage=memory://nisshi/ services='' ;;
+    s3) feature=dynostore storage=s3://nisshi/ services=minio ;;
     *) echo "usage: nisshi-smoke-test/run.sh <postgres|sqlite|memory|s3>" >&2; exit 2 ;;
 esac
 
@@ -52,11 +54,12 @@ rm -f "${results}/results-${leg}.csv" "${results}/nextest-${leg}.log" \
 # this run's and leaves another run's alone.
 export NISSHI_SMOKE_RUN=${engine}-$$
 
-# The engine's own compose project, so a run never touches the volumes of
-# the default one, nor the services of a run on another engine. compose.yaml
-# interpolates these images for services this script doesn't start.
+# The run's own compose project, so a run never touches the services and
+# volumes of the default project or of another run. compose.yaml interpolates
+# these images for services this script doesn't start.
 export NISSHI_IMAGE=${NISSHI_IMAGE:-unused} LAKEKEEPER_IMAGE=${LAKEKEEPER_IMAGE:-unused}
-project=nisshi-smoke-${engine}
+project_prefix=nisshi-smoke-$(id -u)-
+project=${project_prefix}${NISSHI_SMOKE_RUN}
 compose=(docker compose --project-name "${project}" --ansi never)
 
 # Set to true when this run starts the compose services, so cleanup only stops services it started.
@@ -128,7 +131,9 @@ cleanup() (
         while read -r name; do
             docker logs "${name}" >"${results}/${name}.log" 2>&1
         done
-    docker ps --all --quiet --filter "label=nisshi-smoke=${NISSHI_SMOKE_RUN}" | xargs -r docker rm --force >/dev/null
+    # --volumes also removes each container's anonymous volumes, which the next line misses because
+    # they have no label. A test's own PostgreSQL server keeps its data in one.
+    docker ps --all --quiet --filter "label=nisshi-smoke=${NISSHI_SMOKE_RUN}" | xargs -r docker rm --force --volumes >/dev/null
     docker volume ls --quiet --filter "label=nisshi-smoke=${NISSHI_SMOKE_RUN}" | xargs -r docker volume rm --force >/dev/null
     if [[ "${started}" == true ]]; then
         "${compose[@]}" logs --no-color --timestamps >"${results}/services-${leg}.log" 2>&1
@@ -159,12 +164,37 @@ stop_leftover_brokers() {
 
 # Build before starting anything, so a slow build doesn't count against
 # a broker or a service that is already running.
+#
+# Each leg runs its own copy of the broker, so that two legs running at once
+# never run each other's build. Every leg builds target/debug/nisshi with only
+# its own engine's feature. If the postgres leg started target/debug/nisshi just
+# after the memory leg rebuilt it, the broker would lack PostgreSQL support and
+# refuse to start. The lock stops another leg from rebuilding the file between
+# this leg's build and its copy. macOS lacks flock(1), so there the legs must
+# run one at a time.
 if [[ -z "${NISSHI_SMOKE_IMAGE:-}" && -z "${NISSHI_SMOKE_BIN:-}" ]]; then
-    cargo build -p nisshi --bin nisshi --no-default-features --features "${feature}"
-    export NISSHI_SMOKE_BIN=${target_dir}/debug/nisshi
+    (
+        if command -v flock >/dev/null; then
+            flock 9
+        fi
+        cargo build -p nisshi --bin nisshi --no-default-features --features "${feature}"
+        cp "${target_dir}/debug/nisshi" "${results}/nisshi-${leg}"
+    ) 9>"${results}/build.lock"
+    export NISSHI_SMOKE_BIN=${results}/nisshi-${leg}
 fi
 # Building the tests also builds smoke-broker.
 cargo nextest run -p nisshi-smoke-test --features "${engine}" --no-run
+
+# The image of a PostgreSQL server that a test starts for itself. It is the
+# image of the db service.
+export NISSHI_SMOKE_POSTGRES_IMAGE=${POSTGRES_IMAGE:-postgres:17}
+
+# The directory of the files that reserve ports for brokers and PostgreSQL
+# servers. Every run of the same user shares it. Each user has their own,
+# because the first user to create a shared one would own it, and the others
+# couldn't create their lock files in it.
+NISSHI_SMOKE_PORT_LOCKS=${TMPDIR:-/tmp}/nisshi-smoke-$(id -u)/ports
+export NISSHI_SMOKE_PORT_LOCKS
 
 # The harness gives `docker run` a minute to start a broker container, which isn't enough to pull
 # the image as well, so the image is pulled here.
@@ -173,14 +203,22 @@ if [[ -n "${NISSHI_SMOKE_IMAGE:-}" ]] && ! docker image inspect "${NISSHI_SMOKE_
     docker pull --quiet "${NISSHI_SMOKE_IMAGE}"
 fi
 
-# The services publish the same host ports as the default compose project,
-# so if the services from `just ci`, or another run on this engine, are
-# still running, `compose up` fails with "port is already allocated".
-step="check that the service ports are free"
-for port in ${ports}; do
-    if (: </dev/tcp/127.0.0.1/"${port}") 2>/dev/null; then
-        echo "port ${port} is already in use, probably by the services from \`just ci\` or by another \`just smoke ${engine}\`: stop them with \`docker compose stop\`, or end that run (if it was killed, \`docker compose --project-name ${project} down --volumes\`), then rerun" >&2
-        exit 1
+# The services publish their ports on loopback ports that Docker picks, so that
+# a run can start while the services of `just ci` or of another run hold the
+# fixed ports. compose.yaml publishes the fixed ports when these are unset.
+export NISSHI_DB_PORTS=127.0.0.1::5432
+export NISSHI_MINIO_PORTS=127.0.0.1::9000 NISSHI_MINIO_CONSOLE_PORTS=127.0.0.1::9001
+
+# A run that was killed skips its cleanup and leaves its compose project
+# behind. The project's name ends with the process id of that run's script.
+#
+# The script removes only the projects of its own user. Docker shows the
+# projects of every user, but `ps` can't see the processes of another user
+# when /proc hides them, so a live run of another user would look killed.
+step="remove the services of killed runs"
+for stale in $(docker compose ls --all --quiet --filter "name=${project_prefix}"); do
+    if [[ "${stale}" == "${project_prefix}"* ]] && ! ps -p "${stale##*-}" -o command= 2>/dev/null | grep -q 'run.sh'; then
+        docker compose --project-name "${stale}" down --volumes --remove-orphans >/dev/null 2>&1
     fi
 done
 
@@ -205,19 +243,26 @@ case "${engine}" in
             fi
             sleep 1
         done
+        storage=postgres://postgres:postgres@$("${compose[@]}" port db 5432)
         ;;
     s3)
         "${compose[@]}" exec minio /usr/bin/mc ready local
         "${compose[@]}" exec minio /usr/bin/mc alias set local http://localhost:9000 minioadmin minioadmin
         "${compose[@]}" exec minio /usr/bin/mc mb local/nisshi
         export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
-        export AWS_ENDPOINT=http://localhost:9000 AWS_ALLOW_HTTP=true AWS_DEFAULT_REGION=auto
+        AWS_ENDPOINT=http://$("${compose[@]}" port minio 9000)
+        export AWS_ENDPOINT AWS_ALLOW_HTTP=true AWS_DEFAULT_REGION=auto
         ;;
 esac
 
 step="start the Kafka tools"
 export KAFKA_IMAGE=${KAFKA_IMAGE:-apache/kafka:3.9.2}
-NISSHI_SMOKE_KAFKA=$(docker run --detach --rm --label="nisshi-smoke=${NISSHI_SMOKE_RUN}" --network=host --entrypoint=sleep "${KAFKA_IMAGE}" infinity)
+# Each tool call starts a JVM that runs for seconds, so these options make the
+# JVM start faster and use less CPU: the JIT compiles only its fast first tier,
+# and one GC thread collects. They don't change what the Kafka client sends.
+jvm_options="-XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Djava.awt.headless=true"
+NISSHI_SMOKE_KAFKA=$(docker run --detach --rm --label="nisshi-smoke=${NISSHI_SMOKE_RUN}" --network=host \
+    --env "KAFKA_JVM_PERFORMANCE_OPTS=${jvm_options}" --entrypoint=sleep "${KAFKA_IMAGE}" infinity)
 export NISSHI_SMOKE_KAFKA
 export NISSHI_SMOKE_STORAGE=${storage}
 export NISSHI_SMOKE_LOG=${results}/broker-${leg}.log

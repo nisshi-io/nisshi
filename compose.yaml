@@ -25,8 +25,9 @@ services:
     environment:
       PGUSER: postgres
       POSTGRES_PASSWORD: postgres
+    # nisshi-smoke-test/run.sh sets NISSHI_DB_PORTS, so that Docker picks the host port.
     ports:
-      - 5432:5432
+      - ${NISSHI_DB_PORTS:-5432:5432}
     volumes:
       - db:/var/lib/postgresql
       - ./etc/initdb.d/:/docker-entrypoint-initdb.d/
@@ -44,9 +45,10 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio:/data
+    # nisshi-smoke-test/run.sh sets these variables, so that Docker picks the host ports.
     ports:
-      - 9000:9000
-      - 9001:9001
+      - ${NISSHI_MINIO_PORTS:-9000:9000}
+      - ${NISSHI_MINIO_CONSOLE_PORTS:-9001:9001}
     environment:
       MINIO_PROMETHEUS_AUTH_TYPE: public
     healthcheck:
