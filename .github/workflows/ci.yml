@@ -377,9 +377,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: |
-            postgres:17
-            hello-world
+          ecr-fallback-images: postgres:17
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -461,9 +459,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: |
-            postgres:17
-            hello-world
+          ecr-fallback-images: postgres:17
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
