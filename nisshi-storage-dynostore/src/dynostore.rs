@@ -1010,7 +1010,10 @@ impl Storage for DynoStore {
                         .inspect_err(|err| debug!(?err))?;
                 }
 
-                Some(inflated)
+                // Only the lake reads the decoded batch after this point.
+                // Dropping it here, rather than at the end of the function,
+                // frees its memory before the object store writes.
+                self.lake.is_some().then_some(inflated)
             } else {
                 None
             };
