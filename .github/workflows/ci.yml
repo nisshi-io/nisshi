@@ -1025,8 +1025,9 @@ jobs:
   # needs every job ci-gate does, so a red or skipped job anywhere stops it. It is not in
   # ci-gate's `needs`: it runs on push only, and ci-gate's "Nothing skipped
   # off pull_request" step would fail every merge_group run. A `v*` tag isn't
-  # covered by the main ruleset, so this `needs` list is the only gate a tag
-  # gets. On a tag, macos has also run the full release build by now.
+  # covered by the main ruleset, so this `needs` list and the on-main check
+  # below are the only gates a tag gets. On a tag, macos has also run the
+  # full release build by now.
   publish:
     if: github.event_name == 'push'
     needs: *gate_needs
@@ -1053,6 +1054,20 @@ jobs:
             echo "::notice::${GITHUB_REF} is at ${tip}, not ${GITHUB_SHA}; the newer run publishes the image"
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi
+      # A tag run uses the workflow at the tagged commit, and the `release`
+      # environment on publish-release checks only that the ref name matches
+      # `v*`. This step stops a `v*` tag pushed on a commit that is not on
+      # main from publishing. It does not stop someone who can edit the
+      # workflow at the tagged commit, because they can remove it; a tag
+      # ruleset that restricts who creates `v*` tags is the control for that.
+      # The checkout is depth 1, so the step fetches main itself: the fetch
+      # stops at the tagged commit when the tag is on main, and brings main's
+      # history otherwise, which answers the ancestry check either way.
+      - if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::${GITHUB_REF} is at ${GITHUB_SHA}, which is not on main; nothing is published"; exit 1; }
       # release's static musl binaries, as dist/linux/<arch>/nisshi.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
