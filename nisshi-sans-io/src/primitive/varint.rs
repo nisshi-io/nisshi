@@ -154,7 +154,7 @@ impl VarInt {
                         .next_element::<u8>()?
                         .ok_or_else(|| de::Error::custom("u8"))?;
 
-                    let overflow = || de::Error::custom("overflow");
+                    let overflow = || de::Error::custom("varint is too long");
 
                     if byte & CONTINUATION == CONTINUATION {
                         accumulator = u32::from(byte & MASK)
@@ -358,7 +358,7 @@ impl LongVarInt {
                         .next_element::<u8>()?
                         .ok_or_else(|| de::Error::custom("u8"))?;
 
-                    let overflow = || de::Error::custom("overflow");
+                    let overflow = || de::Error::custom("long varint is too long");
 
                     if byte & CONTINUATION == CONTINUATION {
                         accumulator = u64::from(byte & MASK)
@@ -666,14 +666,22 @@ mod tests {
     fn deserialize_overlong_varint_is_an_error() {
         let mut reader = overlong(6);
         let mut decoder = crate::de::Decoder::new(&mut reader);
-        assert!(VarInt::deserialize(&mut decoder).is_err());
+        let err = VarInt::deserialize(&mut decoder).expect_err("six continuation bytes");
+        assert!(
+            matches!(&err, Error::Message(message) if message == "varint is too long"),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn deserialize_overlong_long_varint_is_an_error() {
         let mut reader = overlong(11);
         let mut decoder = crate::de::Decoder::new(&mut reader);
-        assert!(LongVarInt::deserialize(&mut decoder).is_err());
+        let err = LongVarInt::deserialize(&mut decoder).expect_err("eleven continuation bytes");
+        assert!(
+            matches!(&err, Error::Message(message) if message == "long varint is too long"),
+            "{err:?}"
+        );
     }
 
     fn deserialize_varint(encoded: &[u8]) -> Result<i32> {
