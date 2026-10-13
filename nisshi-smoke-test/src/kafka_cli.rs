@@ -14,11 +14,11 @@
 
 //! Runs the Apache Kafka command-line tools against a broker.
 //!
-//! [`KafkaCli`] runs each tool that [`Tool`] lists. Each tool has a module with two kinds of methods. Methods on
-//! [`KafkaCli`] build the tool's command-line arguments, so a test names an action, such as
-//! creating a topic, and does not list flags. Methods on [`Output`] read what the tool printed. A
-//! method returns an [`Output`] typed by its command, so a test can call only the readers for
-//! that command's output.
+//! [`KafkaCli`] runs each tool that [`Tool`] lists. Each tool has a module with two kinds of
+//! methods. Methods on [`KafkaCli`] build the tool's command-line arguments, so a test names an
+//! action, such as creating a topic, and does not list flags. Methods on [`Output`] read what the
+//! tool printed. A method returns an [`Output`] typed by its command, so a test can call only the
+//! readers for that command's output.
 //!
 //! Each method's doc names the Kafka APIs that the command is for. A command sends other requests
 //! too, such as `ApiVersions` and `Metadata` first, and which ones it sends can change between
@@ -49,6 +49,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{settings, timed_command, unique_name};
 
+mod background_tool;
 mod cluster;
 mod configs;
 mod console_consumer;
@@ -56,6 +57,7 @@ mod console_producer;
 mod consumer_groups;
 mod delete_records;
 mod offsets;
+mod partition_reassignments;
 mod topics;
 mod verifiable_consumer;
 mod verifiable_producer;
@@ -68,21 +70,29 @@ pub const RECORD_TOO_LARGE_EXCEPTION: &str = "RecordTooLargeException";
 pub const UNSUPPORTED_VERSION_EXCEPTION: &str = "UnsupportedVersionException";
 /// The name the tools print when the broker refuses a login.
 pub const SASL_AUTHENTICATION_EXCEPTION: &str = "SaslAuthenticationException";
+/// The name the tools print for the broker's `GROUP_ID_NOT_FOUND` error.
+pub const GROUP_ID_NOT_FOUND_EXCEPTION: &str = "GroupIdNotFoundException";
+/// The name the tools print for the broker's `NON_EMPTY_GROUP` error.
+pub const GROUP_NOT_EMPTY_EXCEPTION: &str = "GroupNotEmptyException";
 /// What the console producer logs on stderr for each record that the broker rejects.
 const CONSOLE_PRODUCER_SEND_ERROR: &str = "Error when sending message";
 
+pub use background_tool::{BackgroundTool, PrintedLine, StdoutLines};
 pub use cluster::{ApiVersions, ClusterId};
 pub use configs::{DescribeConfigs, DescribeUsers};
 pub use console_consumer::{
     Consume, ConsumeMatching, ConsumedRecord, LOG_APPEND_TIME, PRINTED_NULL, PrintsPartitionLines,
 };
-pub use consumer_groups::{DescribeGroup, DescribeGroupState, GroupOffsets};
+pub use consumer_groups::{
+    DescribeGroup, DescribeGroupMembers, DescribeGroupState, GroupOffsets, GroupState, ListGroups,
+    ListGroupsInState,
+};
 pub use delete_records::DeleteRecords;
 pub use offsets::GetOffsets;
-pub use topics::{
-    CreateTopic, DeleteTopic, DescribeTopic, ListTopics, PartitionReplicas, RequiresExistingTopic,
+pub use topics::{CreateTopic, DescribeTopic, ListTopics, PartitionReplicas};
+pub use verifiable_consumer::{
+    CommittedOffset, ConsumedOffsets, ConsumerEvent, TopicPartition, VerifiableConsume,
 };
-pub use verifiable_consumer::VerifiableConsume;
 pub use verifiable_producer::{
     Acks, SendResult, StoredRecord, VerifiableProduce, verifiable_producer_values,
 };
@@ -99,10 +109,6 @@ const KILL_AFTER: Duration = Duration::from_secs(5);
 // The harness must wait longer than `timeout` takes to send SIGKILL, or it
 // kills `docker exec` before `timeout` can report why the tool stopped.
 const _: () = assert!(GRACE.as_secs() > KILL_AFTER.as_secs());
-
-/// How long a tool that a test started with [`KafkaCli::start`] can run. The limit stops a tool
-/// that a test left running when nextest killed the test.
-const RUNNING_TOOL_LIMIT: Duration = Duration::from_secs(5 * 60);
 
 /// A SCRAM user that the tools log in as, on a broker started with `--authentication`.
 #[derive(Clone, Debug)]
@@ -312,14 +318,14 @@ impl KafkaCli {
 
             let args = ["cluster-id"];
             let attempt = timed_command::run(
-                &mut self.command(Tool::Cluster, &args, false, limit, None),
+                &mut self.command(Tool::Cluster, &args, false, None, limit),
                 None,
                 limit + GRACE,
             );
 
             match attempt {
                 Ok(finished) if finished.code == Some(0) => {
-                    return Ok(Output::new(Tool::Cluster, &args, finished, None));
+                    return Ok(self.output(Tool::Cluster, &args, finished, None));
                 }
 
                 attempt if Instant::now() >= deadline => {
@@ -379,25 +385,6 @@ impl KafkaCli {
             .unwrap_or_else(|err| panic!("can't read the time in {printed:?}: {err}"))
     }
 
-    /// Starts `tool` in the background, and returns at once. The test stops the tool with
-    /// [`BackgroundTool::stop`].
-    fn start<PrintedBy>(&self, tool: Tool, args: &[&str]) -> BackgroundTool<PrintedBy> {
-        let pid_file = format!("/tmp/{}.pid", unique_name(tool.name()));
-        let mut command = self.command(tool, args, false, RUNNING_TOOL_LIMIT, Some(&pid_file));
-
-        let running =
-            timed_command::spawn(&mut command, None).unwrap_or_else(|err| panic!("{err}"));
-
-        BackgroundTool {
-            container: self.container.clone(),
-            pid_file,
-            tool,
-            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-            running: Some(running),
-            printed_by: PhantomData,
-        }
-    }
-
     /// Runs `tool` as [`KafkaCli::exec`] does, but returns the output of a tool that doesn't
     /// finish in time instead of panicking, with [`Output::timeout`] set.
     fn exec_until_timeout<PrintedBy>(
@@ -414,7 +401,7 @@ impl KafkaCli {
         /// plus the signal number, and SIGKILL is 9.
         const TIMEOUT_KILL_EXIT: i32 = 128 + 9;
 
-        let mut command = self.command(tool, args, input.is_some(), tool_timeout, None);
+        let mut command = self.command(tool, args, input.is_some(), None, tool_timeout);
 
         let finished = timed_command::run(&mut command, input, tool_timeout + GRACE)
             .unwrap_or_else(|err| panic!("{err}"));
@@ -427,18 +414,18 @@ impl KafkaCli {
             _ => None,
         };
 
-        Output::new(tool, args, finished, timeout)
+        self.output(tool, args, finished, timeout)
     }
 
-    /// Returns the `docker exec` command that runs `tool`. With `pid_file`, the command writes the
-    /// process id of the tool's `timeout` to that file in the container.
+    /// Builds the `docker exec` command that runs `tool`. The command puts `jvm_tag` on the tool's
+    /// JVM command line, so that [`BackgroundTool`] signals only this tool.
     fn command(
         &self,
         tool: Tool,
         args: &[&str],
         interactive: bool,
+        jvm_tag: Option<&str>,
         timeout: Duration,
-        pid_file: Option<&str>,
     ) -> Command {
         let mut command = Command::new("docker");
         _ = command.arg("exec");
@@ -449,9 +436,17 @@ impl KafkaCli {
 
         _ = command.arg(&self.container);
 
-        // The shell writes its own process id, and `exec` hands that process id on to `timeout`.
-        if let Some(pid_file) = pid_file {
-            _ = command.args(["sh", "-c", "echo $$ > \"$0\"; exec \"$@\"", pid_file]);
+        // The Kafka scripts pass `KAFKA_OPTS` to `java`. The shell appends the tag to the
+        // container's `KAFKA_OPTS`, which `docker exec --env` would replace. The shell's own
+        // arguments also contain the tag, so it starts the tool with `exec`, which ends the shell,
+        // and `pkill` then matches only the tool's JVM.
+        if let Some(jvm_tag) = jvm_tag {
+            _ = command.args([
+                "sh",
+                "-c",
+                r#"export KAFKA_OPTS="${KAFKA_OPTS:+$KAFKA_OPTS }$0"; exec "$@""#,
+                &background_tool::jvm_tag_option(jvm_tag),
+            ]);
         }
 
         // The tool runs under `timeout` in the container, because killing `docker exec` leaves
@@ -476,79 +471,6 @@ impl KafkaCli {
     }
 }
 
-/// A Kafka tool that a test started in the background, and stops with [`BackgroundTool::stop`].
-#[derive(Debug)]
-pub struct BackgroundTool<PrintedBy> {
-    container: String,
-    /// The file in the tools' container that holds the process id of the tool's `timeout`.
-    pid_file: String,
-    tool: Tool,
-    args: Vec<String>,
-    /// The `docker exec` that runs the tool, until [`BackgroundTool::stop`] waits for it.
-    running: Option<timed_command::BackgroundCommand>,
-    printed_by: PhantomData<PrintedBy>,
-}
-
-impl<PrintedBy> BackgroundTool<PrintedBy> {
-    /// Stops the tool with SIGTERM, and returns what it printed, with [`Output::timeout`] set.
-    /// The tool prints its last lines, such as a producer's `tool_data`, as it stops.
-    ///
-    /// Panics if the tool exited before the test stopped it, or doesn't exit after SIGTERM.
-    #[track_caller]
-    pub fn stop(mut self) -> Output<PrintedBy> {
-        let mut running = self
-            .running
-            .take()
-            .expect("the tool runs until it is stopped");
-        let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
-
-        if running.has_exited() {
-            let finished = running.wait(GRACE).unwrap_or_else(|err| panic!("{err}"));
-            let output = Output::<PrintedBy>::new(self.tool, &args, finished, None);
-            panic!("the tool exited before the test stopped it: {output}");
-        }
-
-        let signalled = self.signal_timeout();
-        assert!(
-            matches!(&signalled, Ok(signalled) if signalled.code == Some(0)),
-            "couldn't stop `{} {}`: {signalled:?}",
-            self.tool.name(),
-            args.join(" ")
-        );
-
-        let finished = running.wait(GRACE).unwrap_or_else(|err| panic!("{err}"));
-
-        Output::new(
-            self.tool,
-            &args,
-            finished,
-            Some("the test stopped it".to_owned()),
-        )
-    }
-
-    /// Sends SIGTERM to the tool's `timeout`, which passes it on to the tool.
-    fn signal_timeout(&self) -> Result<timed_command::Finished, String> {
-        crate::broker::docker(&[
-            "exec",
-            &self.container,
-            "sh",
-            "-c",
-            "kill -TERM \"$(cat \"$0\")\"",
-            &self.pid_file,
-        ])
-    }
-}
-
-impl<PrintedBy> Drop for BackgroundTool<PrintedBy> {
-    /// Stops a tool that the test didn't stop, such as one whose test panicked, so that it doesn't
-    /// keep sending requests to a broker that the test stops.
-    fn drop(&mut self) {
-        if self.running.is_some() {
-            _ = self.signal_timeout();
-        }
-    }
-}
-
 /// A Kafka command-line tool in `/opt/kafka/bin` that the suite runs.
 #[derive(Clone, Copy, Debug)]
 enum Tool {
@@ -560,6 +482,7 @@ enum Tool {
     ConsumerGroups,
     DeleteRecords,
     GetOffsets,
+    ReassignPartitions,
     Topics,
     VerifiableConsumer,
     VerifiableProducer,
@@ -578,6 +501,7 @@ impl Tool {
             Self::ConsumerGroups => "kafka-consumer-groups",
             Self::DeleteRecords => "kafka-delete-records",
             Self::GetOffsets => "kafka-get-offsets",
+            Self::ReassignPartitions => "kafka-reassign-partitions",
             Self::Topics => "kafka-topics",
             Self::VerifiableConsumer => "kafka-verifiable-consumer",
             Self::VerifiableProducer => "kafka-verifiable-producer",
@@ -596,7 +520,29 @@ impl Tool {
             | Self::ConsumerGroups
             | Self::DeleteRecords
             | Self::GetOffsets
+            | Self::ReassignPartitions
             | Self::Topics => "--command-config",
+        }
+    }
+
+    /// Reads an event from one line that the tool printed as JSON, or returns `None` for a line
+    /// that isn't a JSON object, such as a warning that Kafka 4 tools print on stdout.
+    ///
+    /// Panics with the line if it is a JSON object that doesn't read as an `Event`, because then
+    /// the tool prints an event in a layout this reader doesn't know. Returning `None` would
+    /// make a test report a broker that lost the event.
+    #[track_caller]
+    fn read_json_event<Event: DeserializeOwned>(self, line: &str) -> Option<Event> {
+        let Ok(object @ serde_json::Value::Object(_)) = serde_json::from_str(line) else {
+            return None;
+        };
+
+        match serde_json::from_value(object) {
+            Ok(event) => Some(event),
+            Err(err) => panic!(
+                "{} printed an event that this reader doesn't know: {err}\n{line}",
+                self.name()
+            ),
         }
     }
 }
@@ -622,14 +568,15 @@ pub struct Output<PrintedBy = AnyCommand> {
 #[derive(Clone, Copy, Debug)]
 pub enum AnyCommand {}
 
-impl<PrintedBy> Output<PrintedBy> {
-    fn new(
+impl KafkaCli {
+    fn output<PrintedBy>(
+        &self,
         tool: Tool,
         args: &[&str],
         finished: timed_command::Finished,
         timeout: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> Output<PrintedBy> {
+        Output {
             command: format!("{} {}", tool.name(), args.join(" ")),
             code: finished.code,
             stdout: finished.stdout,
@@ -638,12 +585,14 @@ impl<PrintedBy> Output<PrintedBy> {
             printed_by: PhantomData,
         }
     }
+}
 
-    /// Returns the output of a tool that printed `stdout` and exited with 0.
+impl<PrintedBy> Output<PrintedBy> {
+    /// Returns what a tool printed on `stdout` when it exited with 0, for a reader's unit test.
     #[cfg(test)]
     fn printed(stdout: &str) -> Self {
         Self {
-            command: "tool".to_owned(),
+            command: "sample".to_owned(),
             code: Some(0),
             stdout: stdout.to_owned(),
             stderr: String::new(),
@@ -652,18 +601,13 @@ impl<PrintedBy> Output<PrintedBy> {
         }
     }
 
-    /// Parses each JSON line that a verifiable tool printed. Kafka 4 tools also print warnings on
-    /// stdout, so this function skips each line that isn't a JSON object. Panics on a JSON line
-    /// that it can't parse, because the tool then changed what it prints.
+    /// Reads each event that `tool`, a verifiable tool, printed on stdout, as
+    /// [`Tool::read_json_event`] does.
     #[track_caller]
-    fn json_events<Event: DeserializeOwned>(&self) -> impl Iterator<Item = Event> {
+    fn json_events<Event: DeserializeOwned>(&self, tool: Tool) -> impl Iterator<Item = Event> {
         self.stdout
             .lines()
-            .filter(|line| line.starts_with('{'))
-            .map(move |line| {
-                serde_json::from_str(line)
-                    .unwrap_or_else(|err| panic!("can't read {line:?}: {err}\n{self}"))
-            })
+            .filter_map(move |line| tool.read_json_event(line))
     }
 
     /// Asserts the tool exited with `code`, showing its output if not.

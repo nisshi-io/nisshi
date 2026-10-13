@@ -43,7 +43,7 @@ const EXPIRED_RECORD_COUNT: usize = 3;
 /// Produces `count` records to `topic` with a timestamp an hour old.
 fn produce_hour_old_records(cli: &KafkaCli, topic: &str, count: usize) {
     let an_hour_ago = now_in_millis() - 3_600_000;
-    let produced = cli.verifiable_produce_created_at(topic, count, an_hour_ago, None);
+    let produced = cli.verifiable_produce_created_at(topic, count, an_hour_ago, 0, None);
 
     assert_eq!(produced.acknowledged_record_count(), count, "{produced}");
 }

@@ -221,8 +221,9 @@ impl KafkaCli {
 }
 
 impl<PrintedBy: PrintsPartitionLines> Output<PrintedBy> {
-    /// Returns the record lines that the consumer printed, each as tab-separated fields starting with `Partition:` and ending with the value.
-    /// Other lines, such as the warnings that Kafka 4 tools print on stdout, are left out.
+    /// Returns the record lines that the consumer printed, each as tab-separated fields starting
+    /// with `Partition:` and ending with the value. Other lines, such as the warnings that Kafka 4
+    /// tools print on stdout, are left out.
     pub fn consumed_lines(&self) -> Vec<&str> {
         self.lines()
             .into_iter()

@@ -5,10 +5,15 @@ paths:
 
 ## What a smoke test checks
 
-The smoke suite checks that the real Kafka CLI tools work against Nisshi as a user runs them. A
-tool's exit code and printed text are all that the user sees, so a smoke test reads that text. The
-tools write the text for people, though. A test that reads more of it than it needs breaks when a
-Kafka release changes the wording, and it checks the tool instead of the broker.
+The smoke suite checks that the real Kafka CLI tools work against Nisshi as a user runs them.
+Nisshi develops the broker, not the tools, so a test asserts what the broker does, and never looks
+for a bug in a tool. A value that a tool shows from the broker's answer is a fact about the broker:
+the broker must send the tool what the tool needs to show the value correctly. A value that the
+tool computes or formats itself is a fact about the tool. When the tool only changes the broker's
+state, a test reads that state with `BrokerStateReader`. A tool's exit code and printed text are all
+that the user sees, so a smoke test reads that text. The tools write the text for people, though. A
+test that reads more of it than it needs breaks when a Kafka release changes the wording, and it
+checks the tool instead of the broker.
 
 ## Rules
 

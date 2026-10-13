@@ -88,11 +88,6 @@ pub(crate) fn spawn(
 }
 
 impl BackgroundCommand {
-    /// Returns whether the command has exited.
-    pub(crate) fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
-    }
-
     /// Waits for the command to exit, and kills it if it hasn't exited within `timeout`.
     pub(crate) fn wait(mut self, timeout: Duration) -> Result<Finished, String> {
         let status = wait(&mut self.child, timeout);
@@ -134,7 +129,8 @@ pub(crate) fn wait(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     }
 }
 
-fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
+/// Reads `pipe` to its end on a thread, and returns what it read.
+pub(crate) fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
     thread::spawn(move || {
         let mut buffer = Vec::new();
 

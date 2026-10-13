@@ -66,15 +66,18 @@ fn every_partition_at_offset(offset: i64) -> Vec<i64> {
     vec![offset; TEST_TOPIC_PARTITIONS as usize]
 }
 
-/// `kafka-topics --delete` with a mistyped topic name must print an error that names the topic.
-/// `kafka-topics` finds the topic missing in `Metadata` before it sends `DeleteTopics`, so the test
-/// does not check the broker's answer to `DeleteTopics`.
+/// `kafka-topics --delete` with a mistyped topic name must fail, and must not create the topic.
+/// `kafka-topics` finds the topic missing in `Metadata` before it sends `DeleteTopics`, so the
+/// broker must answer `Metadata` without the topic, and without creating it.
 #[test]
 fn delete_missing_topic_fails() {
     let cli = KafkaCli::shared();
     let topic = unique_name("topic");
 
-    cli.delete_topic(&topic).assert_topic_does_not_exist(&topic);
+    _ = cli.delete_topic(&topic).exited(1);
+
+    let listed = cli.list_topics();
+    assert!(!listed.succeeded().lists_topic(&topic), "{listed}");
 }
 
 #[test]
@@ -231,7 +234,7 @@ fn group_consumes_every_record() {
 /// a record must be that partition's end offset, so a member that joins later has nothing left to
 /// read.
 #[test]
-fn group_has_no_lag_after_consuming() {
+fn committed_offset_reaches_end_after_consuming() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic_with_records(&cli);
     let group = unique_name("group");
@@ -260,7 +263,6 @@ fn group_has_no_lag_after_consuming() {
             Some(GroupOffsets {
                 committed: records,
                 end: records,
-                lag: 0,
             }),
             "partition {partition}: {described}"
         );

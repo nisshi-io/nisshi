@@ -12,76 +12,121 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `kafka-verifiable-consumer`, which reports each record it consumes and each offset it commits.
+//! `kafka-verifiable-consumer`, which consumes as a member of a group and prints a JSON line for
+//! each change to its partitions, each poll, each record it reads and each offset it commits.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 
-use super::{BackgroundTool, KafkaCli, Output, StoredRecord, TOOL_TIMEOUT, Tool};
+use super::{BackgroundTool, KafkaCli, Output, StdoutLines, StoredRecord, TOOL_TIMEOUT, Tool};
 
-/// The consumer's session timeout, the lowest that a Kafka broker accepts by default.
-const SESSION_TIMEOUT_MILLIS: &str = "6000";
+/// The session timeout of a consumer that [`KafkaCli::verifiable_consume`] runs, the lowest that a
+/// Kafka broker accepts by default.
+const VERIFIABLE_CONSUME_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// The command of [`KafkaCli::verifiable_consume`]'s [`Output`].
+/// The command of [`KafkaCli::verifiable_consume`]'s [`Output`], and of
+/// [`KafkaCli::start_verifiable_consumer`]'s [`BackgroundTool`].
 #[derive(Clone, Copy, Debug)]
 pub enum VerifiableConsume {}
 
-/// A JSON line that `kafka-verifiable-consumer` prints. The `name` field selects the variant, and
-/// `Other` matches the lines that the tests don't read.
-#[derive(Deserialize)]
+/// A topic's partition.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TopicPartition {
+    pub topic: String,
+    pub partition: u32,
+}
+
+/// The offsets that a consumer read from one partition in one poll, from `min_offset` to
+/// `max_offset`, both included.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumedOffsets {
+    pub topic: String,
+    pub partition: u32,
+    pub min_offset: i64,
+    pub max_offset: i64,
+}
+
+/// A partition's offset in a commit: the next offset that the group reads there.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct CommittedOffset {
+    pub partition: u32,
+    pub offset: i64,
+}
+
+/// An event that `kafka-verifiable-consumer` prints.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "name", rename_all = "snake_case")]
-enum ConsumerEvent {
+pub enum ConsumerEvent {
+    /// The consumer joined its group, or finished a rebalance, and got `partitions`.
+    PartitionsAssigned { partitions: Vec<TopicPartition> },
+    /// The consumer gave up `partitions`, at the start of a rebalance or when it closes.
+    PartitionsRevoked { partitions: Vec<TopicPartition> },
+    /// The consumer read records in one poll.
+    RecordsConsumed { partitions: Vec<ConsumedOffsets> },
     /// A record that the consumer read. The tool prints this line only with `--verbose`.
     RecordData {
         value: String,
         partition: u32,
         offset: i64,
     },
-    /// A commit, with the next offset to read on each partition it committed.
+    /// A commit, with the next offset to read on each partition it committed, and the time the
+    /// consumer reported it, in milliseconds since the Unix epoch.
     OffsetsCommitted {
         timestamp: i64,
         offsets: Vec<CommittedOffset>,
         success: bool,
     },
+    /// An event that no test reads, such as `startup_complete`.
     #[serde(other)]
     Other,
 }
 
-#[derive(Deserialize)]
-struct CommittedOffset {
-    partition: u32,
-    offset: i64,
-}
-
-/// Returns the arguments of `kafka-verifiable-consumer`. Without `max_messages`, the consumer reads
-/// until it is stopped.
-fn verifiable_consumer_args(topic: &str, group: &str, max_messages: Option<usize>) -> Vec<String> {
-    let max_messages = max_messages.map(|max| max.to_string());
-
-    [
+/// Returns the arguments of `kafka-verifiable-consumer`. The consumer starts each partition at the
+/// group's committed offset, or at the beginning when the group has none, and commits after each
+/// poll. Without `max_messages`, it reads until it is stopped.
+fn verifiable_consumer_args(
+    topic: &str,
+    group: &str,
+    session_timeout: Duration,
+    group_instance_id: Option<&str>,
+    max_messages: Option<usize>,
+) -> Vec<String> {
+    let mut args = [
         "--topic",
         topic,
         "--group-id",
         group,
         "--verbose",
         "--session-timeout",
-        SESSION_TIMEOUT_MILLIS,
+        &session_timeout.as_millis().to_string(),
+        "--reset-policy",
+        "earliest",
     ]
-    .into_iter()
-    .chain(
-        max_messages
-            .iter()
-            .flat_map(|max| ["--max-messages", max.as_str()]),
-    )
     .map(ToOwned::to_owned)
-    .collect()
+    .to_vec();
+
+    if let Some(group_instance_id) = group_instance_id {
+        args.extend([
+            "--group-instance-id".to_owned(),
+            group_instance_id.to_owned(),
+        ]);
+    }
+
+    if let Some(max_messages) = max_messages {
+        args.extend(["--max-messages".to_owned(), max_messages.to_string()]);
+    }
+
+    args
 }
 
 impl KafkaCli {
     /// Reads `max_messages` records of `topic` with `kafka-verifiable-consumer`, as a member of
-    /// `group`. The consumer starts each partition at the group's committed offset, or at the
-    /// beginning when the group has none, and commits after each batch.
+    /// `group`.
     ///
     /// The harness stops a consumer that hasn't read `max_messages` records within a minute. This
     /// function then returns what the consumer read, with [`Output::timeout`] set, instead of
@@ -95,7 +140,13 @@ impl KafkaCli {
         group: &str,
         max_messages: usize,
     ) -> Output<VerifiableConsume> {
-        let args = verifiable_consumer_args(topic, group, Some(max_messages));
+        let args = verifiable_consumer_args(
+            topic,
+            group,
+            VERIFIABLE_CONSUME_SESSION_TIMEOUT,
+            None,
+            Some(max_messages),
+        );
 
         self.exec_until_timeout(
             Tool::VerifiableConsumer,
@@ -105,20 +156,104 @@ impl KafkaCli {
         )
     }
 
-    /// Starts a consumer that consumes `topic` with `kafka-verifiable-consumer`, as a member of
-    /// `group`, until the test stops it. The consumer starts each partition as
-    /// [`KafkaCli::verifiable_consume`] does.
-    pub fn start_verifiable_consume(
+    /// Starts `kafka-verifiable-consumer`, which consumes `topic` as a member of `group` until the
+    /// test stops it, as [`KafkaCli::verifiable_consume`] does, and prints a [`ConsumerEvent`]
+    /// per line.
+    ///
+    /// With a `group_instance_id`, the consumer is a static member: a consumer that restarts with
+    /// the same id within `session_timeout` gets its partitions back without a rebalance.
+    ///
+    /// Sends `FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `OffsetFetch`, `Fetch`,
+    /// `OffsetCommit` and `LeaveGroup`.
+    #[track_caller]
+    pub fn start_verifiable_consumer(
         &self,
         topic: &str,
         group: &str,
+        session_timeout: Duration,
+        group_instance_id: Option<&str>,
     ) -> BackgroundTool<VerifiableConsume> {
-        let args = verifiable_consumer_args(topic, group, None);
+        let args = verifiable_consumer_args(topic, group, session_timeout, group_instance_id, None);
 
         self.start(
             Tool::VerifiableConsumer,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )
+    }
+
+    /// Starts a consumer with [`KafkaCli::start_verifiable_consumer`], and waits until it has
+    /// joined `group` and has its partitions. Returns the consumer and its partitions.
+    ///
+    /// Panics with what the consumer printed if it does not have its partitions within
+    /// `join_timeout`.
+    #[track_caller]
+    pub fn join_group(
+        &self,
+        topic: &str,
+        group: &str,
+        session_timeout: Duration,
+        group_instance_id: Option<&str>,
+        join_timeout: Duration,
+    ) -> (BackgroundTool<VerifiableConsume>, Vec<TopicPartition>) {
+        let mut member =
+            self.start_verifiable_consumer(topic, group, session_timeout, group_instance_id);
+
+        match member.wait_for_partitions_assigned(0, join_timeout) {
+            Ok(partitions) => (member, partitions),
+            Err(reason) => panic!("the consumer didn't join {group}: {reason}"),
+        }
+    }
+}
+
+impl BackgroundTool<VerifiableConsume> {
+    /// Waits until the consumer prints a `partitions_assigned` event on a stdout line at or after
+    /// `from_line`, and returns the assigned partitions. The consumer prints
+    /// the event when it has joined its group and has its partitions. Returns an error with what
+    /// the consumer printed if the consumer does not print the event within `timeout`, or exits
+    /// before it does.
+    pub fn wait_for_partitions_assigned(
+        &mut self,
+        from_line: usize,
+        timeout: Duration,
+    ) -> Result<Vec<TopicPartition>, String> {
+        self.wait_for_line(
+            from_line,
+            timeout,
+            |stdout_line| match ConsumerEvent::parse(&stdout_line.line) {
+                Some(ConsumerEvent::PartitionsAssigned { partitions }) => Some(partitions),
+                _ => None,
+            },
+        )
+    }
+
+    /// Waits until the consumer prints a `records_consumed` event on a stdout line at or after
+    /// `from_line`. Returns an error with what the consumer printed if the consumer does not print
+    /// the event within `timeout`, or exits before it does.
+    pub fn wait_for_records_consumed(
+        &mut self,
+        from_line: usize,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.wait_for_line(from_line, timeout, |stdout_line| {
+            matches!(
+                ConsumerEvent::parse(&stdout_line.line),
+                Some(ConsumerEvent::RecordsConsumed { .. })
+            )
+            .then_some(())
+        })
+    }
+}
+
+impl StdoutLines<VerifiableConsume> {
+    /// Returns each event the consumer printed, with the time at which the harness read it, in the
+    /// order the consumer printed them.
+    pub fn consumer_events(&self) -> Vec<(Instant, ConsumerEvent)> {
+        self.lines
+            .iter()
+            .filter_map(|stdout_line| {
+                ConsumerEvent::parse(&stdout_line.line).map(|event| (stdout_line.read_at, event))
+            })
+            .collect()
     }
 }
 
@@ -126,7 +261,7 @@ impl Output<VerifiableConsume> {
     /// Returns each record the consumer read, in the order it printed them.
     #[track_caller]
     pub fn consumed_records(&self) -> Vec<StoredRecord> {
-        self.json_events::<ConsumerEvent>()
+        self.json_events::<ConsumerEvent>(Tool::VerifiableConsumer)
             .filter_map(|event| match event {
                 ConsumerEvent::RecordData {
                     value,
@@ -137,7 +272,7 @@ impl Output<VerifiableConsume> {
                     offset,
                     value,
                 }),
-                ConsumerEvent::OffsetsCommitted { .. } | ConsumerEvent::Other => None,
+                _ => None,
             })
             .collect()
     }
@@ -148,7 +283,7 @@ impl Output<VerifiableConsume> {
     pub fn last_acknowledged_commits_before(&self, reported_before: i64) -> BTreeMap<u32, i64> {
         let mut commits = BTreeMap::new();
 
-        for event in self.json_events::<ConsumerEvent>() {
+        for event in self.json_events::<ConsumerEvent>(Tool::VerifiableConsumer) {
             if let ConsumerEvent::OffsetsCommitted {
                 timestamp,
                 offsets,
@@ -166,11 +301,21 @@ impl Output<VerifiableConsume> {
     }
 }
 
+impl ConsumerEvent {
+    /// Reads an event from one of the consumer's lines, as [`Tool::read_json_event`] does.
+    #[track_caller]
+    fn parse(line: &str) -> Option<Self> {
+        Tool::VerifiableConsumer.read_json_event(line)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{Output, StoredRecord, VerifiableConsume};
+    use super::{
+        ConsumedOffsets, ConsumerEvent, Output, StoredRecord, TopicPartition, VerifiableConsume,
+    };
 
     /// What `kafka-verifiable-consumer` 3.9 printed with `--verbose`, shortened, plus a failed
     /// commit.
@@ -209,6 +354,53 @@ mod tests {
             Output::<VerifiableConsume>::printed(PRINTED)
                 .last_acknowledged_commits_before(1791572898535),
             BTreeMap::new()
+        );
+    }
+
+    #[test]
+    fn events_are_parsed_and_other_lines_left_out() {
+        let lines = [
+            r#"{"timestamp":1791395908729,"name":"partitions_assigned","partitions":[{"topic":"t1","partition":0}]}"#,
+            r#"{"timestamp":1791395908781,"name":"records_consumed","count":5,"partitions":[{"topic":"t1","partition":2,"count":5,"minOffset":0,"maxOffset":4}]}"#,
+            r#"{"timestamp":1791395908791,"name":"offsets_committed","offsets":[],"success":true}"#,
+            "WARNING: something is deprecated",
+            "{not an event, although the line starts with a brace",
+        ];
+
+        assert_eq!(
+            lines
+                .into_iter()
+                .filter_map(ConsumerEvent::parse)
+                .collect::<Vec<_>>(),
+            [
+                ConsumerEvent::PartitionsAssigned {
+                    partitions: vec![TopicPartition {
+                        topic: "t1".to_owned(),
+                        partition: 0
+                    }],
+                },
+                ConsumerEvent::RecordsConsumed {
+                    partitions: vec![ConsumedOffsets {
+                        topic: "t1".to_owned(),
+                        partition: 2,
+                        min_offset: 0,
+                        max_offset: 4,
+                    }],
+                },
+                ConsumerEvent::OffsetsCommitted {
+                    timestamp: 1791395908791,
+                    offsets: Vec::new(),
+                    success: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "printed an event that this reader doesn't know")]
+    fn event_without_the_fields_this_reader_needs_panics() {
+        _ = ConsumerEvent::parse(
+            r#"{"timestamp":1791395908781,"name":"records_consumed","count":5,"partitions":[{"topic":"t1","partition":2,"count":5,"firstOffset":0,"lastOffset":4}]}"#,
         );
     }
 }

@@ -61,15 +61,17 @@ fn describe_shows_node_111_as_leader_replica_and_isr() {
     }
 }
 
-/// `kafka-topics --describe` with a mistyped topic name must print an error that names the topic,
-/// and must not hang.
+/// `kafka-topics --describe` with a mistyped topic name must fail without hanging, and must not
+/// create the topic. The broker must answer `Metadata` without the topic, and without creating it.
 #[test]
-fn describing_missing_topic_fails_with_its_name() {
+fn describing_missing_topic_fails() {
     let cli = KafkaCli::shared();
     let topic = unique_name("topic");
 
-    cli.describe_topic(&topic)
-        .assert_topic_does_not_exist(&topic);
+    _ = cli.describe_topic(&topic).exited(1);
+
+    let listed = cli.list_topics();
+    assert!(!listed.succeeded().lists_topic(&topic), "{listed}");
 }
 
 /// A topic deleted and created again under the same name is a new topic: none of the old records

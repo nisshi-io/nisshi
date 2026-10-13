@@ -29,9 +29,10 @@
 //! test hasn't failed.
 
 use std::{
+    collections::VecDeque,
     fmt,
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, BufRead, BufReader},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -378,11 +379,11 @@ impl Broker {
 
     /// Stops a broker this test launched, failing if it exited before now, didn't exit with 0 on
     /// SIGTERM, or logged a panic. Dropping the broker does the same.
-    pub fn stop(mut self) -> Result<(), String> {
+    pub fn stop(mut self) -> Result<(), StopFailure> {
         self.shutdown()
     }
 
-    fn shutdown(&mut self) -> Result<(), String> {
+    fn shutdown(&mut self) -> Result<(), StopFailure> {
         let Some(deployment) = self.deployment.take() else {
             return Ok(());
         };
@@ -510,48 +511,40 @@ impl Deployment {
     }
 
     /// Stops the broker and checks it. Returns the files and options too, for a restart.
-    fn stop(self, shutdown: Shutdown) -> (Result<(), String>, BrokerFiles, LaunchOptions) {
-        let mut failures = Vec::new();
+    fn stop(self, shutdown: Shutdown) -> (Result<(), StopFailure>, BrokerFiles, LaunchOptions) {
+        let mut reasons = Vec::new();
 
         match self.host {
             Host::Process(mut child) => {
-                stop_process(&mut child, shutdown, &mut failures);
+                stop_process(&mut child, shutdown, &mut reasons);
                 _ = fs::remove_file(self.files.dir.join(PID_FILE));
             }
 
             Host::Container { name } => {
-                stop_container(&name, shutdown, &self.log, &mut failures);
+                stop_container(&name, shutdown, &self.log, &mut reasons);
                 remove_container(&name);
             }
         }
 
-        let log = fs::read_to_string(&self.log).unwrap_or_else(|err| {
-            failures.push(format!(
+        let mut last_log_lines = VecDeque::with_capacity(StopFailure::QUOTED_LOG_LINES);
+
+        match first_panic_in_log(&self.log, &mut last_log_lines) {
+            Ok(Some(panic)) => reasons.push(format!("broker panicked: {panic}")),
+            Ok(None) => {}
+            Err(err) => reasons.push(format!(
                 "couldn't read {} to check for a panic: {err}",
                 self.log.display()
-            ));
-            String::new()
-        });
-
-        if let Some(line) = log.lines().find(|line| line.contains("panicked at")) {
-            failures.push(format!("broker panicked: {line}"));
+            )),
         }
 
-        let result = if failures.is_empty() {
+        let result = if reasons.is_empty() {
             Ok(())
         } else {
-            let lines = log.lines().collect::<Vec<_>>();
-            let tail = lines[lines.len().saturating_sub(40)..]
-                .iter()
-                .map(|line| without_colour(line))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            Err(format!(
-                "{}\nlast lines of {}:\n{tail}",
-                failures.join("\n"),
-                self.log.display()
-            ))
+            Err(StopFailure {
+                reasons,
+                log: self.log.clone(),
+                last_log_lines,
+            })
         };
 
         (result, self.files, self.options)
@@ -750,6 +743,63 @@ fn broker_args(options: &LaunchOptions) -> Vec<String> {
     }
 
     args
+}
+
+/// Why a broker failed its checks when it stopped, with the last lines of its log, which show what
+/// the broker was doing.
+#[derive(Debug)]
+pub struct StopFailure {
+    reasons: Vec<String>,
+    log: PathBuf,
+    last_log_lines: VecDeque<String>,
+}
+
+impl StopFailure {
+    /// How many of the broker log's last lines a stop failure quotes.
+    const QUOTED_LOG_LINES: usize = 40;
+}
+
+impl fmt::Display for StopFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "{}", self.reasons.join("\n"))?;
+        write!(formatter, "last lines of {}:", self.log.display())?;
+
+        for line in &self.last_log_lines {
+            write!(formatter, "\n{}", without_colour(line))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Returns the first line of the broker's log at `log` that reports a panic, and keeps the log's
+/// last [`StopFailure::QUOTED_LOG_LINES`] lines in `last_log_lines`. The function reads the log
+/// one line at a time instead of all at once, because a broker that logs at debug level writes
+/// gigabytes in one run.
+fn first_panic_in_log(
+    log: &Path,
+    last_log_lines: &mut VecDeque<String>,
+) -> io::Result<Option<String>> {
+    let mut reader = BufReader::new(File::open(log)?);
+    let mut first_panic = None;
+    let mut bytes = Vec::new();
+
+    while reader.read_until(b'\n', &mut bytes)? > 0 {
+        // The broker can log bytes that aren't UTF-8, such as a record's value.
+        let line = String::from_utf8_lossy(&bytes).trim_end().to_owned();
+        bytes.clear();
+
+        if first_panic.is_none() && line.contains("panicked at") {
+            first_panic = Some(line.clone());
+        }
+
+        if last_log_lines.len() == StopFailure::QUOTED_LOG_LINES {
+            _ = last_log_lines.pop_front();
+        }
+        last_log_lines.push_back(line);
+    }
+
+    Ok(first_panic)
 }
 
 fn launch_process(options: &LaunchOptions, dir: &Path, log: &Path) -> Result<Host, String> {
@@ -1019,7 +1069,7 @@ fn save_logs(name: &str, log: &Path) -> Result<(), String> {
         return Err(format!("docker logs {name}: {}", logs.stderr.trim()));
     }
 
-    fs::write(log, logs.stdout + &logs.stderr)
+    fs::write(log, logs.stdout + logs.stderr.as_str())
         .map_err(|err| format!("couldn't write {}: {err}", log.display()))
 }
 
@@ -1071,7 +1121,54 @@ fn without_colour(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailedStart, without_colour};
+    use std::{collections::VecDeque, env, fs, path::PathBuf};
+
+    use super::{FailedStart, StopFailure, first_panic_in_log, without_colour};
+    use crate::unique_name;
+
+    /// Writes `log` to a new file in the system's temporary directory, and returns its path.
+    fn log_file(log: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("{}.log", unique_name("broker")));
+        fs::write(&path, log).expect("the test writes its log file");
+        path
+    }
+
+    #[test]
+    fn clean_log_has_no_panic() {
+        let log = log_file("started\nstopped\n");
+        let mut last_log_lines = VecDeque::new();
+
+        assert_eq!(
+            first_panic_in_log(&log, &mut last_log_lines).expect("the test reads its log file"),
+            None
+        );
+        assert_eq!(last_log_lines, ["started", "stopped"]);
+
+        _ = fs::remove_file(log);
+    }
+
+    #[test]
+    fn first_panic_is_found_and_only_the_last_lines_are_kept() {
+        let mut lines = vec!["thread 'a' panicked at src/a.rs:1:1:".to_owned()];
+        lines.extend((0..StopFailure::QUOTED_LOG_LINES).map(|index| format!("line {index}")));
+        lines.push("thread 'b' panicked at src/b.rs:2:2:".to_owned());
+        let log = log_file(&lines.join("\n"));
+        let mut last_log_lines = VecDeque::new();
+
+        assert_eq!(
+            first_panic_in_log(&log, &mut last_log_lines)
+                .expect("the test reads its log file")
+                .as_deref(),
+            Some("thread 'a' panicked at src/a.rs:1:1:")
+        );
+        assert_eq!(last_log_lines.len(), StopFailure::QUOTED_LOG_LINES);
+        assert_eq!(
+            last_log_lines.back().map(String::as_str),
+            Some("thread 'b' panicked at src/b.rs:2:2:")
+        );
+
+        _ = fs::remove_file(log);
+    }
 
     #[test]
     fn colour_codes_are_removed() {

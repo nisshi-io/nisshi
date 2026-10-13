@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nisshi_smoke_test::{DescribeGroupState, KafkaCli, Output, unique_name};
+use nisshi_smoke_test::{DescribeGroupState, GroupState, KafkaCli, Output, unique_name};
 
 /// Waits until `group` is `Stable`, so its members have their assignments. Returns the group's
 /// last state as an error if it isn't stable after a minute.
@@ -30,7 +30,7 @@ fn wait_until_stable(cli: &KafkaCli, group: &str) -> Result<(), Output<DescribeG
     loop {
         let state = cli.describe_group_state(group);
 
-        if state.code == Some(0) && state.group_state(group) == Some("Stable") {
+        if state.code == Some(0) && state.group_state(group) == Some(GroupState::Stable) {
             return Ok(());
         }
 

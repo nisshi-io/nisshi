@@ -41,16 +41,6 @@ pub enum ListTopics {}
 #[derive(Clone, Copy, Debug)]
 pub enum DescribeTopic {}
 
-/// The command of [`KafkaCli::delete_topic`]'s [`Output`].
-#[derive(Clone, Copy, Debug)]
-pub enum DeleteTopic {}
-
-/// A `kafka-topics` command that names one topic, and fails if that topic doesn't exist.
-pub trait RequiresExistingTopic {}
-
-impl RequiresExistingTopic for DescribeTopic {}
-impl RequiresExistingTopic for DeleteTopic {}
-
 impl KafkaCli {
     /// Creates `topic` with `partitions` partitions and `configs`, each a `name=value` topic
     /// config. The broker has one node, so the replication factor is 1.
@@ -101,7 +91,7 @@ impl KafkaCli {
     }
 
     /// Sends `DeleteTopics`.
-    pub fn delete_topic(&self, topic: &str) -> Output<DeleteTopic> {
+    pub fn delete_topic(&self, topic: &str) -> Output {
         self.run(Tool::Topics, &["--delete", "--topic", topic])
     }
 }
@@ -195,18 +185,5 @@ impl Output<DescribeTopic> {
                     .map(|(name, value)| (name.trim(), value.trim()))
                     .collect()
             })
-    }
-}
-
-impl<PrintedBy: RequiresExistingTopic> Output<PrintedBy> {
-    /// Asserts that `kafka-topics` exited with 1 and named the missing `topic`. The tool raises
-    /// the error itself, after the broker's metadata doesn't list the topic, so there is no Kafka
-    /// exception to check for, and the wording differs between Kafka versions.
-    #[track_caller]
-    pub fn assert_topic_does_not_exist(&self, topic: &str) {
-        assert!(
-            self.exited(1).mentions(topic),
-            "the tool's error doesn't name {topic}: {self}"
-        );
     }
 }

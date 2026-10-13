@@ -6180,10 +6180,15 @@ name = "nisshi-smoke-test"
 version = "0.7.0-pre.3"
 dependencies = [
  "clap",
+ "humantime",
  "nanoid",
+ "nisshi-client",
+ "nisshi-sans-io",
  "rand 0.10.3",
  "serde",
  "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]

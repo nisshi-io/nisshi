@@ -24,9 +24,6 @@ use super::{BackgroundTool, KafkaCli, Output, TOOL_TIMEOUT, Tool};
 #[derive(Clone, Copy, Debug)]
 pub enum VerifiableProduce {}
 
-/// What `kafka-verifiable-producer` prints in the JSON line for each record the broker acknowledges.
-const ACKNOWLEDGED_RECORD_MARKER: &str = r#""name":"producer_send_success""#;
-
 /// A record's value, partition and offset, as the broker acknowledged it to a producer or as a
 /// consumer read it. Records sort by partition, then offset.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,7 +44,7 @@ pub enum SendResult {
 
 /// A JSON line that `kafka-verifiable-producer` prints. The `name` field selects the variant, and
 /// `Other` matches the lines that the tests don't read.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "name", rename_all = "snake_case")]
 enum ProducerEvent {
     ProducerSendSuccess {
@@ -97,7 +94,7 @@ fn verifiable_producer_args(
 }
 
 /// When a producer counts a record as sent. The names match the broker's `Ack`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Acks {
     /// When the record is written to the network, without a response from the broker.
     None,
@@ -160,6 +157,11 @@ impl KafkaCli {
 
     /// Starts a producer that sends `throughput` records a second to `topic` with
     /// [`Acks::FullIsr`], until the test stops it. Record `n`'s value is `<value_prefix>.<n>`.
+    ///
+    /// The producer repeats a fixed set of keys, so that the records spread over the topic's
+    /// partitions. A producer without keys writes to one partition until it fills a batch, which
+    /// takes minutes at a few records a second.
+    #[track_caller]
     pub fn start_verifiable_produce(
         &self,
         topic: &str,
@@ -172,7 +174,7 @@ impl KafkaCli {
             None,
             Acks::FullIsr,
             value_prefix,
-            &["--throughput", &throughput],
+            &["--throughput", &throughput, "--repeating-keys", "30"],
         );
 
         self.start(
@@ -184,17 +186,16 @@ impl KafkaCli {
     /// Produces `max_messages` records timestamped about `create_time_millis`, so a test can
     /// produce records that are already older than a topic's `retention.ms`.
     ///
-    /// Record `n`'s value is `0.<n>`. With `repeating_keys` of 2, the keys are `0`, `1`, `0`, `1`,
-    /// and so on; without it, the records have no keys.
+    /// Record `n`'s value is `<value_prefix>.<n>`. With `repeating_keys` of 2, the keys are `0`,
+    /// `1`, `0`, `1`, and so on; without it, the records have no keys.
     pub fn verifiable_produce_created_at(
         &self,
         topic: &str,
         max_messages: usize,
         create_time_millis: i64,
+        value_prefix: u32,
         repeating_keys: Option<usize>,
     ) -> Output<VerifiableProduce> {
-        const VALUE_PREFIX: u32 = 0;
-
         let create_time_millis = create_time_millis.to_string();
         let mut args = vec!["--message-create-time", &create_time_millis];
 
@@ -207,7 +208,7 @@ impl KafkaCli {
             topic,
             max_messages,
             Acks::FullIsr,
-            VALUE_PREFIX,
+            value_prefix,
             &args,
             TOOL_TIMEOUT,
         )
@@ -257,11 +258,20 @@ impl Output<VerifiableProduce> {
     /// Returns how many records the producer says the broker acknowledged.
     #[track_caller]
     pub fn acknowledged_record_count(&self) -> usize {
-        self.succeeded()
-            .lines()
-            .iter()
-            .filter(|line| line.contains(ACKNOWLEDGED_RECORD_MARKER))
-            .count()
+        // The function parses each line in its body, not in a closure, so that a line that
+        // `ProducerEvent::parse` doesn't know reports the test's line.
+        let mut acknowledged_record_count = 0;
+
+        for line in self.succeeded().lines() {
+            if matches!(
+                ProducerEvent::parse(line),
+                Some(ProducerEvent::ProducerSendSuccess { .. })
+            ) {
+                acknowledged_record_count += 1;
+            }
+        }
+
+        acknowledged_record_count
     }
 
     /// Returns each record that the producer says the broker acknowledged, in the order it printed
@@ -281,7 +291,7 @@ impl Output<VerifiableProduce> {
     /// Each result comes with the time the producer reported it (ms since the Unix epoch).
     #[track_caller]
     pub fn send_results_with_report_times(&self) -> Vec<(i64, SendResult)> {
-        self.json_events::<ProducerEvent>()
+        self.json_events::<ProducerEvent>(Tool::VerifiableProducer)
             .filter_map(|event| match event {
                 ProducerEvent::ProducerSendSuccess {
                     timestamp,
@@ -308,11 +318,19 @@ impl Output<VerifiableProduce> {
     /// exits. Returns `None` when that line is missing.
     #[track_caller]
     pub fn sent_count(&self) -> Option<usize> {
-        self.json_events::<ProducerEvent>()
+        self.json_events::<ProducerEvent>(Tool::VerifiableProducer)
             .find_map(|event| match event {
                 ProducerEvent::ToolData { sent } => Some(sent),
                 _ => None,
             })
+    }
+}
+
+impl ProducerEvent {
+    /// Reads an event from one of the producer's lines, as [`Tool::read_json_event`] does.
+    #[track_caller]
+    fn parse(line: &str) -> Option<Self> {
+        Tool::VerifiableProducer.read_json_event(line)
     }
 }
 

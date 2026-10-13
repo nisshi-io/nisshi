@@ -153,7 +153,7 @@ fn compact_delete_policy_compacts_and_deletes_expired_records() {
     let an_hour_ago = now_in_millis() - 3_600_000;
     // Each record has a key of its own, `0` and `1`, because Kafka refuses a record without a key
     // on a compacted topic.
-    let produced = cli.verifiable_produce_created_at(&topic, 2, an_hour_ago, Some(2));
+    let produced = cli.verifiable_produce_created_at(&topic, 2, an_hour_ago, 0, Some(2));
     assert_eq!(produced.acknowledged_record_count(), 2, "{produced}");
     _ = cli.produce_keyed(&topic, &[("new", Some("v2")), ("new", Some("v3"))]);
 

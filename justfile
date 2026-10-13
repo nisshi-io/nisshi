@@ -583,9 +583,10 @@ compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build
     trap 'kill ${broker}' EXIT
     BROKER_PID=${broker} ./compat/franz-go/run.sh
 
-# run the Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3 (needs Docker; starts its own broker and services)
-smoke engine:
-    nisshi-smoke-test/run.sh {{ engine }}
+# run the Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3 (needs Docker; starts its own broker and services); passes extra arguments to `cargo nextest run`
+[positional-arguments]
+smoke engine *nextest_args:
+    nisshi-smoke-test/run.sh "$@"
 
 compat-franz-go-test tests timeout="600s" count="1":
     #!/usr/bin/env bash

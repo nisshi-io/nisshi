@@ -20,8 +20,8 @@
 use std::{collections::BTreeSet, thread};
 
 use nisshi_smoke_test::{
-    Acks, ConsumedRecord, KafkaCli, LOG_APPEND_TIME, RECORD_TOO_LARGE_EXCEPTION, now_in_millis,
-    verifiable_producer_values,
+    Acks, ConsumedRecord, KafkaCli, LOG_APPEND_TIME, PRINTED_NULL, RECORD_TOO_LARGE_EXCEPTION,
+    now_in_millis, verifiable_producer_values,
 };
 
 /// A topic's `max.message.bytes`, the largest record batch the broker accepts for it.
@@ -63,7 +63,11 @@ fn values_without_keys_read_back() {
             .iter()
             .map(|record| (record.key.as_str(), record.value.as_str()))
             .collect::<Vec<_>>(),
-        [("null", "one"), ("null", "two"), ("null", "three")]
+        [
+            (PRINTED_NULL, "one"),
+            (PRINTED_NULL, "two"),
+            (PRINTED_NULL, "three")
+        ]
     );
 }
 
@@ -81,7 +85,7 @@ fn tombstone_reads_back_as_null() {
             .iter()
             .map(|record| (record.key.as_str(), record.value.as_str()))
             .collect::<Vec<_>>(),
-        [("k0", "v0"), ("k1", "null")]
+        [("k0", "v0"), ("k1", PRINTED_NULL)]
     );
 }
 
@@ -94,7 +98,12 @@ fn stores_every_record(acks: Acks) {
     let count = 100;
 
     let produced = cli.verifiable_produce(&topic, count, acks, 0);
-    assert_eq!(produced.acknowledged_record_count(), count, "{produced}");
+
+    // With `acks=0` the producer counts a record as sent without an answer from the broker, so the
+    // count says nothing about the broker.
+    if acks != Acks::None {
+        assert_eq!(produced.acknowledged_record_count(), count, "{produced}");
+    }
 
     assert_eq!(
         record_values(&read_all_records(&cli, &topic, count)),

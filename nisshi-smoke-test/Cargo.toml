@@ -26,9 +26,16 @@ sqlite = []
 [dependencies]
 clap.workspace = true
 nanoid.workspace = true
+nisshi-client.workspace = true
+nisshi-sans-io.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+humantime.workspace = true
 
 [lints]
 workspace = true

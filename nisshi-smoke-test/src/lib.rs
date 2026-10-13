@@ -29,6 +29,7 @@ use std::{
 use nanoid::nanoid;
 
 pub mod broker;
+mod broker_state_reader;
 mod kafka_cli;
 mod postgres;
 mod record;
@@ -37,13 +38,16 @@ mod storage_url;
 mod timed_command;
 
 pub use broker::{Broker, FREQUENT_MAINTENANCE, LaunchOptions, ReservedPort};
+pub use broker_state_reader::BrokerStateReader;
 pub use kafka_cli::{
-    Acks, AnyCommand, ApiVersions, BackgroundTool, ClusterId, Consume, ConsumeMatching,
-    ConsumedRecord, CreateTopic, DeleteRecords, DeleteTopic, DescribeConfigs, DescribeGroup,
-    DescribeGroupState, DescribeTopic, DescribeUsers, GetOffsets, GroupOffsets, KafkaCli,
-    LOG_APPEND_TIME, ListTopics, Output, PRINTED_NULL, PartitionReplicas, PrintsPartitionLines,
-    RECORD_TOO_LARGE_EXCEPTION, RequiresExistingTopic, SASL_AUTHENTICATION_EXCEPTION, ScramLogin,
-    ScramMechanism, SendResult, StoredRecord, TOPIC_EXISTS_EXCEPTION,
+    Acks, AnyCommand, ApiVersions, BackgroundTool, ClusterId, CommittedOffset, Consume,
+    ConsumeMatching, ConsumedOffsets, ConsumedRecord, ConsumerEvent, CreateTopic, DeleteRecords,
+    DescribeConfigs, DescribeGroup, DescribeGroupMembers, DescribeGroupState, DescribeTopic,
+    DescribeUsers, GROUP_ID_NOT_FOUND_EXCEPTION, GROUP_NOT_EMPTY_EXCEPTION, GetOffsets,
+    GroupOffsets, GroupState, KafkaCli, LOG_APPEND_TIME, ListGroups, ListGroupsInState, ListTopics,
+    Output, PRINTED_NULL, PartitionReplicas, PrintedLine, PrintsPartitionLines,
+    RECORD_TOO_LARGE_EXCEPTION, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism,
+    SendResult, StdoutLines, StoredRecord, TOPIC_EXISTS_EXCEPTION, TopicPartition,
     UNSUPPORTED_VERSION_EXCEPTION, VerifiableConsume, VerifiableProduce,
     verifiable_producer_values,
 };

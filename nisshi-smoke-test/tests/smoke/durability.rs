@@ -49,6 +49,9 @@ mod support {
     /// How long a test waits for a consumer to join its group and commit.
     pub(super) const CONSUMER_COMMIT_WAIT: Duration = Duration::from_secs(25);
 
+    /// The session timeout of the consumers, the lowest that a Kafka broker accepts by default.
+    pub(super) const CONSUMER_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
+
     /// How many records [`assert_group_resumes_where_it_committed`] produces, for the group to read
     /// when it rejoins.
     const RECORDS_FOR_RETURNING_GROUP: usize = 30;
@@ -307,8 +310,8 @@ mod restart_under_load {
     use nisshi_smoke_test::{Broker, KafkaCli, unique_name};
 
     use super::support::{
-        CLIENT_TIMEOUT, PARTITIONS_PER_TOPIC, assert_group_resumes_where_it_committed,
-        assert_log_keeps, wait_for_commit,
+        CLIENT_TIMEOUT, CONSUMER_SESSION_TIMEOUT, PARTITIONS_PER_TOPIC,
+        assert_group_resumes_where_it_committed, assert_log_keeps, wait_for_commit,
     };
 
     /// How many records a second the producer sends.
@@ -352,7 +355,8 @@ mod restart_under_load {
         // The test stops the consumer before the restart, instead of letting it run across the
         // restart. A consumer that runs on would commit again after the restart, and the new
         // commits would hide a commit that the restart lost.
-        let consumer = cli.start_verifiable_consume(&topic, &group);
+        let consumer =
+            cli.start_verifiable_consumer(&topic, &group, CONSUMER_SESSION_TIMEOUT, None);
         wait_for_commit(&cli, &group, &topic);
         let consumed = consumer.stop();
 
@@ -418,8 +422,9 @@ mod postgres_outage {
     };
 
     use super::support::{
-        CLIENT_TIMEOUT, PARTITIONS_PER_TOPIC, assert_group_resumes_where_it_committed,
-        assert_log_keeps, wait_for_commit, wait_until_group_caught_up,
+        CLIENT_TIMEOUT, CONSUMER_SESSION_TIMEOUT, PARTITIONS_PER_TOPIC,
+        assert_group_resumes_where_it_committed, assert_log_keeps, wait_for_commit,
+        wait_until_group_caught_up,
     };
 
     /// How long each storage outage lasts.
@@ -511,7 +516,7 @@ mod postgres_outage {
         let records = OUTAGE_PRODUCER_RECORDS_PER_SECOND as usize
             * OUTAGE_PRODUCER_SENDS_FOR.as_secs() as usize;
 
-        let consumer = cli.start_verifiable_consume(topic, &group);
+        let consumer = cli.start_verifiable_consumer(topic, &group, CONSUMER_SESSION_TIMEOUT, None);
         wait_for_commit(cli, &group, topic);
 
         let (produced, outage_started_at, outage_ended_at) = thread::scope(|scope| {

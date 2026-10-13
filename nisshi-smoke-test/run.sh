@@ -2,7 +2,10 @@
 #
 # Runs the smoke suite (nisshi-smoke-test) against one storage engine:
 #
-#   nisshi-smoke-test/run.sh <postgres|sqlite|memory|s3>
+#   nisshi-smoke-test/run.sh <postgres|sqlite|memory|s3> [nextest arguments...]
+#
+# The script passes extra arguments to `cargo nextest run`, such as a filter
+# that selects some of the tests: -E 'test(/^group_rebalance::/)'.
 #
 # It starts what the engine needs under its own compose project, then the
 # shared broker (NISSHI_SMOKE_IMAGE if set, otherwise NISSHI_SMOKE_BIN or a
@@ -38,8 +41,9 @@ case "${engine}" in
     sqlite) feature=libsql storage=sqlite://nisshi.db services='' ;;
     memory) feature=dynostore storage=memory://nisshi/ services='' ;;
     s3) feature=dynostore storage=s3://nisshi/ services=minio ;;
-    *) echo "usage: nisshi-smoke-test/run.sh <postgres|sqlite|memory|s3>" >&2; exit 2 ;;
+    *) echo "usage: nisshi-smoke-test/run.sh <postgres|sqlite|memory|s3> [nextest arguments...]" >&2; exit 2 ;;
 esac
+shift
 
 target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 results=${target_dir}/smoke
@@ -289,7 +293,7 @@ set +e
 "${target_dir}/debug/smoke-broker" -- \
     cargo nextest run -p nisshi-smoke-test --features "${engine}" --profile "${profile}" --run-ignored "${run_ignored}" \
         --no-tests=fail \
-        --color never --status-level all --final-status-level none \
+        --color never --status-level all --final-status-level none "$@" \
     2>&1 | tee "${results}/nextest-${leg}.log"
 status=${PIPESTATUS[0]}
 set -e
