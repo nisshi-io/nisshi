@@ -40,6 +40,23 @@ pub(crate) fn run(
     input: Option<&str>,
     timeout: Duration,
 ) -> Result<Finished, String> {
+    spawn(command, input)?.wait(timeout)
+}
+
+/// A command that runs in the background, from [`spawn`].
+#[derive(Debug)]
+pub(crate) struct BackgroundCommand {
+    description: String,
+    child: Child,
+    stdout: thread::JoinHandle<String>,
+    stderr: thread::JoinHandle<String>,
+}
+
+/// Starts `command`, with `input` on its stdin, and returns without waiting for it.
+pub(crate) fn spawn(
+    command: &mut Command,
+    input: Option<&str>,
+) -> Result<BackgroundCommand, String> {
     let mut child = command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -62,21 +79,39 @@ pub(crate) fn run(
         drop(thread::spawn(move || stdin.write_all(input.as_bytes())));
     }
 
-    let status = wait(&mut child, timeout);
+    Ok(BackgroundCommand {
+        description: format!("{command:?}"),
+        child,
+        stdout,
+        stderr,
+    })
+}
 
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+impl BackgroundCommand {
+    /// Returns whether the command has exited.
+    pub(crate) fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
 
-    match status {
-        Some(status) => Ok(Finished {
-            code: status.code(),
-            stdout,
-            stderr,
-        }),
+    /// Waits for the command to exit, and kills it if it hasn't exited within `timeout`.
+    pub(crate) fn wait(mut self, timeout: Duration) -> Result<Finished, String> {
+        let status = wait(&mut self.child, timeout);
 
-        None => Err(format!(
-            "{command:?} did not finish within {timeout:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        )),
+        let stdout = self.stdout.join().unwrap_or_default();
+        let stderr = self.stderr.join().unwrap_or_default();
+
+        match status {
+            Some(status) => Ok(Finished {
+                code: status.code(),
+                stdout,
+                stderr,
+            }),
+
+            None => Err(format!(
+                "{} did not finish within {timeout:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                self.description
+            )),
+        }
     }
 }
 

@@ -20,8 +20,9 @@
 //! when it stops: the check fails if the broker exited before then, didn't exit with
 //! 0 within 30 seconds of SIGTERM, or wrote `panicked at` to its log.
 //!
-//! A launched broker can also be restarted on the same storage. A test that expects the broker to
-//! refuse its configuration gets a [`FailedStart`] instead of a broker.
+//! A test can restart a launched broker on the same storage and port. The harness first stops the
+//! broker with SIGTERM, or kills it with SIGKILL. A test that expects the broker to refuse its
+//! configuration gets a [`FailedStart`] instead of a broker.
 //!
 //! Each launched broker keeps its files, and a log per start, in a directory of its own under
 //! `NISSHI_SMOKE_WORK_DIR`. The directory is removed when the broker passes its checks and the
@@ -29,7 +30,7 @@
 
 use std::{
     fmt,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io,
     net::TcpListener,
     path::{Path, PathBuf},
@@ -75,8 +76,9 @@ pub struct Broker {
 /// How to launch a broker.
 #[derive(Debug)]
 pub struct LaunchOptions {
-    /// The port the broker listens on and advertises, on 127.0.0.1.
-    pub port: u16,
+    /// The port the broker listens on and advertises, on 127.0.0.1. The broker keeps the port
+    /// when it restarts.
+    pub port: ReservedPort,
     pub cluster_id: String,
     /// The user every client logs in as. When it is set, the broker runs with `--authentication`,
     /// and the harness's own tools log in as this user.
@@ -93,13 +95,22 @@ impl LaunchOptions {
     /// data stays apart from other brokers' data on a shared storage engine.
     pub fn new(storage: StorageUrl) -> Self {
         Self {
-            port: free_port(),
+            port: reserve_port(),
             cluster_id: unique_name("cluster"),
             login: None,
             log: None,
             storage,
         }
     }
+}
+
+/// How the harness stops a broker.
+#[derive(Clone, Copy, Debug)]
+enum Shutdown {
+    /// SIGTERM, after which the broker must exit with 0 within [`STOP_TIMEOUT`].
+    Graceful,
+    /// SIGKILL. The broker stops at once, as in a crash, and can't finish a write in progress.
+    Kill,
 }
 
 /// A broker that this harness launched.
@@ -162,7 +173,7 @@ impl Broker {
     /// answer, for a test that expects the broker to refuse its configuration. Panics, as `launch`
     /// does, when the binary or container can't start at all.
     fn try_launch(options: LaunchOptions) -> Result<Self, FailedStart> {
-        assert_port_is_free(options.port);
+        assert_port_is_free(options.port.number());
 
         let files = BrokerFiles::new(&options.storage);
         Self::start_with_files(options, files)
@@ -185,10 +196,16 @@ impl Broker {
         refused
     }
 
-    /// Stops the broker as [`Broker::stop`] does, and starts it again on the same storage, on a
-    /// new port. Panics if it fails its checks or doesn't start again.
+    /// Stops the broker as [`Broker::stop`] does, and starts it again on the same storage and
+    /// port. Panics if it fails its checks or doesn't start again.
     pub fn restart(self) -> Self {
-        self.restart_with(|_| {}, &[] as &[&str])
+        self.restart_with(Shutdown::Graceful, |_| {}, &[] as &[&str])
+    }
+
+    /// Kills the broker with SIGKILL, as a crash would, and restarts it on the same storage and
+    /// port. Panics if the broker had already exited, logged a panic, or doesn't start again.
+    pub fn kill_and_restart(self) -> Self {
+        self.restart_with(Shutdown::Kill, |_| {}, &[] as &[&str])
     }
 
     /// Like [`Broker::restart`], but the broker starts again with `--authentication`, so every
@@ -196,6 +213,7 @@ impl Broker {
     /// again only if it still has that user's credentials.
     pub fn restart_requiring_login(self, login: &ScramLogin) -> Self {
         self.restart_with(
+            Shutdown::Graceful,
             |options| options.login = Some(login.clone()),
             &[] as &[&str],
         )
@@ -213,11 +231,16 @@ impl Broker {
         storage: StorageUrl,
         files_to_delete: &[impl AsRef<str>],
     ) -> Self {
-        self.restart_with(|options| options.storage = storage, files_to_delete)
+        self.restart_with(
+            Shutdown::Graceful,
+            |options| options.storage = storage,
+            files_to_delete,
+        )
     }
 
     fn restart_with(
         mut self,
+        shutdown: Shutdown,
         change_options: impl FnOnce(&mut LaunchOptions),
         files_to_delete: &[impl AsRef<str>],
     ) -> Self {
@@ -226,14 +249,13 @@ impl Broker {
             .take()
             .expect("only a broker this test launched can restart");
 
-        let (stopped, mut files, mut options) = deployment.stop();
+        let (stopped, mut files, mut options) = deployment.stop(shutdown);
 
         if let Err(reason) = stopped {
             panic!("{reason}");
         }
 
         files.delete(files_to_delete);
-        options.port = free_port();
         change_options(&mut options);
         files.create_volume_for(&options.storage);
         let cluster_id = options.cluster_id.clone();
@@ -247,7 +269,7 @@ impl Broker {
         options: LaunchOptions,
         mut files: BrokerFiles,
     ) -> Result<Self, FailedStart> {
-        let bootstrap = format!("127.0.0.1:{}", options.port);
+        let bootstrap = format!("127.0.0.1:{}", options.port.number());
 
         // The harness finds the tools' container before it launches the broker, so a missing
         // `NISSHI_SMOKE_KAFKA` panics while no broker is running.
@@ -271,7 +293,7 @@ impl Broker {
         eprintln!(
             "launched the broker with cluster id {} on port {}{}, logging to {}",
             options.cluster_id,
-            options.port,
+            options.port.number(),
             match &host {
                 Host::Process(child) => format!(" as process {}", child.id()),
                 Host::Container { name } => format!(" in container {name}"),
@@ -365,7 +387,7 @@ impl Broker {
             return Ok(());
         };
 
-        let (stopped, mut files, _) = deployment.stop();
+        let (stopped, mut files, _) = deployment.stop(Shutdown::Graceful);
 
         if stopped.is_err() {
             files.keep_dir = true;
@@ -488,17 +510,17 @@ impl Deployment {
     }
 
     /// Stops the broker and checks it. Returns the files and options too, for a restart.
-    fn stop(self) -> (Result<(), String>, BrokerFiles, LaunchOptions) {
+    fn stop(self, shutdown: Shutdown) -> (Result<(), String>, BrokerFiles, LaunchOptions) {
         let mut failures = Vec::new();
 
         match self.host {
             Host::Process(mut child) => {
-                stop_process(&mut child, &mut failures);
+                stop_process(&mut child, shutdown, &mut failures);
                 _ = fs::remove_file(self.files.dir.join(PID_FILE));
             }
 
             Host::Container { name } => {
-                stop_container(&name, &self.log, &mut failures);
+                stop_container(&name, shutdown, &self.log, &mut failures);
                 remove_container(&name);
             }
         }
@@ -599,8 +621,8 @@ impl Host {
 }
 
 impl BrokerFiles {
-    /// A new directory under [`settings::broker_work_dir`], and a volume for a SQLite broker in a
-    /// container.
+    /// Creates a directory under [`settings::broker_work_dir`], and a volume for a SQLite broker in
+    /// a container.
     fn new(storage: &StorageUrl) -> Self {
         let dir = settings::broker_work_dir().join(unique_name("nisshi-smoke"));
         fs::create_dir_all(&dir)
@@ -713,7 +735,7 @@ impl Drop for BrokerFiles {
 }
 
 fn broker_args(options: &LaunchOptions) -> Vec<String> {
-    let url = format!("tcp://127.0.0.1:{}", options.port);
+    let url = format!("tcp://127.0.0.1:{}", options.port.number());
 
     let mut args = vec![
         "broker".to_owned(),
@@ -806,13 +828,65 @@ fn launch_container(
     Ok(Host::Container { name })
 }
 
-/// Returns a port for a broker to listen on, which nothing listens on yet.
+/// A port that one broker or PostgreSQL server owns. While the `ReservedPort` exists,
+/// `reserve_port` skips its port for every other test of every smoke run of the same user, so the
+/// owner can stop and start again on it.
 ///
-/// Panics if every port in the range is in use.
-pub fn free_port() -> u16 {
-    /// Launched brokers listen on ports from here up, below the ports the operating system picks
-    /// for outgoing connections and port-0 binds (32768 up on Linux, 49152 up on macOS), so the
-    /// operating system can't take a port between this function's check and the broker's bind.
+/// A port that its stopped owner keeps looks free to a check that something listens on it. So the
+/// reservation is an exclusive `flock` on a file named after the port, in
+/// [`settings::port_lock_dir`], which every test process of the user sees. nextest runs each test in a process of its own, so a lock inside one process would not
+/// reach the other tests. The operating system releases the lock when the process exits, so a test
+/// that nextest kills leaves no reservation behind.
+#[derive(Debug)]
+pub struct ReservedPort {
+    number: u16,
+    _lock: File,
+}
+
+impl ReservedPort {
+    pub fn number(&self) -> u16 {
+        self.number
+    }
+}
+
+/// Reserves a port that is free, and that no other test on this machine has reserved.
+///
+/// Panics if every port in the range is in use or reserved.
+pub(crate) fn reserve_port() -> ReservedPort {
+    candidate_ports()
+        .find_map(|port| {
+            let lock = try_lock_port(port)?;
+
+            // A process outside the smoke runs can still listen on a reserved port.
+            port_is_free(port).then_some(ReservedPort {
+                number: port,
+                _lock: lock,
+            })
+        })
+        .expect("no free port")
+}
+
+/// Takes the lock file of `port`, or returns `None` if another `ReservedPort` holds it.
+fn try_lock_port(port: u16) -> Option<File> {
+    let dir = settings::port_lock_dir();
+    fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display()));
+
+    let path = dir.join(port.to_string());
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+
+    file.try_lock().ok().map(|()| file)
+}
+
+/// Returns the ports that [`reserve_port`] tries, in order.
+fn candidate_ports() -> impl Iterator<Item = u16> {
+    /// Reserved ports start here, below the ports that the operating system picks for outgoing
+    /// connections and port-0 binds: 32768 up on Linux, 49152 up on macOS. The operating system
+    /// then can't take a reserved port before its owner binds it.
     const FIRST_BROKER_PORT: u16 = 20000;
     const BROKER_PORT_COUNT: u16 = 10000;
 
@@ -821,13 +895,10 @@ pub fn free_port() -> u16 {
     // Each process starts at its own offset, so parallel tests try different ports.
     let start = (std::process::id() % u32::from(BROKER_PORT_COUNT)) as u16;
 
-    (0..BROKER_PORT_COUNT)
-        .map(|_| {
-            let offset = start.wrapping_add(PORTS_TRIED.fetch_add(1, Ordering::Relaxed));
-            FIRST_BROKER_PORT + offset % BROKER_PORT_COUNT
-        })
-        .find(|port| port_is_free(*port))
-        .expect("no free port")
+    (0..BROKER_PORT_COUNT).map(move |_| {
+        let offset = start.wrapping_add(PORTS_TRIED.fetch_add(1, Ordering::Relaxed));
+        FIRST_BROKER_PORT + offset % BROKER_PORT_COUNT
+    })
 }
 
 /// Panics if something already listens on `port`, because the broker's readiness check would
@@ -858,22 +929,36 @@ fn broker_environment() -> impl Iterator<Item = (String, String)> {
     })
 }
 
-fn stop_process(child: &mut Child, failures: &mut Vec<String>) {
+/// Stops a broker process with SIGTERM and checks that it exits cleanly in time, or kills it with
+/// SIGKILL and waits for it to exit.
+fn stop_process(child: &mut Child, shutdown: Shutdown, failures: &mut Vec<String>) {
     if let Ok(Some(status)) = child.try_wait() {
         failures.push(format!("broker exited during the run with {status}"));
         return;
     }
 
-    _ = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
+    match shutdown {
+        Shutdown::Graceful => {
+            _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
 
-    match timed_command::wait(child, STOP_TIMEOUT) {
-        Some(status) if status.success() => {}
-        Some(status) => failures.push(format!("broker exited with {status} on SIGTERM")),
-        None => failures.push(format!(
-            "broker did not exit within {STOP_TIMEOUT:?} of SIGTERM"
-        )),
+            match timed_command::wait(child, STOP_TIMEOUT) {
+                Some(status) if status.success() => {}
+                Some(status) => failures.push(format!("broker exited with {status} on SIGTERM")),
+                None => failures.push(format!(
+                    "broker did not exit within {STOP_TIMEOUT:?} of SIGTERM"
+                )),
+            }
+        }
+
+        Shutdown::Kill => {
+            if let Err(err) = child.kill() {
+                failures.push(format!("couldn't kill the broker: {err}"));
+            }
+
+            _ = child.wait();
+        }
     }
 }
 
@@ -885,27 +970,41 @@ fn check_container_running(name: &str) -> Result<(), String> {
     }
 }
 
-fn stop_container(name: &str, log: &Path, failures: &mut Vec<String>) {
+/// Stops a broker container like [`stop_process`], and saves what it printed to `log`.
+fn stop_container(name: &str, shutdown: Shutdown, log: &Path, failures: &mut Vec<String>) {
     if let Err(reason) = check_container_running(name) {
         failures.push(format!("broker {reason} during the run"));
         failures.extend(save_logs(name, log).err());
         return;
     }
 
-    let stopped = timed_command::run(
-        Command::new("docker").args(["stop", &format!("--time={}", STOP_TIMEOUT.as_secs()), name]),
-        None,
-        STOP_TIMEOUT + Duration::from_secs(30),
-    );
+    match shutdown {
+        Shutdown::Graceful => {
+            let stopped = timed_command::run(
+                Command::new("docker").args([
+                    "stop",
+                    &format!("--time={}", STOP_TIMEOUT.as_secs()),
+                    name,
+                ]),
+                None,
+                STOP_TIMEOUT + Duration::from_secs(30),
+            );
 
-    if let Err(reason) = stopped {
-        failures.push(reason);
-    }
+            if let Err(reason) = stopped {
+                failures.push(reason);
+            }
 
-    match inspect(name, "{{.State.ExitCode}}") {
-        Ok(code) if code == "0" => {}
-        Ok(code) => failures.push(format!("broker exited with {code} on SIGTERM")),
-        Err(reason) => failures.push(reason),
+            match inspect(name, "{{.State.ExitCode}}") {
+                Ok(code) if code == "0" => {}
+                Ok(code) => failures.push(format!("broker exited with {code} on SIGTERM")),
+                Err(reason) => failures.push(reason),
+            }
+        }
+
+        Shutdown::Kill => match docker(&["kill", "--signal=KILL", name]) {
+            Ok(killed) if killed.code == Some(0) => {}
+            killed => failures.push(format!("couldn't kill {name}: {killed:?}")),
+        },
     }
 
     failures.extend(save_logs(name, log).err());
@@ -940,7 +1039,7 @@ fn inspect(name: &str, format: &str) -> Result<String, String> {
 }
 
 /// Runs a short `docker` command, such as `docker inspect`, and kills it if it hangs.
-fn docker(args: &[&str]) -> Result<timed_command::Finished, String> {
+pub(crate) fn docker(args: &[&str]) -> Result<timed_command::Finished, String> {
     timed_command::run(
         Command::new("docker").args(args),
         None,

@@ -30,21 +30,24 @@ use nanoid::nanoid;
 
 pub mod broker;
 mod kafka_cli;
+mod postgres;
 mod record;
 pub mod settings;
 mod storage_url;
 mod timed_command;
 
-pub use broker::{Broker, FREQUENT_MAINTENANCE, LaunchOptions, free_port};
+pub use broker::{Broker, FREQUENT_MAINTENANCE, LaunchOptions, ReservedPort};
 pub use kafka_cli::{
-    Acks, AnyCommand, ApiVersions, ClusterId, Consume, ConsumeMatching, ConsumedRecord,
-    CreateTopic, DeleteRecords, DeleteTopic, DescribeConfigs, DescribeGroup, DescribeGroupState,
-    DescribeTopic, DescribeUsers, GetOffsets, GroupOffsets, KafkaCli, LOG_APPEND_TIME, ListTopics,
-    Output, PRINTED_NULL, PartitionReplicas, PrintsPartitionLines, RECORD_TOO_LARGE_EXCEPTION,
-    RequiresExistingTopic, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism,
-    TOPIC_EXISTS_EXCEPTION, UNSUPPORTED_VERSION_EXCEPTION, VerifiableProduce,
+    Acks, AnyCommand, ApiVersions, BackgroundTool, ClusterId, Consume, ConsumeMatching,
+    ConsumedRecord, CreateTopic, DeleteRecords, DeleteTopic, DescribeConfigs, DescribeGroup,
+    DescribeGroupState, DescribeTopic, DescribeUsers, GetOffsets, GroupOffsets, KafkaCli,
+    LOG_APPEND_TIME, ListTopics, Output, PRINTED_NULL, PartitionReplicas, PrintsPartitionLines,
+    RECORD_TOO_LARGE_EXCEPTION, RequiresExistingTopic, SASL_AUTHENTICATION_EXCEPTION, ScramLogin,
+    ScramMechanism, SendResult, StoredRecord, TOPIC_EXISTS_EXCEPTION,
+    UNSUPPORTED_VERSION_EXCEPTION, VerifiableConsume, VerifiableProduce,
     verifiable_producer_values,
 };
+pub use postgres::PostgresServer;
 pub use record::Record;
 pub use storage_url::StorageUrl;
 

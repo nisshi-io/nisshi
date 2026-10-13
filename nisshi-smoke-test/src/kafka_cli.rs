@@ -45,6 +45,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::de::DeserializeOwned;
+
 use crate::{settings, timed_command, unique_name};
 
 mod cluster;
@@ -55,6 +57,7 @@ mod consumer_groups;
 mod delete_records;
 mod offsets;
 mod topics;
+mod verifiable_consumer;
 mod verifiable_producer;
 
 /// The name the tools print for the broker's `TOPIC_ALREADY_EXISTS` error.
@@ -79,7 +82,10 @@ pub use offsets::GetOffsets;
 pub use topics::{
     CreateTopic, DeleteTopic, DescribeTopic, ListTopics, PartitionReplicas, RequiresExistingTopic,
 };
-pub use verifiable_producer::{Acks, VerifiableProduce, verifiable_producer_values};
+pub use verifiable_consumer::VerifiableConsume;
+pub use verifiable_producer::{
+    Acks, SendResult, StoredRecord, VerifiableProduce, verifiable_producer_values,
+};
 
 /// How long a tool a test runs has to finish.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -93,6 +99,10 @@ const KILL_AFTER: Duration = Duration::from_secs(5);
 // The harness must wait longer than `timeout` takes to send SIGKILL, or it
 // kills `docker exec` before `timeout` can report why the tool stopped.
 const _: () = assert!(GRACE.as_secs() > KILL_AFTER.as_secs());
+
+/// How long a tool that a test started with [`KafkaCli::start`] can run. The limit stops a tool
+/// that a test left running when nextest killed the test.
+const RUNNING_TOOL_LIMIT: Duration = Duration::from_secs(5 * 60);
 
 /// A SCRAM user that the tools log in as, on a broker started with `--authentication`.
 #[derive(Clone, Debug)]
@@ -168,8 +178,9 @@ impl KafkaCli {
         ))
     }
 
-    /// Returns tools for the same broker whose clients give up on a call after `timeout`, instead
-    /// of after the Java client's default of 60 seconds.
+    /// Returns a copy of this `KafkaCli` with its API timeout set to `timeout`, instead of the Java
+    /// client's default of 60 seconds. The API timeout limits how long a tool waits for the broker
+    /// to answer a call.
     pub fn with_api_timeout(&self, timeout: Duration) -> Self {
         let timeout_millis = timeout.as_millis();
 
@@ -178,6 +189,21 @@ impl KafkaCli {
         self.with_client_properties(&format!(
             "default.api.timeout.ms={timeout_millis}\nrequest.timeout.ms={timeout_millis}\n"
         ))
+    }
+
+    /// Returns a copy of this `KafkaCli` with its client timeouts set to `timeout`. A client
+    /// timeout limits how long a tool's Kafka client waits for the broker.
+    pub fn with_client_timeouts(&self, timeout: Duration) -> Self {
+        let timeout_millis = timeout.as_millis();
+
+        // A producer rejects a `delivery.timeout.ms` below `request.timeout.ms` plus `linger.ms`.
+        let delivery_timeout_millis = 2 * timeout_millis;
+
+        // Each tool warns about the other tools' client properties, and ignores them.
+        self.with_api_timeout(timeout)
+            .with_client_properties(&format!(
+                "delivery.timeout.ms={delivery_timeout_millis}\nmax.block.ms={timeout_millis}\n"
+            ))
     }
 
     /// Returns tools for the same broker whose client config file holds these tools' client
@@ -286,7 +312,7 @@ impl KafkaCli {
 
             let args = ["cluster-id"];
             let attempt = timed_command::run(
-                &mut self.command(Tool::Cluster, &args, false, limit),
+                &mut self.command(Tool::Cluster, &args, false, limit, None),
                 None,
                 limit + GRACE,
             );
@@ -335,6 +361,43 @@ impl KafkaCli {
         output
     }
 
+    /// Returns the time now on the clock of the tools' container, in milliseconds since the Unix
+    /// epoch. The tools stamp the lines they print with this clock.
+    ///
+    /// A test compares a printed timestamp with this time, instead of with
+    /// [`crate::now_in_millis`]. The host's clock can differ from the container's, such as when
+    /// Docker runs in a virtual machine.
+    #[track_caller]
+    pub fn now_in_millis(&self) -> i64 {
+        let printed = crate::broker::docker(&["exec", &self.container, "date", "+%s%3N"])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        printed
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|err| panic!("can't read the time in {printed:?}: {err}"))
+    }
+
+    /// Starts `tool` in the background, and returns at once. The test stops the tool with
+    /// [`BackgroundTool::stop`].
+    fn start<PrintedBy>(&self, tool: Tool, args: &[&str]) -> BackgroundTool<PrintedBy> {
+        let pid_file = format!("/tmp/{}.pid", unique_name(tool.name()));
+        let mut command = self.command(tool, args, false, RUNNING_TOOL_LIMIT, Some(&pid_file));
+
+        let running =
+            timed_command::spawn(&mut command, None).unwrap_or_else(|err| panic!("{err}"));
+
+        BackgroundTool {
+            container: self.container.clone(),
+            pid_file,
+            tool,
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            running: Some(running),
+            printed_by: PhantomData,
+        }
+    }
+
     /// Runs `tool` as [`KafkaCli::exec`] does, but returns the output of a tool that doesn't
     /// finish in time instead of panicking, with [`Output::timeout`] set.
     fn exec_until_timeout<PrintedBy>(
@@ -351,7 +414,7 @@ impl KafkaCli {
         /// plus the signal number, and SIGKILL is 9.
         const TIMEOUT_KILL_EXIT: i32 = 128 + 9;
 
-        let mut command = self.command(tool, args, input.is_some(), tool_timeout);
+        let mut command = self.command(tool, args, input.is_some(), tool_timeout, None);
 
         let finished = timed_command::run(&mut command, input, tool_timeout + GRACE)
             .unwrap_or_else(|err| panic!("{err}"));
@@ -367,12 +430,28 @@ impl KafkaCli {
         Output::new(tool, args, finished, timeout)
     }
 
-    fn command(&self, tool: Tool, args: &[&str], interactive: bool, timeout: Duration) -> Command {
+    /// Returns the `docker exec` command that runs `tool`. With `pid_file`, the command writes the
+    /// process id of the tool's `timeout` to that file in the container.
+    fn command(
+        &self,
+        tool: Tool,
+        args: &[&str],
+        interactive: bool,
+        timeout: Duration,
+        pid_file: Option<&str>,
+    ) -> Command {
         let mut command = Command::new("docker");
         _ = command.arg("exec");
 
         if interactive {
             _ = command.arg("--interactive");
+        }
+
+        _ = command.arg(&self.container);
+
+        // The shell writes its own process id, and `exec` hands that process id on to `timeout`.
+        if let Some(pid_file) = pid_file {
+            _ = command.args(["sh", "-c", "echo $$ > \"$0\"; exec \"$@\"", pid_file]);
         }
 
         // The tool runs under `timeout` in the container, because killing `docker exec` leaves
@@ -382,7 +461,6 @@ impl KafkaCli {
         // `exec` expects. BusyBox's `timeout` exits with the tool's own status, so a timeout would
         // look like an ordinary failure.
         _ = command
-            .arg(&self.container)
             .arg("timeout")
             .arg(format!("--kill-after={}s", KILL_AFTER.as_secs()))
             .arg(format!("{}s", timeout.as_secs()))
@@ -398,6 +476,79 @@ impl KafkaCli {
     }
 }
 
+/// A Kafka tool that a test started in the background, and stops with [`BackgroundTool::stop`].
+#[derive(Debug)]
+pub struct BackgroundTool<PrintedBy> {
+    container: String,
+    /// The file in the tools' container that holds the process id of the tool's `timeout`.
+    pid_file: String,
+    tool: Tool,
+    args: Vec<String>,
+    /// The `docker exec` that runs the tool, until [`BackgroundTool::stop`] waits for it.
+    running: Option<timed_command::BackgroundCommand>,
+    printed_by: PhantomData<PrintedBy>,
+}
+
+impl<PrintedBy> BackgroundTool<PrintedBy> {
+    /// Stops the tool with SIGTERM, and returns what it printed, with [`Output::timeout`] set.
+    /// The tool prints its last lines, such as a producer's `tool_data`, as it stops.
+    ///
+    /// Panics if the tool exited before the test stopped it, or doesn't exit after SIGTERM.
+    #[track_caller]
+    pub fn stop(mut self) -> Output<PrintedBy> {
+        let mut running = self
+            .running
+            .take()
+            .expect("the tool runs until it is stopped");
+        let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
+
+        if running.has_exited() {
+            let finished = running.wait(GRACE).unwrap_or_else(|err| panic!("{err}"));
+            let output = Output::<PrintedBy>::new(self.tool, &args, finished, None);
+            panic!("the tool exited before the test stopped it: {output}");
+        }
+
+        let signalled = self.signal_timeout();
+        assert!(
+            matches!(&signalled, Ok(signalled) if signalled.code == Some(0)),
+            "couldn't stop `{} {}`: {signalled:?}",
+            self.tool.name(),
+            args.join(" ")
+        );
+
+        let finished = running.wait(GRACE).unwrap_or_else(|err| panic!("{err}"));
+
+        Output::new(
+            self.tool,
+            &args,
+            finished,
+            Some("the test stopped it".to_owned()),
+        )
+    }
+
+    /// Sends SIGTERM to the tool's `timeout`, which passes it on to the tool.
+    fn signal_timeout(&self) -> Result<timed_command::Finished, String> {
+        crate::broker::docker(&[
+            "exec",
+            &self.container,
+            "sh",
+            "-c",
+            "kill -TERM \"$(cat \"$0\")\"",
+            &self.pid_file,
+        ])
+    }
+}
+
+impl<PrintedBy> Drop for BackgroundTool<PrintedBy> {
+    /// Stops a tool that the test didn't stop, such as one whose test panicked, so that it doesn't
+    /// keep sending requests to a broker that the test stops.
+    fn drop(&mut self) {
+        if self.running.is_some() {
+            _ = self.signal_timeout();
+        }
+    }
+}
+
 /// A Kafka command-line tool in `/opt/kafka/bin` that the suite runs.
 #[derive(Clone, Copy, Debug)]
 enum Tool {
@@ -410,6 +561,7 @@ enum Tool {
     DeleteRecords,
     GetOffsets,
     Topics,
+    VerifiableConsumer,
     VerifiableProducer,
 }
 
@@ -427,6 +579,7 @@ impl Tool {
             Self::DeleteRecords => "kafka-delete-records",
             Self::GetOffsets => "kafka-get-offsets",
             Self::Topics => "kafka-topics",
+            Self::VerifiableConsumer => "kafka-verifiable-consumer",
             Self::VerifiableProducer => "kafka-verifiable-producer",
         }
     }
@@ -436,7 +589,7 @@ impl Tool {
     fn client_config_option(self) -> &'static str {
         match self {
             Self::ConsoleProducer | Self::VerifiableProducer => "--producer.config",
-            Self::ConsoleConsumer => "--consumer.config",
+            Self::ConsoleConsumer | Self::VerifiableConsumer => "--consumer.config",
             Self::Cluster => "--config",
             Self::BrokerApiVersions
             | Self::Configs
@@ -484,6 +637,33 @@ impl<PrintedBy> Output<PrintedBy> {
             timeout,
             printed_by: PhantomData,
         }
+    }
+
+    /// Returns the output of a tool that printed `stdout` and exited with 0.
+    #[cfg(test)]
+    fn printed(stdout: &str) -> Self {
+        Self {
+            command: "tool".to_owned(),
+            code: Some(0),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            timeout: None,
+            printed_by: PhantomData,
+        }
+    }
+
+    /// Parses each JSON line that a verifiable tool printed. Kafka 4 tools also print warnings on
+    /// stdout, so this function skips each line that isn't a JSON object. Panics on a JSON line
+    /// that it can't parse, because the tool then changed what it prints.
+    #[track_caller]
+    fn json_events<Event: DeserializeOwned>(&self) -> impl Iterator<Item = Event> {
+        self.stdout
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(move |line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|err| panic!("can't read {line:?}: {err}\n{self}"))
+            })
     }
 
     /// Asserts the tool exited with `code`, showing its output if not.

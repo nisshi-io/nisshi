@@ -27,6 +27,8 @@ sqlite = []
 clap.workspace = true
 nanoid.workspace = true
 rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
