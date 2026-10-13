@@ -986,6 +986,96 @@ mod tests {
         Ok(())
     }
 
+    // The second batch's base timestamp is earlier than the first's, so the
+    // rebased deltas are negative and the first batch's maximum stays the
+    // combined maximum.
+    #[test]
+    fn combine_preserves_timestamps_when_second_base_timestamp_is_earlier() -> Result<(), Error> {
+        let first = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(0)
+            .last_offset_delta(1)
+            .base_sequence(0)
+            .base_timestamp(1_000)
+            .max_timestamp(1_005)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1)
+                    .timestamp_delta(5),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let second = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(2)
+            .last_offset_delta(1)
+            .base_sequence(2)
+            .base_timestamp(990)
+            .max_timestamp(993)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"c").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"d").into())
+                    .offset_delta(1)
+                    .timestamp_delta(3),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let original_times: BTreeMap<&'static [u8], i64> = BTreeMap::from([
+            (&b"a"[..], 1_000),
+            (&b"b"[..], 1_005),
+            (&b"c"[..], 990),
+            (&b"d"[..], 993),
+        ]);
+
+        let combined = combine(vec![first, second])?;
+        assert_eq!(1, combined.len());
+
+        let combined = inflated::Batch::try_from(combined[0].clone())?;
+
+        assert_eq!(4, combined.records.len());
+
+        assert_eq!(1_000, combined.base_timestamp);
+        assert_eq!(1_005, combined.max_timestamp);
+
+        assert_eq!(
+            vec![0, 5, -10, -7],
+            combined
+                .records
+                .iter()
+                .map(|record| record.timestamp_delta)
+                .collect::<Vec<_>>()
+        );
+
+        for record in &combined.records {
+            let value = record.value.as_deref().expect("value");
+            let expected = original_times[value];
+            let actual = combined.base_timestamp + record.timestamp_delta;
+            assert_eq!(
+                expected, actual,
+                "record {value:?} should keep its original absolute timestamp"
+            );
+        }
+
+        Ok(())
+    }
+
     fn produce_request(topic: &str, record_data: &'static [u8]) -> Result<ProduceRequest, Error> {
         record_data_batch(record_data).map(|batch| {
             ProduceRequest::default().topic_data(Some(
