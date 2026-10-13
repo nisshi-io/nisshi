@@ -94,6 +94,60 @@ fuzz-member-metadata: (cargo-fuzz "run" "fuzz_member_metadata" "--" "-max_total_
 
 fuzz-generate-seed: (cargo-fuzz "run" "--package" "fuzz" "--bin" "generate_seeds")
 
+# run every target listed under `tier` in fuzz/ci-targets.json for its budget
+# in seconds (or only `target`), as .github/workflows/fuzz.yml does; see
+# fuzz/README.md
+fuzz-ci tier target="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    config=fuzz/ci-targets.json
+    tier={{ quote(tier) }}
+    only={{ quote(target) }}
+    jq -e --arg tier "$tier" 'has($tier)' "$config" > /dev/null || { echo "::error::no tier '$tier' in $config" >&2; exit 1; }
+    bad=$(jq -r --arg tier "$tier" '.[$tier] | to_entries[] | select((.value | type) != "number" or .value < 1) | .key' "$config")
+    [ -z "$bad" ] || { echo "::error::$config: budgets must be a number of seconds >= 1, not for: $bad" >&2; exit 1; }
+    known=$(cargo +nightly fuzz list | grep -vx generate_seeds)
+    unknown=$(jq -r --arg tier "$tier" '.[$tier] | keys[]' "$config" | grep -vxF -e "$known" || true)
+    [ -z "$unknown" ] || { echo "::error::$config lists targets that aren't in fuzz/Cargo.toml: $unknown" >&2; exit 1; }
+    unlisted=$(grep -vxF -e "$(jq -r '[.[] | keys[]] | unique[]' "$config")" <<< "$known" || true)
+    [ -z "$unlisted" ] || echo "::warning::fuzz targets in no tier of $config, so CI never runs them: $unlisted" >&2
+    if [ -n "$only" ]; then
+        jq -e --arg tier "$tier" --arg t "$only" '.[$tier] | has($t)' "$config" > /dev/null || { echo "::error::'$only' isn't in tier '$tier' of $config" >&2; exit 1; }
+        targets=$only
+    else
+        targets=$(jq -r --arg tier "$tier" '.[$tier] | keys[]' "$config")
+    fi
+    # cargo-fuzz defaults --target to the platform it was built for, which
+    # is musl for its prebuilt Linux release, and ASan can't link against
+    # musl. build, run and cmin must all get the same flags, or the next one
+    # rebuilds from scratch. (--codegen-units above 1 would build faster,
+    # but nightly rustc segfaults on typenum with it and the sanitizer.)
+    opts=(--target "$(rustc +nightly -vV | sed -n 's/^host: //p')")
+    cargo +nightly run --quiet --package fuzz --bin generate_seeds > /dev/null
+    # One build up front so the targets compile in parallel; each takes
+    # minutes on its own, and `fuzz run` would build them one at a time.
+    # Without a target, `fuzz build` builds them all.
+    cargo +nightly fuzz build "${opts[@]}" $only
+    failed=""
+    for t in $targets; do
+        secs=$(jq -r --arg tier "$tier" --arg t "$t" '.[$tier][$t]' "$config")
+        echo "::group::$t (${secs}s)"
+        # -timeout turns a hang on a single input into a reported failure
+        cargo +nightly fuzz run "${opts[@]}" "$t" -- -max_total_time="$secs" -timeout=25 -rss_limit_mb=2048 || failed="$failed $t"
+        echo "::endgroup::"
+    done
+    [ -z "$failed" ] || { echo "::error::fuzz targets failed:$failed (see the log above; crashing inputs are under fuzz/artifacts/)" >&2; exit 1; }
+
+# minimise fuzz/corpus/<target>, built with the same flags as fuzz-ci
+fuzz-cmin target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo +nightly fuzz cmin --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{ quote(target) }}
+
+# the target names under `tier` in fuzz/ci-targets.json, as a JSON array
+fuzz-ci-matrix tier:
+    @jq -c --arg tier {{ quote(tier) }} '.[$tier] | keys' fuzz/ci-targets.json
+
 check:
     cargo check --workspace --all-features --all-targets
 

@@ -99,7 +99,7 @@ jobs:
   # below except typos, shellcheck and ci-gate (see
   # .github/scripts/ci-changes.sh for the list). merge_group and push always get rust=true. The classifier is
   # checked out from the PR's base, so a PR can't widen its own skip list.
-  # The same job is in dependencies.yml and codeql.yml.
+  # The same job is in dependencies.yml, codeql.yml and fuzz.yml.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5

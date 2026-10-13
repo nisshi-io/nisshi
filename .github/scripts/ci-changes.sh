@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # Decides whether a pull request needs the Rust jobs in ci.yml,
-# dependencies.yml and codeql.yml. Reads the PR's changed paths, one per
-# line, on stdin and writes `rust=true` or `rust=false` to $GITHUB_OUTPUT
-# (stdout when unset).
+# dependencies.yml, codeql.yml and fuzz.yml. Reads the PR's changed paths,
+# one per line, on stdin and writes `rust=true` or `rust=false` to
+# $GITHUB_OUTPUT (stdout when unset).
 #
 # `rust=false` only when every path is on the skip list below: CI config
-# that none of those three workflows reads, and prose. Anything else,
+# that none of those four workflows reads, and prose. Anything else,
 # including an empty list, means `rust=true`, so an unexpected path runs
-# the full suite rather than skipping it. The three workflows themselves,
+# the full suite rather than skipping it. The four workflows themselves,
 # and the scripts and SQL their jobs run, are excluded from the skip list so
 # a change to them is exercised by the jobs that use them.
 #
@@ -19,7 +19,7 @@ set -euo pipefail
 
 skippable() {
   case "$1" in
-    .github/workflows/ci.yml | .github/workflows/dependencies.yml | .github/workflows/codeql.yml) return 1 ;;
+    .github/workflows/ci.yml | .github/workflows/dependencies.yml | .github/workflows/codeql.yml | .github/workflows/fuzz.yml) return 1 ;;
     .github/workflows/scripts/* | .github/scripts/*) return 1 ;;
     .github/*) return 0 ;;
     docs/*.md) return 0 ;;
