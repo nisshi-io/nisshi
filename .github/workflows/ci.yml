@@ -31,11 +31,13 @@ name: ci
 # Only `typos` runs ahead of `release`, and only `release` runs ahead of
 # `smoke`, so the release -> smoke chain starts with the rest of the run.
 # `macos` is a compile-only check except on a `v*` tag, where it builds the
-# release tarball (tier-c.yml builds the macOS release nightly). smoke builds its image locally from release's binaries
-# and pushes nothing. `publish` (push only) needs every job ci-gate does and
-# is the only job that pushes an image, so no image reaches the registry
-# untested. `publish-release` attaches the tarballs on a tag, after publish.
-# Both are outside ci-gate, see their comments.
+# release tarball (tier-c.yml builds the macOS release nightly). smoke builds
+# a single-platform image from release's binaries on each os and pushes
+# nothing. `publish` (push only) needs every job ci-gate does and is the only
+# job that pushes an image: a multi-arch build of its own, from the same
+# Dockerfile and the binaries smoke tested. `publish-release` attaches the
+# tarballs on a tag, after publish. Both are outside ci-gate, see their
+# comments.
 #
 # On top of the tiers, the `changes` job skips every Rust job on a
 # pull_request that only touches CI config this workflow doesn't read, or
@@ -586,7 +588,9 @@ jobs:
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   # Runs the nisshi-smoke-test suite (`just smoke <storage>`): the Kafka CLI
-  # tools from each Kafka image against the packaged image on each storage engine.
+  # tools from each Kafka image against an image the job builds from
+  # release's binaries, on each storage engine. The sqlite legs run it
+  # against a broker built from source instead (see below).
   smoke:
     if: *tier_b
     needs: [changes, release]
@@ -878,7 +882,7 @@ jobs:
           cp compose.yaml example.env LICENSE README.md "$dist"
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
-      # publish attaches the tarballs to the GitHub release, on a tag.
+      # publish-release attaches the tarballs to the GitHub release, on a tag.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nisshi-${{matrix.target}}
