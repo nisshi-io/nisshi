@@ -16,9 +16,9 @@
 //! partition, and nothing from the request is written.
 //!
 //! Malformed means: records that do not decode, an unknown compression codec,
-//! or other than exactly one batch for the partition. Every malformed batch
-//! here carries a valid CRC as sent, so the tests still exercise decoding if
-//! produce starts enforcing the CRC.
+//! or other than exactly one batch for the partition, including a zero-length
+//! records field. Every malformed batch here carries a valid CRC as sent, so
+//! the tests still exercise decoding if produce starts enforcing the CRC.
 //!
 //! Every malformed batch here uses `LogAppendTime`. A `CreateTime` batch can
 //! be decoded in `ProduceService` before it reaches storage, and these tests
@@ -51,6 +51,10 @@ use url::Url;
 use uuid::Uuid;
 
 const PARTITION: i32 = 0;
+
+/// The error message for a partition with other than one batch.
+const NOT_EXACTLY_ONE_BATCH: &str =
+    "a produce request must contain exactly one record batch per partition";
 
 /// Bytes from the start of a v2 batch to the first byte covered by its CRC:
 /// base offset, batch length, partition leader epoch, magic and the CRC.
@@ -112,6 +116,16 @@ async fn produce(
     name: &str,
     batches: Vec<deflated::Batch>,
 ) -> Result<PartitionProduceResponse> {
+    produce_records(storage, name, Some(Frame { batches })).await
+}
+
+/// Produces `records` as sent, where `None` is what the decoder yields for a
+/// zero-length records field.
+async fn produce_records(
+    storage: &(impl Storage + Clone),
+    name: &str,
+    records: Option<Frame>,
+) -> Result<PartitionProduceResponse> {
     let response = ProduceService {
         storage: storage.clone(),
     }
@@ -124,7 +138,7 @@ async fn produce(
                     .partition_data(Some(
                         [PartitionProduceData::default()
                             .index(PARTITION)
-                            .records(Some(Frame { batches }))]
+                            .records(records)]
                         .into(),
                     ))]
                 .into(),
@@ -305,21 +319,25 @@ async fn unknown_compression_codec(storage: impl Storage + Clone) -> Result<()> 
 /// own, so a second batch that failed after the first was stored would report
 /// the partition as failed while the first batch stayed in the log. The
 /// request is rejected before either is stored, including when both batches
-/// are well formed.
+/// are well formed. A zero-length records field, which decodes to `None`, is
+/// rejected the same way.
 async fn not_exactly_one_batch(storage: impl Storage + Clone) -> Result<()> {
-    const REASON: &str = "a produce request must contain exactly one record batch per partition";
-
     let name = &alphanumeric_string(15)[..];
     create_topic(&storage, name).await?;
 
-    for batches in [
-        vec![well_formed(b"first")?, truncated_record()?],
-        vec![well_formed(b"first")?, well_formed(b"second")?],
-        vec![],
+    for records in [
+        Some(vec![well_formed(b"first")?, truncated_record()?]),
+        Some(vec![well_formed(b"first")?, well_formed(b"second")?]),
+        Some(vec![]),
+        None,
     ] {
-        let response = produce(&storage, name, batches).await?;
+        let response =
+            produce_records(&storage, name, records.map(|batches| Frame { batches })).await?;
         assert_invalid_record(&response)?;
-        assert_eq!(Some(REASON), response.error_message.as_deref());
+        assert_eq!(
+            Some(NOT_EXACTLY_ONE_BATCH),
+            response.error_message.as_deref()
+        );
     }
 
     assert_nothing_written(&storage, name).await
@@ -548,5 +566,122 @@ mod turso {
     async fn not_exactly_one_batch() -> Result<()> {
         let _guard = init_tracing()?;
         super::not_exactly_one_batch(storage(StorageType::Turso, false).await?).await
+    }
+}
+
+/// A zero-length records field over a real connection. The check runs in
+/// `ProduceService` before any backend is touched, so only the memory backend
+/// is used.
+mod wire {
+    use std::time::Duration;
+
+    use anyhow::anyhow;
+    use nisshi_sans_io::{ApiKey as _, CreateTopicsResponse, ProduceResponse};
+    use tokio::{net::TcpStream, time::timeout};
+
+    use super::*;
+    use crate::common::wire::{round_trip, spawn_broker};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    async fn create_topic(stream: &mut TcpStream, name: &str) -> anyhow::Result<()> {
+        let frame = round_trip(
+            stream,
+            CreateTopicsRequest::KEY,
+            7,
+            1,
+            CreateTopicsRequest::default()
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(name.into())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into()))]
+                    .into(),
+                ))
+                .into(),
+        )
+        .await?;
+
+        let response = CreateTopicsResponse::try_from(frame.body)?;
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+        Ok(())
+    }
+
+    /// Sends a Produce v9 for `records` and returns the partition's response.
+    /// The encoder writes `None` as a zero-length records field.
+    async fn produce(
+        stream: &mut TcpStream,
+        correlation_id: i32,
+        name: &str,
+        records: Option<Frame>,
+    ) -> anyhow::Result<PartitionProduceResponse> {
+        let frame = round_trip(
+            stream,
+            ProduceRequest::KEY,
+            9,
+            correlation_id,
+            ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .timeout_ms(5_000)
+                .topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(name.into())
+                        .partition_data(Some(
+                            [PartitionProduceData::default()
+                                .index(PARTITION)
+                                .records(records)]
+                            .into(),
+                        ))]
+                    .into(),
+                ))
+                .into(),
+        )
+        .await?;
+
+        let response = ProduceResponse::try_from(frame.body)?;
+        let topics = response.responses.unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let mut partitions = topics[0].partition_responses.clone().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+
+        Ok(partitions.remove(0))
+    }
+
+    /// The partition gets `INVALID_RECORD`, and the connection then carries a
+    /// well-formed produce, which lands at offset 0.
+    #[tokio::test]
+    async fn zero_length_records_field_is_an_invalid_record() -> anyhow::Result<()> {
+        let _guard = init_tracing()?;
+
+        timeout(TEST_TIMEOUT, async {
+            let broker = spawn_broker(None).await?;
+            let mut stream = TcpStream::connect(broker.addr).await?;
+
+            let name = &alphanumeric_string(15)[..];
+            create_topic(&mut stream, name).await?;
+
+            let response = produce(&mut stream, 2, name, None).await?;
+            assert_invalid_record(&response)?;
+            assert_eq!(
+                Some(NOT_EXACTLY_ONE_BATCH),
+                response.error_message.as_deref()
+            );
+
+            let batches = vec![well_formed(b"well formed")?];
+            let response = produce(&mut stream, 3, name, Some(Frame { batches })).await?;
+            assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+            assert_eq!(0, response.base_offset);
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow!("timed out after {TEST_TIMEOUT:?}"))?
     }
 }

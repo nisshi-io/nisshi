@@ -441,24 +441,27 @@ where
         name: &str,
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
-        let Some(records) = partition.records else {
-            return self.error(partition.index, ErrorCode::UnknownServerError);
-        };
+        // The decoder turns a zero-length records field into `None`, so it
+        // counts as zero batches.
+        let batches = partition
+            .records
+            .map(|records| records.batches)
+            .unwrap_or_default();
 
         // Kafka allows exactly one batch per partition from Produce v3, the
         // first version that carries record batches, which is the only format
         // this broker decodes. Kafka checks the count before it validates any
         // batch, so this check runs before `rejection`. See
         // https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
-        let batches = records.batches.len();
-        let Ok([mut batch]) = <[deflated::Batch; 1]>::try_from(records.batches) else {
+        let batch_count = batches.len();
+        let Ok([mut batch]) = <[deflated::Batch; 1]>::try_from(batches) else {
             const REASON: &str =
                 "a produce request must contain exactly one record batch per partition";
 
             warn!(
                 topic = name,
                 partition = partition.index,
-                batches,
+                batch_count,
                 reason = REASON,
                 "rejecting produce request",
             );
