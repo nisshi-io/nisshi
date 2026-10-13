@@ -834,9 +834,10 @@ fn launch_container(
 ///
 /// A port that its stopped owner keeps looks free to a check that something listens on it. So the
 /// reservation is an exclusive `flock` on a file named after the port, in
-/// [`settings::port_lock_dir`], which every test process of the user sees. nextest runs each test in a process of its own, so a lock inside one process would not
-/// reach the other tests. The operating system releases the lock when the process exits, so a test
-/// that nextest kills leaves no reservation behind.
+/// `settings::port_lock_dir`, which every test process of the user sees. nextest runs each test in
+/// a process of its own, so a lock inside one process would not reach the other tests. The
+/// operating system releases the lock when the process exits, so a test that nextest kills leaves
+/// no reservation behind.
 #[derive(Debug)]
 pub struct ReservedPort {
     number: u16,
