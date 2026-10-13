@@ -21,7 +21,7 @@ services:
       - grafana:/var/lib/grafana
     pull_policy: missing
   db:
-    image: ${POSTGRES_IMAGE:-postgres:17}
+    image: ${POSTGRES_IMAGE:-postgres:18}
     environment:
       PGUSER: postgres
       POSTGRES_PASSWORD: postgres

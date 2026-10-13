@@ -7,7 +7,7 @@ name: ci
 # a poisoning fix (GitHub already scopes a run's cache writes to its own
 # ref) - it's hygiene, keeping the repo's cache budget from being consumed
 # by entries on refs nothing else can restore from. Applies to fmt, clippy,
-# test (its postgres:17 leg only), cargo-publish-dry-run,
+# test (postgres:18, its only leg), cargo-publish-dry-run,
 # third-party-license, smoke-sqlite (one leg per os), release and macos below
 # (release and macos also skip the cache entirely on tags). The two compat
 # jobs only restore test's entry, through the `dev` shared key, and never
@@ -22,10 +22,12 @@ name: ci
 #
 # - Tier A runs on every pull_request push: fmt, clippy, typos, shellcheck,
 #   third-party-license, the single non-experimental leg of each compat
-#   suite, `test` on postgres:17 only (compose.yaml's default), and ci-gate.
+#   suite, `test` on postgres:18 (compose.yaml's default), and ci-gate.
 # - Tier B runs once per merge-queue entry (`merge_group`) and on push:
-#   the full build-storage/build-storage-lake matrix, `test` on pg16/pg18,
-#   the experimental compat legs, cargo-publish-dry-run, src, release,
+#   the full build-storage/build-storage-lake matrix, `test` on postgres:18
+#   again (Postgres 16, 17 and 19 run nightly in tier-c.yml), the
+#   experimental compat legs (postgres and sqlite; S3 compat runs nightly),
+#   cargo-publish-dry-run, src, release,
 #   macos, smoke, smoke-sqlite, smoke-oldest-client,
 #   smoke-oldest-client-sqlite, smoke-report.
 #
@@ -57,7 +59,7 @@ name: ci
 # (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, written once as the `tier_b`
 # anchor on build-storage and aliased by the others. The trimmed matrices pick
 # the smaller list under the inverse condition, so a leg's check-run name
-# (`test (ubuntu-latest, postgres:17)`) means the same thing whichever tier
+# (`test (ubuntu-latest, postgres:18)`) means the same thing whichever tier
 # produced it. The `MERGE_QUEUE` repository variable is the rollback switch:
 # the split only makes sense while a merge queue runs Tier B before merge,
 # so when the queue is off (variable unset or not `on`) pull_request runs
@@ -158,8 +160,8 @@ jobs:
           [ "$listed" -eq "$CHANGED_FILES" ] || run_all "listed $listed of $CHANGED_FILES changed files"
           bash .github/scripts/ci-changes.sh < "$RUNNER_TEMP/files"
   test:
-    # Tier A on postgres:17 (compose.yaml's default), full pg matrix on
-    # merge_group/push. build-storage/build-storage-lake are Tier B, so they
+    # Postgres 18 (compose.yaml's default) on every tier; the other versions
+    # run nightly in tier-c.yml. build-storage/build-storage-lake are Tier B, so they
     # can't be `needs` here (see the header).
     if: needs.changes.outputs.rust == 'true'
     needs: [changes]
@@ -170,7 +172,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        pg: ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository)) && '["postgres:17"]' || '["postgres:16", "postgres:17", "postgres:18"]') }}
+        pg: [postgres:18]
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -208,10 +210,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          # Every pg leg shares one entry, and only one of them should save
-          # it: pg17, the leg that runs in both tiers. The compat jobs restore
-          # this entry under the same key and never save it.
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.pg == 'postgres:17' }}
+          # Only a push to main saves this entry. The compat jobs restore it
+          # under the same key and never save it.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-shared-key: dev
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -358,12 +359,11 @@ jobs:
         os:
           - ubuntu-latest
         # Tier A runs the one non-experimental leg (memory); merge_group/push
-        # run all four. compat-franz-go reuses this list as `*compat_storage`.
+        # run the three. compat-franz-go reuses this list as `*compat_storage`.
         storage: &compat_storage >-
           ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
-          {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
           {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": true},
           {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": true}]') }}
     env:
@@ -384,7 +384,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:17
+          ecr-fallback-images: postgres:18
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -466,7 +466,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:17
+          ecr-fallback-images: postgres:18
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -641,7 +641,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:17' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -805,7 +805,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:17' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
