@@ -3,7 +3,7 @@ name: ci
 
 # `cache-save-if: github.ref == 'refs/heads/main'` on a job's toolchain
 # setup means every PR and queue entry restores main's cache but only a
-# push to main refreshes it; a `v*` tag push doesn't save either. This isn't
+# push to main refreshes it; a release run on a `v*` tag doesn't save either. This isn't
 # a poisoning fix (GitHub already scopes a run's cache writes to its own
 # ref) - it's hygiene, keeping the repo's cache budget from being consumed
 # by entries on refs nothing else can restore from. Applies to fmt, clippy,
@@ -36,11 +36,16 @@ name: ci
 # `macos` is a compile-only check except on a `v*` tag, where it builds the
 # release tarball (tier-c.yml builds the macOS release nightly). smoke builds
 # a single-platform image from release's binaries on each os and pushes
-# nothing. `publish` (push only) needs every job ci-gate does and is the only
-# job that pushes an image: a multi-arch build of its own, from the same
-# Dockerfile and the binaries smoke tested. `publish-release` attaches the
-# tarballs on a tag, after publish. Both are outside ci-gate, see their
-# comments.
+# nothing. `publish` (push to main only) needs every job ci-gate does and is
+# the only job here that pushes an image: a multi-arch build of its own, from
+# the same Dockerfile and the binaries smoke tested. It is outside ci-gate,
+# see its comment.
+#
+# A `v*` tag doesn't trigger this workflow. release.yml runs on the tag,
+# calls this workflow through `workflow_call`, and publishes the release only
+# after it passes. A called run keeps the tag's `push` event and
+# `refs/tags/v*` ref, so the conditions below treat it as a push, and macos
+# builds the full release.
 #
 # On top of the tiers, the `changes` job skips every Rust job on a
 # pull_request that only touches CI config this workflow doesn't read, or
@@ -84,13 +89,12 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   pull_request:
     branches:
       - main
   merge_group:
     types: [checks_requested]
+  workflow_call:
 # Cancel a superseded pull_request run only. Off pull_request the group is
 # `ref@sha`, not `sha`: the queue fast-forwards main to the commit it just
 # tested, so the merge_group run and the post-merge push run share a sha,
@@ -99,8 +103,12 @@ on:
 # pending run in a group whenever a newer one arrives, whatever
 # `cancel-in-progress` says. Cancelling a merge_group run also fails that
 # queue entry outright.
+#
+# The prefix is a literal, not `github.workflow`: in a called run that is the
+# caller's name, so another workflow the same caller runs would land in this
+# group and GitHub would cancel one of them.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  group: ci-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   REGISTRY: ghcr.io
@@ -1011,7 +1019,7 @@ jobs:
           cp compose.yaml example.env LICENSE README.md "$dist"
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
-      # publish-release attaches the tarballs to the GitHub release, on a tag.
+      # release.yml attaches the tarballs to the GitHub release, on a tag.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nisshi-${{matrix.target}}
@@ -1029,8 +1037,9 @@ jobs:
         with:
           name: image-${{matrix.target}}
           path: dist/
-          # publish reads this on a push, and a re-run of it can come days
-          # later. Other runs only need it for smoke.
+          # publish reads this on a push to main, and release.yml on a tag,
+          # and a re-run of either can come days later. Other runs only need
+          # it for smoke.
           retention-days: ${{ github.event_name == 'push' && 3 || 1 }}
           if-no-files-found: error
   # The full release build (about 20 minutes) runs on a `v*` tag only. Every
@@ -1156,15 +1165,14 @@ jobs:
         run: |
           skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
-  # The only job that pushes an image, and it holds only `packages: write`. It
-  # needs every job ci-gate does, so a red or skipped job anywhere stops it. It is not in
-  # ci-gate's `needs`: it runs on push only, and ci-gate's "Nothing skipped
-  # off pull_request" step would fail every merge_group run. A `v*` tag isn't
-  # covered by the main ruleset, so this `needs` list and the on-main check
-  # below are the only gates a tag gets. On a tag, macos has also run the
-  # full release build by now.
+  # Pushes the `main` image, and it holds only `packages: write`. It needs
+  # every job ci-gate does, so a red or skipped job anywhere stops it. It is
+  # not in ci-gate's `needs`: it runs on push only, and ci-gate's "Nothing
+  # skipped off pull_request" step would fail every merge_group run. On a
+  # `v*` tag (a run release.yml calls) it skips, and release.yml pushes the
+  # version tags instead.
   publish:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'branch'
     needs: *gate_needs
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1180,7 +1188,6 @@ jobs:
       # the tip's own run then fails, re-run that run to publish; the skip
       # says so in the step summary, since the job itself ends green.
       - id: tip
-        if: github.ref_type == 'branch'
         run: |
           set -euo pipefail
           # ls-remote matches a pattern against the tail of a ref name, so
@@ -1199,20 +1206,6 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi
-      # A tag run uses the workflow at the tagged commit, and the `release`
-      # environment on publish-release checks only that the ref name matches
-      # `v*`. This step stops a `v*` tag pushed on a commit that is not on
-      # main from publishing. It does not stop someone who can edit the
-      # workflow at the tagged commit, because they can remove it; a tag
-      # ruleset that restricts who creates `v*` tags is the control for that.
-      # The checkout is depth 1, so the step fetches main itself: the fetch
-      # stops at the tagged commit when the tag is on main, and brings main's
-      # history otherwise, which answers the ancestry check either way.
-      - if: github.ref_type == 'tag'
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::${GITHUB_REF} is at ${GITHUB_SHA}, which is not on main; nothing is published"; exit 1; }
       # release's static musl binaries, as dist/linux/<arch>/nisshi.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -1223,12 +1216,8 @@ jobs:
         id: meta
         with:
           images: ${{env.REGISTRY}}/${{github.repository}}
-          # `latest` comes with the semver tags, for a tag that isn't a
-          # prerelease.
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           buildkitd-flags: --debug
@@ -1255,33 +1244,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-  # Attaches the tarballs to the GitHub release. It is a job of its own so
-  # that `contents: write`, which can create tags the main ruleset doesn't
-  # cover, is held only on a tag run, and the `release` environment's
-  # deployment policy (`v*` tags) is a second, server-side check on the ref.
-  # It needs publish, so it never runs unless every gate passed. The image is
-  # pushed first, so a failed upload leaves an image without a release page
-  # until this job is re-run. The tarballs it reads keep the default artifact
-  # retention.
-  # Release first would put a `needs` on a job that is skipped on main pushes,
-  # which skips publish there.
-  publish-release:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [publish]
-    environment: release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          # Two hyphens: the tarballs are nisshi-<target>, and docker
-          # build-push-action's build record is `nisshi-io~nisshi~<id>.dockerbuild`.
-          pattern: nisshi-*-*
-          merge-multiple: true
-          path: tarballs
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: tarballs/*.tar.gz
-          fail_on_unmatched_files: true
