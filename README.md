@@ -397,6 +397,8 @@ Start PostgreSQL:
 docker compose up -d db
 ```
 
+The `db` service runs PostgreSQL 18, and that image does not start on a `db` volume that holds PostgreSQL 17 data. Run `docker compose down --volumes` once before the first start, or set `POSTGRES_IMAGE=postgres:17` in [.env](.env) to stay on 17.
+
 Bring Nisshi back up:
 
 ```shell

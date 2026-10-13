@@ -59,7 +59,7 @@ name: ci
 # (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, written once as the `tier_b`
 # anchor on build-storage and aliased by the others. The trimmed matrices pick
 # the smaller list under the inverse condition, so a leg's check-run name
-# (`test (ubuntu-latest, postgres:18)`) means the same thing whichever tier
+# (`compat-librdkafka (ubuntu-latest, memory, memory://, dynostore, false)`) means the same thing whichever tier
 # produced it. The `MERGE_QUEUE` repository variable is the rollback switch:
 # the split only makes sense while a merge queue runs Tier B before merge,
 # so when the queue is off (variable unset or not `on`) pull_request runs
