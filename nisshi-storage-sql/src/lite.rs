@@ -56,7 +56,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
     ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel, config::apply_op,
+    bounded_channel, check_claim, config::apply_op, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1397,19 +1397,23 @@ impl Delegate {
 
         let pc = self.connection().await?;
 
-        pc.execute(
-            "lite/policy_delete.sql",
-            (self.cluster.as_str(), now, retention_ms),
-        )
-        .await
-        .map(|deleted| deleted as u64)
-        .map_err(Into::into)
-        .inspect(|_| {
-            DELEGATE_REQUEST_DURATION.record(
-                elapsed_millis(start),
-                &[KeyValue::new("operation", "policy_delete")],
+        let by_age = pc
+            .execute(
+                "lite/policy_delete.sql",
+                (self.cluster.as_str(), now, retention_ms),
             )
-        })
+            .await?;
+
+        pc.execute("lite/policy_delete_bytes.sql", [self.cluster.as_str()])
+            .await
+            .map(|by_bytes| (by_age + by_bytes) as u64)
+            .map_err(Into::into)
+            .inspect(|_| {
+                DELEGATE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[KeyValue::new("operation", "policy_delete")],
+                )
+            })
     }
 
     async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {
@@ -4288,8 +4292,20 @@ impl Storage for Delegate {
             transaction_id, transaction_timeout_ms, producer_id, producer_epoch
         );
 
-        match (producer_id, producer_epoch, transaction_id) {
-            (Some(-1), Some(-1), Some(transaction_id)) => {
+        let claim = match producer_claim(producer_id, producer_epoch) {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
+                    DELEGATE_REQUEST_DURATION.record(
+                        elapsed_millis(start),
+                        &[KeyValue::new("operation", "init_producer")],
+                    )
+                });
+            }
+        };
+
+        match transaction_id {
+            Some(transaction_id) => {
                 let pc = self.connection().await?;
                 let tx = pc.transaction().await?;
 
@@ -4310,7 +4326,25 @@ impl Storage for Delegate {
                             TxnState::from_str(status.as_str()).map(Some)
                         })?;
 
-                    debug!(transaction_id, id, epoch, ?status);
+                    debug!(transaction_id, id, epoch, ?status, ?claim);
+
+                    if let Some(claim) = claim {
+                        let error = check_claim((id, epoch), claim);
+
+                        if error != ErrorCode::None {
+                            _ = tx
+                                .rollback()
+                                .await
+                                .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
+
+                            return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
+                                DELEGATE_REQUEST_DURATION.record(
+                                    elapsed_millis(start),
+                                    &[KeyValue::new("operation", "init_producer")],
+                                )
+                            });
+                        }
+                    }
 
                     if let Some(TxnState::Begin) = status {
                         let error = self
@@ -4441,7 +4475,7 @@ impl Storage for Delegate {
                 })
             }
 
-            (Some(-1), Some(-1), None) => {
+            None => {
                 let pc = self.connection().await?;
                 let tx = pc.transaction().await?;
 
@@ -4523,8 +4557,6 @@ impl Storage for Delegate {
                     })
                 }
             }
-
-            (_, _, _) => todo!(),
         }
     }
 

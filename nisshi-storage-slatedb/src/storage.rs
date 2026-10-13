@@ -53,7 +53,8 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, config::apply_op,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::sleep;
@@ -1940,6 +1941,11 @@ impl Storage for Engine {
         producer_id: Option<i64>,
         producer_epoch: Option<i16>,
     ) -> Result<ProducerIdResponse> {
+        let claim = match producer_claim(producer_id, producer_epoch) {
+            Ok(claim) => claim,
+            Err(error) => return Ok(ProducerIdResponse::failed(error)),
+        };
+
         if let Some(transaction_id) = transaction_id {
             // Transactional producer initialization
             let tx = self
@@ -1963,6 +1969,14 @@ impl Storage for Engine {
                     .last_key_value()
                     .map(|(e, detail)| (*e, detail.state == Some(TxnState::Begin)))
                     .unwrap_or((0, false));
+
+                if let Some(claim) = claim {
+                    let error = check_claim((producer_id, old_epoch), claim);
+
+                    if error != ErrorCode::None {
+                        return Ok(ProducerIdResponse::failed(error));
+                    }
+                }
 
                 // If old epoch is in Begin state, we need to abort it
                 if needs_abort && let Some(old_detail) = existing_txn.epochs.get_mut(&old_epoch) {
@@ -2112,7 +2126,7 @@ impl Storage for Engine {
                 epoch,
                 ..Default::default()
             })
-        } else if Some(-1) == producer_id && Some(-1) == producer_epoch {
+        } else {
             let tx = self
                 .db
                 .begin(slatedb::IsolationLevel::SerializableSnapshot)
@@ -2139,12 +2153,6 @@ impl Storage for Engine {
                     epoch,
                     ..Default::default()
                 }))
-        } else {
-            Ok(ProducerIdResponse {
-                id: -1,
-                epoch: -1,
-                error: ErrorCode::UnknownServerError,
-            })
         }
     }
 

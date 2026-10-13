@@ -1,4 +1,15 @@
 version: 2
+# Each entry sets `commit-message`, so Dependabot titles its PRs
+# `build(deps): bump ...`. pr-title.yml requires a Conventional Commits
+# title, and Dependabot's default `Bump ...` title fails it.
+#
+# Weekly runs land on the weekend, before working hours (Eastern), so the
+# CI for a burst of bump PRs does not compete with merge-queue runs during
+# the week. Cargo gets its own day because it opens most of the PRs. Each
+# bump stays its own PR (no `groups`), so one change reverts cleanly, and
+# `open-pull-requests-limit` stays at its default of 5: a low limit would
+# let a few long-open major bumps block newer ones. Security updates are
+# not subject to the limit or the cooldown.
 updates:
   # The 7-day cooldown gives an upstream CVE or a yanked release time to
   # surface before Dependabot opens a bump PR.
@@ -6,14 +17,26 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "saturday"
+      time: "06:00"
+      timezone: "America/Toronto"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     cooldown:
       default-days: 7
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "America/Toronto"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     ignore:
       # Pinned to 1.1.0 in Cargo.toml: buoyant_kernel 0.22.2 depends on
       # "^1", which resolves to 1.2.0 by default, but 1.2.0 renamed the
@@ -43,13 +66,25 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "saturday"
+      time: "06:00"
+      timezone: "America/Toronto"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     cooldown:
       default-days: 7
   - package-ecosystem: "docker"
     directory: "/.devcontainer"
     schedule:
       interval: "weekly"
+      day: "saturday"
+      time: "06:00"
+      timezone: "America/Toronto"
     target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
     cooldown:
       default-days: 7
