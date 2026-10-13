@@ -48,7 +48,7 @@ runs:
           # Official library images only: ECR Public mirrors those under
           # docker/library and nothing else, so a namespaced image would map
           # to a path that does not exist.
-          if [[ ! "${image}" =~ ^[a-z0-9][a-z0-9._-]*(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]{64})?$ ]]; then
+          if [[ ! "${image}" =~ ^[a-z0-9][a-z0-9._-]*(:[A-Za-z0-9._-]+)?$ ]]; then
             echo "::error::'${image}' is not a plain name[:tag] official image"
             exit 1
           fi
@@ -59,7 +59,8 @@ runs:
           fi
           ecr="public.ecr.aws/docker/library/${image}"
           echo "::warning::Pulling ${image} failed, falling back to ${ecr}"
-          docker pull --quiet "${ecr}" >/dev/null
+          docker pull --quiet "${ecr}" >/dev/null \
+            || { echo "::error::Could not pull ${image} from the Docker daemon or ${ecr}"; exit 1; }
           docker tag "${ecr}" "${image}"
           echo "${image}: pulled from ${ecr}"
         done <<<"${IMAGES}"
