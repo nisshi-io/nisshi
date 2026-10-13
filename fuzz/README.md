@@ -18,7 +18,7 @@ cargo-fuzz targets for the Kafka wire protocol in `nisshi-sans-io`. Each target 
 
 To move a target between tiers, change its budget, or stop running it in CI, edit this file. Nothing in `.github/workflows/fuzz.yml` needs to change. A name in the file that isn't a target fails the run. A target that's in neither tier gets a warning, so a new target isn't silently skipped.
 
-The PR job has a 50 minute timeout and each nightly job 75 minutes. Compiling all five targets from scratch takes about 33 minutes (10 of it dependencies, which the Rust cache saves from `main`). If the budgets outgrow those, raise `timeout-minutes` in `.github/workflows/fuzz.yml` too.
+The PR job has a 50 minute timeout and each nightly job 75 minutes. The six `pr` budgets add up to 6 minutes of fuzzing, after a build that takes about 33 minutes from scratch (10 of it dependencies, which the Rust cache saves from `main`) and, measured on a PR run with that cache, about 19 minutes. If the budgets outgrow those, raise `timeout-minutes` in `.github/workflows/fuzz.yml` too.
 
 ## Adding a target
 

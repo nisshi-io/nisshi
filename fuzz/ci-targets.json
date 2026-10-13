@@ -1,5 +1,6 @@
 {
   "pr": {
+    "fuzz_batch_records": 60,
     "fuzz_deflated_batch": 60,
     "fuzz_member_metadata": 60,
     "fuzz_request_decode": 60,
@@ -7,6 +8,7 @@
     "fuzz_varint": 60
   },
   "nightly": {
+    "fuzz_batch_records": 1800,
     "fuzz_deflated_batch": 1800,
     "fuzz_member_metadata": 1800,
     "fuzz_request_decode": 1800,

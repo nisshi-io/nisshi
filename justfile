@@ -92,10 +92,9 @@ fuzz-request-decode: (cargo-fuzz "run" "fuzz_request_decode" "--" "-max_total_ti
 
 fuzz-member-metadata: (cargo-fuzz "run" "fuzz_member_metadata" "--" "-max_total_time=60")
 
-fuzz-batch-records: (cargo-fuzz "run" "fuzz_batch_records" "--" "-max_total_time=60")
-
+# write the seed corpus under fuzz/corpus/, on the toolchain fuzz-ci runs on
 fuzz-generate-seed:
-    cargo run --package fuzz --bin generate_seeds
+    cargo +nightly run --package fuzz --bin generate_seeds
 
 # run every target listed under `tier` in fuzz/ci-targets.json for its budget
 # in seconds (or only `target`), as .github/workflows/fuzz.yml does; see
