@@ -5,7 +5,7 @@
 #   nisshi-smoke-test/run.sh <postgres|sqlite|memory|s3> [nextest arguments...]
 #
 # The script passes extra arguments to `cargo nextest run`, such as a filter
-# that selects some of the tests: -E 'test(/^group_rebalance::/)'.
+# that selects some of the tests: -E 'test(/^groups::group_rebalance::/)'.
 #
 # It starts what the engine needs under its own compose project, then the
 # shared broker (NISSHI_SMOKE_IMAGE if set, otherwise NISSHI_SMOKE_BIN or a

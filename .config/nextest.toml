@@ -24,14 +24,14 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # The durability tests run clients around a broker kill or a storage outage,
 # and then read back every record, so they get longer than the other tests.
 [[profile.smoke.overrides]]
-filter = "test(/^durability::/)"
+filter = "test(/^broker_lifecycle::durability::/)"
 test-group = "durability"
 slow-timeout = { period = "60s", terminate-after = 8 }
 
 # The rebalance tests print how long consuming paused, and nextest shows a
 # passing test's output only with `success-output`.
 [[profile.smoke.overrides]]
-filter = "test(/^group_rebalance::/)"
+filter = "test(/^groups::group_rebalance::/)"
 test-group = "consumer-group-members"
 success-output = "immediate"
 
@@ -40,4 +40,4 @@ success-output = "immediate"
 # its feature compiles.
 [profile.smoke-s3]
 inherits = "smoke"
-default-filter = "test(/^topic_lifecycle::/) | test(=every_test_file_is_declared)"
+default-filter = "test(/^topic_admin::topic_lifecycle::/) | test(=every_test_file_is_declared)"

@@ -14,51 +14,63 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-pub mod broker;
-pub mod compaction;
-pub mod configs;
-pub mod consume;
-pub mod consumer_groups;
-pub mod delete_records;
-pub mod durability;
-pub mod group_rebalance;
-pub mod offset_resets;
-pub mod offsets;
-pub mod partition_reassignments;
-pub mod produce;
-pub mod restart;
-pub mod retention;
-pub mod scram;
-pub mod sqlite_snapshot;
-pub mod storage_down_at_startup;
-pub mod storage_url;
-pub mod topic_lifecycle;
-pub mod topics;
+use std::{fs, path::Path};
 
-// Cargo only builds the modules declared above, so a file in `tests/smoke/` without a
-// `pub mod` line would never compile or run. Fail instead of skipping it silently.
+pub mod broker_lifecycle;
+pub mod groups;
+pub mod log_cleanup;
+pub mod produce_consume;
+pub mod scram;
+pub mod topic_admin;
+
+// Cargo only builds the modules that a `pub mod` line declares, so a file in `tests/smoke/` without
+// one would never compile or run. Fail instead of skipping it silently. `main.rs` declares each
+// file directly in `tests/smoke/`, and `<folder>.rs` declares each file in `<folder>/`.
 #[test]
 fn every_test_file_is_declared() -> std::io::Result<()> {
-    let declared = include_str!("main.rs");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/smoke");
     let mut undeclared = Vec::new();
+    let mut folders = vec![root.clone()];
 
-    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/smoke"))? {
-        let path = entry?.path();
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
+    while let Some(folder) = folders.pop() {
+        let declaring_file = if folder == root {
+            root.join("main.rs")
+        } else {
+            folder.with_extension("rs")
         };
+        let declarations = fs::read_to_string(&declaring_file).unwrap_or_default();
 
-        if path.extension().is_some_and(|extension| extension == "rs")
-            && stem != "main"
-            && !declared.contains(&format!("\npub mod {stem};\n"))
-        {
-            undeclared.push(stem.to_owned());
+        for entry in fs::read_dir(&folder)? {
+            let path = entry?.path();
+
+            if path.is_dir() {
+                folders.push(path);
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+
+            if path.extension().is_some_and(|extension| extension == "rs")
+                && path != root.join("main.rs")
+                && !declarations.contains(&format!("\npub mod {stem};\n"))
+            {
+                undeclared.push(format!(
+                    "{} in {}",
+                    path.strip_prefix(&root).unwrap_or(&path).display(),
+                    declaring_file
+                        .strip_prefix(&root)
+                        .unwrap_or(&declaring_file)
+                        .display()
+                ));
+            }
         }
     }
 
     assert!(
         undeclared.is_empty(),
-        "add `pub mod <name>;` to tests/smoke/main.rs for: {undeclared:?}"
+        "add a `pub mod <name>;` line for each file: {undeclared:?}"
     );
     Ok(())
 }
