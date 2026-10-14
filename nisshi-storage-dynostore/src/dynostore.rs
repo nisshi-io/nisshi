@@ -15,6 +15,7 @@
 //! Dynamic Object Storage engine (S3, memory, ...)
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{Debug, Display},
     str::FromStr,
@@ -173,7 +174,7 @@ fn decode_group_segment(segment: &str) -> Option<String> {
             )
         })
         .ok()
-        .map(std::borrow::Cow::into_owned)
+        .map(Cow::into_owned)
 }
 
 #[derive(Clone, Debug)]
@@ -1315,17 +1316,19 @@ impl Storage for DynoStore {
                     .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
                     .inspect_err(|err| {
                         // The record is already in the log, so unlike the
-                        // pre-check a sequence rejection here is not
-                        // harmless: the client is told the batch failed
-                        // while it is stored.
-                        if matches!(
-                            err,
-                            Error::Api(ErrorCode::OutOfOrderSequenceNumber)
-                                | Error::Api(ErrorCode::DuplicateSequenceNumber)
-                        ) {
-                            POST_WRITE_SEQUENCE_REJECTED
-                                .add(1, &[KeyValue::new("cluster", self.cluster.clone())]);
-                        }
+                        // pre-check any failure here is not harmless: the
+                        // client is told the batch failed while it is
+                        // stored. That covers a rejected sequence, a fenced
+                        // producer (the pre-check passed on stale metadata)
+                        // and a transient object store error (the retry
+                        // then writes the batch a second time).
+                        POST_WRITE_ADVANCE_FAILED.add(
+                            1,
+                            &[
+                                KeyValue::new("cluster", self.cluster.clone()),
+                                KeyValue::new("reason", post_write_failure_reason(err)),
+                            ],
+                        );
 
                         error!(
                             ?err,
@@ -3090,14 +3093,27 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
     }
 }
 
-static POST_WRITE_SEQUENCE_REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static POST_WRITE_ADVANCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("nisshi_produce_post_write_sequence_rejected")
+        .u64_counter("nisshi_produce_post_write_advance_failed")
         .with_description(
-            "Idempotent produce batches stored but rejected on the post-write sequence advance",
+            "Idempotent produce batches stored but reported as failed because the post-write \
+             sequence advance failed, by reason",
         )
         .build()
 });
+
+/// The `reason` attribute of [`POST_WRITE_ADVANCE_FAILED`]: the Kafka error
+/// code name for an API error, the [`object_store_error_name`] for an object
+/// store error, and `other` for anything else, so the cardinality stays
+/// bounded.
+fn post_write_failure_reason(error: &Error) -> Cow<'static, str> {
+    match error {
+        Error::Api(code) => Cow::Owned(format!("{code:?}")),
+        Error::ObjectStore(error) => Cow::Borrowed(object_store_error_name(error)),
+        _ => Cow::Borrowed("other"),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Metron<O> {
