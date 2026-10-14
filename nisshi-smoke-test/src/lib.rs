@@ -18,6 +18,9 @@
 //! `just smoke <engine>` passes the suite its configuration through the environment, which
 //! [`settings`] reads.
 
+// The whole crate is test harness: a failed setup step should panic the test that hit it.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},

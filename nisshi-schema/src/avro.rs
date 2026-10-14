@@ -638,7 +638,7 @@ impl AsJsonValue for Schema {
 pub fn r<'a>(
     schema: &AvroSchema,
     fields: impl IntoIterator<Item = (&'a str, Value)>,
-) -> apache_avro::types::Record<'_> {
+) -> Result<apache_avro::types::Record<'_>> {
     apache_avro::types::Record::new(schema)
         .map(|mut record| {
             for (name, value) in fields {
@@ -646,7 +646,7 @@ pub fn r<'a>(
             }
             record
         })
-        .unwrap()
+        .ok_or_else(|| Error::Message(format!("not a record schema: {schema:?}")))
 }
 
 #[doc(hidden)]

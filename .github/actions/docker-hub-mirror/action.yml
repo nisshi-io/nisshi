@@ -1,5 +1,14 @@
 name: Docker Hub mirror
-description: Pulls Docker Hub images through mirror.gcr.io, so CI does not hit Docker Hub's anonymous pull limit.
+description: Pulls Docker Hub images through mirror.gcr.io, with public ECR as a fallback for official images, so CI does not hit Docker Hub's anonymous pull limit.
+inputs:
+  ecr-fallback-images:
+    description: >-
+      Newline-separated official Docker Hub images (name or name:tag, no registry or
+      namespace), such as postgres:17. Each is pulled up front, and if that
+      fails it is pulled from public.ecr.aws/docker/library and tagged back to
+      its original name. Leave empty to skip.
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
@@ -27,3 +36,31 @@ runs:
         mirrors=$(docker info --format '{{range .RegistryConfig.Mirrors}}{{println .}}{{end}}')
         grep -q 'mirror.gcr.io' <<<"${mirrors}" \
           || { echo "::error::mirror.gcr.io is not in the Docker daemon config"; exit 1; }
+    - name: Pull images with ECR fallback
+      if: inputs.ecr-fallback-images != ''
+      shell: bash
+      env:
+        IMAGES: ${{ inputs.ecr-fallback-images }}
+      run: |
+        set -euo pipefail
+        while IFS= read -r image; do
+          [[ -n "${image}" ]] || continue
+          # Official library images only: ECR Public mirrors those under
+          # docker/library and nothing else, so a namespaced image would map
+          # to a path that does not exist.
+          if [[ ! "${image}" =~ ^[a-z0-9][a-z0-9._-]*(:[A-Za-z0-9._-]+)?$ ]]; then
+            echo "::error::'${image}' is not a plain name[:tag] official image"
+            exit 1
+          fi
+          # The daemon tries mirror.gcr.io first, then Docker Hub.
+          if docker pull --quiet "${image}" >/dev/null; then
+            echo "${image}: pulled via the Docker daemon (mirror, then Docker Hub)"
+            continue
+          fi
+          ecr="public.ecr.aws/docker/library/${image}"
+          echo "::warning::Pulling ${image} failed, falling back to ${ecr}"
+          docker pull --quiet "${ecr}" >/dev/null \
+            || { echo "::error::Could not pull ${image} from the Docker daemon or ${ecr}"; exit 1; }
+          docker tag "${ecr}" "${image}"
+          echo "${image}: pulled from ${ecr}"
+        done <<<"${IMAGES}"

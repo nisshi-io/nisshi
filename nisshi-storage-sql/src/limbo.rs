@@ -47,7 +47,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
     to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
@@ -62,7 +62,7 @@ use nisshi_storage::{
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
     Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
-    producer_claim,
+    config::apply_op, inflate_produced, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -184,6 +184,80 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let mut connection = self.connection().await?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+
+        let topic = resource.resource_name.as_str();
+
+        if tx
+            .query(
+                &sql_lookup("topic_select_name.sql")?,
+                (self.cluster.as_str(), topic),
+            )
+            .await?
+            .next()
+            .await?
+            .is_none()
+        {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        for config in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(config.config_operation)?;
+            let name = config.name.as_str();
+
+            let current = if matches!(op, OpType::Append | OpType::Subtract) {
+                tx.query(
+                    &sql_lookup("topic_configuration_select_name.sql")?,
+                    (self.cluster.as_str(), topic, name),
+                )
+                .await?
+                .next()
+                .await?
+                .map(|row| row.get_value(0).map(|value| value.as_text().cloned()))
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+
+            match apply_op(
+                ConfigResource::Topic,
+                name,
+                current.as_deref(),
+                op,
+                config.value.as_deref(),
+            )? {
+                Some(value) => {
+                    _ = tx
+                        .query(
+                            &sql_lookup("topic_configuration_upsert.sql")?,
+                            (self.cluster.as_str(), topic, name, value.as_str()),
+                        )
+                        .await?
+                        .next()
+                        .await?;
+                }
+
+                None => {
+                    _ = tx
+                        .execute(
+                            &sql_lookup("topic_configuration_delete.sql")?,
+                            (self.cluster.as_str(), topic, name),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(Into::into)
+    }
+
     pub fn builder()
     -> Builder<PhantomData<String>, PhantomData<i32>, PhantomData<Url>, PhantomData<Url>> {
         Builder::default()
@@ -510,7 +584,7 @@ impl Engine {
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
 
-        let inflated = inflated::Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
+        let inflated = inflate_produced(deflated)?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -1073,9 +1147,12 @@ impl Builder<String, i32, Url, Url> {
 
         debug!(?path);
 
-        let db = turso::Builder::new_local(path.to_str().unwrap())
-            .build()
-            .await?;
+        let db = turso::Builder::new_local(
+            path.to_str()
+                .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?,
+        )
+        .build()
+        .await?;
 
         let connection = db.connect()?;
 
@@ -1180,9 +1257,13 @@ impl Storage for Engine {
                 .inspect(|row| debug!(?parameters, ?row))
                 .and_then(|row| {
                     row.get_value(0)
-                        .map(|value| value.as_text().cloned().unwrap())
-                        .inspect_err(|err| error!(?err))
                         .map_err(Into::into)
+                        .and_then(|value| {
+                            value.as_text().cloned().ok_or_else(|| {
+                                Error::Message("expected a text column value".into())
+                            })
+                        })
+                        .inspect_err(|err| error!(?err))
                 })
                 .and_then(|id| Uuid::parse_str(id.as_str()).map_err(Into::into))
         }
@@ -1332,56 +1413,10 @@ impl Storage for Engine {
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
             ConfigResource::Topic => {
-                let mut error_code = ErrorCode::None;
-
-                for config in resource.configs.unwrap_or_default() {
-                    match OpType::try_from(config.config_operation)? {
-                        OpType::Set => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                &sql_lookup("topic_configuration_upsert.sql")?,
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                    config.value.as_deref(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Delete => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                &sql_lookup("topic_configuration_delete.sql")?,
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Append => todo!(),
-                        OpType::Subtract => todo!(),
-                    }
-                }
+                self.alter_topic(&resource).await?;
 
                 Ok(AlterConfigsResourceResponse::default()
-                    .error_code(error_code.into())
+                    .error_code(ErrorCode::None.into())
                     .error_message(Some("".into()))
                     .resource_type(resource.resource_type)
                     .resource_name(resource.resource_name))
@@ -2189,33 +2224,13 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -2316,33 +2331,13 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -2442,31 +2437,13 @@ impl Storage for Engine {
                         brokers.iter().map(|broker| broker.node_id).collect();
                     broker_ids.shuffle(&mut rng);
 
-                    let mut brokers = broker_ids.into_iter().cycle();
-
-                    let partitions = Some(
-                        (0..partitions)
-                            .map(|partition_index| {
-                                let leader_id = brokers.next().expect("cycling");
-
-                                let replica_nodes = Some(
-                                    (0..replication_factor)
-                                        .map(|_replica| brokers.next().expect("cycling"))
-                                        .collect(),
-                                );
-                                let isr_nodes = replica_nodes.clone();
-
-                                MetadataResponsePartition::default()
-                                    .error_code(error_code)
-                                    .partition_index(partition_index)
-                                    .leader_id(leader_id)
-                                    .leader_epoch(Some(-1))
-                                    .replica_nodes(replica_nodes)
-                                    .isr_nodes(isr_nodes)
-                                    .offline_replicas(Some([].into()))
-                            })
-                            .collect(),
-                    );
+                    let partitions = Some(nisshi_storage::assign_replicas(
+                        &broker_ids,
+                        partitions,
+                        replication_factor,
+                        error_code,
+                        -1,
+                    )?);
 
                     responses.push(
                         MetadataResponseTopic::default()
@@ -4234,6 +4211,102 @@ mod tests {
         assert_eq!(uuid, Uuid::parse_str(row.get_str(0)?)?);
         assert_eq!(num_partitions, row.get::<i32>(1)?);
         assert_eq!(replication_factor, row.get::<i32>(2)? as i16);
+
+        Ok(())
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn incremental_alter_resource() -> Result<()> {
+        use nisshi_sans_io::incremental_alter_configs_request::AlterableConfig;
+
+        let _guard = init_tracing()?;
+
+        // The engine resolves the path of its URL against the working
+        // directory, so the database lives in a temporary directory there.
+        let temp_dir =
+            tempfile::tempdir_in(env::current_dir()?).inspect(|temporary| debug!(?temporary))?;
+        let relative = temp_dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+
+        let storage = Url::parse(&format!("file:///{relative}/nisshi.db"))?;
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+        let cleanup_policy = "cleanup.policy";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let alter = |name: &str, op: OpType, value: &str| {
+            AlterConfigsResource::default()
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name(name.to_owned())
+                .configs(Some(vec![
+                    AlterableConfig::default()
+                        .name(cleanup_policy.to_owned())
+                        .config_operation(op.into())
+                        .value(Some(value.to_owned())),
+                ]))
+        };
+
+        for (op, value, expected) in [
+            (OpType::Append, "compact", "compact"),
+            (OpType::Append, "delete", "compact,delete"),
+            (OpType::Subtract, "compact", "delete"),
+        ] {
+            let response = engine
+                .incremental_alter_resource(alter(topic, op, value))
+                .await?;
+            assert_eq!(i16::from(ErrorCode::None), response.error_code);
+
+            let described = engine
+                .describe_config(
+                    topic,
+                    ConfigResource::Topic,
+                    Some(&[cleanup_policy.to_owned()]),
+                )
+                .await?;
+            let configs = described.configs.unwrap_or_default();
+            assert_eq!(1, configs.len());
+            assert_eq!(Some(expected), configs[0].value.as_deref());
+        }
+
+        assert!(matches!(
+            engine
+                .incremental_alter_resource(alter("missing", OpType::Append, "compact"))
+                .await,
+            Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
+        ));
 
         Ok(())
     }

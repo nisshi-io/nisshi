@@ -257,19 +257,19 @@ where
         let mut set = JoinSet::new();
 
         #[cfg(unix)]
-        let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+        let mut interrupt_signal = signal(SignalKind::interrupt())?;
         #[cfg(windows)]
-        let mut interrupt_signal = tokio::signal::windows::ctrl_c().unwrap();
+        let mut interrupt_signal = tokio::signal::windows::ctrl_c()?;
         debug!(?interrupt_signal);
 
         #[cfg(unix)]
-        let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+        let mut terminate_signal = signal(SignalKind::terminate())?;
         // Windows has no SIGTERM for a console program, so this listens for the nearest event: the
         // user closing the console window, or ending the task in Task Manager. A service manager's
         // stop request doesn't send it. Windows ends the process 5 seconds after the event by
         // default, whether or not shutdown has finished.
         #[cfg(windows)]
-        let mut terminate_signal = tokio::signal::windows::ctrl_close().unwrap();
+        let mut terminate_signal = tokio::signal::windows::ctrl_close()?;
         debug!(?terminate_signal);
 
         let silent = self.silent;
@@ -278,16 +278,26 @@ where
 
         let meter_provider = self.meter_provider.take();
 
-        _ = set.spawn(async move {
-            self.serve(started)
-                .await
-                .inspect_err(|err| error!(?err))
-                .unwrap();
-        });
+        _ = set.spawn(async move { self.serve(started).await });
+
+        // A serve task that ends on its own is a failed (or lost) broker: the
+        // process must exit non-zero so a supervisor restarts it.
+        let mut failure = None;
 
         let kind = tokio::select! {
             v = set.join_next() => {
                 debug!(?v);
+                failure = match v {
+                    Some(Ok(Err(err))) => {
+                        error!(?err);
+                        Some(err)
+                    }
+                    Some(Err(err)) => {
+                        error!(?err);
+                        Some(Error::from(err))
+                    }
+                    Some(Ok(Ok(()))) | None => None,
+                };
                 None
             }
 
@@ -351,7 +361,7 @@ where
             }
         }
 
-        Ok(ErrorCode::None)
+        failure.map_or(Ok(ErrorCode::None), Err)
     }
 
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
@@ -433,8 +443,7 @@ where
 
         let m = MultiProgress::new();
 
-        let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}")
-            .unwrap()
+        let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}")?
             .tick_chars("⠁⠂⠄⡀⢀⠠⠐");
 
         let ls = if self.silent {

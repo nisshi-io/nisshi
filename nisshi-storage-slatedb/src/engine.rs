@@ -171,18 +171,24 @@ impl Builder {
         self
     }
 
-    /// Build the Engine, panicking if required fields are missing
-    pub(crate) fn build(self) -> Engine {
-        Engine {
-            cluster: self.cluster.expect("cluster is required"),
-            node: self.node.expect("node is required"),
+    /// Builds the Engine, returning an error if a required field is missing.
+    pub(crate) fn build(self) -> Result<Engine> {
+        Ok(Engine {
+            cluster: self
+                .cluster
+                .ok_or_else(|| Error::Message("cluster is required".into()))?,
+            node: self
+                .node
+                .ok_or_else(|| Error::Message("node is required".into()))?,
             advertised_listener: self
                 .advertised_listener
-                .expect("advertised_listener is required"),
-            db: self.db.expect("db is required"),
+                .ok_or_else(|| Error::Message("advertised_listener is required".into()))?,
+            db: self
+                .db
+                .ok_or_else(|| Error::Message("db is required".into()))?,
             schemas: self.schemas,
             lake: self.lake,
-        }
+        })
     }
 }
 

@@ -143,7 +143,9 @@ impl Create {
         let topics = topics.unwrap_or_default();
         assert_eq!(1, topics.len());
 
-        let CreatableTopicResult { error_code, .. } = topics.first().expect("topics: {topics:?}");
+        let CreatableTopicResult { error_code, .. } = topics
+            .first()
+            .ok_or_else(|| Error::Message(format!("expected exactly one response: {topics:?}")))?;
 
         ErrorCode::try_from(error_code).map_err(Into::into)
     }

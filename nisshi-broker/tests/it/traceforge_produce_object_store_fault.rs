@@ -230,6 +230,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
         let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
         let storage: ArcDynStorage = Arc::new(Box::new(
             DynoStore::new("spike", 111, object_store.clone())
+                .expect("dynostore")
                 .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
                 .schemas(None)
                 .lake(None),
@@ -489,6 +490,7 @@ fn end_txn_marker_write_failure_completes_transaction_anyway() {
         let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
         let storage: ArcDynStorage = Arc::new(Box::new(
             DynoStore::new("spike", 111, object_store.clone())
+                .expect("dynostore")
                 .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
                 .schemas(None)
                 .lake(None),
@@ -659,6 +661,7 @@ fn end_txn_retry_with_opposite_decision_is_rejected() {
         let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
         let storage: ArcDynStorage = Arc::new(Box::new(
             DynoStore::new("spike", 111, object_store.clone())
+                .expect("dynostore")
                 .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
                 .schemas(None)
                 .lake(None),

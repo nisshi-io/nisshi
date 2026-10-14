@@ -111,6 +111,7 @@
 //! ```
 //!
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use async_trait::async_trait;
 use bytes::{Bytes, TryGetError};
 
@@ -189,12 +190,15 @@ use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
 
+mod assignment;
 mod batch;
+pub mod config;
 mod latency;
 mod producer;
 mod proxy;
 mod service;
 
+pub use assignment::assign_replicas;
 pub use batch::ProduceRequestBatcher;
 pub use latency::LatencyIntroducingStorage;
 pub use producer::{check_claim, producer_claim};
@@ -210,7 +214,7 @@ pub use service::{
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
     ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
     RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, bounded_channel,
+    TxnEndService, TxnOffsetCommitService, bounded_channel, inflate_produced,
 };
 
 #[cfg(feature = "dynostore")]
@@ -309,6 +313,8 @@ pub enum Error {
     #[cfg(feature = "slatedb")]
     Postcard(#[from] postcard::Error),
 
+    ProgressStyleTemplate(Arc<indicatif::style::TemplateError>),
+
     Regex(#[from] regex::Error),
 
     SansIo(#[from] nisshi_sans_io::Error),
@@ -389,6 +395,12 @@ impl<T> From<PoisonError<T>> for Error {
 impl From<AcquireError> for Error {
     fn from(value: AcquireError) -> Self {
         Self::Acquire(Arc::new(value))
+    }
+}
+
+impl From<indicatif::style::TemplateError> for Error {
+    fn from(value: indicatif::style::TemplateError) -> Self {
+        Self::ProgressStyleTemplate(Arc::new(value))
     }
 }
 
@@ -1403,6 +1415,22 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid>;
 
     /// Incrementally alter a resource on this storage.
+    ///
+    /// A topic resource applies all of its changes or none of them. Its
+    /// `APPEND` and `SUBTRACT` changes follow [`config::apply_op`].
+    ///
+    /// [`IncrementalAlterConfigsService`] checks each resource the way Kafka
+    /// does before it calls this method. A caller that skips the service gets
+    /// only the checks that `apply_op` makes.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for a topic
+    ///   that doesn't exist;
+    /// - [`Error::Api`] with [`ErrorCode::InvalidConfig`] for `APPEND` or
+    ///   `SUBTRACT` on a key that isn't a list;
+    /// - any other error when storage fails, or when a change has an unknown
+    ///   operation.
     async fn incremental_alter_resource(
         &self,
         resource: AlterConfigsResource,
@@ -1427,6 +1455,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// writes. Only the broker may write control batches, so client Produce
     /// batches must reach storage through [`ProduceService`], which rejects
     /// them.
+    ///
+    /// A backend that decodes the batch does so with [`inflate_produced`], so
+    /// records that do not decode fail with `INVALID_RECORD`.
     async fn produce(
         &self,
         transaction_id: Option<&str>,
@@ -2391,8 +2422,7 @@ impl Builder<i32, String, Url, Url> {
         } else {
             let pb = ProgressBar::new(1);
             pb.set_style(
-                ProgressStyle::with_template("[{elapsed}] {bar:40.cyan/blue} {msg}")
-                    .unwrap()
+                ProgressStyle::with_template("[{elapsed}] {bar:40.cyan/blue} {msg}")?
                     .progress_chars("##-"),
             );
 

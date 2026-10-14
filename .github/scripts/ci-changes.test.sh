@@ -40,6 +40,8 @@ expect "license files" false LICENSE NOTICE
 expect "ci.yml" true .github/workflows/ci.yml
 expect "dependencies.yml" true .github/workflows/dependencies.yml
 expect "codeql.yml" true .github/workflows/codeql.yml
+expect "fuzz.yml" true .github/workflows/fuzz.yml
+expect "fuzz target config" true fuzz/ci-targets.json
 expect "compat report sql" true .github/workflows/scripts/pivot-integration-report.sql
 expect "ci scripts" true .github/scripts/ci-changes.sh
 expect "rust source" true nisshi-broker/src/lib.rs

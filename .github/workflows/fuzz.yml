@@ -1,0 +1,232 @@
+---
+name: fuzz
+
+# Runs the cargo-fuzz targets in fuzz/. Which targets run, and for how many
+# seconds each, is set per tier in fuzz/ci-targets.json, not here; see
+# fuzz/README.md. Both tiers run `just fuzz-ci <tier>`, so a local run
+# matches CI.
+#
+# - pull_request: every `pr` target, back to back in one job. One job rather
+#   than a matrix because one `cargo fuzz build` compiles every target in
+#   parallel, where a matrix would pay for a cold build per target.
+#   Report-only: this workflow isn't in ci.yml's ci-gate or the required
+#   checks, so a crash fails this check without blocking the merge. A find
+#   isn't necessarily caused by the PR it shows up on.
+# - schedule (and workflow_dispatch): one job per `nightly` target.
+#
+# Crashing, hanging or out-of-memory inputs land in fuzz/artifacts/<target>/
+# and are uploaded as an artifact when a run fails.
+#
+# Corpus: each nightly leg minimises its target's corpus and uploads it,
+# and fuzz-corpus merges them over the previous corpus into one
+# `fuzz-corpus-<run>` cache entry. Only a run on main saves it; PR runs and
+# the nightly legs restore the latest one, on top of generate_seeds' seeds.
+permissions:
+  contents: read
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Daily, 03:41 UTC. Off the hour to avoid the top-of-hour rush.
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+# Same grouping as ci.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CLICOLOR: 1
+  CARGO_FUZZ_VERSION: 0.13.2
+  CARGO_FUZZ_SHA256: b5b704018b63e0f151c17a057ac53b5111e1db545d1b9f72fee79f08a545931c
+jobs:
+  # Whether a pull_request run needs fuzzing at all. Same job as ci.yml's;
+  # see the comment there.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          run_all() { echo "$1, running everything"; echo "rust=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          [ "$EVENT_NAME" = pull_request ] || run_all "$EVENT_NAME run"
+          [ -f .github/scripts/ci-changes.sh ] || run_all "base has no ci-changes.sh"
+          bash .github/scripts/ci-changes.test.sh
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > "$RUNNER_TEMP/files"
+          listed=$(wc -l < "$RUNNER_TEMP/files")
+          # The files API stops at 3000; a short list could hide a Rust change.
+          [ "$listed" -eq "$CHANGED_FILES" ] || run_all "listed $listed of $CHANGED_FILES changed files"
+          bash .github/scripts/ci-changes.sh < "$RUNNER_TEMP/files"
+  fuzz-pr:
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
+    needs: [changes]
+    runs-on: ubuntu-latest
+    # Build plus the sum of the `pr` budgets in fuzz/ci-targets.json; raise
+    # this if they outgrow it.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: nightly
+          # a new nightly lint shouldn't fail the fuzz build
+          build-warnings: warn
+          cache-shared-key: fuzz
+          cache-save-if: false
+      - name: Install cargo-fuzz
+        run: |
+          set -euo pipefail
+          tarball="cargo-fuzz-${CARGO_FUZZ_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rust-fuzz/cargo-fuzz/releases/download/${CARGO_FUZZ_VERSION}/$tarball"
+          echo "${CARGO_FUZZ_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$HOME/.cargo/bin" cargo-fuzz
+          cargo +nightly fuzz --version
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-
+          restore-keys: fuzz-corpus-
+      - run: just fuzz-ci pr
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-pr
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+  fuzz-nightly-targets:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            fuzz/ci-targets.json
+            justfile
+          sparse-checkout-cone-mode: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - id: targets
+        run: echo "targets=$(just fuzz-ci-matrix nightly)" >> "$GITHUB_OUTPUT"
+  fuzz-nightly:
+    if: github.event_name != 'pull_request'
+    needs: [fuzz-nightly-targets]
+    runs-on: ubuntu-latest
+    # Build plus the target's `nightly` budget in fuzz/ci-targets.json plus
+    # cmin; raise this if a budget outgrows it.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.fuzz-nightly-targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: nightly
+          build-warnings: warn
+          cache-shared-key: fuzz
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install cargo-fuzz
+        run: |
+          set -euo pipefail
+          tarball="cargo-fuzz-${CARGO_FUZZ_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rust-fuzz/cargo-fuzz/releases/download/${CARGO_FUZZ_VERSION}/$tarball"
+          echo "${CARGO_FUZZ_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$HOME/.cargo/bin" cargo-fuzz
+          cargo +nightly fuzz --version
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-
+          restore-keys: fuzz-corpus-
+      - env:
+          TARGET: ${{ matrix.target }}
+        run: just fuzz-ci nightly "$TARGET"
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+      # Keep the corpus even when the run found a crash: the inputs that got
+      # there are the useful ones.
+      - name: Minimise corpus
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+        run: just fuzz-cmin "$TARGET"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 1
+          if-no-files-found: ignore
+  # Merge the legs' corpora over the previous cache entry, so a leg that
+  # didn't upload (cancelled, or dropped from ci-targets.json) keeps its
+  # last corpus, and save one entry for the next run.
+  fuzz-corpus:
+    if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [fuzz-nightly]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-
+          restore-keys: fuzz-corpus-
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: fuzz-corpus-*
+          path: ${{ runner.temp }}/corpus
+      - name: Merge corpora
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus
+          shopt -s nullglob
+          for dir in "$RUNNER_TEMP"/corpus/fuzz-corpus-*/; do
+            target=$(basename "$dir")
+            target=${target#fuzz-corpus-}
+            rm -rf "fuzz/corpus/$target"
+            cp -R "$dir" "fuzz/corpus/$target"
+            echo "$target: $(find "fuzz/corpus/$target" -type f | wc -l) inputs"
+          done
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}

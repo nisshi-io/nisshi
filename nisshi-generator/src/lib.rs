@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Nisshi Message Generator
 //!
 //! Generate fake data for schema backed topics.
@@ -293,19 +294,19 @@ impl Generate {
         };
 
         #[cfg(unix)]
-        let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+        let mut interrupt_signal = signal(SignalKind::interrupt())?;
         #[cfg(windows)]
-        let mut interrupt_signal = tokio::signal::windows::ctrl_c().unwrap();
+        let mut interrupt_signal = tokio::signal::windows::ctrl_c()?;
         debug!(?interrupt_signal);
 
         #[cfg(unix)]
-        let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+        let mut terminate_signal = signal(SignalKind::terminate())?;
         // Windows has no SIGTERM for a console program, so this listens for the nearest event: the
         // user closing the console window, or ending the task in Task Manager. A service manager's
         // stop request doesn't send it. Windows ends the process 5 seconds after the event by
         // default, whether or not shutdown has finished.
         #[cfg(windows)]
-        let mut terminate_signal = tokio::signal::windows::ctrl_close().unwrap();
+        let mut terminate_signal = tokio::signal::windows::ctrl_close()?;
         debug!(?terminate_signal);
 
         let rate_limiter = self

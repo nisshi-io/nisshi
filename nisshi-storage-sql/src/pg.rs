@@ -32,7 +32,6 @@ use deadpool_postgres::{
     Transaction,
 };
 use futures::pin_mut;
-use futures_util::future;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -52,7 +51,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated::Batch},
     to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
@@ -65,17 +64,18 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    inflate_produced, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
 use tokio_postgres::{
-    Config, Row, RowStream,
+    Config, Row,
     binary_copy::BinaryCopyInWriter,
     error::SqlState,
-    types::{BorrowToSql, ToSql, Type},
+    types::{ToSql, Type},
 };
 use tracing::{debug, error, instrument};
 use url::Url;
@@ -286,6 +286,75 @@ impl TryFrom<Row> for Txn {
 }
 
 impl Postgres {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let mut c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        let topic = &resource.resource_name;
+
+        if self
+            .tx_prepare_query_opt(
+                &tx,
+                "topic_select_name_for_update.sql",
+                &[&self.cluster, topic],
+            )
+            .await?
+            .is_none()
+        {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        for config in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(config.config_operation)?;
+
+            let current = if matches!(op, OpType::Append | OpType::Subtract) {
+                self.tx_prepare_query_opt(
+                    &tx,
+                    "topic_configuration_select_name.sql",
+                    &[&self.cluster, topic, &config.name],
+                )
+                .await?
+                .map(|row| row.try_get::<_, Option<String>>(0))
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+
+            match apply_op(
+                ConfigResource::Topic,
+                &config.name,
+                current.as_deref(),
+                op,
+                config.value.as_deref(),
+            )? {
+                Some(value) => {
+                    _ = self
+                        .tx_prepare_query_opt(
+                            &tx,
+                            "topic_configuration_upsert.sql",
+                            &[&self.cluster, topic, &config.name, &value],
+                        )
+                        .await?;
+                }
+
+                None => {
+                    _ = self
+                        .tx_prepare_execute(
+                            &tx,
+                            "topic_configuration_delete.sql",
+                            &[&self.cluster, topic, &config.name],
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(Into::into)
+    }
+
     pub fn builder(
         connection: &str,
     ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, Pool>> {
@@ -804,28 +873,6 @@ impl Postgres {
             .map_err(Into::into)
     }
 
-    #[instrument(skip(self, tx, params))]
-    async fn tx_prepare_query_raw<P, I>(
-        &self,
-        tx: &Transaction<'_>,
-        sql: &str,
-        params: I,
-    ) -> Result<RowStream, Error>
-    where
-        P: BorrowToSql,
-        I: IntoIterator<Item = P>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = tx
-            .prepare_cached(sql)
-            .await
-            .inspect_err(|err| error!(?err))?;
-
-        tx.query_raw(&prepared, params).await.map_err(Into::into)
-    }
-
     #[instrument(skip_all)]
     async fn produce_in_tx(
         &self,
@@ -871,7 +918,7 @@ impl Postgres {
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
 
-        let inflated = Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
+        let inflated = inflate_produced(deflated)?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -1774,7 +1821,14 @@ impl Postgres {
             )
             .await?;
 
-        tx.commit().await.map_err(Into::into).and(Ok(deleted))
+        let deleted_by_bytes = self
+            .tx_prepare_execute(&tx, "policy_delete_bytes.sql", &[&self.cluster])
+            .await?;
+
+        tx.commit()
+            .await
+            .map_err(Into::into)
+            .and(Ok(deleted + deleted_by_bytes))
     }
 
     async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {
@@ -1916,30 +1970,25 @@ impl Storage for Postgres {
 
         debug!(?topic_uuid, cluster = self.cluster, ?topic);
 
-        _ = future::try_join_all(
-            (0..topic.num_partitions)
-                .map(|partition| {
-                    let cluster = Box::new(self.cluster.clone()) as Box<dyn ToSql + Sync + Send>;
-                    let name = Box::new(topic.name.clone()) as Box<dyn ToSql + Sync + Send>;
-                    let partition = Box::new(partition) as Box<dyn ToSql + Sync + Send>;
-                    [cluster, name, partition]
-                })
-                .map(|parameters| self.tx_prepare_query_raw(&tx, "topition_insert.sql", parameters))
-                .chain(
-                    (0..topic.num_partitions)
-                        .map(|partition| {
-                            let cluster =
-                                Box::new(self.cluster.clone()) as Box<dyn ToSql + Sync + Send>;
-                            let name = Box::new(topic.name.clone()) as Box<dyn ToSql + Sync + Send>;
-                            let partition = Box::new(partition) as Box<dyn ToSql + Sync + Send>;
-                            [cluster, name, partition]
-                        })
-                        .map(|parameters| {
-                            self.tx_prepare_query_raw(&tx, "watermark_insert.sql", parameters)
-                        }),
-                ),
-        )
-        .await?;
+        // The watermark insert selects the topition rows that the topition insert creates, so
+        // every topition insert must finish before the first watermark insert is sent. Each
+        // statement is awaited before the next one is sent on this transaction's connection,
+        // which keeps that order. A watermark insert that finds no topition row matches no
+        // rows without an error, leaving a topic that rejects every produce.
+        for sql in ["topition_insert.sql", "watermark_insert.sql"] {
+            for partition in 0..topic.num_partitions {
+                let inserted = self
+                    .tx_prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
+                    .await?;
+
+                if inserted != 1 {
+                    return Err(Error::Message(format!(
+                        "{sql} did not insert one row per partition of {} in {}",
+                        topic.name, self.cluster
+                    )));
+                }
+            }
+        }
 
         if let Some(configs) = topic.configs {
             for config in configs {
@@ -2120,6 +2169,14 @@ impl Storage for Postgres {
 
         let topic_name = row.try_get::<_, String>(1)?;
 
+        _ = self
+            .tx_prepare_query_opt(
+                &tx,
+                "topic_select_name_for_update.sql",
+                &[&self.cluster, &topic_name],
+            )
+            .await?;
+
         for (description, sql) in [
             ("consumer_offsets", "consumer_offset_delete_by_topic.sql"),
             (
@@ -2187,56 +2244,10 @@ impl Storage for Postgres {
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
             ConfigResource::Topic => {
-                let mut error_code = ErrorCode::None;
-
-                for config in resource.configs.unwrap_or_default() {
-                    match OpType::try_from(config.config_operation)? {
-                        OpType::Set => {
-                            let c = self.connection().await?;
-
-                            if self
-                                .prepare_query(
-                                    &c,
-                                    "topic_configuration_upsert.sql",
-                                    &[
-                                        &self.cluster,
-                                        &resource.resource_name,
-                                        &config.name,
-                                        &config.value,
-                                    ],
-                                )
-                                .await
-                                .inspect_err(|err| error!(?err))
-                                .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Delete => {
-                            let c = self.connection().await?;
-
-                            if self
-                                .prepare_query(
-                                    &c,
-                                    "topic_configuration_delete.sql",
-                                    &[&self.cluster, &resource.resource_name, &config.name],
-                                )
-                                .await
-                                .inspect_err(|err| error!(?err))
-                                .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Append => todo!(),
-                        OpType::Subtract => todo!(),
-                    }
-                }
+                self.alter_topic(&resource).await?;
 
                 Ok(AlterConfigsResourceResponse::default()
-                    .error_code(error_code.into())
+                    .error_code(ErrorCode::None.into())
                     .error_message(Some("".into()))
                     .resource_type(resource.resource_type)
                     .resource_name(resource.resource_name))
@@ -2911,33 +2922,13 @@ impl Storage for Postgres {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(0))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        0,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -3003,33 +2994,13 @@ impl Storage for Postgres {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(0))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        0,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -3091,31 +3062,13 @@ impl Storage for Postgres {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
-
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
-
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
-
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
+                            let partitions = Some(nisshi_storage::assign_replicas(
+                                &broker_ids,
+                                partitions,
+                                replication_factor,
+                                error_code,
+                                0,
+                            )?);
 
                             responses.push(
                                 MetadataResponseTopic::default()
@@ -4132,6 +4085,7 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
     use rand::distr::Alphanumeric;
 
@@ -6561,6 +6515,71 @@ mod tests {
             records.len(),
             "all committed records must be served regardless of unrelated open transactions",
         );
+
+        Ok(())
+    }
+
+    /// The watermark insert selects the topition row that the topition insert creates, so
+    /// `create_topic` must finish the second before sending the first. When it sent both
+    /// together, a connection holding only the watermark statement in its statement cache
+    /// sent the watermark insert first; it matched no rows without an error, and the topic
+    /// had no watermark, so every produce to it failed with `UnknownTopicOrPartition`. No
+    /// current caller leaves the cache in that state; this test sets it up directly.
+    #[tokio::test]
+    async fn create_topic_writes_the_watermark_when_only_its_statement_is_cached() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping create_topic_writes_the_watermark_when_only_its_statement_is_cached: {err:?}"
+            );
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        {
+            let c = storage.connection().await?;
+            _ = c
+                .prepare_cached(storage.sql_lookup("watermark_insert.sql")?)
+                .await?;
+        }
+
+        assert_eq!(
+            1,
+            storage.pool.status().size,
+            "one connection holds the cache"
+        );
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let stage = storage.offset_stage(&Topition::new(topic_name, 0)).await?;
+
+        assert_eq!(0, stage.high_watermark);
 
         Ok(())
     }

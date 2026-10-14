@@ -571,18 +571,24 @@ impl AsArrow for Schema {
         {
             let mut i = fields.iter().zip(builders.iter_mut());
 
-            let (field, builder) = i.next().unwrap();
+            let (field, builder) = i
+                .next()
+                .ok_or_else(|| Error::Message("fields/builders out of sync".into()))?;
             debug!(meta = %kv.meta, ?field);
             append(field, kv.meta, builder)?;
 
             if let Some(key) = kv.key {
-                let (field, builder) = i.next().unwrap();
+                let (field, builder) = i
+                    .next()
+                    .ok_or_else(|| Error::Message("fields/builders out of sync".into()))?;
                 debug!(?field);
                 append(field, key, builder)?;
             }
 
             if let Some(value) = kv.value {
-                let (field, builder) = i.next().unwrap();
+                let (field, builder) = i
+                    .next()
+                    .ok_or_else(|| Error::Message("fields/builders out of sync".into()))?;
                 debug!(?field);
                 append(field, value, builder)?;
             }

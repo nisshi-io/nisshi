@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use crate::common::alphanumeric_string;
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use bytes::Bytes;
@@ -1479,7 +1480,8 @@ mod avro {
                     ("g", Vec::from(&b"abcdef"[..]).into()),
                     ("h", "pqr".into()),
                 ],
-            )];
+            )
+            .unwrap()];
 
             for value in values {
                 batch =
@@ -1600,7 +1602,8 @@ mod avro {
                         AvroValue::Array(vec!["abc".into(), "pqr".into(), "xyz".into()]),
                     ),
                 ],
-            )];
+            )
+            .unwrap()];
 
             for value in values {
                 batch =
@@ -2113,7 +2116,8 @@ mod avro {
                         ("name", "alice".into()),
                         ("lucky", AvroValue::Array([6.into()].into())),
                     ],
-                ),
+                )
+                .unwrap(),
                 r(
                     schema.value().as_ref().unwrap(),
                     [
@@ -2121,7 +2125,8 @@ mod avro {
                         ("name", "bob".into()),
                         ("lucky", AvroValue::Array([5.into(), 9.into()].into())),
                     ],
-                ),
+                )
+                .unwrap(),
             ];
 
             for value in values {

@@ -102,19 +102,19 @@ impl<O> Cache<O>
 where
     O: ObjectStore,
 {
-    pub(super) fn new(object_store: O, retention: Duration) -> Self {
+    pub(super) fn new(object_store: O, retention: Duration) -> Result<Self, Error> {
         let entries = Arc::new(Mutex::new(
             TtlSortedCache::builder()
                 .ttl(retention)
                 .build()
-                .expect("metadata cache retention must be non-zero"),
+                .map_err(|_| Error::Message("metadata cache retention must be non-zero".into()))?,
         ));
 
-        Self {
+        Ok(Self {
             entries,
             object_store,
             retention,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -585,7 +585,7 @@ mod tests {
 
         let duration = Duration::from_millis(100);
 
-        let cache = Cache::new(object_store, duration);
+        let cache = Cache::new(object_store, duration)?;
 
         assert_eq!(0, cache.inner().get_opts()?);
 
@@ -625,7 +625,7 @@ mod tests {
             .await?;
 
         let duration = Duration::from_millis(100);
-        let cache = Cache::new(object_store, duration);
+        let cache = Cache::new(object_store, duration)?;
 
         assert_eq!(0, cache.inner().get_opts()?);
 
@@ -662,7 +662,7 @@ mod tests {
         let path = Path::from(format!("/abc/{id}.json"));
 
         let duration = Duration::from_millis(5_000);
-        let cache = Cache::new(Counter::new(InMemory::new()), duration);
+        let cache = Cache::new(Counter::new(InMemory::new()), duration)?;
 
         assert_eq!(0, cache.inner().put_opts()?);
         assert_eq!(0, cache.inner().get_opts()?);
@@ -705,7 +705,7 @@ mod tests {
         let _guard = init_tracing()?;
 
         let ttl = Duration::from_millis(100);
-        let cache = Cache::new(Counter::new(InMemory::new()), ttl);
+        let cache = Cache::new(Counter::new(InMemory::new()), ttl)?;
 
         for (i, id) in ["a", "b"].into_iter().enumerate() {
             if i > 0 {
@@ -735,7 +735,7 @@ mod tests {
         let path = Path::from(format!("/abc/{id}.json"));
 
         let duration = Duration::from_millis(100);
-        let cache = Cache::new(Counter::new(InMemory::new()), duration);
+        let cache = Cache::new(Counter::new(InMemory::new()), duration)?;
 
         assert_eq!(0, cache.inner().put_opts()?);
         assert_eq!(0, cache.inner().get_opts()?);

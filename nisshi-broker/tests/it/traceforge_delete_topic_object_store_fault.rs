@@ -199,6 +199,7 @@ fn delete_topic_partial_failure_can_permanently_block_recreated_topic() {
         let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
         let storage: ArcDynStorage = Arc::new(Box::new(
             DynoStore::new("spike", 111, object_store.clone())
+                .expect("dynostore")
                 .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
                 .schemas(None)
                 .lake(None),

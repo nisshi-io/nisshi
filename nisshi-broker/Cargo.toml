@@ -79,5 +79,6 @@ pretty_assertions.workspace = true
 slatedb.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage.workspace = true
+crc-fast.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
 traceforge.workspace = true

@@ -270,7 +270,6 @@ fn deleted_retention_ms_restores_the_default() {
 /// records, and keep the newest ones. A user sets it to bound a topic's storage, whatever the
 /// records' age.
 #[test]
-#[ignore = "retention ignores retention.bytes (#921)"]
 fn retention_bytes_keeps_partition_under_the_cap() {
     /// The size of each record's value. The broker stores more bytes than this per record, so a
     /// partition under the cap holds at most `RETENTION_BYTES / VALUE_BYTES` records.

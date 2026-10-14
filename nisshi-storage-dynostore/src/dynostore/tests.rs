@@ -167,7 +167,7 @@ fn decode_group_segment_rejects_invalid_utf8() {
 /// `Path::from(format!(..))` from these templates.
 #[test]
 fn group_keys_are_stable_for_ids_without_a_slash() -> Result<()> {
-    let storage = DynoStore::new("c", 111, InMemory::new());
+    let storage = DynoStore::new("c", 111, InMemory::new())?;
     let topition = Topition::new("t", 3);
 
     assert_eq!(
@@ -203,7 +203,7 @@ fn group_keys_are_stable_for_ids_without_a_slash() -> Result<()> {
 /// keeps the committed offset key it had, which `delete_topic` matches on.
 #[test]
 fn committed_offset_key_keeps_the_topic_segment_rule() -> Result<()> {
-    let storage = DynoStore::new("c", 111, InMemory::new());
+    let storage = DynoStore::new("c", 111, InMemory::new())?;
 
     for topic in ["t", "a/b", "a#b", "café"] {
         assert_eq!(

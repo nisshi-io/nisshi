@@ -48,7 +48,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated, inflated},
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
@@ -60,7 +60,8 @@ use nisshi_storage::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    inflate_produced, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -296,68 +297,49 @@ impl Meta {
     }
 
     fn alter_topic(&mut self, topic: &str, changes: &[AlterableConfig]) -> Result<()> {
-        if let Some(metadata) = self.topics.get_mut(topic) {
-            let mut configuration = metadata
-                .topic
-                .configs
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .fold(BTreeMap::new(), |mut acc, item| {
-                    _ = acc.insert(item.name.clone(), item.value.clone());
-                    acc
-                });
+        let metadata = self
+            .topics
+            .get_mut(topic)
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))?;
 
-            for change in changes {
-                match OpType::try_from(change.config_operation)? {
-                    OpType::Set => {
-                        _ = configuration.insert(change.name.clone(), change.value.clone());
-                    }
-                    OpType::Delete => {
-                        _ = configuration.remove(change.name.as_str());
-                    }
-                    // append to, or subtract from, a comma separated list
-                    OpType::Append => {
-                        let appended = change.value.as_deref().unwrap_or_default();
+        let mut configuration = metadata
+            .topic
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .fold(BTreeMap::new(), |mut acc, item| {
+                _ = acc.insert(item.name.clone(), item.value.clone());
+                acc
+            });
 
-                        _ = configuration
-                            .entry(change.name.clone())
-                            .and_modify(|value| match value {
-                                Some(current) if !current.is_empty() => {
-                                    if !current.split(',').any(|item| item == appended) {
-                                        *current = format!("{current},{appended}");
-                                    }
-                                }
-                                _ => *value = Some(appended.to_owned()),
-                            })
-                            .or_insert_with(|| Some(appended.to_owned()));
-                    }
-                    OpType::Subtract => {
-                        let subtracted = change.value.as_deref().unwrap_or_default();
+        for change in changes {
+            let op = OpType::try_from(change.config_operation)?;
+            let current = configuration.get(&change.name).and_then(Option::as_deref);
 
-                        if let Some(Some(current)) = configuration.get_mut(change.name.as_str()) {
-                            *current = current
-                                .split(',')
-                                .filter(|item| *item != subtracted)
-                                .collect::<Vec<_>>()
-                                .join(",");
-                        }
-                    }
-                }
+            match apply_op(
+                ConfigResource::Topic,
+                &change.name,
+                current,
+                op,
+                change.value.as_deref(),
+            )? {
+                Some(value) => _ = configuration.insert(change.name.clone(), Some(value)),
+                None => _ = configuration.remove(change.name.as_str()),
             }
-
-            _ = metadata
-                .topic
-                .configs
-                .replace(
-                    configuration
-                        .into_iter()
-                        .fold(Vec::new(), |mut acc, (key, value)| {
-                            acc.push(CreatableTopicConfig::default().name(key).value(value));
-                            acc
-                        }),
-                );
         }
+
+        _ = metadata
+            .topic
+            .configs
+            .replace(
+                configuration
+                    .into_iter()
+                    .fold(Vec::new(), |mut acc, (key, value)| {
+                        acc.push(CreatableTopicConfig::default().name(key).value(value));
+                        acc
+                    }),
+            );
 
         Ok(())
     }
@@ -462,20 +444,20 @@ impl DynoStore {
     /// methods below) is `pub` only under `test-support`, for `nisshi-broker`'s
     /// fault-injection tests to supply their own [`ObjectStore`].
     #[cfg(feature = "test-support")]
-    pub fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
+    pub fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Result<Self> {
         Self::new_with(cluster, node, object_store)
     }
 
     #[cfg(not(feature = "test-support"))]
-    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
+    pub(crate) fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Result<Self> {
         Self::new_with(cluster, node, object_store)
     }
 
-    fn new_with(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
-        Self {
+    fn new_with(cluster: &str, node: i32, object_store: impl ObjectStore) -> Result<Self> {
+        Ok(Self {
             cluster: cluster.into(),
             node,
-            advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
+            advertised_listener: Url::parse("tcp://127.0.0.1/")?,
             schemas: None,
 
             lake: None,
@@ -485,8 +467,8 @@ impl DynoStore {
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
                 Duration::from_millis(5_000),
-            )),
-        }
+            )?),
+        })
     }
 
     #[cfg(feature = "test-support")]
@@ -986,6 +968,32 @@ impl Storage for DynoStore {
                 })
                 .unwrap_or(false)
         {
+            // Decode and validate before the high watermark moves, so that a
+            // batch rejected here leaves no state behind.
+            let inflated = if let Some(ref registry) = self.schemas {
+                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
+                    .inspect(|batch_attribute| debug!(?batch_attribute))
+                    .inspect_err(|err| debug!(?err))?;
+
+                if batch_attribute.control {
+                    None
+                } else {
+                    let inflated = inflate_produced(&deflated)
+                        .inspect(|inflated| debug!(?inflated))
+                        .inspect_err(|err| debug!(?err))?;
+
+                    registry
+                        .validate(topition.topic(), &inflated)
+                        .await
+                        .inspect(|validation| debug!(?validation))
+                        .inspect_err(|err| debug!(?err))?;
+
+                    Some(inflated)
+                }
+            } else {
+                None
+            };
+
             // Get watermark to calculate proper offset for lake sink
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
@@ -1014,39 +1022,51 @@ impl Storage for DynoStore {
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
 
-            if let Some(ref registry) = self.schemas {
-                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
-                    .inspect(|batch_attribute| debug!(?batch_attribute))
-                    .inspect_err(|err| debug!(?err))?;
-
-                if !batch_attribute.control {
-                    let inflated = inflated::Batch::try_from(&deflated)
-                        .inspect(|inflated| debug!(?inflated))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect(|validation| debug!(?validation))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    if let Some(ref lake) = self.lake {
-                        lake.store(
-                            topition.topic(),
-                            topition.partition(),
-                            offset,
-                            &inflated,
-                            config,
-                        )
-                        .await
-                        .inspect(|store| debug!(?store))
-                        .inspect_err(|err| debug!(?err))?;
-                    }
-                }
+            if let Some(ref lake) = self.lake
+                && let Some(ref inflated) = inflated
+            {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                    inflated,
+                    config,
+                )
+                .await
+                .inspect(|store| debug!(?store))
+                .inspect_err(|err| debug!(?err))?;
             }
 
             Ok(offset)
         } else {
+            let attributes =
+                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
+
+            // Decode and validate before the producer's sequence or the high
+            // watermark moves, so that a batch rejected here leaves no state
+            // behind. A producer can reuse a rejected batch's sequence for its
+            // next batch. If the stored sequence had moved, that batch would
+            // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
+            // although nothing was stored.
+            let inflated = if !attributes.control && (self.schemas.is_some() || self.lake.is_some())
+            {
+                let inflated = inflate_produced(&deflated).inspect_err(|err| debug!(?err))?;
+
+                if let Some(ref registry) = self.schemas {
+                    registry
+                        .validate(topition.topic(), &inflated)
+                        .await
+                        .inspect_err(|err| debug!(?err))?;
+                }
+
+                // Only the lake reads the decoded batch after this point.
+                // Dropping it here, rather than at the end of the function,
+                // frees its memory before the object store writes.
+                self.lake.is_some().then_some(inflated)
+            } else {
+                None
+            };
+
             // Idempotent sequence numbers are checked here but only
             // *advanced* after the record write below succeeds (see the
             // second check further down). Checking first, without
@@ -1110,21 +1130,6 @@ impl Storage for DynoStore {
                     })?;
             }
 
-            if let Some(ref registry) = self.schemas {
-                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
-                    .inspect_err(|err| debug!(?err))?;
-
-                if !batch_attribute.control {
-                    let inflated =
-                        inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect_err(|err| debug!(?err))?;
-                }
-            }
-
             let watermark = self.watermarks.lock().map(|mut locked| {
                 locked
                     .entry(topition.to_owned())
@@ -1152,20 +1157,14 @@ impl Storage for DynoStore {
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
 
-            let attributes =
-                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
-
-            if !attributes.control
-                && let Some(ref lake) = self.lake
+            if let Some(ref lake) = self.lake
+                && let Some(ref inflated) = inflated
             {
-                let inflated =
-                    inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
-
                 lake.store(
                     topition.topic(),
                     topition.partition(),
                     offset,
-                    &inflated,
+                    inflated,
                     config,
                 )
                 .await
@@ -1748,8 +1747,7 @@ impl Storage for DynoStore {
                 .await
                 .inspect(|meta| debug!(?meta))
                 .transpose()
-                .inspect_err(|error| error!(?error))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .inspect_err(|error| error!(?error))?
             {
                 debug!(?meta);
 
@@ -1769,8 +1767,15 @@ impl Storage for DynoStore {
                 let Some(partition) = parts
                     .nth(1)
                     .inspect(|partition| debug!(?partition))
-                    .map(|partition| i32::from_str(&partition.as_ref()[0..10]))
-                    .transpose()?
+                    .map(|partition| {
+                        partition
+                            .as_ref()
+                            .get(0..10)
+                            .and_then(|partition| i32::from_str(partition).ok())
+                            .ok_or(Error::Api(ErrorCode::UnknownServerError))
+                    })
+                    .transpose()
+                    .inspect_err(|error| error!(?error, ?meta))?
                 else {
                     continue;
                 };
@@ -1797,24 +1802,27 @@ impl Storage for DynoStore {
             for topition in topics {
                 let location = self.committed_offset_location(group_id, topition)?;
 
+                // An object store failure may clear on a retry, so it stays a
+                // plain error. An offset that doesn't decode won't, so it is
+                // UNKNOWN_SERVER_ERROR.
                 let offset = match self.object_store.get(&location).await {
-                    Ok(get_result) => get_result
-                        .bytes()
-                        .await
-                        .map_err(Error::from)
-                        .and_then(|encoded| {
-                            serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
-                                .map_err(Error::from)
-                        })
-                        .map(|commit| commit.offset)
-                        .inspect_err(|error| error!(?error, ?group_id, ?topition))
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError)),
+                    Ok(get_result) => {
+                        let encoded = get_result
+                            .bytes()
+                            .await
+                            .inspect_err(|error| error!(?error, ?group_id, ?topition))?;
+
+                        serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
+                            .map(|commit| commit.offset)
+                            .inspect_err(|error| error!(?error, ?group_id, ?topition))
+                            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                    }
 
                     Err(object_store::Error::NotFound { .. }) => Ok(-1),
 
                     Err(error) => {
                         error!(?error, ?group_id, ?topition);
-                        Err(Error::Api(ErrorCode::UnknownServerError))
+                        Err(Error::from(error))
                     }
                 }?;
 
@@ -1871,31 +1879,13 @@ impl Storage for DynoStore {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
-
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
-
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
-
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
+                            let partitions = Some(nisshi_storage::assign_replicas(
+                                &broker_ids,
+                                partitions,
+                                replication_factor,
+                                error_code,
+                                0,
+                            )?);
 
                             MetadataResponseTopic::default()
                                 .error_code(error_code)
@@ -1970,31 +1960,13 @@ impl Storage for DynoStore {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
-
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
-
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
-
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
+                            let partitions = Some(nisshi_storage::assign_replicas(
+                                &broker_ids,
+                                partitions,
+                                replication_factor,
+                                error_code,
+                                0,
+                            )?);
 
                             responses.push(
                                 MetadataResponseTopic::default()
