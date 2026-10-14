@@ -47,9 +47,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pg: postgres:16
-            experimental: false
           - pg: postgres:17
+            experimental: false
+          - pg: postgres:18
             experimental: false
           # Docker Hub has no tag that follows the latest beta, so a person
           # moves this tag to the next beta, and to the release when it ships.
