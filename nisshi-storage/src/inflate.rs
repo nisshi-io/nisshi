@@ -81,11 +81,19 @@ fn permits() -> Arc<Semaphore> {
 /// Use this for CPU-bound work, such as decoding a record batch, that would
 /// otherwise block a runtime worker thread. A panic in `f` is returned as
 /// [`crate::Error::Join`].
+///
+/// Outside a Tokio runtime, such as under a model checker that drives a
+/// service with its own executor, `f` runs inline: there is no worker thread
+/// to protect, and no blocking pool to run on.
 pub async fn offload<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    if Handle::try_current().is_err() {
+        return f();
+    }
+
     offload_with(permits(), f).await
 }
 
@@ -169,6 +177,17 @@ mod tests {
             offload_with::<_, ()>(Arc::new(Semaphore::new(1)), || panic!("decode panicked")).await;
 
         assert!(matches!(outcome, Err(Error::Join(_))), "{outcome:?}");
+    }
+
+    // A plain test has no Tokio runtime, so `offload` runs the closure on
+    // the calling thread instead of panicking in `spawn_blocking`.
+    #[test]
+    fn offload_runs_inline_without_a_runtime() -> Result<()> {
+        let ran_on = futures::executor::block_on(offload(|| Ok(thread::current().id())))?;
+
+        assert_eq!(thread::current().id(), ran_on);
+
+        Ok(())
     }
 
     // Each closure holds its permit long enough for every other spawned
