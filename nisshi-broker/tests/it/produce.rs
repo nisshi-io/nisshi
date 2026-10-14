@@ -16,7 +16,7 @@ use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut as _, Bytes, BytesMut};
 use nisshi_broker::Result;
@@ -37,7 +37,7 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, DeleteTopicsService, FetchService, InitProducerIdService,
-    ListOffsetsService, ProduceService, Storage,
+    ListOffsetsService, ProduceService, Storage, Topition,
 };
 use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -1643,6 +1643,51 @@ async fn produce_rewrites_header_max_timestamp(
     Ok(())
 }
 
+/// A header below its records' timestamps is rewritten at produce, so a
+/// timestamp lookup for a target between the header and the largest record
+/// finds that record. The time index reads the batch header, so a header
+/// that kept the client's value would answer no match here.
+async fn produce_header_below_records_is_found_by_timestamp_lookup(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let index = 0;
+    let now = now_ms()?;
+    let topic = create_topic_with_configs(storage.clone(), &[]).await?;
+
+    // The header says `now`, and the second record is 500 ms later.
+    let response = produce_batches(
+        storage.clone(),
+        &topic,
+        index,
+        vec![create_time_batch(Compression::None, now, now, &[0, 500])?],
+    )
+    .await?;
+
+    assert_accepted_at(0, &response)?;
+
+    let target = now + 300;
+
+    let answers = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(
+                Topition::new(topic.as_str(), index),
+                ListOffset::Timestamp(UNIX_EPOCH + Duration::from_millis(u64::try_from(target)?)),
+            )],
+        )
+        .await?;
+
+    assert_eq!(1, answers.len());
+    assert_eq!(ErrorCode::None, answers[0].1.error_code);
+    assert_eq!(Some(1), answers[0].1.offset);
+    assert_eq!(
+        Some(UNIX_EPOCH + Duration::from_millis(u64::try_from(now + 500)?)),
+        answers[0].1.timestamp
+    );
+
+    Ok(())
+}
+
 /// The header rewrite decodes the records, so it must accept each codec a
 /// client can send, including a snappy-java stream of several blocks.
 async fn produce_rewrites_header_for_every_codec(
@@ -2004,6 +2049,22 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn produce_header_below_records_is_found_by_timestamp_lookup() -> Result<()> {
+        {
+            let _guard = init_tracing()?;
+
+            let cluster_id = Uuid::now_v7();
+            let broker_id = rng().random_range(0..i32::MAX);
+
+            let storage = storage_container(cluster_id, broker_id).await?;
+
+            super::produce_header_below_records_is_found_by_timestamp_lookup(storage).await?;
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
     async fn produce_log_append_time_ignores_bounds_check() -> Result<()> {
         {
             let _guard = init_tracing()?;
@@ -2192,6 +2253,22 @@ mod lite {
             let storage = storage_container(cluster_id, broker_id).await?;
 
             super::produce_rewrites_header_max_timestamp(storage, false).await?;
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn produce_header_below_records_is_found_by_timestamp_lookup() -> Result<()> {
+        {
+            let _guard = init_tracing()?;
+
+            let cluster_id = Uuid::now_v7();
+            let broker_id = rng().random_range(0..i32::MAX);
+
+            let storage = storage_container(cluster_id, broker_id).await?;
+
+            super::produce_header_below_records_is_found_by_timestamp_lookup(storage).await?;
 
             Ok(())
         }
