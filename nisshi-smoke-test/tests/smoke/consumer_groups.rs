@@ -243,9 +243,8 @@ fn delete_removes_an_empty_group() {
 /// with `NON_EMPTY_GROUP`, and keep the group.
 #[test]
 #[cfg_attr(
-    any(feature = "postgres", feature = "memory"),
-    ignore = "on PostgreSQL, DeleteGroups for a group with members gets no answer; on memory \
-              storage, ListGroups leaves out a group without committed offsets (#961)"
+    feature = "memory",
+    ignore = "ListGroups leaves out a group without committed offsets (#961)"
 )]
 fn delete_refuses_a_group_with_members() {
     let cli = KafkaCli::shared();
