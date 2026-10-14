@@ -23,18 +23,19 @@ use std::{
     fmt::Display,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::SystemTime,
 };
 
 use crate::dynostore::{
-    DynoStore, Txn, TxnDetail, TxnProduceOffset, Watermark,
+    BATCH_SETTLED_AFTER, DynoStore, Txn, TxnDetail, TxnProduceOffset, Watermark,
     tests::init_tracing,
-    time_index::{MAX_ENTRIES, TimeIndex},
+    time_index::{INITIAL_INTERVAL_BYTES, MAX_ENTRIES, TimeIndex},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use nisshi_sans_io::{
     IsolationLevel, ListOffset, create_topics_request::CreatableTopic, to_system_time, to_timestamp,
 };
@@ -75,7 +76,17 @@ async fn create_topic(storage: &DynoStore, topic: &str, num_partitions: i32) -> 
 /// records beyond the first so a caller can build a multi-record batch by
 /// supplying more than one timestamp.
 fn batch_with_timestamps(base_offset: i64, timestamps: &[i64]) -> Result<deflated_batch::Batch> {
-    deflated_batch::build(base_offset, timestamps)
+    deflated_batch::build(base_offset, timestamps, Bytes::from_static(b"v"))
+}
+
+/// A batch that fills the index's initial interval on its own, so that it
+/// gets an entry whenever it raises the maximum timestamp.
+fn interval_batch(base_offset: i64, timestamp: i64) -> Result<deflated_batch::Batch> {
+    deflated_batch::build(
+        base_offset,
+        &[timestamp],
+        Bytes::from(vec![b'v'; usize::try_from(INITIAL_INTERVAL_BYTES)?]),
+    )
 }
 
 // Keeps the `deflated`/`inflated` plumbing out of the test bodies above.
@@ -85,7 +96,7 @@ mod deflated_batch {
 
     pub(super) use deflated::Batch;
 
-    pub(super) fn build(base_offset: i64, timestamps: &[i64]) -> Result<Batch> {
+    pub(super) fn build(base_offset: i64, timestamps: &[i64], value: Bytes) -> Result<Batch> {
         let base_timestamp = timestamps[0];
         let max_timestamp = timestamps.iter().copied().max().unwrap_or(base_timestamp);
 
@@ -98,7 +109,7 @@ mod deflated_batch {
         for (i, timestamp) in timestamps.iter().enumerate() {
             builder = builder.record(
                 Record::builder()
-                    .value(Some(Bytes::from_static(b"v")))
+                    .value(Some(value.clone()))
                     .timestamp_delta(timestamp - base_timestamp)
                     .offset_delta(i32::try_from(i).unwrap_or_default()),
             );
@@ -127,7 +138,22 @@ async fn write_legacy_batch(
     base_offset: i64,
     timestamp: i64,
 ) -> Result<()> {
-    let batch = batch_with_timestamps(base_offset, &[timestamp])?;
+    write_batch_object(
+        storage,
+        topition,
+        batch_with_timestamps(base_offset, &[timestamp])?,
+    )
+    .await
+}
+
+/// Writes `batch`'s object directly to the object store, at its own base
+/// offset, as the last step of `produce` does.
+async fn write_batch_object(
+    storage: &DynoStore,
+    topition: &Topition,
+    batch: deflated_batch::Batch,
+) -> Result<()> {
+    let base_offset = batch.base_offset;
     let path = storage.batch_path(topition, base_offset);
     let payload = storage.encode(batch)?;
 
@@ -227,10 +253,15 @@ async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
     .await?;
 
     // Step 1: collect a candidate from the pre-concurrent-produce state.
-    let (candidate, batches) = storage.collect_time_index_candidate(&topition).await?;
+    let backfill = storage.begin_time_index_backfill(&topition).await?;
+    assert_eq!((0, 2), (backfill.low, backfill.high));
+    let (candidate, batches) = storage
+        .collect_time_index_candidate(&topition, &backfill)
+        .await?;
     assert_eq!(2, batches);
     assert_eq!(&BTreeMap::from([(T0, 0)]), candidate.entries());
     assert_eq!(T0, candidate.max_timestamp());
+    assert!(candidate.is_complete());
 
     // Step 2: a concurrent produce lands before the backfill commits, with a
     // new running max above everything seen so far.
@@ -240,7 +271,7 @@ async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
 
     // Step 3: commit the now-stale candidate.
     let merged = storage
-        .commit_time_index_backfill(&topition, &candidate)
+        .commit_time_index_backfill(&topition, &candidate, backfill.token)
         .await?;
     assert_eq!(
         &BTreeMap::from([(T0, 0), (concurrent_timestamp, 2)]),
@@ -695,14 +726,16 @@ enum Fault {
     Unavailable,
 }
 
-/// An object store that fails the next GET of one armed path, and counts
-/// the GETs of batch objects. Every GET first yields to the runtime, so
-/// that concurrent requests in a test interleave.
+/// An object store that fails the next GET of one armed path, counts the
+/// GETs of batch objects, and once aged lists every object as written
+/// longer than [`BATCH_SETTLED_AFTER`] ago. Every GET first yields to the
+/// runtime, so that concurrent requests in a test interleave.
 #[derive(Clone, Debug, Default)]
 struct Faulty {
     inner: Arc<InMemory>,
     armed: Arc<Mutex<Option<(Path, Fault)>>>,
     batch_gets: Arc<AtomicUsize>,
+    aged: Arc<AtomicBool>,
 }
 
 impl Faulty {
@@ -715,6 +748,10 @@ impl Faulty {
 
     fn batch_gets(&self) -> usize {
         self.batch_gets.load(Ordering::SeqCst)
+    }
+
+    fn age_listing(&self) {
+        self.aged.store(true, Ordering::SeqCst);
     }
 }
 
@@ -787,7 +824,17 @@ impl ObjectStore for Faulty {
         &self,
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
-        self.inner.list(prefix)
+        let aged = self.aged.load(Ordering::SeqCst);
+
+        self.inner
+            .list(prefix)
+            .map_ok(move |mut meta| {
+                if aged {
+                    meta.last_modified = (SystemTime::now() - 2 * BATCH_SETTLED_AFTER).into();
+                }
+                meta
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(
@@ -961,6 +1008,170 @@ async fn concurrent_lookups_share_one_backfill() -> Result<()> {
     assert_eq!((Some(0), Some(T0)), second?);
 
     assert_eq!(3 + 2, faulty.batch_gets() - before);
+
+    Ok(())
+}
+
+/// `produce` assigns a batch's offset in the watermark document before it
+/// writes the batch object, so a backfill's listing can see a later batch
+/// and not an earlier one still in flight. Here offset 4 (T0 + 200) is in
+/// flight, with no entry because it is inside the live index's interval,
+/// and offset 5 (T0 + 150) is written. A candidate entry for offset 5
+/// would be the floor of a lookup for T0 + 180, and a scan from offset 5
+/// would miss offset 4 for good. The batches past the gap get no entry
+/// instead, and the index is left incomplete, so the lookup after the
+/// batch lands rebuilds it.
+#[tokio::test]
+async fn backfill_stops_its_listing_at_a_batch_in_flight() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage();
+    let topic = "in-flight";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+
+    // The interval batch at offset 1 fills the candidate's interval, so
+    // offset 1 gets an entry.
+    write_legacy_batch(&storage, &topition, 0, T0).await?;
+    write_batch_object(&storage, &topition, interval_batch(1, T0 + 100)?).await?;
+    write_legacy_batch(&storage, &topition, 2, T0 + 50).await?;
+
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(3);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+
+    // A produce by this binary before any lookup: the live index's first
+    // entry.
+    assert_eq!(3, produce(&storage, &topition, &[T0 + 10]).await?);
+
+    // Offset 4 has assigned its offset and raised the live maximum without
+    // an entry, and has not yet written its batch object.
+    let in_flight = batch_with_timestamps(4, &[T0 + 200])?;
+    let in_flight_bytes = u64::try_from(in_flight.batch_length)?;
+    seed_watermark(&storage, &topition, |w| {
+        w.high = Some(5);
+        w.time_index.append(T0 + 200, 4, in_flight_bytes);
+        Ok(())
+    })
+    .await?;
+
+    // Offset 5 is written, and fills the candidate's interval since its
+    // entry at offset 1.
+    assert_eq!(
+        5,
+        storage
+            .produce(None, &topition, interval_batch(0, T0 + 150)?)
+            .await?
+    );
+
+    // The batch in flight is not readable yet, so no match is the answer
+    // for now. The index stays incomplete, with no entry past the gap.
+    let (offset, _) = list_offsets_timestamp(&storage, &topition, T0 + 180).await?;
+    assert_eq!(None, offset);
+    assert!(!time_index_complete(&storage, &topition).await?);
+    assert_eq!(
+        BTreeMap::from([(T0, 0), (T0 + 100, 1)]),
+        time_index_entries(&storage, &topition).await?
+    );
+
+    write_batch_object(&storage, &topition, in_flight).await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 180).await?;
+    assert_eq!(Some(4), offset);
+    assert_eq!(Some(T0 + 200), timestamp);
+    assert!(time_index_complete(&storage, &topition).await?);
+
+    Ok(())
+}
+
+/// A gap below a batch written longer than `BATCH_SETTLED_AFTER` ago is a
+/// produce that failed between assigning its offset and writing its batch
+/// object, and holds no records. The listing continues past it and the
+/// index completes. The same gap below a batch written just now is taken
+/// as in flight, and the index stays incomplete.
+#[tokio::test]
+async fn backfill_completes_past_a_settled_gap() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    async fn partition_with_a_gap_at_offset_1(faulty: &Faulty) -> Result<(DynoStore, Topition)> {
+        let storage = DynoStore::new("nisshi", 111, faulty.clone());
+        let topic = "gap";
+        let topition = Topition::new(topic, 0);
+
+        create_topic(&storage, topic, 1).await?;
+
+        write_legacy_batch(&storage, &topition, 0, T0).await?;
+        write_legacy_batch(&storage, &topition, 2, T0 + 100).await?;
+
+        seed_watermark(&storage, &topition, |w| {
+            w.low = Some(0);
+            w.high = Some(3);
+            w.time_index = TimeIndex::default();
+            Ok(())
+        })
+        .await?;
+
+        Ok((storage, topition))
+    }
+
+    let settled = Faulty::default();
+    let (storage, topition) = partition_with_a_gap_at_offset_1(&settled).await?;
+    settled.age_listing();
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+    assert!(time_index_complete(&storage, &topition).await?);
+
+    let fresh = Faulty::default();
+    let (storage, topition) = partition_with_a_gap_at_offset_1(&fresh).await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+    assert!(!time_index_complete(&storage, &topition).await?);
+
+    Ok(())
+}
+
+/// A binary without the index rewrites the watermark document without it,
+/// and with the batch it produced in neither the backfill's listing nor
+/// the live index. A commit that finds its token gone leaves the index
+/// incomplete, so the next lookup backfills again and finds that batch.
+#[tokio::test]
+async fn backfill_is_left_incomplete_by_an_older_broker_write() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage();
+    let topition = legacy_partition_with_max_at_offset_1(&storage, "older-broker").await?;
+
+    let backfill = storage.begin_time_index_backfill(&topition).await?;
+    let (candidate, _) = storage
+        .collect_time_index_candidate(&topition, &backfill)
+        .await?;
+    assert!(candidate.is_complete());
+
+    // The older broker's produce lands between the listing and the commit.
+    write_legacy_batch(&storage, &topition, 3, T0 + 200).await?;
+    seed_watermark(&storage, &topition, |w| {
+        w.high = Some(4);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+
+    let merged = storage
+        .commit_time_index_backfill(&topition, &candidate, backfill.token)
+        .await?;
+    assert!(!merged.is_complete());
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 150).await?;
+    assert_eq!(Some(3), offset);
+    assert_eq!(Some(T0 + 200), timestamp);
+    assert!(time_index_complete(&storage, &topition).await?);
 
     Ok(())
 }
