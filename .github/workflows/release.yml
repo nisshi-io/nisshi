@@ -97,6 +97,9 @@ jobs:
         with:
           files: tarballs/*.tar.gz
           fail_on_unmatched_files: true
+          # A semver prerelease (v0.7.0-pre.3) has a hyphen. Marking it keeps
+          # it off "Latest", as publish-image keeps it off the `latest` image.
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   # Last, because a crates.io publish can't be undone.
   publish-crates:
