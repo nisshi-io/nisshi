@@ -122,7 +122,7 @@ jsonschema = "0.58.3"
 lazy_static = "1.4.0"
 libc = "0.2.189"
 libfuzzer-sys = "0.4"
-libsql = { version = "0.9.18", default-features = false, features = ["core"] }
+libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
 nanoid = "0.5.0"
 nonzero_ext = "0.3.0"

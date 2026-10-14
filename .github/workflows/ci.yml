@@ -8,11 +8,11 @@ name: ci
 # ref) - it's hygiene, keeping the repo's cache budget from being consumed
 # by entries on refs nothing else can restore from. Applies to fmt, clippy,
 # test (postgres:16, its only leg), cargo-publish-dry-run,
-# third-party-license, smoke-sqlite (one leg per os), release and macos below
-# (release and macos also skip the cache entirely on tags). The two compat
-# jobs only restore test's entry, through the `dev` shared key, and never
-# save. build-storage and build-storage-lake use no cache: they run `cargo
-# check`, which reuses little of a full build's artifacts.
+# third-party-license, release and macos below (release and macos also skip
+# the cache entirely on tags). The two compat jobs only restore test's entry,
+# through the `dev` shared key, and never save. build-storage and
+# build-storage-lake use no cache: they run `cargo check`, which reuses little
+# of a full build's artifacts.
 #
 # Two tiers. The split was made on GitHub's Free plan (20 concurrent jobs),
 # where a full run of this workflow (~60 jobs, 31 of them with no `needs`) on
@@ -29,13 +29,10 @@ name: ci
 #   postgres:16 again (Postgres 17, 18 and 19 run nightly in tier-c.yml), the
 #   experimental compat legs (postgres and sqlite; S3 compat runs nightly),
 #   cargo-publish-dry-run, src, release,
-#   macos, smoke, smoke-sqlite, smoke-oldest-client,
-#   smoke-oldest-client-sqlite, smoke-report.
+#   macos, smoke, smoke-oldest-client, smoke-report.
 #
 # Only `typos` runs ahead of `release`, and only `release` runs ahead of
 # `smoke`, so the release -> smoke chain starts with the rest of the run.
-# The sqlite smoke jobs build the broker from source and need nothing from
-# release, so they start with the rest of the run too.
 # `macos` is a compile-only check except on a `v*` tag, where it builds the
 # release tarball (tier-c.yml builds the macOS release nightly). smoke builds
 # a single-platform image from release's binaries on each os and pushes
@@ -622,7 +619,7 @@ jobs:
           if-no-files-found: error
   # Runs the nisshi-smoke-test suite (`just smoke <storage>`): the Kafka CLI
   # tools from each Kafka image against an image the job builds from
-  # release's binaries, on each storage engine but sqlite (smoke-sqlite).
+  # release's binaries, on each storage engine.
   smoke:
     if: *tier_b_off_main
     needs: [changes, release]
@@ -634,6 +631,7 @@ jobs:
           - ubuntu-24.04-arm
         storage:
           - postgres
+          - sqlite
           - memory
           - s3
         kafka:
@@ -662,8 +660,7 @@ jobs:
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
-      # The job does not build the broker, so it uses no cache; smoke-sqlite
-      # does.
+      # The job does not build the broker, so it uses no cache.
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
@@ -679,85 +676,6 @@ jobs:
       - run: |
           docker build --tag nisshi:smoke .
           echo "NISSHI_SMOKE_IMAGE=nisshi:smoke" >> "$GITHUB_ENV"
-      # The step stops well before the job's timeout, so the steps that
-      # upload the results and logs still run when the suite hangs.
-      - run: just smoke "${STORAGE}"
-        timeout-minutes: 20
-      # `just smoke` writes the results file even when it fails. A leg that
-      # failed before `just smoke` ran gets a failed row here instead, so it
-      # still has a column in the report.
-      - if: always()
-        run: |
-          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
-          if [[ ! -f "${results}" ]]; then
-            mkdir -p target/smoke
-            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
-          fi
-      - if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
-          path: target/smoke/results-*.csv
-          if-no-files-found: warn
-      - if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
-          path: |
-            target/smoke/*.log
-            target/smoke/brokers-*/*/*.log
-          if-no-files-found: warn
-  # The smoke suite on sqlite. The packaged image crashes at startup on
-  # sqlite:// (#796), so these legs run the suite against a broker built from
-  # source and need nothing from release. They are a job of their own so that
-  # they start with the rest of the run instead of after release, and so that
-  # a failed release leaves their result visible instead of marking them
-  # skipped. The fix for #796 moves sqlite back into smoke's matrix and
-  # removes this job.
-  smoke-sqlite:
-    if: *tier_b
-    needs: [changes]
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - ubuntu-24.04-arm
-        # A push to main runs the 3.9.2 leg only: it is the leg that saves
-        # the cache, and the 4.3.1 leg only repeats what the queue tested.
-        kafka: ${{ fromJSON(github.ref == 'refs/heads/main' && '["apache/kafka:3.9.2"]' || '["apache/kafka:3.9.2", "apache/kafka:4.3.1"]') }}
-    runs-on: ${{matrix.os}}
-    timeout-minutes: 30
-    env:
-      KAFKA_IMAGE: ${{matrix.kafka}}
-      RUST_BACKTRACE: 1
-      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
-      STORAGE: sqlite
-    steps:
-      # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
-      - run: |
-          kafka=${KAFKA_IMAGE#*:}
-          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/docker-hub-mirror
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: 1.58.0
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # One leg per os saves the cache. The key replaces the default,
-          # which includes the job id, so smoke-oldest-client-sqlite restores
-          # this cache too.
-          cache-shared-key: smoke-sqlite
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.kafka == 'apache/kafka:3.9.2' }}
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
-        with:
-          tool: cargo-nextest@0.9.146
       # The step stops well before the job's timeout, so the steps that
       # upload the results and logs still run when the suite hangs.
       - run: just smoke "${STORAGE}"
@@ -793,12 +711,12 @@ jobs:
     needs: [changes, release]
     strategy:
       fail-fast: false
-      # The job runs on every storage engine but sqlite (smoke-oldest-client-sqlite), because an
-      # older client can call other APIs than a newer one, and each engine implements those APIs
-      # in its own code.
+      # The job runs on every storage engine, because an older client can call other APIs than a
+      # newer one, and each engine implements those APIs in its own code.
       matrix:
         storage:
           - postgres
+          - sqlite
           - memory
           - s3
     # A Java client sends the same requests on any CPU, so this job runs on x86 only.
@@ -825,8 +743,7 @@ jobs:
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
-      # The job does not build the broker, so it uses no cache; smoke-sqlite
-      # does.
+      # The job does not build the broker, so it uses no cache.
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
@@ -870,77 +787,12 @@ jobs:
             target/smoke/*.log
             target/smoke/brokers-*/*/*.log
           if-no-files-found: warn
-  # smoke-oldest-client on sqlite: a broker built from source, for the same
-  # reason as smoke-sqlite (#796), and a job of its own for the same reasons.
-  # The fix for #796 moves sqlite back into smoke-oldest-client's matrix and
-  # removes this job.
-  smoke-oldest-client-sqlite:
-    if: *tier_b_off_main
-    needs: [changes]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      KAFKA_IMAGE: apache/kafka:3.7.2
-      RUST_BACKTRACE: 1
-      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
-      STORAGE: sqlite
-    steps:
-      # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
-      - run: |
-          kafka=${KAFKA_IMAGE#*:}
-          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/docker-hub-mirror
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: 1.58.0
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # Reads the cache that smoke-sqlite saves.
-          cache-shared-key: smoke-sqlite
-          cache-save-if: false
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
-        with:
-          tool: cargo-nextest@0.9.146
-      # The step stops well before the job's timeout, so the steps that
-      # upload the results and logs still run when the suite hangs.
-      - run: just smoke "${STORAGE}"
-        timeout-minutes: 20
-      # `just smoke` writes the results file even when it fails. A leg that
-      # failed before `just smoke` ran gets a failed row here instead, so it
-      # still has a column in the report.
-      - if: always()
-        run: |
-          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
-          if [[ ! -f "${results}" ]]; then
-            mkdir -p target/smoke
-            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
-          fi
-      - if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
-          path: target/smoke/results-*.csv
-          if-no-files-found: warn
-      - if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
-          path: |
-            target/smoke/*.log
-            target/smoke/brokers-*/*/*.log
-          if-no-files-found: warn
-  # Reports every leg of the four smoke jobs. `always()` with the result
+  # Reports every leg of the two smoke jobs. `always()` with the result
   # check runs it when any of them ran, so a job that release's failure
   # skipped still leaves the others' legs in the grid.
   smoke-report:
-    if: always() && github.ref != 'refs/heads/main' && (needs.smoke.result != 'skipped' || needs.smoke-sqlite.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped' || needs.smoke-oldest-client-sqlite.result != 'skipped')
-    needs: [smoke, smoke-sqlite, smoke-oldest-client, smoke-oldest-client-sqlite]
+    if: always() && github.ref != 'refs/heads/main' && (needs.smoke.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped')
+    needs: [smoke, smoke-oldest-client]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -1143,9 +995,7 @@ jobs:
       - third-party-license
       - src
       - smoke
-      - smoke-sqlite
       - smoke-oldest-client
-      - smoke-oldest-client-sqlite
       - release
       - macos
     runs-on: ubuntu-latest
@@ -1184,7 +1034,7 @@ jobs:
       - name: Tier A ran on pull_request
         if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
         env:
-          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src smoke smoke-sqlite smoke-oldest-client smoke-oldest-client-sqlite release macos
+          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src smoke smoke-oldest-client release macos
         run: |
           skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
@@ -1194,7 +1044,7 @@ jobs:
       - name: Only trimmed jobs skipped on main
         if: github.ref == 'refs/heads/main'
         env:
-          MAY_SKIP: build-storage build-storage-lake compat-librdkafka compat-franz-go src smoke smoke-oldest-client smoke-oldest-client-sqlite
+          MAY_SKIP: build-storage build-storage-lake compat-librdkafka compat-franz-go src smoke smoke-oldest-client
         run: |
           skipped=$(jq -r --arg may_skip "$MAY_SKIP" '($may_skip | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::skipped on a push to main, only the trimmed jobs may skip here: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
