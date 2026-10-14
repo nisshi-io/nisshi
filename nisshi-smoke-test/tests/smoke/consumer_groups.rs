@@ -33,6 +33,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Starts a consumer in `group`, and waits until it has its partitions.
+#[track_caller]
 fn start_member(cli: &KafkaCli, topic: &str, group: &str) -> BackgroundTool<VerifiableConsume> {
     cli.join_group(topic, group, SESSION_TIMEOUT, None, JOIN_TIMEOUT)
         .0

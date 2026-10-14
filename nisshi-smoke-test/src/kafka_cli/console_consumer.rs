@@ -51,6 +51,7 @@ impl KafkaCli {
     ///
     /// The consumer prints each record as `Partition:<n>\tOffset:<n>\t` followed by
     /// [`Record::console_line`](crate::Record::console_line).
+    #[track_caller]
     pub fn consume(&self, topic: &str, group: &str, max_messages: usize) -> Output<Consume> {
         let max_messages = max_messages.to_string();
 
@@ -174,6 +175,7 @@ impl KafkaCli {
     ///
     /// Sends `Metadata`, `FindCoordinator`, `JoinGroup`, `SyncGroup`, `Fetch`, `OffsetCommit` and
     /// `LeaveGroup`.
+    #[track_caller]
     pub fn consume_matching(
         &self,
         pattern: &str,

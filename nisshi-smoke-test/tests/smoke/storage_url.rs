@@ -69,6 +69,7 @@ mod sqlite {
 
     /// Starts a broker on `storage`, checks that it stores a record and returns it, and returns
     /// the broker.
+    #[track_caller]
     fn stores_and_returns_a_record(storage: &str) -> Broker {
         let broker = Broker::launch(LaunchOptions::new(StorageUrl::as_given(storage)));
         let cli = KafkaCli::new(broker.bootstrap());

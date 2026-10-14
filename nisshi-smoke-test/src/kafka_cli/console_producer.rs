@@ -71,10 +71,12 @@ impl KafkaCli {
 
     /// Like [`KafkaCli::produce_values`], but returns the producer's output without checking it,
     /// for a test that expects the broker to reject a record.
+    #[track_caller]
     pub fn try_produce_values(&self, topic: &str, values: &[impl AsRef<str>]) -> Output {
         self.run_console_producer(topic, values, &[])
     }
 
+    #[track_caller]
     fn run_console_producer(
         &self,
         topic: &str,

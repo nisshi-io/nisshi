@@ -24,6 +24,7 @@ use nisshi_smoke_test::{KafkaCli, UNSUPPORTED_VERSION_EXCEPTION, now_in_millis};
 /// The returned time is halfway between the timestamps of records 0 and 1, which the producer
 /// sets. The test's own clock would also give a time between them, but the producer runs in a
 /// container, and a container's clock can differ from the host's by more than a short gap.
+#[track_caller]
 fn create_topic_with_records_before_and_after() -> (KafkaCli, String, i64) {
     let cli = KafkaCli::shared();
     let topic = cli.create_unique_topic(1, &[]);

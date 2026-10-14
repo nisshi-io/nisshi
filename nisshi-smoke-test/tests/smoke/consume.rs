@@ -24,6 +24,7 @@ use nisshi_smoke_test::{DescribeGroupState, GroupState, KafkaCli, Output, unique
 
 /// Waits until `group` is `Stable`, so its members have their assignments. Returns the group's
 /// last state as an error if it isn't stable after a minute.
+#[track_caller]
 fn wait_until_stable(cli: &KafkaCli, group: &str) -> Result<(), Output<DescribeGroupState>> {
     let deadline = Instant::now() + Duration::from_secs(60);
 

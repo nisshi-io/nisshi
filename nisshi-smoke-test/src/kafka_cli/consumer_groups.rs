@@ -108,6 +108,7 @@ impl KafkaCli {
     /// Sends `ConsumerGroupDescribe`, `DescribeGroups` and `OffsetFetch`. The tool tries
     /// `ConsumerGroupDescribe` first, and falls back to `DescribeGroups` for a group that uses the
     /// classic protocol, as the console consumer's groups do.
+    #[track_caller]
     pub fn describe_group(&self, group: &str) -> Output<DescribeGroup> {
         self.run(Tool::ConsumerGroups, &["--describe", "--group", group])
     }
@@ -115,6 +116,7 @@ impl KafkaCli {
     /// Describes `group`'s [`GroupState`], in a table with a `STATE` column.
     ///
     /// Sends `ConsumerGroupDescribe` and `DescribeGroups`.
+    #[track_caller]
     pub fn describe_group_state(&self, group: &str) -> Output<DescribeGroupState> {
         self.run(
             Tool::ConsumerGroups,
@@ -126,6 +128,7 @@ impl KafkaCli {
     /// partitions it reads.
     ///
     /// Sends `ConsumerGroupDescribe` and `DescribeGroups`.
+    #[track_caller]
     pub fn describe_group_members(&self, group: &str) -> Output<DescribeGroupMembers> {
         self.run(
             Tool::ConsumerGroups,
@@ -136,6 +139,7 @@ impl KafkaCli {
     /// Lists the cluster's consumer groups, one name per line.
     ///
     /// Sends `ListGroups`.
+    #[track_caller]
     pub fn list_groups(&self) -> Output<ListGroups> {
         self.run(Tool::ConsumerGroups, &["--list"])
     }
@@ -143,6 +147,7 @@ impl KafkaCli {
     /// Lists the consumer groups in `state`, in a table with a `GROUP` and a `STATE` column.
     ///
     /// Sends `ListGroups`, with a filter on the state.
+    #[track_caller]
     pub fn list_groups_in_state(&self, state: GroupState) -> Output<ListGroupsInState> {
         self.run(
             Tool::ConsumerGroups,
@@ -155,6 +160,7 @@ impl KafkaCli {
     /// separate arguments, such as `["--shift-by", "-2"]`.
     ///
     /// Sends `OffsetFetch` and `ListOffsets`.
+    #[track_caller]
     pub fn plan_offset_reset(&self, group: &str, topic: &str, reset_option: &[&str]) -> Output {
         self.reset_offsets_with(group, topic, reset_option, "--dry-run")
     }
@@ -163,10 +169,12 @@ impl KafkaCli {
     /// [`KafkaCli::plan_offset_reset`] does. The tool refuses a group that has members.
     ///
     /// Sends `OffsetFetch`, `ListOffsets` and `OffsetCommit`.
+    #[track_caller]
     pub fn reset_offsets(&self, group: &str, topic: &str, reset_option: &[&str]) -> Output {
         self.reset_offsets_with(group, topic, reset_option, "--execute")
     }
 
+    #[track_caller]
     fn reset_offsets_with(
         &self,
         group: &str,
@@ -184,6 +192,7 @@ impl KafkaCli {
     /// Deletes `group` and its offsets.
     ///
     /// Sends `DeleteGroups`.
+    #[track_caller]
     pub fn delete_group(&self, group: &str) -> Output {
         self.run(Tool::ConsumerGroups, &["--delete", "--group", group])
     }
@@ -191,6 +200,7 @@ impl KafkaCli {
     /// Deletes `group`'s offsets in `topic`, and keeps its offsets in other topics.
     ///
     /// Sends `OffsetDelete`.
+    #[track_caller]
     pub fn delete_group_offsets(&self, group: &str, topic: &str) -> Output {
         self.run(
             Tool::ConsumerGroups,

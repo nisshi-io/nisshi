@@ -45,11 +45,13 @@ const TEST_TOPIC_PARTITIONS: u32 = 3;
 const TEST_TOPIC_CONFIGS: &[&str] = &["cleanup.policy=compact"];
 
 /// Creates a test topic with a name no other test uses.
+#[track_caller]
 fn create_test_topic(cli: &KafkaCli) -> String {
     cli.create_unique_topic(TEST_TOPIC_PARTITIONS, TEST_TOPIC_CONFIGS)
 }
 
 /// Creates a test topic and produces [`RECORDS_WITH_KEYS_AND_HEADERS`] to it.
+#[track_caller]
 fn create_test_topic_with_records(cli: &KafkaCli) -> String {
     let topic = create_test_topic(cli);
     produce_test_records(cli, &topic);
@@ -57,6 +59,7 @@ fn create_test_topic_with_records(cli: &KafkaCli) -> String {
 }
 
 /// Produces [`RECORDS_WITH_KEYS_AND_HEADERS`] to `topic`.
+#[track_caller]
 fn produce_test_records(cli: &KafkaCli, topic: &str) {
     _ = cli.produce(topic, &RECORDS_WITH_KEYS_AND_HEADERS);
 }

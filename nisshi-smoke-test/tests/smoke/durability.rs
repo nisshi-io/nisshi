@@ -104,6 +104,7 @@ mod support {
 
     /// Waits until `group` has committed an offset above 0 on a partition of `topic`. Panics after
     /// [`CONSUMER_COMMIT_WAIT`].
+    #[track_caller]
     pub(super) fn wait_for_commit(cli: &KafkaCli, group: &str, topic: &str) {
         wait_until(CONSUMER_COMMIT_WAIT, || {
             let described = cli.describe_group(group);
@@ -340,6 +341,7 @@ mod restart_under_load {
     /// Restarts the broker with `restart` while a producer sends to it, and asserts that the
     /// broker kept every record and committed offset that it acknowledged. `restart` panics if
     /// the broker doesn't stop as it requires.
+    #[track_caller]
     fn assert_restart_keeps_acknowledged_data(restart: fn(Broker) -> Broker) {
         let broker = Broker::isolated();
         let cli = KafkaCli::new(broker.bootstrap()).with_client_timeouts(CLIENT_TIMEOUT);
@@ -470,6 +472,7 @@ mod postgres_outage {
     }
 
     impl Outage {
+        #[track_caller]
         fn start(self, postgres: &PostgresServer) {
             match self {
                 Self::Stop => postgres.stop(),
@@ -477,6 +480,7 @@ mod postgres_outage {
             }
         }
 
+        #[track_caller]
         fn end(self, postgres: &PostgresServer) {
             match self {
                 Self::Stop => postgres.start_again(),
@@ -496,6 +500,7 @@ mod postgres_outage {
     ///
     /// `cli` must come from [`KafkaCli::with_client_timeouts`] with [`CLIENT_TIMEOUT`], so that
     /// each record times out within [`OUTAGE_PRODUCER_TIMEOUT`].
+    #[track_caller]
     fn assert_clients_ride_out_outage(
         cli: &KafkaCli,
         topic: &str,
@@ -614,6 +619,7 @@ mod postgres_outage {
 
     /// Starts a broker on a [`PostgresServer`] of its own, and runs
     /// [`assert_clients_ride_out_outage`] with `outage` on it.
+    #[track_caller]
     fn assert_broker_recovers_from(outage: Outage) {
         let postgres = PostgresServer::start();
         let broker = Broker::launch(LaunchOptions::new(postgres.storage_url()));

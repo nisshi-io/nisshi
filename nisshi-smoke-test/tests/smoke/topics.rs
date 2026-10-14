@@ -21,21 +21,30 @@ use nisshi_smoke_test::{KafkaCli, PartitionReplicas, unique_name};
 const AUTO_CREATE_PARTITIONS: u32 = 4;
 
 /// Every record on each partition, as offset and value.
+#[track_caller]
 fn records_on_each_partition(cli: &KafkaCli, topic: &str) -> Vec<Vec<(i64, String)>> {
-    cli.partition_offsets_at(topic, "latest")
+    let mut records_on_each_partition = Vec::new();
+
+    for (end, partition) in cli
+        .partition_offsets_at(topic, "latest")
         .into_iter()
         .zip(0..)
-        .map(|(end, partition)| {
-            if end == 0 {
-                return Vec::new();
-            }
-
+    {
+        let records = if end == 0 {
+            Vec::new()
+        } else {
             cli.read_records(topic, partition, 0, end as usize)
+        };
+
+        records_on_each_partition.push(
+            records
                 .into_iter()
                 .map(|record| (record.offset, record.value))
-                .collect()
-        })
-        .collect()
+                .collect(),
+        );
+    }
+
+    records_on_each_partition
 }
 
 /// Nisshi is one broker, node 111, which holds the only replica of every partition. Monitoring

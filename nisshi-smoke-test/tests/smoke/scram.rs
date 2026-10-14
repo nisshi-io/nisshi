@@ -72,6 +72,7 @@ mod login {
 
     /// Creates `login`'s user with `kafka-configs` on a new broker, and restarts the broker with
     /// `--authentication`.
+    #[track_caller]
     fn broker_requiring_kafka_configs_user(login: &ScramLogin) -> Broker {
         let broker = Broker::isolated();
         _ = KafkaCli::new(broker.bootstrap())

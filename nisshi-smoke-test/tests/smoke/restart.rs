@@ -41,6 +41,7 @@ mod persistence {
     }
 
     /// Starts a broker, stores data on it as a client would, and restarts it on the same storage.
+    #[track_caller]
     fn store_data_and_restart() -> (Broker, StoredBeforeRestart) {
         let broker = Broker::isolated();
         let cli = KafkaCli::new(broker.bootstrap());

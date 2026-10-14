@@ -134,6 +134,7 @@ impl KafkaCli {
     ///
     /// Sends `FindCoordinator`, `JoinGroup`, `SyncGroup`, `OffsetFetch`, `Fetch`, `OffsetCommit`
     /// and `LeaveGroup`.
+    #[track_caller]
     pub fn verifiable_consume(
         &self,
         topic: &str,

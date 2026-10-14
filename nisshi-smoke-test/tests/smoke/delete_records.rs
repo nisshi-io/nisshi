@@ -30,6 +30,7 @@ const DELETE_BEFORE_OFFSET: i64 = 3;
 ///
 /// Each test launches its own broker instead of using the shared one, because a broker that
 /// panics on `DeleteRecords` would fail every other test on the shared broker too.
+#[track_caller]
 fn create_topic_with_records() -> (Broker, KafkaCli, String) {
     let broker = Broker::isolated();
     let cli = KafkaCli::new(broker.bootstrap());

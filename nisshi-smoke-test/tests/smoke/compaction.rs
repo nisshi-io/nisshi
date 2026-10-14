@@ -44,6 +44,7 @@ struct StoredRecord<'a> {
 ///
 /// Until a maintenance run compacts the topic, the topic holds at least as many records as
 /// `expected`, so each read returns at once.
+#[track_caller]
 fn wait_until_records_are(cli: &KafkaCli, topic: &str, expected: &[StoredRecord<'_>]) {
     wait_until(MAINTENANCE_TIMEOUT, || {
         let consumed = cli.read_records_from_earliest(topic, 0, expected.len());

@@ -46,6 +46,7 @@ impl KafkaCli {
     /// config. The broker has one node, so the replication factor is 1.
     ///
     /// Sends `CreateTopics`.
+    #[track_caller]
     pub fn create_topic(
         &self,
         topic: &str,
@@ -70,6 +71,7 @@ impl KafkaCli {
 
     /// Creates a topic with a name no other test uses, as [`KafkaCli::create_topic`] does, asserts
     /// that the tool succeeded, and returns the topic's name.
+    #[track_caller]
     pub fn create_unique_topic(&self, partitions: u32, configs: &[&str]) -> String {
         let topic = unique_name("topic");
         _ = self.create_topic(&topic, partitions, configs).succeeded();
@@ -79,6 +81,7 @@ impl KafkaCli {
     /// Lists the cluster's topics, one name per line.
     ///
     /// Sends `Metadata`.
+    #[track_caller]
     pub fn list_topics(&self) -> Output<ListTopics> {
         self.run(Tool::Topics, &["--list"])
     }
@@ -86,11 +89,13 @@ impl KafkaCli {
     /// Describes `topic`'s partitions and configs.
     ///
     /// Sends `DescribeTopicPartitions` and `DescribeConfigs`.
+    #[track_caller]
     pub fn describe_topic(&self, topic: &str) -> Output<DescribeTopic> {
         self.run(Tool::Topics, &["--describe", "--topic", topic])
     }
 
     /// Sends `DeleteTopics`.
+    #[track_caller]
     pub fn delete_topic(&self, topic: &str) -> Output {
         self.run(Tool::Topics, &["--delete", "--topic", topic])
     }

@@ -172,6 +172,7 @@ impl KafkaCli {
     /// Like [`KafkaCli::new`], but every tool logs in as `login`.
     ///
     /// Each tool sends `SaslHandshake` and `SaslAuthenticate` before its other requests.
+    #[track_caller]
     pub fn logged_in_as(bootstrap: &str, login: &ScramLogin) -> Self {
         Self::new(bootstrap).with_client_properties(&format!(
             "security.protocol=SASL_PLAINTEXT\n\
@@ -187,6 +188,7 @@ impl KafkaCli {
     /// Returns a copy of this `KafkaCli` with its API timeout set to `timeout`, instead of the Java
     /// client's default of 60 seconds. The API timeout limits how long a tool waits for the broker
     /// to answer a call.
+    #[track_caller]
     pub fn with_api_timeout(&self, timeout: Duration) -> Self {
         let timeout_millis = timeout.as_millis();
 
@@ -199,6 +201,7 @@ impl KafkaCli {
 
     /// Returns a copy of this `KafkaCli` with its client timeouts set to `timeout`. A client
     /// timeout limits how long a tool's Kafka client waits for the broker.
+    #[track_caller]
     pub fn with_client_timeouts(&self, timeout: Duration) -> Self {
         let timeout_millis = timeout.as_millis();
 
@@ -214,6 +217,7 @@ impl KafkaCli {
 
     /// Returns tools for the same broker whose client config file holds these tools' client
     /// properties, followed by `properties`.
+    #[track_caller]
     fn with_client_properties(&self, properties: &str) -> Self {
         let client_properties = format!("{}{properties}", self.client_properties);
         let path = self.write_file_in_container("client", "properties", &client_properties);
@@ -228,6 +232,7 @@ impl KafkaCli {
 
     /// Writes `contents` to a new file in the tools' container, and returns the file's path there.
     /// The file is named `<name_prefix>-<unique part>.<extension>`.
+    #[track_caller]
     fn write_file_in_container(
         &self,
         name_prefix: &str,
@@ -262,11 +267,13 @@ impl KafkaCli {
     /// after a subcommand such as `kafka-cluster.sh cluster-id`, which takes it as its own option.
     ///
     /// Panics if the tool does not finish within `TOOL_TIMEOUT`.
+    #[track_caller]
     fn run<PrintedBy>(&self, tool: Tool, args: &[&str]) -> Output<PrintedBy> {
         self.exec(tool, args, None, TOOL_TIMEOUT)
     }
 
     /// Like [`KafkaCli::run`], with `input` on the tool's stdin.
+    #[track_caller]
     fn run_with_input<PrintedBy>(
         &self,
         tool: Tool,
@@ -375,18 +382,20 @@ impl KafkaCli {
     /// Docker runs in a virtual machine.
     #[track_caller]
     pub fn now_in_millis(&self) -> i64 {
-        let printed = crate::broker::docker(&["exec", &self.container, "date", "+%s%3N"])
-            .unwrap_or_else(|err| panic!("{err}"));
+        let printed = match crate::broker::docker(&["exec", &self.container, "date", "+%s%3N"]) {
+            Ok(printed) => printed,
+            Err(err) => panic!("{err}"),
+        };
 
-        printed
-            .stdout
-            .trim()
-            .parse()
-            .unwrap_or_else(|err| panic!("can't read the time in {printed:?}: {err}"))
+        match printed.stdout.trim().parse() {
+            Ok(now_in_millis) => now_in_millis,
+            Err(err) => panic!("can't read the time in {printed:?}: {err}"),
+        }
     }
 
     /// Runs `tool` as [`KafkaCli::exec`] does, but returns the output of a tool that doesn't
     /// finish in time instead of panicking, with [`Output::timeout`] set.
+    #[track_caller]
     fn exec_until_timeout<PrintedBy>(
         &self,
         tool: Tool,
@@ -403,8 +412,10 @@ impl KafkaCli {
 
         let mut command = self.command(tool, args, input.is_some(), None, tool_timeout);
 
-        let finished = timed_command::run(&mut command, input, tool_timeout + GRACE)
-            .unwrap_or_else(|err| panic!("{err}"));
+        let finished = match timed_command::run(&mut command, input, tool_timeout + GRACE) {
+            Ok(finished) => finished,
+            Err(err) => panic!("{err}"),
+        };
 
         let timeout = match finished.code {
             Some(TIMEOUT_TERM_EXIT) => Some(format!("did not finish within {tool_timeout:?}")),

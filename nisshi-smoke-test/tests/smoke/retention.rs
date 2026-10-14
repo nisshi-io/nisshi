@@ -41,6 +41,7 @@ const DELETE_POLICY: &str = "cleanup.policy=delete";
 const EXPIRED_RECORD_COUNT: usize = 3;
 
 /// Produces `count` records to `topic` with a timestamp an hour old.
+#[track_caller]
 fn produce_hour_old_records(cli: &KafkaCli, topic: &str, count: usize) {
     let an_hour_ago = now_in_millis() - 3_600_000;
     let produced = cli.verifiable_produce_created_at(topic, count, an_hour_ago, 0, None);
@@ -48,16 +49,19 @@ fn produce_hour_old_records(cli: &KafkaCli, topic: &str, count: usize) {
     assert_eq!(produced.acknowledged_record_count(), count, "{produced}");
 }
 
+#[track_caller]
 fn earliest_offset(cli: &KafkaCli, topic: &str) -> i64 {
     cli.partition_offsets_at(topic, "earliest")[0]
 }
 
+#[track_caller]
 fn latest_offset(cli: &KafkaCli, topic: &str) -> i64 {
     cli.partition_offsets_at(topic, "latest")[0]
 }
 
 /// Waits until `topic`'s earliest offset is `expected`, which shows that a maintenance run deleted
 /// the records before it. Panics if that doesn't happen within [`MAINTENANCE_TIMEOUT`].
+#[track_caller]
 fn wait_until_earliest_offset_is(cli: &KafkaCli, topic: &str, expected: i64) {
     wait_until(MAINTENANCE_TIMEOUT, || match earliest_offset(cli, topic) {
         earliest if earliest == expected => Ok(()),
@@ -88,6 +92,7 @@ fn assert_every_record_kept(cli: &KafkaCli, topic: &str, count: usize) {
 /// this after it produces them, and then checks them. Each maintenance run applies retention to
 /// every topic of the cluster at once, so the run that deleted this record also checked the
 /// records that the test produced before it.
+#[track_caller]
 fn wait_for_maintenance_run(cli: &KafkaCli) {
     let topic = cli.create_unique_topic(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
     produce_hour_old_records(cli, &topic, 1);

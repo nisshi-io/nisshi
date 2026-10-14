@@ -39,6 +39,7 @@ impl KafkaCli {
     /// line each. With `all_configs`, it describes every config the topic has, defaults included.
     ///
     /// Sends `DescribeConfigs`.
+    #[track_caller]
     pub fn describe_topic_configs(
         &self,
         topic: &str,
@@ -62,6 +63,7 @@ impl KafkaCli {
     /// Sets `configs`, each a `name=value` topic config, on `topic`.
     ///
     /// Sends `IncrementalAlterConfigs`.
+    #[track_caller]
     pub fn add_topic_configs(&self, topic: &str, configs: &[&str]) -> Output {
         let configs = configs.join(",");
 
@@ -83,6 +85,7 @@ impl KafkaCli {
     /// those configs.
     ///
     /// Sends `IncrementalAlterConfigs`.
+    #[track_caller]
     pub fn delete_topic_configs(&self, topic: &str, names: &[&str]) -> Output {
         let names = names.join(",");
 
@@ -103,6 +106,7 @@ impl KafkaCli {
     /// Describes the cluster-wide broker defaults that `--entity-default` selects.
     ///
     /// Sends `DescribeConfigs`.
+    #[track_caller]
     pub fn describe_broker_defaults(&self) -> Output<DescribeConfigs> {
         self.run(
             Tool::Configs,
@@ -113,6 +117,7 @@ impl KafkaCli {
     /// Creates credentials for `user` with each mechanism in [`ScramMechanism::ALL`].
     ///
     /// Sends `AlterUserScramCredentials`.
+    #[track_caller]
     pub fn add_scram_user(&self, user: &str, password: &str) -> Output {
         let credentials = ScramMechanism::ALL
             .map(|mechanism| format!("{}=[password={password}]", mechanism.name()))
@@ -137,6 +142,7 @@ impl KafkaCli {
     /// line per user.
     ///
     /// Sends `DescribeUserScramCredentials`.
+    #[track_caller]
     pub fn describe_users(&self) -> Output<DescribeUsers> {
         self.run(Tool::Configs, &["--entity-type", "users", "--describe"])
     }

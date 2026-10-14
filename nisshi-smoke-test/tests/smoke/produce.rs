@@ -92,6 +92,7 @@ fn tombstone_reads_back_as_null() {
 /// `acks` sets when the producer counts a record as sent: when it is written to the network, when
 /// the broker has stored it, or when every replica has. Whichever it is, the broker must store
 /// every record.
+#[track_caller]
 fn stores_every_record(acks: Acks) {
     let cli = KafkaCli::shared();
     let topic = cli.create_unique_topic(1, &[]);
@@ -140,6 +141,7 @@ fn acks_all_stores_every_record() {
 
 /// Producers compress record batches to save network and storage. The broker must keep a
 /// compressed batch so that consumers get back the same records.
+#[track_caller]
 fn compressed_records_read_back(compression: &str) {
     let cli = KafkaCli::shared();
     let topic = cli.create_unique_topic(1, &[]);

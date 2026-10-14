@@ -21,6 +21,7 @@ impl KafkaCli {
     /// Lists the partition reassignments in progress.
     ///
     /// Sends `ListPartitionReassignments`.
+    #[track_caller]
     pub fn list_partition_reassignments(&self) -> Output {
         self.run(Tool::ReassignPartitions, &["--list"])
     }

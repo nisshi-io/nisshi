@@ -30,6 +30,7 @@ impl KafkaCli {
     /// `partition: <topic>-<partition>\tlow_watermark: <offset>` line for the partition.
     ///
     /// Sends `DeleteRecords`.
+    #[track_caller]
     pub fn delete_records_before(
         &self,
         topic: &str,

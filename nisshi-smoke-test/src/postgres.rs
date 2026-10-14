@@ -48,10 +48,13 @@ impl PostgresServer {
     /// Starts a server from the image in `NISSHI_SMOKE_POSTGRES_IMAGE`, with the schema from
     /// `etc/initdb.d`, and waits until it accepts connections. Panics if it doesn't within a
     /// minute.
+    #[track_caller]
     pub fn start() -> Self {
         let initdb = Path::new(env!("CARGO_MANIFEST_DIR")).join("../etc/initdb.d");
-        let initdb =
-            fs::canonicalize(&initdb).unwrap_or_else(|err| panic!("{}: {err}", initdb.display()));
+        let initdb = match fs::canonicalize(&initdb) {
+            Ok(initdb) => initdb,
+            Err(err) => panic!("{}: {err}", initdb.display()),
+        };
 
         let server = Self {
             container: unique_name("nisshi-smoke-postgres"),
@@ -98,12 +101,14 @@ impl PostgresServer {
 
     /// Stops the server with `docker stop`. The server keeps its data and port for
     /// [`PostgresServer::start_again`].
+    #[track_caller]
     pub fn stop(&self) {
         self.docker_or_panic(&["stop", &self.container]);
     }
 
     /// Starts the server again after [`PostgresServer::stop`], and waits until it accepts
     /// connections.
+    #[track_caller]
     pub fn start_again(&self) {
         self.docker_or_panic(&["start", &self.container]);
         self.wait_until_ready();
@@ -111,12 +116,14 @@ impl PostgresServer {
 
     /// Freezes the server's processes with `docker pause`. The server keeps its connections open
     /// and stops answering on them, as a server behind a network partition does.
+    #[track_caller]
     pub fn pause(&self) {
         self.docker_or_panic(&["pause", &self.container]);
     }
 
     /// Lets the server run again after [`PostgresServer::pause`]. The server then answers on the
     /// connections it kept.
+    #[track_caller]
     pub fn unpause(&self) {
         self.docker_or_panic(&["unpause", &self.container]);
     }
@@ -124,6 +131,7 @@ impl PostgresServer {
     /// Waits until the server accepts connections over TCP. The image's entrypoint first runs the
     /// init scripts on a server that listens only on its socket. A check over the socket passes
     /// during that time, so this check connects over TCP.
+    #[track_caller]
     fn wait_until_ready(&self) {
         wait_until(READY_TIMEOUT, || {
             match docker(&[
@@ -139,6 +147,7 @@ impl PostgresServer {
         });
     }
 
+    #[track_caller]
     fn docker_or_panic(&self, args: &[&str]) {
         match docker(args) {
             Ok(finished) if finished.code == Some(0) => {}

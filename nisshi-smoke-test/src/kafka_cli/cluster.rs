@@ -34,6 +34,7 @@ impl KafkaCli {
     /// Prints the cluster's id, as `Cluster ID: <id>`.
     ///
     /// Sends `DescribeCluster`.
+    #[track_caller]
     pub fn cluster_id(&self) -> Output<ClusterId> {
         self.run(Tool::Cluster, &["cluster-id"])
     }
@@ -45,6 +46,7 @@ impl KafkaCli {
     /// <version>]` line per API, after a line naming the broker.
     ///
     /// Sends `ApiVersions` and `Metadata`.
+    #[track_caller]
     pub fn api_versions(&self) -> Output<ApiVersions> {
         self.run(Tool::BrokerApiVersions, &[])
     }

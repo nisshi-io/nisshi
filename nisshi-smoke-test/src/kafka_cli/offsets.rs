@@ -26,6 +26,7 @@ impl KafkaCli {
     /// partition.
     ///
     /// Sends `ListOffsets`.
+    #[track_caller]
     pub fn get_offsets(&self, topic: &str, time: &str) -> Output<GetOffsets> {
         self.run(Tool::GetOffsets, &["--topic", topic, "--time", time])
     }

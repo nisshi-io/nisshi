@@ -122,6 +122,7 @@ impl KafkaCli {
     ///
     /// Sends `Produce`. The tool sets `retries=0`, and the Java client then turns idempotence off,
     /// whatever `acks` is. [`KafkaCli::idempotent_verifiable_produce`] turns it on.
+    #[track_caller]
     pub fn verifiable_produce(
         &self,
         topic: &str,
@@ -135,6 +136,7 @@ impl KafkaCli {
     /// Produces `max_messages` records to `topic` with [`Acks::FullIsr`], at most `throughput`
     /// records a second. Record `n`'s value is `<value_prefix>.<n>`. Panics if the producer
     /// doesn't finish within `tool_timeout`.
+    #[track_caller]
     pub fn throttled_verifiable_produce(
         &self,
         topic: &str,
@@ -188,6 +190,7 @@ impl KafkaCli {
     ///
     /// Record `n`'s value is `<value_prefix>.<n>`. With `repeating_keys` of 2, the keys are `0`,
     /// `1`, `0`, `1`, and so on; without it, the records have no keys.
+    #[track_caller]
     pub fn verifiable_produce_created_at(
         &self,
         topic: &str,
@@ -216,6 +219,7 @@ impl KafkaCli {
 
     /// Runs `kafka-verifiable-producer` until it has sent `max_messages` records. Panics if the
     /// producer doesn't finish within `tool_timeout`.
+    #[track_caller]
     fn run_verifiable_producer(
         &self,
         topic: &str,
@@ -240,6 +244,7 @@ impl KafkaCli {
     /// idempotent: it numbers its batches, so the broker can drop a batch that it gets twice.
     ///
     /// Sends `InitProducerId` and `Produce`.
+    #[track_caller]
     pub fn idempotent_verifiable_produce(
         &self,
         topic: &str,
