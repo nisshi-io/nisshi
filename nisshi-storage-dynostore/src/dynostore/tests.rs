@@ -29,6 +29,7 @@ mod delete_records;
 mod latency;
 mod ping;
 mod post_write_failure_reason;
+mod produce_topic_guard;
 mod stale_watermark;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {

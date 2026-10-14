@@ -422,12 +422,57 @@ struct Watermark {
     timestamps: Option<BTreeMap<i64, i64>>,
 }
 
+/// `clusters/{cluster}/topics/{topic}`, the prefix every key of a topic's
+/// data is stored beneath.
+///
+/// The topic is exactly one segment: [`PathPart`] percent-encodes "/", so a
+/// name holding "/" cannot reach another topic's keys. A valid topic name
+/// (`[a-zA-Z0-9._-]`, not `.` or `..`) holds no character [`PathPart`]
+/// encodes, so its keys are the ones `Path::from(format!(..))` gave. Only a
+/// name holding "/" has keys that differ. `extend` skips an empty segment,
+/// as `Path::from` does, so the empty name keeps its key too.
+fn topic_prefix(cluster: &str, topic: &str) -> Path {
+    let mut path = Path::from(format!("clusters/{cluster}/topics"));
+    path.extend([PathPart::from(topic)]);
+    path
+}
+
+/// `clusters/{cluster}/topics/{topic}/partitions/{partition:0>10}`.
+fn partition_prefix(cluster: &str, topition: &Topition) -> Path {
+    topic_prefix(cluster, topition.topic.as_str())
+        .join("partitions")
+        .join(format!("{:0>10}", topition.partition))
+}
+
+/// The prefix a partition's batch objects are stored beneath.
+fn records_prefix(cluster: &str, topition: &Topition) -> Path {
+    partition_prefix(cluster, topition).join("records")
+}
+
+/// The key of the batch object whose first record is at `base_offset`.
+fn batch_path(cluster: &str, topition: &Topition, base_offset: i64) -> Path {
+    records_prefix(cluster, topition).join(format!("{base_offset:0>20}.batch"))
+}
+
+/// The base offset of a batch object that sits directly under
+/// `records_prefix`, or `None` for any other object, such as one a produce
+/// to a name holding "/" left there before topic keys were one segment.
+fn batch_base_offset(records_prefix: &Path, location: &Path) -> Option<i64> {
+    let mut parts = location.prefix_match(records_prefix)?;
+    let name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let digits = name.as_ref().strip_suffix(".batch")?;
+    if digits.len() != 20 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    i64::from_str(digits).ok()
+}
+
 impl OptiCon<Watermark> {
     fn new(cluster: &str, topition: &Topition) -> Self {
-        Self::path(format!(
-            "clusters/{}/topics/{}/partitions/{:0>10}/watermark.json",
-            cluster, topition.topic, topition.partition,
-        ))
+        Self::path(partition_prefix(cluster, topition).join("watermark.json"))
     }
 }
 
@@ -565,8 +610,9 @@ impl DynoStore {
     /// The location of a single committed offset, e.g.
     /// `clusters/{cluster}/groups/consumers/{group}/offsets/{topic}/partitions/{partition:0>10}.json`.
     ///
-    /// The topic keeps the segment rule of its data keys, `Path::from`, which
-    /// splits on "/": a topic named before CreateTopics rejected "/" keeps the
+    /// The topic keeps the segment rule `Path::from`, which splits on "/",
+    /// unlike its data keys (see [`topic_prefix`]); for a valid name the two
+    /// rules agree. A topic named before CreateTopics rejected "/" keeps the
     /// key it had, and `delete_topic` matches its offsets by the same rule.
     fn committed_offset_location(&self, group_id: &str, topition: &Topition) -> Result<Path> {
         let mut location = self.group_offsets_prefix(group_id)?;
@@ -599,10 +645,7 @@ impl DynoStore {
             return;
         }
 
-        let prefix = Path::from(format!(
-            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-            self.cluster, topition.topic, topition.partition
-        ));
+        let prefix = records_prefix(&self.cluster, topition);
 
         let mut objects = match self
             .object_store
@@ -614,10 +657,7 @@ impl DynoStore {
             Ok(locations) => locations
                 .into_iter()
                 .filter_map(|location| {
-                    let base_offset = location
-                        .parts()
-                        .next_back()
-                        .and_then(|name| i64::from_str(name.as_ref().get(0..20)?).ok())?;
+                    let base_offset = batch_base_offset(&prefix, &location)?;
 
                     Some((location, base_offset))
                 })
@@ -989,22 +1029,19 @@ impl Storage for DynoStore {
             // already-emptied prefix is a no-op, so retrying the whole
             // sequence is safe.
 
-            // Both sweeps below build a key prefix from the name, and
-            // `Path::from` treats "/" as a separator and drops empty
-            // segments. Such a name can only predate CreateTopics' name
+            // Both sweeps below build a key prefix from the name. A name
+            // with "/" or an empty name can only predate CreateTopics' name
             // check. A sweep whose prefix can reach another topic's objects
-            // is skipped, and the objects stay. Names with other invalid
-            // characters (a space, non-ASCII) stay one path segment, so
-            // they are swept.
+            // is skipped, and the objects stay.
             //
             // The resolved name is checked, not the request's, because a
             // delete by id carries no name until `topic_metadata` resolves it.
             let name = metadata.topic.name.as_str();
 
-            // The data sweep deletes everything under `topics/<name>/`, so any
-            // "/" in the name puts that prefix on or inside another topic's
-            // keys: "a/partitions/" is all of topic "a"'s data.
-            let data_prefix_is_shared = name.is_empty() || name.contains('/');
+            // The data sweep deletes everything under the topic's key
+            // segment, which holds the whole name, "/" included. The empty
+            // name drops out of the key, so its prefix is every topic's data.
+            let data_prefix_is_shared = name.is_empty();
 
             // The offsets sweep matches whole segments after `offsets/`, so a
             // name with no empty segment does not reach the keys of the plain
@@ -1016,15 +1053,25 @@ impl Storage for DynoStore {
                 warn!(
                     name,
                     topic_id = %metadata.id,
-                    location = %Path::from(format!(
-                        "clusters/{}/topics/{}/partitions",
-                        self.cluster, name
-                    )),
+                    location = %topic_prefix(&self.cluster, name),
                     "topic deleted, but its data was left in place: \
                      its name is not a safe key prefix"
                 );
             } else {
-                let prefix = Path::from(format!("clusters/{}/topics/{}/", self.cluster, name));
+                if name.contains('/') {
+                    warn!(
+                        name,
+                        topic_id = %metadata.id,
+                        location = %Path::from(format!(
+                            "clusters/{}/topics/{}/partitions",
+                            self.cluster, name
+                        )),
+                        "topic deleted, but objects under the keys its name \
+                         had before it was stored as one segment were left in place"
+                    );
+                }
+
+                let prefix = topic_prefix(&self.cluster, name);
 
                 let locations = self
                     .object_store
@@ -1132,6 +1179,19 @@ impl Storage for DynoStore {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
+        // Checked before any key is built, so a produce to a topic or
+        // partition that does not exist writes nothing, as in Kafka.
+        let Some(metadata) = self
+            .topic_metadata(&TopicId::Name(topition.topic.clone()))
+            .await?
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        if topition.partition < 0 || topition.partition >= metadata.topic.num_partitions {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
         let config = self
             .describe_config(topition.topic(), ConfigResource::Topic, None)
             .await
@@ -1413,10 +1473,7 @@ impl Storage for DynoStore {
                     .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
             }
 
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                self.cluster, topition.topic, topition.partition, offset,
-            ));
+            let location = batch_path(&self.cluster, topition, offset);
 
             // `deflated` is moved into `encode`, so the fields the
             // post-write sequence advance below needs are copied out
@@ -1574,10 +1631,7 @@ impl Storage for DynoStore {
         let mut offsets = BTreeSet::new();
 
         if offset < high_watermark {
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-                self.cluster, topition.topic, topition.partition
-            ));
+            let location = records_prefix(&self.cluster, topition);
 
             let mut list_stream = self.object_store.list(Some(&location));
 
@@ -1590,11 +1644,9 @@ impl Storage for DynoStore {
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
                 && !has_deadline_expired()
             {
-                let Some(offset) = meta.location.parts().next_back() else {
+                let Some(offset) = batch_base_offset(&location, &meta.location) else {
                     continue;
                 };
-
-                let offset = i64::from_str(&offset.as_ref()[0..20])?;
                 debug!(offset);
 
                 if offset < high_watermark {
@@ -1622,10 +1674,7 @@ impl Storage for DynoStore {
         for base_offset in wanted {
             debug!(?base_offset);
 
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                self.cluster, topition.topic, topition.partition, base_offset,
-            ));
+            let location = batch_path(&self.cluster, topition, base_offset);
 
             let get_result = self
                 .object_store
@@ -1776,10 +1825,7 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records",
-                self.cluster, topition.topic, topition.partition,
-            ));
+            let location = records_prefix(&self.cluster, topition);
 
             let mut list_stream = self.object_store.list(Some(&location));
 
@@ -1793,22 +1839,16 @@ impl Storage for DynoStore {
                 .inspect_err(|error| error!(?error))
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             {
+                let Some(meta_offset) = batch_base_offset(&location, &meta.location) else {
+                    continue;
+                };
+
                 if let Some(last) = stable.get(topition)
                     && offset_request == &ListOffset::Latest
                 {
                     let Some(found_offset) = candidate
                         .as_ref()
-                        .and_then(|found| found.location.parts().next_back())
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    let Some(meta_offset) = meta
-                        .location
-                        .parts()
-                        .next_back()
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
+                        .and_then(|found| batch_base_offset(&location, &found.location))
                     else {
                         continue;
                     };
@@ -1858,8 +1898,7 @@ impl Storage for DynoStore {
                 // be below the log start.
                 let base_offset = candidate
                     .as_ref()
-                    .and_then(|found| found.location.parts().next_back())
-                    .and_then(|name| i64::from_str(name.as_ref().get(0..20)?).ok());
+                    .and_then(|found| batch_base_offset(&location, &found.location));
 
                 if base_offset.is_none_or(|base_offset| base_offset < log_start) {
                     responses.push((
@@ -1876,11 +1915,9 @@ impl Storage for DynoStore {
             }
 
             if let Some(ref found) = candidate {
-                let Some(offset) = found.location.parts().next_back() else {
+                let Some(offset) = batch_base_offset(&location, &found.location) else {
                     continue;
                 };
-
-                let offset = i64::from_str(&offset.as_ref()[0..20])?;
                 debug!(offset);
 
                 responses.push((
@@ -3061,20 +3098,31 @@ impl Storage for DynoStore {
                 .and_then(TryInto::try_into)
                 .inspect(|deflated| debug!(?deflated))?;
 
-            _ = self
-                .produce(Some(transaction_id), &topition, batch)
-                .await
-                .inspect(|offset| {
-                    debug!(
-                        offset,
-                        ?topition,
-                        producer_id,
-                        producer_epoch,
-                        transaction_id,
-                        committed,
-                    )
-                })
-                .inspect_err(|err| {
+            match self.produce(Some(transaction_id), &topition, batch).await {
+                Ok(offset) => debug!(
+                    offset,
+                    ?topition,
+                    producer_id,
+                    producer_epoch,
+                    transaction_id,
+                    committed,
+                ),
+
+                // The topic was deleted while the transaction was open, so
+                // there is no log left to mark. Kafka's coordinator drops
+                // such a partition from the markers it writes; failing here
+                // instead would fail every retry of EndTxn and hold the
+                // last stable offset of the other partitions back for good.
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => warn!(
+                    ?topition,
+                    producer_id,
+                    producer_epoch,
+                    transaction_id,
+                    committed,
+                    "partition no longer exists, end transaction marker skipped"
+                ),
+
+                Err(err) => {
                     error!(
                         ?err,
                         ?topition,
@@ -3082,8 +3130,11 @@ impl Storage for DynoStore {
                         producer_epoch,
                         transaction_id,
                         committed,
-                    )
-                })?;
+                    );
+
+                    return Err(err);
+                }
+            }
         }
 
         let offsets_to_commit = self
