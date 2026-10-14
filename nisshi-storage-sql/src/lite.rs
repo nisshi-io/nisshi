@@ -535,12 +535,26 @@ impl managed::Manager for ConnectionManager {
             .inspect(|_| CONNECT_DURATION.record(elapsed_millis(start), &[]))
     }
 
+    /// Rejects a connection still inside a transaction, for example one whose
+    /// rollback failed when its `Transaction` was dropped. Such a connection
+    /// holds SQLite's write lock. Rejecting it makes the pool drop it, which
+    /// closes the handle and rolls the transaction back, and hand out a fresh
+    /// connection instead.
     async fn recycle(
         &self,
-        _obj: &mut Self::Type,
+        obj: &mut Self::Type,
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<Self::Error> {
-        Ok(())
+        if obj.connection.is_autocommit() {
+            Ok(())
+        } else {
+            // deadpool discards a recycle error without logging it.
+            warn!("discarding a pooled connection left inside an open transaction");
+
+            Err(managed::RecycleError::message(
+                "connection is inside an open transaction",
+            ))
+        }
     }
 }
 
@@ -6126,6 +6140,46 @@ mod tests {
         // a cut to the high watermark keeps the row at `high_watermark - 1`
         assert_eq!((ErrorCode::None, record_count), delete_up_to(-1).await?);
         assert_eq!((1, record_count - 1), stored_rows().await?);
+
+        Ok(())
+    }
+
+    /// A connection returned to the pool inside an open transaction holds
+    /// SQLite's write lock. The pool discards it on its next checkout of that
+    /// object, not on return: `recycle` rejects it, dropping it closes the
+    /// handle and rolls the transaction back, and the pool hands out a fresh
+    /// connection instead. Until that checkout, a writer that pops another
+    /// idle connection first can still see `SQLITE_BUSY` (the queue is FIFO,
+    /// so this is bounded by the number of idle connections ahead of it).
+    #[tokio::test]
+    async fn pool_discards_connection_left_in_open_transaction() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let db = libsql::Builder::new_local(temp_dir.path().join("nisshi.db"))
+            .build()
+            .await?;
+
+        let pool = Pool::builder(ConnectionManager {
+            db: Arc::new(Mutex::new(db)),
+            busy_timeout: Duration::from_millis(100),
+        })
+        .build()?;
+
+        {
+            let stale = pool.get().await?;
+            _ = stale.connection.execute("BEGIN IMMEDIATE", ()).await?;
+            assert!(!stale.connection.is_autocommit());
+        }
+
+        let next = pool.get().await?;
+        assert!(next.connection.is_autocommit());
+        assert_eq!(0, managed::Object::metrics(&next).recycle_count);
+        assert_eq!(1, pool.status().size);
+
+        let other = pool.get().await?;
+        let tx = other.transaction().await?;
+        other.commit(tx).await?;
 
         Ok(())
     }
