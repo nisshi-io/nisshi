@@ -15,7 +15,7 @@
 //! Tests that `kafka-topics` describes and changes a topic as it does against Apache Kafka, so that
 //! admin and monitoring scripts written for Kafka work unchanged.
 
-use nisshi_smoke_test::{KafkaCli, PartitionReplicas, unique_name};
+use nisshi_smoke_test::{KafkaCli, PartitionReplicas, unique};
 
 /// The partition count of a topic the broker creates for a producer.
 const AUTO_CREATE_PARTITIONS: u32 = 4;
@@ -26,14 +26,16 @@ fn records_on_each_partition(cli: &KafkaCli, topic: &str) -> Vec<Vec<(i64, Strin
     let mut records_on_each_partition = Vec::new();
 
     for (end, partition) in cli
-        .partition_offsets_at(topic, "latest")
+        .get_offsets()
+        .partition_offsets(topic, "latest")
         .into_iter()
         .zip(0..)
     {
         let records = if end == 0 {
             Vec::new()
         } else {
-            cli.read_records(topic, partition, 0, end as usize)
+            cli.console_consumer()
+                .read_records(topic, partition, 0, end as usize)
         };
 
         records_on_each_partition.push(
@@ -53,9 +55,9 @@ fn records_on_each_partition(cli: &KafkaCli, topic: &str) -> Vec<Vec<(i64, Strin
 #[test]
 fn describe_shows_node_111_as_leader_replica_and_isr() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(3, &[]);
+    let topic = cli.topics().create_unique(3, &[]);
 
-    let described = cli.describe_topic(&topic);
+    let described = cli.topics().describe(&topic);
 
     for partition in 0..3 {
         assert_eq!(
@@ -75,11 +77,11 @@ fn describe_shows_node_111_as_leader_replica_and_isr() {
 #[test]
 fn describing_missing_topic_fails() {
     let cli = KafkaCli::shared();
-    let topic = unique_name("topic");
+    let topic = unique::name("topic");
 
-    _ = cli.describe_topic(&topic).exited(1);
+    _ = cli.topics().describe(&topic).exited(1);
 
-    let listed = cli.list_topics();
+    let listed = cli.topics().list();
     assert!(!listed.succeeded().lists_topic(&topic), "{listed}");
 }
 
@@ -88,12 +90,14 @@ fn describing_missing_topic_fails() {
 #[test]
 fn recreated_topic_starts_at_offset_0() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
 
-    _ = cli.produce_values(&topic, &["old-0", "old-1"]);
-    _ = cli.delete_topic(&topic).succeeded();
-    _ = cli.create_topic(&topic, 1, &[]).succeeded();
-    _ = cli.produce_values(&topic, &["new-0"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["old-0", "old-1"]);
+    _ = cli.topics().delete(&topic).succeeded();
+    _ = cli.topics().create(&topic, 1, &[]).succeeded();
+    _ = cli.console_producer().produce_values(&topic, &["new-0"]);
 
     assert_eq!(
         records_on_each_partition(&cli, &topic),
@@ -106,11 +110,13 @@ fn recreated_topic_starts_at_offset_0() {
 #[test]
 fn producing_to_deleted_topic_recreates_it_empty() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
 
-    _ = cli.produce_values(&topic, &["old-0", "old-1"]);
-    _ = cli.delete_topic(&topic).succeeded();
-    _ = cli.produce_values(&topic, &["new-0"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["old-0", "old-1"]);
+    _ = cli.topics().delete(&topic).succeeded();
+    _ = cli.console_producer().produce_values(&topic, &["new-0"]);
 
     assert_eq!(
         records_on_each_partition(&cli, &topic)
@@ -127,11 +133,11 @@ fn producing_to_deleted_topic_recreates_it_empty() {
 #[test]
 fn produce_to_missing_topic_creates_it() {
     let cli = KafkaCli::shared();
-    let topic = unique_name("topic");
+    let topic = unique::name("topic");
 
-    _ = cli.produce_values(&topic, &["created"]);
+    _ = cli.console_producer().produce_values(&topic, &["created"]);
 
-    let described = cli.describe_topic(&topic);
+    let described = cli.topics().describe(&topic);
 
     assert_eq!(
         described.succeeded().partition_count(),

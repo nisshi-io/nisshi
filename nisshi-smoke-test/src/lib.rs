@@ -21,115 +21,33 @@
 // The whole crate is test harness: a failed setup step should panic the test that hit it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-
-use nanoid::nanoid;
-
 pub mod broker;
 mod broker_state_reader;
+mod common;
 mod kafka_cli;
-mod postgres;
-mod record;
+mod postgres_server;
 pub mod settings;
 mod storage_url;
-mod timed_command;
 
-pub use broker::{Broker, FREQUENT_MAINTENANCE, LaunchOptions, ReservedPort};
+pub use broker::{Broker, FREQUENT_MAINTENANCE, LaunchOptions};
 pub use broker_state_reader::BrokerStateReader;
+pub use common::{ReservedPort, polling, unique};
 pub use kafka_cli::{
     Acks, AnyCommand, ApiVersions, BackgroundTool, ClusterId, CommittedOffset, Consume,
     ConsumeMatching, ConsumedOffsets, ConsumedRecord, ConsumerEvent, CreateTopic, DeleteRecords,
     DescribeConfigs, DescribeGroup, DescribeGroupMembers, DescribeGroupState, DescribeTopic,
     DescribeUsers, GROUP_ID_NOT_FOUND_EXCEPTION, GROUP_NOT_EMPTY_EXCEPTION, GetOffsets,
-    GroupOffsets, GroupState, KafkaCli, LOG_APPEND_TIME, ListGroups, ListGroupsInState, ListTopics,
-    Output, PRINTED_NULL, PartitionReplicas, PrintedLine, PrintsPartitionLines,
-    RECORD_TOO_LARGE_EXCEPTION, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism,
-    SendResult, StdoutLines, StoredRecord, TOPIC_EXISTS_EXCEPTION, TopicPartition,
-    UNSUPPORTED_VERSION_EXCEPTION, VerifiableConsume, VerifiableProduce,
-    verifiable_producer_values,
+    GroupOffsets, GroupState, KafkaBrokerApiVersions, KafkaCli, KafkaCluster, KafkaConfigs,
+    KafkaConsoleConsumer, KafkaConsoleProducer, KafkaConsumerGroups, KafkaDeleteRecords,
+    KafkaGetOffsets, KafkaReassignPartitions, KafkaTopics, KafkaVerifiableConsumer,
+    KafkaVerifiableProducer, LOG_APPEND_TIME, ListGroups, ListGroupsInState, ListTopics, Output,
+    PRINTED_NULL, PartitionReplicas, PrintedLine, PrintsPartitionLines, RECORD_TOO_LARGE_EXCEPTION,
+    Record, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism, SendResult, StdoutLines,
+    StoredRecord, TOPIC_EXISTS_EXCEPTION, TopicPartition, UNSUPPORTED_VERSION_EXCEPTION,
+    VerifiableConsume, VerifiableProduce,
 };
-pub use postgres::PostgresServer;
-pub use record::Record;
+pub use postgres_server::PostgresServer;
 pub use storage_url::StorageUrl;
 
 /// The cluster id of the broker that all tests share.
 pub const SHARED_CLUSTER_ID: &str = "nisshi-smoke";
-
-/// Returns a name that no other test, process or earlier run uses, so tests can share one broker
-/// and one database.
-///
-/// The random part of the name contains only lowercase letters and digits.
-pub fn unique_name(prefix: &str) -> String {
-    // This alphabet replaces nanoid's default alphabet, which contains `_` and uppercase letters.
-    // `kafka-topics` prints a warning before its output for a topic name that contains `_`, and
-    // the tests read the first line of that output.
-    const NAME_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
-
-    let alphabet = NAME_ALPHABET.chars().collect::<Vec<_>>();
-    format!("{prefix}-{}", nanoid!(21, &alphabet))
-}
-
-/// Returns a random password for a SCRAM user that a test creates.
-///
-/// The password is a random number in decimal. CodeQL reports a password built from any constant,
-/// such as a literal or the alphabet that [`unique_name`] picks from, as a hard-coded cryptographic
-/// value, so this one is built from none.
-pub fn random_password() -> String {
-    rand::random::<u128>().to_string()
-}
-
-/// The time now, in milliseconds since the Unix epoch, as Kafka gives record timestamps.
-pub fn now_in_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or_default()
-}
-
-/// Calls `attempt` until it returns `Ok`, and returns that value. Panics with the last `Err` if
-/// `attempt` hasn't returned `Ok` within `timeout`.
-///
-/// A test waits with this for something the broker does in the background, such as a maintenance
-/// run. The test stops as soon as it sees the result, so `timeout` only limits a test that has
-/// already failed.
-#[track_caller]
-pub fn wait_until<T>(timeout: Duration, mut attempt: impl FnMut() -> Result<T, String>) -> T {
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        match attempt() {
-            Ok(value) => return value,
-            Err(reason) if Instant::now() >= deadline => {
-                panic!("not within {timeout:?}: {reason}");
-            }
-            Err(_) => thread::sleep(Duration::from_millis(500)),
-        }
-    }
-}
-
-/// The `docker --label` on every container and volume this run creates.
-fn label() -> String {
-    format!("--label=nisshi-smoke={}", settings::run_id())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unique_name_appends_only_lowercase_letters_and_digits() {
-        let name = unique_name("topic");
-        let random = name.strip_prefix("topic-").unwrap_or_default();
-
-        assert_eq!(random.len(), 21, "{name}");
-        assert!(
-            random
-                .chars()
-                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()),
-            "{name}"
-        );
-    }
-}

@@ -25,9 +25,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use nisshi_smoke_test::{
-    BrokerStateReader, KafkaCli, now_in_millis, unique_name, verifiable_producer_values,
-};
+use nisshi_smoke_test::{BrokerStateReader, KafkaCli, KafkaVerifiableProducer, unique};
 
 /// The records that each test produces.
 const RECORDS: [&str; 10] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"];
@@ -62,7 +60,7 @@ impl ConsumerGroup {
     #[track_caller]
     fn after_reading(records: &[&str], records_read: usize) -> Self {
         Self::produced_with(records, records_read, |cli, topic| {
-            _ = cli.produce_values(topic, records);
+            _ = cli.console_producer().produce_values(topic, records);
         })
     }
 
@@ -77,12 +75,12 @@ impl ConsumerGroup {
     ) -> Self {
         let values = (0..)
             .zip(created_at_millis)
-            .flat_map(|(batch, _)| verifiable_producer_values(batch, records_per_batch))
+            .flat_map(|(batch, _)| KafkaVerifiableProducer::values(batch, records_per_batch))
             .collect::<Vec<_>>();
 
         Self::produced_with(&as_strs(&values), records_read, |cli, topic| {
             for (batch, created_at_millis) in (0..).zip(created_at_millis) {
-                let produced = cli.verifiable_produce_created_at(
+                let produced = cli.verifiable_producer().produce_created_at(
                     topic,
                     records_per_batch,
                     *created_at_millis,
@@ -106,7 +104,7 @@ impl ConsumerGroup {
     fn with_two_batches_an_hour_apart() -> Self {
         let gap_millis =
             i64::try_from(GAP_BETWEEN_BATCHES.as_millis()).expect("the gap fits in an i64");
-        let now_millis = now_in_millis();
+        let now_millis = KafkaCli::shared().now_in_millis();
 
         Self::after_reading_batches_created_at(
             &[now_millis - 2 * gap_millis, now_millis - gap_millis],
@@ -122,12 +120,12 @@ impl ConsumerGroup {
         produce: impl FnOnce(&KafkaCli, &str),
     ) -> Self {
         let cli = KafkaCli::shared();
-        let topic = cli.create_unique_topic(1, &[]);
-        let group = unique_name("group");
+        let topic = cli.topics().create_unique(1, &[]);
+        let group = unique::name("group");
 
         produce(&cli, &topic);
 
-        let consumed = cli.consume(&topic, &group, records_read);
+        let consumed = cli.console_consumer().consume(&topic, &group, records_read);
         assert_eq!(
             consumed.succeeded().consumed_values(),
             records[..records_read],
@@ -162,7 +160,10 @@ impl ConsumerGroup {
     ) {
         self.assert_reset_stores(reset_option, expected_offset);
 
-        let consumed = self.cli.consume(&self.topic, &self.group, 1);
+        let consumed = self
+            .cli
+            .console_consumer()
+            .consume(&self.topic, &self.group, 1);
         assert_eq!(
             consumed.succeeded().consumed_values(),
             [expected_first_value],
@@ -174,9 +175,10 @@ impl ConsumerGroup {
     /// stores `expected_offset` after a reset with it.
     #[track_caller]
     fn assert_reset_stores(&self, reset_option: &[&str], expected_offset: i64) {
-        let planned = self
-            .cli
-            .plan_offset_reset(&self.group, &self.topic, reset_option);
+        let planned =
+            self.cli
+                .consumer_groups()
+                .plan_offset_reset(&self.group, &self.topic, reset_option);
         _ = planned.succeeded();
         assert_eq!(
             self.stored_offset(),
@@ -184,9 +186,10 @@ impl ConsumerGroup {
             "the broker stored another offset after a dry run: {planned}"
         );
 
-        let executed = self
-            .cli
-            .reset_offsets(&self.group, &self.topic, reset_option);
+        let executed =
+            self.cli
+                .consumer_groups()
+                .reset_offsets(&self.group, &self.topic, reset_option);
         _ = executed.succeeded();
         assert_eq!(
             self.stored_offset(),
@@ -222,9 +225,11 @@ fn reset_to_latest_skips_every_record_so_far() {
         cli, topic, group, ..
     } = &consumer_group;
 
-    _ = cli.produce_values(topic, &["after-reset"]);
+    _ = cli
+        .console_producer()
+        .produce_values(topic, &["after-reset"]);
 
-    let consumed = cli.consume(topic, group, 1);
+    let consumed = cli.console_consumer().consume(topic, group, 1);
     assert_eq!(
         consumed.succeeded().consumed_values(),
         ["after-reset"],
@@ -314,9 +319,13 @@ fn reset_of_a_group_with_members_is_refused() {
         cli, topic, group, ..
     } = &consumer_group;
 
-    let (member, _) = cli.join_group(topic, group, SESSION_TIMEOUT, None, JOIN_TIMEOUT);
+    let (member, _) =
+        cli.verifiable_consumer()
+            .join_group(topic, group, SESSION_TIMEOUT, None, JOIN_TIMEOUT);
 
-    let refused = cli.reset_offsets(group, topic, &["--to-earliest"]);
+    let refused = cli
+        .consumer_groups()
+        .reset_offsets(group, topic, &["--to-earliest"]);
     let stored_offset = consumer_group.stored_offset();
 
     drop(member.terminate());

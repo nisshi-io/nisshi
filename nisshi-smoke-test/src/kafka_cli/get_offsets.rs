@@ -16,35 +16,43 @@
 
 use super::{KafkaCli, Output, Tool};
 
-/// The command of [`KafkaCli::get_offsets`]'s [`Output`].
+/// The command of [`KafkaGetOffsets::at`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum GetOffsets {}
 
-impl KafkaCli {
+/// Runs `kafka-get-offsets` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaGetOffsets<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaGetOffsets<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Reads each partition's offset of `topic` at `time`, which is `earliest`, `latest` or a
     /// timestamp in milliseconds. The tool prints one `<topic>:<partition>:<offset>` line per
     /// partition.
     ///
     /// Sends `ListOffsets`.
     #[track_caller]
-    pub fn get_offsets(&self, topic: &str, time: &str) -> Output<GetOffsets> {
-        self.run(Tool::GetOffsets, &["--topic", topic, "--time", time])
+    pub fn at(&self, topic: &str, time: &str) -> Output<GetOffsets> {
+        self.cli
+            .run(Tool::GetOffsets, &["--topic", topic, "--time", time])
     }
 
-    /// Returns each partition's offset of `topic` at `time`, as [`KafkaCli::get_offsets`] reads
+    /// Returns each partition's offset of `topic` at `time`, as [`KafkaGetOffsets::at`] reads
     /// it. Panics, showing the tool's output, if the tool fails.
     #[track_caller]
-    pub fn partition_offsets_at(&self, topic: &str, time: &str) -> Vec<i64> {
-        self.get_offsets(topic, time)
-            .succeeded()
-            .partition_offsets(topic)
+    pub fn partition_offsets(&self, topic: &str, time: &str) -> Vec<i64> {
+        self.at(topic, time).succeeded().partition_offsets(topic)
     }
 }
 
 impl Output<GetOffsets> {
-    /// Returns each of `topic`'s partition offsets, in the order the tool printed them. The tool prints one `<topic>:<partition>:<offset>` line per
-    /// partition, and Kafka 4 tools also print warnings on stdout, so the reader reads only the
-    /// lines that start with `topic`.
+    /// Returns each of `topic`'s partition offsets, in the order the tool printed them. The tool
+    /// prints one `<topic>:<partition>:<offset>` line per partition, and Kafka 4 tools also print
+    /// warnings on stdout, so the reader reads only the lines that start with `topic`.
     pub fn partition_offsets(&self, topic: &str) -> Vec<i64> {
         self.lines()
             .iter()

@@ -24,12 +24,12 @@ use serde::Deserialize;
 
 use super::{BackgroundTool, KafkaCli, Output, StdoutLines, StoredRecord, TOOL_TIMEOUT, Tool};
 
-/// The session timeout of a consumer that [`KafkaCli::verifiable_consume`] runs, the lowest that a
-/// Kafka broker accepts by default.
+/// The session timeout of a consumer that [`KafkaVerifiableConsumer::consume`] runs, the lowest
+/// that a Kafka broker accepts by default.
 const VERIFIABLE_CONSUME_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// The command of [`KafkaCli::verifiable_consume`]'s [`Output`], and of
-/// [`KafkaCli::start_verifiable_consumer`]'s [`BackgroundTool`].
+/// The command of [`KafkaVerifiableConsumer::consume`]'s [`Output`], and of
+/// [`KafkaVerifiableConsumer::start`]'s [`BackgroundTool`].
 #[derive(Clone, Copy, Debug)]
 pub enum VerifiableConsume {}
 
@@ -124,7 +124,16 @@ fn verifiable_consumer_args(
     args
 }
 
-impl KafkaCli {
+/// Runs `kafka-verifiable-consumer` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaVerifiableConsumer<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaVerifiableConsumer<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Reads `max_messages` records of `topic` with `kafka-verifiable-consumer`, as a member of
     /// `group`.
     ///
@@ -135,7 +144,7 @@ impl KafkaCli {
     /// Sends `FindCoordinator`, `JoinGroup`, `SyncGroup`, `OffsetFetch`, `Fetch`, `OffsetCommit`
     /// and `LeaveGroup`.
     #[track_caller]
-    pub fn verifiable_consume(
+    pub fn consume(
         &self,
         topic: &str,
         group: &str,
@@ -149,7 +158,7 @@ impl KafkaCli {
             Some(max_messages),
         );
 
-        self.exec_until_timeout(
+        self.cli.exec_until_timeout(
             Tool::VerifiableConsumer,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
             None,
@@ -158,7 +167,7 @@ impl KafkaCli {
     }
 
     /// Starts `kafka-verifiable-consumer`, which consumes `topic` as a member of `group` until the
-    /// test stops it, as [`KafkaCli::verifiable_consume`] does, and prints a [`ConsumerEvent`]
+    /// test stops it, as [`KafkaVerifiableConsumer::consume`] does, and prints a [`ConsumerEvent`]
     /// per line.
     ///
     /// With a `group_instance_id`, the consumer is a static member: a consumer that restarts with
@@ -167,7 +176,7 @@ impl KafkaCli {
     /// Sends `FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `OffsetFetch`, `Fetch`,
     /// `OffsetCommit` and `LeaveGroup`.
     #[track_caller]
-    pub fn start_verifiable_consumer(
+    pub fn start(
         &self,
         topic: &str,
         group: &str,
@@ -176,13 +185,14 @@ impl KafkaCli {
     ) -> BackgroundTool<VerifiableConsume> {
         let args = verifiable_consumer_args(topic, group, session_timeout, group_instance_id, None);
 
-        self.start(
+        BackgroundTool::start(
+            self.cli,
             Tool::VerifiableConsumer,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )
     }
 
-    /// Starts a consumer with [`KafkaCli::start_verifiable_consumer`], and waits until it has
+    /// Starts a consumer with [`KafkaVerifiableConsumer::start`], and waits until it has
     /// joined `group` and has its partitions. Returns the consumer and its partitions.
     ///
     /// Panics with what the consumer printed if it does not have its partitions within
@@ -196,8 +206,7 @@ impl KafkaCli {
         group_instance_id: Option<&str>,
         join_timeout: Duration,
     ) -> (BackgroundTool<VerifiableConsume>, Vec<TopicPartition>) {
-        let mut member =
-            self.start_verifiable_consumer(topic, group, session_timeout, group_instance_id);
+        let mut member = self.start(topic, group, session_timeout, group_instance_id);
 
         match member.wait_for_partitions_assigned(0, join_timeout) {
             Ok(partitions) => (member, partitions),

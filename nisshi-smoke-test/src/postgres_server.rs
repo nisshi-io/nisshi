@@ -26,8 +26,8 @@ use std::{fs, path::Path, time::Duration};
 
 use crate::{
     ReservedPort, StorageUrl,
-    broker::{docker, reserve_port},
-    label, settings, unique_name, wait_until,
+    common::{docker, polling, unique},
+    settings,
 };
 
 /// How long a server has to accept connections after it starts. A new server first runs the
@@ -57,16 +57,16 @@ impl PostgresServer {
         };
 
         let server = Self {
-            container: unique_name("nisshi-smoke-postgres"),
-            port: reserve_port(),
+            container: unique::name("nisshi-smoke-postgres"),
+            port: ReservedPort::reserve(),
         };
 
-        let started = docker(&[
+        let started = docker::execute(&[
             "run",
             "--detach",
             "--name",
             &server.container,
-            &label(),
+            &docker::label(),
             "--publish",
             &format!("127.0.0.1:{}:5432", server.port.number()),
             "--env",
@@ -133,8 +133,8 @@ impl PostgresServer {
     /// during that time, so this check connects over TCP.
     #[track_caller]
     fn wait_until_ready(&self) {
-        wait_until(READY_TIMEOUT, || {
-            match docker(&[
+        polling::wait_until(READY_TIMEOUT, || {
+            match docker::execute(&[
                 "exec",
                 &self.container,
                 "pg_isready",
@@ -149,7 +149,7 @@ impl PostgresServer {
 
     #[track_caller]
     fn docker_or_panic(&self, args: &[&str]) {
-        match docker(args) {
+        match docker::execute(args) {
             Ok(finished) if finished.code == Some(0) => {}
             finished => panic!("docker {}: {finished:?}", args.join(" ")),
         }
@@ -158,6 +158,6 @@ impl PostgresServer {
 
 impl Drop for PostgresServer {
     fn drop(&mut self) {
-        _ = docker(&["rm", "--force", "--volumes", &self.container]);
+        _ = docker::execute(&["rm", "--force", "--volumes", &self.container]);
     }
 }

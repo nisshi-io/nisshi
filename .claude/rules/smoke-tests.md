@@ -40,8 +40,8 @@ checks the tool instead of the broker.
   expects the tool to print. Put the names of the Kafka exceptions that the tools print in
   `src/kafka_cli.rs`. Write a command-line argument as a literal where the command is built,
   because the harness writes it and does not read it.
-- **Give each command that has a reader its own `Output` type.** A `KafkaCli` method whose output
-  a reader reads returns `Output<Marker>`, where `Marker` is an empty enum named after the method,
-  such as `DescribeTopic` for `describe_topic`. The reader is a method of `impl Output<Marker>`.
-  The compiler then rejects a reader called on another command's output. A method whose output no
-  reader reads returns `Output`.
+- **Give each command that has a reader its own `Output` type.** A tool's method whose output a
+  reader reads returns `Output<Marker>`, where `Marker` is an empty enum named for the command,
+  such as `DescribeTopic` for `KafkaTopics::describe`. The reader is a method of
+  `impl Output<Marker>`. The compiler then rejects a reader called on another command's output. A
+  method whose output no reader reads returns `Output`.

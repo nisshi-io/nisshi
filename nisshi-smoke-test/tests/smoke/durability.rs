@@ -29,8 +29,7 @@ mod support {
     use std::{collections::HashSet, time::Duration};
 
     use nisshi_smoke_test::{
-        Acks, DescribeGroup, KafkaCli, Output, StoredRecord, VerifiableConsume, unique_name,
-        wait_until,
+        Acks, DescribeGroup, KafkaCli, Output, StoredRecord, VerifiableConsume, polling, unique,
     };
 
     /// The number of partitions in each test's topic. With more than one, the checks cover each
@@ -62,7 +61,7 @@ mod support {
     /// Returns the latest offset of each partition of `topic`, indexed by partition.
     #[track_caller]
     fn latest_offsets(cli: &KafkaCli, topic: &str) -> Vec<i64> {
-        let latest = cli.partition_offsets_at(topic, "latest");
+        let latest = cli.get_offsets().partition_offsets(topic, "latest");
         assert_eq!(
             latest.len(),
             PARTITIONS_PER_TOPIC as usize,
@@ -83,7 +82,7 @@ mod support {
         // A consumer that misses records never reaches `count`, and times out. The check skips
         // `succeeded()` for it, so that the caller's offset check reports the missing offsets
         // instead of a bare timeout.
-        let read = cli.verifiable_consume(topic, group, count);
+        let read = cli.verifiable_consumer().consume(topic, group, count);
         if read.timeout.is_none() {
             _ = read.succeeded();
         }
@@ -106,8 +105,8 @@ mod support {
     /// [`CONSUMER_COMMIT_WAIT`].
     #[track_caller]
     pub(super) fn wait_for_commit(cli: &KafkaCli, group: &str, topic: &str) {
-        wait_until(CONSUMER_COMMIT_WAIT, || {
-            let described = cli.describe_group(group);
+        polling::wait_until(CONSUMER_COMMIT_WAIT, || {
+            let described = cli.consumer_groups().describe(group);
 
             if (0..PARTITIONS_PER_TOPIC).any(|partition| {
                 described
@@ -128,8 +127,8 @@ mod support {
     pub(super) fn wait_until_group_caught_up(cli: &KafkaCli, group: &str, topic: &str) {
         let latest = latest_offsets(cli, topic);
 
-        wait_until(CONSUMER_COMMIT_WAIT, || {
-            let described = cli.describe_group(group);
+        polling::wait_until(CONSUMER_COMMIT_WAIT, || {
+            let described = cli.consumer_groups().describe(group);
 
             let behind = (0..PARTITIONS_PER_TOPIC)
                 .zip(&latest)
@@ -165,7 +164,7 @@ mod support {
         let latest = latest_offsets(cli, topic);
         let total = latest.iter().sum::<i64>() as usize;
 
-        let (read, records) = consume_sorted(cli, topic, &unique_name("group"), total);
+        let (read, records) = consume_sorted(cli, topic, &unique::name("group"), total);
 
         for (partition, latest) in (0..PARTITIONS_PER_TOPIC).zip(&latest) {
             assert_eq!(
@@ -214,7 +213,7 @@ mod support {
     ) {
         // These records give the rejoining group something to read, even when it committed every
         // earlier record. The broker must number each of them after the records it already has.
-        let produced = cli.verifiable_produce(
+        let produced = cli.verifiable_producer().produce(
             topic,
             RECORDS_FOR_RETURNING_GROUP,
             Acks::FullIsr,
@@ -308,7 +307,7 @@ mod support {
 mod restart_under_load {
     use std::{thread, time::Duration};
 
-    use nisshi_smoke_test::{Broker, KafkaCli, unique_name};
+    use nisshi_smoke_test::{Broker, KafkaCli, unique};
 
     use super::support::{
         CLIENT_TIMEOUT, CONSUMER_SESSION_TIMEOUT, PARTITIONS_PER_TOPIC,
@@ -345,10 +344,10 @@ mod restart_under_load {
     fn assert_restart_keeps_acknowledged_data(restart: fn(Broker) -> Broker) {
         let broker = Broker::isolated();
         let cli = KafkaCli::new(broker.bootstrap()).with_client_timeouts(CLIENT_TIMEOUT);
-        let topic = cli.create_unique_topic(PARTITIONS_PER_TOPIC, &[]);
-        let group = unique_name("group");
+        let topic = cli.topics().create_unique(PARTITIONS_PER_TOPIC, &[]);
+        let group = unique::name("group");
 
-        let producer = cli.start_verifiable_produce(
+        let producer = cli.verifiable_producer().start(
             &topic,
             PRODUCER_RECORDS_PER_SECOND,
             PRODUCER_VALUE_PREFIX,
@@ -358,7 +357,8 @@ mod restart_under_load {
         // restart. A consumer that runs on would commit again after the restart, and the new
         // commits would hide a commit that the restart lost.
         let consumer =
-            cli.start_verifiable_consumer(&topic, &group, CONSUMER_SESSION_TIMEOUT, None);
+            cli.verifiable_consumer()
+                .start(&topic, &group, CONSUMER_SESSION_TIMEOUT, None);
         wait_for_commit(&cli, &group, &topic);
         let consumed = consumer.stop();
 
@@ -369,7 +369,7 @@ mod restart_under_load {
         );
 
         let broker = restart(broker);
-        let described = cli.describe_group(&group);
+        let described = cli.consumer_groups().describe(&group);
 
         for (partition, acknowledged_commit) in commits {
             let offsets = described
@@ -420,7 +420,7 @@ mod postgres_outage {
     use std::{collections::HashSet, thread, time::Duration};
 
     use nisshi_smoke_test::{
-        Acks, Broker, KafkaCli, LaunchOptions, PostgresServer, SendResult, unique_name,
+        Acks, Broker, KafkaCli, LaunchOptions, PostgresServer, SendResult, unique,
     };
 
     use super::support::{
@@ -507,7 +507,7 @@ mod postgres_outage {
         postgres: &PostgresServer,
         outage: Outage,
     ) {
-        let before = cli.verifiable_produce(
+        let before = cli.verifiable_producer().produce(
             topic,
             RECORDS_BEFORE_OUTAGE,
             Acks::FullIsr,
@@ -516,17 +516,19 @@ mod postgres_outage {
         let mut acknowledged = before.acknowledged_records();
         assert_eq!(acknowledged.len(), RECORDS_BEFORE_OUTAGE, "{before}");
 
-        let group = unique_name("group");
+        let group = unique::name("group");
 
         let records = OUTAGE_PRODUCER_RECORDS_PER_SECOND as usize
             * OUTAGE_PRODUCER_SENDS_FOR.as_secs() as usize;
 
-        let consumer = cli.start_verifiable_consumer(topic, &group, CONSUMER_SESSION_TIMEOUT, None);
+        let consumer =
+            cli.verifiable_consumer()
+                .start(topic, &group, CONSUMER_SESSION_TIMEOUT, None);
         wait_for_commit(cli, &group, topic);
 
         let (produced, outage_started_at, outage_ended_at) = thread::scope(|scope| {
             let producer = scope.spawn(|| {
-                cli.throttled_verifiable_produce(
+                cli.verifiable_producer().produce_throttled(
                     topic,
                     records,
                     OUTAGE_PRODUCER_RECORDS_PER_SECOND,
@@ -613,7 +615,7 @@ mod postgres_outage {
             &acknowledged,
             &consumed,
             &latest,
-            &cli.describe_group(&group),
+            &cli.consumer_groups().describe(&group),
         );
     }
 
@@ -624,7 +626,7 @@ mod postgres_outage {
         let postgres = PostgresServer::start();
         let broker = Broker::launch(LaunchOptions::new(postgres.storage_url()));
         let cli = KafkaCli::new(broker.bootstrap()).with_client_timeouts(CLIENT_TIMEOUT);
-        let topic = cli.create_unique_topic(PARTITIONS_PER_TOPIC, &[]);
+        let topic = cli.topics().create_unique(PARTITIONS_PER_TOPIC, &[]);
 
         assert_clients_ride_out_outage(&cli, &topic, &postgres, outage);
 

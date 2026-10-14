@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use nisshi_smoke_test::{
     BackgroundTool, GROUP_ID_NOT_FOUND_EXCEPTION, GROUP_NOT_EMPTY_EXCEPTION, GroupOffsets,
-    GroupState, KafkaCli, VerifiableConsume, unique_name,
+    GroupState, KafkaCli, VerifiableConsume, unique,
 };
 
 /// How long a consumer has to join its group and get its partitions.
@@ -35,7 +35,8 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(6);
 /// Starts a consumer in `group`, and waits until it has its partitions.
 #[track_caller]
 fn start_member(cli: &KafkaCli, topic: &str, group: &str) -> BackgroundTool<VerifiableConsume> {
-    cli.join_group(topic, group, SESSION_TIMEOUT, None, JOIN_TIMEOUT)
+    cli.verifiable_consumer()
+        .join_group(topic, group, SESSION_TIMEOUT, None, JOIN_TIMEOUT)
         .0
 }
 
@@ -44,13 +45,16 @@ fn start_member(cli: &KafkaCli, topic: &str, group: &str) -> BackgroundTool<Veri
 #[test]
 fn list_includes_a_group_that_consumed() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(1, &[]);
+    let group = unique::name("group");
 
-    _ = cli.produce_values(&topic, &["r0"]);
-    _ = cli.consume(&topic, &group, 1).succeeded();
+    _ = cli.console_producer().produce_values(&topic, &["r0"]);
+    _ = cli
+        .console_consumer()
+        .consume(&topic, &group, 1)
+        .succeeded();
 
-    let listed = cli.list_groups();
+    let listed = cli.consumer_groups().list();
 
     assert!(listed.succeeded().lists_group(&group), "{listed}");
 }
@@ -62,15 +66,18 @@ fn list_includes_a_group_that_consumed() {
 #[ignore = "ListGroups answers every group's state as Unknown, and ignores the state filter (#960)"]
 fn list_by_state_shows_only_groups_in_that_state() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
-    let (stable_group, empty_group) = (unique_name("stable"), unique_name("empty"));
+    let topic = cli.topics().create_unique(1, &[]);
+    let (stable_group, empty_group) = (unique::name("stable"), unique::name("empty"));
 
-    _ = cli.produce_values(&topic, &["r0"]);
-    _ = cli.consume(&topic, &empty_group, 1).succeeded();
+    _ = cli.console_producer().produce_values(&topic, &["r0"]);
+    _ = cli
+        .console_consumer()
+        .consume(&topic, &empty_group, 1)
+        .succeeded();
     let member = start_member(&cli, &topic, &stable_group);
 
-    let listed_stable = cli.list_groups_in_state(GroupState::Stable);
-    let listed_empty = cli.list_groups_in_state(GroupState::Empty);
+    let listed_stable = cli.consumer_groups().list_in_state(GroupState::Stable);
+    let listed_empty = cli.consumer_groups().list_in_state(GroupState::Empty);
 
     drop(member.terminate());
 
@@ -103,13 +110,18 @@ fn list_by_state_shows_only_groups_in_that_state() {
 )]
 fn describe_shows_committed_and_end_offsets() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(1, &[]);
+    let group = unique::name("group");
 
-    _ = cli.produce_values(&topic, &["r0", "r1", "r2", "r3", "r4"]);
-    _ = cli.consume(&topic, &group, 3).succeeded();
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["r0", "r1", "r2", "r3", "r4"]);
+    _ = cli
+        .console_consumer()
+        .consume(&topic, &group, 3)
+        .succeeded();
 
-    let described = cli.describe_group(&group);
+    let described = cli.consumer_groups().describe(&group);
 
     assert_eq!(
         described.succeeded().group_offsets(&group, &topic, 0),
@@ -128,20 +140,23 @@ fn describe_shows_committed_and_end_offsets() {
 #[ignore = "DescribeGroups answers no members for a group that has them (#962)"]
 fn describe_members_shows_each_member_and_its_partitions() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(2, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(2, &[]);
+    let group = unique::name("group");
 
-    let (mut first_member, _) = cli.join_group(&topic, &group, SESSION_TIMEOUT, None, JOIN_TIMEOUT);
+    let (mut first_member, _) =
+        cli.verifiable_consumer()
+            .join_group(&topic, &group, SESSION_TIMEOUT, None, JOIN_TIMEOUT);
     let first_member_lines_before_second_join = first_member.line_count();
     let (second_member, second_member_partitions) =
-        cli.join_group(&topic, &group, SESSION_TIMEOUT, None, JOIN_TIMEOUT);
+        cli.verifiable_consumer()
+            .join_group(&topic, &group, SESSION_TIMEOUT, None, JOIN_TIMEOUT);
     let first_member_partitions = first_member
         .wait_for_partitions_assigned(first_member_lines_before_second_join, JOIN_TIMEOUT)
         .unwrap_or_else(|reason| {
             panic!("the first member didn't get its partitions after the second joined: {reason}")
         });
 
-    let described = cli.describe_group_members(&group);
+    let described = cli.consumer_groups().describe_members(&group);
 
     drop(first_member.terminate());
     drop(second_member.terminate());
@@ -166,14 +181,14 @@ fn describe_members_shows_each_member_and_its_partitions() {
 #[test]
 fn state_is_stable_while_consuming_and_empty_after() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(1, &[]);
+    let group = unique::name("group");
 
     let member = start_member(&cli, &topic, &group);
-    let while_consuming = cli.describe_group_state(&group);
+    let while_consuming = cli.consumer_groups().describe_state(&group);
 
     drop(member.terminate());
-    let after_leaving = cli.describe_group_state(&group);
+    let after_leaving = cli.consumer_groups().describe_state(&group);
 
     assert_eq!(
         (
@@ -196,7 +211,7 @@ fn state_is_stable_while_consuming_and_empty_after() {
 fn describe_of_unknown_group_says_it_does_not_exist() {
     let cli = KafkaCli::shared();
 
-    let described = cli.describe_group(&unique_name("never-used"));
+    let described = cli.consumer_groups().describe(&unique::name("never-used"));
 
     assert!(
         described.mentions(GROUP_ID_NOT_FOUND_EXCEPTION),
@@ -209,21 +224,24 @@ fn describe_of_unknown_group_says_it_does_not_exist() {
 #[test]
 fn delete_removes_an_empty_group() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(1, &[]);
+    let group = unique::name("group");
 
-    _ = cli.produce_values(&topic, &["r0", "r1"]);
-    _ = cli.consume(&topic, &group, 1).succeeded();
+    _ = cli.console_producer().produce_values(&topic, &["r0", "r1"]);
+    _ = cli
+        .console_consumer()
+        .consume(&topic, &group, 1)
+        .succeeded();
 
-    let listed_before = cli.list_groups();
+    let listed_before = cli.consumer_groups().list();
     assert!(
         listed_before.succeeded().lists_group(&group),
         "{listed_before}"
     );
 
-    _ = cli.delete_group(&group).succeeded();
+    _ = cli.consumer_groups().delete(&group).succeeded();
 
-    let listed_after = cli.list_groups();
+    let listed_after = cli.consumer_groups().list();
     assert!(
         !listed_after.succeeded().lists_group(&group),
         "{listed_after}"
@@ -231,7 +249,7 @@ fn delete_removes_an_empty_group() {
 
     // The group committed offset 1 before the delete, so a consumer that kept that offset would
     // read `r1`.
-    let consumed = cli.consume(&topic, &group, 1);
+    let consumed = cli.console_consumer().consume(&topic, &group, 1);
     assert_eq!(
         consumed.succeeded().consumed_values(),
         ["r0"],
@@ -249,12 +267,12 @@ fn delete_removes_an_empty_group() {
 )]
 fn delete_refuses_a_group_with_members() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(1, &[]);
+    let group = unique::name("group");
 
     let member = start_member(&cli, &topic, &group);
-    let deleted = cli.delete_group(&group);
-    let listed = cli.list_groups();
+    let deleted = cli.consumer_groups().delete(&group);
+    let listed = cli.consumer_groups().list();
 
     drop(member.terminate());
 
@@ -270,18 +288,29 @@ fn delete_refuses_a_group_with_members() {
 #[ignore = "the broker doesn't support OffsetDelete (#964)"]
 fn delete_offsets_removes_only_that_topics_offsets() {
     let cli = KafkaCli::shared();
-    let removed_topic = cli.create_unique_topic(1, &[]);
-    let kept_topic = cli.create_unique_topic(1, &[]);
-    let group = unique_name("group");
+    let removed_topic = cli.topics().create_unique(1, &[]);
+    let kept_topic = cli.topics().create_unique(1, &[]);
+    let group = unique::name("group");
 
-    _ = cli.produce_values(&removed_topic, &["r0"]);
-    _ = cli.produce_values(&kept_topic, &["r0"]);
-    _ = cli.consume(&removed_topic, &group, 1).succeeded();
-    _ = cli.consume(&kept_topic, &group, 1).succeeded();
+    _ = cli
+        .console_producer()
+        .produce_values(&removed_topic, &["r0"]);
+    _ = cli.console_producer().produce_values(&kept_topic, &["r0"]);
+    _ = cli
+        .console_consumer()
+        .consume(&removed_topic, &group, 1)
+        .succeeded();
+    _ = cli
+        .console_consumer()
+        .consume(&kept_topic, &group, 1)
+        .succeeded();
 
-    _ = cli.delete_group_offsets(&group, &removed_topic).succeeded();
+    _ = cli
+        .consumer_groups()
+        .delete_offsets(&group, &removed_topic)
+        .succeeded();
 
-    let described = cli.describe_group(&group);
+    let described = cli.consumer_groups().describe(&group);
 
     assert_eq!(
         (

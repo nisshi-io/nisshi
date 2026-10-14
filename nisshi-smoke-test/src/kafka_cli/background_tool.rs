@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{GRACE, KafkaCli, Output, Tool};
-use crate::{timed_command, unique_name};
+use crate::common::{timed_command, unique};
 
 /// How long a background tool may run before `timeout` stops it inside the container. A test stops
 /// its tools long before this, so the limit only ends a tool whose test has already failed.
@@ -57,7 +57,7 @@ pub struct PrintedLine {
 }
 
 /// The stdout lines of a [`BackgroundTool`], in the order it printed them. `PrintedBy` names the
-/// [`KafkaCli`] method that started the tool, as it does for [`Output`], and the readers for the
+/// tool method that started the tool, as it does for [`Output`], and the readers for the
 /// lines are methods of `StdoutLines<ThatCommand>`.
 #[derive(Clone, Debug)]
 pub struct StdoutLines<PrintedBy> {
@@ -99,14 +99,15 @@ pub struct BackgroundTool<PrintedBy> {
     printed_by: PhantomData<PrintedBy>,
 }
 
-impl KafkaCli {
-    /// Starts `/opt/kafka/bin/<tool>.sh <args> --bootstrap-server <broker>` in the background.
+impl<PrintedBy> BackgroundTool<PrintedBy> {
+    /// Starts `/opt/kafka/bin/<tool>.sh <args> --bootstrap-server <broker>` in the background,
+    /// with `cli`'s settings.
     ///
     /// Panics if `docker exec` can't start.
     #[track_caller]
-    pub(super) fn start<PrintedBy>(&self, tool: Tool, args: &[&str]) -> BackgroundTool<PrintedBy> {
-        let jvm_tag = unique_name(tool.name());
-        let mut command = self.command(tool, args, false, Some(&jvm_tag), BACKGROUND_TOOL_TIMEOUT);
+    pub(super) fn start(cli: &KafkaCli, tool: Tool, args: &[&str]) -> Self {
+        let jvm_tag = unique::name(tool.name());
+        let mut command = cli.command(tool, args, false, Some(&jvm_tag), BACKGROUND_TOOL_TIMEOUT);
 
         let mut child = match command
             .stdin(Stdio::null())
@@ -130,9 +131,9 @@ impl KafkaCli {
             thread::spawn(move || record_lines(stderr, &stderr_lines))
         });
 
-        BackgroundTool {
+        Self {
             command_line: format!("{} {}", tool.name(), args.join(" ")),
-            container: self.container.clone(),
+            container: cli.container.clone(),
             jvm_tag,
             started: Instant::now(),
             child: Some(child),
@@ -333,16 +334,15 @@ impl<PrintedBy> BackgroundTool<PrintedBy> {
 
         let lines = self.stdout_lines();
 
-        let output = Output {
-            command: self.command_line.clone(),
-            code: status.and_then(|status| status.code()),
-            stdout: joined(&lines.lines),
-            stderr: joined(&locked(&self.stderr_lines)),
-            timeout: status
+        let output = Output::new(
+            self.command_line.clone(),
+            status.and_then(|status| status.code()),
+            joined(&lines.lines),
+            joined(&locked(&self.stderr_lines)),
+            status
                 .is_none()
                 .then(|| format!("did not exit within {STOP_TIMEOUT:?} of the signal")),
-            printed_by: PhantomData,
-        };
+        );
 
         assert!(output.timeout.is_none(), "{output}");
 

@@ -22,7 +22,7 @@ use nisshi_smoke_test::{KafkaCli, SHARED_CLUSTER_ID};
 fn api_versions_names_node_111() {
     let cli = KafkaCli::shared();
 
-    let listed = cli.api_versions();
+    let listed = cli.broker_api_versions().list();
 
     assert_eq!(listed.succeeded().node_id(), Some(111), "{listed}");
 }
@@ -33,7 +33,7 @@ fn api_versions_names_node_111() {
 fn cluster_id_is_the_one_the_broker_started_with() {
     let cli = KafkaCli::shared();
 
-    let cluster_id = cli.cluster_id();
+    let cluster_id = cli.cluster().id();
 
     assert_eq!(
         cluster_id.succeeded().cluster_id(),

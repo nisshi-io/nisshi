@@ -14,11 +14,12 @@
 
 //! Runs the Apache Kafka command-line tools against a broker.
 //!
-//! [`KafkaCli`] runs each tool that [`Tool`] lists. Each tool has a module with two kinds of
-//! methods. Methods on [`KafkaCli`] build the tool's command-line arguments, so a test names an
-//! action, such as creating a topic, and does not list flags. Methods on [`Output`] read what the
-//! tool printed. A method returns an [`Output`] typed by its command, so a test can call only the
-//! readers for that command's output.
+//! [`KafkaCli`] runs each tool that [`Tool`] lists. Each tool has a module with a type named after
+//! the tool, such as [`KafkaTopics`], which a method of [`KafkaCli`] returns, such as
+//! [`KafkaCli::topics`]. The type's methods build the tool's command-line arguments, so a test
+//! names an action, such as creating a topic, and does not list flags. Methods on [`Output`] read
+//! what the tool printed. A method returns an [`Output`] typed by its command, so a test can call
+//! only the readers for that command's output.
 //!
 //! Each method's doc names the Kafka APIs that the command is for. A command sends other requests
 //! too, such as `ApiVersions` and `Metadata` first, and which ones it sends can change between
@@ -29,35 +30,39 @@
 //! call returns the tool's exit code and output.
 //!
 //! Every time limit in the harness is a watchdog for a test that has already failed. A passing test
-//! must stop when it reaches the result it expects, such as a record count, and must not wait for
-//! a limit to expire. Each limit can then be well above the slowest passing run.
+//! must stop when it reaches the result it expects, such as a record count, and must not wait for a
+//! limit to expire. Each limit can then be well above the slowest passing run.
 //!
 //! Each call has two time limits. GNU `timeout` stops the tool inside the container, because
-//! killing `docker exec` would leave the tool running there. [`timed_command::run`] kills a
-//! `docker exec` that still hasn't returned [`GRACE`] later.
+//! killing `docker exec` would leave the tool running there. [`timed_command::run`] kills a `docker
+//! exec` that still hasn't returned [`GRACE`] later.
 
 use std::{
-    fmt,
-    marker::PhantomData,
     net::{TcpStream, ToSocketAddrs},
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-use serde::de::DeserializeOwned;
-
-use crate::{settings, timed_command, unique_name};
+use crate::{
+    common::{docker, timed_command, unique},
+    settings,
+};
 
 mod background_tool;
+mod broker_api_versions;
 mod cluster;
 mod configs;
 mod console_consumer;
 mod console_producer;
 mod consumer_groups;
 mod delete_records;
-mod offsets;
-mod partition_reassignments;
+mod get_offsets;
+mod output;
+mod reassign_partitions;
+mod record;
+mod scram_login;
+mod tool;
 mod topics;
 mod verifiable_consumer;
 mod verifiable_producer;
@@ -74,27 +79,34 @@ pub const SASL_AUTHENTICATION_EXCEPTION: &str = "SaslAuthenticationException";
 pub const GROUP_ID_NOT_FOUND_EXCEPTION: &str = "GroupIdNotFoundException";
 /// The name the tools print for the broker's `NON_EMPTY_GROUP` error.
 pub const GROUP_NOT_EMPTY_EXCEPTION: &str = "GroupNotEmptyException";
-/// What the console producer logs on stderr for each record that the broker rejects.
-const CONSOLE_PRODUCER_SEND_ERROR: &str = "Error when sending message";
 
 pub use background_tool::{BackgroundTool, PrintedLine, StdoutLines};
-pub use cluster::{ApiVersions, ClusterId};
-pub use configs::{DescribeConfigs, DescribeUsers};
+pub use broker_api_versions::{ApiVersions, KafkaBrokerApiVersions};
+pub use cluster::{ClusterId, KafkaCluster};
+pub use configs::{DescribeConfigs, DescribeUsers, KafkaConfigs};
 pub use console_consumer::{
-    Consume, ConsumeMatching, ConsumedRecord, LOG_APPEND_TIME, PRINTED_NULL, PrintsPartitionLines,
+    Consume, ConsumeMatching, ConsumedRecord, KafkaConsoleConsumer, LOG_APPEND_TIME, PRINTED_NULL,
+    PrintsPartitionLines,
 };
+pub use console_producer::KafkaConsoleProducer;
 pub use consumer_groups::{
-    DescribeGroup, DescribeGroupMembers, DescribeGroupState, GroupOffsets, GroupState, ListGroups,
-    ListGroupsInState,
+    DescribeGroup, DescribeGroupMembers, DescribeGroupState, GroupOffsets, GroupState,
+    KafkaConsumerGroups, ListGroups, ListGroupsInState,
 };
-pub use delete_records::DeleteRecords;
-pub use offsets::GetOffsets;
-pub use topics::{CreateTopic, DescribeTopic, ListTopics, PartitionReplicas};
+pub use delete_records::{DeleteRecords, KafkaDeleteRecords};
+pub use get_offsets::{GetOffsets, KafkaGetOffsets};
+pub use output::{AnyCommand, Output};
+pub use reassign_partitions::KafkaReassignPartitions;
+pub use record::Record;
+pub use scram_login::{ScramLogin, ScramMechanism};
+use tool::Tool;
+pub use topics::{CreateTopic, DescribeTopic, KafkaTopics, ListTopics, PartitionReplicas};
 pub use verifiable_consumer::{
-    CommittedOffset, ConsumedOffsets, ConsumerEvent, TopicPartition, VerifiableConsume,
+    CommittedOffset, ConsumedOffsets, ConsumerEvent, KafkaVerifiableConsumer, TopicPartition,
+    VerifiableConsume,
 };
 pub use verifiable_producer::{
-    Acks, SendResult, StoredRecord, VerifiableProduce, verifiable_producer_values,
+    Acks, KafkaVerifiableProducer, SendResult, StoredRecord, VerifiableProduce,
 };
 
 /// How long a tool a test runs has to finish.
@@ -109,34 +121,6 @@ const KILL_AFTER: Duration = Duration::from_secs(5);
 // The harness must wait longer than `timeout` takes to send SIGKILL, or it
 // kills `docker exec` before `timeout` can report why the tool stopped.
 const _: () = assert!(GRACE.as_secs() > KILL_AFTER.as_secs());
-
-/// A SCRAM user that the tools log in as, on a broker started with `--authentication`.
-#[derive(Clone, Debug)]
-pub struct ScramLogin {
-    pub user: String,
-    pub password: String,
-    pub mechanism: ScramMechanism,
-}
-
-/// A SCRAM mechanism: the hash function that a SCRAM credential and a SCRAM login use.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScramMechanism {
-    Sha256,
-    Sha512,
-}
-
-impl ScramMechanism {
-    /// Every mechanism that Kafka supports.
-    pub const ALL: [Self; 2] = [Self::Sha256, Self::Sha512];
-
-    /// Returns the mechanism's name, as Kafka's user configs and SASL settings write it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Sha256 => "SCRAM-SHA-256",
-            Self::Sha512 => "SCRAM-SHA-512",
-        }
-    }
-}
 
 /// The Kafka CLI tools, run with `docker exec` in a container on the host
 /// network, so they reach a broker at the address it advertises.
@@ -183,6 +167,66 @@ impl KafkaCli {
             login.user,
             login.password
         ))
+    }
+
+    /// Returns `kafka-broker-api-versions`, run against this broker.
+    pub fn broker_api_versions(&self) -> KafkaBrokerApiVersions<'_> {
+        KafkaBrokerApiVersions::new(self)
+    }
+
+    /// Returns `kafka-cluster`, run against this broker.
+    pub fn cluster(&self) -> KafkaCluster<'_> {
+        KafkaCluster::new(self)
+    }
+
+    /// Returns `kafka-configs`, run against this broker.
+    pub fn configs(&self) -> KafkaConfigs<'_> {
+        KafkaConfigs::new(self)
+    }
+
+    /// Returns `kafka-console-consumer`, run against this broker.
+    pub fn console_consumer(&self) -> KafkaConsoleConsumer<'_> {
+        KafkaConsoleConsumer::new(self)
+    }
+
+    /// Returns `kafka-console-producer`, run against this broker.
+    pub fn console_producer(&self) -> KafkaConsoleProducer<'_> {
+        KafkaConsoleProducer::new(self)
+    }
+
+    /// Returns `kafka-consumer-groups`, run against this broker.
+    pub fn consumer_groups(&self) -> KafkaConsumerGroups<'_> {
+        KafkaConsumerGroups::new(self)
+    }
+
+    /// Returns `kafka-delete-records`, run against this broker.
+    pub fn delete_records(&self) -> KafkaDeleteRecords<'_> {
+        KafkaDeleteRecords::new(self)
+    }
+
+    /// Returns `kafka-get-offsets`, run against this broker.
+    pub fn get_offsets(&self) -> KafkaGetOffsets<'_> {
+        KafkaGetOffsets::new(self)
+    }
+
+    /// Returns `kafka-reassign-partitions`, run against this broker.
+    pub fn reassign_partitions(&self) -> KafkaReassignPartitions<'_> {
+        KafkaReassignPartitions::new(self)
+    }
+
+    /// Returns `kafka-topics`, run against this broker.
+    pub fn topics(&self) -> KafkaTopics<'_> {
+        KafkaTopics::new(self)
+    }
+
+    /// Returns `kafka-verifiable-consumer`, run against this broker.
+    pub fn verifiable_consumer(&self) -> KafkaVerifiableConsumer<'_> {
+        KafkaVerifiableConsumer::new(self)
+    }
+
+    /// Returns `kafka-verifiable-producer`, run against this broker.
+    pub fn verifiable_producer(&self) -> KafkaVerifiableProducer<'_> {
+        KafkaVerifiableProducer::new(self)
     }
 
     /// Returns a copy of this `KafkaCli` with its API timeout set to `timeout`, instead of the Java
@@ -239,7 +283,7 @@ impl KafkaCli {
         extension: &str,
         contents: &str,
     ) -> String {
-        let path = format!("/tmp/{}.{extension}", unique_name(name_prefix));
+        let path = format!("/tmp/{}.{extension}", unique::name(name_prefix));
 
         let written = timed_command::run(
             Command::new("docker").args([
@@ -283,7 +327,7 @@ impl KafkaCli {
         self.exec(tool, args, Some(input), TOOL_TIMEOUT)
     }
 
-    /// Waits until the broker answers [`KafkaCli::cluster_id`], and returns that answer. Returns an
+    /// Waits until the broker answers [`KafkaCluster::id`], and returns that answer. Returns an
     /// error soon after `check_running` reports that the broker has exited, and also if the broker
     /// does not answer within `timeout`.
     ///
@@ -332,7 +376,7 @@ impl KafkaCli {
 
             match attempt {
                 Ok(finished) if finished.code == Some(0) => {
-                    return Ok(self.output(Tool::Cluster, &args, finished, None));
+                    return Ok(Output::of_tool(Tool::Cluster, &args, finished, None));
                 }
 
                 attempt if Instant::now() >= deadline => {
@@ -377,12 +421,12 @@ impl KafkaCli {
     /// Returns the time now on the clock of the tools' container, in milliseconds since the Unix
     /// epoch. The tools stamp the lines they print with this clock.
     ///
-    /// A test compares a printed timestamp with this time, instead of with
-    /// [`crate::now_in_millis`]. The host's clock can differ from the container's, such as when
-    /// Docker runs in a virtual machine.
+    /// A test compares a printed timestamp with this time, instead of with this machine's clock.
+    /// This machine's clock can differ from the container's, such as when Docker runs in a virtual
+    /// machine.
     #[track_caller]
     pub fn now_in_millis(&self) -> i64 {
-        let printed = match crate::broker::docker(&["exec", &self.container, "date", "+%s%3N"]) {
+        let printed = match docker::execute(&["exec", &self.container, "date", "+%s%3N"]) {
             Ok(printed) => printed,
             Err(err) => panic!("{err}"),
         };
@@ -425,7 +469,7 @@ impl KafkaCli {
             _ => None,
         };
 
-        self.output(tool, args, finished, timeout)
+        Output::of_tool(tool, args, finished, timeout)
     }
 
     /// Builds the `docker exec` command that runs `tool`. The command puts `jvm_tag` on the tool's
@@ -479,196 +523,5 @@ impl KafkaCli {
         }
 
         command
-    }
-}
-
-/// A Kafka command-line tool in `/opt/kafka/bin` that the suite runs.
-#[derive(Clone, Copy, Debug)]
-enum Tool {
-    BrokerApiVersions,
-    Cluster,
-    Configs,
-    ConsoleConsumer,
-    ConsoleProducer,
-    ConsumerGroups,
-    DeleteRecords,
-    GetOffsets,
-    ReassignPartitions,
-    Topics,
-    VerifiableConsumer,
-    VerifiableProducer,
-}
-
-impl Tool {
-    /// Returns the tool's name, which is also its script's file name in `/opt/kafka/bin` without
-    /// `.sh`.
-    fn name(self) -> &'static str {
-        match self {
-            Self::BrokerApiVersions => "kafka-broker-api-versions",
-            Self::Cluster => "kafka-cluster",
-            Self::Configs => "kafka-configs",
-            Self::ConsoleConsumer => "kafka-console-consumer",
-            Self::ConsoleProducer => "kafka-console-producer",
-            Self::ConsumerGroups => "kafka-consumer-groups",
-            Self::DeleteRecords => "kafka-delete-records",
-            Self::GetOffsets => "kafka-get-offsets",
-            Self::ReassignPartitions => "kafka-reassign-partitions",
-            Self::Topics => "kafka-topics",
-            Self::VerifiableConsumer => "kafka-verifiable-consumer",
-            Self::VerifiableProducer => "kafka-verifiable-producer",
-        }
-    }
-
-    /// Returns the option that gives the tool a client config file, such as the one that logs in.
-    /// The tools don't share one name for it.
-    fn client_config_option(self) -> &'static str {
-        match self {
-            Self::ConsoleProducer | Self::VerifiableProducer => "--producer.config",
-            Self::ConsoleConsumer | Self::VerifiableConsumer => "--consumer.config",
-            Self::Cluster => "--config",
-            Self::BrokerApiVersions
-            | Self::Configs
-            | Self::ConsumerGroups
-            | Self::DeleteRecords
-            | Self::GetOffsets
-            | Self::ReassignPartitions
-            | Self::Topics => "--command-config",
-        }
-    }
-
-    /// Reads an event from one line that the tool printed as JSON, or returns `None` for a line
-    /// that isn't a JSON object, such as a warning that Kafka 4 tools print on stdout.
-    ///
-    /// Panics with the line if it is a JSON object that doesn't read as an `Event`, because then
-    /// the tool prints an event in a layout this reader doesn't know. Returning `None` would
-    /// make a test report a broker that lost the event.
-    #[track_caller]
-    fn read_json_event<Event: DeserializeOwned>(self, line: &str) -> Option<Event> {
-        let Ok(object @ serde_json::Value::Object(_)) = serde_json::from_str(line) else {
-            return None;
-        };
-
-        match serde_json::from_value(object) {
-            Ok(event) => Some(event),
-            Err(err) => panic!(
-                "{} printed an event that this reader doesn't know: {err}\n{line}",
-                self.name()
-            ),
-        }
-    }
-}
-
-/// What a Kafka CLI tool printed, and how it exited. Its `Display` form shows the command, the exit
-/// code, and the full stdout and stderr, for use in a failure message.
-///
-/// `PrintedBy` names the [`KafkaCli`] method that ran the tool, such as [`DescribeTopic`] for
-/// [`KafkaCli::describe_topic`]. The readers for a command's output are methods of
-/// `Output<ThatCommand>`, so the compiler rejects a reader called on another command's output.
-#[derive(Debug)]
-pub struct Output<PrintedBy = AnyCommand> {
-    pub command: String,
-    pub code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    /// Why the harness stopped the tool, if it didn't finish in time.
-    pub timeout: Option<String>,
-    printed_by: PhantomData<PrintedBy>,
-}
-
-/// The `PrintedBy` of an [`Output`] that no reader reads, beyond its exit code and its text.
-#[derive(Clone, Copy, Debug)]
-pub enum AnyCommand {}
-
-impl KafkaCli {
-    fn output<PrintedBy>(
-        &self,
-        tool: Tool,
-        args: &[&str],
-        finished: timed_command::Finished,
-        timeout: Option<String>,
-    ) -> Output<PrintedBy> {
-        Output {
-            command: format!("{} {}", tool.name(), args.join(" ")),
-            code: finished.code,
-            stdout: finished.stdout,
-            stderr: finished.stderr,
-            timeout,
-            printed_by: PhantomData,
-        }
-    }
-}
-
-impl<PrintedBy> Output<PrintedBy> {
-    /// Returns what a tool printed on `stdout` when it exited with 0, for a reader's unit test.
-    #[cfg(test)]
-    fn printed(stdout: &str) -> Self {
-        Self {
-            command: "sample".to_owned(),
-            code: Some(0),
-            stdout: stdout.to_owned(),
-            stderr: String::new(),
-            timeout: None,
-            printed_by: PhantomData,
-        }
-    }
-
-    /// Reads each event that `tool`, a verifiable tool, printed on stdout, as
-    /// [`Tool::read_json_event`] does.
-    #[track_caller]
-    fn json_events<Event: DeserializeOwned>(&self, tool: Tool) -> impl Iterator<Item = Event> {
-        self.stdout
-            .lines()
-            .filter_map(move |line| tool.read_json_event(line))
-    }
-
-    /// Asserts the tool exited with `code`, showing its output if not.
-    #[track_caller]
-    pub fn exited(&self, code: i32) -> &Self {
-        assert_eq!(self.code, Some(code), "{self}");
-        self
-    }
-
-    /// Asserts the tool exited with 0.
-    #[track_caller]
-    pub fn succeeded(&self) -> &Self {
-        self.exited(0)
-    }
-
-    /// Asserts that a console producer exited with 0 and did not log an error for a record. The
-    /// console producer exits with 0 even if the broker rejects a record, and only logs the error.
-    #[track_caller]
-    fn assert_every_record_accepted(&self) {
-        assert!(
-            !self
-                .succeeded()
-                .stderr
-                .contains(CONSOLE_PRODUCER_SEND_ERROR),
-            "the broker rejected a record: {self}"
-        );
-    }
-
-    pub fn lines(&self) -> Vec<&str> {
-        self.stdout.lines().collect()
-    }
-
-    /// Returns whether the tool printed `text` on stdout or stderr. A tool prints an exception on
-    /// one or the other, depending on where it caught it.
-    pub fn mentions(&self, text: &str) -> bool {
-        self.stdout.contains(text) || self.stderr.contains(text)
-    }
-}
-
-impl<PrintedBy> fmt::Display for Output<PrintedBy> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.timeout {
-            Some(reason) => write!(formatter, "`{}` {reason}", self.command)?,
-            None => write!(formatter, "`{}` exited with {:?}", self.command, self.code)?,
-        }
-
-        write!(
-            formatter,
-            "\nstdout:\n{}\nstderr:\n{}",
-            self.stdout, self.stderr
-        )
     }
 }

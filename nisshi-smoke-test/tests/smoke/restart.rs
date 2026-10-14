@@ -22,7 +22,7 @@
 /// What clients stored survives a restart, on the engines that keep it.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod persistence {
-    use nisshi_smoke_test::{Broker, KafkaCli, unique_name};
+    use nisshi_smoke_test::{Broker, KafkaCli, unique};
 
     /// A topic config that isn't the default, to find after the restart.
     const NON_DEFAULT_RETENTION: &str = "retention.ms=123456";
@@ -47,15 +47,19 @@ mod persistence {
         let cli = KafkaCli::new(broker.bootstrap());
 
         let stored = StoredBeforeRestart {
-            topic: unique_name("topic"),
-            group: unique_name("group"),
+            topic: unique::name("topic"),
+            group: unique::name("group"),
         };
 
         _ = cli
-            .create_topic(&stored.topic, 1, &[NON_DEFAULT_RETENTION])
+            .topics()
+            .create(&stored.topic, 1, &[NON_DEFAULT_RETENTION])
             .succeeded();
-        _ = cli.produce_keyed(&stored.topic, &PRODUCED_RECORDS);
         _ = cli
+            .console_producer()
+            .produce_keyed(&stored.topic, &PRODUCED_RECORDS);
+        _ = cli
+            .console_consumer()
             .consume(&stored.topic, &stored.group, PRODUCED_RECORDS.len())
             .succeeded();
 
@@ -67,7 +71,7 @@ mod persistence {
         let (broker, StoredBeforeRestart { topic, .. }) = &store_data_and_restart();
         let cli = KafkaCli::new(broker.bootstrap());
 
-        let listed = cli.list_topics();
+        let listed = cli.topics().list();
 
         assert!(
             listed.succeeded().lists_topic(topic),
@@ -81,7 +85,8 @@ mod persistence {
         let cli = KafkaCli::new(broker.bootstrap());
 
         assert_eq!(
-            cli.read_records(topic, 0, 0, PRODUCED_RECORDS.len())
+            cli.console_consumer()
+                .read_records(topic, 0, 0, PRODUCED_RECORDS.len())
                 .into_iter()
                 .map(|record| (record.offset, record.key, record.value))
                 .collect::<Vec<_>>(),
@@ -106,7 +111,7 @@ mod persistence {
         let (broker, StoredBeforeRestart { topic, group }) = &store_data_and_restart();
         let cli = KafkaCli::new(broker.bootstrap());
 
-        let described = cli.describe_group(group);
+        let described = cli.consumer_groups().describe(group);
 
         assert_eq!(
             described
@@ -125,8 +130,12 @@ mod persistence {
         let (broker, StoredBeforeRestart { topic, group }) = &store_data_and_restart();
         let cli = KafkaCli::new(broker.bootstrap());
 
-        _ = cli.produce_values(topic, &VALUES_AFTER_RESTART);
-        let resumed = cli.consume(topic, group, VALUES_AFTER_RESTART.len());
+        _ = cli
+            .console_producer()
+            .produce_values(topic, &VALUES_AFTER_RESTART);
+        let resumed = cli
+            .console_consumer()
+            .consume(topic, group, VALUES_AFTER_RESTART.len());
 
         assert_eq!(
             resumed.succeeded().consumed_values(),
@@ -144,7 +153,7 @@ mod persistence {
 
         // `--all` lists every config whatever source the broker gives it, so this check doesn't
         // depend on how the broker labels a topic's own configs.
-        let configs = cli.describe_topic_configs(topic, true);
+        let configs = cli.configs().describe_topic(topic, true);
 
         assert!(
             configs.succeeded().describes_config(NON_DEFAULT_RETENTION),
@@ -163,12 +172,12 @@ mod memory_storage {
     fn starts_empty_after_restart() {
         let broker = Broker::isolated();
         let cli = KafkaCli::new(broker.bootstrap());
-        let topic = cli.create_unique_topic(1, &[]);
+        let topic = cli.topics().create_unique(1, &[]);
 
         let broker = broker.restart();
         let cli = KafkaCli::new(broker.bootstrap());
 
-        let listed = cli.list_topics();
+        let listed = cli.topics().list();
         assert!(
             !listed.succeeded().lists_topic(&topic),
             "{topic} is still listed: {listed}"

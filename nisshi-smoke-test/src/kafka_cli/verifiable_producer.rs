@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use super::{BackgroundTool, KafkaCli, Output, TOOL_TIMEOUT, Tool};
 
-/// The command of [`KafkaCli::verifiable_produce`]'s [`Output`].
+/// The command of [`KafkaVerifiableProducer::produce`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum VerifiableProduce {}
 
@@ -115,15 +115,24 @@ impl Acks {
     }
 }
 
-impl KafkaCli {
+/// Runs `kafka-verifiable-producer` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaVerifiableProducer<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaVerifiableProducer<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Produces `max_messages` records to `topic` with `kafka-verifiable-producer`, which prints
     /// one JSON line per record it sends, with `"name":"producer_send_success"` for each record
     /// the broker acknowledges. Record `n`'s value is `<value_prefix>.<n>`.
     ///
     /// Sends `Produce`. The tool sets `retries=0`, and the Java client then turns idempotence off,
-    /// whatever `acks` is. [`KafkaCli::idempotent_verifiable_produce`] turns it on.
+    /// whatever `acks` is. [`KafkaVerifiableProducer::produce_idempotent`] turns it on.
     #[track_caller]
-    pub fn verifiable_produce(
+    pub fn produce(
         &self,
         topic: &str,
         max_messages: usize,
@@ -137,7 +146,7 @@ impl KafkaCli {
     /// records a second. Record `n`'s value is `<value_prefix>.<n>`. Panics if the producer
     /// doesn't finish within `tool_timeout`.
     #[track_caller]
-    pub fn throttled_verifiable_produce(
+    pub fn produce_throttled(
         &self,
         topic: &str,
         max_messages: usize,
@@ -164,7 +173,7 @@ impl KafkaCli {
     /// partitions. A producer without keys writes to one partition until it fills a batch, which
     /// takes minutes at a few records a second.
     #[track_caller]
-    pub fn start_verifiable_produce(
+    pub fn start(
         &self,
         topic: &str,
         throughput: u32,
@@ -179,7 +188,8 @@ impl KafkaCli {
             &["--throughput", &throughput, "--repeating-keys", "30"],
         );
 
-        self.start(
+        BackgroundTool::start(
+            self.cli,
             Tool::VerifiableProducer,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )
@@ -191,7 +201,7 @@ impl KafkaCli {
     /// Record `n`'s value is `<value_prefix>.<n>`. With `repeating_keys` of 2, the keys are `0`,
     /// `1`, `0`, `1`, and so on; without it, the records have no keys.
     #[track_caller]
-    pub fn verifiable_produce_created_at(
+    pub fn produce_created_at(
         &self,
         topic: &str,
         max_messages: usize,
@@ -232,7 +242,7 @@ impl KafkaCli {
         let args =
             verifiable_producer_args(topic, Some(max_messages), acks, value_prefix, more_args);
 
-        self.exec(
+        self.cli.exec(
             Tool::VerifiableProducer,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
             None,
@@ -240,12 +250,12 @@ impl KafkaCli {
         )
     }
 
-    /// Like [`KafkaCli::verifiable_produce`] with [`Acks::FullIsr`], but the producer is
+    /// Like [`KafkaVerifiableProducer::produce`] with [`Acks::FullIsr`], but the producer is
     /// idempotent: it numbers its batches, so the broker can drop a batch that it gets twice.
     ///
     /// Sends `InitProducerId` and `Produce`.
     #[track_caller]
-    pub fn idempotent_verifiable_produce(
+    pub fn produce_idempotent(
         &self,
         topic: &str,
         max_messages: usize,
@@ -254,8 +264,16 @@ impl KafkaCli {
         // The tool sets `retries=0`, and the Java client refuses `enable.idempotence=true` with
         // it, so the producer is idempotent or the tool fails. The tool reads this file after its
         // own settings, so the file's `retries` replaces that 0.
-        self.with_client_properties("enable.idempotence=true\nretries=2147483647\n")
-            .verifiable_produce(topic, max_messages, Acks::FullIsr, value_prefix)
+        self.cli
+            .with_client_properties("enable.idempotence=true\nretries=2147483647\n")
+            .verifiable_producer()
+            .produce(topic, max_messages, Acks::FullIsr, value_prefix)
+    }
+
+    /// Returns the values of the first `count` records that [`KafkaVerifiableProducer::produce`]
+    /// sends with `value_prefix`: `<value_prefix>.<n>`.
+    pub fn values(value_prefix: u32, count: usize) -> Vec<String> {
+        (0..count).map(|n| format!("{value_prefix}.{n}")).collect()
     }
 }
 
@@ -337,12 +355,6 @@ impl ProducerEvent {
     fn parse(line: &str) -> Option<Self> {
         Tool::VerifiableProducer.read_json_event(line)
     }
-}
-
-/// Returns the values of the first `count` records that [`KafkaCli::verifiable_produce`] sends
-/// with `value_prefix`: `<value_prefix>.<n>`.
-pub fn verifiable_producer_values(value_prefix: u32, count: usize) -> Vec<String> {
-    (0..count).map(|n| format!("{value_prefix}.{n}")).collect()
 }
 
 #[cfg(test)]

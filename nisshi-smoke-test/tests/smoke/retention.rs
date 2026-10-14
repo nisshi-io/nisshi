@@ -26,7 +26,7 @@
 
 use std::time::Duration;
 
-use nisshi_smoke_test::{Broker, KafkaCli, now_in_millis, wait_until};
+use nisshi_smoke_test::{Broker, KafkaCli, polling};
 
 /// How long a test waits for a maintenance run to give the result it expects.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -43,27 +43,29 @@ const EXPIRED_RECORD_COUNT: usize = 3;
 /// Produces `count` records to `topic` with a timestamp an hour old.
 #[track_caller]
 fn produce_hour_old_records(cli: &KafkaCli, topic: &str, count: usize) {
-    let an_hour_ago = now_in_millis() - 3_600_000;
-    let produced = cli.verifiable_produce_created_at(topic, count, an_hour_ago, 0, None);
+    let an_hour_ago = cli.now_in_millis() - 3_600_000;
+    let produced = cli
+        .verifiable_producer()
+        .produce_created_at(topic, count, an_hour_ago, 0, None);
 
     assert_eq!(produced.acknowledged_record_count(), count, "{produced}");
 }
 
 #[track_caller]
 fn earliest_offset(cli: &KafkaCli, topic: &str) -> i64 {
-    cli.partition_offsets_at(topic, "earliest")[0]
+    cli.get_offsets().partition_offsets(topic, "earliest")[0]
 }
 
 #[track_caller]
 fn latest_offset(cli: &KafkaCli, topic: &str) -> i64 {
-    cli.partition_offsets_at(topic, "latest")[0]
+    cli.get_offsets().partition_offsets(topic, "latest")[0]
 }
 
 /// Waits until `topic`'s earliest offset is `expected`, which shows that a maintenance run deleted
 /// the records before it. Panics if that doesn't happen within [`MAINTENANCE_TIMEOUT`].
 #[track_caller]
 fn wait_until_earliest_offset_is(cli: &KafkaCli, topic: &str, expected: i64) {
-    wait_until(MAINTENANCE_TIMEOUT, || match earliest_offset(cli, topic) {
+    polling::wait_until(MAINTENANCE_TIMEOUT, || match earliest_offset(cli, topic) {
         earliest if earliest == expected => Ok(()),
         earliest => Err(format!(
             "{topic}'s earliest offset is {earliest}, not {expected}"
@@ -78,6 +80,7 @@ fn wait_until_earliest_offset_is(cli: &KafkaCli, topic: &str, expected: i64) {
 #[track_caller]
 fn assert_every_record_kept(cli: &KafkaCli, topic: &str, count: usize) {
     let offsets = cli
+        .console_consumer()
         .read_records(topic, 0, 0, count)
         .into_iter()
         .map(|record| record.offset)
@@ -94,11 +97,13 @@ fn assert_every_record_kept(cli: &KafkaCli, topic: &str, count: usize) {
 /// records that the test produced before it.
 #[track_caller]
 fn wait_for_maintenance_run(cli: &KafkaCli) {
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
+    let topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
     produce_hour_old_records(cli, &topic, 1);
     // The topic keeps a newer record, so retention never empties it. The broker reports the
     // earliest offset of an empty partition as 0, and the wait would then never end.
-    _ = cli.produce_values(&topic, &["new-0"]);
+    _ = cli.console_producer().produce_values(&topic, &["new-0"]);
     wait_until_earliest_offset_is(cli, &topic, 1);
 }
 
@@ -108,13 +113,19 @@ fn wait_for_maintenance_run(cli: &KafkaCli) {
 fn expired_records_are_deleted_and_newer_records_kept() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
+    let topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
     produce_hour_old_records(&cli, &topic, EXPIRED_RECORD_COUNT);
-    _ = cli.produce_values(&topic, &["new-0", "new-1"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["new-0", "new-1"]);
 
     wait_until_earliest_offset_is(&cli, &topic, EXPIRED_RECORD_COUNT as i64);
 
-    let kept_records = cli.read_records_from_earliest(&topic, 0, 2);
+    let kept_records = cli
+        .console_consumer()
+        .read_records_from_earliest(&topic, 0, 2);
     let kept_offsets = kept_records.iter().map(|record| record.offset);
     let kept_values = kept_records.iter().map(|record| record.value.as_str());
     assert_eq!(kept_offsets.collect::<Vec<_>>(), [3, 4]);
@@ -128,16 +139,21 @@ fn expired_records_are_deleted_and_newer_records_kept() {
 fn record_produced_after_retention_gets_the_next_offset() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
+    let topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
     produce_hour_old_records(&cli, &topic, EXPIRED_RECORD_COUNT);
     wait_for_maintenance_run(&cli);
 
-    _ = cli.produce_values(&topic, &["after-retention"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["after-retention"]);
 
     // The read starts at the earliest offset, so it also shows that retention deleted the
     // expired records, and the partition was empty before the new record.
     assert_eq!(
-        cli.read_records_from_earliest(&topic, 0, 1)
+        cli.console_consumer()
+            .read_records_from_earliest(&topic, 0, 1)
             .into_iter()
             .map(|record| (record.offset, record.value))
             .collect::<Vec<_>>(),
@@ -154,7 +170,9 @@ fn record_produced_after_retention_gets_the_next_offset() {
 fn offsets_are_kept_when_retention_empties_a_partition() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
+    let topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
     produce_hour_old_records(&cli, &topic, EXPIRED_RECORD_COUNT);
 
     wait_for_maintenance_run(&cli);
@@ -172,9 +190,9 @@ fn offsets_are_kept_when_retention_empties_a_partition() {
 fn topic_without_cleanup_policy_is_cleaned_by_retention() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[TEN_MINUTE_RETENTION]);
+    let topic = cli.topics().create_unique(1, &[TEN_MINUTE_RETENTION]);
     produce_hour_old_records(&cli, &topic, EXPIRED_RECORD_COUNT);
-    _ = cli.produce_values(&topic, &["new-0"]);
+    _ = cli.console_producer().produce_values(&topic, &["new-0"]);
 
     wait_until_earliest_offset_is(&cli, &topic, EXPIRED_RECORD_COUNT as i64);
 }
@@ -186,7 +204,9 @@ fn topic_without_cleanup_policy_is_cleaned_by_retention() {
 fn retention_ms_minus_1_keeps_every_record() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY, "retention.ms=-1"]);
+    let topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, "retention.ms=-1"]);
     produce_hour_old_records(&cli, &topic, EXPIRED_RECORD_COUNT);
 
     wait_for_maintenance_run(&cli);
@@ -205,10 +225,14 @@ fn retention_ms_minus_1_keeps_every_record() {
 fn long_retention_on_one_topic_does_not_stop_retention_on_another() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let thirty_day_topic = cli.create_unique_topic(1, &[DELETE_POLICY, "retention.ms=2592000000"]);
+    let thirty_day_topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, "retention.ms=2592000000"]);
     // The topic holds a record, so that the maintenance run checks the record's age against the
     // topic's `retention.ms`.
-    _ = cli.produce_values(&thirty_day_topic, &["new-0"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&thirty_day_topic, &["new-0"]);
 
     wait_for_maintenance_run(&cli);
 }
@@ -223,8 +247,12 @@ fn long_retention_on_one_topic_does_not_stop_retention_on_another() {
 fn thirty_day_retention_keeps_a_new_record() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let thirty_day_topic = cli.create_unique_topic(1, &[DELETE_POLICY, "retention.ms=2592000000"]);
-    _ = cli.produce_values(&thirty_day_topic, &["new-0"]);
+    let thirty_day_topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, "retention.ms=2592000000"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&thirty_day_topic, &["new-0"]);
 
     wait_for_maintenance_run(&cli);
 
@@ -238,14 +266,15 @@ fn thirty_day_retention_keeps_a_new_record() {
 fn added_retention_ms_deletes_older_records() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY]);
+    let topic = cli.topics().create_unique(1, &[DELETE_POLICY]);
     produce_hour_old_records(&cli, &topic, EXPIRED_RECORD_COUNT);
-    _ = cli.produce_values(&topic, &["new-0"]);
+    _ = cli.console_producer().produce_values(&topic, &["new-0"]);
     wait_for_maintenance_run(&cli);
     assert_every_record_kept(&cli, &topic, EXPIRED_RECORD_COUNT + 1);
 
     _ = cli
-        .add_topic_configs(&topic, &[TEN_MINUTE_RETENTION])
+        .configs()
+        .add_to_topic(&topic, &[TEN_MINUTE_RETENTION])
         .succeeded();
 
     wait_until_earliest_offset_is(&cli, &topic, EXPIRED_RECORD_COUNT as i64);
@@ -260,9 +289,12 @@ fn added_retention_ms_deletes_older_records() {
 fn deleted_retention_ms_restores_the_default() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
+    let topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
     _ = cli
-        .delete_topic_configs(&topic, &["retention.ms"])
+        .configs()
+        .delete_from_topic(&topic, &["retention.ms"])
         .succeeded();
     produce_hour_old_records(&cli, &topic, EXPIRED_RECORD_COUNT);
 
@@ -285,15 +317,17 @@ fn retention_bytes_keeps_partition_under_the_cap() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
     let retention_bytes = format!("retention.bytes={RETENTION_BYTES}");
-    let topic = cli.create_unique_topic(1, &[DELETE_POLICY, &retention_bytes]);
+    let topic = cli
+        .topics()
+        .create_unique(1, &[DELETE_POLICY, &retention_bytes]);
     let values = (0..PRODUCED_RECORD_COUNT)
         .map(|n| format!("{n:0>VALUE_BYTES$}"))
         .collect::<Vec<_>>();
-    _ = cli.produce_values(&topic, &values);
+    _ = cli.console_producer().produce_values(&topic, &values);
 
     // A broker can delete the records in several runs, as Kafka does a segment at a time, so the
     // test waits until the partition is under the cap, not for the first deletion.
-    wait_until(MAINTENANCE_TIMEOUT, || {
+    polling::wait_until(MAINTENANCE_TIMEOUT, || {
         let kept_record_count = PRODUCED_RECORD_COUNT as i64 - earliest_offset(&cli, &topic);
 
         if kept_record_count <= (RETENTION_BYTES / VALUE_BYTES) as i64 {
@@ -308,7 +342,9 @@ fn retention_bytes_keeps_partition_under_the_cap() {
 
     let newest_offset = PRODUCED_RECORD_COUNT as u64 - 1;
     assert_eq!(
-        cli.read_records(&topic, 0, newest_offset, 1)[0].value,
+        cli.console_consumer()
+            .read_records(&topic, 0, newest_offset, 1)[0]
+            .value,
         values[PRODUCED_RECORD_COUNT - 1]
     );
 }

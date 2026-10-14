@@ -82,43 +82,53 @@ impl GroupState {
     }
 }
 
-/// The command of [`KafkaCli::describe_group`]'s [`Output`].
+/// The command of [`KafkaConsumerGroups::describe`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum DescribeGroup {}
 
-/// The command of [`KafkaCli::describe_group_state`]'s [`Output`].
+/// The command of [`KafkaConsumerGroups::describe_state`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum DescribeGroupState {}
 
-/// The command of [`KafkaCli::describe_group_members`]'s [`Output`].
+/// The command of [`KafkaConsumerGroups::describe_members`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum DescribeGroupMembers {}
 
-/// The command of [`KafkaCli::list_groups`]'s [`Output`].
+/// The command of [`KafkaConsumerGroups::list`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum ListGroups {}
 
-/// The command of [`KafkaCli::list_groups_in_state`]'s [`Output`].
+/// The command of [`KafkaConsumerGroups::list_in_state`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum ListGroupsInState {}
 
-impl KafkaCli {
+/// Runs `kafka-consumer-groups` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaConsumerGroups<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaConsumerGroups<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Describes `group`'s members and offsets.
     ///
     /// Sends `ConsumerGroupDescribe`, `DescribeGroups` and `OffsetFetch`. The tool tries
     /// `ConsumerGroupDescribe` first, and falls back to `DescribeGroups` for a group that uses the
     /// classic protocol, as the console consumer's groups do.
     #[track_caller]
-    pub fn describe_group(&self, group: &str) -> Output<DescribeGroup> {
-        self.run(Tool::ConsumerGroups, &["--describe", "--group", group])
+    pub fn describe(&self, group: &str) -> Output<DescribeGroup> {
+        self.cli
+            .run(Tool::ConsumerGroups, &["--describe", "--group", group])
     }
 
     /// Describes `group`'s [`GroupState`], in a table with a `STATE` column.
     ///
     /// Sends `ConsumerGroupDescribe` and `DescribeGroups`.
     #[track_caller]
-    pub fn describe_group_state(&self, group: &str) -> Output<DescribeGroupState> {
-        self.run(
+    pub fn describe_state(&self, group: &str) -> Output<DescribeGroupState> {
+        self.cli.run(
             Tool::ConsumerGroups,
             &["--describe", "--group", group, "--state"],
         )
@@ -129,8 +139,8 @@ impl KafkaCli {
     ///
     /// Sends `ConsumerGroupDescribe` and `DescribeGroups`.
     #[track_caller]
-    pub fn describe_group_members(&self, group: &str) -> Output<DescribeGroupMembers> {
-        self.run(
+    pub fn describe_members(&self, group: &str) -> Output<DescribeGroupMembers> {
+        self.cli.run(
             Tool::ConsumerGroups,
             &["--describe", "--group", group, "--members"],
         )
@@ -140,16 +150,16 @@ impl KafkaCli {
     ///
     /// Sends `ListGroups`.
     #[track_caller]
-    pub fn list_groups(&self) -> Output<ListGroups> {
-        self.run(Tool::ConsumerGroups, &["--list"])
+    pub fn list(&self) -> Output<ListGroups> {
+        self.cli.run(Tool::ConsumerGroups, &["--list"])
     }
 
     /// Lists the consumer groups in `state`, in a table with a `GROUP` and a `STATE` column.
     ///
     /// Sends `ListGroups`, with a filter on the state.
     #[track_caller]
-    pub fn list_groups_in_state(&self, state: GroupState) -> Output<ListGroupsInState> {
-        self.run(
+    pub fn list_in_state(&self, state: GroupState) -> Output<ListGroupsInState> {
+        self.cli.run(
             Tool::ConsumerGroups,
             &["--list", "--state", state.printed_name()],
         )
@@ -166,7 +176,7 @@ impl KafkaCli {
     }
 
     /// Commits the offsets that `reset_option` gives `group` in `topic`, and lists them as
-    /// [`KafkaCli::plan_offset_reset`] does. The tool refuses a group that has members.
+    /// [`KafkaConsumerGroups::plan_offset_reset`] does. The tool refuses a group that has members.
     ///
     /// Sends `OffsetFetch`, `ListOffsets` and `OffsetCommit`.
     #[track_caller]
@@ -186,23 +196,24 @@ impl KafkaCli {
         args.extend(reset_option);
         args.push(apply_option);
 
-        self.run(Tool::ConsumerGroups, &args)
+        self.cli.run(Tool::ConsumerGroups, &args)
     }
 
     /// Deletes `group` and its offsets.
     ///
     /// Sends `DeleteGroups`.
     #[track_caller]
-    pub fn delete_group(&self, group: &str) -> Output {
-        self.run(Tool::ConsumerGroups, &["--delete", "--group", group])
+    pub fn delete(&self, group: &str) -> Output {
+        self.cli
+            .run(Tool::ConsumerGroups, &["--delete", "--group", group])
     }
 
     /// Deletes `group`'s offsets in `topic`, and keeps its offsets in other topics.
     ///
     /// Sends `OffsetDelete`.
     #[track_caller]
-    pub fn delete_group_offsets(&self, group: &str, topic: &str) -> Output {
-        self.run(
+    pub fn delete_offsets(&self, group: &str, topic: &str) -> Output {
+        self.cli.run(
             Tool::ConsumerGroups,
             &["--delete-offsets", "--group", group, "--topic", topic],
         )
@@ -216,7 +227,8 @@ pub struct GroupOffsets {
     pub end: u64,
 }
 
-/// The heading of the table that [`KafkaCli::describe_group_state`] prints, split at whitespace.
+/// The heading of the table that [`KafkaConsumerGroups::describe_state`] prints, split at
+/// whitespace.
 const GROUP_STATE_HEADING: &[&str] = &[
     "GROUP",
     "COORDINATOR",
@@ -226,7 +238,7 @@ const GROUP_STATE_HEADING: &[&str] = &[
     "#MEMBERS",
 ];
 
-/// The heading of the table that [`KafkaCli::describe_group`] prints, split at whitespace.
+/// The heading of the table that [`KafkaConsumerGroups::describe`] prints, split at whitespace.
 const GROUP_OFFSETS_HEADING: &[&str] = &[
     "GROUP",
     "TOPIC",
@@ -239,11 +251,13 @@ const GROUP_OFFSETS_HEADING: &[&str] = &[
     "CLIENT-ID",
 ];
 
-/// The heading of the table that [`KafkaCli::describe_group_members`] prints (split by whitespace).
+/// The heading of the table that [`KafkaConsumerGroups::describe_members`] prints (split by
+/// whitespace).
 const GROUP_MEMBERS_HEADING: &[&str] =
     &["GROUP", "CONSUMER-ID", "HOST", "CLIENT-ID", "#PARTITIONS"];
 
-/// The heading of the table that [`KafkaCli::list_groups_in_state`] prints (split by whitespace).
+/// The heading of the table that [`KafkaConsumerGroups::list_in_state`] prints (split by
+/// whitespace).
 const GROUPS_IN_STATE_HEADING: &[&str] = &["GROUP", "STATE"];
 
 impl Output<ListGroups> {
@@ -257,8 +271,7 @@ impl Output<ListGroupsInState> {
     /// Returns the state that the list shows for `group`, or `None` if the list has no row for it.
     #[track_caller]
     pub fn group_state(&self, group: &str) -> Option<GroupState> {
-        let state = self
-            .group_table_rows(GROUPS_IN_STATE_HEADING)
+        let state = group_table_rows(self, GROUPS_IN_STATE_HEADING)
             .into_iter()
             .find_map(|columns| match columns[..] {
                 [row_group, state] if row_group == group => Some(state),
@@ -274,7 +287,7 @@ impl Output<DescribeGroupMembers> {
     /// table's rows.
     #[track_caller]
     pub fn member_partition_counts(&self, group: &str) -> Vec<u32> {
-        self.group_table_rows(GROUP_MEMBERS_HEADING)
+        group_table_rows(self, GROUP_MEMBERS_HEADING)
             .into_iter()
             .filter_map(|columns| match columns[..] {
                 [row_group, _, _, _, partition_count, ..] if row_group == group => {
@@ -293,8 +306,7 @@ impl Output<DescribeGroupState> {
     /// row, and the assignment strategy before them is one word, `-` or nothing.
     #[track_caller]
     pub fn group_state(&self, group: &str) -> Option<GroupState> {
-        let state = self
-            .group_table_rows(GROUP_STATE_HEADING)
+        let state = group_table_rows(self, GROUP_STATE_HEADING)
             .into_iter()
             .find_map(|columns| match columns[..] {
                 [row_group, .., state, _members] if row_group == group => Some(state),
@@ -310,7 +322,7 @@ impl Output<DescribeGroup> {
     /// for them.
     #[track_caller]
     pub fn group_offsets(&self, group: &str, topic: &str, partition: u32) -> Option<GroupOffsets> {
-        self.group_table_rows(GROUP_OFFSETS_HEADING)
+        group_table_rows(self, GROUP_OFFSETS_HEADING)
             .into_iter()
             .find_map(|columns| match columns[..] {
                 [row_group, row_topic, row_partition, committed, end, ..]
@@ -329,28 +341,29 @@ impl Output<DescribeGroup> {
     }
 }
 
-impl<PrintedBy> Output<PrintedBy> {
-    /// Returns the rows of the `kafka-consumer-groups` table under `heading`, each split at
-    /// whitespace, or no rows if the output has no table. Panics if the table has another heading,
-    /// because the readers find each column by its position under `heading`.
-    #[track_caller]
-    fn group_table_rows(&self, heading: &[&str]) -> Vec<Vec<&str>> {
-        let mut lines = self
-            .stdout
-            .lines()
-            .map(|line| line.split_whitespace().collect::<Vec<_>>());
+/// Returns the rows of the `kafka-consumer-groups` table under `heading` in `output`, each split at
+/// whitespace, or no rows if the output has no table. Panics if the table has another heading,
+/// because the readers find each column by its position under `heading`.
+#[track_caller]
+fn group_table_rows<'output, PrintedBy>(
+    output: &'output Output<PrintedBy>,
+    heading: &[&str],
+) -> Vec<Vec<&'output str>> {
+    let mut lines = output
+        .stdout
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>());
 
-        let Some(found_heading) = lines.find(|columns| columns.first() == Some(&"GROUP")) else {
-            return Vec::new();
-        };
+    let Some(found_heading) = lines.find(|columns| columns.first() == Some(&"GROUP")) else {
+        return Vec::new();
+    };
 
-        assert_eq!(
-            found_heading, heading,
-            "kafka-consumer-groups printed a table with a heading this reader doesn't know: {self}"
-        );
+    assert_eq!(
+        found_heading, heading,
+        "kafka-consumer-groups printed a table with a heading this reader doesn't know: {output}"
+    );
 
-        lines.filter(|columns| !columns.is_empty()).collect()
-    }
+    lines.filter(|columns| !columns.is_empty()).collect()
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nisshi_smoke_test::{DescribeGroupState, GroupState, KafkaCli, Output, unique_name};
+use nisshi_smoke_test::{DescribeGroupState, GroupState, KafkaCli, Output, unique};
 
 /// Waits until `group` is `Stable`, so its members have their assignments. Returns the group's
 /// last state as an error if it isn't stable after a minute.
@@ -29,7 +29,7 @@ fn wait_until_stable(cli: &KafkaCli, group: &str) -> Result<(), Output<DescribeG
     let deadline = Instant::now() + Duration::from_secs(60);
 
     loop {
-        let state = cli.describe_group_state(group);
+        let state = cli.consumer_groups().describe_state(group);
 
         if state.code == Some(0) && state.group_state(group) == Some(GroupState::Stable) {
             return Ok(());
@@ -47,12 +47,15 @@ fn wait_until_stable(cli: &KafkaCli, group: &str) -> Result<(), Output<DescribeG
 #[test]
 fn reading_from_an_offset_starts_at_that_record() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
 
-    _ = cli.produce_values(&topic, &["r0", "r1", "r2", "r3", "r4", "r5"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["r0", "r1", "r2", "r3", "r4", "r5"]);
 
     assert_eq!(
-        cli.read_records(&topic, 0, 3, 3)
+        cli.console_consumer()
+            .read_records(&topic, 0, 3, 3)
             .into_iter()
             .map(|record| (record.offset, record.value))
             .collect::<Vec<_>>(),
@@ -69,21 +72,25 @@ fn reading_from_an_offset_starts_at_that_record() {
 #[test]
 fn group_resumes_after_what_it_read() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(1, &[]);
+    let group = unique::name("group");
 
-    _ = cli.produce_values(&topic, &["first-0", "first-1", "first-2"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["first-0", "first-1", "first-2"]);
 
-    let first_run = cli.consume(&topic, &group, 3);
+    let first_run = cli.console_consumer().consume(&topic, &group, 3);
     assert_eq!(
         first_run.succeeded().consumed_values(),
         ["first-0", "first-1", "first-2"],
         "{first_run}"
     );
 
-    _ = cli.produce_values(&topic, &["second-0", "second-1"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["second-0", "second-1"]);
 
-    let second_run = cli.consume(&topic, &group, 2);
+    let second_run = cli.console_consumer().consume(&topic, &group, 2);
     assert_eq!(
         second_run.succeeded().consumed_values(),
         ["second-0", "second-1"],
@@ -99,28 +106,34 @@ fn group_resumes_after_what_it_read() {
 #[test]
 fn pattern_subscription_reads_topic_created_later() {
     let cli = KafkaCli::shared();
-    let topic_name_prefix = unique_name("include");
+    let topic_name_prefix = unique::name("include");
     let (early_topic, late_topic) = (
         format!("{topic_name_prefix}.early"),
         format!("{topic_name_prefix}.late"),
     );
 
-    _ = cli.create_topic(&early_topic, 1, &[]).succeeded();
-    _ = cli.produce_values(&early_topic, &["from-early"]);
+    _ = cli.topics().create(&early_topic, 1, &[]).succeeded();
+    _ = cli
+        .console_producer()
+        .produce_values(&early_topic, &["from-early"]);
 
-    let group = unique_name("group");
+    let group = unique::name("group");
 
     let consumed = thread::scope(|scope| {
-        let consumer_thread =
-            scope.spawn(|| cli.consume_matching(&format!(r"{topic_name_prefix}\..*"), &group, 2));
+        let consumer_thread = scope.spawn(|| {
+            cli.console_consumer()
+                .consume_matching(&format!(r"{topic_name_prefix}\..*"), &group, 2)
+        });
 
         // The late topic must appear after the consumer subscribed, and a group is stable only
         // after its members have subscribed.
         let stable = wait_until_stable(&cli, &group);
 
         if stable.is_ok() {
-            _ = cli.create_topic(&late_topic, 1, &[]).succeeded();
-            _ = cli.produce_values(&late_topic, &["from-late"]);
+            _ = cli.topics().create(&late_topic, 1, &[]).succeeded();
+            _ = cli
+                .console_producer()
+                .produce_values(&late_topic, &["from-late"]);
         }
 
         // The test joins the consumer before it fails, so the failure shows why the group didn't

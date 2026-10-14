@@ -22,7 +22,7 @@
 mod postgres {
     use std::time::{Duration, Instant};
 
-    use nisshi_smoke_test::{Broker, KafkaCli, LaunchOptions, PostgresServer, unique_name};
+    use nisshi_smoke_test::{Broker, KafkaCli, LaunchOptions, PostgresServer, unique};
 
     /// How long a broker whose storage is down may take to exit. The broker checks its storage
     /// once at startup, and exits when the check fails, instead of retrying. The limit allows for
@@ -52,10 +52,15 @@ mod postgres {
         postgres.start_again();
         let broker = Broker::launch(LaunchOptions::new(postgres.storage_url()));
         let cli = KafkaCli::new(broker.bootstrap());
-        let topic = cli.create_unique_topic(1, &[]);
+        let topic = cli.topics().create_unique(1, &[]);
 
-        _ = cli.produce_values(&topic, &VALUES).succeeded();
-        let consumed = cli.consume(&topic, &unique_name("group"), VALUES.len());
+        _ = cli
+            .console_producer()
+            .produce_values(&topic, &VALUES)
+            .succeeded();
+        let consumed = cli
+            .console_consumer()
+            .consume(&topic, &unique::name("group"), VALUES.len());
         assert_eq!(consumed.succeeded().consumed_values(), VALUES, "{consumed}");
 
         if let Err(reason) = broker.stop() {

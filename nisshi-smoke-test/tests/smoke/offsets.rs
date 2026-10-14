@@ -16,7 +16,7 @@
 //! point in time. A lookup must return the first record at or after the time, -1 when there is
 //! none, and a clear error when the broker can't do the lookup.
 
-use nisshi_smoke_test::{KafkaCli, UNSUPPORTED_VERSION_EXCEPTION, now_in_millis};
+use nisshi_smoke_test::{KafkaCli, UNSUPPORTED_VERSION_EXCEPTION};
 
 /// A topic with one record produced before the returned time, at offset 0, and two after it, at
 /// offsets 1 and 2.
@@ -27,12 +27,14 @@ use nisshi_smoke_test::{KafkaCli, UNSUPPORTED_VERSION_EXCEPTION, now_in_millis};
 #[track_caller]
 fn create_topic_with_records_before_and_after() -> (KafkaCli, String, i64) {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
 
-    _ = cli.produce_values(&topic, &["before"]);
-    _ = cli.produce_values(&topic, &["after-0", "after-1"]);
+    _ = cli.console_producer().produce_values(&topic, &["before"]);
+    _ = cli
+        .console_producer()
+        .produce_values(&topic, &["after-0", "after-1"]);
 
-    let records = cli.read_records(&topic, 0, 0, 3);
+    let records = cli.console_consumer().read_records(&topic, 0, 0, 3);
     let time_between_records = records[0].timestamp.midpoint(records[1].timestamp);
 
     (cli, topic, time_between_records)
@@ -45,7 +47,9 @@ fn create_topic_with_records_before_and_after() -> (KafkaCli, String, i64) {
 fn timestamp_lookup_returns_first_record_at_or_after_it() {
     let (cli, topic, time_between_records) = create_topic_with_records_before_and_after();
 
-    let offsets = cli.get_offsets(&topic, &time_between_records.to_string());
+    let offsets = cli
+        .get_offsets()
+        .at(&topic, &time_between_records.to_string());
 
     assert_eq!(
         offsets.succeeded().partition_offsets(&topic),
@@ -59,9 +63,11 @@ fn timestamp_lookup_returns_first_record_at_or_after_it() {
 #[test]
 fn timestamp_after_last_record_finds_no_offset() {
     let (cli, topic, _) = create_topic_with_records_before_and_after();
-    let hour_after_last_record = now_in_millis() + 3_600_000;
+    let hour_after_last_record = cli.now_in_millis() + 3_600_000;
 
-    let offsets = cli.get_offsets(&topic, &hour_after_last_record.to_string());
+    let offsets = cli
+        .get_offsets()
+        .at(&topic, &hour_after_last_record.to_string());
 
     assert_eq!(
         offsets.succeeded().partition_offsets(&topic),
@@ -79,7 +85,7 @@ fn timestamp_after_last_record_finds_no_offset() {
 fn max_timestamp_lookup_fails_at_once_as_unsupported() {
     let (cli, topic, _) = create_topic_with_records_before_and_after();
 
-    let offsets = cli.get_offsets(&topic, "max-timestamp");
+    let offsets = cli.get_offsets().at(&topic, "max-timestamp");
 
     assert!(offsets.mentions(UNSUPPORTED_VERSION_EXCEPTION), "{offsets}");
 }

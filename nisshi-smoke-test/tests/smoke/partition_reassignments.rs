@@ -23,9 +23,9 @@ use nisshi_smoke_test::KafkaCli;
 #[ignore = "ListPartitionReassignments answers every partition as being reassigned (#965)"]
 fn list_does_not_report_a_new_partition_as_reassigned() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
 
-    let listed = cli.list_partition_reassignments();
+    let listed = cli.reassign_partitions().list();
 
     assert!(
         !listed.succeeded().mentions(&format!("{topic}-0")),

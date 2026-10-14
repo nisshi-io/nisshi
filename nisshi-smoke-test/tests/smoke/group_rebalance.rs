@@ -29,7 +29,7 @@ use std::{
 
 use nisshi_smoke_test::{
     BackgroundTool, ConsumerEvent, KafkaCli, Output, StdoutLines, TopicPartition,
-    VerifiableConsume, unique_name,
+    VerifiableConsume, unique,
 };
 
 /// How long a consumer has to join its group and get its partitions, and how long the members
@@ -275,7 +275,9 @@ fn start_member_and_wait(
     others: &mut [&mut NamedMember],
 ) -> NamedMember {
     let mut line_counts_before = line_counts(others);
-    let consumer = cli.start_verifiable_consumer(topic, group, SHORT_SESSION_TIMEOUT, None);
+    let consumer = cli
+        .verifiable_consumer()
+        .start(topic, group, SHORT_SESSION_TIMEOUT, None);
     let mut started = NamedMember { name, consumer };
 
     let mut members = others
@@ -322,10 +324,12 @@ fn group_consumes_every_record_while_members_leave_join_and_crash() {
     let print_step = |step: &str| println!("{:?}: {step}", test_started.elapsed());
 
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(PARTITIONS, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(PARTITIONS, &[]);
+    let group = unique::name("group");
 
-    let producer = cli.start_verifiable_produce(&topic, RECORDS_PER_SECOND, 0);
+    let producer = cli
+        .verifiable_producer()
+        .start(&topic, RECORDS_PER_SECOND, 0);
 
     let mut staying = start_member_and_wait(&cli, &topic, &group, "staying", &mut []);
     let mut leaving = start_member_and_wait(&cli, &topic, &group, "leaving", &mut [&mut staying]);
@@ -476,10 +480,10 @@ fn group_consumes_every_record_while_members_leave_join_and_crash() {
 #[test]
 fn member_that_leaves_cleanly_is_removed_before_its_session_times_out() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(2, &[]);
-    let group = unique_name("group");
+    let topic = cli.topics().create_unique(2, &[]);
+    let group = unique::name("group");
 
-    let (mut staying, _) = cli.join_group(
+    let (mut staying, _) = cli.verifiable_consumer().join_group(
         &topic,
         &group,
         LEAVE_GROUP_SESSION_TIMEOUT,
@@ -487,7 +491,7 @@ fn member_that_leaves_cleanly_is_removed_before_its_session_times_out() {
         JOIN_TIMEOUT,
     );
     let staying_lines_before_second_join = staying.line_count();
-    let (leaving, _) = cli.join_group(
+    let (leaving, _) = cli.verifiable_consumer().join_group(
         &topic,
         &group,
         LEAVE_GROUP_SESSION_TIMEOUT,
@@ -537,12 +541,12 @@ fn member_that_leaves_cleanly_is_removed_before_its_session_times_out() {
 #[test]
 fn static_member_restart_keeps_its_partitions_without_a_rebalance() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(2, &[]);
-    let group = unique_name("group");
-    let (staying_id, restarting_id) = (unique_name("staying"), unique_name("restarting"));
+    let topic = cli.topics().create_unique(2, &[]);
+    let group = unique::name("group");
+    let (staying_id, restarting_id) = (unique::name("staying"), unique::name("restarting"));
 
     let start_static_member = |group_instance_id: &str| {
-        cli.join_group(
+        cli.verifiable_consumer().join_group(
             &topic,
             &group,
             STATIC_MEMBER_SESSION_TIMEOUT,
@@ -551,7 +555,9 @@ fn static_member_restart_keeps_its_partitions_without_a_rebalance() {
         )
     };
 
-    let producer = cli.start_verifiable_produce(&topic, RECORDS_PER_SECOND, 0);
+    let producer = cli
+        .verifiable_producer()
+        .start(&topic, RECORDS_PER_SECOND, 0);
 
     let (mut staying, _) = start_static_member(&staying_id);
 
@@ -627,12 +633,12 @@ fn static_member_restart_keeps_its_partitions_without_a_rebalance() {
 #[test]
 fn static_member_is_removed_when_its_session_times_out() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(2, &[]);
-    let group = unique_name("group");
-    let (staying_id, returning_id) = (unique_name("staying"), unique_name("returning"));
+    let topic = cli.topics().create_unique(2, &[]);
+    let group = unique::name("group");
+    let (staying_id, returning_id) = (unique::name("staying"), unique::name("returning"));
 
     let join_as = |group_instance_id: &str| {
-        cli.join_group(
+        cli.verifiable_consumer().join_group(
             &topic,
             &group,
             SHORT_SESSION_TIMEOUT,

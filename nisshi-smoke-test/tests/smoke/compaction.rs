@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use nisshi_smoke_test::{Broker, KafkaCli, PRINTED_NULL, now_in_millis, wait_until};
+use nisshi_smoke_test::{Broker, KafkaCli, PRINTED_NULL, polling};
 
 /// How long a test waits for a maintenance run to give the result it expects.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -46,8 +46,10 @@ struct StoredRecord<'a> {
 /// `expected`, so each read returns at once.
 #[track_caller]
 fn wait_until_records_are(cli: &KafkaCli, topic: &str, expected: &[StoredRecord<'_>]) {
-    wait_until(MAINTENANCE_TIMEOUT, || {
-        let consumed = cli.read_records_from_earliest(topic, 0, expected.len());
+    polling::wait_until(MAINTENANCE_TIMEOUT, || {
+        let consumed = cli
+            .console_consumer()
+            .read_records_from_earliest(topic, 0, expected.len());
         let records = consumed
             .iter()
             .map(|record| StoredRecord {
@@ -74,8 +76,8 @@ fn wait_until_records_are(cli: &KafkaCli, topic: &str, expected: &[StoredRecord<
 fn compaction_keeps_the_latest_value_of_each_key() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &["cleanup.policy=compact"]);
-    _ = cli.produce_keyed(
+    let topic = cli.topics().create_unique(1, &["cleanup.policy=compact"]);
+    _ = cli.console_producer().produce_keyed(
         &topic,
         &[
             ("k0", Some("v0")),
@@ -117,8 +119,8 @@ fn compaction_keeps_the_latest_value_of_each_key() {
 fn tombstone_is_the_only_record_left_for_its_key() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &["cleanup.policy=compact"]);
-    _ = cli.produce_keyed(
+    let topic = cli.topics().create_unique(1, &["cleanup.policy=compact"]);
+    _ = cli.console_producer().produce_keyed(
         &topic,
         &[("k0", Some("v0")), ("k1", Some("v1")), ("k0", None)],
     );
@@ -149,14 +151,19 @@ fn tombstone_is_the_only_record_left_for_its_key() {
 fn compact_delete_policy_compacts_and_deletes_expired_records() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic =
-        cli.create_unique_topic(1, &["cleanup.policy=compact,delete", "retention.ms=600000"]);
-    let an_hour_ago = now_in_millis() - 3_600_000;
+    let topic = cli
+        .topics()
+        .create_unique(1, &["cleanup.policy=compact,delete", "retention.ms=600000"]);
+    let an_hour_ago = cli.now_in_millis() - 3_600_000;
     // Each record has a key of its own, `0` and `1`, because Kafka refuses a record without a key
     // on a compacted topic.
-    let produced = cli.verifiable_produce_created_at(&topic, 2, an_hour_ago, 0, Some(2));
+    let produced = cli
+        .verifiable_producer()
+        .produce_created_at(&topic, 2, an_hour_ago, 0, Some(2));
     assert_eq!(produced.acknowledged_record_count(), 2, "{produced}");
-    _ = cli.produce_keyed(&topic, &[("new", Some("v2")), ("new", Some("v3"))]);
+    _ = cli
+        .console_producer()
+        .produce_keyed(&topic, &[("new", Some("v2")), ("new", Some("v3"))]);
 
     wait_until_records_are(
         &cli,

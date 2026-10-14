@@ -34,11 +34,11 @@ const DELETE_BEFORE_OFFSET: i64 = 3;
 fn create_topic_with_records() -> (Broker, KafkaCli, String) {
     let broker = Broker::isolated();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
     let values = (0..PRODUCED_RECORD_COUNT)
         .map(|n| format!("value-{n}"))
         .collect::<Vec<_>>();
-    _ = cli.produce_values(&topic, &values);
+    _ = cli.console_producer().produce_values(&topic, &values);
 
     (broker, cli, topic)
 }
@@ -51,7 +51,7 @@ fn create_topic_with_records() -> (Broker, KafkaCli, String) {
 fn delete_records_returns_the_new_low_watermark() {
     let (_broker, cli, topic) = create_topic_with_records();
 
-    let deleted = cli.delete_records_before(&topic, 0, DELETE_BEFORE_OFFSET);
+    let deleted = cli.delete_records().before(&topic, 0, DELETE_BEFORE_OFFSET);
 
     assert_eq!(
         deleted.succeeded().low_watermark(&topic, 0),
@@ -69,11 +69,12 @@ fn delete_records_returns_the_new_low_watermark() {
 fn earliest_offset_moves_to_the_offset_deleted_before() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
-        .delete_records_before(&topic, 0, DELETE_BEFORE_OFFSET)
+        .delete_records()
+        .before(&topic, 0, DELETE_BEFORE_OFFSET)
         .succeeded();
 
     assert_eq!(
-        cli.partition_offsets_at(&topic, "earliest"),
+        cli.get_offsets().partition_offsets(&topic, "earliest"),
         [DELETE_BEFORE_OFFSET]
     );
 }
@@ -86,11 +87,12 @@ fn earliest_offset_moves_to_the_offset_deleted_before() {
 fn latest_offset_is_kept_after_delete_records() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
-        .delete_records_before(&topic, 0, DELETE_BEFORE_OFFSET)
+        .delete_records()
+        .before(&topic, 0, DELETE_BEFORE_OFFSET)
         .succeeded();
 
     assert_eq!(
-        cli.partition_offsets_at(&topic, "latest"),
+        cli.get_offsets().partition_offsets(&topic, "latest"),
         [PRODUCED_RECORD_COUNT as i64]
     );
 }

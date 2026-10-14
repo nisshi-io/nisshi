@@ -17,12 +17,21 @@
 
 use super::{KafkaCli, Output, Tool};
 
-impl KafkaCli {
+/// Runs `kafka-reassign-partitions` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaReassignPartitions<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaReassignPartitions<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Lists the partition reassignments in progress.
     ///
     /// Sends `ListPartitionReassignments`.
     #[track_caller]
-    pub fn list_partition_reassignments(&self) -> Output {
-        self.run(Tool::ReassignPartitions, &["--list"])
+    pub fn list(&self) -> Output {
+        self.cli.run(Tool::ReassignPartitions, &["--list"])
     }
 }
