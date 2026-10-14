@@ -120,6 +120,7 @@ mod support {
     /// Waits until `group` has committed the latest offset of each partition of `topic` that holds
     /// records. Panics after [`CONSUMER_COMMIT_WAIT`]. Nothing may produce to `topic` while it
     /// waits, because it reads the latest offsets once.
+    #[cfg(feature = "postgres")]
     pub(super) fn wait_until_group_caught_up(cli: &KafkaCli, group: &str, topic: &str) {
         let latest = latest_offsets(cli, topic);
 
