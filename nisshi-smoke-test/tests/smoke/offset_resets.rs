@@ -268,7 +268,7 @@ fn reset_shift_by_moves_back_from_the_committed_offset() {
 #[cfg_attr(
     feature = "memory",
     ignore = "a lookup by time compares the time at which the broker stored each batch, not the \
-              records' timestamps"
+              records' timestamps (#840)"
 )]
 fn reset_to_datetime_starts_at_first_record_after_that_time() {
     let consumer_group = ConsumerGroup::with_two_batches_an_hour_apart();
@@ -288,7 +288,7 @@ fn reset_to_datetime_starts_at_first_record_after_that_time() {
 #[cfg_attr(
     feature = "memory",
     ignore = "a lookup by time compares the time at which the broker stored each batch, not the \
-              records' timestamps"
+              records' timestamps (#840)"
 )]
 fn reset_by_duration_starts_at_first_record_within_it() {
     let consumer_group = ConsumerGroup::with_two_batches_an_hour_apart();

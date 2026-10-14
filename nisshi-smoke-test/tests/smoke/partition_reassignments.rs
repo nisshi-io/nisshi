@@ -20,7 +20,7 @@
 use nisshi_smoke_test::KafkaCli;
 
 #[test]
-#[ignore = "ListPartitionReassignments answers every partition as being reassigned"]
+#[ignore = "ListPartitionReassignments answers every partition as being reassigned (#965)"]
 fn list_does_not_report_a_new_partition_as_reassigned() {
     let cli = KafkaCli::shared();
     let topic = cli.create_unique_topic(1, &[]);

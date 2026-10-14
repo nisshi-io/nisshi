@@ -58,7 +58,7 @@ fn list_includes_a_group_that_consumed() {
 /// operator can find the groups that are running, or the ones that are idle. The broker must
 /// answer `ListGroups` with each group's state, and apply the state filter.
 #[test]
-#[ignore = "ListGroups answers every group's state as Unknown, and ignores the state filter"]
+#[ignore = "ListGroups answers every group's state as Unknown, and ignores the state filter (#960)"]
 fn list_by_state_shows_only_groups_in_that_state() {
     let cli = KafkaCli::shared();
     let topic = cli.create_unique_topic(1, &[]);
@@ -124,7 +124,7 @@ fn describe_shows_committed_and_end_offsets() {
 /// reads, so an operator sees who reads what. The broker must answer `DescribeGroups` with each
 /// member and its assignment.
 #[test]
-#[ignore = "DescribeGroups answers no members for a group that has them"]
+#[ignore = "DescribeGroups answers no members for a group that has them (#962)"]
 fn describe_members_shows_each_member_and_its_partitions() {
     let cli = KafkaCli::shared();
     let topic = cli.create_unique_topic(2, &[]);
@@ -190,7 +190,7 @@ fn state_is_stable_while_consuming_and_empty_after() {
 #[test]
 #[cfg_attr(
     feature = "memory",
-    ignore = "DescribeGroups answers an empty group for a group that doesn't exist"
+    ignore = "DescribeGroups answers an empty group for a group that doesn't exist (#963)"
 )]
 fn describe_of_unknown_group_says_it_does_not_exist() {
     let cli = KafkaCli::shared();
@@ -245,7 +245,7 @@ fn delete_removes_an_empty_group() {
 #[cfg_attr(
     any(feature = "postgres", feature = "memory"),
     ignore = "on PostgreSQL, DeleteGroups for a group with members gets no answer; on memory \
-              storage, the group is missing from the group list after DeleteGroups refuses it"
+              storage, ListGroups leaves out a group without committed offsets (#961)"
 )]
 fn delete_refuses_a_group_with_members() {
     let cli = KafkaCli::shared();
@@ -267,7 +267,7 @@ fn delete_refuses_a_group_with_members() {
 /// again from the reset policy, and keep their committed offsets in the other topics. The broker
 /// must delete only the named topic's offsets on `OffsetDelete`.
 #[test]
-#[ignore = "the broker doesn't support OffsetDelete"]
+#[ignore = "the broker doesn't support OffsetDelete (#964)"]
 fn delete_offsets_removes_only_that_topics_offsets() {
     let cli = KafkaCli::shared();
     let removed_topic = cli.create_unique_topic(1, &[]);
