@@ -19,6 +19,7 @@ use nisshi_sans_io::{
     Header, RequestInput, RootMessageMeta, api_versions_response::ApiVersion,
 };
 use rama::{Service, extensions::Extensions, service::BoxService};
+use tracing::warn;
 
 use crate::Error;
 
@@ -222,7 +223,15 @@ where
             return service.serve(req).await;
         }
 
-        Err(E::from(nisshi_sans_io::Error::UnsupportedVersion {
+        warn!(
+            api_key,
+            api_name = req.frame.api_name(),
+            api_version,
+            client_id = req.frame.client_id().ok().flatten(),
+            "request version outside the protocol range"
+        );
+
+        Err(E::from(Error::UnsupportedVersion {
             api_key,
             api_version,
         }))
@@ -240,27 +249,14 @@ where
     type Error = E;
 
     async fn serve(&self, req: Frame) -> Result<Self::Output, Self::Error> {
-        let api_key = req.api_key()?;
-
-        let Some(service) = self.routes.get(&api_key) else {
-            return Err(E::from(Error::UnknownServiceFrame(Box::new(req))));
-        };
-
-        let api_version = req.api_version()?;
-
-        let req = FrameInput {
-            frame: req,
-            extensions: Extensions::default(),
-        };
-
-        if is_within_protocol_range(api_key, api_version) {
-            return service.serve(req).await;
-        }
-
-        Err(E::from(nisshi_sans_io::Error::UnsupportedVersion {
-            api_key,
-            api_version,
-        }))
+        Service::<FrameInput>::serve(
+            self,
+            FrameInput {
+                frame: req,
+                extensions: Extensions::default(),
+            },
+        )
+        .await
     }
 }
 
@@ -420,10 +416,10 @@ mod tests {
     fn assert_unsupported_version(result: Result<Frame, Error>, expected_version: i16) {
         assert!(matches!(
             result,
-            Err(Error::Protocol(nisshi_sans_io::Error::UnsupportedVersion {
+            Err(Error::UnsupportedVersion {
                 api_key,
                 api_version,
-            })) if api_key == ApiVersionsRequest::KEY && api_version == expected_version
+            }) if api_key == ApiVersionsRequest::KEY && api_version == expected_version
         ));
     }
 

@@ -39,7 +39,9 @@ Sweeps of the librdkafka integration test suite against
    entirely (the service had no real telemetry sink behind it, and
    `PushTelemetry` was never routed either), so nisshi no longer
    advertises the telemetry APIs at all and this race can no longer
-   happen. librdkafka's `0150_telemetry_mock` runs only against a mock
+   happen. Kafka itself only advertises the telemetry APIs when a
+   client-telemetry plugin is configured (`ApiVersionsResponse.filterApis`),
+   which is why upstream never sees the race. librdkafka's `0150_telemetry_mock` runs only against a mock
    cluster and is unaffected either way.
 
 ## Open gaps, most impactful first

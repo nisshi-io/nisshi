@@ -125,12 +125,10 @@ async fn version_outside_the_cap_closes_the_connection() -> Result<(), Error> {
         assert!(
             matches!(
                 err,
-                Error::Service(nisshi_service::Error::Protocol(
-                    nisshi_sans_io::Error::UnsupportedVersion {
-                        api_key: rejected_key,
-                        api_version: rejected_version,
-                    }
-                )) if rejected_key == api_key && rejected_version == api_version
+                Error::Service(nisshi_service::Error::UnsupportedVersion {
+                    api_key: rejected_key,
+                    api_version: rejected_version,
+                }) if rejected_key == api_key && rejected_version == api_version
             ),
             "api_key: {api_key}, api_version: {api_version}, err: {err:?}"
         );

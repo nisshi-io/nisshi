@@ -22,9 +22,9 @@ use nisshi_broker::{
 };
 use nisshi_sans_io::{
     AddPartitionsToTxnRequest, ApiKey as _, ApiVersionsRequest, ApiVersionsResponse, Body,
-    BytesInput, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, FetchRequest, Frame,
-    FrameInput, Header, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse,
-    ProduceRequest, RootMessageMeta,
+    BytesInput, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, Frame, FrameInput, Header,
+    IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse, ProduceRequest,
+    RootMessageMeta,
     api_versions_response::ApiVersion,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
@@ -141,17 +141,17 @@ async fn full_route_table_has_the_expected_route_count() -> Result<()> {
     let with_storage_routes = storage::services(FrameRouteService::<Error>::builder(), storage)?;
     // The broker does not register a route for GetTelemetrySubscriptions, so it does not
     // advertise the client telemetry APIs.
-    assert_eq!(26, with_storage_routes.len());
+    assert_eq!(25, with_storage_routes.len());
 
     let with_coordinator_routes = coordinator::services(with_storage_routes, coordinator)?;
-    assert_eq!(26 + 6, with_coordinator_routes.len());
+    assert_eq!(25 + 7, with_coordinator_routes.len());
 
     let with_auth_routes = auth::services(with_coordinator_routes)?;
-    assert_eq!(26 + 6 + 2, with_auth_routes.len());
+    assert_eq!(25 + 7 + 2, with_auth_routes.len());
 
     let route_table = with_auth_routes.build().map_err(Error::from)?;
     // `build` adds the `ApiVersions` route itself.
-    assert_eq!(26 + 6 + 2 + 1, route_table.len());
+    assert_eq!(25 + 7 + 2 + 1, route_table.len());
 
     Ok(())
 }
@@ -193,10 +193,73 @@ async fn api_versions_advertises_each_cap() -> Result<()> {
         );
     }
 
-    assert_eq!(
-        Some(protocol_range(FetchRequest::KEY)),
-        range(FetchRequest::KEY)
-    );
+    Ok(())
+}
+
+// A literal table, not `protocol_range`, because the protocol metadata is what changes when
+// the Kafka message descriptors are updated. An API that is not capped advertises its whole
+// protocol range, so a descriptor update that adds a version nisshi does not implement fails
+// here until someone caps the API or updates its row.
+#[tokio::test]
+async fn api_versions_advertises_the_expected_table() -> Result<()> {
+    let route_table = route_table().await?;
+
+    let response = serve(
+        &route_table,
+        ApiVersionsRequest::KEY,
+        3,
+        ApiVersionsRequest::default().into(),
+    )
+    .await?;
+
+    let mut advertised = ApiVersionsResponse::try_from(response.body)?
+        .api_keys
+        .unwrap_or_default()
+        .iter()
+        .map(|api: &ApiVersion| (api.api_key, api.min_version, api.max_version))
+        .collect::<Vec<_>>();
+    advertised.sort_unstable();
+
+    // `(api_key, min_version, max_version)`
+    let expected: Vec<(i16, i16, i16)> = vec![
+        (0, 3, 11), // Produce
+        (1, 0, 17), // Fetch
+        (2, 0, 6),  // ListOffsets
+        (3, 0, 12), // Metadata
+        (8, 0, 9),  // OffsetCommit
+        (9, 0, 9),  // OffsetFetch
+        (10, 0, 6), // FindCoordinator
+        (11, 0, 9), // JoinGroup
+        (12, 0, 4), // Heartbeat
+        (13, 0, 5), // LeaveGroup
+        (14, 0, 5), // SyncGroup
+        (15, 0, 5), // DescribeGroups
+        (16, 0, 5), // ListGroups
+        (17, 0, 1), // SaslHandshake
+        (18, 0, 4), // ApiVersions
+        (19, 0, 7), // CreateTopics
+        (20, 0, 6), // DeleteTopics
+        (21, 0, 2), // DeleteRecords
+        (22, 0, 5), // InitProducerId
+        (24, 0, 3), // AddPartitionsToTxn
+        (25, 0, 4), // AddOffsetsToTxn
+        (26, 0, 4), // EndTxn
+        (28, 0, 4), // TxnOffsetCommit
+        (29, 0, 3), // DescribeAcls
+        (30, 0, 3), // CreateAcls
+        (32, 0, 4), // DescribeConfigs
+        (36, 0, 2), // SaslAuthenticate
+        (42, 0, 2), // DeleteGroups
+        (44, 0, 1), // IncrementalAlterConfigs
+        (46, 0, 0), // ListPartitionReassignments
+        (50, 0, 0), // DescribeUserScramCredentials
+        (51, 0, 0), // AlterUserScramCredentials
+        (60, 0, 1), // DescribeCluster
+        (69, 0, 0), // ConsumerGroupDescribe
+        (75, 0, 0), // DescribeTopicPartitions
+    ];
+
+    assert_eq!(expected, advertised);
 
     Ok(())
 }

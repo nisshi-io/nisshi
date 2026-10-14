@@ -143,7 +143,7 @@ impl<S> fmt::Debug for VersionGateService<S> {
 impl<S> Service<FrameInput> for VersionGateService<S>
 where
     S: Service<FrameInput, Output = Frame>,
-    S::Error: From<nisshi_sans_io::Error>,
+    S::Error: From<nisshi_sans_io::Error> + From<Error>,
 {
     type Output = Frame;
     type Error = S::Error;
@@ -170,7 +170,7 @@ where
             "request version outside the supported range"
         );
 
-        Err(S::Error::from(nisshi_sans_io::Error::UnsupportedVersion {
+        Err(S::Error::from(Error::UnsupportedVersion {
             api_key: self.api_key,
             api_version,
         }))
@@ -179,7 +179,7 @@ where
 
 impl<E> FrameRouteBuilder<E>
 where
-    E: std::error::Error + From<nisshi_sans_io::Error> + Send + Sync + 'static,
+    E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,
 {
     /// Registers `handler` as the route for `Q`, behind a [`VersionGateLayer`] with `Q`'s range
     /// from [`CAPPED_API_VERSIONS`], and advertises that range in `ApiVersions`, so a client
@@ -202,8 +202,8 @@ where
         validate_capped_range(Q::KEY, supported.clone())?;
 
         let service = (
-            MapErrLayer::new(E::from),
             VersionGateLayer::new(Q::KEY, supported.clone()),
+            MapErrLayer::new(E::from),
             FrameRequestLayer::<Q>::new(),
         )
             .into_layer(handler)

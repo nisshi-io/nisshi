@@ -334,6 +334,14 @@ pub enum Error {
     UnknownHost(Url),
     UnknownServiceBody(Box<Body>),
     UnknownServiceFrame(Box<Frame>),
+    /// The broker does not route `api_version` for `api_key`, because the version is outside
+    /// the protocol's valid range or outside the range the broker advertises for that API.
+    /// The caller closes the connection on this error, as Kafka does for a version it has not
+    /// enabled.
+    UnsupportedVersion {
+        api_key: i16,
+        api_version: i16,
+    },
 }
 
 impl fmt::Display for Error {
