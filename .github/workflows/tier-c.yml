@@ -371,13 +371,20 @@ jobs:
             echo "::error::${GITHUB_SHA} has no successful push run of ci.yml, so there are no binaries to publish"
             exit 1
           fi
-          # The artifacts expire after 30 days.
+          # The artifacts expire after 30 days. After 30 days without a merge,
+          # the tip's artifacts are gone and an earlier run has already
+          # published the tip, so this run stops without an error. Only a new
+          # merge produces new artifacts.
           names=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${push_run}/artifacts?per_page=100" \
             --jq '[.artifacts[] | select(.expired | not) | .name] | join(" ")')
           for want in image-x86_64-unknown-linux-musl image-aarch64-unknown-linux-musl; do
             case " ${names} " in
               *" ${want} "*) ;;
-              *) echo "::error::run ${push_run} has no unexpired ${want} artifact"; exit 1 ;;
+              *)
+                echo "::notice::run ${push_run} has no unexpired ${want} artifact; edge keeps its current image"
+                echo "publish=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
             esac
           done
           echo "merge-queue run ${queue_run}, binaries from push run ${push_run}"

@@ -83,8 +83,10 @@ name: ci
 # A pull_request from a fork can't read repository variables, so
 # `vars.MERGE_QUEUE` is empty there and the checks above would run Tier B on
 # every push. A fork PR therefore takes the queue-on path whatever the
-# variable says, as `smoke` already did. With the queue off, a fork PR's
-# Tier B then runs only after it merges.
+# variable says, as `smoke` already did. With the queue off, the push to
+# `main` runs only the trimmed job set, so a fork PR's Tier B runs nowhere.
+# Turning the queue off therefore needs a follow-up that gates the trim on
+# `vars.MERGE_QUEUE` as well.
 #
 # No Tier A job may `needs` a Tier B job: GitHub marks a job `skipped` (not
 # `failure`) when its own `needs` didn't run, which would silently skip Tier A
