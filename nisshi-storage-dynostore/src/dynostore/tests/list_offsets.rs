@@ -52,7 +52,7 @@ use object_store::{
 /// passing by coincidence the way a `SystemTime::now()`-based one could.
 const T0: i64 = 1_577_836_800_000; // 2020-01-01T00:00:00Z
 
-fn storage() -> DynoStore {
+fn storage() -> Result<DynoStore> {
     DynoStore::new("nisshi", 111, InMemory::new())
 }
 
@@ -282,7 +282,7 @@ async fn list_offsets_timestamp_error(
 #[tokio::test]
 async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "legacy";
     let topition = Topition::new(topic, 0);
 
@@ -347,7 +347,7 @@ async fn backfill_commit_picks_up_concurrent_produce() -> Result<()> {
 #[tokio::test]
 async fn merge_does_not_let_a_lower_concurrent_entry_outrank_an_established_one() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "legacy-union";
     let topition = Topition::new(topic, 0);
 
@@ -389,7 +389,7 @@ async fn merge_does_not_let_a_lower_concurrent_entry_outrank_an_established_one(
 #[tokio::test]
 async fn timestamp_lookup_skips_deleted_prefix_of_a_straddling_batch() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "straddling";
     let topition = Topition::new(topic, 0);
 
@@ -424,7 +424,7 @@ async fn timestamp_lookup_skips_deleted_prefix_of_a_straddling_batch() -> Result
 #[tokio::test]
 async fn sequential_scan_past_every_real_batch_returns_none() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "empty";
     let topition = Topition::new(topic, 0);
 
@@ -444,7 +444,7 @@ async fn sequential_scan_past_every_real_batch_returns_none() -> Result<()> {
 #[tokio::test]
 async fn empty_partition_no_match() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "never-produced";
     let topition = Topition::new(topic, 0);
 
@@ -463,7 +463,7 @@ async fn empty_partition_no_match() -> Result<()> {
 #[tokio::test]
 async fn future_timestamp_no_match() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "future";
     let topition = Topition::new(topic, 0);
 
@@ -483,7 +483,7 @@ async fn future_timestamp_no_match() -> Result<()> {
 #[tokio::test]
 async fn new_partition_first_produce_marks_index_complete() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "brand-new";
     let topition = Topition::new(topic, 0);
 
@@ -510,7 +510,7 @@ async fn new_partition_first_produce_marks_index_complete() -> Result<()> {
 #[tokio::test]
 async fn equal_and_mid_batch_timestamps_match_inside_a_batch() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "boundary";
     let topition = Topition::new(topic, 0);
 
@@ -548,7 +548,7 @@ async fn equal_and_mid_batch_timestamps_match_inside_a_batch() -> Result<()> {
 #[tokio::test]
 async fn produce_skips_an_entry_below_the_running_max() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "fresh-out-of-order";
     let topition = Topition::new(topic, 0);
 
@@ -610,7 +610,7 @@ async fn time_index_entries(
 #[tokio::test]
 async fn lookup_scans_from_the_floor_entry_past_an_unindexed_batch() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "sparse";
     let topition = Topition::new(topic, 0);
 
@@ -661,7 +661,7 @@ async fn lookup_scans_from_the_floor_entry_past_an_unindexed_batch() -> Result<(
 #[tokio::test]
 async fn index_stays_within_the_cap_and_answers_after_thinning() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "capped";
     let topition = Topition::new(topic, 0);
 
@@ -695,7 +695,7 @@ async fn index_stays_within_the_cap_and_answers_after_thinning() -> Result<()> {
 #[tokio::test]
 async fn lookup_does_not_create_a_watermark_document() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topition = Topition::new("absent", 0);
 
     let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0).await?;
@@ -716,7 +716,7 @@ async fn lookup_does_not_create_a_watermark_document() -> Result<()> {
 #[tokio::test]
 async fn read_committed_lookup_stops_at_the_last_stable_offset() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "open-transaction";
     let topition = Topition::new(topic, 0);
 
@@ -983,7 +983,7 @@ async fn time_index_complete(storage: &DynoStore, topition: &Topition) -> Result
 #[tokio::test]
 async fn backfill_merge_drops_a_live_entry_below_an_unindexed_legacy_batch() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topition = legacy_partition_with_max_at_offset_1(&storage, "legacy-sparse").await?;
 
     assert_eq!(3, produce(&storage, &topition, &[T0 + 70]).await?);
@@ -1008,7 +1008,7 @@ async fn backfill_merge_drops_a_live_entry_below_an_unindexed_legacy_batch() -> 
 async fn backfill_get_failure_leaves_the_index_incomplete() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
-    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topition = legacy_partition_with_max_at_offset_1(&storage, "backfill-failure").await?;
 
     faulty.arm(storage.batch_path(&topition, 1), Fault::Unavailable)?;
@@ -1033,7 +1033,7 @@ async fn backfill_get_failure_leaves_the_index_incomplete() -> Result<()> {
 async fn backfill_skips_a_batch_deleted_after_listing() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
-    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topition = legacy_partition_with_max_at_offset_1(&storage, "backfill-not-found").await?;
 
     faulty.arm(storage.batch_path(&topition, 2), Fault::NotFound)?;
@@ -1052,7 +1052,7 @@ async fn backfill_skips_a_batch_deleted_after_listing() -> Result<()> {
 async fn scan_get_failure_answers_an_error_for_the_partition() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
-    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topic = "scan-failure";
     let topition = Topition::new(topic, 0);
 
@@ -1082,7 +1082,7 @@ async fn scan_get_failure_answers_an_error_for_the_partition() -> Result<()> {
 async fn failed_lookup_answers_only_its_own_partition_with_an_error() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
-    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topic = "partial-failure";
     let failing = Topition::new(topic, 0);
     let healthy = Topition::new(topic, 1);
@@ -1115,7 +1115,7 @@ async fn failed_lookup_answers_only_its_own_partition_with_an_error() -> Result<
 async fn concurrent_lookups_share_one_backfill() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
-    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topition = legacy_partition_with_max_at_offset_1(&storage, "single-flight").await?;
 
     let before = faulty.batch_gets();
@@ -1144,7 +1144,7 @@ async fn concurrent_lookups_share_one_backfill() -> Result<()> {
 #[tokio::test]
 async fn backfill_stops_its_listing_at_a_batch_in_flight() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topic = "in-flight";
     let topition = Topition::new(topic, 0);
 
@@ -1218,7 +1218,7 @@ async fn backfill_completes_past_a_settled_gap() -> Result<()> {
     let _guard = init_tracing()?;
 
     async fn partition_with_a_gap_at_offset_1(faulty: &Faulty) -> Result<(DynoStore, Topition)> {
-        let storage = DynoStore::new("nisshi", 111, faulty.clone());
+        let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
         let topic = "gap";
         let topition = Topition::new(topic, 0);
 
@@ -1269,7 +1269,7 @@ async fn settled_gap_age_is_measured_on_the_store_clock() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
     faulty.set_clock_behind(2 * BATCH_SETTLED_AFTER);
-    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topic = "store-clock";
     let topition = Topition::new(topic, 0);
 
@@ -1302,7 +1302,7 @@ async fn settled_gap_age_is_measured_on_the_store_clock() -> Result<()> {
 async fn backfill_is_left_incomplete_by_a_gap_after_the_last_listed_batch() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
-    let storage = DynoStore::new("nisshi", 111, faulty.clone());
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topic = "trailing-gap";
     let topition = Topition::new(topic, 0);
 
@@ -1346,8 +1346,8 @@ async fn backfill_is_left_incomplete_by_a_gap_after_the_last_listed_batch() -> R
 async fn backfill_commit_merges_again_after_a_cas_conflict() -> Result<()> {
     let _guard = init_tracing()?;
     let faulty = Faulty::default();
-    let committing = DynoStore::new("nisshi", 111, faulty.clone());
-    let producing = DynoStore::new("nisshi", 111, faulty.clone());
+    let committing = DynoStore::new("nisshi", 111, faulty.clone())?;
+    let producing = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topition = legacy_partition_with_max_at_offset_1(&committing, "cas-conflict").await?;
 
     let backfill = committing.begin_time_index_backfill(&topition).await?;
@@ -1382,7 +1382,7 @@ async fn backfill_commit_merges_again_after_a_cas_conflict() -> Result<()> {
 #[tokio::test]
 async fn backfill_is_left_incomplete_by_an_older_broker_write() -> Result<()> {
     let _guard = init_tracing()?;
-    let storage = storage();
+    let storage = storage()?;
     let topition = legacy_partition_with_max_at_offset_1(&storage, "older-broker").await?;
 
     let backfill = storage.begin_time_index_backfill(&topition).await?;
