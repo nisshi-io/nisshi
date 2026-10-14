@@ -1,11 +1,11 @@
 ---
 name: tier-c
 
-# Tier C is the optional nightly tier. It runs the checks that are too slow
-# or too unstable to gate a merge: the compat suites on the S3 engine, the
-# `test` suite on more Postgres versions, including one beta, the build on
-# Windows, and the full macOS release build (ci.yml only checks macOS, except
-# on a `v*` tag).
+# Tier C is the optional scheduled tier, run twice a day. It runs the checks
+# that are too slow or too unstable to gate a merge: the compat suites on the
+# S3 engine, the `test` suite on more Postgres versions, including one beta,
+# the build on Windows, and the full macOS release build (ci.yml only checks
+# macOS, except on a `v*` tag).
 #
 # Tier C does not gate anything. It is not in the `needs` of ci-gate and it is
 # not a required check. A red run opens or updates one GitHub issue with the
@@ -17,9 +17,12 @@ permissions:
   contents: read
 on:
   schedule:
-    # 03:17 UTC. An off-peak hour that is not on the hour, so the run does
-    # not queue with the many scheduled workflows that start at :00.
-    - cron: "17 3 * * *"
+    # 06:17 and 18:17 UTC, which is 02:17 and 14:17 US Eastern while daylight
+    # saving time is in effect (01:17 and 13:17 after it ends). Cron has no
+    # time zone, so these two times move by an hour at each change. Not on the
+    # hour, so the run does not queue with the many scheduled workflows that
+    # start at :00.
+    - cron: "17 6,18 * * *"
   workflow_dispatch:
 # Two Tier C runs on one ref must not overlap: both write to the same issue.
 # A run that arrives while another runs waits. GitHub keeps one waiting run
