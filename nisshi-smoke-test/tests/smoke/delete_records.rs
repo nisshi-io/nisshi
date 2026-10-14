@@ -46,7 +46,7 @@ fn create_topic_with_records() -> (Broker, KafkaCli, String) {
 /// A user reads it to confirm what the deletion did.
 #[test]
 #[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies"]
+            and memory storage never replies (#835)"]
 fn delete_records_returns_the_new_low_watermark() {
     let (_broker, cli, topic) = create_topic_with_records();
 
@@ -64,7 +64,7 @@ fn delete_records_returns_the_new_low_watermark() {
 /// kept.
 #[test]
 #[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies"]
+            and memory storage never replies (#835)"]
 fn earliest_offset_moves_to_the_offset_deleted_before() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
@@ -81,7 +81,7 @@ fn earliest_offset_moves_to_the_offset_deleted_before() {
 /// from a lower offset gives two records one offset, and consumers skip or repeat records.
 #[test]
 #[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies"]
+            and memory storage never replies (#835)"]
 fn latest_offset_is_kept_after_delete_records() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
