@@ -15,7 +15,7 @@
 //! Deflated (compressed) Kafka Records
 use std::{
     fmt::{self, Formatter},
-    io::{BufRead, Write},
+    io::{BufRead, Read, Write},
     result,
 };
 
@@ -28,7 +28,7 @@ use serde::{
 use tracing::{debug, error, instrument};
 
 use crate::{
-    ByteSize, Compression, Decode as _, Decoder, Encode, Error, ErrorCode, Result,
+    ByteSize, Compression, Decode as _, Encode, Error, ErrorCode, Result,
     record::{
         Header, Record,
         codec::{
@@ -506,7 +506,7 @@ impl TryFrom<Batch> for Vec<Record> {
     type Error = Error;
 
     #[instrument(skip_all)]
-    fn try_from(mut batch: Batch) -> Result<Self, Self::Error> {
+    fn try_from(batch: Batch) -> Result<Self, Self::Error> {
         let record_count = usize::try_from(batch.record_count)?;
 
         debug!(?record_count);
@@ -532,20 +532,11 @@ impl TryFrom<Batch> for Vec<Record> {
         }
 
         if uncompressed {
-            let mut budget = DecodeBudget::new(MAX_DECODED_BATCH_BYTES);
-            let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
-
-            for _ in 0..record_count {
-                let record = Record::decode(&mut batch.record_data)?;
-                budget.charge(allocated_size(&record))?;
-                records.push(record);
-            }
-
-            if !batch.record_data.is_empty() {
-                return Err(Error::Overflow);
-            }
-
-            Ok(records)
+            decode_records(
+                batch.record_data,
+                record_count,
+                &mut DecodeBudget::new(MAX_DECODED_BATCH_BYTES),
+            )
         } else {
             batch.compression().and_then(|compression| {
                 inflate_records(
@@ -560,12 +551,14 @@ impl TryFrom<Batch> for Vec<Record> {
     }
 }
 
-/// Decode `record_count` records from `record_data` through `compression`'s
-/// decompressing reader. `inflated_limit` caps the bytes that reader may
-/// produce (`LimitedRead`); `decoded_limit` is the `DecodeBudget` the
-/// decoded records are charged to. Production passes
-/// `MAX_DECODED_BATCH_BYTES` for both; they are separate so a test can
-/// exercise each limit on its own.
+/// Decodes `record_count` records from `record_data`, which `compression`
+/// inflates.
+///
+/// `inflated_limit` caps the bytes that the decompressing reader may produce
+/// (`LimitedRead`), and `decoded_limit` caps the memory that the inflated
+/// bytes and the decoded records use together. Production passes
+/// `MAX_DECODED_BATCH_BYTES` for both. The two limits are separate parameters
+/// so that a test can exercise each one on its own.
 fn inflate_records(
     compression: Compression,
     record_data: impl BufRead + 'static,
@@ -573,26 +566,53 @@ fn inflate_records(
     inflated_limit: usize,
     decoded_limit: usize,
 ) -> Result<Vec<Record>> {
-    let mut reader = compression.inflator(record_data, inflated_limit)?;
+    let mut inflated = Vec::new();
 
-    let mut decoder = Decoder::new(&mut reader).with_budget(DecodeBudget::new(decoded_limit));
+    _ = compression
+        .inflator(record_data, inflated_limit)?
+        .read_to_end(&mut inflated)?;
+
+    // The batch holds the inflated bytes in memory, so the budget counts them
+    // before any record.
+    let mut budget = DecodeBudget::new(decoded_limit);
+    budget.charge(inflated.len())?;
+
+    decode_records(Bytes::from(inflated), record_count, &mut budget)
+}
+
+/// Decodes `record_count` records from the front of `record_data`, and charges
+/// the structures of each record to `budget`.
+///
+/// Each key and value is a slice of `record_data`, not a copy. A batch with
+/// bytes left after its last record is corrupt, as in Kafka's
+/// [`DefaultRecordBatch`].
+///
+/// [`DefaultRecordBatch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L605-L606
+fn decode_records(
+    mut record_data: Bytes,
+    record_count: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<Record>> {
     let mut records = Vec::with_capacity(record_count.min(MAX_PREALLOCATED_ELEMENTS));
 
     for _ in 0..record_count {
-        decoder.charge(size_of::<Record>())?;
-        let record = Record::deserialize(&mut decoder)?;
+        let record = Record::decode(&mut record_data)?;
+        budget.charge(allocated_size(&record))?;
         records.push(record);
+    }
+
+    if !record_data.is_empty() {
+        return Err(Error::Overflow);
     }
 
     Ok(records)
 }
 
-/// What decoding an uncompressed record allocates beyond the record data it
-/// was decoded from: the `Record` itself and its `Vec<Header>`. Keys and
-/// values are zero-copy slices of the record data on this path, which the
-/// frame size already bounds, so they are not charged twice. (The compressed
-/// path copies every byte out of the decompressing reader, so there the
-/// `Decoder`'s budget charges them.)
+/// What decoding a record allocates beyond the record data it was decoded
+/// from: the `Record` itself and its `Vec<Header>`. Keys and values are
+/// slices of the record data, so the caller charges the record data once
+/// instead: `inflate_records` does so for a compressed batch, and the frame
+/// size bounds an uncompressed one.
 fn allocated_size(record: &Record) -> usize {
     size_of::<Record>() + record.headers.len() * size_of::<Header>()
 }
@@ -601,26 +621,9 @@ impl TryFrom<&Batch> for Vec<Record> {
     type Error = Error;
 
     fn try_from(batch: &Batch) -> Result<Self, Self::Error> {
-        let record_count = usize::try_from(batch.record_count)?;
-
-        debug!(?record_count);
-        debug!(record_data_len = batch.record_data.len());
-
-        if batch.exceeds_decoded_record_count_limit() {
-            return Err(Error::MessageMaxSizeExceeded(
-                record_count.saturating_mul(size_of::<Record>()),
-            ));
-        }
-
-        batch.compression().and_then(|compression| {
-            inflate_records(
-                compression,
-                batch.record_data.clone().reader(),
-                record_count,
-                MAX_DECODED_BATCH_BYTES,
-                MAX_DECODED_BATCH_BYTES,
-            )
-        })
+        // This delegates so that both conversions decode alike. `record_data`
+        // is a `Bytes`, so the clone shares its buffer.
+        Self::try_from(batch.clone())
     }
 }
 
@@ -691,6 +694,8 @@ mod tests {
     };
 
     use super::*;
+
+    use std::assert_matches;
 
     use tracing::subscriber::DefaultGuard;
 
@@ -1638,8 +1643,8 @@ mod tests {
     /// A compressed record whose `length` varint has a sixth byte, one more
     /// than an `i32` can hold, is rejected by every conversion that decodes
     /// compressed records. The record is otherwise valid, so only the
-    /// overlong varint can reject it: a record decoder that let the serde
-    /// visitor wrap the value would decode this batch.
+    /// overlong varint can reject it: a record decoder that wrapped the value
+    /// would decode this batch.
     #[test]
     fn overlong_varint_in_a_compressed_record_is_rejected() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1668,10 +1673,7 @@ mod tests {
 
         let err = Vec::<Record>::try_from(&batch)
             .expect_err("an overlong varint must be rejected by reference");
-        assert!(
-            matches!(&err, Error::Message(message) if message == "varint is too long"),
-            "{err:?}"
-        );
+        assert_matches!(err, Error::Overflow);
         assert!(
             Vec::<Record>::try_from(batch.clone()).is_err(),
             "an overlong varint must be rejected by value"
@@ -1781,6 +1783,218 @@ mod tests {
         let err = Vec::<Record>::try_from(batch)
             .expect_err("bytes after the last declared record must be rejected");
         assert!(matches!(err, Error::Overflow), "{err:?}");
+
+        Ok(())
+    }
+
+    const EVERY_CODEC: [Compression; 5] = [
+        Compression::None,
+        Compression::Gzip,
+        Compression::Snappy,
+        Compression::Lz4,
+        Compression::Zstd,
+    ];
+
+    /// `uncompressed` as a producer compresses the record data of a batch.
+    fn compress(compression: &Compression, uncompressed: &[u8]) -> Result<Bytes> {
+        match compression {
+            Compression::None => Ok(Bytes::copy_from_slice(uncompressed)),
+
+            Compression::Gzip => {
+                let mut gz =
+                    GzEncoder::new(BytesMut::new().writer(), flate2::Compression::default());
+                gz.write_all(uncompressed)?;
+                gz.finish()
+                    .map(|writer| writer.into_inner().freeze())
+                    .map_err(Into::into)
+            }
+
+            Compression::Snappy => snap::raw::Encoder::new()
+                .compress_vec(uncompressed)
+                .map(Bytes::from)
+                .map_err(Into::into),
+
+            Compression::Lz4 => {
+                let mut lz4 = lz4::EncoderBuilder::new().build(BytesMut::new().writer())?;
+                lz4.write_all(uncompressed)?;
+                let (writer, finished) = lz4.finish();
+                finished?;
+                Ok(writer.into_inner().freeze())
+            }
+
+            Compression::Zstd => {
+                let mut zstd = zstd::stream::write::Encoder::new(BytesMut::new().writer(), 0)?;
+                zstd.write_all(uncompressed)?;
+                zstd.finish()
+                    .map(|writer| writer.into_inner().freeze())
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    /// A batch of `record_count` records whose record data is `uncompressed`
+    /// compressed with `compression`. The bytes need not be valid records.
+    fn batch_of_record_data(
+        compression: Compression,
+        record_count: u32,
+        uncompressed: &[u8],
+    ) -> Result<Batch> {
+        Ok(Batch {
+            record_data: compress(&compression, uncompressed)?,
+            attributes: BatchAttribute::default().compression(compression).into(),
+            record_count,
+            ..Default::default()
+        })
+    }
+
+    /// The encoding of `record` with `adjustment` added to its declared
+    /// `length`, and the fields left as they are.
+    fn encode_with_adjusted_length(record: &Record, adjustment: i32) -> Result<BytesMut> {
+        let mut fields = record.encode()?;
+        let length: i32 = VarInt::decode(&mut fields).map(Into::into)?;
+
+        let mut encoded = BytesMut::new();
+        encoded.put(VarInt(length + adjustment).encode()?);
+        encoded.put(fields);
+        Ok(encoded)
+    }
+
+    /// Both conversions reject `batch` with an error that is not
+    /// `MessageMaxSizeExceeded`, which is what lets the broker answer
+    /// `INVALID_RECORD` rather than `MESSAGE_TOO_LARGE`. A record that ends
+    /// before its fields do fails as `TryGet` when a field has no byte left,
+    /// and as `Overflow` when a field claims more bytes than are left.
+    fn assert_rejected_as_corrupt_by_both_conversions(batch: &Batch) {
+        let by_reference =
+            Vec::<Record>::try_from(batch).expect_err("a corrupt batch must be rejected");
+        assert_matches!(by_reference, Error::Overflow | Error::TryGet(_));
+
+        let by_value =
+            Vec::<Record>::try_from(batch.clone()).expect_err("a corrupt batch must be rejected");
+        assert_matches!(by_value, Error::Overflow | Error::TryGet(_));
+    }
+
+    /// The by-reference and by-value conversions decode a batch the same way,
+    /// whether it is uncompressed or compressed with any codec.
+    #[test]
+    fn by_reference_and_by_value_conversions_give_the_same_records_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let records = vec![
+            Record::builder()
+                .key(Some(Bytes::from_static(b"key")))
+                .value(Some(Bytes::from_static(LOREM)))
+                .header(
+                    Header::builder()
+                        .key(Bytes::from_static(b"format"))
+                        .value(Bytes::from_static(b"text")),
+                )
+                .build()?,
+            Record::builder().offset_delta(1).build()?,
+            Record::builder()
+                .offset_delta(2)
+                .timestamp_delta(7)
+                .key(Some(Bytes::new()))
+                .value(Some(Bytes::from(vec![0xa5; 4096])))
+                .build()?,
+        ];
+
+        for compression in EVERY_CODEC {
+            let mut inflated = inflated::Batch {
+                records: records.clone(),
+                ..Default::default()
+            };
+
+            inflated.attributes = BatchAttribute::try_from(inflated.attributes)
+                .map(|attribute| attribute.compression(compression.clone()).into())?;
+
+            let batch = Batch::try_from(inflated)?;
+
+            assert_eq!(
+                records,
+                Vec::<Record>::try_from(&batch)?,
+                "by reference, {compression:?}"
+            );
+            assert_eq!(
+                records,
+                Vec::<Record>::try_from(batch)?,
+                "by value, {compression:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Kafka's `DefaultRecord` answers `INVALID_RECORD` for a record whose
+    /// fields end before its declared `length` does, and the same holds for
+    /// every codec.
+    #[test]
+    fn record_with_length_longer_than_its_fields_is_rejected_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut record_data = encode_with_adjusted_length(
+            &Record::builder()
+                .key(Some(Bytes::from_static(b"key")))
+                .value(Some(Bytes::from_static(b"value")))
+                .build()?,
+            1,
+        )?;
+        record_data.put_u8(0xff); // padding inside the declared length
+
+        for compression in EVERY_CODEC {
+            assert_rejected_as_corrupt_by_both_conversions(&batch_of_record_data(
+                compression,
+                1,
+                &record_data,
+            )?);
+        }
+
+        Ok(())
+    }
+
+    /// Kafka's `DefaultRecord` answers `INVALID_RECORD` for a record whose
+    /// fields run past its declared `length`, and the same holds for every
+    /// codec.
+    #[test]
+    fn record_with_length_shorter_than_its_fields_is_rejected_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let record_data = encode_with_adjusted_length(
+            &Record::builder()
+                .key(Some(Bytes::from_static(b"key")))
+                .value(Some(Bytes::from_static(b"value")))
+                .build()?,
+            -1,
+        )?;
+
+        for compression in EVERY_CODEC {
+            assert_rejected_as_corrupt_by_both_conversions(&batch_of_record_data(
+                compression,
+                1,
+                &record_data,
+            )?);
+        }
+
+        Ok(())
+    }
+
+    /// Kafka's `DefaultRecordBatch` answers `INVALID_RECORD` for a batch that
+    /// has bytes after its last record, and the same holds for every codec.
+    #[test]
+    fn bytes_after_the_last_record_are_rejected_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut record_data = BytesMut::new();
+        record_data.put(Record::builder().build()?.encode()?);
+        record_data.put_u8(0);
+
+        for compression in EVERY_CODEC {
+            assert_rejected_as_corrupt_by_both_conversions(&batch_of_record_data(
+                compression,
+                1,
+                &record_data,
+            )?);
+        }
 
         Ok(())
     }

@@ -51,18 +51,19 @@ pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 /// running [`DecodeBudget`] that every allocation made while decoding a batch
 /// is charged to.
 ///
-/// The real peak per batch is a small multiple of this, not this exactly: an
-/// uncompressed record's headers are charged after they are allocated (the
+/// The real peak per batch is a small multiple of this, not this exactly: a
+/// record's headers are charged after they are allocated (the
 /// sequence-length pre-check compares one record against the whole limit,
 /// not what is left of the budget), a Snappy batch's decompressed block is
-/// live alongside the records decoded from it, and the zstd decoder's window
-/// (up to 128 MiB by default) is not charged.
+/// live alongside the buffer that the records decode from, the spare capacity
+/// of that buffer is not charged, and the zstd decoder's window (up to
+/// 128 MiB by default) is not charged.
 pub(crate) const MAX_DECODED_BATCH_BYTES: usize = 100 * 1024 * 1024;
 
-/// The decoded-memory budget of one batch. Each `Record`, each `Header` and
-/// each copied byte of key or value is charged as it is decoded, and the
-/// batch is rejected once the budget is spent, so the memory a batch decodes
-/// into is bounded by the budget however small its wire encoding is.
+/// The decoded-memory budget of one batch. The inflated bytes of a compressed
+/// batch, each `Record` and each `Header` are charged as they are decoded, and
+/// the batch is rejected once the budget is spent, so the memory a batch
+/// decodes into is bounded by the budget however small its wire encoding is.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodeBudget {
     limit: usize,

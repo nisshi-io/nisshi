@@ -1739,8 +1739,7 @@ async fn produce_rejects_corrupt_batch_before_rewrite(storage: impl Storage + Cl
 /// keep the error code that any other produce path answers.
 ///
 /// The broker rejects the batch before it writes anything, so the test runs
-/// on the memory backend only: decoding 100 MiB takes seconds in a debug
-/// build, and another backend would not change the result.
+/// on the memory backend only: another backend would not change the result.
 async fn produce_rejects_batch_over_decoded_size_limit_as_too_large(
     storage: impl Storage + Clone,
 ) -> Result<()> {
