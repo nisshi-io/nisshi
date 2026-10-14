@@ -5,11 +5,19 @@ name: tier-c
 # that are too slow or too unstable to gate a merge: the compat suites on the
 # S3 engine, the `test` suite on more Postgres versions, including one beta,
 # the build on Windows, and the full macOS release build (ci.yml only checks
-# macOS, except on a `v*` tag).
+# macOS, except on a `v*` tag). It also publishes the `edge` image, see below.
 #
 # Tier C does not gate anything. It is not in the `needs` of ci-gate and it is
 # not a required check. A red run opens or updates one GitHub issue with the
 # `nightly-failure` label. The next green run closes that issue.
+#
+# The `edge-gate` and `edge-publish` jobs push the multi-arch image of main's
+# tip as `ghcr.io/nisshi-io/nisshi:edge`, and as `main`, which stays for
+# external consumers and goes in a follow-up. They push only when the merge
+# queue passed the tip, and they reuse the binaries that the push run of ci.yml
+# built, so they compile nothing. `edge` can trail the tip until the next run
+# when a merge lands during the scheduled run, or shortly before it while that
+# merge's push run is still in progress: the gate then skips the publish.
 #
 # The workflow runs on main only. Each job checks the ref, so a manual run
 # from another ref does nothing.
@@ -304,11 +312,113 @@ jobs:
           tool: cargo-auditable@0.7.6
           fallback: none
       - run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+  # Passes only when the tip of main has a successful merge-queue run of
+  # ci.yml, so no image is pushed from a commit that skipped the queue. The
+  # push run of ci.yml is trimmed and does not test the tree, so the gate
+  # reads the merge_group run for the verdict and the push run for the
+  # binaries. ci-gate runs under `always()`, so a successful run conclusion
+  # means that ci-gate passed.
+  edge-gate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The job reads workflow runs and artifact metadata. It has no checkout.
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
+      run-id: ${{ steps.gate.outputs.run_id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A merge can land while this run is in progress. The newer tip gets
+          # its image from the next run, and this run must not move `edge`
+          # backwards, so it stops without an error.
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at ${tip}, not ${GITHUB_SHA}; the next run publishes the newer tip"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The newest run of ci.yml for this commit and event that completed
+          # with a success conclusion.
+          ok_run() {
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=$1&per_page=100" \
+              --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | sort_by(.created_at) | last | .id // empty'
+          }
+          queue_run=$(ok_run merge_group)
+          if [ -z "$queue_run" ]; then
+            echo "::error::${GITHUB_SHA} has no successful merge-queue run of ci.yml, so no image is published"
+            exit 1
+          fi
+          push_run=$(ok_run push)
+          # A merge that landed shortly before this run can still have its
+          # push run in progress. That is not a failure: the next run
+          # publishes the tip.
+          running=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=100" \
+            --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+          if [ -z "$push_run" ] && [ "$running" -gt 0 ]; then
+            echo "::notice::the push run of ci.yml for ${GITHUB_SHA} is still in progress; the next run publishes it"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$push_run" ]; then
+            echo "::error::${GITHUB_SHA} has no successful push run of ci.yml, so there are no binaries to publish"
+            exit 1
+          fi
+          # The artifacts expire after 30 days.
+          names=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${push_run}/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.expired | not) | .name] | join(" ")')
+          for want in image-x86_64-unknown-linux-musl image-aarch64-unknown-linux-musl; do
+            case " ${names} " in
+              *" ${want} "*) ;;
+              *) echo "::error::run ${push_run} has no unexpired ${want} artifact"; exit 1 ;;
+            esac
+          done
+          echo "merge-queue run ${queue_run}, binaries from push run ${push_run}"
+          {
+            echo "publish=true"
+            echo "run_id=${push_run}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Pushes the image from the push run's binaries. The gate decides whether it
+  # pushes, and the steps skip instead of the job, so a newer tip leaves this
+  # job green and `alert` quiet.
+  edge-publish:
+    needs: [edge-gate]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # `actions: read` is for the download of another run's artifacts.
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    steps:
+      - if: needs.edge-gate.outputs.publish == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `main` is the tag that ci.yml used to push on every merge. It points
+      # at the same image as `edge`, and it stays for consumers outside this
+      # repository until a follow-up drops it.
+      - if: needs.edge-gate.outputs.publish == 'true'
+        uses: ./.github/actions/publish-image
+        with:
+          run-id: ${{ needs.edge-gate.outputs.run-id }}
+          tags: |
+            type=raw,value=edge
+            type=raw,value=main
   alert:
     # This job reads the result of each job above. A beta leg that fails does
     # not change the result of `test`, so it does not raise an alert.
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
-    needs: [test, compat-librdkafka, compat-franz-go, build-windows, macos-release]
+    needs: [test, compat-librdkafka, compat-franz-go, build-windows, macos-release, edge-gate, edge-publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # The job writes to issues and nothing else. It has no checkout, so

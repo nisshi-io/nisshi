@@ -22,11 +22,10 @@ jobs:
   ci:
     # A called workflow's jobs can't hold more than this job grants, so this
     # lists every permission a ci.yml job declares: `changes` reads the PR
-    # files and `publish` pushes the `main` image (it skips on a tag).
+    # files.
     permissions:
       contents: read
       pull-requests: read
-      packages: write
     uses: ./.github/workflows/ci.yml
 
   # A tag run uses the workflow at the tagged commit, and the `release`
@@ -52,8 +51,8 @@ jobs:
             *) echo "::error::${GITHUB_REF} is at ${GITHUB_SHA}, which is not on main (${status}); nothing is published"; exit 1 ;;
           esac
 
-  # The multi-arch image, built by the same action as ci.yml's `publish` from
-  # the binaries smoke tested, tagged with the version. `latest` comes with the
+  # The multi-arch image, built from the binaries smoke tested by the same
+  # action as tier-c.yml's `edge-publish`, tagged with the version. `latest` comes with the
   # semver tags, for a tag that isn't a prerelease.
   publish-image:
     needs: [ci, on-main]

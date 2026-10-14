@@ -1,9 +1,13 @@
 name: Publish image
-description: Builds the multi-arch image from release's static binaries and pushes it to ghcr.io with the given tags. Used by ci.yml's publish (the `main` image) and release.yml's publish-image (the version tags).
+description: Builds the multi-arch image from release's static binaries and pushes it to ghcr.io with the given tags. Used by tier-c.yml's edge-publish (the `edge` and `main` tags) and release.yml's publish-image (the version tags).
 inputs:
   tags:
     description: docker/metadata-action `tags` spec for the pushed image.
     required: true
+  run-id:
+    description: Workflow run that holds the `image-*` artifacts. The default is the current run.
+    required: false
+    default: ${{ github.run_id }}
 runs:
   using: composite
   steps:
@@ -14,6 +18,10 @@ runs:
         pattern: image-*
         merge-multiple: true
         path: dist
+        run-id: ${{ inputs.run-id }}
+        # download-artifact needs a token, and the calling job's `actions:
+        # read`, only to read another run's artifacts.
+        github-token: ${{ inputs.run-id != github.run_id && github.token || '' }}
     - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
       id: meta
       with:
