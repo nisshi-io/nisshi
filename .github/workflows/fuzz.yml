@@ -111,7 +111,7 @@ jobs:
           restore-keys: fuzz-corpus-
       - run: just fuzz-ci pr
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-pr
           path: fuzz/artifacts/
@@ -177,7 +177,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: just fuzz-ci nightly "$TARGET"
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
@@ -190,7 +190,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: just fuzz-cmin "$TARGET"
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}/
@@ -210,7 +210,7 @@ jobs:
           path: fuzz/corpus
           key: fuzz-corpus-
           restore-keys: fuzz-corpus-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: fuzz-corpus-*
           path: ${{ runner.temp }}/corpus
