@@ -98,7 +98,6 @@ deadpool-postgres = "0.14.2"
 # builds against. Pin to 1.1.0 until deltalake bumps its buoyant_kernel dep.
 buoyant_kernel_derive = "=1.1.0"
 deltalake = { version = "0.32", features = ["datafusion", "s3"] }
-digest = "0.11.3"
 dotenv = "0.15.0"
 fake = "5.1.0"
 flate2 = "1.1"
