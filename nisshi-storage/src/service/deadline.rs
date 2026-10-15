@@ -53,7 +53,7 @@ static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// What a read bounded by [`within`] was doing when its deadline passed.
+/// What a read bounded by [`bounded`] was doing when its deadline passed.
 ///
 /// An operator reads it from the `stage` attribute of the
 /// `nisshi_storage_read_deadline_exceeded` counter: `reading` points at a
@@ -84,7 +84,7 @@ impl Missed {
 }
 
 tokio::task_local! {
-    /// Whether the read that the enclosing [`within`] bounds is in [`queued`].
+    /// Whether the read that the enclosing [`bounded`] bounds is in [`queued`].
     static QUEUED: Cell<bool>;
 }
 
@@ -121,6 +121,28 @@ where
 /// Dropping the read cancels nisshi's side of it. Work the storage engine
 /// runs on its own tasks, or a statement already sent to a database server,
 /// carries on until it finishes.
+pub(crate) async fn bounded<F>(deadline: Instant, read: F) -> Result<F::Output, Missed>
+where
+    F: Future,
+{
+    if Instant::now() >= deadline {
+        return Err(Missed::NotStarted);
+    }
+
+    let mut read = pin!(QUEUED.scope(Cell::new(false), timeout_at(deadline, read)));
+
+    match read.as_mut().await {
+        Ok(output) => Ok(output),
+        Err(_elapsed) => Err(if read.take_value().is_some_and(|queued| queued.get()) {
+            Missed::Queued
+        } else {
+            Missed::Reading
+        }),
+    }
+}
+
+/// Runs [`bounded`], counting each abandoned read in the
+/// `nisshi_storage_read_deadline_exceeded` counter under `operation`.
 pub(crate) async fn within<F>(
     operation: &'static str,
     deadline: Instant,
@@ -142,20 +164,7 @@ async fn within_counting<F>(
 where
     F: Future,
 {
-    let outcome = if Instant::now() >= deadline {
-        Err(Missed::NotStarted)
-    } else {
-        let mut read = pin!(QUEUED.scope(Cell::new(false), timeout_at(deadline, read)));
-
-        match read.as_mut().await {
-            Ok(output) => Ok(output),
-            Err(_elapsed) => Err(if read.take_value().is_some_and(|queued| queued.get()) {
-                Missed::Queued
-            } else {
-                Missed::Reading
-            }),
-        }
-    };
+    let outcome = bounded(deadline, read).await;
 
     if let Err(missed) = outcome {
         exceeded.add(
