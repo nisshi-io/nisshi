@@ -100,7 +100,10 @@ use tracing::{Instrument as _, debug, error, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
-use crate::sql::{default_hash, idempotent_sequence_check};
+use crate::{
+    schema::{RecordedSchema, should_create_schema},
+    sql::{default_hash, idempotent_sequence_check},
+};
 
 pub mod factory;
 
@@ -222,6 +225,27 @@ const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
 /// The server ends the statement itself at `statement_timeout`, and this
 /// margin gives its answer time to arrive.
 const ABANDONED_STATEMENT_MARGIN: Duration = Duration::from_secs(5);
+
+/// The statements that create the schema of [`SCHEMA_VERSION`].
+const SCHEMA: &str = include_str!("pg/schema.sql");
+
+/// The version of the schema that [`SCHEMA`] creates. A database records the version of its
+/// schema in its `nisshi_schema_version` table.
+const SCHEMA_VERSION: i32 = 1;
+
+// The build fails here when someone changes `SCHEMA_VERSION`. In a database with tables but no
+// recorded version, `ensure_schema` creates only the missing tables, and then records
+// `SCHEMA_VERSION`. A new version needs an upgrade step there, because such a database has the
+// tables of version 1.
+const _: () = assert!(SCHEMA_VERSION == 1);
+
+/// The oldest schema version whose broker can use the schema that [`SCHEMA`] creates.
+const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
+
+/// The key of the advisory lock that [`Postgres::ensure_schema`] holds. Advisory locks share one
+/// key space per database. The key spells `nisshi`, so that it is unlikely to match another
+/// application's key.
+const SCHEMA_LOCK: i64 = i64::from_be_bytes(*b"\0\0nisshi");
 
 /// Postgres statement timeout applied to every connection by default, so a stalled query
 /// (e.g. a lock wait) is aborted server-side instead of holding a pooled connection open
@@ -1058,6 +1082,79 @@ impl Postgres {
         }
 
         Ok(responses)
+    }
+
+    /// Makes sure that the database has the broker's schema before the broker serves a request.
+    ///
+    /// When the database records no schema version, this function creates the missing tables and
+    /// records [`SCHEMA_VERSION`]. It leaves existing tables and their data as they are.
+    ///
+    /// This function runs no DDL on a database that records a version. A database user that cannot
+    /// create tables can therefore start a broker on a database that records a version.
+    pub(crate) async fn ensure_schema(&self) -> Result<()> {
+        let mut c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        // This transaction sets its own `statement_timeout`, because an operator's short timeout
+        // bounds a request and can abort this setup. The setup can wait for another broker's lock
+        // below. A broker whose lock wait reaches 5 minutes exits. Its orchestrator then restarts
+        // it.
+        tx.batch_execute("SET LOCAL statement_timeout = '5min'")
+            .await?;
+
+        // This lock makes a second broker wait until the first broker commits the schema. The
+        // second broker then finds the recorded version. Without the lock, PostgreSQL fails one of
+        // two concurrent `create table if not exists` statements with a unique violation.
+        tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
+            .await?;
+
+        let version_table_exists = tx
+            .query_one(self.sql_lookup("pg/nisshi_schema_version_exists.sql")?, &[])
+            .await?
+            .try_get::<_, bool>(0)?;
+
+        let recorded = if version_table_exists {
+            tx.query_opt(self.sql_lookup("nisshi_schema_version_select.sql")?, &[])
+                .await?
+                .map(|row| {
+                    Ok::<_, Error>(RecordedSchema {
+                        version: row.try_get(0)?,
+                        oldest_compatible_version: row.try_get(1)?,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        debug!(?recorded);
+
+        if !should_create_schema(recorded, SCHEMA_VERSION)? {
+            return tx.commit().await.map_err(Into::into);
+        }
+
+        // This query puts only the namespace that holds the existing `cluster` table on the search
+        // path, for this transaction. PostgreSQL calls a namespace a schema. An unqualified `create
+        // table` creates its table in the first namespace on the search path. That namespace can
+        // differ from the one that holds the existing tables. The broker then finds new, empty
+        // tables instead of its data.
+        _ = tx
+            .query_opt(
+                self.sql_lookup("pg/search_path_set_to_cluster_namespace.sql")?,
+                &[],
+            )
+            .await?;
+
+        tx.batch_execute(self.sql_lookup("nisshi_schema_version_create.sql")?)
+            .await?;
+        tx.batch_execute(SCHEMA).await?;
+        _ = tx
+            .execute(
+                self.sql_lookup("nisshi_schema_version_insert.sql")?,
+                &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
+            )
+            .await?;
+
+        tx.commit().await.map_err(Into::into)
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
@@ -4734,7 +4831,11 @@ mod tests {
     use super::*;
     use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use nisshi_storage::{
+        ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
+    };
     use rand::distr::Alphanumeric;
+    use std::assert_matches;
 
     // mirrors nisshi-broker/tests/it/common/mod.rs storage_container(StorageType::Postgres)
     const CONNECTION: &str = "postgres://postgres:postgres@localhost";
@@ -4745,6 +4846,24 @@ mod tests {
             .take(length)
             .map(char::from)
             .collect()
+    }
+
+    /// Returns a [`Postgres`] storage engine for `cluster` on the server at `url`, with the schema
+    /// created. Returns `None` when the server can't be reached. The caller then skips `test`.
+    async fn storage_with_schema(test: &str, url: &str, cluster: &str) -> Result<Option<Postgres>> {
+        let storage = Postgres::builder(url)?
+            .cluster(cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        // The test skips only when the server can't be reached. Any later error fails it.
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping {test}: {err:?}");
+            return Ok(None);
+        }
+
+        storage.ensure_schema().await?;
+        Ok(Some(storage))
     }
 
     #[test]
@@ -5483,17 +5602,15 @@ mod tests {
     async fn maintenance_sweeps_are_exempt_from_statement_timeout() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(&format!(
-            "{CONNECTION}?options=-c%20statement_timeout%3D100"
-        ))?
-        .cluster(cluster.as_str())
-        .node(rng().random_range(0..i32::MAX))
-        .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintenance_sweeps_are_exempt_from_statement_timeout: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintenance_sweeps_are_exempt_from_statement_timeout",
+            &format!("{CONNECTION}?options=-c%20statement_timeout%3D100"),
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5518,15 +5635,15 @@ mod tests {
     async fn maintain_removes_records_left_below_log_start() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintain_removes_records_left_below_log_start: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintain_removes_records_left_below_log_start",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5624,19 +5741,15 @@ mod tests {
     async fn read_committed_last_stable_offset_pinned_by_open_transaction() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        // Probe connectivity explicitly: only a genuinely unreachable postgres
-        // should skip. Any later schema/query error must fail the test.
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping read_committed_last_stable_offset_pinned_by_open_transaction: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "read_committed_last_stable_offset_pinned_by_open_transaction",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5720,15 +5833,15 @@ mod tests {
     async fn maintain_transactions_aborts_timed_out_transaction() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintain_transactions_aborts_timed_out_transaction: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintain_transactions_aborts_timed_out_transaction",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5822,15 +5935,15 @@ mod tests {
     async fn maintain_transactions_leaves_transaction_before_timeout() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintain_transactions_leaves_transaction_before_timeout: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintain_transactions_leaves_transaction_before_timeout",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5924,17 +6037,15 @@ mod tests {
     -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping maintain_transactions_defers_when_older_overlapping_transaction_still_open: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "maintain_transactions_defers_when_older_overlapping_transaction_still_open",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6064,15 +6175,15 @@ mod tests {
     async fn txn_end_after_already_finalized_with_conflicting_outcome_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_after_already_finalized_is_a_no_op: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_after_already_finalized_is_a_no_op",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6179,15 +6290,15 @@ mod tests {
     async fn deferred_txn_end_retry_does_not_duplicate_marker() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping deferred_txn_end_retry_does_not_duplicate_marker: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "deferred_txn_end_retry_does_not_duplicate_marker",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6336,15 +6447,15 @@ mod tests {
     async fn late_commit_after_sweep_abort_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping late_commit_after_sweep_abort_is_rejected: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "late_commit_after_sweep_abort_is_rejected",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6469,15 +6580,15 @@ mod tests {
     async fn txn_end_scopes_bookkeeping_delete_to_its_own_epoch() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_scopes_bookkeeping_delete_to_its_own_epoch: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_scopes_bookkeeping_delete_to_its_own_epoch",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6684,15 +6795,11 @@ mod tests {
     async fn race_concurrent_commit_and_abort() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping race_concurrent_commit_and_abort: {err:?}");
+        let Some(storage) =
+            storage_with_schema("race_concurrent_commit_and_abort", CONNECTION, &cluster).await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6820,15 +6927,15 @@ mod tests {
     async fn sweep_fenced_producer_zombie_produce_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping sweep_fenced_producer_zombie_produce_is_rejected: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "sweep_fenced_producer_zombie_produce_is_rejected",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6931,15 +7038,15 @@ mod tests {
     async fn sweep_fenced_producer_can_reconnect_and_produce_normally() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping sweep_fenced_producer_can_reconnect_and_produce_normally: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "sweep_fenced_producer_can_reconnect_and_produce_normally",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7061,15 +7168,15 @@ mod tests {
     async fn txn_end_for_unknown_producer_is_unknown_producer_id() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_for_unknown_producer_is_unknown_producer_id: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_for_unknown_producer_is_unknown_producer_id",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7098,15 +7205,15 @@ mod tests {
     async fn txn_end_with_future_epoch_is_invalid_producer_epoch() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_with_future_epoch_is_invalid_producer_epoch: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_with_future_epoch_is_invalid_producer_epoch",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7140,15 +7247,15 @@ mod tests {
     async fn sweep_abort_retry_is_fenced_and_does_not_double_bump() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping sweep_abort_retry_is_fenced_and_does_not_double_bump: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "sweep_abort_retry_is_fenced_and_does_not_double_bump",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7306,15 +7413,15 @@ mod tests {
     async fn init_producer_old_api_version_is_treated_as_fresh() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_old_api_version_is_treated_as_fresh: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_old_api_version_is_treated_as_fresh",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7343,15 +7450,15 @@ mod tests {
     async fn init_producer_recovery_with_current_epoch_succeeds() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_recovery_with_current_epoch_succeeds: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_recovery_with_current_epoch_succeeds",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7396,15 +7503,15 @@ mod tests {
     async fn init_producer_recovery_with_stale_epoch_is_fenced() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_recovery_with_stale_epoch_is_fenced: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_recovery_with_stale_epoch_is_fenced",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7451,15 +7558,15 @@ mod tests {
     async fn init_producer_recovery_after_sweep_is_fenced() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_recovery_after_sweep_is_fenced: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_recovery_after_sweep_is_fenced",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7553,15 +7660,15 @@ mod tests {
 
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_concurrent_claims_bump_once: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_concurrent_claims_bump_once",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7640,15 +7747,15 @@ mod tests {
     async fn init_producer_malformed_partial_fields_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_malformed_partial_fields_is_rejected: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_malformed_partial_fields_is_rejected",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7678,15 +7785,11 @@ mod tests {
     async fn txn_add_partitions_is_idempotent() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_add_partitions_is_idempotent: {err:?}");
+        let Some(storage) =
+            storage_with_schema("txn_add_partitions_is_idempotent", CONNECTION, &cluster).await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7759,17 +7862,15 @@ mod tests {
     async fn fetch_serves_committed_records_despite_concurrent_transaction() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping fetch_serves_committed_records_despite_concurrent_transaction: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "fetch_serves_committed_records_despite_concurrent_transaction",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7865,17 +7966,15 @@ mod tests {
     async fn create_topic_writes_the_watermark_when_only_its_statement_is_cached() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping create_topic_writes_the_watermark_when_only_its_statement_is_cached: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "create_topic_writes_the_watermark_when_only_its_statement_is_cached",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7929,17 +8028,15 @@ mod tests {
     async fn delete_topic_leaves_the_other_topics_in_the_cluster_intact() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping delete_topic_leaves_the_other_topics_in_the_cluster_intact: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "delete_topic_leaves_the_other_topics_in_the_cluster_intact",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -8036,15 +8133,15 @@ mod tests {
     async fn headers_keep_produce_order_and_allow_repeated_keys() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping headers_keep_produce_order_and_allow_repeated_keys: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "headers_keep_produce_order_and_allow_repeated_keys",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -8139,5 +8236,417 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// An empty database that one test creates on the server at [`CONNECTION`].
+    struct EmptyDatabase {
+        name: String,
+        admin: Postgres,
+    }
+
+    impl EmptyDatabase {
+        /// Creates the database. Returns `None` when the server isn't reachable.
+        async fn create(test: &str) -> Result<Option<Self>> {
+            let admin = Postgres::builder(CONNECTION)?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(0)
+                .build();
+
+            let c = match admin.connection().await {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("skipping {test}: {err:?}");
+                    return Ok(None);
+                }
+            };
+
+            let name = format!("nisshi_test_{}", alphanumeric_string(12).to_lowercase());
+            c.batch_execute(&format!("create database {name}")).await?;
+
+            Ok(Some(Self { name, admin }))
+        }
+
+        fn url(&self) -> Result<Url> {
+            let mut url = Url::parse(CONNECTION)?;
+            url.set_path(&self.name);
+            Ok(url)
+        }
+
+        /// Returns a [`Postgres`] storage engine for a new cluster on this database, as the user
+        /// in [`CONNECTION`].
+        fn storage(&self) -> Result<Postgres> {
+            self.storage_at(&self.url()?)
+        }
+
+        fn storage_at(&self, url: &Url) -> Result<Postgres> {
+            Ok(Postgres::builder(url.as_str())?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(111)
+                .build())
+        }
+
+        /// Runs `sql` on this database as the user in [`CONNECTION`].
+        async fn execute(&self, sql: &str) -> Result<()> {
+            self.storage()?
+                .connection()
+                .await?
+                .batch_execute(sql)
+                .await
+                .map_err(Into::into)
+        }
+
+        /// Records `version` and `oldest_compatible_version` in the database's
+        /// `nisshi_schema_version` table.
+        async fn record_schema_version(
+            &self,
+            version: i32,
+            oldest_compatible_version: i32,
+        ) -> Result<()> {
+            self.execute(&format!(
+                "update nisshi_schema_version set version = {version}, \
+                 oldest_compatible_version = {oldest_compatible_version}"
+            ))
+            .await
+        }
+
+        /// Creates a login role that can't create anything in the `public` namespace, and returns
+        /// the URL that logs in to this database as the role. [`EmptyDatabase::remove`] drops
+        /// the role.
+        async fn create_role(&self) -> Result<Url> {
+            let role = format!("{}_role", self.name);
+            let password = alphanumeric_string(12);
+
+            self.admin
+                .connection()
+                .await?
+                .batch_execute(&format!("create role {role} login password '{password}'"))
+                .await?;
+            self.execute("revoke create on schema public from public")
+                .await?;
+
+            let mut url = self.url()?;
+            url.set_username(&role)
+                .and_then(|()| url.set_password(Some(&password)))
+                .map_err(|()| Error::Message(format!("{url} can't hold a user")))?;
+            Ok(url)
+        }
+
+        /// Drops the database, and the role of [`EmptyDatabase::create_role`] if there is one.
+        async fn remove(self) -> Result<()> {
+            let c = self.admin.connection().await?;
+            c.batch_execute(&format!("drop database {} with (force)", self.name))
+                .await?;
+            c.batch_execute(&format!("drop role if exists {}_role", self.name))
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    /// Runs `body` on an empty database of its own, then drops the database when `body` returns.
+    /// Skips `test` when the server can't be reached.
+    async fn with_empty_database(
+        test: &str,
+        body: impl AsyncFnOnce(&EmptyDatabase) -> Result<()>,
+    ) -> Result<()> {
+        let Some(database) = EmptyDatabase::create(test).await? else {
+            return Ok(());
+        };
+
+        let outcome = body(&database).await;
+        let removed = database.remove().await;
+        outcome.and(removed)
+    }
+
+    /// Returns the version that the `nisshi_schema_version` table in `storage`'s database records,
+    /// or `None` when it records none.
+    async fn recorded_version(storage: &Postgres) -> Result<Option<i32>> {
+        storage
+            .connection()
+            .await?
+            .query_opt("select version from nisshi_schema_version", &[])
+            .await?
+            .map(|row| row.try_get(0))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn register(storage: &Postgres) -> Result<()> {
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: storage.node,
+                cluster_id: storage.cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await
+    }
+
+    /// Returns whether `storage`'s cluster is stored in its database.
+    async fn cluster_is_stored(storage: &Postgres) -> Result<bool> {
+        storage
+            .connection()
+            .await?
+            .query_one(
+                "select count(*) from cluster where name = $1",
+                &[&storage.cluster],
+            )
+            .await?
+            .try_get::<_, i64>(0)
+            .map(|count| count == 1)
+            .map_err(Into::into)
+    }
+
+    /// Builds a storage on `storage` through the factory, as a broker does at startup.
+    ///
+    /// The server reserves some connections for superusers. The other tests connect as a superuser
+    /// and can hold every other connection. When `storage` logs in as a role that isn't a
+    /// superuser, this function then waits up to 30 seconds for a free connection.
+    async fn build_with_factory(storage: Url) -> Result<ArcDynStorage> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+        loop {
+            let built = factory::PostgresFactory
+                .build(StorageFactoryConfiguration {
+                    node_id: 111,
+                    cluster: alphanumeric_string(15),
+                    advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                    storage: storage.clone(),
+                    schema_registry: None,
+                    lake_house: None,
+                    cancellation: Default::default(),
+                })
+                .await;
+
+            match built {
+                Err(Error::StartupFailed {
+                    failure: StartupFailure::StorageUnreachable,
+                    ref source,
+                    ..
+                }) if server_has_no_free_connection(source)
+                    && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(500)).await
+                }
+                built => return built,
+            }
+        }
+    }
+
+    /// Returns whether the server refused a connection because it had no free connection.
+    fn server_has_no_free_connection(error: &Error) -> bool {
+        let Error::Pool(pool_error) = error else {
+            return false;
+        };
+
+        matches!(
+            pool_error.downcast_ref::<PoolError>(),
+            Some(PoolError::Backend(err)) if err.code() == Some(&SqlState::TOO_MANY_CONNECTIONS)
+        )
+    }
+
+    /// In an empty database, `ensure_schema` must create every table and record [`SCHEMA_VERSION`].
+    #[tokio::test]
+    async fn ensure_schema_creates_the_schema_on_an_empty_database() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_creates_the_schema_on_an_empty_database",
+            async |database| {
+                let storage = database.storage()?;
+
+                storage.ensure_schema().await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                register(&storage).await?;
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A newer release set up this database with a schema that this release can use.
+    /// `ensure_schema` must leave the tables, the data and the recorded version as they are.
+    #[tokio::test]
+    async fn ensure_schema_keeps_a_database_that_records_a_version() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_keeps_a_database_that_records_a_version",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                register(&storage).await?;
+                database.record_schema_version(2, 1).await?;
+
+                storage.ensure_schema().await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// An earlier release created the tables in this database without recording a version.
+    /// `ensure_schema` must record [`SCHEMA_VERSION`] and keep the data.
+    #[tokio::test]
+    async fn ensure_schema_records_the_version_of_a_database_created_without_one() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_records_the_version_of_a_database_created_without_one",
+            async |database| {
+                let storage = database.storage()?;
+                database.execute(SCHEMA).await?;
+                register(&storage).await?;
+
+                storage.ensure_schema().await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// When an existing deployment keeps its tables in PostgreSQL's `public` namespace (which
+    /// PostgreSQL calls a schema), `ensure_schema` must add the version table there too, even when
+    /// the broker's search path puts another, empty namespace first. It must create nothing in that
+    /// other namespace, because reads would then find empty copies of the tables instead of data.
+    #[tokio::test]
+    async fn ensure_schema_uses_the_namespace_that_holds_the_existing_tables() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_uses_the_namespace_that_holds_the_existing_tables",
+            async |database| {
+                database.execute(SCHEMA).await?;
+                database.execute("create schema first_on_path").await?;
+
+                // tokio-postgres reads a `+` in the URL as a `+`, so the space is written as `%20`.
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20search_path%3Dfirst_on_path%2Cpublic"));
+                let storage = database.storage_at(&url)?;
+                register(&storage).await?;
+
+                storage.ensure_schema().await?;
+
+                let tables_in_first_on_path = storage
+                    .connection()
+                    .await?
+                    .query_one(
+                        "select count(*) from pg_tables where schemaname = 'first_on_path'",
+                        &[],
+                    )
+                    .await?
+                    .try_get::<_, i64>(0)?;
+                assert_eq!(tables_in_first_on_path, 0);
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// Four brokers run `ensure_schema` at the same time on one empty database. Each one must
+    /// succeed, and the database must record [`SCHEMA_VERSION`].
+    #[tokio::test]
+    async fn ensure_schema_succeeds_for_brokers_that_start_together() -> Result<()> {
+        const BROKERS: usize = 4;
+
+        with_empty_database(
+            "ensure_schema_succeeds_for_brokers_that_start_together",
+            async |database| {
+                let storages = (0..BROKERS)
+                    .map(|_| database.storage())
+                    .collect::<Result<Vec<_>>>()?;
+
+                for result in
+                    future::join_all(storages.iter().map(|storage| storage.ensure_schema())).await
+                {
+                    result?;
+                }
+
+                assert_eq!(recorded_version(&storages[0]).await?, Some(SCHEMA_VERSION));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The database is already set up, and the broker's database user can read and write the tables
+    /// but can't create them. The broker must start.
+    #[tokio::test]
+    async fn factory_starts_without_create_permission_on_a_database_that_is_set_up() -> Result<()> {
+        with_empty_database(
+            "factory_starts_without_create_permission_on_a_database_that_is_set_up",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                let role = database.create_role().await?;
+                database
+                    .execute(&format!(
+                        "grant select, insert, update, delete on all tables in schema public to {0}; \
+                         grant usage on all sequences in schema public to {0}",
+                        role.username()
+                    ))
+                    .await?;
+
+                _ = build_with_factory(role).await?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The database is empty, and the broker's database user can't create tables. The broker must
+    /// stop at startup with a `SchemaSetup` failure.
+    #[tokio::test]
+    async fn factory_fails_with_schema_setup_when_the_user_cannot_create_tables() -> Result<()> {
+        with_empty_database(
+            "factory_fails_with_schema_setup_when_the_user_cannot_create_tables",
+            async |database| {
+                let role = database.create_role().await?;
+
+                let Err(Error::StartupFailed {
+                    storage: reported,
+                    failure,
+                    source,
+                }) = build_with_factory(role.clone()).await
+                else {
+                    panic!("expected a startup failure");
+                };
+
+                assert_eq!(failure, StartupFailure::SchemaSetup);
+                assert_eq!(*reported, nisshi_schema::redact_url(&role));
+                assert_eq!(reported.password(), None);
+                assert_matches!(
+                    &*source,
+                    Error::TokioPostgres(err) if err.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A newer release set up this database with a schema that this release can't use. The broker
+    /// must stop at startup with an `IncompatibleSchema` error.
+    #[tokio::test]
+    async fn factory_refuses_a_database_whose_schema_this_release_cannot_use() -> Result<()> {
+        with_empty_database(
+            "factory_refuses_a_database_whose_schema_this_release_cannot_use",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                database.record_schema_version(2, 2).await?;
+
+                let Err(Error::StartupFailed {
+                    failure, source, ..
+                }) = build_with_factory(database.url()?).await
+                else {
+                    panic!("expected a startup failure");
+                };
+
+                assert_eq!(failure, StartupFailure::SchemaSetup);
+                assert_matches!(*source, Error::IncompatibleSchema { .. });
+                Ok(())
+            },
+        )
+        .await
     }
 }

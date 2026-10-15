@@ -399,6 +399,15 @@ docker compose up -d db
 
 The `db` service runs PostgreSQL 18, and that image does not start on a `db` volume that holds PostgreSQL 17 data. Run `docker compose down --volumes` once before the first start, or set `POSTGRES_IMAGE=postgres:17` in [.env](.env) to stay on 17.
 
+Nisshi creates its tables when it starts on an empty database. On a PostgreSQL server of your own, give Nisshi a role that owns its database:
+
+```sql
+create role nisshi login password '...';
+create database nisshi owner nisshi;
+```
+
+Nisshi needs PostgreSQL 13 or later. On PostgreSQL 16 or later, an administrator who isn't a superuser, such as the admin user of a managed service, must first run `grant nisshi to <admin>`. Nisshi supports a database that 0.7.0-pre.3 or a later release set up.
+
 Bring Nisshi back up:
 
 ```shell

@@ -82,20 +82,54 @@ async fn main() -> Result<ErrorCode> {
                         "could not get AWS credentials from the configured provider: {source}. AWS credentials come from static keys (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY), a web identity token (AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN), an ECS or EKS container credential endpoint, or the EC2 instance metadata service."
                     )
                 }
-                nisshi_broker::Error::Storage(nisshi_storage::Error::StartupCheck {
+                nisshi_broker::Error::Storage(nisshi_storage::Error::StartupFailed {
                     storage,
+                    failure,
                     source,
-                }) => error!(
-                    "storage {storage} failed its startup check: {source}{}",
-                    startup_check_hint(storage.scheme())
-                ),
+                }) => match failure {
+                    nisshi_storage::StartupFailure::StorageUnreachable => error!(
+                        "storage {storage} failed its startup check: {source}{}",
+                        startup_check_hint(storage.scheme())
+                    ),
+                    nisshi_storage::StartupFailure::SchemaSetup => match &**source {
+                        nisshi_storage::Error::IncompatibleSchema {
+                            recorded_version,
+                            oldest_compatible_version,
+                            schema_version,
+                        } => error!(
+                            "storage {storage} records schema version {recorded_version}, which a \
+                            release with schema version {oldest_compatible_version} or later can \
+                            use. This release has schema version {schema_version}: upgrade Nisshi."
+                        ),
+                        nisshi_storage::Error::OutdatedSchema {
+                            recorded_version,
+                            schema_version,
+                        } => error!(
+                            "storage {storage} records schema version {recorded_version}, which is \
+                            older than this release's schema version {schema_version}. This \
+                            release can't upgrade the schema: run the release that set up this \
+                            database."
+                        ),
+                        #[cfg(feature = "postgres")]
+                        nisshi_storage::Error::TokioPostgres(err)
+                            if err.code().map(|code| code.code()) == Some("42501") =>
+                        {
+                            error!(
+                                "storage {storage} failed its schema setup: {source}. The broker's \
+                                database role must own Nisshi's tables and views, and must be \
+                                allowed to create a table in their schema. See the PostgreSQL \
+                                section of README.md."
+                            )
+                        }
+                        _ => error!("storage {storage} failed its schema setup: {source}"),
+                    },
+                },
                 nisshi_broker::Error::InvalidStorageOptionValue { option, value } => error!(
                     "storage option {option}={value} is not a valid interval: give a non-zero duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"
                 ),
-                nisshi_broker::Error::Storage(nisshi_storage::Error::UnrecognizedStorageOption {
-                    scheme,
-                    option,
-                }) => error!("storage option {option} is not recognised by the {scheme} engine"),
+                nisshi_broker::Error::Storage(
+                    nisshi_storage::Error::UnrecognizedStorageOption { scheme, option },
+                ) => error!("storage option {option} is not recognised by the {scheme} engine"),
                 _ => error!("Unknown error occurred during command: {}", err),
             },
             nisshi_cli::Error::TlsCertificate { path, source } => error!(
