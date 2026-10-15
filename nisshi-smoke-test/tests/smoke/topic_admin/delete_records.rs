@@ -30,14 +30,15 @@ const DELETE_BEFORE_OFFSET: i64 = 3;
 ///
 /// Each test launches its own broker instead of using the shared one, because a broker that
 /// panics on `DeleteRecords` would fail every other test on the shared broker too.
+#[track_caller]
 fn create_topic_with_records() -> (Broker, KafkaCli, String) {
     let broker = Broker::isolated();
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
     let values = (0..PRODUCED_RECORD_COUNT)
         .map(|n| format!("value-{n}"))
         .collect::<Vec<_>>();
-    _ = cli.produce_values(&topic, &values);
+    _ = cli.console_producer().produce_values(&topic, &values);
 
     (broker, cli, topic)
 }
@@ -45,12 +46,10 @@ fn create_topic_with_records() -> (Broker, KafkaCli, String) {
 /// The tool prints the low watermark that the broker returns, the partition's new earliest offset.
 /// A user reads it to confirm what the deletion did.
 #[test]
-#[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies"]
 fn delete_records_returns_the_new_low_watermark() {
     let (_broker, cli, topic) = create_topic_with_records();
 
-    let deleted = cli.delete_records_before(&topic, 0, DELETE_BEFORE_OFFSET);
+    let deleted = cli.delete_records().before(&topic, 0, DELETE_BEFORE_OFFSET);
 
     assert_eq!(
         deleted.succeeded().low_watermark(&topic, 0),
@@ -63,16 +62,15 @@ fn delete_records_returns_the_new_low_watermark() {
 /// deleted before. A consumer that starts from the beginning then reads only the records the user
 /// kept.
 #[test]
-#[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies"]
 fn earliest_offset_moves_to_the_offset_deleted_before() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
-        .delete_records_before(&topic, 0, DELETE_BEFORE_OFFSET)
+        .delete_records()
+        .before(&topic, 0, DELETE_BEFORE_OFFSET)
         .succeeded();
 
     assert_eq!(
-        cli.partition_offsets_at(&topic, "earliest"),
+        cli.get_offsets().partition_offsets(&topic, "earliest"),
         [DELETE_BEFORE_OFFSET]
     );
 }
@@ -80,16 +78,19 @@ fn earliest_offset_moves_to_the_offset_deleted_before() {
 /// The deletion must not change the partition's latest offset. A broker that numbers new records
 /// from a lower offset gives two records one offset, and consumers skip or repeat records.
 #[test]
-#[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies"]
+#[cfg_attr(
+    feature = "memory",
+    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
+)]
 fn latest_offset_is_kept_after_delete_records() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
-        .delete_records_before(&topic, 0, DELETE_BEFORE_OFFSET)
+        .delete_records()
+        .before(&topic, 0, DELETE_BEFORE_OFFSET)
         .succeeded();
 
     assert_eq!(
-        cli.partition_offsets_at(&topic, "latest"),
+        cli.get_offsets().partition_offsets(&topic, "latest"),
         [PRODUCED_RECORD_COUNT as i64]
     );
 }

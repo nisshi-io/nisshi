@@ -84,6 +84,18 @@ pub(crate) fn broker_work_dir() -> PathBuf {
     PathBuf::from(required("NISSHI_SMOKE_WORK_DIR"))
 }
 
+/// Returns the image of the PostgreSQL server that a test starts for itself, from
+/// `NISSHI_SMOKE_POSTGRES_IMAGE`.
+pub(crate) fn postgres_image() -> String {
+    required("NISSHI_SMOKE_POSTGRES_IMAGE")
+}
+
+/// Returns the directory of the files that reserve ports, from `NISSHI_SMOKE_PORT_LOCKS`. Every
+/// run of the same user shares it.
+pub(crate) fn port_lock_dir() -> PathBuf {
+    PathBuf::from(required("NISSHI_SMOKE_PORT_LOCKS"))
+}
+
 const RUN_WITH_JUST_SMOKE: &str = "run the suite with `just smoke <engine>`";
 
 fn required(name: &str) -> String {

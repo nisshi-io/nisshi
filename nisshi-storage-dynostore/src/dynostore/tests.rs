@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
+mod delete_records;
 mod latency;
 mod ping;
 mod post_write_failure_reason;

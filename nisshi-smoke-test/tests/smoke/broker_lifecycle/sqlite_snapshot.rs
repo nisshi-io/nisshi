@@ -21,7 +21,7 @@
 use std::time::Duration;
 
 use nisshi_smoke_test::{
-    Broker, FREQUENT_MAINTENANCE, KafkaCli, LaunchOptions, StorageUrl, settings, wait_until,
+    Broker, FREQUENT_MAINTENANCE, KafkaCli, LaunchOptions, StorageUrl, polling, settings,
 };
 
 /// The snapshot's path, relative to the broker's working directory, where its database is too.
@@ -47,15 +47,15 @@ fn broker_started_on_a_snapshot_has_its_topics_and_records() {
             .with_query_option(&format!("vacuum_into={SNAPSHOT_PATH}")),
     ));
     let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
     let values = ["value-0", "value-1", "value-2"];
-    _ = cli.produce_values(&topic, &values);
+    _ = cli.console_producer().produce_values(&topic, &values);
 
     // A run that started before the records were stored writes a snapshot without them, so the
     // test waits until the broker has written the snapshot twice.
     let mut last_written = broker.file_modification_time(SNAPSHOT_PATH);
     for _ in 0..2 {
-        last_written = Some(wait_until(SNAPSHOT_TIMEOUT, || {
+        last_written = Some(polling::wait_until(SNAPSHOT_TIMEOUT, || {
             match broker.file_modification_time(SNAPSHOT_PATH) {
                 Some(written) if Some(&written) != last_written.as_ref() => Ok(written),
                 _ => Err(format!("the broker didn't write {SNAPSHOT_PATH} again")),
@@ -72,7 +72,8 @@ fn broker_started_on_a_snapshot_has_its_topics_and_records() {
     let cli = KafkaCli::new(broker.bootstrap());
 
     assert_eq!(
-        cli.read_records(&topic, 0, 0, values.len())
+        cli.console_consumer()
+            .read_records(&topic, 0, 0, values.len())
             .into_iter()
             .map(|record| record.value)
             .collect::<Vec<_>>(),

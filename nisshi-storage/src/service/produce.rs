@@ -29,7 +29,7 @@ use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, METER, Result, Storage, Topition};
+use crate::{Error, METER, Result, Storage, Topition, offload};
 
 /// Counts the connections closed by a failed `acks=0` Produce, by the error
 /// code of the first failing partition.
@@ -438,6 +438,24 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
     }
 }
 
+/// Runs [`rewrite_create_time`] on Tokio's blocking thread pool, through
+/// [`offload`], and hands the batch back with the outcome.
+///
+/// The batch moves into the closure and back out, because `offload` needs a
+/// `'static` closure. A clone would only add a handle to the same record
+/// bytes, so moving the batch keeps one owner.
+async fn rewrite_create_time_offloaded(
+    batch: deflated::Batch,
+    now: i64,
+) -> Result<(deflated::Batch, Option<Rejection>)> {
+    offload(move || {
+        let mut batch = batch;
+        let rejection = rewrite_create_time(&mut batch, now)?;
+        Ok((batch, rejection))
+    })
+    .await
+}
+
 /// The rejection for a client batch that [`inflate_produced`] did not decode,
 /// with the error code [`storage_error_code`] gives `error`: `MESSAGE_TOO_LARGE`
 /// for a batch over the decoded-size limit, which a producer recovers from by
@@ -467,6 +485,7 @@ fn corrupt_batch() -> Rejection {
 mod rewrite_create_time_tests {
     use bytes::{BufMut as _, BytesMut};
     use nisshi_sans_io::{Compression, record::Record};
+    use tokio::task::yield_now;
 
     use super::*;
 
@@ -662,6 +681,65 @@ mod rewrite_create_time_tests {
             rewrite_create_time(&mut batch, FIXED_NOW)?
         );
         assert_eq!(damaged, batch);
+
+        Ok(())
+    }
+
+    // The test runtime has a single thread. If the rewrite decoded the batch
+    // inline, the spawned task would decode, rewrite and return within its
+    // first poll, so it would already be finished when `yield_now` returns.
+    // Offloaded, it is still waiting on the decode.
+    #[tokio::test]
+    async fn rewrite_runs_off_the_runtime_thread() -> Result<()> {
+        const RECORDS: usize = 1_000;
+        const RECORD_SIZE: usize = 1_024;
+
+        // Pseudo-random values, so gzip has real work to do on decode.
+        let mut seed = 0x2545_f491_u32;
+        let mut builder = inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+            )
+            .base_timestamp(FIXED_NOW)
+            .max_timestamp(NO_TIMESTAMP)
+            .last_offset_delta(i32::try_from(RECORDS)? - 1);
+
+        for offset_delta in 0..RECORDS {
+            let value = (0..RECORD_SIZE)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect::<bytes::Bytes>();
+
+            builder = builder.record(
+                Record::builder()
+                    .value(value.into())
+                    .offset_delta(i32::try_from(offset_delta)?)
+                    .timestamp_delta(i64::try_from(offset_delta)?),
+            );
+        }
+
+        let batch: deflated::Batch = builder.build().and_then(TryInto::try_into)?;
+
+        let rewrite = tokio::spawn(rewrite_create_time_offloaded(batch, FIXED_NOW));
+
+        yield_now().await;
+
+        assert!(
+            !rewrite.is_finished(),
+            "the batch was decoded on the runtime thread"
+        );
+
+        let (batch, rejection) = rewrite.await??;
+
+        assert_eq!(None, rejection);
+        assert_eq!(FIXED_NOW + i64::try_from(RECORDS)? - 1, batch.max_timestamp);
+        assert_eq!(batch.computed_crc(), batch.crc);
 
         Ok(())
     }
@@ -889,11 +967,11 @@ where
                 }
             }
         } else {
-            match rewrite_create_time(&mut batch, now) {
-                Ok(Some(rejection)) => {
-                    return self.reject(name, partition.index, &batch, rejection);
+            match rewrite_create_time_offloaded(batch, now).await {
+                Ok((rewritten, None)) => batch = rewritten,
+                Ok((rewritten, Some(rejection))) => {
+                    return self.reject(name, partition.index, &rewritten, rejection);
                 }
-                Ok(None) => {}
                 Err(err) => {
                     error!(?err);
                     return self.error(partition.index, ErrorCode::UnknownServerError);

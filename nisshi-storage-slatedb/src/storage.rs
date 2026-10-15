@@ -50,11 +50,12 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    inflate_produced, producer_claim,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
+    producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::sleep;
@@ -580,42 +581,11 @@ impl Storage for Engine {
                         if partition.partition_index < 0
                             || partition.partition_index >= metadata.topic.num_partitions
                         {
-                            (ErrorCode::UnknownTopicOrPartition, 0)
+                            (
+                                ErrorCode::UnknownTopicOrPartition,
+                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                            )
                         } else {
-                            // Delete batches below the specified offset
-                            let batch_prefix = postcard::to_stdvec(&BatchKeyPrefix::new(
-                                metadata.id,
-                                partition.partition_index,
-                            ))?;
-                            let scan_start = postcard::to_stdvec(&BatchKey::scan_from(
-                                metadata.id,
-                                partition.partition_index,
-                                0,
-                            ))?;
-
-                            let mut scan = self.db.scan(scan_start..).await?;
-                            while let Some(kv) = scan.next().await? {
-                                if !kv.key.starts_with(&batch_prefix) {
-                                    break;
-                                }
-
-                                let batch_key: BatchKey = match postcard::from_bytes(&kv.key) {
-                                    Ok(key) => key,
-                                    Err(_) => continue,
-                                };
-
-                                // Delete batches with offset < specified offset
-                                if batch_key.offset >= partition.offset {
-                                    break;
-                                }
-
-                                tx.delete(&kv.key)?;
-                            }
-
-                            // The new low watermark is the requested offset
-                            let new_low_watermark = partition.offset;
-
-                            // Update the watermark
                             let watermark_key = postcard::to_stdvec(&WatermarkKey::new(
                                 metadata.id,
                                 partition.partition_index,
@@ -630,20 +600,89 @@ impl Storage for Engine {
                                     },
                                 )?;
 
-                            watermark.low = Some(new_low_watermark);
+                            let high_watermark = watermark.high.unwrap_or(0);
+                            let log_start = watermark.low.unwrap_or(0);
 
-                            // Remove timestamps before the new low watermark
-                            if let Some(ref mut timestamps) = watermark.timestamps {
-                                timestamps.retain(|_, offset| *offset >= new_low_watermark);
+                            let stage = OffsetStage {
+                                last_stable: high_watermark,
+                                high_watermark,
+                                log_start,
+                            };
+
+                            match delete_records_cutoff(partition.offset, &stage) {
+                                Err(error_code) => {
+                                    (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                }
+
+                                Ok(cutoff) => {
+                                    if cutoff > log_start {
+                                        // A batch key holds the base offset of the batch,
+                                        // and not its end offset. A batch ends before the
+                                        // base offset of the next batch, so this deletes a
+                                        // batch when the next batch's base offset is at or
+                                        // below the cutoff, without decoding either batch.
+                                        // A batch that straddles the cutoff stays whole.
+                                        // The last batch has no successor, so this never
+                                        // deletes it. That batch holds `high_watermark - 1`.
+                                        let batch_prefix =
+                                            postcard::to_stdvec(&BatchKeyPrefix::new(
+                                                metadata.id,
+                                                partition.partition_index,
+                                            ))?;
+                                        let scan_start =
+                                            postcard::to_stdvec(&BatchKey::scan_from(
+                                                metadata.id,
+                                                partition.partition_index,
+                                                0,
+                                            ))?;
+
+                                        let mut previous: Option<Bytes> = None;
+
+                                        let mut scan = self.db.scan(scan_start..).await?;
+                                        while let Some(kv) = scan.next().await? {
+                                            if !kv.key.starts_with(&batch_prefix) {
+                                                break;
+                                            }
+
+                                            let Ok(batch_key) =
+                                                postcard::from_bytes::<BatchKey>(&kv.key)
+                                            else {
+                                                continue;
+                                            };
+
+                                            if batch_key.offset > cutoff {
+                                                break;
+                                            }
+
+                                            if let Some(key) = previous.replace(kv.key) {
+                                                tx.delete(&key)?;
+                                            }
+
+                                            if batch_key.offset == cutoff {
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    watermark.low = Some(cutoff);
+
+                                    // Remove timestamps before the new low watermark
+                                    if let Some(ref mut timestamps) = watermark.timestamps {
+                                        timestamps.retain(|_, offset| *offset >= cutoff);
+                                    }
+
+                                    let watermark_value = postcard::to_stdvec(&watermark)?;
+                                    tx.put(&watermark_key, watermark_value)?;
+
+                                    (ErrorCode::None, cutoff)
+                                }
                             }
-
-                            let watermark_value = postcard::to_stdvec(&watermark)?;
-                            tx.put(&watermark_key, watermark_value)?;
-
-                            (ErrorCode::None, new_low_watermark)
                         }
                     } else {
-                        (ErrorCode::UnknownTopicOrPartition, 0)
+                        (
+                            ErrorCode::UnknownTopicOrPartition,
+                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                        )
                     };
 
                     partition_results.push(
@@ -819,6 +858,15 @@ impl Storage for Engine {
         topition: &Topition,
         deflated: Batch,
     ) -> Result<i64> {
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not lengthen the optimistic
+        // transaction.
+        let inflated = if self.schemas.is_some() || self.lake.is_some() {
+            Some(inflate(deflated.clone()).await?)
+        } else {
+            None
+        };
+
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
@@ -836,13 +884,14 @@ impl Storage for Engine {
         }
 
         // Schema validation (if schemas registry is configured)
-        if let Some(ref schemas) = self.schemas {
-            let inflated = inflate_produced(deflated.clone())?;
+        if let Some(ref schemas) = self.schemas
+            && let Some(ref inflated) = inflated
+        {
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             // Only validate non-control batches
             if !attributes.control {
-                schemas.validate(topition.topic(), &inflated).await?;
+                schemas.validate(topition.topic(), inflated).await?;
             }
         }
 
@@ -977,8 +1026,9 @@ impl Storage for Engine {
         tx.put(watermark_key, watermark_value)?;
 
         // Store to data lake if configured
-        if let Some(ref lake) = self.lake {
-            let inflated = inflate_produced(deflated.clone())?;
+        if let Some(ref lake) = self.lake
+            && let Some(ref inflated) = inflated
+        {
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             if !attributes.control {
@@ -993,7 +1043,7 @@ impl Storage for Engine {
                     topition.topic(),
                     topition.partition(),
                     offset,
-                    &inflated,
+                    inflated,
                     config,
                 )
                 .await?;

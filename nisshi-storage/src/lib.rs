@@ -183,7 +183,7 @@ use std::{
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTime, SystemTimeError},
 };
-use tokio::sync::AcquireError;
+use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing_subscriber::filter::ParseError;
@@ -193,6 +193,7 @@ use uuid::Uuid;
 mod assignment;
 mod batch;
 pub mod config;
+mod inflate;
 mod latency;
 mod producer;
 mod proxy;
@@ -200,6 +201,7 @@ mod service;
 
 pub use assignment::assign_replicas;
 pub use batch::ProduceRequestBatcher;
+pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use producer::{check_claim, producer_claim};
 pub use proxy::SemaphoreProxy;
@@ -259,6 +261,9 @@ pub enum Error {
     Glob(Arc<GlobError>),
     InsufficientCapacity(#[from] InsufficientCapacity),
     Io(Arc<io::Error>),
+
+    /// An [`offload`]ed task panicked or was cancelled.
+    Join(Arc<JoinError>),
 
     LessThanBaseOffset {
         offset: i64,
@@ -393,6 +398,12 @@ impl From<TryGetError> for Error {
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
+    }
+}
+
+impl From<JoinError> for Error {
+    fn from(value: JoinError) -> Self {
+        Self::Join(Arc::new(value))
     }
 }
 
@@ -900,6 +911,46 @@ impl OffsetStage {
     pub fn log_start(&self) -> i64 {
         self.log_start
     }
+}
+
+/// The `low_watermark` of a `DeleteRecords` partition result that carries an
+/// error, as Kafka's `DeleteRecordsResponse.INVALID_LOW_WATERMARK`.
+pub const DELETE_RECORDS_INVALID_LOW_WATERMARK: i64 = -1;
+
+/// Validate a client-requested `DeleteRecords` offset against a partition's
+/// current [`OffsetStage`], and resolve it to the new low watermark (log
+/// start offset).
+///
+/// Mirrors the validation Kafka applies in `Partition.deleteRecordsOnLeader`
+/// / `UnifiedLog.maybeIncrementLogStartOffset`:
+///
+/// - `requested == -1` means "delete everything up to the high watermark"
+///   (what `kafka-delete-records.sh` sends by default): resolves to
+///   `stage.high_watermark`.
+/// - Any other negative offset, or one above the high watermark, is
+///   [`ErrorCode::OffsetOutOfRange`].
+/// - An offset at or below the current log start is a no-op: it resolves to
+///   the *existing* `stage.log_start`, not the requested value, so the log
+///   start never moves backward.
+/// - Otherwise the requested offset becomes the new log start.
+///
+/// Every backend must call this before mutating any watermark or deleting
+/// any record/object, so the five storage engines cannot drift from one
+/// another on what counts as a valid request.
+pub fn delete_records_cutoff(requested: i64, stage: &OffsetStage) -> Result<i64, ErrorCode> {
+    if requested == -1 {
+        return Ok(stage.high_watermark);
+    }
+
+    if requested < -1 || requested > stage.high_watermark {
+        return Err(ErrorCode::OffsetOutOfRange);
+    }
+
+    if requested <= stage.log_start {
+        return Ok(stage.log_start);
+    }
+
+    Ok(requested)
 }
 
 /// Group Member
@@ -2549,6 +2600,104 @@ mod tests {
         let url = Url::parse("memory://nisshi/")?;
         assert_eq!(url, redact_url(&url));
         Ok(())
+    }
+
+    #[test]
+    fn delete_records_cutoff_minus_one_means_high_watermark() {
+        let stage = OffsetStage {
+            last_stable: 100,
+            high_watermark: 100,
+            log_start: 10,
+        };
+
+        assert_eq!(Ok(100), delete_records_cutoff(-1, &stage));
+    }
+
+    #[test]
+    fn delete_records_cutoff_rejects_other_negative_offsets() {
+        let stage = OffsetStage {
+            last_stable: 100,
+            high_watermark: 100,
+            log_start: 10,
+        };
+
+        assert_eq!(
+            Err(ErrorCode::OffsetOutOfRange),
+            delete_records_cutoff(-2, &stage)
+        );
+
+        assert_eq!(
+            Err(ErrorCode::OffsetOutOfRange),
+            delete_records_cutoff(i64::MIN, &stage)
+        );
+    }
+
+    #[test]
+    fn delete_records_cutoff_rejects_offset_above_high_watermark() {
+        let stage = OffsetStage {
+            last_stable: 100,
+            high_watermark: 100,
+            log_start: 10,
+        };
+
+        assert_eq!(
+            Err(ErrorCode::OffsetOutOfRange),
+            delete_records_cutoff(101, &stage)
+        );
+    }
+
+    #[test]
+    fn delete_records_cutoff_at_or_below_log_start_is_a_noop() {
+        let stage = OffsetStage {
+            last_stable: 100,
+            high_watermark: 100,
+            log_start: 10,
+        };
+
+        // Exactly at the current log start: unchanged.
+        assert_eq!(Ok(10), delete_records_cutoff(10, &stage));
+
+        // Below the current log start: the log start never moves backward.
+        assert_eq!(Ok(10), delete_records_cutoff(0, &stage));
+    }
+
+    #[test]
+    fn delete_records_cutoff_within_range_uses_requested_offset() {
+        let stage = OffsetStage {
+            last_stable: 100,
+            high_watermark: 100,
+            log_start: 10,
+        };
+
+        assert_eq!(Ok(50), delete_records_cutoff(50, &stage));
+    }
+
+    #[test]
+    fn delete_records_cutoff_allows_explicit_high_watermark() {
+        let stage = OffsetStage {
+            last_stable: 100,
+            high_watermark: 100,
+            log_start: 10,
+        };
+
+        assert_eq!(Ok(100), delete_records_cutoff(100, &stage));
+    }
+
+    #[test]
+    fn delete_records_cutoff_on_empty_partition() {
+        // A brand new partition: high_watermark == log_start == 0.
+        let stage = OffsetStage {
+            last_stable: 0,
+            high_watermark: 0,
+            log_start: 0,
+        };
+
+        assert_eq!(Ok(0), delete_records_cutoff(-1, &stage));
+        assert_eq!(Ok(0), delete_records_cutoff(0, &stage));
+        assert_eq!(
+            Err(ErrorCode::OffsetOutOfRange),
+            delete_records_cutoff(1, &stage)
+        );
     }
 
     fn log_file_path() -> Result<String> {

@@ -1,15 +1,23 @@
 ---
 name: tier-c
 
-# Tier C is the optional nightly tier. It runs the checks that are too slow
-# or too unstable to gate a merge: the compat suites on the S3 engine, the
-# `test` suite on more Postgres versions, including one beta, the build on
-# Windows, and the full macOS release build (ci.yml only checks macOS, except
-# on a `v*` tag).
+# Tier C is the optional scheduled tier, run twice a day. It runs the checks
+# that are too slow or too unstable to gate a merge: the compat suites on the
+# S3 engine, the `test` suite on more Postgres versions, including one beta,
+# the build on Windows, and the full macOS release build (ci.yml only checks
+# macOS, except on a `v*` tag). It also publishes the `edge` image, see below.
 #
 # Tier C does not gate anything. It is not in the `needs` of ci-gate and it is
 # not a required check. A red run opens or updates one GitHub issue with the
 # `nightly-failure` label. The next green run closes that issue.
+#
+# The `edge-gate` and `edge-publish` jobs push the multi-arch image of main's
+# tip as `ghcr.io/nisshi-io/nisshi:edge`, and as `main`, which stays for
+# external consumers and goes in a follow-up. They push only when the merge
+# queue passed the tip, and they reuse the binaries that the push run of ci.yml
+# built, so they compile nothing. `edge` can trail the tip until the next run
+# when a merge lands during the scheduled run, or shortly before it while that
+# merge's push run is still in progress: the gate then skips the publish.
 #
 # The workflow runs on main only. Each job checks the ref, so a manual run
 # from another ref does nothing.
@@ -17,9 +25,12 @@ permissions:
   contents: read
 on:
   schedule:
-    # 03:17 UTC. An off-peak hour that is not on the hour, so the run does
-    # not queue with the many scheduled workflows that start at :00.
-    - cron: "17 3 * * *"
+    # 06:17 and 18:17 UTC, which is 02:17 and 14:17 US Eastern while daylight
+    # saving time is in effect (01:17 and 13:17 after it ends). Cron has no
+    # time zone, so these two times move by an hour at each change. Not on the
+    # hour, so the run does not queue with the many scheduled workflows that
+    # start at :00.
+    - cron: "17 6,18 * * *"
   workflow_dispatch:
 # Two Tier C runs on one ref must not overlap: both write to the same issue.
 # A run that arrives while another runs waits. GitHub keeps one waiting run
@@ -47,9 +58,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pg: postgres:16
-            experimental: false
           - pg: postgres:17
+            experimental: false
+          - pg: postgres:18
             experimental: false
           # Docker Hub has no tag that follows the latest beta, so a person
           # moves this tag to the next beta, and to the release when it ships.
@@ -99,7 +110,7 @@ jobs:
           # that ci.yml restores on every pull request.
           cache-shared-key: dev
           cache-save-if: false
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest@0.9.146
       # Set on the step, as in ci.yml: the cache key hashes `RUST*` variables.
@@ -111,7 +122,7 @@ jobs:
         if: always()
       - run: tar --create --verbose --gzip --file="logs-${PG_IMAGE_DASH}.tar.gz" logs
         if: always()
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: logs-${{env.PG_IMAGE_DASH}}.tar.gz
@@ -142,7 +153,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:17
+          ecr-fallback-images: postgres:18
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -154,7 +165,7 @@ jobs:
       - run: just compat-infra-up
       - run: just compat-librdkafka "$STORAGE_ENGINE" "$STORAGE_FEATURES"
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compat-librdkafka-results-s3
           path: ${{env.RESULTS_FILE}}
@@ -174,7 +185,7 @@ jobs:
             .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
           path: reports
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: compat-librdkafka-results-*
           path: results
@@ -214,7 +225,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:17
+          ecr-fallback-images: postgres:18
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -227,7 +238,7 @@ jobs:
       - run: just compat-infra-up
       - run: just compat-franz-go "$STORAGE_ENGINE" "$STORAGE_FEATURES"
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compat-franz-go-results-s3
           path: ${{env.RESULTS_FILE}}
@@ -247,7 +258,7 @@ jobs:
             .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
           path: reports
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: compat-franz-go-results-*
           path: results
@@ -296,16 +307,125 @@ jobs:
           build-warnings: ""
           cache: false
       - run: rustup target add "$TARGET"
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
       - run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+  # Passes only when the tip of main has a successful merge-queue run of
+  # ci.yml, so no image is pushed from a commit that skipped the queue. The
+  # push run of ci.yml is trimmed and does not test the tree, so the gate
+  # reads the merge_group run for the verdict and the push run for the
+  # binaries. ci-gate runs under `always()`, so a successful run conclusion
+  # means that ci-gate passed.
+  edge-gate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The job reads workflow runs and artifact metadata. It has no checkout.
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
+      run-id: ${{ steps.gate.outputs.run_id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A merge can land while this run is in progress. The newer tip gets
+          # its image from the next run, and this run must not move `edge`
+          # backwards, so it stops without an error.
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at ${tip}, not ${GITHUB_SHA}; the next run publishes the newer tip"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The newest run of ci.yml for this commit and event that completed
+          # with a success conclusion.
+          ok_run() {
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=$1&per_page=100" \
+              --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | sort_by(.created_at) | last | .id // empty'
+          }
+          queue_run=$(ok_run merge_group)
+          if [ -z "$queue_run" ]; then
+            echo "::error::${GITHUB_SHA} has no successful merge-queue run of ci.yml, so no image is published"
+            exit 1
+          fi
+          push_run=$(ok_run push)
+          # A merge that landed shortly before this run can still have its
+          # push run in progress. That is not a failure: the next run
+          # publishes the tip.
+          running=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=100" \
+            --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+          if [ -z "$push_run" ] && [ "$running" -gt 0 ]; then
+            echo "::notice::the push run of ci.yml for ${GITHUB_SHA} is still in progress; the next run publishes it"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$push_run" ]; then
+            echo "::error::${GITHUB_SHA} has no successful push run of ci.yml, so there are no binaries to publish"
+            exit 1
+          fi
+          # The artifacts expire after 30 days. After 30 days without a merge,
+          # the tip's artifacts are gone and an earlier run has already
+          # published the tip, so this run stops without an error. Only a new
+          # merge produces new artifacts.
+          names=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${push_run}/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.expired | not) | .name] | join(" ")')
+          for want in image-x86_64-unknown-linux-musl image-aarch64-unknown-linux-musl; do
+            case " ${names} " in
+              *" ${want} "*) ;;
+              *)
+                echo "::notice::run ${push_run} has no unexpired ${want} artifact; edge keeps its current image"
+                echo "publish=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done
+          echo "merge-queue run ${queue_run}, binaries from push run ${push_run}"
+          {
+            echo "publish=true"
+            echo "run_id=${push_run}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Pushes the image from the push run's binaries. The gate decides whether it
+  # pushes, and the steps skip instead of the job, so a newer tip leaves this
+  # job green and `alert` quiet.
+  edge-publish:
+    needs: [edge-gate]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # `actions: read` is for the download of another run's artifacts.
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    steps:
+      - if: needs.edge-gate.outputs.publish == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `main` is the tag that ci.yml used to push on every merge. It points
+      # at the same image as `edge`, and it stays for consumers outside this
+      # repository until a follow-up drops it.
+      - if: needs.edge-gate.outputs.publish == 'true'
+        uses: ./.github/actions/publish-image
+        with:
+          run-id: ${{ needs.edge-gate.outputs.run-id }}
+          tags: |
+            type=raw,value=edge
+            type=raw,value=main
   alert:
     # This job reads the result of each job above. A beta leg that fails does
     # not change the result of `test`, so it does not raise an alert.
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
-    needs: [test, compat-librdkafka, compat-franz-go, build-windows, macos-release]
+    needs: [test, compat-librdkafka, compat-franz-go, build-windows, macos-release, edge-gate, edge-publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # The job writes to issues and nothing else. It has no checkout, so

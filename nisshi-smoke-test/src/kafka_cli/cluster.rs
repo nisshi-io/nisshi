@@ -12,41 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `kafka-cluster` and `kafka-broker-api-versions`, which describe the cluster and its broker.
+//! `kafka-cluster`, which describes the cluster.
 
 use super::{KafkaCli, Output, Tool};
 
 /// How `kafka-cluster cluster-id` starts the line that holds the cluster's id.
 const CLUSTER_ID_LINE_PREFIX: &str = "Cluster ID: ";
-/// What `kafka-broker-api-versions` prints before the node id, on its first line.
-const NODE_ID_MARKER: &str = "(id: ";
 
-/// The command of [`KafkaCli::cluster_id`]'s [`Output`].
+/// The command of [`KafkaCluster::id`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum ClusterId {}
 
-/// The command of [`KafkaCli::api_versions`]'s [`Output`].
+/// Runs `kafka-cluster` against the broker of a [`KafkaCli`].
 #[derive(Clone, Copy, Debug)]
-pub enum ApiVersions {}
+pub struct KafkaCluster<'cli> {
+    cli: &'cli KafkaCli,
+}
 
-/// Runs `kafka-cluster`, which describes the cluster.
-impl KafkaCli {
+impl<'cli> KafkaCluster<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
+
     /// Prints the cluster's id, as `Cluster ID: <id>`.
     ///
     /// Sends `DescribeCluster`.
-    pub fn cluster_id(&self) -> Output<ClusterId> {
-        self.run(Tool::Cluster, &["cluster-id"])
-    }
-}
-
-/// Runs `kafka-broker-api-versions`, which lists the APIs each broker supports.
-impl KafkaCli {
-    /// Lists the API versions the broker supports, one `<name>(<key>): <min> to <max> [usable:
-    /// <version>]` line per API, after a line naming the broker.
-    ///
-    /// Sends `ApiVersions` and `Metadata`.
-    pub fn api_versions(&self) -> Output<ApiVersions> {
-        self.run(Tool::BrokerApiVersions, &[])
+    #[track_caller]
+    pub fn id(&self) -> Output<ClusterId> {
+        self.cli.run(Tool::Cluster, &["cluster-id"])
     }
 }
 
@@ -56,21 +49,5 @@ impl Output<ClusterId> {
         self.stdout
             .lines()
             .find_map(|line| line.strip_prefix(CLUSTER_ID_LINE_PREFIX))
-    }
-}
-
-impl Output<ApiVersions> {
-    /// Returns the node id that the listing names on its first line,
-    /// `<host>:<port> (id: <node> rack: ...) -> (`.
-    pub fn node_id(&self) -> Option<i32> {
-        self.stdout
-            .lines()
-            .next()?
-            .split_once(NODE_ID_MARKER)?
-            .1
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
     }
 }

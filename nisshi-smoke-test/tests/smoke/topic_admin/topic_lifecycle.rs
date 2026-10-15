@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 
-use nisshi_smoke_test::{GroupOffsets, KafkaCli, Record, unique_name};
+use nisshi_smoke_test::{GroupOffsets, KafkaCli, Record, unique};
 
 const RECORDS_WITH_KEYS_AND_HEADERS: [Record<'static>; 3] = [
     Record {
@@ -45,11 +45,14 @@ const TEST_TOPIC_PARTITIONS: u32 = 3;
 const TEST_TOPIC_CONFIGS: &[&str] = &["cleanup.policy=compact"];
 
 /// Creates a test topic with a name no other test uses.
+#[track_caller]
 fn create_test_topic(cli: &KafkaCli) -> String {
-    cli.create_unique_topic(TEST_TOPIC_PARTITIONS, TEST_TOPIC_CONFIGS)
+    cli.topics()
+        .create_unique(TEST_TOPIC_PARTITIONS, TEST_TOPIC_CONFIGS)
 }
 
 /// Creates a test topic and produces [`RECORDS_WITH_KEYS_AND_HEADERS`] to it.
+#[track_caller]
 fn create_test_topic_with_records(cli: &KafkaCli) -> String {
     let topic = create_test_topic(cli);
     produce_test_records(cli, &topic);
@@ -57,8 +60,11 @@ fn create_test_topic_with_records(cli: &KafkaCli) -> String {
 }
 
 /// Produces [`RECORDS_WITH_KEYS_AND_HEADERS`] to `topic`.
+#[track_caller]
 fn produce_test_records(cli: &KafkaCli, topic: &str) {
-    _ = cli.produce(topic, &RECORDS_WITH_KEYS_AND_HEADERS);
+    _ = cli
+        .console_producer()
+        .produce(topic, &RECORDS_WITH_KEYS_AND_HEADERS);
 }
 
 /// `offset` for each of a test topic's partitions.
@@ -66,15 +72,18 @@ fn every_partition_at_offset(offset: i64) -> Vec<i64> {
     vec![offset; TEST_TOPIC_PARTITIONS as usize]
 }
 
-/// `kafka-topics --delete` with a mistyped topic name must print an error that names the topic.
-/// `kafka-topics` finds the topic missing in `Metadata` before it sends `DeleteTopics`, so the test
-/// does not check the broker's answer to `DeleteTopics`.
+/// `kafka-topics --delete` with a mistyped topic name must fail, and must not create the topic.
+/// `kafka-topics` finds the topic missing in `Metadata` before it sends `DeleteTopics`, so the
+/// broker must answer `Metadata` without the topic, and without creating it.
 #[test]
 fn delete_missing_topic_fails() {
     let cli = KafkaCli::shared();
-    let topic = unique_name("topic");
+    let topic = unique::name("topic");
 
-    cli.delete_topic(&topic).assert_topic_does_not_exist(&topic);
+    _ = cli.topics().delete(&topic).exited(1);
+
+    let listed = cli.topics().list();
+    assert!(!listed.succeeded().lists_topic(&topic), "{listed}");
 }
 
 #[test]
@@ -82,7 +91,7 @@ fn list_shows_created_topic() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic(&cli);
 
-    let listed = cli.list_topics();
+    let listed = cli.topics().list();
 
     assert!(
         listed.succeeded().lists_topic(&topic),
@@ -95,7 +104,8 @@ fn create_duplicate_topic_fails() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic(&cli);
 
-    cli.create_topic(&topic, TEST_TOPIC_PARTITIONS, TEST_TOPIC_CONFIGS)
+    cli.topics()
+        .create(&topic, TEST_TOPIC_PARTITIONS, TEST_TOPIC_CONFIGS)
         .assert_topic_already_exists();
 }
 
@@ -104,7 +114,7 @@ fn describe_shows_partition_count() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic(&cli);
 
-    let described = cli.describe_topic(&topic);
+    let described = cli.topics().describe(&topic);
 
     assert_eq!(
         described.succeeded().partition_count(),
@@ -120,7 +130,7 @@ fn describe_shows_topic_configs() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic(&cli);
 
-    let described = cli.describe_topic(&topic);
+    let described = cli.topics().describe(&topic);
 
     assert_eq!(
         described.succeeded().topic_configs(),
@@ -135,7 +145,7 @@ fn earliest_offsets_are_0_before_produce() {
     let topic = create_test_topic(&cli);
 
     assert_eq!(
-        cli.partition_offsets_at(&topic, "earliest"),
+        cli.get_offsets().partition_offsets(&topic, "earliest"),
         every_partition_at_offset(0)
     );
 }
@@ -146,7 +156,7 @@ fn latest_offsets_are_0_before_produce() {
     let topic = create_test_topic(&cli);
 
     assert_eq!(
-        cli.partition_offsets_at(&topic, "latest"),
+        cli.get_offsets().partition_offsets(&topic, "latest"),
         every_partition_at_offset(0)
     );
 }
@@ -165,7 +175,7 @@ fn earliest_offsets_stay_0_after_produce() {
     let topic = create_test_topic_with_records(&cli);
 
     assert_eq!(
-        cli.partition_offsets_at(&topic, "earliest"),
+        cli.get_offsets().partition_offsets(&topic, "earliest"),
         every_partition_at_offset(0)
     );
 }
@@ -177,7 +187,7 @@ fn latest_offsets_count_records_after_produce() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic_with_records(&cli);
 
-    let latest = cli.partition_offsets_at(&topic, "latest");
+    let latest = cli.get_offsets().partition_offsets(&topic, "latest");
 
     assert_eq!(
         latest.iter().sum::<i64>(),
@@ -194,9 +204,9 @@ fn group_consumes_every_record() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic_with_records(&cli);
 
-    let consumed = cli.consume(
+    let consumed = cli.console_consumer().consume(
         &topic,
-        &unique_name("group"),
+        &unique::name("group"),
         RECORDS_WITH_KEYS_AND_HEADERS.len(),
     );
 
@@ -231,13 +241,15 @@ fn group_consumes_every_record() {
 /// a record must be that partition's end offset, so a member that joins later has nothing left to
 /// read.
 #[test]
-fn group_has_no_lag_after_consuming() {
+fn committed_offset_reaches_end_after_consuming() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic_with_records(&cli);
-    let group = unique_name("group");
+    let group = unique::name("group");
 
-    let consumed = cli.consume(&topic, &group, RECORDS_WITH_KEYS_AND_HEADERS.len());
-    let described = cli.describe_group(&group);
+    let consumed =
+        cli.console_consumer()
+            .consume(&topic, &group, RECORDS_WITH_KEYS_AND_HEADERS.len());
+    let described = cli.consumer_groups().describe(&group);
 
     let consumed_offsets = consumed.succeeded().consumed_offsets_by_partition();
 
@@ -260,7 +272,6 @@ fn group_has_no_lag_after_consuming() {
             Some(GroupOffsets {
                 committed: records,
                 end: records,
-                lag: 0,
             }),
             "partition {partition}: {described}"
         );
@@ -272,9 +283,9 @@ fn deleted_topic_is_not_listed() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic(&cli);
 
-    _ = cli.delete_topic(&topic).succeeded();
+    _ = cli.topics().delete(&topic).succeeded();
 
-    let listed = cli.list_topics();
+    let listed = cli.topics().list();
 
     assert!(
         !listed.succeeded().lists_topic(&topic),

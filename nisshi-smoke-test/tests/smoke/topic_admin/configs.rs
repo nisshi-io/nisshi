@@ -26,9 +26,9 @@ const NON_DEFAULT_RETENTION: &str = "retention.ms=123456";
 #[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn describe_shows_topic_overrides() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[NON_DEFAULT_RETENTION]);
+    let topic = cli.topics().create_unique(1, &[NON_DEFAULT_RETENTION]);
 
-    let described = cli.describe_topic_configs(&topic, false);
+    let described = cli.configs().describe_topic(&topic, false);
 
     assert!(
         described
@@ -43,13 +43,14 @@ fn describe_shows_topic_overrides() {
 #[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn add_config_shows_in_describe() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[]);
+    let topic = cli.topics().create_unique(1, &[]);
 
     _ = cli
-        .add_topic_configs(&topic, &[NON_DEFAULT_RETENTION])
+        .configs()
+        .add_to_topic(&topic, &[NON_DEFAULT_RETENTION])
         .succeeded();
 
-    let described = cli.describe_topic_configs(&topic, false);
+    let described = cli.configs().describe_topic(&topic, false);
     assert!(
         described
             .succeeded()
@@ -63,19 +64,20 @@ fn add_config_shows_in_describe() {
 #[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn delete_config_removes_it_from_describe() {
     let cli = KafkaCli::shared();
-    let topic = cli.create_unique_topic(1, &[NON_DEFAULT_RETENTION]);
+    let topic = cli.topics().create_unique(1, &[NON_DEFAULT_RETENTION]);
 
-    let before = cli.describe_topic_configs(&topic, false);
+    let before = cli.configs().describe_topic(&topic, false);
     assert!(
         before.succeeded().describes_config(NON_DEFAULT_RETENTION),
         "{before}"
     );
 
     _ = cli
-        .delete_topic_configs(&topic, &["retention.ms"])
+        .configs()
+        .delete_from_topic(&topic, &["retention.ms"])
         .succeeded();
 
-    let after = cli.describe_topic_configs(&topic, false);
+    let after = cli.configs().describe_topic(&topic, false);
     assert!(
         !after.succeeded().describes_config(NON_DEFAULT_RETENTION),
         "{after}"
@@ -92,5 +94,5 @@ fn delete_config_removes_it_from_describe() {
 fn broker_defaults_are_described() {
     let cli = KafkaCli::shared();
 
-    _ = cli.describe_broker_defaults().succeeded();
+    _ = cli.configs().describe_broker_defaults().succeeded();
 }

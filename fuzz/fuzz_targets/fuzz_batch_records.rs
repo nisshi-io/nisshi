@@ -45,7 +45,6 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let compression = CODECS[usize::from(*selector) % CODECS.len()].clone();
-    let uncompressed = matches!(compression, Compression::None);
 
     let batch = deflated::Batch {
         attributes: i16::from(compression),
@@ -54,38 +53,16 @@ fuzz_target!(|data: &[u8]| {
         ..Default::default()
     };
 
-    // The by-reference and by-value conversions are separate
-    // implementations (they differ for uncompressed batches), and the
-    // storage backends use both, so exercise each.
+    // The storage backends use both conversions, so exercise each.
     let by_reference = Vec::<Record>::try_from(&batch);
     let by_value = Vec::<Record>::try_from(batch.clone());
 
     // The two must agree on whether the batch decodes and, when it does, on
-    // the records. Error variants are not compared.
-    //
-    // For a compressed batch both conversions call the same
-    // `inflate_records`, so agreement there shows only that it is
-    // deterministic. For an uncompressed batch the by-value conversion
-    // decodes each record with `Record::decode` and the by-reference
-    // conversion with the serde visitors, so there the comparison is a
-    // differential between the two record decoders.
-    //
-    // The `(Ok, Err)` arm for an uncompressed batch exists because
-    // `Record::decode` rejects what the serde visitors accept in two known
-    // ways: bytes left after the last record, and a record `length` that
-    // does not match its body. Without the arm the fuzzer reports those
-    // within seconds and finds nothing else. The arm accepts more than those
-    // two, though: it accepts every batch that the serde visitors decode and
-    // `Record::decode` rejects. So this target cannot catch a serde visitor
-    // that is more lenient than `Decode`; `fuzz_varint` covers the varint
-    // visitors by comparing the two varint decoders directly, and nothing
-    // covers the key, value and header visitors that way. Remove the arm
-    // once the by-reference conversion rejects trailing bytes and a
-    // mismatched `length`.
+    // the records. Error variants are not compared. Both conversions share
+    // one decoder, so agreement shows that decoding is deterministic.
     match (&by_reference, &by_value) {
         (Ok(by_reference), Ok(by_value)) => assert_eq!(by_reference, by_value),
         (Err(_), Err(_)) => {}
-        (Ok(_), Err(_)) if uncompressed => {}
         _ => panic!(
             "by-reference and by-value decoding disagree: {:?} vs {:?}",
             by_reference.as_ref().map(Vec::len),

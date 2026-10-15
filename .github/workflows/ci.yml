@@ -7,12 +7,12 @@ name: ci
 # a poisoning fix (GitHub already scopes a run's cache writes to its own
 # ref) - it's hygiene, keeping the repo's cache budget from being consumed
 # by entries on refs nothing else can restore from. Applies to fmt, clippy,
-# test (its postgres:17 leg only), cargo-publish-dry-run,
-# third-party-license, smoke-sqlite (one leg per os), release and macos below
-# (release and macos also skip the cache entirely on tags). The two compat
-# jobs only restore test's entry, through the `dev` shared key, and never
-# save. build-storage and build-storage-lake use no cache: they run `cargo
-# check`, which reuses little of a full build's artifacts.
+# test (postgres:16, its only leg), cargo-publish-dry-run,
+# third-party-license, release and macos below (release and macos also skip
+# the cache entirely on tags). The two compat jobs only restore test's entry,
+# through the `dev` shared key, and never save. build-storage and
+# build-storage-lake use no cache: they run `cargo check`, which reuses little
+# of a full build's artifacts.
 #
 # Two tiers. The split was made on GitHub's Free plan (20 concurrent jobs),
 # where a full run of this workflow (~60 jobs, 31 of them with no `needs`) on
@@ -22,24 +22,35 @@ name: ci
 #
 # - Tier A runs on every pull_request push: fmt, clippy, typos, shellcheck,
 #   third-party-license, the single non-experimental leg of each compat
-#   suite, `test` on postgres:17 only (compose.yaml's default), and ci-gate.
-# - Tier B runs once per merge-queue entry (`merge_group`) and on push:
-#   the full build-storage/build-storage-lake matrix, `test` on pg16/pg18,
-#   the experimental compat legs, cargo-publish-dry-run, src, release,
-#   macos, smoke, smoke-sqlite, smoke-oldest-client,
-#   smoke-oldest-client-sqlite, smoke-report.
+#   suite, `test` on postgres:16 (the oldest version the project tests), and
+#   ci-gate.
+# - Tier B runs once per merge-queue entry (`merge_group`) and, trimmed, on
+#   push to main: the full build-storage/build-storage-lake matrix, `test` on
+#   postgres:16 again (Postgres 17, 18 and 19 run nightly in tier-c.yml), the
+#   experimental compat legs (postgres and sqlite; S3 compat runs nightly),
+#   cargo-publish-dry-run, src, release,
+#   macos, smoke, smoke-oldest-client, smoke-report.
 #
 # Only `typos` runs ahead of `release`, and only `release` runs ahead of
 # `smoke`, so the release -> smoke chain starts with the rest of the run.
-# The sqlite smoke jobs build the broker from source and need nothing from
-# release, so they start with the rest of the run too.
 # `macos` is a compile-only check except on a `v*` tag, where it builds the
 # release tarball (tier-c.yml builds the macOS release nightly). smoke builds
 # a single-platform image from release's binaries on each os and pushes
-# nothing. `publish` (push to main only) needs every job ci-gate does and is
-# the only job here that pushes an image: a multi-arch build of its own, from
-# the same Dockerfile and the binaries smoke tested. It is outside ci-gate,
-# see its comment.
+# nothing. No job in this workflow pushes an image: tier-c.yml's edge-publish
+# pushes the `edge` image from the binaries that `release` uploads on a push
+# to main, and release.yml pushes the version tags.
+#
+# The push to main repeats a tree that the merge queue has already tested, so
+# it runs only the jobs that save a cache (see the first paragraph), plus
+# `changes`, `typos`, `shellcheck` and ci-gate. `github.ref !=
+# 'refs/heads/main'` turns off every other job. pull_request, merge_group
+# and tag runs do not have that ref, so they run what they ran before.
+# ci-gate's "Only trimmed jobs skipped on main" step names the jobs that may
+# skip there, so a job added later must run on main until someone lists it.
+# The trim assumes the merge queue: it does not read `vars.MERGE_QUEUE`, so
+# with the queue off, the tree that merges gets no Tier B run, and tier-c.yml's
+# edge-gate finds no merge-queue run to publish from. Change the trim
+# together with that variable.
 #
 # A `v*` tag doesn't trigger this workflow. release.yml runs on the tag,
 # calls this workflow through `workflow_call`, and publishes the release only
@@ -55,9 +66,11 @@ name: ci
 #
 # Tier B jobs carry `if: github.event_name != 'pull_request' ||
 # (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, written once as the `tier_b`
-# anchor on build-storage and aliased by the others. The trimmed matrices pick
+# anchor on cargo-publish-dry-run and aliased by the others. The jobs that
+# skip on a push to main add `&& github.ref != 'refs/heads/main'`; that
+# second condition is the `tier_b_off_main` anchor on build-storage. The trimmed matrices pick
 # the smaller list under the inverse condition, so a leg's check-run name
-# (`test (ubuntu-latest, postgres:17)`) means the same thing whichever tier
+# (`compat-librdkafka (ubuntu-latest, memory, memory://, dynostore, false)`) means the same thing whichever tier
 # produced it. The `MERGE_QUEUE` repository variable is the rollback switch:
 # the split only makes sense while a merge queue runs Tier B before merge,
 # so when the queue is off (variable unset or not `on`) pull_request runs
@@ -67,8 +80,10 @@ name: ci
 # A pull_request from a fork can't read repository variables, so
 # `vars.MERGE_QUEUE` is empty there and the checks above would run Tier B on
 # every push. A fork PR therefore takes the queue-on path whatever the
-# variable says, as `smoke` already did. With the queue off, a fork PR's
-# Tier B then runs only after it merges.
+# variable says, as `smoke` already did. With the queue off, the push to
+# `main` runs only the trimmed job set, so a fork PR's Tier B runs nowhere.
+# Turning the queue off therefore needs a follow-up that gates the trim on
+# `vars.MERGE_QUEUE` as well.
 #
 # No Tier A job may `needs` a Tier B job: GitHub marks a job `skipped` (not
 # `failure`) when its own `needs` didn't run, which would silently skip Tier A
@@ -79,10 +94,8 @@ name: ci
 # would never report there and every entry would hang until ejected. `push`
 # is scoped to `main`, so the queue branch itself doesn't also trigger a
 # push run. The queue fast-forwards main to the exact commit it tested, so
-# the post-merge push run does repeat Tier B on the same tree; that is what
-# refreshes the caches and, through `publish`, tags the `main` image, and it
-# is the same cost as today's post-merge run, not an addition. Trimming it is
-# a follow-up.
+# the post-merge push run repeats that tree; it exists to refresh the caches
+# and to leave the `image-*` artifacts that the scheduled edge image reads.
 permissions:
   contents: read
 on:
@@ -158,9 +171,10 @@ jobs:
           [ "$listed" -eq "$CHANGED_FILES" ] || run_all "listed $listed of $CHANGED_FILES changed files"
           bash .github/scripts/ci-changes.sh < "$RUNNER_TEMP/files"
   test:
-    # Tier A on postgres:17 (compose.yaml's default), full pg matrix on
-    # merge_group/push. build-storage/build-storage-lake are Tier B, so they
-    # can't be `needs` here (see the header).
+    # Postgres 16, the oldest version the project tests, on every tier: a query
+    # that needs a newer function or syntax then fails before merge. The newer
+    # versions run nightly in tier-c.yml. build-storage/build-storage-lake are
+    # Tier B, so they can't be `needs` here (see the header).
     if: needs.changes.outputs.rust == 'true'
     needs: [changes]
     runs-on: ${{matrix.os}}
@@ -170,7 +184,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        pg: ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository)) && '["postgres:17"]' || '["postgres:16", "postgres:17", "postgres:18"]') }}
+        pg: [postgres:16]
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -208,12 +222,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          # Every pg leg shares one entry, and only one of them should save
-          # it: pg17, the leg that runs in both tiers. The compat jobs restore
-          # this entry under the same key and never save it.
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.pg == 'postgres:17' }}
+          # Only a push to main saves this entry. The compat jobs restore it
+          # under the same key and never save it.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-shared-key: dev
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
@@ -231,7 +244,7 @@ jobs:
         if: always()
       - run: tar --create --verbose --gzip --file=logs-${{env.PG_IMAGE_DASH}}.tar.gz logs
         if: always()
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: logs-${{env.PG_IMAGE_DASH}}.tar.gz
@@ -286,8 +299,10 @@ jobs:
       # this job instead of in a job of its own.
       - run: just doc
   build-storage:
-    # Every Tier B job reuses this condition as `*tier_b`.
-    if: &tier_b needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    # Every Tier B job that skips on a push to main reuses this condition as
+    # `*tier_b_off_main`. The others use `*tier_b`, defined on
+    # cargo-publish-dry-run.
+    if: &tier_b_off_main needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)) && github.ref != 'refs/heads/main'
     needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
@@ -316,7 +331,7 @@ jobs:
       # and linking.
       - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}}
   build-storage-lake:
-    if: *tier_b
+    if: *tier_b_off_main
     needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
@@ -347,7 +362,7 @@ jobs:
       # Check proves the combination compiles without codegen or linking.
       - run: cargo check --bin nisshi --no-default-features --features dynostore,${{matrix.lake}}
   compat-librdkafka:
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
     needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
@@ -358,12 +373,11 @@ jobs:
         os:
           - ubuntu-latest
         # Tier A runs the one non-experimental leg (memory); merge_group/push
-        # run all four. compat-franz-go reuses this list as `*compat_storage`.
+        # run the three. compat-franz-go reuses this list as `*compat_storage`.
         storage: &compat_storage >-
           ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
-          {"name": "s3", "engine": "s3://nisshi/", "features": "dynostore", "experimental": true},
           {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": true},
           {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": true}]') }}
     env:
@@ -384,7 +398,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:17
+          ecr-fallback-images: postgres:18
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -401,13 +415,13 @@ jobs:
           RUST_BACKTRACE: 1
           RUST_LOG: warn
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compat-librdkafka-results-${{matrix.storage.name}}
           path: ${{env.RESULTS_FILE}}
           if-no-files-found: warn
   compat-librdkafka-report:
-    if: always() && needs.changes.outputs.rust == 'true'
+    if: always() && needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
     needs: [changes, compat-librdkafka]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -421,7 +435,7 @@ jobs:
             .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
           path: reports
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: compat-librdkafka-results-*
           path: results
@@ -437,7 +451,7 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   compat-franz-go:
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
     needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
@@ -466,7 +480,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:17
+          ecr-fallback-images: postgres:18
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -483,13 +497,13 @@ jobs:
           RUST_BACKTRACE: 1
           RUST_LOG: warn
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compat-franz-go-results-${{matrix.storage.name}}
           path: ${{env.RESULTS_FILE}}
           if-no-files-found: warn
   compat-franz-go-report:
-    if: always() && needs.changes.outputs.rust == 'true'
+    if: always() && needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
     needs: [changes, compat-franz-go]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -503,7 +517,7 @@ jobs:
             .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
           path: reports
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: compat-franz-go-results-*
           path: results
@@ -519,7 +533,7 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   cargo-publish-dry-run:
-    if: *tier_b
+    if: &tier_b needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
     needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
@@ -545,7 +559,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3
+      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
         with:
           config: typos.toml
   # actionlint already runs shellcheck on each workflow `run:` block. This
@@ -562,7 +576,7 @@ jobs:
           just-version: 1.58.0
       # We install a pinned version instead of using the runner image's copy,
       # so that a runner image update cannot fail this check on unchanged code.
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
@@ -578,17 +592,17 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-about@0.8.4
       - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: third-party-license
           path: THIRD-PARTY-LICENSE.html
           if-no-files-found: error
   src:
-    if: *tier_b
+    if: *tier_b_off_main
     needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -598,16 +612,16 @@ jobs:
           persist-credentials: false
       - run: |
           git archive --format=tar.gz HEAD >${{runner.temp}}/src.tar.gz
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: src
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
   # Runs the nisshi-smoke-test suite (`just smoke <storage>`): the Kafka CLI
   # tools from each Kafka image against an image the job builds from
-  # release's binaries, on each storage engine but sqlite (smoke-sqlite).
+  # release's binaries, on each storage engine.
   smoke:
-    if: *tier_b
+    if: *tier_b_off_main
     needs: [changes, release]
     strategy:
       fail-fast: false
@@ -617,6 +631,7 @@ jobs:
           - ubuntu-24.04-arm
         storage:
           - postgres
+          - sqlite
           - memory
           - s3
         kafka:
@@ -641,21 +656,19 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:17' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
-      # The job does not build the broker, so it uses no cache; smoke-sqlite
-      # does.
+      # The job does not build the broker, so it uses no cache.
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest@0.9.146
-      # The image is built here from release's binaries and never pushed;
-      # only publish pushes an image.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      # The image is built here from release's binaries and never pushed.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*
           merge-multiple: true
@@ -678,92 +691,13 @@ jobs:
             echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
           fi
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
           path: target/smoke/results-*.csv
           if-no-files-found: warn
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
-          path: |
-            target/smoke/*.log
-            target/smoke/brokers-*/*/*.log
-          if-no-files-found: warn
-  # The smoke suite on sqlite. The packaged image crashes at startup on
-  # sqlite:// (#796), so these legs run the suite against a broker built from
-  # source and need nothing from release. They are a job of their own so that
-  # they start with the rest of the run instead of after release, and so that
-  # a failed release leaves their result visible instead of marking them
-  # skipped. The fix for #796 moves sqlite back into smoke's matrix and
-  # removes this job.
-  smoke-sqlite:
-    if: *tier_b
-    needs: [changes]
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - ubuntu-24.04-arm
-        kafka:
-          - apache/kafka:3.9.2
-          - apache/kafka:4.3.1
-    runs-on: ${{matrix.os}}
-    timeout-minutes: 30
-    env:
-      KAFKA_IMAGE: ${{matrix.kafka}}
-      RUST_BACKTRACE: 1
-      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
-      STORAGE: sqlite
-    steps:
-      # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
-      - run: |
-          kafka=${KAFKA_IMAGE#*:}
-          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/docker-hub-mirror
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: 1.58.0
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # One leg per os saves the cache. The key replaces the default,
-          # which includes the job id, so smoke-oldest-client-sqlite restores
-          # this cache too.
-          cache-shared-key: smoke-sqlite
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.kafka == 'apache/kafka:3.9.2' }}
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-nextest@0.9.146
-      # The step stops well before the job's timeout, so the steps that
-      # upload the results and logs still run when the suite hangs.
-      - run: just smoke "${STORAGE}"
-        timeout-minutes: 20
-      # `just smoke` writes the results file even when it fails. A leg that
-      # failed before `just smoke` ran gets a failed row here instead, so it
-      # still has a column in the report.
-      - if: always()
-        run: |
-          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
-          if [[ ! -f "${results}" ]]; then
-            mkdir -p target/smoke
-            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
-          fi
-      - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
-          path: target/smoke/results-*.csv
-          if-no-files-found: warn
-      - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
           path: |
@@ -773,16 +707,16 @@ jobs:
   # Runs the smoke suite with the Kafka CLI tools from the oldest Kafka release that CI tests, so
   # CI checks that an older Java client still negotiates API versions with the broker.
   smoke-oldest-client:
-    if: *tier_b
+    if: *tier_b_off_main
     needs: [changes, release]
     strategy:
       fail-fast: false
-      # The job runs on every storage engine but sqlite (smoke-oldest-client-sqlite), because an
-      # older client can call other APIs than a newer one, and each engine implements those APIs
-      # in its own code.
+      # The job runs on every storage engine, because an older client can call other APIs than a
+      # newer one, and each engine implements those APIs in its own code.
       matrix:
         storage:
           - postgres
+          - sqlite
           - memory
           - s3
     # A Java client sends the same requests on any CPU, so this job runs on x86 only.
@@ -805,21 +739,19 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:17' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
-      # The job does not build the broker, so it uses no cache; smoke-sqlite
-      # does.
+      # The job does not build the broker, so it uses no cache.
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest@0.9.146
-      # The image is built here from release's binaries and never pushed;
-      # only publish pushes an image.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      # The image is built here from release's binaries and never pushed.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*
           merge-multiple: true
@@ -842,90 +774,25 @@ jobs:
             echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
           fi
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
           path: target/smoke/results-*.csv
           if-no-files-found: warn
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
           path: |
             target/smoke/*.log
             target/smoke/brokers-*/*/*.log
           if-no-files-found: warn
-  # smoke-oldest-client on sqlite: a broker built from source, for the same
-  # reason as smoke-sqlite (#796), and a job of its own for the same reasons.
-  # The fix for #796 moves sqlite back into smoke-oldest-client's matrix and
-  # removes this job.
-  smoke-oldest-client-sqlite:
-    if: *tier_b
-    needs: [changes]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      KAFKA_IMAGE: apache/kafka:3.7.2
-      RUST_BACKTRACE: 1
-      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
-      STORAGE: sqlite
-    steps:
-      # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
-      - run: |
-          kafka=${KAFKA_IMAGE#*:}
-          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/docker-hub-mirror
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: 1.58.0
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # Reads the cache that smoke-sqlite saves.
-          cache-shared-key: smoke-sqlite
-          cache-save-if: false
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-nextest@0.9.146
-      # The step stops well before the job's timeout, so the steps that
-      # upload the results and logs still run when the suite hangs.
-      - run: just smoke "${STORAGE}"
-        timeout-minutes: 20
-      # `just smoke` writes the results file even when it fails. A leg that
-      # failed before `just smoke` ran gets a failed row here instead, so it
-      # still has a column in the report.
-      - if: always()
-        run: |
-          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
-          if [[ ! -f "${results}" ]]; then
-            mkdir -p target/smoke
-            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
-          fi
-      - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
-          path: target/smoke/results-*.csv
-          if-no-files-found: warn
-      - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
-          path: |
-            target/smoke/*.log
-            target/smoke/brokers-*/*/*.log
-          if-no-files-found: warn
-  # Reports every leg of the four smoke jobs. `always()` with the result
+  # Reports every leg of the two smoke jobs. `always()` with the result
   # check runs it when any of them ran, so a job that release's failure
   # skipped still leaves the others' legs in the grid.
   smoke-report:
-    if: always() && (needs.smoke.result != 'skipped' || needs.smoke-sqlite.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped' || needs.smoke-oldest-client-sqlite.result != 'skipped')
-    needs: [smoke, smoke-sqlite, smoke-oldest-client, smoke-oldest-client-sqlite]
+    if: always() && github.ref != 'refs/heads/main' && (needs.smoke.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped')
+    needs: [smoke, smoke-oldest-client]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -938,7 +805,7 @@ jobs:
             .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
           path: reports
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: smoke-results-*
           path: results
@@ -953,15 +820,14 @@ jobs:
       - run: echo "## Smoke report card" >> "${GITHUB_STEP_SUMMARY}"
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
-  # The static Linux binaries: smoke and publish build the image from them.
-  # macos is the same build for macOS, in a job of its own so smoke needn't
-  # wait for it.
+  # The static Linux binaries: smoke, release.yml's publish-image and
+  # tier-c.yml's edge-publish build the image from them. macos is the same
+  # build for macOS, in a job of its own so smoke needn't wait for it.
   release:
     if: *tier_b
     # test, src and the build matrices are not here, so this leg starts with
-    # the rest of the run. publish needs them, so a failure there still
-    # blocks every image and tag. typos stays: it takes seconds and stops a
-    # run before the expensive jobs.
+    # the rest of the run. typos stays: it takes seconds and stops a run
+    # before the expensive jobs.
     needs: [changes, typos]
     runs-on: ${{matrix.os}}
     timeout-minutes: 45
@@ -1006,7 +872,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
       # Embeds the crate list so scanners can read the binary's dependencies.
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
@@ -1029,31 +895,32 @@ jobs:
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       # release.yml attaches the tarballs to the GitHub release, on a tag.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nisshi-${{matrix.target}}
           path: nisshi-${{matrix.target}}.tar.gz
           if-no-files-found: error
       # The Dockerfile copies dist/<platform>/nisshi into the image, in smoke
-      # and in publish.
+      # and in the publish jobs of release.yml and tier-c.yml.
       - env:
           PLATFORM: ${{matrix.platform}}
           TARGET: ${{matrix.target}}
         run: |
           mkdir -p dist/"${PLATFORM}"
           cp target/"${TARGET}"/release/nisshi dist/"${PLATFORM}"/nisshi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{matrix.target}}
           path: dist/
-          # publish reads this on a push to main, and release.yml on a tag,
-          # and a re-run of either can come days later. Other runs only need
+          # tier-c.yml's edge-publish reads this from the push run of main's
+          # tip, and a manual run can come weeks later. release.yml reads it
+          # on a tag, and a re-run can come days later. Other runs only need
           # it for smoke.
-          retention-days: ${{ github.event_name == 'push' && 3 || 1 }}
+          retention-days: ${{ github.ref == 'refs/heads/main' && 30 || github.event_name == 'push' && 3 || 1 }}
           if-no-files-found: error
   # The full release build (about 20 minutes) runs on a `v*` tag only. Every
   # other run compiles the binary without optimizing or linking it, which
-  # keeps the queue's critical path and the `main` image short. The nightly
+  # keeps the queue's critical path short. The nightly
   # macos-release job in tier-c.yml builds the release on main's tip, so a
   # link or release-profile break shows up before a tag.
   macos:
@@ -1081,7 +948,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
@@ -1096,7 +963,7 @@ jobs:
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       - if: ${{github.ref_type == 'tag'}}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nisshi-${{env.TARGET}}
           path: nisshi-${{env.TARGET}}.tar.gz
@@ -1113,8 +980,7 @@ jobs:
   # `needs.*.result` reads each listed job's own outcome, not the masked one.
   ci-gate:
     if: always()
-    # publish reuses this list as `*gate_needs`.
-    needs: &gate_needs
+    needs:
       - changes
       - fmt
       - clippy
@@ -1129,9 +995,7 @@ jobs:
       - third-party-license
       - src
       - smoke
-      - smoke-sqlite
       - smoke-oldest-client
-      - smoke-oldest-client-sqlite
       - release
       - macos
     runs-on: ubuntu-latest
@@ -1153,11 +1017,11 @@ jobs:
           bad=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
           [ -z "$bad" ] || { echo "::error::$(tr '\n' ' ' <<<"$bad")"; exit 1; }
       # `skipped` is tolerated above because Tier B legitimately skips on
-      # pull_request. Off pull_request (merge_group, push) nothing may skip:
+      # pull_request. Off pull_request (merge_group, a tag run) nothing may skip:
       # a Tier B job whose `if:` is wrong must fail the gate, not slide
       # through as "didn't fail".
-      - name: Nothing skipped off pull_request
-        if: github.event_name != 'pull_request'
+      - name: Nothing skipped off pull_request and main
+        if: github.event_name != 'pull_request' && github.ref != 'refs/heads/main'
         run: |
           skipped=$(jq -r 'to_entries[] | select(.value.result == "skipped") | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::skipped on a ${GITHUB_EVENT_NAME} run, every listed job must run and succeed here: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
@@ -1170,55 +1034,17 @@ jobs:
       - name: Tier A ran on pull_request
         if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
         env:
-          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src smoke smoke-sqlite smoke-oldest-client smoke-oldest-client-sqlite release macos
+          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src smoke smoke-oldest-client release macos
         run: |
           skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
-  # Pushes the `main` image, and it holds only `packages: write`. It needs
-  # every job ci-gate does, so a red or skipped job anywhere stops it. It is
-  # not in ci-gate's `needs`: it runs on push only, and ci-gate's "Nothing
-  # skipped off pull_request" step would fail every merge_group run. On a
-  # `v*` tag (a run release.yml calls) it skips, and release.yml pushes the
-  # version tags instead.
-  publish:
-    if: github.event_name == 'push' && github.ref_type == 'branch'
-    needs: *gate_needs
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read     # check out the repository, for the local publish-image action
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # Each push run has a concurrency group of its own, so an older commit's
-      # run can finish after a newer one. On main, push only while this commit
-      # is still the branch tip, so the `main` image never moves backwards. If
-      # the tip's own run then fails, re-run that run to publish; the skip
-      # says so in the step summary, since the job itself ends green. The tip
-      # comes from the API, not `git ls-remote`, so the read-only token works
-      # whether the repository is public or private.
-      - id: tip
+      # A push to main skips the jobs that only repeat what the merge queue
+      # tested. The list names them, so a job added later defaults to
+      # must-run on main, and a cache-saving job that skips fails the gate.
+      - name: Only trimmed jobs skipped on main
+        if: github.ref == 'refs/heads/main'
         env:
-          GH_TOKEN: ${{ github.token }}
+          MAY_SKIP: build-storage build-storage-lake compat-librdkafka compat-franz-go src smoke smoke-oldest-client
         run: |
-          set -euo pipefail
-          tip=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/${GITHUB_REF#refs/}" --jq .object.sha)
-          if [ "$tip" = "$GITHUB_SHA" ]; then
-            echo "stale=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::${GITHUB_REF} is at ${tip}, not ${GITHUB_SHA}; the newer run publishes the image"
-            {
-              echo "## publish skipped"
-              echo
-              echo "\`${GITHUB_REF}\` is at \`${tip}\`, not \`${GITHUB_SHA}\`, so this run pushed no image."
-              echo "The run for [\`${tip}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${tip}) publishes the \`main\` image; if that run failed, re-run it."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "stale=true" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.tip.outputs.stale != 'true'
-        uses: ./.github/actions/publish-image
-        with:
-          tags: |
-            type=ref,event=branch
+          skipped=$(jq -r --arg may_skip "$MAY_SKIP" '($may_skip | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
+          [ -z "$skipped" ] || { echo "::error::skipped on a push to main, only the trimmed jobs may skip here: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }

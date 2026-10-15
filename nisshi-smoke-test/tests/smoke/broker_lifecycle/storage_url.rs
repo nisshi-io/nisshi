@@ -53,7 +53,7 @@ fn zero_maintenance_interval_stops_the_broker() {
 mod sqlite {
     use std::fs;
 
-    use nisshi_smoke_test::{Broker, KafkaCli, LaunchOptions, StorageUrl, unique_name};
+    use nisshi_smoke_test::{Broker, KafkaCli, LaunchOptions, StorageUrl, unique};
 
     /// A database file at an absolute path, removed with its journal files when the test ends,
     /// whether it passes or not.
@@ -69,14 +69,15 @@ mod sqlite {
 
     /// Starts a broker on `storage`, checks that it stores a record and returns it, and returns
     /// the broker.
+    #[track_caller]
     fn stores_and_returns_a_record(storage: &str) -> Broker {
         let broker = Broker::launch(LaunchOptions::new(StorageUrl::as_given(storage)));
         let cli = KafkaCli::new(broker.bootstrap());
-        let topic = cli.create_unique_topic(1, &[]);
+        let topic = cli.topics().create_unique(1, &[]);
 
-        _ = cli.produce_values(&topic, &["stored"]);
+        _ = cli.console_producer().produce_values(&topic, &["stored"]);
 
-        let [record] = &cli.read_records(&topic, 0, 0, 1)[..] else {
+        let [record] = &cli.console_consumer().read_records(&topic, 0, 0, 1)[..] else {
             unreachable!("read_records checks the record count")
         };
         assert_eq!(record.value, "stored");
@@ -97,7 +98,7 @@ mod sqlite {
     #[test]
     fn absolute_path_works() {
         let database_file =
-            TemporarySqliteDatabase(format!("/tmp/{}.db", unique_name("nisshi-smoke")));
+            TemporarySqliteDatabase(format!("/tmp/{}.db", unique::name("nisshi-smoke")));
 
         let broker = stores_and_returns_a_record(&format!("sqlite:///{}", database_file.0));
 

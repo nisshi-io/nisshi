@@ -15,7 +15,7 @@
 //! `kafka-topics`, which creates, lists, describes, alters and deletes topics.
 
 use super::{KafkaCli, Output, TOPIC_EXISTS_EXCEPTION, Tool};
-use crate::unique_name;
+use crate::common::unique;
 
 /// How `kafka-topics --describe` starts the line for the topic and the line for each partition.
 const DESCRIBED_LINE_PREFIX: &str = "Topic: ";
@@ -29,39 +29,34 @@ const LEADER_FIELD: &str = "Leader";
 const REPLICAS_FIELD: &str = "Replicas";
 const ISR_FIELD: &str = "Isr";
 
-/// The command of [`KafkaCli::create_topic`]'s [`Output`].
+/// The command of [`KafkaTopics::create`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum CreateTopic {}
 
-/// The command of [`KafkaCli::list_topics`]'s [`Output`].
+/// The command of [`KafkaTopics::list`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum ListTopics {}
 
-/// The command of [`KafkaCli::describe_topic`]'s [`Output`].
+/// The command of [`KafkaTopics::describe`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum DescribeTopic {}
 
-/// The command of [`KafkaCli::delete_topic`]'s [`Output`].
+/// Runs `kafka-topics` against the broker of a [`KafkaCli`].
 #[derive(Clone, Copy, Debug)]
-pub enum DeleteTopic {}
+pub struct KafkaTopics<'cli> {
+    cli: &'cli KafkaCli,
+}
 
-/// A `kafka-topics` command that names one topic, and fails if that topic doesn't exist.
-pub trait RequiresExistingTopic {}
-
-impl RequiresExistingTopic for DescribeTopic {}
-impl RequiresExistingTopic for DeleteTopic {}
-
-impl KafkaCli {
+impl<'cli> KafkaTopics<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Creates `topic` with `partitions` partitions and `configs`, each a `name=value` topic
     /// config. The broker has one node, so the replication factor is 1.
     ///
     /// Sends `CreateTopics`.
-    pub fn create_topic(
-        &self,
-        topic: &str,
-        partitions: u32,
-        configs: &[&str],
-    ) -> Output<CreateTopic> {
+    #[track_caller]
+    pub fn create(&self, topic: &str, partitions: u32, configs: &[&str]) -> Output<CreateTopic> {
         let partitions = format!("--partitions={partitions}");
         let mut args = vec![
             "--create",
@@ -75,38 +70,43 @@ impl KafkaCli {
             args.extend(["--config", config]);
         }
 
-        self.run(Tool::Topics, &args)
+        self.cli.run(Tool::Topics, &args)
     }
 
-    /// Creates a topic with a name no other test uses, as [`KafkaCli::create_topic`] does, asserts
+    /// Creates a topic with a name no other test uses, as [`KafkaTopics::create`] does, asserts
     /// that the tool succeeded, and returns the topic's name.
-    pub fn create_unique_topic(&self, partitions: u32, configs: &[&str]) -> String {
-        let topic = unique_name("topic");
-        _ = self.create_topic(&topic, partitions, configs).succeeded();
+    #[track_caller]
+    pub fn create_unique(&self, partitions: u32, configs: &[&str]) -> String {
+        let topic = unique::name("topic");
+        _ = self.create(&topic, partitions, configs).succeeded();
         topic
     }
 
     /// Lists the cluster's topics, one name per line.
     ///
     /// Sends `Metadata`.
-    pub fn list_topics(&self) -> Output<ListTopics> {
-        self.run(Tool::Topics, &["--list"])
+    #[track_caller]
+    pub fn list(&self) -> Output<ListTopics> {
+        self.cli.run(Tool::Topics, &["--list"])
     }
 
     /// Describes `topic`'s partitions and configs.
     ///
     /// Sends `DescribeTopicPartitions` and `DescribeConfigs`.
-    pub fn describe_topic(&self, topic: &str) -> Output<DescribeTopic> {
-        self.run(Tool::Topics, &["--describe", "--topic", topic])
+    #[track_caller]
+    pub fn describe(&self, topic: &str) -> Output<DescribeTopic> {
+        self.cli
+            .run(Tool::Topics, &["--describe", "--topic", topic])
     }
 
     /// Sends `DeleteTopics`.
-    pub fn delete_topic(&self, topic: &str) -> Output<DeleteTopic> {
-        self.run(Tool::Topics, &["--delete", "--topic", topic])
+    #[track_caller]
+    pub fn delete(&self, topic: &str) -> Output {
+        self.cli.run(Tool::Topics, &["--delete", "--topic", topic])
     }
 }
 
-/// A partition's leader and replicas, as [`KafkaCli::describe_topic`] shows them.
+/// A partition's leader and replicas, as [`KafkaTopics::describe`] shows them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PartitionReplicas<'a> {
     pub leader: &'a str,
@@ -195,18 +195,5 @@ impl Output<DescribeTopic> {
                     .map(|(name, value)| (name.trim(), value.trim()))
                     .collect()
             })
-    }
-}
-
-impl<PrintedBy: RequiresExistingTopic> Output<PrintedBy> {
-    /// Asserts that `kafka-topics` exited with 1 and named the missing `topic`. The tool raises
-    /// the error itself, after the broker's metadata doesn't list the topic, so there is no Kafka
-    /// exception to check for, and the wording differs between Kafka versions.
-    #[track_caller]
-    pub fn assert_topic_does_not_exist(&self, topic: &str) {
-        assert!(
-            self.exited(1).mentions(topic),
-            "the tool's error doesn't name {topic}: {self}"
-        );
     }
 }
