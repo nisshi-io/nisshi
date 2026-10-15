@@ -161,6 +161,7 @@ pub enum Request {
         group_ids: Option<Vec<String>>,
         include_authorized_operations: bool,
     },
+    GroupWithVersion(String),
     UpdateGroup {
         group_id: String,
         detail: GroupDetail,
@@ -227,6 +228,7 @@ impl Display for Request {
             Self::DescribeGroups { .. } => f.write_str("DescribeGroups"),
             Self::DescribeTopicPartitions { .. } => f.write_str("DescribeTopicPartitions"),
             Self::Fetch { .. } => f.write_str("Fetch"),
+            Self::GroupWithVersion(_) => f.write_str("GroupWithVersion"),
             Self::IncrementalAlterResource(_) => f.write_str("IncrementalAlterResource"),
             Self::InitProducer { .. } => f.write_str("InitProducer"),
             Self::ListGroups(_) => f.write_str("ListGroups"),
@@ -269,6 +271,7 @@ pub enum Response {
     DescribeGroups(Result<Vec<NamedGroupDetail>>),
     DescribeTopicPartitions(Result<Vec<DescribeTopicPartitionsResponseTopic>>),
     Fetch(Result<Vec<deflated::Batch>>),
+    GroupWithVersion(Result<Option<(GroupDetail, Version)>>),
     IncrementalAlterResponse(Result<AlterConfigsResourceResponse>),
     InitProducer(Result<ProducerIdResponse>),
     ListGroups(Result<Vec<ListedGroup>>),
@@ -750,6 +753,15 @@ impl Storage for RequestChannelService {
                 include_authorized_operations,
             },
             DescribeGroups
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        serve_and_extract!(
+            self,
+            Request::GroupWithVersion(group_id.to_owned()),
+            GroupWithVersion
         )
     }
 
@@ -1245,6 +1257,9 @@ where
                 self.storage
                     .describe_groups(group_ids.as_deref(), include_authorized_operations)
                     .await,
+            )),
+            Request::GroupWithVersion(group_id) => Ok(Response::GroupWithVersion(
+                self.storage.group_with_version(&group_id).await,
             )),
             Request::UpdateGroup {
                 group_id,

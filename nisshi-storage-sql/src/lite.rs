@@ -1970,6 +1970,17 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let start = SystemTime::now();
+        self.inner.group_with_version(group_id).await.inspect(|_| {
+            ENGINE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "group_with_version")],
+            )
+        })
+    }
+
+    #[instrument(skip_all)]
     async fn update_group(
         &self,
         group_id: &str,
@@ -2452,6 +2463,31 @@ fn unique_constraint(error_code: ErrorCode) -> impl Fn(libsql::Error) -> Error {
             err.into()
         }
     }
+}
+
+/// Reads a `consumer_group_detail.sql` row as the stored group and the version that
+/// `update_group` compares against.
+fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
+    let version = row
+        .get_str(0)
+        .map_err(Error::from)
+        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
+        .inspect_err(|err| error!(?err))
+        .map(|uuid| Version {
+            e_tag: Some(uuid.to_string()),
+            version: None,
+        })
+        .inspect(|version| debug!(?version))?;
+
+    let current = row
+        .get_str(1)
+        .map_err(Error::from)
+        .inspect(|value| debug!(%value))
+        .and_then(|value| serde_json::from_str::<GroupDetail>(value).map_err(Into::into))
+        .inspect(|current| debug!(?current))
+        .inspect_err(|err| error!(?err))?;
+
+    Ok((current, version))
 }
 
 #[async_trait]
@@ -4239,6 +4275,32 @@ impl Storage for Delegate {
         })
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let start = SystemTime::now();
+
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        c.query_opt(
+            "consumer_group_detail.sql",
+            (group_id, self.cluster.as_str()),
+        )
+        .await
+        .map_err(Error::from)
+        .inspect_err(|err| error!(?err, group_id))?
+        .as_ref()
+        .map(group_detail_with_version)
+        .transpose()
+        .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
+        .inspect(|_| {
+            DELEGATE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "group_with_version")],
+            )
+        })
+    }
+
     async fn update_group(
         &self,
         group_id: &str,
@@ -4314,32 +4376,12 @@ impl Storage for Delegate {
                 .inspect(|row| debug!(?row))
                 .inspect_err(|err| error!(?err))?;
 
-            let version = row
-                .get_str(0)
-                .map_err(Error::from)
-                .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                .inspect_err(|err| error!(?err))
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))?;
+            let (current, version) = group_detail_with_version(&row)?;
 
-            let value = row
-                .get_str(1)
-                .map_err(Error::from)
-                .inspect(|value| debug!(%value))
-                .and_then(|value| serde_json::from_str(value).map_err(Into::into))
-                .inspect(|value| debug!(%value))?;
-
-            let current = serde_json::from_value::<GroupDetail>(value)
-                .inspect(|current| debug!(?current))
-                .inspect_err(|err| error!(?err))
-                .map(Box::new)?;
-
-            Err(UpdateError::Outdated { current, version })
+            Err(UpdateError::Outdated {
+                current: Box::new(current),
+                version,
+            })
         };
 
         pc.commit(tx).await?;

@@ -63,6 +63,7 @@ pub mod startup_failure;
 pub mod storage_describe_cluster;
 pub mod storage_describe_configs;
 pub mod storage_fetch;
+pub mod storage_group_version;
 pub mod storage_list_offsets;
 pub mod storage_metadata;
 pub mod storage_options;

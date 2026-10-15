@@ -1618,6 +1618,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
         cursor: Option<Topition>,
     ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>>;
 
+    /// Returns the stored state of a group and the version that a following
+    /// [`Storage::update_group`] must pass, or `None` when no state is stored for the
+    /// group.
+    ///
+    /// The read does not change the stored version, so the returned version stays
+    /// valid until the stored group changes.
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>>;
+
     /// Conditionally update the state of a group in this storage.
     ///
     /// `version` is the version of the group the caller last read. `None`
@@ -1875,6 +1883,10 @@ where
         self.as_ref()
             .describe_topic_partitions(topics, partition_limit, cursor)
             .await
+    }
+
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.as_ref().group_with_version(group_id).await
     }
 
     async fn update_group(
@@ -2145,6 +2157,10 @@ where
         self.as_ref()
             .describe_topic_partitions(topics, partition_limit, cursor)
             .await
+    }
+
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.as_ref().group_with_version(group_id).await
     }
 
     async fn update_group(

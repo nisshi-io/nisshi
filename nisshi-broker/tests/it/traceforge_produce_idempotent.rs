@@ -551,6 +551,13 @@ impl Storage for FaultInjectingProduceStorage {
             .await
     }
 
+    async fn group_with_version(
+        &self,
+        group_id: &str,
+    ) -> StorageResult<Option<(GroupDetail, Version)>> {
+        self.inner.group_with_version(group_id).await
+    }
+
     async fn update_group(
         &self,
         group_id: &str,

@@ -2676,6 +2676,25 @@ impl Postgres {
     }
 }
 
+/// Reads a `consumer_group_detail.sql` row as the stored group and the version that
+/// `update_group` compares against.
+fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
+    let version = row
+        .try_get::<_, Uuid>(0)
+        .inspect_err(|err| error!(?err))
+        .map(|uuid| Version {
+            e_tag: Some(uuid.to_string()),
+            version: None,
+        })
+        .inspect(|version| debug!(?version))?;
+
+    let value = row.try_get::<_, Value>(1)?;
+    let current =
+        serde_json::from_value::<GroupDetail>(value).inspect(|current| debug!(?current))?;
+
+    Ok((current, version))
+}
+
 #[async_trait]
 impl Storage for Postgres {
     #[instrument(skip_all)]
@@ -4146,6 +4165,25 @@ impl Storage for Postgres {
     }
 
     #[instrument(skip_all)]
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        self.prepare_query_opt(
+            &c,
+            "consumer_group_detail.sql",
+            &[&group_id, &self.cluster.as_str()],
+        )
+        .await
+        .inspect_err(|err| error!(?err, group_id))?
+        .as_ref()
+        .map(group_detail_with_version)
+        .transpose()
+        .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
+    }
+
+    #[instrument(skip_all)]
     async fn update_group(
         &self,
         group_id: &str,
@@ -4220,23 +4258,12 @@ impl Storage for Postgres {
                 .inspect(|row| debug!(?row))
                 .inspect_err(|err| error!(?err))?;
 
-            let version = row
-                .try_get::<_, Uuid>(0)
-                .inspect_err(|err| error!(?err))
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))?;
+            let (current, version) = group_detail_with_version(&row)?;
 
-            let value = row.try_get::<_, Value>(1)?;
-            let current = serde_json::from_value::<GroupDetail>(value)
-                .inspect(|current| debug!(?current))
-                .map(Box::new)?;
-
-            Err(UpdateError::Outdated { current, version })
+            Err(UpdateError::Outdated {
+                current: Box::new(current),
+                version,
+            })
         };
 
         tx.commit().await.inspect_err(|err| error!(?err))?;

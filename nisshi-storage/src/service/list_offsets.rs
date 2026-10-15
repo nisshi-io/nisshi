@@ -572,6 +572,13 @@ mod tests {
             unimplemented!()
         }
 
+        async fn group_with_version(
+            &self,
+            _group_id: &str,
+        ) -> Result<Option<(GroupDetail, Version)>> {
+            unimplemented!()
+        }
+
         async fn update_group(
             &self,
             _group_id: &str,

@@ -1900,6 +1900,27 @@ impl Storage for Engine {
         Ok(results)
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let key = postcard::to_stdvec(&GroupKey::new(group_id))?;
+
+        let stored = self
+            .db
+            .get(&key)
+            .await
+            .map_err(Error::from)
+            .inspect_err(|err| debug!(?err, group_id))?
+            .map(|encoded| postcard::from_bytes::<GroupDetailVersion>(&encoded[..]))
+            .transpose()
+            .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))?;
+
+        // An offset commit stores a placeholder for a group without state, with the default
+        // version, which no `update_group` stores. The group reads as having no state, as on the
+        // other backends, and `update_group` accepts no version for the placeholder.
+        Ok(stored
+            .filter(|stored| stored.version != Version::default())
+            .map(|stored| (stored.detail, stored.version)))
+    }
+
     async fn update_group(
         &self,
         group_id: &str,

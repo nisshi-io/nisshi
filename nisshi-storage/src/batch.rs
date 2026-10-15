@@ -598,6 +598,10 @@ where
             .await
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.storage.group_with_version(group_id).await
+    }
+
     async fn update_group(
         &self,
         group_id: &str,
@@ -951,6 +955,13 @@ mod tests {
             _group_ids: Option<&[String]>,
             _include_authorized_operations: bool,
         ) -> Result<Vec<NamedGroupDetail>> {
+            unimplemented!()
+        }
+
+        async fn group_with_version(
+            &self,
+            _group_id: &str,
+        ) -> Result<Option<(GroupDetail, Version)>> {
             unimplemented!()
         }
 

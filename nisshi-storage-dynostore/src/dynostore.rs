@@ -3033,6 +3033,22 @@ impl Storage for DynoStore {
         Ok(results)
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let location = self.group_state_location(group_id)?;
+
+        match self.get::<GroupDetail>(&location).await {
+            Ok(stored) => Ok(Some(stored)),
+
+            Err(Error::ObjectStore(error))
+                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+            {
+                Ok(None)
+            }
+
+            Err(otherwise) => Err(otherwise).inspect_err(|err| error!(?err, group_id)),
+        }
+    }
+
     async fn update_group(
         &self,
         group_id: &str,

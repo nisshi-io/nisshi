@@ -375,6 +375,18 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.groups.lock().map_err(Into::into).map(|groups| {
+            groups.get(group_id).map(|group| {
+                (
+                    group.detail.clone(),
+                    group.version.clone().unwrap_or_default(),
+                )
+            })
+        })
+    }
+
+    #[instrument(skip_all)]
     async fn update_group(
         &self,
         group_id: &str,
