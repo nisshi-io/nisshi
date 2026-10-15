@@ -20,12 +20,22 @@
 //! every member has rejoined. Each test measures the time on the wall clock, because a client sees
 //! that time.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use nisshi_broker::{Error, Result, coordinator::group::administrator::Controller};
 use nisshi_sans_io::{ErrorCode, sync_group_request::SyncGroupRequestAssignment};
-use nisshi_storage::Storage;
+use nisshi_storage::{
+    LatencyIntroducingStorage, Request, RequestChannelService, RequestStorageService, Storage,
+    bounded_channel,
+};
+use rama::Service as _;
 use rand::{prelude::*, rng};
 use tokio::{task::JoinHandle, time::sleep};
 use url::Url;
@@ -51,6 +61,42 @@ const ALLOWED_DELAY: Duration = Duration::from_millis(1_500);
 
 /// How long a test sends heartbeats for, at most, until the coordinator reports a rebalance.
 const HEARTBEAT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long each member of the shared-storage test waits after the previous one before it
+/// rejoins, so that the rebalance can end only when the last member rejoins.
+const REJOIN_STAGGER: Duration = Duration::from_millis(300);
+
+/// How long the shared-storage test holds a join while nothing changes: three of the
+/// coordinator's default poll intervals.
+const IDLE_HOLD: Duration = Duration::from_millis(1_500);
+
+/// Returns `storage` behind a channel that counts each `update_group`, with 50 ms to 150 ms of
+/// latency on every storage call, as two brokers would see a shared database.
+fn counting_storage<G>(storage: G, writes: Arc<AtomicUsize>) -> RequestChannelService
+where
+    G: Storage + Clone + 'static,
+{
+    let (sender, mut receiver) = bounded_channel(64);
+    let service = RequestStorageService::new(LatencyIntroducingStorage::new(storage));
+
+    _ = tokio::spawn(async move {
+        while let Some((request, reply)) = receiver.recv().await {
+            if matches!(request, Request::UpdateGroup { .. }) {
+                _ = writes.fetch_add(1, Ordering::SeqCst);
+            }
+
+            let service = service.clone();
+
+            _ = tokio::spawn(async move {
+                if let Ok(response) = service.serve(request).await {
+                    _ = reply.send(response);
+                }
+            });
+        }
+    });
+
+    RequestChannelService::new(sender)
+}
 
 /// Joins `group` as a new dynamic member, in a task, so that several members can wait in the same
 /// join phase.
@@ -291,6 +337,94 @@ where
     Ok(())
 }
 
+/// Four members of a group are split across two brokers that share storage. When the leader
+/// rejoins, the others rejoin one after another, each on its own broker. The join phase ends as
+/// soon as the last member rejoins, on whichever broker it uses. While a join is held and nothing
+/// changes, the brokers only read the group: a held request doesn't write it on each poll.
+async fn rebalance_across_brokers_ends_once_the_last_member_rejoins<G>(storage: G) -> Result<()>
+where
+    G: Storage + Clone + 'static,
+{
+    const MEMBERS: usize = 4;
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let shared = counting_storage(storage, writes.clone());
+    let brokers = [
+        Controller::with_storage(shared.clone())?,
+        Controller::with_storage(shared)?,
+    ];
+    let group = alphanumeric_string(15);
+
+    let joins = (0..MEMBERS)
+        .map(|index| spawn_join(&brokers[index % 2], &group))
+        .collect::<Vec<_>>();
+
+    let mut members = Vec::new();
+    for (index, join) in joins.into_iter().enumerate() {
+        members.push((join.await??, &brokers[index % 2]));
+    }
+
+    let leader = members
+        .iter()
+        .position(|(member, _)| member.is_leader())
+        .expect("a leader");
+    let all = members.iter().map(|(member, _)| member).collect::<Vec<_>>();
+
+    let syncs = members
+        .iter()
+        .map(|(member, broker)| spawn_sync(broker, &group, member, &all))
+        .collect::<Vec<_>>();
+
+    for sync in syncs {
+        assert!(!sync.await??.is_empty());
+    }
+
+    let (leader_member, leader_broker) = &members[leader];
+    let mut rejoins = vec![spawn_rejoin(leader_broker, &group, leader_member)];
+
+    let followers = members
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != leader)
+        .map(|(_, member)| member)
+        .collect::<Vec<_>>();
+
+    for (member, broker) in &followers {
+        wait_for_rebalance_in_progress(broker, &group, member).await?;
+    }
+
+    // The leader's join is held while nothing else happens, so its broker only reads the group.
+    let writes_before_idle = writes.load(Ordering::SeqCst);
+    sleep(IDLE_HOLD).await;
+    let writes_while_idle = writes.load(Ordering::SeqCst) - writes_before_idle;
+    assert_eq!(
+        0, writes_while_idle,
+        "the brokers wrote the group {writes_while_idle} times while a join was held for \
+         {IDLE_HOLD:?} and nothing changed"
+    );
+
+    for (member, broker) in &followers {
+        sleep(REJOIN_STAGGER).await;
+        rejoins.push(spawn_rejoin(broker, &group, member));
+    }
+
+    let last_rejoined_at = Instant::now();
+
+    for rejoin in rejoins {
+        assert_eq!(leader_member.generation() + 1, rejoin.await??.generation());
+    }
+
+    let elapsed = last_rejoined_at.elapsed();
+    println!("the rebalance ended {elapsed:?} after the last rejoin");
+
+    assert!(
+        elapsed <= ALLOWED_DELAY,
+        "the rebalance ended {elapsed:?} after the last member rejoined, allowed {ALLOWED_DELAY:?}"
+    );
+
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -310,7 +444,6 @@ macro_rules! backend {
                 .await
             }
 
-            #[ignore = "JoinGroup waits half the session timeout (#986)"]
             #[tokio::test]
             async fn first_join_of_a_new_group_waits_for_the_initial_delay() -> Result<()> {
                 let _guard = init_tracing()?;
@@ -320,12 +453,20 @@ macro_rules! backend {
                 .await
             }
 
-            #[ignore = "JoinGroup waits half the session timeout (#986)"]
             #[tokio::test]
             async fn rebalance_ends_once_every_member_has_rejoined() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::rebalance_ends_once_every_member_has_rejoined(storage_container().await?)
                     .await
+            }
+
+            #[tokio::test]
+            async fn rebalance_across_brokers_ends_once_the_last_member_rejoins() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::rebalance_across_brokers_ends_once_the_last_member_rejoins(
+                    storage_container().await?,
+                )
+                .await
             }
         }
     };

@@ -49,7 +49,7 @@ use std::{collections::BTreeMap, fmt, time::SystemTime};
 
 use bytes::Bytes;
 use nisshi_sans_io::{ScramMechanism, create_topics_request::CreatableTopic};
-use nisshi_storage::{GroupDetail, ScramCredential, TxnState, Version};
+use nisshi_storage::{GroupDetail, GroupMember, GroupState, ScramCredential, TxnState, Version};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -141,7 +141,78 @@ pub(super) struct GroupDetailVersion {
     pub version: Version,
 }
 
+/// A stored group in the layout from before [`GroupDetail::rebalance`] existed.
+#[derive(Deserialize)]
+struct PreRebalanceGroupDetailVersion {
+    detail: PreRebalanceGroupDetail,
+    version: Version,
+}
+
+#[derive(Deserialize)]
+struct PreRebalanceGroupDetail {
+    session_timeout_ms: i32,
+    rebalance_timeout_ms: Option<i32>,
+    members: BTreeMap<String, GroupMember>,
+    generation_id: i32,
+    skip_assignment: Option<bool>,
+    inception: SystemTime,
+    state: GroupState,
+}
+
+impl From<PreRebalanceGroupDetailVersion> for GroupDetailVersion {
+    fn from(value: PreRebalanceGroupDetailVersion) -> Self {
+        let PreRebalanceGroupDetail {
+            session_timeout_ms,
+            rebalance_timeout_ms,
+            members,
+            generation_id,
+            skip_assignment,
+            inception,
+            state,
+        } = value.detail;
+
+        Self {
+            detail: GroupDetail {
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                members,
+                generation_id,
+                skip_assignment,
+                inception,
+                state,
+                rebalance: Box::default(),
+            },
+            version: value.version,
+        }
+    }
+}
+
+/// Decodes `encoded` as `T` only if `T` takes every byte.
+fn decode_exactly<'de, T>(encoded: &'de [u8]) -> postcard::Result<T>
+where
+    T: Deserialize<'de>,
+{
+    match postcard::take_from_bytes(encoded)? {
+        (decoded, []) => Ok(decoded),
+        _ => Err(postcard::Error::DeserializeBadEncoding),
+    }
+}
+
 impl GroupDetailVersion {
+    /// Decodes a stored group, in the current layout or in the layout from before
+    /// [`GroupDetail::rebalance`] existed.
+    ///
+    /// Postcard encodes a struct's fields by position and does not record their names, so it
+    /// can't default a field that older bytes lack. It also ignores bytes left after a value. Each
+    /// layout must therefore take every byte, or bytes in one layout could decode as the other.
+    pub(super) fn decode(encoded: &[u8]) -> postcard::Result<Self> {
+        decode_exactly::<Self>(encoded).or_else(|error| {
+            decode_exactly::<PreRebalanceGroupDetailVersion>(encoded)
+                .map(Self::from)
+                .map_err(|_| error)
+        })
+    }
+
     pub(super) fn detail(self, detail: GroupDetail) -> Self {
         Self { detail, ..self }
     }
@@ -446,5 +517,93 @@ impl From<StoredScramCredential> for ScramCredential {
             stored_key: Bytes::from(stored.stored_key),
             server_key: Bytes::from(stored.server_key),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, time::Duration};
+
+    use nisshi_storage::{GroupRebalance, JoinPhase, PendingSync};
+
+    use super::*;
+
+    /// The layout of a stored group before `GroupDetail::rebalance` existed, for encoding.
+    #[derive(Serialize)]
+    struct PreRebalanceLayout<'a> {
+        session_timeout_ms: i32,
+        rebalance_timeout_ms: Option<i32>,
+        members: &'a BTreeMap<String, GroupMember>,
+        generation_id: i32,
+        skip_assignment: Option<bool>,
+        inception: SystemTime,
+        state: &'a GroupState,
+        version: &'a Version,
+    }
+
+    fn version() -> Version {
+        Version {
+            e_tag: Some("e-tag".into()),
+            version: None,
+        }
+    }
+
+    #[test]
+    fn group_stored_before_the_rebalance_state_decodes_without_a_rebalance() -> postcard::Result<()>
+    {
+        let detail = GroupDetail {
+            generation_id: 7,
+            state: GroupState::Formed {
+                protocol_type: "consumer".into(),
+                protocol_name: "range".into(),
+                leader: "leader".into(),
+                assignments: BTreeMap::new(),
+            },
+            ..GroupDetail::default()
+        };
+        let version = version();
+
+        let encoded = postcard::to_stdvec(&PreRebalanceLayout {
+            session_timeout_ms: detail.session_timeout_ms,
+            rebalance_timeout_ms: detail.rebalance_timeout_ms,
+            members: &detail.members,
+            generation_id: detail.generation_id,
+            skip_assignment: detail.skip_assignment,
+            inception: detail.inception,
+            state: &detail.state,
+            version: &version,
+        })?;
+
+        let decoded = GroupDetailVersion::decode(&encoded)?;
+        assert_eq!(detail, decoded.detail);
+        assert_eq!(version, decoded.version);
+        Ok(())
+    }
+
+    #[test]
+    fn group_with_a_rebalance_decodes_as_stored() -> postcard::Result<()> {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        let stored = GroupDetailVersion::default()
+            .detail(GroupDetail {
+                rebalance: Box::new(GroupRebalance {
+                    join_phase: Some(JoinPhase {
+                        deadline: now,
+                        joined: BTreeSet::from(["member".to_owned()]),
+                        initial_delay: None,
+                    }),
+                    pending_sync: Some(PendingSync {
+                        deadline: now,
+                        members: BTreeSet::from(["member".to_owned()]),
+                    }),
+                    pending_members: BTreeMap::from([("pending".to_owned(), now)]),
+                }),
+                ..GroupDetail::default()
+            })
+            .version(version());
+
+        let encoded = postcard::to_stdvec(&stored)?;
+        assert_eq!(stored, GroupDetailVersion::decode(&encoded)?);
+        Ok(())
     }
 }

@@ -23,7 +23,11 @@ use crate::{EnvVarExp, Error, Result, cli::storage_engines};
 
 use super::DEFAULT_BROKER;
 use clap::Parser;
-use nisshi_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
+use nisshi_broker::{
+    NODE_ID,
+    broker::Broker,
+    coordinator::group::administrator::{Controller, GroupCoordinatorConfig},
+};
 use nisshi_sans_io::ErrorCode;
 use nisshi_schema::{Registry, redact_url};
 use nisshi_storage::ArcDynStorage;
@@ -43,6 +47,16 @@ use zeroize::Zeroizing;
 
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 use clap::Subcommand;
+
+/// Parses a duration that is longer than zero. A held `JoinGroup` reads storage once per poll
+/// interval, so a zero interval would read storage in a loop.
+fn positive_duration(value: &str) -> std::result::Result<Duration, String> {
+    match humantime::parse_duration(value) {
+        Ok(duration) if duration.is_zero() => Err("must be longer than zero".into()),
+        Ok(duration) => Ok(duration),
+        Err(error) => Err(error.to_string()),
+    }
+}
 
 #[derive(Clone, Debug, Parser)]
 pub(super) struct Arg {
@@ -91,6 +105,14 @@ pub(super) struct Arg {
     /// Schema registry cache expiry duration
     #[arg(long,value_parser = humantime::parse_duration)]
     schema_registry_cache_expiry: Option<Duration>,
+
+    /// How long the first rebalance of an empty consumer group waits for more members, as Kafka's group.initial.rebalance.delay.ms
+    #[arg(long, env = "GROUP_INITIAL_REBALANCE_DELAY", default_value = "3s", value_parser = humantime::parse_duration)]
+    group_initial_rebalance_delay: Duration,
+
+    /// How often a held JoinGroup or SyncGroup reads its group from storage, to see changes by other brokers
+    #[arg(long, env = "GROUP_POLL_INTERVAL", default_value = "500ms", value_parser = positive_duration)]
+    group_poll_interval: Duration,
 
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -493,7 +515,11 @@ impl Arg {
             .listener(listener.clone())
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
-            .silent(self.silent);
+            .silent(self.silent)
+            .group_coordinator(GroupCoordinatorConfig {
+                initial_rebalance_delay: self.group_initial_rebalance_delay,
+                poll_interval: self.group_poll_interval,
+            });
 
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
         let broker = broker.lake_house(lake_house);

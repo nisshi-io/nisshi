@@ -186,7 +186,8 @@ async fn simple_txn_commit() -> Result<()> {
         ErrorCode::MemberIdRequired,
         ErrorCode::try_from(member_id_required.error_code)?
     );
-    assert_eq!(Some(PROTOCOL_TYPE.into()), member_id_required.protocol_type);
+    // Kafka leaves the protocol type null in this response.
+    assert_eq!(None, member_id_required.protocol_type);
     assert_eq!(Some("".into()), member_id_required.protocol_name);
     assert!(member_id_required.leader.is_empty());
     assert!(member_id_required.member_id.starts_with(CLIENT_ID));
@@ -214,7 +215,7 @@ async fn simple_txn_commit() -> Result<()> {
         ErrorCode::None,
         ErrorCode::try_from(join_response.error_code)?
     );
-    assert_eq!(0, join_response.generation_id);
+    assert_eq!(1, join_response.generation_id);
     assert_eq!(Some(PROTOCOL_TYPE.into()), join_response.protocol_type);
     assert_eq!(Some(RANGE.into()), join_response.protocol_name);
     assert_eq!(member_id_required.member_id.as_str(), join_response.leader);

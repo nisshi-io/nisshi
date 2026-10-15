@@ -89,7 +89,7 @@ use slatedb::Db;
 use tracing::debug;
 use url::Url;
 
-use super::types::{TopicMetadata, Topics, Transactions};
+use super::types::{GroupDetailVersion, TopicMetadata, Topics, Transactions};
 
 /// SlateDB Storage Engine
 ///
@@ -251,6 +251,22 @@ impl Engine {
             .and_then(|bytes: Option<Bytes>| {
                 bytes.map_or(Ok(T::default()), |encoded| {
                     postcard::from_bytes(&encoded[..]).map_err(Into::into)
+                })
+            })
+    }
+
+    /// Returns the group stored at `key`, or the default group and version if none is.
+    pub(super) async fn load_group(
+        &self,
+        tx: &slatedb::DbTransaction,
+        key: &[u8],
+    ) -> Result<GroupDetailVersion> {
+        tx.get(key)
+            .await
+            .map_err(Error::from)
+            .and_then(|bytes: Option<Bytes>| {
+                bytes.map_or(Ok(GroupDetailVersion::default()), |encoded| {
+                    GroupDetailVersion::decode(&encoded).map_err(Into::into)
                 })
             })
     }

@@ -30,13 +30,14 @@
 //!
 //! What's modeled and what isn't: this drives `Wrapper<O>::join` and
 //! `Storage::update_group` directly, skipping `Controller::join`'s outer
-//! request-handler loop (rebalance-timeout polling with real
-//! `tokio::time::sleep`s, which TraceForge cannot fork the search on, so
+//! request-handler loop (which holds a request until the group's phase ends,
+//! with real `tokio` waits, which TraceForge cannot fork the search on, so
 //! exhaustive `verify()` would just run the loop to completion instead of
 //! exploring its interleavings). Each member is pre-assigned a member id, so
 //! the separate empty-member-id round trip (`MemberIdRequired`) isn't
 //! exercised here; that path has no shared mutable state and isn't part of
-//! this hazard.
+//! this hazard. Each test stores the member ids as pending member ids, as
+//! `MemberIdRequired` would, before the members join with them.
 //!
 //! The invariant checked is not just "exactly one leader" (the code trivially
 //! enforces that per call) but "the leader is always whichever member's join
@@ -50,7 +51,7 @@
 //! per-call cache-miss race), where only the leader submits real
 //! assignments and every other member submits none, as real clients do.
 //! This exercises Kafka's `SyncGroupRequest` fencing: a follower's sync
-//! before the leader's must be told to retry (`RebalanceInProgress`), the
+//! before the leader's must be held until the leader's assignment, the
 //! leader's sync must be the one that commits the assignment map, and a
 //! follower syncing after the leader must simply be handed its own stored
 //! assignment (`Inner<Formed>::sync`) - across every one of the 6 x 8 = 48
@@ -59,10 +60,8 @@
 //!
 //! `heartbeats_succeed_regardless_of_node_or_order` and
 //! `members_leave_regardless_of_node_or_order` cover the remaining two
-//! operations differently: `Controller::heartbeat`
-//! (`administrator.rs:1335-1416`) and `Controller::leave`
-//! (`administrator.rs:1164-1239`) turn out to have no rebalance-timeout
-//! polling at all (unlike join/sync, every non-error path returns
+//! operations differently: `Controller::heartbeat` and `Controller::leave`
+//! never hold a request (unlike join/sync, every path returns
 //! immediately) - so, unlike the hand-rolled `join_member`/`sync_member`
 //! above, they can be driven through the real public `Coordinator` trait
 //! directly, which is strictly stronger evidence. Two independent
@@ -79,7 +78,7 @@ use crate::common::{CLIENT_ID, PROTOCOL_TYPE, RANGE, alphanumeric_string, memory
 use bytes::Bytes;
 use nisshi_broker::coordinator::group::{
     Coordinator,
-    administrator::{Controller, Group, Inner, Wrapper},
+    administrator::{Controller, Group, Inner, JoinRequest, Reply, SyncRequest, Wrapper},
 };
 use nisshi_sans_io::{
     Body, ErrorCode, HeartbeatResponse, LeaveGroupResponse,
@@ -87,18 +86,17 @@ use nisshi_sans_io::{
     sync_group_request::SyncGroupRequestAssignment, sync_group_response::SyncGroupResponse,
 };
 use nisshi_storage::{
-    ArcDynStorage, GroupDetail, GroupDetailResponse, GroupState, NamedGroupDetail, Storage,
-    UpdateError, Version,
+    ArcDynStorage, GroupDetail, GroupDetailResponse, GroupRebalance, GroupState, NamedGroupDetail,
+    Storage, UpdateError, Version,
 };
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use traceforge::{Config, Nondet, TypeNondet, cover, future, verify};
 
 const MEMBER_IDS: [&str; 3] = ["m0", "m1", "m2"];
 
-/// One member's join, replaying `Controller::join`'s CAS-retry loop
-/// (`nisshi-broker/src/coordinator/group/administrator.rs:790-967`) without
-/// its rebalance-timeout polling/backoff: retry on `Outdated`, return as soon
-/// as the write commits.
+/// One member's join, replaying the CAS-retry loop of `Controller::join`
+/// without holding the request until the join phase ends: retry on
+/// `Outdated`, return as soon as the write commits.
 fn join_member(
     storage: &ArcDynStorage,
     group_id: &str,
@@ -120,19 +118,21 @@ fn join_member(
         first_attempt = false;
 
         let (updated, result) = future::block_on(async {
-            let (updated, _body) = original
-                .join(
-                    SystemTime::now(),
-                    Some(CLIENT_ID),
-                    group_id,
-                    45_000,
-                    Some(300_000),
-                    member_id,
-                    None,
-                    PROTOCOL_TYPE,
-                    Some(protocols),
-                    None,
-                )
+            let request = JoinRequest {
+                api_version: 9,
+                client_id: Some(CLIENT_ID),
+                group_id,
+                session_timeout_ms: 45_000,
+                rebalance_timeout_ms: 300_000,
+                member_id,
+                group_instance_id: None,
+                protocol_type: PROTOCOL_TYPE,
+                protocols: Some(protocols),
+                reason: None,
+            };
+
+            let (updated, _reply) = original
+                .join(SystemTime::now(), &request, Duration::from_secs(3))
                 .await;
 
             let detail = GroupDetail::from(&updated);
@@ -162,11 +162,10 @@ fn join_member(
     }
 }
 
-/// One member's sync, replaying `Controller::sync`'s CAS-retry loop
-/// (`nisshi-broker/src/coordinator/group/administrator.rs:970-1161`) without
-/// its rebalance-timeout polling/backoff, the same way `join_member` mirrors
-/// `Controller::join`. Returns the `SyncGroupResponse` body so the caller can
-/// check the Kafka-level fencing outcome.
+/// One member's sync, replaying the CAS-retry loop of `Controller::sync`
+/// without holding the request, the same way `join_member` mirrors
+/// `Controller::join`. Returns the reply so the caller can check the
+/// Kafka-level fencing outcome.
 #[allow(clippy::too_many_arguments)]
 fn sync_member(
     storage: &ArcDynStorage,
@@ -178,7 +177,7 @@ fn sync_member(
     assignments: Option<&[SyncGroupRequestAssignment]>,
     cache: &mut Option<(Wrapper<ArcDynStorage>, Option<Version>)>,
     simulate_cache_miss: bool,
-) -> Body {
+) -> Reply {
     let mut first_attempt = true;
 
     loop {
@@ -192,18 +191,17 @@ fn sync_member(
         first_attempt = false;
 
         let (updated, body, result) = future::block_on(async {
-            let (updated, body) = original
-                .sync(
-                    SystemTime::now(),
-                    group_id,
-                    generation_id,
-                    member_id,
-                    None,
-                    Some(protocol_type),
-                    Some(protocol_name),
-                    assignments,
-                )
-                .await;
+            let request = SyncRequest {
+                group_id,
+                generation_id,
+                member_id,
+                group_instance_id: None,
+                protocol_type: Some(protocol_type),
+                protocol_name: Some(protocol_name),
+                assignments,
+            };
+
+            let (updated, body) = original.sync(SystemTime::now(), &request).await;
 
             let detail = GroupDetail::from(&updated);
             let result = storage.update_group(group_id, detail, version).await;
@@ -232,11 +230,51 @@ fn sync_member(
     }
 }
 
+/// Stores `MEMBER_IDS` as pending member ids of a new group, as
+/// `MemberIdRequired` would, so that each member can join with its id.
+fn create_group_with_pending_members(storage: &ArcDynStorage, group_id: &str) {
+    let expires = SystemTime::now() + Duration::from_secs(3_600);
+
+    let detail = GroupDetail {
+        rebalance: Box::new(GroupRebalance {
+            pending_members: MEMBER_IDS
+                .iter()
+                .map(|member_id| ((*member_id).to_owned(), expires))
+                .collect(),
+            ..GroupRebalance::default()
+        }),
+        ..GroupDetail::default()
+    };
+
+    _ = future::block_on(storage.update_group(group_id, detail, None)).expect("create the group");
+}
+
+/// Ends the group's join phase, as the first request after its deadline does.
+fn end_join_phase(
+    storage: &ArcDynStorage,
+    group_id: &str,
+    cache: &mut Option<(Wrapper<ArcDynStorage>, Option<Version>)>,
+) {
+    let (detail, version) = future::block_on(storage.group_with_version(group_id))
+        .expect("read the group")
+        .expect("the group");
+
+    let ended = Wrapper::with_storage_group_detail(storage.clone(), detail)
+        .settle(group_id, SystemTime::now() + Duration::from_secs(3_600));
+
+    let version =
+        future::block_on(storage.update_group(group_id, GroupDetail::from(&ended), Some(version)))
+            .expect("end the join phase");
+
+    *cache = Some((ended, Some(version)));
+}
+
 #[test]
 fn three_members_join_with_simulated_cache_misses() {
     let stats = verify(Config::builder().build(), || {
         let storage = future::block_on(memory_storage("spike", 111)).expect("storage");
         let group_id = alphanumeric_string(15);
+        create_group_with_pending_members(&storage, &group_id);
 
         let protocols = [JoinGroupRequestProtocol::default()
             .name(RANGE.into())
@@ -333,6 +371,7 @@ fn sync_forms_group_with_races() {
     let stats = verify(Config::builder().build(), || {
         let storage = future::block_on(memory_storage("spike", 111)).expect("storage");
         let group_id = alphanumeric_string(15);
+        create_group_with_pending_members(&storage, &group_id);
 
         let protocols = [JoinGroupRequestProtocol::default()
             .name(RANGE.into())
@@ -357,6 +396,8 @@ fn sync_forms_group_with_races() {
                 bool::nondet(),
             );
         }
+
+        end_join_phase(&storage, &group_id, &mut cache);
 
         // The join phase's own invariants (durability, leader election) are
         // already exhaustively checked in `three_members_join_with_simulated_
@@ -390,10 +431,10 @@ fn sync_forms_group_with_races() {
             let is_leader = member_id == leader_id;
             let simulate_cache_miss = bool::nondet();
 
-            let body = sync_member(
+            let reply = sync_member(
                 &storage,
                 &group_id,
-                0,
+                1,
                 member_id,
                 PROTOCOL_TYPE,
                 RANGE,
@@ -402,24 +443,26 @@ fn sync_forms_group_with_races() {
                 simulate_cache_miss,
             );
 
-            let Body::SyncGroupResponse(SyncGroupResponse {
-                error_code,
-                assignment,
-                ..
-            }) = body
-            else {
-                panic!("expected a SyncGroupResponse, got: {body:?}");
-            };
-
             if position < leader_position {
                 assert_eq!(
-                    error_code,
-                    i16::from(ErrorCode::RebalanceInProgress),
+                    reply,
+                    Reply::Held {
+                        member_id: member_id.to_owned()
+                    },
                     "member={member_id} synced before the leader (position {position} < \
-                     {leader_position}) and must be told to rebalance"
+                     {leader_position}) and must wait for the leader's assignment"
                 );
-                cover!("follower_rebalance_in_progress_before_leader");
+                cover!("follower_held_until_leader_syncs");
             } else {
+                let Reply::Ready(Body::SyncGroupResponse(SyncGroupResponse {
+                    error_code,
+                    assignment,
+                    ..
+                })) = reply
+                else {
+                    panic!("expected a SyncGroupResponse, got: {reply:?}");
+                };
+
                 assert_eq!(
                     error_code,
                     i16::from(ErrorCode::None),
@@ -492,7 +535,7 @@ fn sync_forms_group_with_races() {
     assert!(
         stats
             .coverage
-            .is_covered("follower_rebalance_in_progress_before_leader".to_string())
+            .is_covered("follower_held_until_leader_syncs".to_string())
     );
     assert!(
         stats
@@ -521,6 +564,7 @@ fn heartbeats_succeed_regardless_of_node_or_order() {
     let stats = verify(Config::builder().build(), || {
         let storage = future::block_on(memory_storage("spike", 111)).expect("storage");
         let group_id = alphanumeric_string(15);
+        create_group_with_pending_members(&storage, &group_id);
 
         let protocols = [JoinGroupRequestProtocol::default()
             .name(RANGE.into())
@@ -532,6 +576,8 @@ fn heartbeats_succeed_regardless_of_node_or_order() {
                 &storage, &group_id, member_id, &protocols, &mut cache, false,
             );
         }
+
+        end_join_phase(&storage, &group_id, &mut cache);
 
         let leader_assignments: Vec<SyncGroupRequestAssignment> = MEMBER_IDS
             .iter()
@@ -547,7 +593,7 @@ fn heartbeats_succeed_regardless_of_node_or_order() {
             let _ = sync_member(
                 &storage,
                 &group_id,
-                0,
+                1,
                 member_id,
                 PROTOCOL_TYPE,
                 RANGE,
@@ -572,9 +618,9 @@ fn heartbeats_succeed_regardless_of_node_or_order() {
             let on_node_a = bool::nondet();
 
             let body = if on_node_a {
-                future::block_on(node_a.heartbeat(&group_id, 0, member_id, None))
+                future::block_on(node_a.heartbeat(&group_id, 1, member_id, None))
             } else {
-                future::block_on(node_b.heartbeat(&group_id, 0, member_id, None))
+                future::block_on(node_b.heartbeat(&group_id, 1, member_id, None))
             }
             .expect("heartbeat");
 
@@ -615,6 +661,7 @@ fn members_leave_regardless_of_node_or_order() {
     let stats = verify(Config::builder().build(), || {
         let storage = future::block_on(memory_storage("spike", 111)).expect("storage");
         let group_id = alphanumeric_string(15);
+        create_group_with_pending_members(&storage, &group_id);
 
         let protocols = [JoinGroupRequestProtocol::default()
             .name(RANGE.into())

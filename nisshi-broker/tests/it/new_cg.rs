@@ -619,57 +619,58 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
     );
     assert!(!c1_next_action.member_id.is_empty());
 
-    // c1: join with member id
+    // c0 and c1: join with member id. The coordinator holds both joins until the initial
+    // rebalance delay ends, as Kafka does, so they run at once, as two clients do.
     //
-    let c1_next_action = join(&c1, Some(c1_next_action))
-        .await
-        .inspect(|c1_next_action| debug!(?c1_next_action))?;
+    let (c0_next_action, c1_next_action) = tokio::join!(
+        join(&c0, Some(c0_next_action)),
+        join(&c1, Some(c1_next_action))
+    );
+    let (c0_next_action, c1_next_action) = (c0_next_action?, c1_next_action?);
+    debug!(?c0_next_action, ?c1_next_action);
 
-    assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
-    assert_eq!(0, c1_next_action.generation_id);
-    assert_eq!(c1_member_id, c1_next_action.leader);
+    for next_action in [&c0_next_action, &c1_next_action] {
+        assert_eq!(i16::from(ErrorCode::None), next_action.error_code);
+        assert_eq!(1, next_action.generation_id);
+    }
+
+    assert_eq!(c0_member_id.as_str(), c0_next_action.member_id.as_str());
+    assert_eq!(c1_member_id.as_str(), c1_next_action.member_id.as_str());
+    assert_eq!(c0_next_action.leader, c1_next_action.leader);
+
+    let (leader, follower) = if c0_next_action.leader == c0_member_id {
+        (&c0_next_action, &c1_next_action)
+    } else {
+        (&c1_next_action, &c0_next_action)
+    };
+
     assert!(
-        c1_next_action
+        leader
             .members
             .as_ref()
             .is_some_and(|members| members.len() == 2)
     );
-    assert_eq!(c1_member_id.as_str(), c1_next_action.member_id.as_str());
-
-    // c1: sync
-    //
-    let c1_next_action = sync(&c1, Some(c1_next_action))
-        .await
-        .inspect(|c1_next_action| debug!(?c1_next_action))?;
-
-    assert!(!c1_next_action.assignment.is_empty());
-    assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
-
-    // c0: join with member id
-    //
-    let c0_next_action = join(&c0, Some(c0_next_action))
-        .await
-        .inspect(|c0_next_action| debug!(?c0_next_action))?;
-
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
-    assert_eq!(0, c0_next_action.generation_id);
-    assert_eq!(c1_member_id, c0_next_action.leader);
     assert!(
-        c0_next_action
+        follower
             .members
             .as_ref()
             .is_some_and(|members| members.is_empty())
     );
-    assert_eq!(c0_member_id.as_str(), c0_next_action.member_id.as_str());
 
-    // c0: sync
+    // c0 and c1: sync. The coordinator holds the follower's sync until the leader's
+    // assignment arrives.
     //
-    let c0_next_action = sync(&c0, Some(c0_next_action))
-        .await
-        .inspect(|c0_next_action| debug!(?c0_next_action))?;
+    let (c0_next_action, c1_next_action) = tokio::join!(
+        sync(&c0, Some(c0_next_action)),
+        sync(&c1, Some(c1_next_action))
+    );
+    let (c0_next_action, c1_next_action) = (c0_next_action?, c1_next_action?);
+    debug!(?c0_next_action, ?c1_next_action);
 
-    assert!(!c0_next_action.assignment.is_empty());
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
+    for next_action in [&c0_next_action, &c1_next_action] {
+        assert!(!next_action.assignment.is_empty());
+        assert_eq!(i16::from(ErrorCode::None), next_action.error_code);
+    }
 
     // c0: heartbeat
     //

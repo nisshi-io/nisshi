@@ -170,7 +170,7 @@ use serde::{Deserialize, Serialize};
 use std::error;
 use std::{
     array::TryFromSliceError,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fmt::{self, Debug, Display, Formatter},
     fs::DirEntry,
@@ -1057,6 +1057,10 @@ pub struct GroupDetail {
     pub skip_assignment: Option<bool>,
     pub inception: SystemTime,
     pub state: GroupState,
+    /// A group stored before this field existed has no rebalance in progress. The field is
+    /// boxed to keep `GroupDetail` small in the enums that carry it.
+    #[serde(default)]
+    pub rebalance: Box<GroupRebalance>,
 }
 
 impl Default for GroupDetail {
@@ -1069,8 +1073,58 @@ impl Default for GroupDetail {
             skip_assignment: Some(false),
             inception: SystemTime::now(),
             state: GroupState::default(),
+            rebalance: Box::default(),
         }
     }
+}
+
+/// The progress of a group's rebalance, which the group coordinator stores with the group so that
+/// any broker sharing the storage can coordinate the group.
+///
+/// Kafka keeps this state in the memory of the one broker that coordinates the group. Nisshi has
+/// no such broker, so each deadline is a wall-clock time that every broker can compare with its own
+/// clock.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct GroupRebalance {
+    /// The join phase in progress, which Kafka calls `PreparingRebalance`.
+    pub join_phase: Option<JoinPhase>,
+    /// The members that must still send `SyncGroup` for the current generation.
+    pub pending_sync: Option<PendingSync>,
+    /// The member ids that `MEMBER_ID_REQUIRED` gave out and that have not joined yet, each with
+    /// the time after which the coordinator forgets it.
+    pub pending_members: BTreeMap<String, SystemTime>,
+}
+
+/// A join phase: the coordinator holds each `JoinGroup` until the phase ends.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct JoinPhase {
+    /// When the phase ends whether or not every member has rejoined.
+    pub deadline: SystemTime,
+    /// The members that have joined in this phase.
+    pub joined: BTreeSet<String>,
+    /// Set while the group forms from empty, when the phase lasts for a delay instead of ending
+    /// once every member has joined.
+    pub initial_delay: Option<InitialDelay>,
+}
+
+/// The delay of a join phase that forms a group from empty, as Kafka's
+/// `group.initial.rebalance.delay.ms` gives it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct InitialDelay {
+    /// The length of the delay that ends at the phase's deadline.
+    pub delay_ms: u64,
+    /// How much longer than the deadline the phase may still be extended.
+    pub remaining_ms: u64,
+    /// Whether a new member joined during the delay that ends at the deadline.
+    pub new_member_added: bool,
+}
+
+/// The members that must still send `SyncGroup`, and when the coordinator removes those that have
+/// not.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct PendingSync {
+    pub deadline: SystemTime,
+    pub members: BTreeSet<String>,
 }
 
 impl From<&GroupDetail> for ConsumerGroupState {

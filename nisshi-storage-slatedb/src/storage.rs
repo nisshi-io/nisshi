@@ -1868,19 +1868,20 @@ impl Storage for Engine {
                 let key = postcard::to_stdvec(&GroupKey::new(group_id))?;
 
                 match self.db.get(&key).await {
-                    Ok(Some(encoded)) => {
-                        match postcard::from_bytes::<GroupDetailVersion>(&encoded) {
-                            Ok(gdv) => {
-                                results.push(NamedGroupDetail::found(group_id.into(), gdv.detail));
-                            }
-                            Err(_) => {
-                                results.push(NamedGroupDetail::found(
-                                    group_id.into(),
-                                    GroupDetail::default(),
-                                ));
-                            }
+                    Ok(Some(encoded)) => match GroupDetailVersion::decode(&encoded) {
+                        Ok(gdv) => {
+                            results.push(NamedGroupDetail::found(group_id.into(), gdv.detail));
                         }
-                    }
+                        // A group that can't be decoded is reported as an error, not as an empty
+                        // group, so that a delete of the group refuses it instead of deleting it.
+                        Err(err) => {
+                            warn!(?err, group_id, "the stored group can't be decoded");
+                            results.push(NamedGroupDetail::error_code(
+                                group_id.into(),
+                                ErrorCode::UnknownServerError,
+                            ));
+                        }
+                    },
                     Ok(None) => {
                         results.push(NamedGroupDetail::found(
                             group_id.into(),
@@ -1909,7 +1910,7 @@ impl Storage for Engine {
             .await
             .map_err(Error::from)
             .inspect_err(|err| debug!(?err, group_id))?
-            .map(|encoded| postcard::from_bytes::<GroupDetailVersion>(&encoded[..]))
+            .map(|encoded| GroupDetailVersion::decode(&encoded))
             .transpose()
             .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))?;
 
@@ -1942,8 +1943,8 @@ impl Storage for Engine {
         // only a missing group or the empty placeholder that offset_commit
         // stores, so a group with state is reported as outdated rather than
         // silently overwritten.
-        let current: GroupDetailVersion = self
-            .load_metadata(&tx, &key)
+        let current = self
+            .load_group(&tx, &key)
             .await
             .map_err(UpdateError::Error)?;
 
@@ -1980,7 +1981,7 @@ impl Storage for Engine {
                     .map_err(Error::from)
                     .and_then(|encoded| {
                         encoded.map_or(Ok(GroupDetailVersion::default()), |encoded| {
-                            postcard::from_bytes(&encoded[..]).map_err(Into::into)
+                            GroupDetailVersion::decode(&encoded).map_err(Into::into)
                         })
                     })
                     .map_err(UpdateError::Error)?;

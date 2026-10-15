@@ -574,7 +574,6 @@ fn describe(duration: Option<Duration>) -> String {
 /// extended while new members join, and ends a later rebalance as soon as every member has
 /// rejoined. A broker that holds each join for a part of the session timeout pauses the group for
 /// many seconds at each change.
-#[ignore = "JoinGroup waits half the session timeout (#986)"]
 #[test]
 fn group_rebalance_follows_kafka_timing() {
     let cli = KafkaCli::shared();
