@@ -756,20 +756,6 @@ impl DynoStore {
             .await
     }
 
-    fn records_prefix(&self, topition: &Topition) -> Path {
-        Path::from(format!(
-            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-            self.cluster, topition.topic, topition.partition,
-        ))
-    }
-
-    fn batch_path(&self, topition: &Topition, base_offset: i64) -> Path {
-        Path::from(format!(
-            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-            self.cluster, topition.topic, topition.partition, base_offset,
-        ))
-    }
-
     /// Returns the (cached, shared) `OptiCon` handle for `topition`'s
     /// watermark document, inserting one if this is the first time this
     /// partition has been touched in this process.
@@ -794,16 +780,6 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
-    /// Returns the base offset of the batch object at `meta`, or `None` for
-    /// an object under the records prefix that is not a batch.
-    fn batch_base_offset(meta: &ObjectMeta) -> Option<i64> {
-        meta.location.parts().next_back().and_then(|name| {
-            name.as_ref()
-                .get(0..20)
-                .and_then(|digits| i64::from_str(digits).ok())
-        })
-    }
-
     /// Streams the batch objects of `topition` at or after `start_offset`,
     /// in offset order, as the base offset and write time of each. The
     /// stream lists lazily, so a consumer that stops early lists only up to
@@ -813,14 +789,16 @@ impl DynoStore {
         topition: &Topition,
         start_offset: i64,
     ) -> BoxStream<'static, Result<(i64, SystemTime)>> {
-        let prefix = self.records_prefix(topition);
+        let prefix = records_prefix(&self.cluster, topition);
 
         // A batch key zero-pads its base offset, so key order is offset
         // order. A store that supports a start-after LIST then begins at
         // `start_offset`, instead of at the first batch of the partition.
         let list_stream = if start_offset > 0 {
-            self.object_store
-                .list_with_offset(Some(&prefix), &self.batch_path(topition, start_offset - 1))
+            self.object_store.list_with_offset(
+                Some(&prefix),
+                &batch_path(&self.cluster, topition, start_offset - 1),
+            )
         } else {
             self.object_store.list(Some(&prefix))
         };
@@ -833,7 +811,7 @@ impl DynoStore {
                 Error::Api(ErrorCode::KafkaStorageError)
             })
             .try_filter_map(move |meta| {
-                ready(Ok(Self::batch_base_offset(&meta)
+                ready(Ok(batch_base_offset(&prefix, &meta.location)
                     .filter(|&base_offset| base_offset >= start_offset)
                     .map(|base_offset| {
                         (base_offset, SystemTime::from(meta.last_modified))
@@ -871,7 +849,7 @@ impl DynoStore {
         topition: &Topition,
         base_offset: i64,
     ) -> Result<Option<deflated::Batch>> {
-        let path = self.batch_path(topition, base_offset);
+        let path = batch_path(&self.cluster, topition, base_offset);
 
         let encoded = match self.object_store.get(&path).await {
             Ok(get_result) => get_result.bytes().await,

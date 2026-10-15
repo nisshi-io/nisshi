@@ -29,7 +29,7 @@ use std::{
 };
 
 use crate::dynostore::{
-    BATCH_SETTLED_AFTER, DynoStore, Txn, TxnDetail, TxnProduceOffset, Watermark,
+    BATCH_SETTLED_AFTER, DynoStore, Txn, TxnDetail, TxnProduceOffset, Watermark, batch_path,
     tests::init_tracing,
     time_index::{INITIAL_INTERVAL_BYTES, MAX_ENTRIES, TimeIndex},
 };
@@ -155,7 +155,7 @@ async fn write_batch_object(
     batch: deflated_batch::Batch,
 ) -> Result<()> {
     let base_offset = batch.base_offset;
-    let path = storage.batch_path(topition, base_offset);
+    let path = batch_path(&storage.cluster, topition, base_offset);
     let payload = storage.encode(batch)?;
 
     _ = storage
@@ -1011,7 +1011,10 @@ async fn backfill_get_failure_leaves_the_index_incomplete() -> Result<()> {
     let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topition = legacy_partition_with_max_at_offset_1(&storage, "backfill-failure").await?;
 
-    faulty.arm(storage.batch_path(&topition, 1), Fault::Unavailable)?;
+    faulty.arm(
+        batch_path(&storage.cluster, &topition, 1),
+        Fault::Unavailable,
+    )?;
 
     assert_eq!(
         ErrorCode::KafkaStorageError,
@@ -1036,7 +1039,7 @@ async fn backfill_skips_a_batch_deleted_after_listing() -> Result<()> {
     let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
     let topition = legacy_partition_with_max_at_offset_1(&storage, "backfill-not-found").await?;
 
-    faulty.arm(storage.batch_path(&topition, 2), Fault::NotFound)?;
+    faulty.arm(batch_path(&storage.cluster, &topition, 2), Fault::NotFound)?;
 
     let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 60).await?;
     assert_eq!(Some(1), offset);
@@ -1061,7 +1064,10 @@ async fn scan_get_failure_answers_an_error_for_the_partition() -> Result<()> {
     assert_eq!(1, produce(&storage, &topition, &[T0 + 50]).await?);
     assert_eq!(2, produce(&storage, &topition, &[T0 + 100]).await?);
 
-    faulty.arm(storage.batch_path(&topition, 1), Fault::Unavailable)?;
+    faulty.arm(
+        batch_path(&storage.cluster, &topition, 1),
+        Fault::Unavailable,
+    )?;
 
     assert_eq!(
         ErrorCode::KafkaStorageError,
@@ -1091,7 +1097,10 @@ async fn failed_lookup_answers_only_its_own_partition_with_an_error() -> Result<
     assert_eq!(0, produce(&storage, &failing, &[T0]).await?);
     assert_eq!(0, produce(&storage, &healthy, &[T0]).await?);
 
-    faulty.arm(storage.batch_path(&failing, 0), Fault::Unavailable)?;
+    faulty.arm(
+        batch_path(&storage.cluster, &failing, 0),
+        Fault::Unavailable,
+    )?;
 
     let responses = list_offsets_timestamp_responses(
         &storage,
