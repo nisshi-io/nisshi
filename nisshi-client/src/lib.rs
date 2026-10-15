@@ -49,7 +49,13 @@
 //! # Proxy: [`Layer`] Composition
 //!
 //! An example API proxy listening for requests on `tcp://localhost:9092` that
-//! forwards each [`Frame`] to an origin broker on `tcp://example.com:9092`:
+//! forwards each [`Frame`] to an origin broker on `tcp://example.com:9092`.
+//!
+//! The pool shares each origin connection between the proxy's clients, and the
+//! origin binds a SASL login to the connection that carried it. A forwarded login
+//! therefore applies to every client that later uses that connection. This example
+//! forwards every frame, so it suits only an origin that requires no authentication.
+//! A proxy for any other origin must answer SaslHandshake and SaslAuthenticate itself.
 //!
 //! ```no_run
 //! use rama::{Layer as _, Service as _, extensions::Extensions};
@@ -556,6 +562,10 @@ impl Builder {
 }
 
 /// Inject the [`Pool`] into each request of this [`Layer`], as a [`FramePool`], using [`FramePoolService`]
+///
+/// Every caller of the layer shares the pool's connections. A request that changes the
+/// state of its connection, as SaslHandshake and SaslAuthenticate do, therefore affects
+/// every later request on that connection, whoever sends it.
 #[derive(Clone, Debug)]
 pub struct FramePoolLayer {
     pool: Pool,

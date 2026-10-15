@@ -459,6 +459,46 @@ Consumer:
   -b localhost:9092
 ```
 
+## proxy
+
+The `nisshi proxy` command runs a Kafka API proxy in front of an origin broker:
+
+```shell
+nisshi proxy --help
+Apache Kafka compatible proxy
+
+Usage: nisshi proxy [OPTIONS]
+
+Options:
+      --listener-url <LISTENER_URL>
+          The proxy will listen on this address [env: LISTENER_URL=] [default: tcp://0.0.0.0:9092]
+      --advertised-listener-url <ADVERTISED_LISTENER_URL>
+          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=] [default: tcp://127.0.0.1:9092]
+      --origin-url <ORIGIN_URL>
+          The proxy will forward traffic to this origin broker, which must not require authentication [env: ORIGIN_URL=] [default: tcp://127.0.0.1:9092]
+      --otlp-endpoint-url <OTLP_ENDPOINT_URL>
+          OTEL Exporter OTLP endpoint [env: OTEL_EXPORTER_OTLP_ENDPOINT=]
+      --schema-registry <SCHEMA_REGISTRY>
+          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
+  -h, --help
+          Print help
+```
+
+To proxy a broker that listens on `localhost:19092`:
+
+```shell
+nisshi proxy --origin-url tcp://localhost:19092
+```
+
+The proxy does not authenticate its clients, and it connects to the origin
+over plain TCP without SASL. So the origin listener must not require
+authentication, as with a Kafka `PLAINTEXT` listener. Every client that can
+reach the proxy listener gets the proxy's access to the origin.
+
+The proxy answers SaslHandshake and SaslAuthenticate itself with
+`ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not
+forward them to the origin. So a client configured for SASL fails to connect.
+
 ## Feedback
 
 Please [raise an issue][nisshi-issues] if you encounter a problem.
