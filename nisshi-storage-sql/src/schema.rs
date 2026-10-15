@@ -19,9 +19,10 @@ use tracing::info;
 
 /// The schema version that a database records in its `nisshi_schema_version` table.
 ///
-/// Every release must keep this one row up to date, also when it tracks its migrations
-/// elsewhere, because an older broker reads it to decide whether it can use the database. An
-/// older broker that finds no `nisshi_schema_version` table creates its own schema there.
+/// An older broker reads this row to decide whether it can use the database, so every release
+/// must keep the table. An older broker that finds no `nisshi_schema_version` table creates its
+/// own schema there. A release that moves to another way of tracking the schema can stop
+/// updating the row once it has raised `oldest_compatible_version` to its own version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecordedSchema {
     /// The version of the database's schema.
