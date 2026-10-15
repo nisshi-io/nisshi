@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse, RequestInput,
+    ApiKey, ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode,
+    RequestInput, describe_configs_response::DescribeConfigsResult,
 };
 use rama::Service;
 use tracing::{error, instrument};
@@ -85,18 +86,72 @@ where
         let mut results = vec![];
 
         for resource in input.request.resources.unwrap_or_default() {
-            results.push(
-                self.storage
-                    .describe_config(
-                        resource.resource_name.as_str(),
-                        ConfigResource::from(resource.resource_type),
-                        resource.configuration_keys.as_deref(),
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err))?,
-            );
+            let result = match ConfigResource::from(resource.resource_type) {
+                ConfigResource::Broker => self.describe_broker(&resource.resource_name).await,
+                resource_type => {
+                    self.storage
+                        .describe_config(
+                            resource.resource_name.as_str(),
+                            resource_type,
+                            resource.configuration_keys.as_deref(),
+                        )
+                        .await
+                }
+            };
+
+            results.push(result.inspect_err(|err| error!(?err))?);
         }
 
         Ok(DescribeConfigsResponse::default().results(Some(results)))
+    }
+}
+
+impl<G> DescribeConfigsService<G>
+where
+    G: Storage,
+{
+    /// Describes the broker resource `name`, as Kafka 3.9.1 does
+    /// ([ConfigHelper.scala#L113-L121](https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigHelper.scala#L113-L121)).
+    /// It compares `name` with this broker's node id, and does not look it up as a topic.
+    ///
+    /// An empty name selects the dynamic defaults for every broker, and our node id selects
+    /// this broker. Both get an empty config list. Nisshi takes its settings from its command
+    /// line, not from Kafka broker configs, and every engine discards an alter of a broker
+    /// config, so it has no broker config to report. For our node id, Kafka lists every config
+    /// of the broker, so `kafka-configs --describe --all` prints them there. Without `--all`,
+    /// the tool prints only dynamic configs, so it prints what Kafka prints for a broker that
+    /// has none.
+    ///
+    /// Any other name gets `INVALID_REQUEST` with Kafka's message, in this resource's result
+    /// only. The other resources in the request still get an answer.
+    async fn describe_broker(&self, name: &str) -> Result<DescribeConfigsResult> {
+        let result = DescribeConfigsResult::default()
+            .resource_name(name.into())
+            .resource_type(ConfigResource::Broker.into())
+            .configs(Some(vec![]));
+
+        if name.is_empty() {
+            return Ok(result
+                .error_code(ErrorCode::None.into())
+                .error_message(None));
+        }
+
+        let node = self.storage.node().await?;
+
+        let error_message = match name.parse::<i32>() {
+            Ok(id) if id == node => {
+                return Ok(result
+                    .error_code(ErrorCode::None.into())
+                    .error_message(None));
+            }
+            Ok(_) => format!(
+                "Unexpected broker id, expected {node} or empty string, but received {name}"
+            ),
+            Err(_) => format!("Broker id must be an integer, but it is: {name}"),
+        };
+
+        Ok(result
+            .error_code(ErrorCode::InvalidRequest.into())
+            .error_message(Some(error_message)))
     }
 }

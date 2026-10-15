@@ -1584,6 +1584,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Option<ScramCredential>>;
 
     /// Query the configuration of a resource in this storage.
+    ///
+    /// [`DescribeConfigsService`] answers a [`ConfigResource::Broker`] resource itself, so an
+    /// implementation needs to answer only the other resource types.
     async fn describe_config(
         &self,
         name: &str,
