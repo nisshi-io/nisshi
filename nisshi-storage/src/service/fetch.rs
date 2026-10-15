@@ -47,6 +47,23 @@ static FETCH_OFFSET_OUT_OF_BOUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Partitions that a Fetch answers with `UNKNOWN_TOPIC_OR_PARTITION` although
+/// their topic exists, by `topic` and by `source`: `request` for an index
+/// outside the topic's partitions, and `storage` for a partition that the
+/// metadata listed and storage then reported unknown. A Fetch counts once
+/// per poll round. A `storage` count that does not stop points at metadata
+/// and storage that disagree.
+static FETCH_UNKNOWN_PARTITION: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_fetch_unknown_partition")
+        .with_description(
+            "Fetch partitions of an existing topic answered UNKNOWN_TOPIC_OR_PARTITION, by \
+             source: request (an index outside the topic) or storage (storage reported the \
+             partition unknown after the metadata listed it); counted once per poll round",
+        )
+        .build()
+});
+
 /// How long past the client's `max_wait` a Fetch may spend reading storage.
 ///
 /// A client abandons a Fetch at its own read deadline, then sends it again
@@ -383,7 +400,7 @@ where
         // isolation level, as in Kafka.
         let offset_stage = match before(cap, self.storage.offset_stage(&tp)).await {
             Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                return Ok(Self::unknown_partition(partition_index));
+                return Ok(Self::unknown_to_storage(&tp, "offset_stage"));
             }
             Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
             Err(reason) => {
@@ -483,7 +500,7 @@ where
             .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_partition(partition_index));
+                    return Ok(Self::unknown_to_storage(&tp, "fetch"));
                 }
                 Ok(fetched) => fetched,
                 Err(reason) => {
@@ -559,7 +576,7 @@ where
             .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_partition(partition_index));
+                    return Ok(Self::unknown_to_storage(&tp, "offset_stage"));
                 }
                 Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
                 Err(reason) => {
@@ -660,15 +677,32 @@ where
             })))
     }
 
+    /// The answer for a partition that storage reports as unknown after the
+    /// request read the topic's metadata, because the topic was deleted, or
+    /// recreated with fewer partitions, in between.
+    ///
+    /// Storage reports it with [`ErrorCode::UnknownTopicOrPartition`] (see
+    /// [`Storage::offset_stage`]), and the request answers it in the
+    /// response, as for any other unknown partition, instead of closing the
+    /// connection. The answer is counted in `nisshi_fetch_unknown_partition`
+    /// with `source` `storage`, because a count that does not stop shows
+    /// metadata and storage that disagree.
+    fn unknown_to_storage(tp: &Topition, operation: &'static str) -> PartitionData {
+        debug!(?tp, operation, "storage reports the partition unknown");
+
+        FETCH_UNKNOWN_PARTITION.add(
+            1,
+            &[
+                KeyValue::new("topic", tp.topic().to_owned()),
+                KeyValue::new("source", "storage"),
+            ],
+        );
+
+        Self::unknown_partition(tp.partition())
+    }
+
     /// The answer for a partition that the topic does not have, and for
     /// each partition of an unknown topic.
-    ///
-    /// It also answers a partition that storage reports as unknown, because
-    /// its topic was deleted, or recreated with fewer partitions, after the
-    /// request read the topic's metadata. Storage reports that with
-    /// [`ErrorCode::UnknownTopicOrPartition`], and the request answers it
-    /// in the response, as for any other unknown partition, instead of
-    /// closing the connection.
     fn unknown_partition(partition_index: i32) -> PartitionData {
         PartitionData::default()
             .partition_index(partition_index)
@@ -715,6 +749,7 @@ where
             let partition_count = topic_partitions.as_deref().map_or(0, <[_]>::len);
 
             let mut partitions = Vec::new();
+            let mut outside_topic = 0;
 
             for fetch_partition in fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
                 // Kafka answers a partition that the topic does not have
@@ -727,7 +762,14 @@ where
                     .is_ok_and(|index| index < partition_count)
                 {
                     *left = left.saturating_sub(1);
+                    outside_topic += 1;
                     partitions.push(Self::unknown_partition(fetch_partition.partition));
+
+                    // A request can hold millions of such indexes, and this
+                    // branch does not await, so it yields to the runtime once
+                    // its budget is spent instead of holding the worker for
+                    // the whole request.
+                    tokio::task::consume_budget().await;
                     continue;
                 }
 
@@ -766,6 +808,21 @@ where
                     max_bytes.saturating_sub(partition_max_bytes.saturating_sub(partition_bytes));
 
                 partitions.push(partition);
+            }
+
+            if outside_topic > 0 {
+                debug!(
+                    topic = name,
+                    outside_topic, partition_count, "fetch of partitions outside the topic"
+                );
+
+                FETCH_UNKNOWN_PARTITION.add(
+                    outside_topic,
+                    &[
+                        KeyValue::new("topic", name.to_owned()),
+                        KeyValue::new("source", "request"),
+                    ],
+                );
             }
 
             Ok(FetchableTopicResponse::default()
@@ -1341,6 +1398,12 @@ mod tests {
         offset_stage: OffsetStage,
         offset_stage_reads: Arc<AtomicUsize>,
         stage_growth: i64,
+        /// Offset stage reads, counted from 0, from which the partition is
+        /// unknown to storage.
+        unknown_from_stage_read: Option<usize>,
+        /// Records reads, counted from 1, from which the partition is
+        /// unknown to storage.
+        unknown_from_fetch_call: Option<usize>,
     }
 
     impl Scripted {
@@ -1352,6 +1415,8 @@ mod tests {
                 offset_stage,
                 offset_stage_reads: Arc::new(AtomicUsize::new(0)),
                 stage_growth: 0,
+                unknown_from_stage_read: None,
+                unknown_from_fetch_call: None,
             }
         }
 
@@ -1384,6 +1449,13 @@ mod tests {
                 calls.len()
             };
 
+            if self
+                .unknown_from_fetch_call
+                .is_some_and(|unknown_from| calls >= unknown_from)
+            {
+                return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
             let response = {
                 let mut responses = self.responses.lock()?;
 
@@ -1407,6 +1479,14 @@ mod tests {
 
         async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
             let reads = self.offset_stage_reads.fetch_add(1, Ordering::SeqCst);
+
+            if self
+                .unknown_from_stage_read
+                .is_some_and(|unknown_from| reads >= unknown_from)
+            {
+                return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
             let growth = self.stage_growth * i64::try_from(reads)?;
 
             Ok(OffsetStage {
@@ -2572,6 +2652,64 @@ mod tests {
             ErrorCode::try_from(topics[0][0].error_code)?
         );
         assert_eq!(0, batches(&topics[1][0]));
+
+        Ok(())
+    }
+
+    /// A partition that storage reports as unknown at any of its reads
+    /// answers `UNKNOWN_TOPIC_OR_PARTITION` in the response, and the read
+    /// does not fail.
+    #[tokio::test(start_paused = true)]
+    async fn storage_unknown_partition_at_each_read_answers_in_band() -> Result<()> {
+        // records up to offset 3, past a high watermark of 1, so the offset
+        // stage is read again after the records
+        let stage = OffsetStage {
+            last_stable: 1,
+            high_watermark: 1,
+            log_start: 0,
+        };
+
+        let cases = [
+            (
+                "first offset stage read",
+                Scripted {
+                    unknown_from_stage_read: Some(0),
+                    ..Scripted::new(vec![], stage)
+                },
+            ),
+            (
+                "records read",
+                Scripted {
+                    unknown_from_fetch_call: Some(1),
+                    ..Scripted::new(vec![], stage)
+                },
+            ),
+            (
+                "offset stage read after the records",
+                Scripted {
+                    unknown_from_stage_read: Some(1),
+                    ..Scripted::new(vec![vec![batch(0, &[0, 3])?], vec![]], stage)
+                },
+            ),
+        ];
+
+        for (name, storage) in cases {
+            let partition = fetch_partition_at(
+                storage,
+                Duration::from_secs(1),
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                0,
+            )
+            .await?;
+
+            assert_eq!(
+                ErrorCode::UnknownTopicOrPartition,
+                ErrorCode::try_from(partition.error_code)?,
+                "{name}"
+            );
+            assert_eq!(None, partition.records, "{name}");
+        }
 
         Ok(())
     }

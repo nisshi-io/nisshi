@@ -762,20 +762,28 @@ impl DynoStore {
         }
     }
 
-    /// Returns the low watermark of one partition: its log start offset.
+    /// Returns [`Self::watermark_for`] `topition`, after it ensures, on the
+    /// partition's first read, that the partition exists.
     ///
-    /// The caller must first ensure that the partition exists (see
-    /// [`Self::ensure_partition_exists`]), because this caches a watermark
-    /// for each partition that it reads.
-    async fn log_start(&self, topition: &Topition) -> Result<i64> {
-        let watermark = self.watermarks.lock().map(|mut locked| {
-            locked
-                .entry(topition.to_owned())
-                .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                .to_owned()
-        })?;
+    /// The partition index comes from the client, and the broker keeps each
+    /// cached watermark until the topic is deleted, so the first read checks
+    /// the partition (see [`Self::ensure_partition_exists`]). A later read
+    /// skips that check, because it would read the metadata again on each
+    /// Fetch of the partition.
+    async fn checked_watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
+        if let Some(watermark) = self.watermarks.lock()?.get(topition) {
+            return Ok(watermark.to_owned());
+        }
 
-        watermark
+        self.ensure_partition_exists(topition).await?;
+
+        self.watermark_for(topition)
+    }
+
+    /// Returns the low watermark of one partition: its log start offset.
+    async fn log_start(&self, topition: &Topition) -> Result<i64> {
+        self.checked_watermark_for(topition)
+            .await?
             .with(&self.object_store, |watermark| {
                 Ok(watermark.low.unwrap_or(0))
             })
@@ -785,6 +793,10 @@ impl DynoStore {
     /// Returns the (cached, shared) `OptiCon` handle for `topition`'s
     /// watermark document, inserting one if this is the first time this
     /// partition has been touched in this process.
+    ///
+    /// The caller must already know that the partition exists, because the
+    /// broker keeps the handle until the topic is deleted. For an index from
+    /// the client, use [`Self::checked_watermark_for`].
     fn watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
         self.watermarks
             .lock()
@@ -1661,6 +1673,14 @@ impl Storage for DynoStore {
                 })
                 .await?;
 
+            // The broker keeps a cached watermark for each partition that it
+            // reads, so it drops the topic's watermarks here. Without this,
+            // a client that creates and deletes topics grows the cache
+            // without bound.
+            self.watermarks
+                .lock()?
+                .retain(|topition, _| topition.topic != metadata.topic.name);
+
             Ok(ErrorCode::None)
         } else {
             Ok(ErrorCode::UnknownTopicOrPartition)
@@ -2269,14 +2289,8 @@ impl Storage for DynoStore {
 
         debug!(?stable);
 
-        // The broker keeps the watermark of each partition that it reads,
-        // and never removes one, so an index from the client must not add
-        // one for a partition that does not exist.
-        self.ensure_partition_exists(topition).await?;
-
-        let watermark = self.watermark_for(topition)?;
-
-        watermark
+        self.checked_watermark_for(topition)
+            .await?
             .with(&self.object_store, |watermark| {
                 debug!(?watermark);
                 let high_watermark = watermark.high.unwrap_or(0);

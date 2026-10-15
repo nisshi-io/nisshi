@@ -1521,6 +1521,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<i64>;
 
     /// Fetch deflated batches from storage.
+    ///
+    /// For a topic or partition that does not exist, see
+    /// [`Storage::offset_stage`].
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -1532,6 +1535,20 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Vec<deflated::Batch>>;
 
     /// Query the offset stage for a topic partition.
+    ///
+    /// The partition index comes from the client, so an engine must not
+    /// keep state for a partition that does not exist: a client can send
+    /// any number of indexes.
+    ///
+    /// # Errors
+    ///
+    /// An engine should return [`Error::Api`] with
+    /// [`ErrorCode::UnknownTopicOrPartition`] for a topic or partition that
+    /// does not exist. Fetch reads the metadata before storage, so it sees
+    /// this error only when the topic is deleted, or recreated with fewer
+    /// partitions, in between, and it then answers the partition with that
+    /// error in the response. Any other error closes the client's
+    /// connection.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
     /// Query the offsets for one or more topic partitions. See

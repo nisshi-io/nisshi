@@ -14,16 +14,17 @@
 
 //! An offset stage read and a ListOffsets lookup answer
 //! `UNKNOWN_TOPIC_OR_PARTITION` for a topic or partition that does not
-//! exist, and the broker keeps no watermark for it. The broker never removes
-//! a watermark, so a client that sends many indexes would otherwise grow the
-//! broker's memory without bound.
+//! exist, and the broker keeps no watermark for it. Deleting a topic drops
+//! its watermarks. The broker keeps each other watermark that it caches, so
+//! a client that sends many indexes, or creates and deletes many topics,
+//! would otherwise grow the broker's memory without bound.
 
-use std::{assert_matches, sync::Arc};
+use std::{assert_matches, sync::Arc, time::SystemTime};
 
 use nisshi_sans_io::{
     ErrorCode, IsolationLevel, ListOffset, create_topics_request::CreatableTopic,
 };
-use nisshi_storage::{Error, Storage as _, Topition};
+use nisshi_storage::{Error, Storage as _, TopicId, Topition};
 use object_store::memory::InMemory;
 
 use crate::dynostore::{DynoStore, tests::init_tracing};
@@ -31,21 +32,28 @@ use crate::dynostore::{DynoStore, tests::init_tracing};
 const TOPIC: &str = "abc";
 const PARTITIONS: i32 = 2;
 
-/// Storage with [`TOPIC`], created with [`PARTITIONS`] partitions.
-async fn storage() -> Result<DynoStore, Error> {
-    let storage = DynoStore::new("nisshi", 1, Arc::new(InMemory::new()))?;
-
+/// Creates [`TOPIC`] with `partitions` partitions.
+async fn create(storage: &DynoStore, partitions: i32) -> Result<(), Error> {
     _ = storage
         .create_topic(
             CreatableTopic::default()
                 .name(TOPIC.into())
-                .num_partitions(PARTITIONS)
+                .num_partitions(partitions)
                 .replication_factor(1)
                 .assignments(Some([].into()))
                 .configs(Some([].into())),
             false,
         )
         .await?;
+
+    Ok(())
+}
+
+/// Storage with [`TOPIC`], created with [`PARTITIONS`] partitions.
+async fn storage() -> Result<DynoStore, Error> {
+    let storage = DynoStore::new("nisshi", 1, Arc::new(InMemory::new()))?;
+
+    create(&storage, PARTITIONS).await?;
 
     Ok(storage)
 }
@@ -92,7 +100,11 @@ async fn list_offsets_of_unknown_partition_keeps_no_watermark() -> Result<(), Er
 
     let storage = storage().await?;
 
-    for request in [ListOffset::Earliest, ListOffset::Latest] {
+    for request in [
+        ListOffset::Earliest,
+        ListOffset::Latest,
+        ListOffset::Timestamp(SystemTime::UNIX_EPOCH),
+    ] {
         let offsets = unknown()
             .into_iter()
             .map(|topition| (topition, request))
@@ -125,6 +137,42 @@ async fn list_offsets_of_unknown_partition_keeps_no_watermark() -> Result<(), Er
 
     assert_eq!(ErrorCode::None, responses[0].1.error_code);
     assert_eq!(Some(0), responses[0].1.offset);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_topic_drops_its_watermarks() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+
+    for partition in 0..PARTITIONS {
+        _ = storage
+            .offset_stage(&Topition::new(TOPIC, partition))
+            .await?;
+    }
+
+    assert_eq!(
+        ErrorCode::None,
+        storage.delete_topic(&TopicId::Name(TOPIC.into())).await?
+    );
+
+    for partition in 0..PARTITIONS {
+        let topition = Topition::new(TOPIC, partition);
+        assert!(!has_watermark(&storage, &topition)?, "{topition:?}");
+    }
+
+    // A topic created again with fewer partitions does not answer from a
+    // watermark of the deleted topic.
+    create(&storage, 1).await?;
+
+    assert_matches!(
+        storage
+            .offset_stage(&Topition::new(TOPIC, PARTITIONS - 1))
+            .await,
+        Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
+    );
 
     Ok(())
 }
