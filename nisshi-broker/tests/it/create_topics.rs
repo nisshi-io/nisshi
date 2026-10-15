@@ -376,11 +376,11 @@ async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<()
     Ok(())
 }
 
-/// `replication_factor` of `0` or less than `-1` must be rejected with
-/// `InvalidReplicationFactor` under both values of `validate_only`, and the
-/// topic must never reach storage (SlateDB's `create_topic` ignores
+/// `replication_factor` of `0`, less than `-1`, or above 64 must be rejected
+/// with `InvalidReplicationFactor` under both values of `validate_only`, and
+/// the topic must never reach storage (SlateDB's `create_topic` ignores
 /// `validate_only`, so the check has to run before storage either way).
-/// `-1` (the "use the default" sentinel) must still succeed.
+/// `-1` (the "use the default" sentinel) and 64 must still succeed.
 async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = CreateTopicsService {
         storage: storage.clone(),
@@ -394,7 +394,7 @@ async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> R
     let configs = Some([].into());
 
     for validate_only in [false, true] {
-        for replication_factor in [0, -2] {
+        for replication_factor in [0, -2, 65, i16::MAX] {
             let name = alphanumeric_string(15);
 
             let response = service
@@ -422,6 +422,14 @@ async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> R
                 ErrorCode::try_from(topics[0].error_code)?,
                 "replication_factor = {replication_factor}, validate_only = {validate_only}"
             );
+            let expected_message = if replication_factor < 1 {
+                String::from(
+                    "Replication factor must be larger than 0, or -1 to use the default value.",
+                )
+            } else {
+                format!("Replication factor {replication_factor} is above the maximum of 64.")
+            };
+            assert_eq!(Some(expected_message), topics[0].error_message);
 
             let describe_response = describe
                 .serve(RequestInput {
@@ -493,6 +501,32 @@ async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> R
     assert_eq!(name, topics[0].name.as_str());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
     assert_eq!(Some(1), topics[0].replication_factor);
+
+    // 64 is the largest replication factor accepted.
+    let name = alphanumeric_string(15);
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name(name.clone())
+                        .num_partitions(num_partitions)
+                        .replication_factor(64)
+                        .assignments(assignments.clone())
+                        .configs(configs.clone()),
+                ]))
+                .validate_only(Some(false)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(name, topics[0].name.as_str());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+    assert_eq!(Some(64), topics[0].replication_factor);
 
     Ok(())
 }

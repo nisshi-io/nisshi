@@ -2842,16 +2842,14 @@ impl Storage for DynoStore {
                                         .partition_index(partition_index)
                                         .leader_id(self.node)
                                         .leader_epoch(0)
-                                        .replica_nodes(Some(vec![
-                                            self.node;
-                                            topic_metadata.topic.replication_factor
-                                                as usize
-                                        ]))
-                                        .isr_nodes(Some(vec![
-                                            self.node;
-                                            topic_metadata.topic.replication_factor
-                                                as usize
-                                        ]))
+                                        .replica_nodes(Some(nisshi_storage::single_node_replicas(
+                                            self.node,
+                                            topic_metadata.topic.replication_factor,
+                                        )))
+                                        .isr_nodes(Some(nisshi_storage::single_node_replicas(
+                                            self.node,
+                                            topic_metadata.topic.replication_factor,
+                                        )))
                                         .eligible_leader_replicas(Some(vec![]))
                                         .last_known_elr(Some(vec![]))
                                         .offline_replicas(Some(vec![]))

@@ -36,7 +36,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::deflated::Batch,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
@@ -253,54 +253,41 @@ impl Storage for Engine {
         let port = self.advertised_listener.port().unwrap_or(9092).into();
         let rack = None;
 
-        self.topics
-            .lock()
-            .map(|topics| {
-                topics
-                    .iter()
-                    .map(|topic| {
-                        MetadataResponseTopic::default()
-                            .error_code(ErrorCode::None.into())
-                            .is_internal(Some(false))
-                            .name(Some(topic.name.clone()))
-                            .partitions(Some(
-                                (0..topic.num_partitions)
-                                    .map(|partition_index| {
-                                        MetadataResponsePartition::default()
-                                            .leader_id(self.node)
-                                            .leader_epoch(Some(-1))
-                                            .partition_index(partition_index)
-                                            .error_code(ErrorCode::None.into())
-                                            .offline_replicas(Some([].into()))
-                                            .replica_nodes(Some(vec![
-                                                self.node;
-                                                topic.replication_factor
-                                                    as usize
-                                            ]))
-                                            .isr_nodes(Some(vec![
-                                                self.node;
-                                                topic.replication_factor as usize
-                                            ]))
-                                    })
-                                    .collect(),
-                            ))
-                            .topic_id(Some(NULL_TOPIC_ID))
-                            .topic_authorized_operations(Some(i32::MIN))
-                    })
-                    .collect()
+        let topics = self
+            .topics
+            .lock()?
+            .iter()
+            .map(|topic| {
+                nisshi_storage::assign_replicas(
+                    &[self.node],
+                    topic.num_partitions,
+                    topic.replication_factor,
+                    ErrorCode::None.into(),
+                    -1,
+                )
+                .map(|partitions| {
+                    MetadataResponseTopic::default()
+                        .error_code(ErrorCode::None.into())
+                        .is_internal(Some(false))
+                        .name(Some(topic.name.clone()))
+                        .partitions(Some(partitions))
+                        .topic_id(Some(NULL_TOPIC_ID))
+                        .topic_authorized_operations(Some(i32::MIN))
+                })
             })
-            .map(|topics| MetadataResponse {
-                cluster: Some(self.cluster.clone()),
-                controller: Some(self.node),
-                brokers: [MetadataResponseBroker::default()
-                    .node_id(node_id)
-                    .host(host)
-                    .port(port)
-                    .rack(rack)]
-                .into(),
-                topics,
-            })
-            .map_err(Into::into)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(MetadataResponse {
+            cluster: Some(self.cluster.clone()),
+            controller: Some(self.node),
+            brokers: [MetadataResponseBroker::default()
+                .node_id(node_id)
+                .host(host)
+                .port(port)
+                .rack(rack)]
+            .into(),
+            topics,
+        })
     }
 
     #[instrument(skip_all)]
@@ -338,10 +325,10 @@ impl Storage for Engine {
                                     DescribeTopicPartitionsResponsePartition::default()
                                         .leader_id(self.node)
                                         .partition_index(partition_index)
-                                        .isr_nodes(Some(vec![
-                                            self.node;
-                                            existing.replication_factor as usize
-                                        ]))
+                                        .isr_nodes(Some(nisshi_storage::single_node_replicas(
+                                            self.node,
+                                            existing.replication_factor,
+                                        )))
                                 })
                                 .collect(),
                         ))
@@ -616,6 +603,51 @@ mod tests {
             ],
             offsets
         );
+
+        Ok(())
+    }
+
+    /// A stored replication factor outside what CreateTopics accepts must
+    /// describe without a panic: no replicas below one, and at most
+    /// `MAX_REPLICATION_FACTOR` replicas above it.
+    #[tokio::test]
+    async fn stored_out_of_range_replication_factor() -> Result<()> {
+        let node = 111;
+
+        for (replication_factor, expected) in [(-2, vec![]), (i16::MAX, vec![node; 64])] {
+            let engine = Engine::new(
+                "cluster".into(),
+                node,
+                Url::parse("tcp://127.0.0.1:9092/").expect("valid url"),
+            );
+
+            _ = engine
+                .create_topic(
+                    CreatableTopic::default()
+                        .name("t".into())
+                        .num_partitions(3)
+                        .replication_factor(replication_factor),
+                    false,
+                )
+                .await?;
+
+            let metadata = engine.metadata(None).await?;
+            let partitions = metadata.topics[0].partitions.as_deref().unwrap_or_default();
+            assert_eq!(3, partitions.len());
+
+            for partition in partitions {
+                assert_eq!(Some(&expected), partition.replica_nodes.as_ref());
+                assert_eq!(Some(&expected), partition.isr_nodes.as_ref());
+            }
+
+            let topics = engine.describe_topic_partitions(None, 2_000, None).await?;
+            let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+            assert_eq!(3, partitions.len());
+
+            for partition in partitions {
+                assert_eq!(Some(&expected), partition.isr_nodes.as_ref());
+            }
+        }
 
         Ok(())
     }

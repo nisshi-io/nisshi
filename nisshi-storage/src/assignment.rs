@@ -18,12 +18,53 @@ use nisshi_sans_io::metadata_response::MetadataResponsePartition;
 
 use crate::{Error, Result};
 
+/// The largest replication factor that a topic can be created with, and the
+/// most replicas reported for a partition.
+///
+/// Kafka 3.9.1 has no fixed cap. It rejects a factor below one, or above the
+/// number of registered brokers, with `INVALID_REPLICATION_FACTOR` when the
+/// topic is created ([ReplicationControlManager.java#L727-L729], [#L761-L765],
+/// [StripedReplicaPlacer.java#L412-L418]). Nisshi accepts a factor above its
+/// broker count, so that a client asking for three replicas of a single node
+/// keeps working, and uses this fixed bound instead, well above any real
+/// factor.
+///
+/// [ReplicationControlManager.java#L727-L729]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L727-L729
+/// [#L761-L765]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L761-L765
+/// [StripedReplicaPlacer.java#L412-L418]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/metadata/placement/StripedReplicaPlacer.java#L412-L418
+pub const MAX_REPLICATION_FACTOR: i16 = 64;
+
+/// The number of replicas to report for a partition with the stored
+/// `replication_factor`: none below one, and at most
+/// [`MAX_REPLICATION_FACTOR`].
+///
+/// A stored factor can be out of that range, because CreateTopics did not
+/// always check it, so a stored factor cannot panic or grow a response
+/// without bound. Within the range, the response reports the stored factor
+/// and lists a broker more than once when fewer brokers are listed. Kafka
+/// never lists a broker twice, but tools such as the Terraform Kafka provider
+/// read a topic's replication factor back as its replica count, and replace a
+/// topic whose count differs from the one they created it with.
+fn replica_count(replication_factor: impl Into<i32>) -> usize {
+    usize::try_from(replication_factor.into())
+        .unwrap_or_default()
+        .min(usize::from(MAX_REPLICATION_FACTOR.unsigned_abs()))
+}
+
+/// The replicas of a partition when `node` is the only broker listed: `node`
+/// repeated once per replica, none for a `replication_factor` below one, and
+/// at most [`MAX_REPLICATION_FACTOR`] times.
+pub fn single_node_replicas(node: i32, replication_factor: impl Into<i32>) -> Vec<i32> {
+    vec![node; replica_count(replication_factor)]
+}
+
 /// Assign a leader and replicas to each partition, round robin over `broker_ids`.
 ///
-/// Each partition takes `1 + replication_factor` consecutive brokers: the
-/// first leads and the rest are its replicas (also reported as in sync). A
-/// replication factor below one gives a partition no replicas beyond its
-/// leader. Every storage backend builds metadata through this one function.
+/// Each partition takes the brokers following its leader as its replicas
+/// (also reported as in sync): none for a `replication_factor` below one, and
+/// at most [`MAX_REPLICATION_FACTOR`], wrapping over `broker_ids` when there
+/// are fewer brokers than replicas. Every
+/// storage backend builds its Metadata partitions through this function.
 pub fn assign_replicas(
     broker_ids: &[i32],
     partitions: i32,
@@ -37,7 +78,7 @@ pub fn assign_replicas(
         ));
     }
 
-    let replicas = usize::try_from(replication_factor.into()).unwrap_or_default();
+    let replicas = replica_count(replication_factor);
     let per_partition = 1 + replicas;
 
     Ok((0..partitions)
@@ -121,5 +162,29 @@ mod tests {
         assert_eq!(1, partitions[0].leader_id);
         assert_eq!(vec![2, 1, 2], nodes(&partitions[0]));
         Ok(())
+    }
+
+    #[test]
+    fn replica_count_is_zero_below_one() {
+        for replication_factor in [-2, 0, i16::MIN] {
+            assert_eq!(0, replica_count(replication_factor));
+        }
+    }
+
+    #[test]
+    fn replica_count_is_the_factor_up_to_the_maximum() {
+        assert_eq!(1, replica_count(1));
+        assert_eq!(3, replica_count(3));
+        assert_eq!(64, replica_count(MAX_REPLICATION_FACTOR));
+        assert_eq!(64, replica_count(MAX_REPLICATION_FACTOR + 1));
+        assert_eq!(64, replica_count(i16::MAX));
+    }
+
+    #[test]
+    fn single_node_replicas_repeats_the_node_up_to_the_maximum() {
+        assert_eq!(Vec::<i32>::new(), single_node_replicas(111, -2));
+        assert_eq!(Vec::<i32>::new(), single_node_replicas(111, 0));
+        assert_eq!(vec![111; 3], single_node_replicas(111, 3));
+        assert_eq!(vec![111; 64], single_node_replicas(111, i16::MAX));
     }
 }

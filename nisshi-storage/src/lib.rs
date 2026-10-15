@@ -199,7 +199,7 @@ mod producer;
 mod proxy;
 mod service;
 
-pub use assignment::assign_replicas;
+pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;

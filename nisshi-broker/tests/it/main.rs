@@ -55,6 +55,7 @@ pub mod produce_acks_zero;
 pub mod produce_fetch;
 pub mod produce_invalid_record;
 pub mod produce_post_write_advance_failed;
+pub mod replication_factor;
 pub mod retention_bytes;
 pub mod sasl_scram_enforcement;
 pub mod startup_failure;

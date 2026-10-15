@@ -3945,15 +3945,18 @@ impl Storage for Delegate {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(0)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))
@@ -4036,15 +4039,18 @@ impl Storage for Delegate {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(0)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))

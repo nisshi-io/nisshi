@@ -19,7 +19,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::{debug, instrument};
 
-use crate::{Error, Result, Storage};
+use crate::{Error, MAX_REPLICATION_FACTOR, Result, Storage};
 
 /// Build the [`CreatableTopicResult`] for a topic that was rejected, either
 /// by storage or by validation performed before storage is ever consulted.
@@ -228,14 +228,42 @@ where
             // Replication factor is checked before partition count, matching
             // Kafka's KRaft controller (ReplicationControlManager), the only
             // mode from Kafka 4.0. -1 (broker default) was already replaced
-            // above, so anything below 1 is invalid.
-            if replication_factor.is_some_and(|factor| factor < 1) {
-                topics.push(error_result(
-                    name,
-                    num_partitions,
-                    replication_factor,
-                    ErrorCode::InvalidReplicationFactor,
-                ));
+            // above, so anything below 1 is invalid, as is anything above
+            // `MAX_REPLICATION_FACTOR`.
+            if let Some(factor) =
+                replication_factor.filter(|factor| !(1..=MAX_REPLICATION_FACTOR).contains(factor))
+            {
+                debug!(
+                    topic = %name,
+                    replication_factor = factor,
+                    limit = MAX_REPLICATION_FACTOR,
+                    "rejecting CreateTopics: invalid replication factor"
+                );
+
+                // The generic text for this error code blames the number of
+                // available brokers, which is wrong here, because the factor
+                // can exceed the broker count. The message below 1 is
+                // Kafka's own.
+                let message = if factor < 1 {
+                    String::from(
+                        "Replication factor must be larger than 0, or -1 to use the default value.",
+                    )
+                } else {
+                    format!(
+                        "Replication factor {factor} is above the maximum of \
+                         {MAX_REPLICATION_FACTOR}."
+                    )
+                };
+
+                topics.push(
+                    error_result(
+                        name,
+                        num_partitions,
+                        replication_factor,
+                        ErrorCode::InvalidReplicationFactor,
+                    )
+                    .error_message(Some(message)),
+                );
                 continue;
             }
 
