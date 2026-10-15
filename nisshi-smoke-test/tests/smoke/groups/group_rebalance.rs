@@ -18,8 +18,9 @@
 //! left without a consumer. A static member that restarts within its session timeout must get its
 //! partitions back without a rebalance, which would pause every other member.
 //!
-//! The tests print how long consuming paused at each rebalance, without asserting it, so that the
-//! cost of a rebalance stays visible.
+//! The tests print how long consuming paused at each rebalance, so that the cost of a rebalance
+//! stays visible. One test also asserts the pauses of a group with the client's default session
+//! timeout, against the pauses that Kafka's own broker gives.
 
 use std::{
     collections::BTreeSet,
@@ -58,6 +59,41 @@ const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long each member has to consume a record after a change to the group's members.
 const CONSUME_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The Java client's default `session.timeout.ms`. The timing test uses it, because a broker that
+/// holds a join for a part of the session timeout pauses a group with this default for many
+/// seconds.
+const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Kafka's default `group.initial.rebalance.delay.ms`. Kafka holds the first join of an empty
+/// group for this delay, and holds it for another delay after each delay in which a member joined.
+const INITIAL_REBALANCE_DELAY: Duration = Duration::from_secs(3);
+
+/// The Java client's default `heartbeat.interval.ms`. A member learns of a rebalance from the
+/// answer to its next heartbeat.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long the members of the timing test take, on Kafka, to revoke, rejoin, sync and fetch once
+/// each knows of a rebalance.
+const REBALANCE_DURATION: Duration = Duration::from_secs(1);
+
+/// How much later than Kafka the broker may end each step of the timing test, for its round trips
+/// to storage and for a CI runner that is slower than the machine that measured Kafka.
+const ALLOWED_DELAY_OVER_KAFKA: Duration = Duration::from_secs(2);
+
+/// How long the timing test's group may take from the start of its last member to its first
+/// record. The last member joins during the initial delay that is running, and Kafka then holds
+/// the join for one more delay.
+const FIRST_RECORD_BOUND: Duration = INITIAL_REBALANCE_DELAY
+    .saturating_mul(2)
+    .saturating_add(REBALANCE_DURATION)
+    .saturating_add(ALLOWED_DELAY_OVER_KAFKA);
+
+/// How long the timing test's group may pause after a member leaves or joins: until the other
+/// members' next heartbeat, and then for the rebalance.
+const PAUSE_BOUND: Duration = HEARTBEAT_INTERVAL
+    .saturating_add(REBALANCE_DURATION)
+    .saturating_add(ALLOWED_DELAY_OVER_KAFKA);
 
 const PARTITIONS: u32 = 3;
 const RECORDS_PER_SECOND: u32 = 20;
@@ -469,6 +505,202 @@ fn group_consumes_every_record_while_members_leave_join_and_crash() {
         consumed_after_last_rebalance,
         (0..PARTITIONS).collect(),
         "only these partitions were consumed after the last rebalance\n{stderr}"
+    );
+}
+
+/// Waits until `members` consume a record of every partition at or after `change`, so that
+/// [`pause_after`] can measure each partition's pause.
+#[track_caller]
+fn wait_until_every_partition_is_consumed_after(
+    change: Instant,
+    after: &str,
+    members: &[&mut NamedMember],
+) {
+    let deadline = Instant::now() + CONSUME_TIMEOUT;
+
+    loop {
+        let consumers_lines = members
+            .iter()
+            .map(|member| member.consumer.stdout_lines())
+            .collect::<Vec<_>>();
+        let consumed = partitions_consumed_after(change, &consumers_lines);
+
+        if consumed == (0..PARTITIONS).collect() {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "only partitions {consumed:?} were consumed within {CONSUME_TIMEOUT:?} after {after}"
+        );
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Returns when the first of `consumers_lines` consumed a record.
+fn first_record_consumed_at(consumers_lines: &[ConsumerLines]) -> Option<Instant> {
+    consumers_lines
+        .iter()
+        .flat_map(ConsumerLines::consumer_events)
+        .filter(|(_, event)| matches!(event, ConsumerEvent::RecordsConsumed { .. }))
+        .map(|(read_at, _)| read_at)
+        .min()
+}
+
+/// Returns when the last of `consumers_lines` reported that it started, just before it subscribed.
+/// The time from there excludes how long each member's JVM took to start.
+fn last_startup_at(consumers_lines: &[ConsumerLines]) -> Option<Instant> {
+    consumers_lines
+        .iter()
+        .map(|lines| {
+            lines
+                .consumer_events()
+                .into_iter()
+                .find(|(_, event)| matches!(event, ConsumerEvent::StartupComplete))
+                .map(|(read_at, _)| read_at)
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|started| started.into_iter().max())
+}
+
+fn describe(duration: Option<Duration>) -> String {
+    duration.map_or("never".to_owned(), |duration| format!("{duration:?}"))
+}
+
+/// A group of consumers with the client's default session timeout must pause no longer than it
+/// would on Kafka's own broker, when it forms, when a member leaves cleanly and when a member
+/// joins. Kafka holds the first join of a new group only for `group.initial.rebalance.delay.ms`,
+/// extended while new members join, and ends a later rebalance as soon as every member has
+/// rejoined. A broker that holds each join for a part of the session timeout pauses the group for
+/// many seconds at each change.
+#[ignore = "JoinGroup waits half the session timeout (#986)"]
+#[test]
+fn group_rebalance_follows_kafka_timing() {
+    let cli = KafkaCli::shared();
+    let topic = cli.topics().create_unique(PARTITIONS, &[]);
+    let group = unique::name("group");
+
+    let producer = cli
+        .verifiable_producer()
+        .start(&topic, RECORDS_PER_SECOND, 0);
+
+    let start_member = |name: &'static str| NamedMember {
+        name,
+        consumer: cli
+            .verifiable_consumer()
+            .start(&topic, &group, DEFAULT_SESSION_TIMEOUT, None),
+    };
+
+    let mut staying = start_member("staying");
+    let mut leaving = start_member("leaving");
+    let mut other = start_member("other");
+
+    wait_until_reassigned(
+        "three members started",
+        &mut [&mut staying, &mut leaving, &mut other],
+        &[0, 0, 0],
+    );
+    let assigned_at = Instant::now();
+    wait_until_every_partition_is_consumed_after(
+        assigned_at,
+        "three members started",
+        &[&mut staying, &mut leaving, &mut other],
+    );
+    let started_lines = [
+        staying.consumer.stdout_lines(),
+        leaving.consumer.stdout_lines(),
+        other.consumer.stdout_lines(),
+    ];
+    let last_started_at = last_startup_at(&started_lines);
+    let first_record_at = first_record_consumed_at(&started_lines);
+
+    // Each pause is measured up to records that the members consumed after they got their new
+    // partitions. A record consumed before that comes from a partition that a member held before
+    // the rebalance, so it can't show how long the rebalance paused the group.
+    let line_counts_before_leave = line_counts(&[&mut staying, &mut other]);
+    let left_at = Instant::now();
+    let (left_output, left_lines) = leaving.consumer.terminate();
+    wait_until_reassigned(
+        "the leaving member left",
+        &mut [&mut staying, &mut other],
+        &line_counts_before_leave,
+    );
+    let reassigned_after_leave_at = Instant::now();
+    wait_until_every_partition_is_consumed_after(
+        reassigned_after_leave_at,
+        "the leaving member left",
+        &[&mut staying, &mut other],
+    );
+
+    let line_counts_before_join = line_counts(&[&mut staying, &mut other]);
+    let joined_at = Instant::now();
+    let mut joining = start_member("joining");
+    wait_until_reassigned(
+        "a member joined",
+        &mut [&mut staying, &mut other, &mut joining],
+        &[line_counts_before_join[0], line_counts_before_join[1], 0],
+    );
+    let reassigned_after_join_at = Instant::now();
+    wait_until_every_partition_is_consumed_after(
+        reassigned_after_join_at,
+        "a member joined",
+        &[&mut staying, &mut other, &mut joining],
+    );
+    let measured_until = Instant::now();
+
+    let consumers_lines = vec![
+        left_lines,
+        staying.consumer.stdout_lines(),
+        other.consumer.stdout_lines(),
+        joining.consumer.stdout_lines(),
+    ];
+    let (staying_output, _) = staying.consumer.terminate();
+    let (other_output, _) = other.consumer.terminate();
+    let (joining_output, _) = joining.consumer.terminate();
+    drop(producer.terminate());
+
+    let stderr = members_stderr(&[
+        ("leaving", &left_output),
+        ("staying", &staying_output),
+        ("other", &other_output),
+        ("joining", &joining_output),
+    ]);
+
+    let first_record_after =
+        last_started_at
+            .zip(first_record_at)
+            .map(|(last_started_at, first_record_at)| {
+                first_record_at.saturating_duration_since(last_started_at)
+            });
+    let pause_after_leave = pause_after(left_at, joined_at, &consumers_lines);
+    let pause_after_join = pause_after(joined_at, measured_until, &consumers_lines);
+
+    println!(
+        "the first record was consumed {} after the last member started",
+        describe(first_record_after)
+    );
+    print_pause("a member left", pause_after_leave);
+    print_pause("a member joined", pause_after_join);
+
+    assert!(
+        first_record_after
+            .is_some_and(|first_record_after| first_record_after <= FIRST_RECORD_BOUND),
+        "the first record was consumed {} after the last member started, allowed \
+         {FIRST_RECORD_BOUND:?}\n{stderr}",
+        describe(first_record_after)
+    );
+
+    assert!(
+        pause_after_leave.is_some_and(|pause| pause <= PAUSE_BOUND),
+        "consuming paused for {} after a member left, allowed {PAUSE_BOUND:?}\n{stderr}",
+        describe(pause_after_leave)
+    );
+
+    assert!(
+        pause_after_join.is_some_and(|pause| pause <= PAUSE_BOUND),
+        "consuming paused for {} after a member joined, allowed {PAUSE_BOUND:?}\n{stderr}",
+        describe(pause_after_join)
     );
 }
 
