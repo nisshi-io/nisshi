@@ -623,6 +623,28 @@ impl DynoStore {
             .await
     }
 
+    /// Ensures that `topition` names an existing partition: its topic
+    /// exists, and its index is below the topic's partition count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`]
+    /// for an unknown topic or an index outside the topic.
+    async fn ensure_partition_exists(&self, topition: &Topition) -> Result<()> {
+        let Some(metadata) = self
+            .topic_metadata(&TopicId::Name(topition.topic.clone()))
+            .await?
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        if topition.partition < 0 || topition.partition >= metadata.topic.num_partitions {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        Ok(())
+    }
+
     fn encode(&self, deflated: deflated::Batch) -> Result<PutPayload> {
         Ok(PutPayload::from(Bytes::from(deflated)))
     }
@@ -741,6 +763,10 @@ impl DynoStore {
     }
 
     /// Returns the low watermark of one partition: its log start offset.
+    ///
+    /// The caller must first ensure that the partition exists (see
+    /// [`Self::ensure_partition_exists`]), because this caches a watermark
+    /// for each partition that it reads.
     async fn log_start(&self, topition: &Topition) -> Result<i64> {
         let watermark = self.watermarks.lock().map(|mut locked| {
             locked
@@ -1668,16 +1694,7 @@ impl Storage for DynoStore {
     ) -> Result<i64> {
         // Checked before any key is built, so a produce to a topic or
         // partition that does not exist writes nothing, as in Kafka.
-        let Some(metadata) = self
-            .topic_metadata(&TopicId::Name(topition.topic.clone()))
-            .await?
-        else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        if topition.partition < 0 || topition.partition >= metadata.topic.num_partitions {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        }
+        self.ensure_partition_exists(topition).await?;
 
         let config = self
             .describe_config(topition.topic(), ConfigResource::Topic, None)
@@ -2252,6 +2269,11 @@ impl Storage for DynoStore {
 
         debug!(?stable);
 
+        // The broker keeps the watermark of each partition that it reads,
+        // and never removes one, so an index from the client must not add
+        // one for a partition that does not exist.
+        self.ensure_partition_exists(topition).await?;
+
         let watermark = self.watermark_for(topition)?;
 
         watermark
@@ -2317,6 +2339,27 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
+            // Kafka answers a partition that does not exist in the response,
+            // with no offset:
+            // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
+            // The check comes before every lookup, because each one caches
+            // the partition's watermark.
+            match self.ensure_partition_exists(topition).await {
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                    responses.push((
+                        topition.to_owned(),
+                        ListOffsetResponse {
+                            error_code: ErrorCode::UnknownTopicOrPartition,
+                            offset: None,
+                            timestamp: None,
+                        },
+                    ));
+
+                    continue;
+                }
+                checked => checked?,
+            }
+
             if let ListOffset::Timestamp(system_time) = offset_request {
                 let target = to_timestamp(system_time)?;
 
