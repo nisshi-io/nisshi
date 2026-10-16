@@ -15,13 +15,14 @@
 
 -- Returns whether a namespace on the search path holds the nisshi_schema_version table.
 --
--- This query reads pg_class with the statement's snapshot, instead of calling to_regclass.
--- to_regclass looks the name up in the session's catalog cache without a lock, and the session
--- applies the changes of other sessions to that cache only at certain points, such as the start of
--- a transaction. A broker that waits for the setup lock runs this query in a transaction that began
--- before the lock holder committed. to_regclass can then miss the table that the holder created,
--- and the broker creates the schema a second time. A new statement snapshot sees every transaction
--- that committed before the statement started.
+-- This query asks the database directly, by reading pg_class, which always shows every table
+-- committed before the query started. It doesn't call to_regclass, because to_regclass answers
+-- from the connection's cache of table names, and that cache can be out of date.
+--
+-- The broker runs this query twice: before it asks for the setup lock, and again once it holds it.
+-- If another broker held the lock, that broker has created the table in between. The cache can
+-- still hold the first answer, that the table doesn't exist, and the broker would then create the
+-- schema a second time.
 
 select exists (
     select
