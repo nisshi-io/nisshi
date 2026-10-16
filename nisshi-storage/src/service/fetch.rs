@@ -406,17 +406,18 @@ where
 
         // Above the high watermark, every engine answers NONE with no
         // records. Kafka does so only up to the log end offset, and answers
-        // OFFSET_OUT_OF_RANGE above it:
-        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L368-L371
-        // This is a deliberate difference. On dynostore, the high watermark
-        // that this broker reads can lag a write through another broker, so
-        // a client can be ahead of it, and an error would reset the client's
+        // OFFSET_OUT_OF_RANGE above it ([LocalLog.scala#L368-L371]). This is
+        // a deliberate difference. On dynostore, the high watermark that
+        // this broker reads can lag a write through another broker, so a
+        // client can be ahead of it, and an error would reset the client's
         // position. One rule for every engine keeps the answer independent
         // of the engine. The consequence: a consumer whose position is past
         // the end of the log (after a restore, or a seek past the end) never
         // applies `auto.offset.reset`. It resumes at its position once the
         // log reaches it, and skips the records written below that position.
         // The counter makes such a parked consumer visible.
+        //
+        // [LocalLog.scala#L368-L371]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L368-L371
         if fetch_offset > offset_stage.high_watermark() {
             debug!(
                 topic,
@@ -723,10 +724,11 @@ where
             for fetch_partition in fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
                 // Kafka answers a partition that the topic does not have
                 // before it reads any log, so that partition does not end the
-                // wait for `min_bytes`:
-                // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L806-L811
-                // The index must not reach storage, because some engines keep
+                // wait for `min_bytes` ([KafkaApis.scala#L806-L811]). The
+                // index must not reach storage, because some engines keep
                 // state for each partition that they read.
+                //
+                // [KafkaApis.scala#L806-L811]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L806-L811
                 if !usize::try_from(fetch_partition.partition)
                     .is_ok_and(|index| index < partition_count)
                 {

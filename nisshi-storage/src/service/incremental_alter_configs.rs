@@ -274,10 +274,12 @@ where
     }
 }
 
-/// Returns the error for a `resource` that Kafka rejects before it reads or
-/// changes any configuration, checked in the order of Kafka's
-/// [`ConfigAdminManager.preprocess`](https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L105-L165)
-/// and [`incrementalAlterConfigResource`](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L237).
+/// Returns the error for a `resource` that Kafka rejects before it reads or changes any
+/// configuration, checked in the order of Kafka's [`ConfigAdminManager.preprocess`] and
+/// [`incrementalAlterConfigResource`].
+///
+/// [`ConfigAdminManager.preprocess`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L105-L165
+/// [`incrementalAlterConfigResource`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L237
 fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
     let configs = resource.configs.as_deref().unwrap_or_default();
 
@@ -309,12 +311,14 @@ fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
 
     for config in configs {
         // Kafka rejects an unknown operation with INVALID_REQUEST only on a
-        // broker resource
-        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L176-L179).
-        // On a topic resource its controller looks the operation up as null
-        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ControllerApis.scala#L745).
-        // We reject an unknown operation with INVALID_REQUEST on every
-        // resource, because the request is malformed whatever the resource.
+        // broker resource ([ConfigAdminManager.scala#L176-L179]). On a
+        // topic resource its controller looks the operation up as null
+        // ([ControllerApis.scala#L745]). We reject an unknown operation
+        // with INVALID_REQUEST on every resource, because the request is
+        // malformed whatever the resource.
+        //
+        // [ConfigAdminManager.scala#L176-L179]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L176-L179
+        // [ControllerApis.scala#L745]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ControllerApis.scala#L745
         let Ok(op) = OpType::try_from(config.config_operation) else {
             return Some((
                 ErrorCode::InvalidRequest,
@@ -351,8 +355,9 @@ fn error_response(
     resource: &AlterConfigsResource,
     error_code: ErrorCode,
 ) -> AlterConfigsResourceResponse {
-    // Kafka's message for a missing topic:
-    // https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/QuorumController.java#L488-L489
+    // This is the message that Kafka sends for a missing topic ([QuorumController.java#L488-L489]).
+    //
+    // [QuorumController.java#L488-L489]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/QuorumController.java#L488-L489
     let message = (error_code == ErrorCode::UnknownTopicOrPartition
         && ConfigResource::from(resource.resource_type) == ConfigResource::Topic)
         .then(|| format!("The topic '{}' does not exist.", resource.resource_name));

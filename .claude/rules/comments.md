@@ -163,6 +163,7 @@ These rules add to the rules above for Rust code. They come from the [rustdoc bo
 - Explain **why**, not **what**. The code already says what.
 - Put it where the confusion is — at the call site if that is where the surprise lands.
 - Wrap to the file's prevailing width. Keep it shorter than the code it explains; a paragraph over a two-line function is a design smell.
+- **Put each URL on a line of its own, at the end of the comment.** Write a reference-style link in the text, such as ``[`ConfigAdminManager.preprocess`]``, and define it on the comment's last lines, such as ``[`ConfigAdminManager.preprocess`]: https://github.com/apache/kafka/blob/3.9.1/...``. A URL does not break across lines, so a reference-style link keeps the prose within the width, and only the definition lines run past it. rustdoc renders the link in a `///` or `//!` comment. Write a `//` comment the same way, so that it reads the same as a doc comment.
 - **One point per comment.** A comment above a condition or a block states the rule that the code enforces first, and the reason after it. When a block has several reasons, write one comment for each, above the line that it explains. One paragraph that covers all of them makes the reader work out which reason goes with which line.
 
 ## Say It Directly

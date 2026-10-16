@@ -31,7 +31,9 @@ use crate::Error;
 ///
 /// The proxy listener does not authenticate its clients. So the proxy answers as a Kafka
 /// PLAINTEXT listener does, with `ILLEGAL_SASL_STATE` and an empty list of enabled
-/// mechanisms ([KafkaApis.scala](https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1970-L1980)).
+/// mechanisms ([KafkaApis.scala]).
+///
+/// [KafkaApis.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1970-L1980
 pub(crate) fn reject_layer() -> (
     HijackRequestLayer<SaslHandshakeRequest, SaslHandshakeRejectService>,
     HijackRequestLayer<SaslAuthenticateRequest, SaslAuthenticateRejectService>,

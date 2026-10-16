@@ -265,8 +265,9 @@ struct UnsupportedApiVersionsHeader {
 ///
 /// The broker must not decode the body of such a request, because a later version can add
 /// fields that this build's decoder does not know, and the decode then fails. Kafka also skips
-/// the body in this case
-/// (<https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/RequestContext.java#L111-L115>).
+/// the body in this case ([RequestContext.java#L111-L115]).
+///
+/// [RequestContext.java#L111-L115]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/RequestContext.java#L111-L115
 fn unsupported_api_versions_header(bytes: &Bytes) -> Option<UnsupportedApiVersionsHeader> {
     let api_key = peek::<2>(bytes, 4).map(i16::from_be_bytes)?;
     let api_version = peek::<2>(bytes, 6).map(i16::from_be_bytes)?;
@@ -483,9 +484,10 @@ where
 
             // Kafka answers an `ApiVersions` request outside the protocol range with
             // `UNSUPPORTED_VERSION`, encoded at v0, so that the client reads the `ApiVersions`
-            // entry and retries at a version in range
-            // (https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiVersionsRequest.java#L112-L126).
+            // entry and retries at a version in range ([ApiVersionsRequest.java#L112-L126]).
             // `api_version` is already 0 for such a request.
+            //
+            // [ApiVersionsRequest.java#L112-L126]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiVersionsRequest.java#L112-L126
             let body = match body {
                 Body::ApiVersionsResponse(response) if unsupported_api_versions.is_some() => {
                     Body::ApiVersionsResponse(

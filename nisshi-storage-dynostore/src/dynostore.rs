@@ -1211,9 +1211,10 @@ impl DynoStore {
 
         let start_offset = time_index.floor_offset(target);
 
-        // Under READ_COMMITTED, Kafka answers only a record before the last
-        // stable offset, and answers no match otherwise
-        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589).
+        // Under READ_COMMITTED, Kafka answers only a record before the last stable offset, and
+        // answers no match otherwise ([Partition.scala#L1589]).
+        //
+        // [Partition.scala#L1589]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589
         let found = self
             .sequential_timestamp_scan(topition, start_offset, target, low)
             .await?
@@ -2358,10 +2359,11 @@ impl Storage for DynoStore {
 
         for (topition, offset_request) in offsets {
             // Kafka answers a partition that does not exist in the response,
-            // with no offset:
-            // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
-            // The check comes before every lookup, because each one caches
-            // the partition's watermark.
+            // with no offset ([KafkaApis.scala#L1231-L1239]). The check
+            // comes before every lookup, because each one caches the
+            // partition's watermark.
+            //
+            // [KafkaApis.scala#L1231-L1239]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
             match self.ensure_partition_exists(topition).await {
                 Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
                     responses.push((

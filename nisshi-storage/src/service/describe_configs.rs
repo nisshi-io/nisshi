@@ -111,8 +111,8 @@ where
     G: Storage,
 {
     /// Describes the broker resource `name`, as Kafka 3.9.1 does
-    /// ([ConfigHelper.scala#L113-L121](https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigHelper.scala#L113-L121)).
-    /// It compares `name` with this broker's node id, and does not look it up as a topic.
+    /// ([ConfigHelper.scala#L113-L121]). It compares `name` with this broker's node id, and
+    /// does not look it up as a topic.
     ///
     /// An empty name selects the dynamic defaults for every broker, and our node id selects
     /// this broker. Both get an empty config list. Nisshi takes its settings from its command
@@ -124,6 +124,8 @@ where
     ///
     /// Any other name gets `INVALID_REQUEST` with Kafka's message, in this resource's result
     /// only. The other resources in the request still get an answer.
+    ///
+    /// [ConfigHelper.scala#L113-L121]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigHelper.scala#L113-L121
     async fn describe_broker(&self, name: &str) -> Result<DescribeConfigsResult> {
         let result = DescribeConfigsResult::default()
             .resource_name(name.into())

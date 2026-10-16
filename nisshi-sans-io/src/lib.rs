@@ -20,8 +20,7 @@
 //! contains a list of fields together with their associated type. Each field can
 //! include a range of versions for which it is valid, its encoding and whether it
 //! includes tagged fields. Further background on the protocol and implementation
-//! used are in the
-//! [Apache Kafka protocol with serde, quote, syn and proc_macro2](https://blog.nisshi.io/articles/serde-kafka-protocol)
+//! used are in the [Apache Kafka protocol with serde, quote, syn and proc_macro2]
 //! article.
 //!
 //! Some useful starting points:
@@ -114,7 +113,10 @@
 //! The Kafka protocol is implemented by [`ser::Encoder`] and [`de::Decoder`],
 //! using [`MESSAGE_META`] to determine which fields are present, their serialization type
 //! and whether any tagged fields can be present for a particular message version. Serializers
-//! map from the [Serde Data Model](https://serde.rs/data-model.html) to the Kafka protocol or vice versa.
+//! map from the [Serde Data Model] to the Kafka protocol or vice versa.
+//!
+//! [Apache Kafka protocol with serde, quote, syn and proc_macro2]: https://blog.nisshi.io/articles/serde-kafka-protocol
+//! [Serde Data Model]: https://serde.rs/data-model.html
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod acl;
@@ -1837,7 +1839,8 @@ impl Compression {
 
                 let mut decompressed = Vec::new();
 
-                // https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
+                // snappy-java's [compatibility notes] describe the xerial
+                // framing.
                 //
                 // The xerial magic is followed by a 4-byte version, a 4-byte
                 // compatible version, and then a sequence of blocks, each a
@@ -1845,6 +1848,8 @@ impl Compression {
                 // snappy-java's `SnappyOutputStream`, which the Java producer
                 // uses, starts a new block every 32 KiB of uncompressed input,
                 // so a larger batch has more than one block.
+                //
+                // [compatibility notes]: https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
                 if let Some(framed) = input.strip_prefix(XERIAL_MAGIC) {
                     // Untrusted input: a header or block that stops short is
                     // an error, not a slice panic.

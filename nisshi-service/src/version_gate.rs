@@ -43,10 +43,12 @@ pub const CAPPED_API_VERSIONS: [(i16, RangeInclusive<i16>); 3] = [
     // Kafka's AddPartitionsToTxn range is 0-5. Version 4 adds the multi-transaction request
     // shape (`Transactions`), which only the SlateDB backend implements. Kafka 3.9.1 advertises
     // 0-5 and protects v4+ with a `CLUSTER_ACTION` authorization check
-    // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2586-L2587),
-    // and the Java client limits itself to v3
-    // (https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/AddPartitionsToTxnRequest.java#L43-L59).
-    // So this cap is stricter than Kafka, but no client sends v4+.
+    // ([KafkaApis.scala#L2586-L2587]), and the Java client limits itself to v3
+    // ([AddPartitionsToTxnRequest.java#L43-L59]). So this cap is stricter than Kafka, but no
+    // client sends v4+.
+    //
+    // [KafkaApis.scala#L2586-L2587]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2586-L2587
+    // [AddPartitionsToTxnRequest.java#L43-L59]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/AddPartitionsToTxnRequest.java#L43-L59
     (AddPartitionsToTxnRequest::KEY, 0..=3),
 ];
 
@@ -157,10 +159,10 @@ where
         }
 
         // The broker closes the connection, as Kafka 3.9.1 does for a version it has not
-        // enabled
-        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1119-L1125).
-        // `ApiVersions` advertises this range, so only a client that skips the negotiation
-        // sends such a version.
+        // enabled ([SocketServer.scala#L1119-L1125]). `ApiVersions` advertises this range,
+        // so only a client that skips the negotiation sends such a version.
+        //
+        // [SocketServer.scala#L1119-L1125]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1119-L1125
         warn!(
             api_key = self.api_key,
             api_name = req.frame.api_name(),

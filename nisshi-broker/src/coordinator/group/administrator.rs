@@ -90,15 +90,16 @@ const MAX_SESSION_TIMEOUT_MS: i32 = 1_800_000;
 const FALLBACK_SESSION_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The first `JoinGroup` version that answers a dynamic member without a member id with
-/// `MEMBER_ID_REQUIRED`, as Kafka's
-/// [`requiresKnownMemberId`](https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/JoinGroupRequest.java#L100)
-/// decides. An older client gets its member id with the response that ends the join phase.
+/// `MEMBER_ID_REQUIRED`, as Kafka's [`requiresKnownMemberId`] decides. An older client
+/// gets its member id with the response that ends the join phase.
+///
+/// [`requiresKnownMemberId`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/JoinGroupRequest.java#L100
 const MEMBER_ID_REQUIRED_VERSION: i16 = 4;
 
 /// The first `JoinGroup` version whose response can tell a restarted static leader to skip the
-/// assignment, as Kafka's
-/// [`supportsSkippingAssignment`](https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/JoinGroupRequest.java#L154)
-/// decides.
+/// assignment, as Kafka's [`supportsSkippingAssignment`] decides.
+///
+/// [`supportsSkippingAssignment`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/JoinGroupRequest.java#L154
 const SKIP_ASSIGNMENT_VERSION: i16 = 9;
 
 static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -1406,7 +1407,9 @@ where
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "delete_groups")]);
 
         // Kafka processes each distinct group id once, and answers it once:
-        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1891
+        // [KafkaApis.scala#L1891].
+        //
+        // [KafkaApis.scala#L1891]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1891
         let mut seen = HashSet::with_capacity(group_ids.len());
         let group_ids = group_ids
             .iter()
@@ -2069,9 +2072,9 @@ where
     }
 
     /// Checks that `member_id` is a member, and that it is the member that holds
-    /// `group_instance_id`, as Kafka's
-    /// [`validateMember`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java#L793)
-    /// does.
+    /// `group_instance_id`, as Kafka's [`validateMember`] does.
+    ///
+    /// [`validateMember`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java#L793
     fn validate_member(
         &self,
         member_id: &str,
@@ -2200,9 +2203,9 @@ where
     }
 
     /// Removes each member that has not sent `SyncGroup` by the sync deadline, static members
-    /// too, as Kafka's
-    /// [`expirePendingSync`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4854)
-    /// does. Returns whether it removed a member.
+    /// too, as Kafka's [`expirePendingSync`] does. Returns whether it removed a member.
+    ///
+    /// [`expirePendingSync`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4854
     fn remove_members_pending_sync(&mut self, now: SystemTime) -> bool {
         match self.pending_sync.take() {
             Some(pending_sync) if pending_sync.deadline <= now => {
@@ -2293,12 +2296,13 @@ where
         (responses, any_left)
     }
 
-    /// Fences an offset commit as Kafka's
-    /// [`validateOffsetCommit`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java#L825)
-    /// does. A commit without a generation or a member, from a simple consumer or an admin
-    /// client, needs an empty group. Any other commit must come from a member in the group's
-    /// current generation. A member that commits while the group waits for the leader's
-    /// assignment gets `REBALANCE_IN_PROGRESS`.
+    /// Fences an offset commit as Kafka's [`validateOffsetCommit`] does. A commit without a
+    /// generation or a member, from a simple consumer or an admin client, needs an empty
+    /// group. Any other commit must come from a member in the group's current generation. A
+    /// member that commits while the group waits for the leader's assignment gets
+    /// `REBALANCE_IN_PROGRESS`.
+    ///
+    /// [`validateOffsetCommit`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java#L825
     #[instrument(skip(self, now, detail), fields(generation_id = detail.generation_id_or_member_epoch, member_id = detail.member_id))]
     fn offset_commit_fence(
         &mut self,
@@ -2440,10 +2444,10 @@ where
     }
 
     /// Starts a join phase in a group with members, which ends when every member has rejoined, or
-    /// at the rebalance timeout, as Kafka's
-    /// [`prepareRebalance`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4627)
-    /// does. Each member waiting to sync gets `REBALANCE_IN_PROGRESS`, and its session starts
-    /// again.
+    /// at the rebalance timeout, as Kafka's [`prepareRebalance`] does. Each member waiting to
+    /// sync gets `REBALANCE_IN_PROGRESS`, and its session starts again.
+    ///
+    /// [`prepareRebalance`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4627
     fn prepare_rebalance(&mut self, now: SystemTime) {
         // A member with a SyncGroup in progress couldn't heartbeat while it waited. Kafka
         // answers the request when the rebalance starts and then reschedules the member's
@@ -2459,8 +2463,9 @@ where
     /// member that `pending_sync` doesn't list, which is every member when it is `None`. Such a
     /// member waits for the leader's assignment and can't heartbeat while it waits, so its
     /// session starts again when its `SyncGroup` is answered, as Kafka's
-    /// [`propagateAssignment`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4787-L4796)
-    /// reschedules each member's heartbeat.
+    /// [`propagateAssignment`] reschedules each member's heartbeat.
+    ///
+    /// [`propagateAssignment`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4787-L4796
     fn restart_sessions_of_synced_members(&mut self, now: SystemTime) {
         let pending_sync = self
             .pending_sync
@@ -2549,12 +2554,12 @@ where
 
     /// Ends the join phase if its deadline has passed. The join phase of an empty group gets
     /// another delay instead if a new member joined during the last one and the rebalance timeout
-    /// allows it, as Kafka's
-    /// [`tryCompleteInitialRebalanceElseSchedule`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4696)
-    /// does.
+    /// allows it, as Kafka's [`tryCompleteInitialRebalanceElseSchedule`] does.
     ///
     /// A request can read the group after more than one deadline has passed, so the coordinator
     /// handles each of them in turn.
+    ///
+    /// [`tryCompleteInitialRebalanceElseSchedule`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4696
     fn end_join_phase_after_deadline(&mut self, now: SystemTime) {
         while let Some(join_phase) = self.state.join_phase.as_mut()
             && join_phase.deadline <= now
@@ -2579,11 +2584,12 @@ where
         }
     }
 
-    /// Ends the join phase, as Kafka's
-    /// [`completeClassicGroupJoin`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4306)
-    /// does. The coordinator removes each dynamic member that has not rejoined, and keeps each
-    /// static member with its old subscription. If a member joined, the group starts its next
-    /// generation and waits for the leader's assignment. A group without members becomes empty.
+    /// Ends the join phase, as Kafka's [`completeClassicGroupJoin`] does. The coordinator
+    /// removes each dynamic member that has not rejoined, and keeps each static member with its
+    /// old subscription. If a member joined, the group starts its next generation and waits for
+    /// the leader's assignment. A group without members becomes empty.
+    ///
+    /// [`completeClassicGroupJoin`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4306
     fn complete_join(&mut self, now: SystemTime) {
         let Some(join_phase) = self.state.join_phase.take() else {
             return;
@@ -2706,8 +2712,9 @@ where
     }
 
     /// Adds a member, and starts a rebalance or ends the join phase, as Kafka's
-    /// [`addMemberThenRebalanceOrCompleteJoin`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4557)
-    /// does.
+    /// [`addMemberThenRebalanceOrCompleteJoin`] does.
+    ///
+    /// [`addMemberThenRebalanceOrCompleteJoin`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4557
     fn add_member(
         mut self,
         now: SystemTime,
@@ -2790,9 +2797,10 @@ where
 
     /// Gives the member that holds `group_instance_id` the member id `new_member_id`, so that a
     /// restarted static member takes the place of its earlier instance, as Kafka's
-    /// [`updateStaticMemberThenRebalanceOrCompleteJoin`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4938)
-    /// does. A forming group then rebalances, because the leader may already hold the old member
-    /// id.
+    /// [`updateStaticMemberThenRebalanceOrCompleteJoin`] does. A forming group then rebalances,
+    /// because the leader may already hold the old member id.
+    ///
+    /// [`updateStaticMemberThenRebalanceOrCompleteJoin`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4938
     fn replace_static_member(
         mut self,
         now: SystemTime,
@@ -3004,9 +3012,10 @@ enum NewMember {
 
 impl NewMember {
     /// Decides how `request`, a `JoinGroup` without a member id, joins, as Kafka's
-    /// [`classicGroupJoinNewDynamicMember`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4084)
-    /// and `classicGroupJoinNewStaticMember` decide. `static_member_id` is the member that holds
-    /// the request's group instance id.
+    /// [`classicGroupJoinNewDynamicMember`] and `classicGroupJoinNewStaticMember` decide.
+    /// `static_member_id` is the member that holds the request's group instance id.
+    ///
+    /// [`classicGroupJoinNewDynamicMember`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4084
     fn of(request: &JoinRequest<'_>, static_member_id: Option<&str>) -> Self {
         match request.group_instance_id {
             Some(group_instance_id) => {
@@ -3060,10 +3069,10 @@ where
     type OffsetCommitState = Inner<O, Forming>;
     type OffsetFetchState = Inner<O, Forming>;
 
-    /// Handles `JoinGroup` as Kafka's
-    /// [`classicGroupJoinExistingMember`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4134)
-    /// and the methods it calls do, in Kafka's Empty, PreparingRebalance and
-    /// CompletingRebalance states.
+    /// Handles `JoinGroup` as Kafka's [`classicGroupJoinExistingMember`] and the methods it calls
+    /// do, in Kafka's Empty, PreparingRebalance and CompletingRebalance states.
+    ///
+    /// [`classicGroupJoinExistingMember`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4134
     async fn join(
         mut self,
         now: SystemTime,
@@ -3136,9 +3145,10 @@ where
         self.update_member(now, request.member_id, request, &protocol.metadata)
     }
 
-    /// Handles `SyncGroup` as Kafka's
-    /// [`classicGroupSyncToClassicGroup`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L5099)
-    /// does. The leader's assignment ends the rebalance, and each other member waits for it.
+    /// Handles `SyncGroup` as Kafka's [`classicGroupSyncToClassicGroup`] does. The leader's
+    /// assignment ends the rebalance, and each other member waits for it.
+    ///
+    /// [`classicGroupSyncToClassicGroup`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L5099
     async fn sync(
         mut self,
         now: SystemTime,
@@ -3238,9 +3248,10 @@ where
         (formed.into(), reply)
     }
 
-    /// Handles `Heartbeat` as Kafka's
-    /// [`classicGroupHeartbeatToClassicGroup`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L5366)
-    /// does: a heartbeat during the join phase tells the member to rejoin.
+    /// Handles `Heartbeat` as Kafka's [`classicGroupHeartbeatToClassicGroup`] does: a heartbeat
+    /// during the join phase tells the member to rejoin.
+    ///
+    /// [`classicGroupHeartbeatToClassicGroup`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L5366
     async fn heartbeat(
         mut self,
         now: SystemTime,
@@ -3656,8 +3667,9 @@ fn offset_commit_response(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> B
 /// reports a committed offset that it can't decode as `UNKNOWN_SERVER_ERROR`,
 /// because a retry can't fix it. Any other storage error is treated as
 /// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka
-/// clients
-/// [retry](https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L1460-L1464).
+/// clients [retry].
+///
+/// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L1460-L1464
 fn offset_fetch_error_code(error: &Error) -> ErrorCode {
     match error {
         Error::Storage(nisshi_storage::Error::Api(error_code)) => *error_code,

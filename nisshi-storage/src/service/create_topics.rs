@@ -43,13 +43,15 @@ fn error_result(
 /// Kafka 3.9.1 rejects a whole `CreateTopics` request whose topics add up
 /// to more than `MAX_PARTITIONS_PER_BATCH` (10,000) partitions, before any
 /// per-topic validation runs, including the name check
-/// ([ReplicationControlManager.java#L1152-L1169](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L1152-L1169)).
+/// ([ReplicationControlManager.java#L1152-L1169]).
 ///
 /// nisshi counts partitions only. Kafka 3.9.1 also caps the metadata
 /// records a request produces at 10,000 (one `TopicRecord` per topic, one
 /// per config, one per partition), so a request for exactly 10,000
 /// partitions fails there with `POLICY_VIOLATION`. nisshi has no metadata
 /// records, so it deliberately allows exactly 10,000 partitions.
+///
+/// [ReplicationControlManager.java#L1152-L1169]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L1152-L1169
 const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
 
 /// Partitions created for a topic whose `num_partitions` is `-1` (the
