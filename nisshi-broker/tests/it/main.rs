@@ -34,6 +34,7 @@ pub mod describe_topic_partitions;
 pub mod fetch;
 pub mod fetch_wire;
 pub mod find_coordinator;
+pub mod group_across_brokers;
 pub mod group_cache_miss;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;

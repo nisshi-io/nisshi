@@ -205,11 +205,16 @@ pub trait Group: Debug + Send {
         members: Option<&[MemberIdentity]>,
     ) -> (Self::LeaveState, Body);
 
-    async fn offset_commit(
+    /// Checks an `OffsetCommit` against the group, and records the committing member's contact.
+    /// Returns the error code that rejects the commit, or `None` when the commit may store its
+    /// offsets. The check stores no offsets: the coordinator stores them only after its
+    /// conditional write of the group lands, so that it never stores offsets of a member that
+    /// another broker has removed.
+    fn check_offset_commit(
         self,
         now: SystemTime,
         detail: &OffsetCommit<'_>,
-    ) -> (Self::OffsetCommitState, Body);
+    ) -> (Self::OffsetCommitState, Option<ErrorCode>);
 
     async fn offset_fetch(
         self,
@@ -606,6 +611,15 @@ where
             Self::Formed(inner) => inner.next_deadline(),
         }
     }
+
+    /// Stores the offsets of `detail`, a commit that [`Group::check_offset_commit`] accepted, and
+    /// returns the response.
+    async fn commit_offset(&mut self, detail: &OffsetCommit<'_>) -> Result<Body> {
+        match self {
+            Self::Forming(inner) => inner.commit_offset(detail).await,
+            Self::Formed(inner) => inner.commit_offset(detail).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -664,16 +678,20 @@ where
         }
     }
 
-    async fn offset_commit(self, now: SystemTime, detail: &OffsetCommit<'_>) -> (Wrapper<O>, Body) {
+    fn check_offset_commit(
+        self,
+        now: SystemTime,
+        detail: &OffsetCommit<'_>,
+    ) -> (Wrapper<O>, Option<ErrorCode>) {
         match self {
             Wrapper::Forming(inner) => {
-                let (state, body) = inner.offset_commit(now, detail).await;
-                (state.into(), body)
+                let (state, error_code) = inner.check_offset_commit(now, detail);
+                (state.into(), error_code)
             }
 
             Wrapper::Formed(inner) => {
-                let (state, body) = inner.offset_commit(now, detail).await;
-                (state.into(), body)
+                let (state, error_code) = inner.check_offset_commit(now, detail);
+                (state.into(), error_code)
             }
         }
     }
@@ -1265,29 +1283,43 @@ where
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit_loop")]);
 
-            // The commit writes its offsets before the group is stored, so it is fenced against
-            // the group in storage, not the cache: a cached group can be older than another
-            // broker's rebalance that fenced this member.
+            // The commit is checked against the group in storage, not the cache: a cached group
+            // can be older than another broker's rebalance that removed this member.
             let (original, version) = self.stored_group(group_id).await?;
             let now = SystemTime::now();
 
-            let (wrapper, body) = original
+            let (mut wrapper, error_code) = original
                 .clone()
                 .settle(group_id, now)
-                .offset_commit(now, &offset_commit)
-                .await;
+                .check_offset_commit(now, &offset_commit);
 
-            // An answer that changes nothing needs no write, unless storage holds no group yet.
-            if wrapper == original && version.is_some() {
-                return Ok(body);
-            }
+            // The coordinator stores the group before the offsets, and stores the offsets only
+            // if the group's conditional write lands. A lost write means that another broker
+            // changed the group after this read, and may have removed the member, so the commit
+            // is checked again. A member's accepted commit refreshes its contact, so it always
+            // writes the group. A check that changes nothing needs no write, unless storage
+            // holds no group yet.
+            let is_unchanged = wrapper == original && version.is_some();
 
-            if self
-                .store_group(group_id, &wrapper, version, "offset_commit")
-                .await?
+            if !is_unchanged
+                && !self
+                    .store_group(group_id, &wrapper, version, "offset_commit")
+                    .await?
             {
-                return Ok(body);
+                continue;
             }
+
+            return Ok(match error_code {
+                Some(error_code) => offset_commit_response(&offset_commit, error_code),
+
+                None => wrapper
+                    .commit_offset(&offset_commit)
+                    .await
+                    .unwrap_or_else(|reason| {
+                        debug!(?reason);
+                        offset_commit_response(&offset_commit, ErrorCode::UnknownMemberId)
+                    }),
+            });
         }
     }
 
@@ -3254,30 +3286,15 @@ where
     }
 
     #[instrument(skip(self, now, detail), fields(generation_id = detail.generation_id_or_member_epoch, member_id = detail.member_id))]
-    async fn offset_commit(
+    fn check_offset_commit(
         mut self,
         now: SystemTime,
         detail: &OffsetCommit<'_>,
-    ) -> (Self::OffsetCommitState, Body) {
+    ) -> (Self::OffsetCommitState, Option<ErrorCode>) {
         let is_completing_rebalance = self.is_completing_rebalance();
-
-        if let Some(error_code) = self.offset_commit_fence(now, detail, is_completing_rebalance) {
-            debug!(offset_commit_outcome = ?error_code);
-
-            let body = offset_commit_response(detail, error_code);
-            return (self, body);
-        }
-
-        match self.commit_offset(detail).await {
-            Ok(body) => (self, body),
-            Err(reason) => {
-                debug!(?reason);
-                (
-                    self,
-                    offset_commit_response(detail, ErrorCode::UnknownMemberId),
-                )
-            }
-        }
+        let error_code = self.offset_commit_fence(now, detail, is_completing_rebalance);
+        debug!(offset_commit_outcome = ?error_code);
+        (self, error_code)
     }
 
     async fn offset_fetch(
@@ -3540,28 +3557,14 @@ where
     }
 
     #[instrument(skip(self, now, detail), fields(generation_id = detail.generation_id_or_member_epoch, member_id = detail.member_id))]
-    async fn offset_commit(
+    fn check_offset_commit(
         mut self,
         now: SystemTime,
         detail: &OffsetCommit<'_>,
-    ) -> (Self::OffsetCommitState, Body) {
-        if let Some(error_code) = self.offset_commit_fence(now, detail, false) {
-            debug!(offset_commit_outcome = ?error_code);
-
-            let body = offset_commit_response(detail, error_code);
-            return (self, body);
-        }
-
-        match self.commit_offset(detail).await {
-            Ok(body) => (self, body),
-            Err(reason) => {
-                debug!(?reason);
-                (
-                    self,
-                    offset_commit_response(detail, ErrorCode::UnknownMemberId),
-                )
-            }
-        }
+    ) -> (Self::OffsetCommitState, Option<ErrorCode>) {
+        let error_code = self.offset_commit_fence(now, detail, false);
+        debug!(offset_commit_outcome = ?error_code);
+        (self, error_code)
     }
 
     async fn offset_fetch(
