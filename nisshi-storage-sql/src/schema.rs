@@ -72,6 +72,23 @@ pub(crate) fn should_create_schema(
     Ok(false)
 }
 
+/// Returns the SHA-256 digest of `statements`, in hex.
+#[cfg(test)]
+pub(crate) fn schema_digest<'a>(statements: impl IntoIterator<Item = &'a str>) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    for statement in statements {
+        hasher.update(statement.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches;

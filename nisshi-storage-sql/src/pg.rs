@@ -96,7 +96,7 @@ use tokio_postgres::{
 use tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(unix)]
 use tokio_util::either::Either;
-use tracing::{Instrument as _, debug, error, instrument, warn};
+use tracing::{Instrument as _, debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -1093,6 +1093,19 @@ impl Postgres {
     /// create tables can therefore start a broker on a database that records a version.
     pub(crate) async fn ensure_schema(&self) -> Result<()> {
         let mut c = self.connection().await?;
+
+        // The broker reads the version without the lock first, because a broker that holds the
+        // lock and then stops answering blocks every broker that waits for it. A recorded version
+        // means a complete schema, because the transaction that creates the schema also records
+        // the version.
+        {
+            let tx = c.transaction().await?;
+            let recorded = self.recorded_schema(&tx).await?;
+            if !should_create_schema(recorded, SCHEMA_VERSION)? {
+                return tx.commit().await.map_err(Into::into);
+            }
+        }
+
         let tx = c.transaction().await?;
 
         // This transaction sets its own `statement_timeout`, because an operator's short timeout
@@ -1102,32 +1115,29 @@ impl Postgres {
         tx.batch_execute("SET LOCAL statement_timeout = '5min'")
             .await?;
 
+        // The server ends this session when the session stays idle in this transaction for a
+        // minute. The lock of a broker that stops answering is then released after a minute,
+        // instead of when TCP keepalive notices that the broker is gone.
+        tx.batch_execute("SET LOCAL idle_in_transaction_session_timeout = '1min'")
+            .await?;
+
         // This lock makes a second broker wait until the first broker commits the schema. The
         // second broker then finds the recorded version. Without the lock, PostgreSQL fails one of
         // two concurrent `create table if not exists` statements with a unique violation.
-        tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
-            .await?;
-
-        let version_table_exists = tx
-            .query_one(self.sql_lookup("pg/nisshi_schema_version_exists.sql")?, &[])
+        let locked_at_once = tx
+            .query_one(
+                &format!("select pg_try_advisory_xact_lock({SCHEMA_LOCK})"),
+                &[],
+            )
             .await?
             .try_get::<_, bool>(0)?;
+        if !locked_at_once {
+            info!("waiting for another broker to set up the schema");
+            tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
+                .await?;
+        }
 
-        let recorded = if version_table_exists {
-            tx.query_opt(self.sql_lookup("nisshi_schema_version_select.sql")?, &[])
-                .await?
-                .map(|row| {
-                    Ok::<_, Error>(RecordedSchema {
-                        version: row.try_get(0)?,
-                        oldest_compatible_version: row.try_get(1)?,
-                    })
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        debug!(?recorded);
-
+        let recorded = self.recorded_schema(&tx).await?;
         if !should_create_schema(recorded, SCHEMA_VERSION)? {
             return tx.commit().await.map_err(Into::into);
         }
@@ -1136,13 +1146,14 @@ impl Postgres {
         // path, for this transaction. PostgreSQL calls a namespace a schema. An unqualified `create
         // table` creates its table in the first namespace on the search path. That namespace can
         // differ from the one that holds the existing tables. The broker then finds new, empty
-        // tables instead of its data.
-        _ = tx
+        // tables instead of its data. The query returns a row only when `cluster` exists.
+        let has_tables = tx
             .query_opt(
                 self.sql_lookup("pg/search_path_set_to_cluster_namespace.sql")?,
                 &[],
             )
-            .await?;
+            .await?
+            .is_some();
 
         tx.batch_execute(self.sql_lookup("nisshi_schema_version_create.sql")?)
             .await?;
@@ -1154,7 +1165,42 @@ impl Postgres {
             )
             .await?;
 
-        tx.commit().await.map_err(Into::into)
+        tx.commit().await?;
+
+        if has_tables {
+            warn!(
+                schema_version = SCHEMA_VERSION,
+                "recorded the schema version in a database whose tables an earlier release created"
+            );
+        } else {
+            info!(schema_version = SCHEMA_VERSION, "created the schema");
+        }
+
+        Ok(())
+    }
+
+    /// Returns the schema version that the database records, or `None` when it records none.
+    async fn recorded_schema(&self, tx: &Transaction<'_>) -> Result<Option<RecordedSchema>> {
+        let version_table_exists = tx
+            .query_one(self.sql_lookup("pg/nisshi_schema_version_exists.sql")?, &[])
+            .await?
+            .try_get::<_, bool>(0)?;
+        if !version_table_exists {
+            return Ok(None);
+        }
+
+        let recorded = tx
+            .query_opt(self.sql_lookup("nisshi_schema_version_select.sql")?, &[])
+            .await?
+            .map(|row| {
+                Ok::<_, Error>(RecordedSchema {
+                    version: row.try_get(0)?,
+                    oldest_compatible_version: row.try_get(1)?,
+                })
+            })
+            .transpose()?;
+        debug!(?recorded);
+        Ok(recorded)
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
@@ -4848,6 +4894,27 @@ mod tests {
             .collect()
     }
 
+    /// A change to the schema must come with a new [`SCHEMA_VERSION`], and with an upgrade step for
+    /// databases of the earlier version. A database that records a version keeps the tables that
+    /// it has, so a change without a new version reaches only new databases. Update the digest
+    /// here once both are in place.
+    #[test]
+    fn schema_matches_its_version() -> Result<()> {
+        let digest = crate::schema::schema_digest([
+            crate::sql::remove_comments(SCHEMA).as_str(),
+            crate::sql::SQL.get("nisshi_schema_version_create.sql")?,
+        ]);
+
+        assert_eq!(
+            (SCHEMA_VERSION, digest.as_str()),
+            (
+                1,
+                "c453a24e053100c8c68e7f31694fa6f9920d20225b1d245aac671b9c198c9dad"
+            )
+        );
+        Ok(())
+    }
+
     /// Returns a [`Postgres`] storage engine for `cluster` on the server at `url`, with the schema
     /// created. Returns `None` when the server can't be reached. The caller then skips `test`.
     async fn storage_with_schema(test: &str, url: &str, cluster: &str) -> Result<Option<Postgres>> {
@@ -8538,6 +8605,39 @@ mod tests {
                 assert_eq!(tables_in_first_on_path, 0);
                 assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
                 assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// `ensure_schema` must wait for the schema lock on a database that records no version, so that
+    /// two brokers never create the schema at the same time.
+    #[tokio::test]
+    async fn ensure_schema_waits_for_the_schema_lock() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_waits_for_the_schema_lock",
+            async |database| {
+                let holder_storage = database.storage()?;
+                let holder = holder_storage.connection().await?;
+                holder
+                    .batch_execute(&format!("select pg_advisory_lock({SCHEMA_LOCK})"))
+                    .await?;
+
+                let storage = database.storage()?;
+                let setup = tokio::spawn(async move { storage.ensure_schema().await });
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(!setup.is_finished());
+
+                holder
+                    .batch_execute(&format!("select pg_advisory_unlock({SCHEMA_LOCK})"))
+                    .await?;
+                setup.await??;
+
+                assert_eq!(
+                    recorded_version(&database.storage()?).await?,
+                    Some(SCHEMA_VERSION)
+                );
                 Ok(())
             },
         )

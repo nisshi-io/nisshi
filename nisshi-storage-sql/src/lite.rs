@@ -83,7 +83,7 @@ use std::{
 };
 use tokio::{fs::rename, sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -1689,24 +1689,47 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
     };
     debug!(?recorded);
 
-    if should_create_schema(recorded, SCHEMA_VERSION)? {
-        for (name, ddl) in DDL.iter() {
-            _ = tx
-                .execute(ddl.as_str(), ())
-                .await
-                .inspect(|rows| debug!(name, rows))
-                .inspect_err(|err| error!(name, ?err))?;
-        }
-
-        _ = tx
-            .execute(
-                SQL.get("nisshi_schema_version_insert.sql")?,
-                [SCHEMA_VERSION, OLDEST_COMPATIBLE_SCHEMA_VERSION],
-            )
-            .await?;
+    if !should_create_schema(recorded, SCHEMA_VERSION)? {
+        return tx.commit().await.map_err(Into::into);
     }
 
-    tx.commit().await.map_err(Into::into)
+    let has_tables = tx
+        .query(
+            "select 1 from sqlite_schema where type = 'table' and name = 'cluster'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+
+    for (name, ddl) in DDL.iter() {
+        _ = tx
+            .execute(ddl.as_str(), ())
+            .await
+            .inspect(|rows| debug!(name, rows))
+            .inspect_err(|err| error!(name, ?err))?;
+    }
+
+    _ = tx
+        .execute(
+            SQL.get("nisshi_schema_version_insert.sql")?,
+            [SCHEMA_VERSION, OLDEST_COMPATIBLE_SCHEMA_VERSION],
+        )
+        .await?;
+
+    tx.commit().await?;
+
+    if has_tables {
+        warn!(
+            schema_version = SCHEMA_VERSION,
+            "recorded the schema version in a file whose tables an earlier release created"
+        );
+    } else {
+        info!(schema_version = SCHEMA_VERSION, "created the schema");
+    }
+
+    Ok(())
 }
 
 pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
@@ -6259,6 +6282,28 @@ mod tests {
         Ok(())
     }
 
+    /// A change to the schema must come with a new [`SCHEMA_VERSION`], and with an upgrade step for
+    /// databases of the earlier version. A database that records a version keeps the tables that
+    /// it has, so a change without a new version reaches only new databases. Update the digest
+    /// here once both are in place.
+    #[test]
+    fn schema_matches_its_version() -> Result<()> {
+        let digest = crate::schema::schema_digest(
+            DDL.values()
+                .map(|statement| statement.as_str())
+                .chain([SQL.get("nisshi_schema_version_create.sql")?]),
+        );
+
+        assert_eq!(
+            (SCHEMA_VERSION, digest.as_str()),
+            (
+                1,
+                "4b97d00984999b16629d9d0a7a6da18e8458adc6a57cd0affa36f407b819d1dd"
+            )
+        );
+        Ok(())
+    }
+
     /// Returns the version that `db`'s `nisshi_schema_version` table records, or `None` when it
     /// records none.
     async fn recorded_version(db: &Database) -> Result<Option<i32>> {
@@ -6290,6 +6335,34 @@ mod tests {
                 .await?;
         }
 
+        Ok(())
+    }
+
+    /// Brokers that start together on one new file must all start, and the file must record
+    /// [`SCHEMA_VERSION`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_schema_succeeds_for_brokers_that_start_together() -> Result<()> {
+        const BROKERS: usize = 4;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let barrier = Arc::new(tokio::sync::Barrier::new(BROKERS));
+
+        let mut setups = Vec::with_capacity(BROKERS);
+        for _ in 0..BROKERS {
+            let db = libsql::Builder::new_local(&path).build().await?;
+            let barrier = Arc::clone(&barrier);
+            setups.push(tokio::spawn(async move {
+                _ = barrier.wait().await;
+                ensure_schema(&db, Duration::from_secs(5)).await
+            }));
+        }
+        for setup in setups {
+            setup.await??;
+        }
+
+        let db = libsql::Builder::new_local(&path).build().await?;
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
         Ok(())
     }
 
