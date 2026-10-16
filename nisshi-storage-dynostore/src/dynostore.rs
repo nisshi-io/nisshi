@@ -1674,9 +1674,13 @@ impl Storage for DynoStore {
                 .await?;
 
             // The broker keeps a cached watermark for each partition that it
-            // reads, so it drops the topic's watermarks here. Without this,
-            // a client that creates and deletes topics grows the cache
-            // without bound.
+            // reads, so it drops the topic's watermarks here, and creating
+            // and deleting topics through it does not grow its cache. This
+            // cleanup is per broker: with several brokers on one object
+            // store, another broker that read the topic keeps its entries
+            // until it restarts. That broker never reads those entries again,
+            // because Fetch, ListOffsets and Produce check the partition
+            // against the metadata before they read its watermark.
             self.watermarks
                 .lock()?
                 .retain(|topition, _| topition.topic != metadata.topic.name);
