@@ -47,7 +47,10 @@ use nisshi_sans_io::{
         inflated,
     },
 };
-use nisshi_storage::{ArcDynStorage, CreateTopicsService, InitProducerIdService, ProduceService};
+use nisshi_storage::{
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, InitProducerIdService,
+    ProduceService,
+};
 use nisshi_storage_dynostore::DynoStore;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -58,7 +61,7 @@ use opentelemetry_sdk::metrics::{
     InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
     data::{AggregatedMetrics, MetricData},
 };
-use rama::{Service as _, extensions::Extensions};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use url::Url;
 
 const CLUSTER: &str = "post-write-advance-failed";
@@ -232,24 +235,25 @@ async fn failed_sequence_advance_is_counted_with_its_reason() -> Result<()> {
 
     let extensions = Extensions::default();
 
-    let created = CreateTopicsService {
-        storage: storage.clone(),
-    }
-    .serve(RequestInput {
-        request: CreateTopicsRequest::default()
-            .validate_only(Some(false))
-            .topics(Some(
-                [CreatableTopic::default()
-                    .name(TOPIC.into())
-                    .num_partitions(1)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into()))]
-                .into(),
-            )),
-        extensions: extensions.clone(),
-    })
-    .await?;
+    let created = CreateTopicsValidationLayer::new()
+        .layer(CreateTopicsService {
+            storage: storage.clone(),
+        })
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(TOPIC.into())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into()))]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
 
     let topics = created.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());

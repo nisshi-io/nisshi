@@ -77,6 +77,7 @@ private_intra_doc_links = "deny"
 [workspace.dependencies]
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
+arbitrary = { version = "1", features = ["derive"] }
 arrow = { version = "58" }
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}

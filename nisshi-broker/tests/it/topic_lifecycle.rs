@@ -22,18 +22,19 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic, metadata_request::MetadataRequestTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, DeleteTopicsService, MetadataService, Storage,
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, DeleteTopicsService,
+    MetadataService, Storage,
 };
-use rama::{Service, extensions::Extensions};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let delete_topic = DeleteTopicsService {
         storage: storage.clone(),

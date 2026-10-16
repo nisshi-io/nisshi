@@ -25,18 +25,19 @@ use nisshi_sans_io::{
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
 };
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, LatencyIntroducingStorage, ListOffsetsService, Storage,
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, LatencyIntroducingStorage,
+    ListOffsetsService, Storage,
 };
-use rama::{Service, extensions::Extensions};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let topic = &alphanumeric_string(15)[..];
 
@@ -121,9 +122,9 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
 async fn timestamp_no_match(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let topic = &alphanumeric_string(15)[..];
 
@@ -198,6 +199,131 @@ async fn timestamp_no_match(storage: impl Storage + Clone, broker_id: i32) -> Re
     Ok(())
 }
 
+/// An invalid timestamp is answered `INVALID_TIMESTAMP` on its own partition: the valid
+/// partition beside it still resolves, and both sit under one topic entry.
+async fn invalid_timestamp_is_scoped_to_its_partition(
+    storage: impl Storage + Clone,
+    broker_id: i32,
+) -> Result<()> {
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    let response = CreateTopicsValidationLayer::new()
+        .layer(CreateTopicsService {
+            storage: storage.clone(),
+        })
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(topic.into())
+                        .num_partitions(2)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into()))]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+    let created = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(created[0].error_code)?);
+
+    let response = ListOffsetsService { storage }
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
+                .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                .replica_id(broker_id)
+                .topics(Some(
+                    [ListOffsetsTopic::default()
+                        .name(topic.into())
+                        .partitions(Some(
+                            [
+                                ListOffsetsPartition::default()
+                                    .partition_index(0)
+                                    .timestamp(ListOffset::Earliest.try_into()?),
+                                ListOffsetsPartition::default()
+                                    .partition_index(1)
+                                    .timestamp(-100),
+                            ]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+            extensions,
+        })
+        .await?;
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(topic, topics[0].name);
+
+    let mut partitions = topics[0].partitions.clone().unwrap_or_default();
+    partitions.sort_by_key(|partition| partition.partition_index);
+    assert_eq!(2, partitions.len());
+
+    assert_eq!(0, partitions[0].partition_index);
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(Some(0), partitions[0].offset);
+
+    assert_eq!(1, partitions[1].partition_index);
+    assert_eq!(
+        ErrorCode::InvalidTimestamp,
+        ErrorCode::try_from(partitions[1].error_code)?
+    );
+
+    Ok(())
+}
+
+/// An out of range `isolation_level` applies to the whole request, so every requested
+/// partition is answered `INVALID_REQUEST`.
+async fn invalid_isolation_level(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
+    let topic = &alphanumeric_string(15)[..];
+
+    let response = ListOffsetsService { storage }
+        .serve(RequestInput {
+            request: ListOffsetsRequest::default()
+                .isolation_level(Some(7))
+                .replica_id(broker_id)
+                .topics(Some(
+                    [ListOffsetsTopic::default()
+                        .name(topic.into())
+                        .partitions(Some(
+                            [0, 1]
+                                .map(|partition_index| {
+                                    ListOffsetsPartition::default()
+                                        .partition_index(partition_index)
+                                        .timestamp(-1)
+                                })
+                                .into(),
+                        ))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+    assert_eq!(2, partitions.len());
+
+    for partition in partitions {
+        assert_eq!(
+            ErrorCode::InvalidRequest,
+            ErrorCode::try_from(partition.error_code)?
+        );
+    }
+
+    Ok(())
+}
+
 /// Every partition of a request for many partitions answers within the
 /// ListOffsets deadline, in both isolation levels, when each storage call
 /// takes 50 to 150ms.
@@ -207,24 +333,25 @@ async fn many_partitions_with_latency(storage: impl Storage + Clone, broker_id: 
     let extensions = Extensions::default();
     let topic = &alphanumeric_string(15)[..];
 
-    let response = CreateTopicsService {
-        storage: storage.clone(),
-    }
-    .serve(RequestInput {
-        request: CreateTopicsRequest::default()
-            .validate_only(Some(false))
-            .topics(Some(
-                [CreatableTopic::default()
-                    .name(topic.into())
-                    .num_partitions(PARTITIONS)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into()))]
-                .into(),
-            )),
-        extensions: extensions.clone(),
-    })
-    .await?;
+    let response = CreateTopicsValidationLayer::new()
+        .layer(CreateTopicsService {
+            storage: storage.clone(),
+        })
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(topic.into())
+                        .num_partitions(PARTITIONS)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into()))]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
@@ -301,6 +428,26 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn invalid_timestamp_is_scoped_to_its_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_timestamp_is_scoped_to_its_partition(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_level() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_isolation_level(storage, broker_id).await
+    }
+
+    #[tokio::test]
     async fn simple() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -352,6 +499,26 @@ mod lite {
         node: i32,
     ) -> Result<ArcDynStorage> {
         lite_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn invalid_timestamp_is_scoped_to_its_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_timestamp_is_scoped_to_its_partition(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_level() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_isolation_level(storage, broker_id).await
     }
 
     #[tokio::test]
@@ -409,6 +576,26 @@ mod slatedb {
     }
 
     #[tokio::test]
+    async fn invalid_timestamp_is_scoped_to_its_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_timestamp_is_scoped_to_its_partition(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_level() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_isolation_level(storage, broker_id).await
+    }
+
+    #[tokio::test]
     async fn simple() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -460,6 +647,26 @@ mod pg {
         node: i32,
     ) -> Result<ArcDynStorage> {
         postgres_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn invalid_timestamp_is_scoped_to_its_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_timestamp_is_scoped_to_its_partition(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_level() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_isolation_level(storage, broker_id).await
     }
 
     #[tokio::test]

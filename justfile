@@ -159,6 +159,9 @@ clippy:
 fmt:
     cargo fmt --all --check
 
+fmt-fix:
+    cargo fmt --all
+
 shellcheck:
     git ls-files -z '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
 

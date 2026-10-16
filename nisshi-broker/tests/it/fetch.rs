@@ -28,8 +28,8 @@ use nisshi_sans_io::{
     fetch_request::{FetchPartition, FetchTopic},
     record::{Header, Record, inflated},
 };
-use nisshi_storage::{FetchService, ListOffsetResponse, Storage, Topition};
-use rama::{Service, extensions::Extensions};
+use nisshi_storage::{FetchService, FetchValidationLayer, ListOffsetResponse, Storage, Topition};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::{debug, error};
 use url::Url;
@@ -87,19 +87,20 @@ where
 
     let extensions = Extensions::default();
 
-    let fetch = FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: FetchRequest::default()
-            .max_wait_ms(max_wait_ms)
-            .min_bytes(min_bytes)
-            .max_bytes(max_bytes)
-            .isolation_level(Some(isolation_level.into()))
-            .topics(Some(topics.into())),
-        extensions: extensions.clone(),
-    })
-    .await?;
+    let fetch = FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(min_bytes)
+                .max_bytes(max_bytes)
+                .isolation_level(Some(isolation_level.into()))
+                .topics(Some(topics.into())),
+            extensions: extensions.clone(),
+        })
+        .await?;
 
     assert_eq!(
         ErrorCode::None,
@@ -255,20 +256,21 @@ pub async fn kv_header(
 
     let extensions = Extensions::default();
 
-    let fetched = FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: FetchRequest::default()
-            .max_wait_ms(max_wait_ms)
-            .min_bytes(min_bytes)
-            .max_bytes(max_bytes)
-            .isolation_level(Some(isolation_level.into()))
-            .topics(Some(topics.into())),
-        extensions: extensions.clone(),
-    })
-    .await
-    .map(records)?;
+    let fetched = FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(min_bytes)
+                .max_bytes(max_bytes)
+                .isolation_level(Some(isolation_level.into()))
+                .topics(Some(topics.into())),
+            extensions: extensions.clone(),
+        })
+        .await
+        .map(records)?;
 
     assert_eq!(messages.len(), fetched.len());
 
@@ -452,20 +454,21 @@ pub async fn compacted_header(
             .into(),
         ))];
 
-    let fetched = FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: FetchRequest::default()
-            .max_wait_ms(max_wait_ms)
-            .min_bytes(min_bytes)
-            .max_bytes(max_bytes)
-            .isolation_level(Some(isolation_level.into()))
-            .topics(Some(topics.into())),
-        extensions: Extensions::default(),
-    })
-    .await
-    .map(records)?;
+    let fetched = FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(min_bytes)
+                .max_bytes(max_bytes)
+                .isolation_level(Some(isolation_level.into()))
+                .topics(Some(topics.into())),
+            extensions: Extensions::default(),
+        })
+        .await
+        .map(records)?;
 
     // the record at offset 0 has been compacted away, leaving only the
     // record at offset 1, which must be fetched with its own headers
@@ -603,19 +606,20 @@ where
             .into(),
         ))];
 
-    let fetch = FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: FetchRequest::default()
-            .max_wait_ms(max_wait_ms)
-            .min_bytes(min_bytes)
-            .max_bytes(max_bytes)
-            .isolation_level(Some(isolation_level.into()))
-            .topics(Some(topics.into())),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let fetch = FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(min_bytes)
+                .max_bytes(max_bytes)
+                .isolation_level(Some(isolation_level.into()))
+                .topics(Some(topics.into())),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     assert_eq!(
         ErrorCode::None,
@@ -936,14 +940,15 @@ where
 
     let started_at = SystemTime::now();
 
-    let response = FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: fetch_request(&topic_name),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let response = FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: fetch_request(&topic_name),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     let elapsed = started_at.elapsed()?;
     assert!(elapsed < answered_within, "took {elapsed:?}");
@@ -982,7 +987,8 @@ where
         )
         .await?;
 
-    let response = FetchService { storage: sc }
+    let response = FetchValidationLayer::new()
+        .layer(FetchService { storage: sc })
         .serve(RequestInput {
             request: fetch_request(&topic_name).max_wait_ms(200),
             extensions: Extensions::default(),
@@ -1055,7 +1061,8 @@ where
     let max_wait_ms = 1_000;
     let started_at = SystemTime::now();
 
-    let response = FetchService { storage: sc }
+    let response = FetchValidationLayer::new()
+        .layer(FetchService { storage: sc })
         .serve(RequestInput {
             request: FetchRequest::default()
                 .max_wait_ms(max_wait_ms)
@@ -1119,7 +1126,8 @@ where
 
     let started_at = SystemTime::now();
 
-    let response = FetchService { storage: sc }
+    let response = FetchValidationLayer::new()
+        .layer(FetchService { storage: sc })
         .serve(RequestInput {
             request: FetchRequest::default()
                 .max_wait_ms(max_wait_ms)
@@ -1201,39 +1209,40 @@ async fn fetch_offsets<G>(
 where
     G: Storage + Clone,
 {
-    FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: FetchRequest::default()
-            .max_wait_ms(max_wait_ms)
-            .min_bytes(1)
-            .max_bytes(Some(50 * 1024))
-            .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
-            .topics(Some(
-                [FetchTopic::default()
-                    .topic(Some(topic.into()))
-                    .topic_id(Some(NULL_TOPIC_ID))
-                    .partitions(Some(
-                        partitions
-                            .iter()
-                            .map(|(partition, fetch_offset)| {
-                                FetchPartition::default()
-                                    .partition(*partition)
-                                    .current_leader_epoch(Some(-1))
-                                    .fetch_offset(*fetch_offset)
-                                    .last_fetched_epoch(Some(-1))
-                                    .log_start_offset(Some(-1))
-                                    .partition_max_bytes(50 * 1024)
-                            })
-                            .collect(),
-                    ))]
-                .into(),
-            )),
-        extensions: Extensions::default(),
-    })
-    .await
-    .map_err(Into::into)
+    FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(1)
+                .max_bytes(Some(50 * 1024))
+                .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+                .topics(Some(
+                    [FetchTopic::default()
+                        .topic(Some(topic.into()))
+                        .topic_id(Some(NULL_TOPIC_ID))
+                        .partitions(Some(
+                            partitions
+                                .iter()
+                                .map(|(partition, fetch_offset)| {
+                                    FetchPartition::default()
+                                        .partition(*partition)
+                                        .current_leader_epoch(Some(-1))
+                                        .fetch_offset(*fetch_offset)
+                                        .last_fetched_epoch(Some(-1))
+                                        .log_start_offset(Some(-1))
+                                        .partition_max_bytes(50 * 1024)
+                                })
+                                .collect(),
+                        ))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await
+        .map_err(Into::into)
 }
 
 /// The partition answers in a fetch response, in request order.
@@ -1559,31 +1568,32 @@ where
     let max_wait_ms = 1_000;
     let started_at = SystemTime::now();
 
-    let response = FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: FetchRequest::default()
-            .max_wait_ms(max_wait_ms)
-            .min_bytes(1)
-            .max_bytes(Some(50 * 1024))
-            .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
-            .topics(Some(
-                [
-                    FetchTopic::default()
-                        .topic(None)
-                        .topic_id(Some(Uuid::now_v7().into_bytes()))
-                        .partitions(Some([partition(0)].into())),
-                    FetchTopic::default()
-                        .topic(Some(topic_name))
-                        .topic_id(Some(NULL_TOPIC_ID))
-                        .partitions(Some([partition(0)].into())),
-                ]
-                .into(),
-            )),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let response = FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(1)
+                .max_bytes(Some(50 * 1024))
+                .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+                .topics(Some(
+                    [
+                        FetchTopic::default()
+                            .topic(None)
+                            .topic_id(Some(Uuid::now_v7().into_bytes()))
+                            .partitions(Some([partition(0)].into())),
+                        FetchTopic::default()
+                            .topic(Some(topic_name))
+                            .topic_id(Some(NULL_TOPIC_ID))
+                            .partitions(Some([partition(0)].into())),
+                    ]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     let elapsed = started_at.elapsed()?;
     assert!(

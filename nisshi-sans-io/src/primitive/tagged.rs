@@ -33,6 +33,20 @@ use tracing::{debug, instrument};
 
 const MAXIMUM_TAGGED_FIELDS: usize = 128;
 
+/// Caps the up-front allocation for a single tagged field's data. The real
+/// length is an attacker-controlled varint read straight off the wire
+/// (`fuzz_request_decode` found a ~3.5GB claim aborting the process via
+/// `Vec::with_capacity` before a single data byte was read), so it must not
+/// be trusted directly for a pre-allocation size. A legitimate payload
+/// larger than this still decodes correctly, just via a few extra
+/// reallocations as the vec grows one `push` at a time.
+const MAXIMUM_PREALLOCATED_TAG_DATA: usize = 4096;
+
+/// Up-front capacity for a tag field's data, given the length claimed on the wire.
+fn preallocated_capacity(claimed_length: usize) -> usize {
+    claimed_length.min(MAXIMUM_PREALLOCATED_TAG_DATA)
+}
+
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TagField(pub u32, pub Vec<u8>);
 
@@ -117,21 +131,18 @@ impl<'de> Deserialize<'de> for TagField {
                     .ok_or_else(|| serde::de::Error::custom("length"))?
                     .into();
 
-                if length > MAXIMUM_TAGGED_FIELDS {
-                    return Err(serde::de::Error::custom(format!(
-                        "maximum tagged fields exceeded {length}"
-                    )));
-                }
-
                 (0..length)
-                    .try_fold(Vec::with_capacity(length), |mut acc, _| {
-                        seq.next_element::<u8>()?
-                            .ok_or_else(|| serde::de::Error::custom("byte"))
-                            .map(|byte| {
-                                acc.push(byte);
-                                acc
-                            })
-                    })
+                    .try_fold(
+                        Vec::with_capacity(preallocated_capacity(length)),
+                        |mut acc, _| {
+                            seq.next_element::<u8>()?
+                                .ok_or_else(|| serde::de::Error::custom("byte"))
+                                .map(|byte| {
+                                    acc.push(byte);
+                                    acc
+                                })
+                        },
+                    )
                     .inspect(|data| debug!(?tag, ?data))
                     .map(|data| TagField(tag, data))
             }
@@ -468,6 +479,44 @@ mod tests {
         let mut decoder = Decoder::new(&mut c);
 
         assert_eq!(expected, Example::deserialize(&mut decoder)?);
+
+        Ok(())
+    }
+
+    /// Unlike a decode, which an overcommitting OS lets succeed even for a ~3.5GB
+    /// `Vec::with_capacity`, this fails if the cap is lost.
+    #[test]
+    fn preallocation_ignores_the_claimed_length_beyond_the_cap() {
+        assert_eq!(0, preallocated_capacity(0));
+        assert_eq!(10, preallocated_capacity(10));
+        assert_eq!(
+            MAXIMUM_PREALLOCATED_TAG_DATA,
+            preallocated_capacity(MAXIMUM_PREALLOCATED_TAG_DATA + 1)
+        );
+        assert_eq!(
+            MAXIMUM_PREALLOCATED_TAG_DATA,
+            preallocated_capacity(usize::MAX)
+        );
+    }
+
+    /// The up-front allocation for a tag field's data is capped at
+    /// `MAXIMUM_PREALLOCATED_TAG_DATA`, but a legitimate field larger than that must still
+    /// decode in full, the vec growing past the cap as bytes arrive.
+    #[test]
+    fn tag_field_larger_than_preallocation_cap_round_trips() -> Result<()> {
+        let data: Vec<u8> = (0..MAXIMUM_PREALLOCATED_TAG_DATA * 3)
+            .map(|i| u8::try_from(i % 251).expect("below 251"))
+            .collect();
+        let expected = TagField(42, data);
+
+        let mut encoder = crate::ser::Encoder::new(bytes::BytesMut::new());
+        expected.serialize(&mut encoder)?;
+        let encoded = bytes::Bytes::from(encoder);
+
+        let mut reader = Cursor::new(encoded);
+        let actual = TagField::deserialize(&mut crate::de::Decoder::new(&mut reader))?;
+
+        assert_eq!(expected, actual);
 
         Ok(())
     }

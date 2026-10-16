@@ -24,13 +24,13 @@ use nisshi_sans_io::{
 use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
 use nisshi_storage::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
-    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    CreateTopicsService, CreateTopicsValidationLayer, DeleteRecordsService, DeleteTopicsService,
+    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, IncrementalAlterConfigsService, InitProducerIdService,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService,
+    FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
+    InitProducerIdService, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
+    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
@@ -189,6 +189,7 @@ where
             (
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<CreateTopicsRequest>::new(),
+                CreateTopicsValidationLayer::new(),
             )
                 .into_layer(CreateTopicsService { storage })
                 .boxed(),
@@ -329,6 +330,7 @@ where
             (
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<FetchRequest>::new(),
+                FetchValidationLayer::new(),
             )
                 .into_layer(FetchService { storage })
                 .boxed(),

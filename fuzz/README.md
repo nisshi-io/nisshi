@@ -20,6 +20,8 @@ To move a target between tiers, change its budget, or stop running it in CI, edi
 
 The PR job has a 50 minute timeout and each nightly job 75 minutes. The six `pr` budgets add up to 6 minutes of fuzzing, after a build that takes about 33 minutes from scratch (10 of it dependencies, which the Rust cache saves from `main`) and, measured on a PR run with that cache, about 19 minutes. If the budgets outgrow those, raise `timeout-minutes` in `.github/workflows/fuzz.yml` too.
 
+The `fuzz_<api>_storage` targets run in `nightly` only, 15 minutes each: the `pr` job builds every target and runs the listed ones back to back, and its time is the sum of its budgets. `fuzz_delete_records_storage` is in no tier on purpose: `delete_records` is an unconditional `todo!()` in `nisshi-storage-dynostore` and in the libSQL and turso backends of `nisshi-storage-sql`, so it panics on its first execution. Add it to a tier when those stubs are filled in. The "in neither tier" warning for it is expected until then.
+
 ## Adding a target
 
 1. Add `fuzz_targets/<name>.rs` and a `[[bin]]` entry in `Cargo.toml` (copy an existing one).
