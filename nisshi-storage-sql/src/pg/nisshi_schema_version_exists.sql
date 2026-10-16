@@ -13,4 +13,20 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-select to_regclass('nisshi_schema_version') is not null
+-- Returns whether a namespace on the search path holds the nisshi_schema_version table.
+--
+-- This query reads pg_class with the statement's snapshot, instead of calling to_regclass.
+-- to_regclass looks the name up in the session's catalog cache without a lock, and the session
+-- applies the changes of other sessions to that cache only at certain points, such as the start of
+-- a transaction. A broker that waits for the setup lock runs this query in a transaction that began
+-- before the lock holder committed. to_regclass can then miss the table that the holder created,
+-- and the broker creates the schema a second time. A new statement snapshot sees every transaction
+-- that committed before the statement started.
+
+select exists (
+    select
+    from pg_catalog.pg_class c
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+    where c.relname = 'nisshi_schema_version'
+    and n.nspname = any (current_schemas(false))
+)

@@ -9305,6 +9305,65 @@ mod tests {
         .await
     }
 
+    /// A broker finds no schema, and then waits for the setup lock while another broker creates
+    /// the schema. The broker must find the committed schema after the wait, and must not create
+    /// it again.
+    ///
+    /// The test fixes the order of the two brokers. It can't make the waiting broker's catalog
+    /// cache miss the new table, because the server decides when a session applies other
+    /// sessions' catalog changes.
+    #[tokio::test]
+    async fn ensure_schema_finds_the_schema_committed_while_it_waits_for_the_lock() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_finds_the_schema_committed_while_it_waits_for_the_lock",
+            async |database| {
+                let other = database.storage()?;
+                let mut c = other.connection().await?;
+                let tx = c.transaction().await?;
+                tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
+                    .await?;
+
+                let waiting = database.storage()?;
+                let (waited, created) = future::join(waiting.ensure_schema(), async {
+                    // The schema must be created only after the waiting broker has read that
+                    // there is none, which it does before it asks for the lock.
+                    let observer = database.storage()?.connection().await?;
+                    while !observer
+                        .query_one(
+                            "select exists (select from pg_locks \
+                             where locktype = 'advisory' and not granted \
+                             and database = (select oid from pg_database \
+                             where datname = current_database()))",
+                            &[],
+                        )
+                        .await?
+                        .try_get::<_, bool>(0)?
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+
+                    tx.batch_execute(crate::sql::SQL.get("nisshi_schema_version_create.sql")?)
+                        .await?;
+                    tx.batch_execute(SCHEMA).await?;
+                    _ = tx
+                        .execute(
+                            crate::sql::SQL.get("nisshi_schema_version_insert.sql")?,
+                            &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
+                        )
+                        .await?;
+                    tx.commit().await.map_err(Error::from)
+                })
+                .await;
+
+                created?;
+                waited?;
+                assert_eq!(recorded_version(&waiting).await?, Some(SCHEMA_VERSION));
+                Ok(())
+            },
+        )
+        .await
+    }
+
     /// The database is already set up, and the broker's database user can read and write the tables
     /// but can't create them. The broker must start.
     #[tokio::test]
