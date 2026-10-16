@@ -284,8 +284,6 @@ fn added_retention_ms_deletes_older_records() {
 /// keeps a record an hour old. A broker that keeps applying the deleted value deletes records the
 /// user meant to keep.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-configs refuses to \
-            delete them (#904)"]
 fn deleted_retention_ms_restores_the_default() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());

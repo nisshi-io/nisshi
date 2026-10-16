@@ -23,7 +23,6 @@ const NON_DEFAULT_RETENTION: &str = "retention.ms=123456";
 
 /// A setting given when the topic was created must show.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn describe_shows_topic_overrides() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[NON_DEFAULT_RETENTION]);
@@ -40,7 +39,6 @@ fn describe_shows_topic_overrides() {
 
 /// A setting added to an existing topic must show.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn add_config_shows_in_describe() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);
@@ -61,7 +59,6 @@ fn add_config_shows_in_describe() {
 
 /// A setting removed from a topic must stop showing, because the topic now uses the default.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn delete_config_removes_it_from_describe() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[NON_DEFAULT_RETENTION]);
