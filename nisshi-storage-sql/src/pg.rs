@@ -231,6 +231,23 @@ const ABANDONED_STATEMENT_MARGIN: Duration = Duration::from_secs(5);
 /// full-table scans can legitimately run longer than a request-path query should.
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 
+/// Settings that leave an ordered scan of the `record` primary key as the only plan for a
+/// fetch. The fetch queries read at most 10000 rows because the limit stops that scan. When
+/// the planner estimates that the offset range holds few rows, it instead reads the whole range
+/// with a bitmap scan and sorts it before the limit applies. `record` grows by tens of
+/// megabytes a second and is analyzed after the fact, so the estimate is often wrong, and one
+/// fetch then reads and sorts every record between its offset and the high watermark. A prepared
+/// statement keeps such a plan after it is built, so the plan can outlive the stale statistics
+/// that produced it.
+const FETCH_PLAN_SETTINGS: &str =
+    "SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = off";
+
+/// The most rows that one fetch reads from `record`, bound as the limit of the fetch queries. The
+/// fetch service reads again from the last offset it received, so a limit that ends a read early
+/// costs one more query. Without it, one fetch costs as much as the whole backlog between the fetch
+/// offset and the high watermark.
+const ROWS_PER_FETCH: i64 = 10_000;
+
 /// How long a caller waits for a free pooled connection before failing fast with a retriable
 /// error, rather than queuing indefinitely while the pool is exhausted.
 const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3067,6 +3084,10 @@ impl Storage for Postgres {
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
 
+        tx.batch_execute(FETCH_PLAN_SETTINGS)
+            .await
+            .inspect_err(|err| error!(?err))?;
+
         let records = if let Some(key) = key_filter {
             self.tx_prepare_query(
                 &tx,
@@ -3079,6 +3100,7 @@ impl Storage for Postgres {
                     &(max_bytes as i64),
                     &high_watermark,
                     &key,
+                    &ROWS_PER_FETCH,
                 ],
             )
             .await
@@ -3094,6 +3116,7 @@ impl Storage for Postgres {
                     &offset,
                     &(max_bytes as i64),
                     &high_watermark,
+                    &ROWS_PER_FETCH,
                 ],
             )
             .await
@@ -3135,6 +3158,30 @@ impl Storage for Postgres {
                         .map(|producer_epoch| producer_epoch.unwrap_or(-1))
                         .inspect_err(|err| error!(?err))?,
                 );
+
+            // One query for the headers of the returned records. A query per record costs a
+            // round trip each, which capped a consumer at a few thousand records a second.
+            // The topic is the base topic: a keyed fetch has a name that is not a topic.
+            let mut headers: BTreeMap<i64, Vec<Row>> = BTreeMap::new();
+            let offsets = records
+                .iter()
+                .map(|record| record.try_get::<_, i64>(0))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            for header in self
+                .tx_prepare_query(
+                    &tx,
+                    "header_fetch_range.sql",
+                    &[&self.cluster, &base_topic, &topition.partition(), &offsets],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                headers
+                    .entry(header.try_get::<_, i64>(0)?)
+                    .or_default()
+                    .push(header);
+            }
 
             for record in records.iter() {
                 let attributes = record
@@ -3214,32 +3261,18 @@ impl Storage for Postgres {
                     .key(k)
                     .value(v);
 
-                for header in self
-                    .tx_prepare_query(
-                        &tx,
-                        "header_fetch.sql",
-                        &[
-                            &self.cluster,
-                            &topition.topic(),
-                            &topition.partition(),
-                            &offset,
-                        ],
-                    )
-                    .await
-                    .inspect(|row| debug!(?row))
-                    .inspect_err(|err| error!(?err))?
-                {
+                for header in headers.remove(&offset).unwrap_or_default() {
                     let mut header_builder = Header::builder();
 
                     if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(0)
+                        .try_get::<_, Option<&[u8]>>(1)
                         .inspect_err(|err| error!(?err))?
                     {
                         header_builder = header_builder.key(Bytes::copy_from_slice(k));
                     }
 
                     if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(1)
+                        .try_get::<_, Option<&[u8]>>(2)
                         .inspect_err(|err| error!(?err))?
                     {
                         header_builder = header_builder.value(Bytes::copy_from_slice(v));
@@ -8163,6 +8196,597 @@ mod tests {
             keys.iter().map(|key| key.to_string()).collect::<Vec<_>>(),
             fetched,
             "headers must be served in produce order, repeats included",
+        );
+
+        Ok(())
+    }
+
+    /// A storage on a new cluster holding one empty single-partition topic, or `None` when
+    /// there is no postgres to connect to.
+    async fn storage_with_topic() -> Result<Option<(Postgres, Topition)>> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping: {err:?}");
+            return Ok(None);
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster,
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        Ok(Some((storage, Topition::new(topic_name, 0))))
+    }
+
+    /// The records of every batch, as `(offset, record)`.
+    fn records_with_offsets(batches: Vec<deflated::Batch>) -> Result<Vec<(i64, Record)>> {
+        batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            let inflated = Batch::try_from(batch)?;
+
+            acc.extend(inflated.records.into_iter().map(|record| {
+                (
+                    inflated.base_offset + i64::from(record.offset_delta),
+                    record,
+                )
+            }));
+
+            Ok(acc)
+        })
+    }
+
+    /// The fetch query reads at most 10,000 rows per call. Without that bound each fetch
+    /// reads every row between the fetch offset and the high watermark, so a consumer behind
+    /// a fast producer slows down as its backlog grows. The fetch service reads again from
+    /// the last offset it received, so a bounded read must neither skip nor repeat a record.
+    #[tokio::test]
+    async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        let batch = (0..RECORDS)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                )
+            })
+            .last_offset_delta(i32::try_from(RECORDS - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let fetch_from = |offset| {
+            storage.fetch(
+                &topition,
+                offset,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+        };
+
+        let first = records_with_offsets(fetch_from(0).await?)?;
+
+        assert_eq!(
+            (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+            first.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            "one fetch must stop at the row limit",
+        );
+
+        let rest = records_with_offsets(fetch_from(ROWS_PER_FETCH).await?)?;
+
+        assert_eq!(
+            (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
+            rest.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            "reading on from the last offset must return the rest, with no gap or repeat",
+        );
+
+        Ok(())
+    }
+
+    /// Gives the topic a delete policy with a retention of one minute.
+    async fn retain_for_one_minute(storage: &Postgres, topition: &Topition) -> Result<()> {
+        let c = storage.connection().await?;
+
+        _ = c
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, v.name, v.value \
+                 from topic t \
+                 join cluster c on c.id = t.cluster, \
+                 (values ('cleanup.policy', 'delete'), ('retention.ms', '60000')) v(name, value) \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Produces one record per timestamp, in milliseconds since the epoch, at consecutive offsets.
+    async fn produce_at(storage: &Postgres, topition: &Topition, timestamps: &[i64]) -> Result<()> {
+        let base = timestamps.iter().copied().min().unwrap_or_default();
+
+        let batch = timestamps
+            .iter()
+            .enumerate()
+            .fold(Batch::builder(), |builder, (offset, timestamp)| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(offset).unwrap_or(i32::MAX))
+                        .timestamp_delta(timestamp - base),
+                )
+            })
+            .base_timestamp(base)
+            .max_timestamp(timestamps.iter().copied().max().unwrap_or_default())
+            .last_offset_delta(i32::try_from(timestamps.len() - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, topition, batch).await?;
+
+        Ok(())
+    }
+
+    /// Sets when each record was appended, in milliseconds since the epoch, for the records at
+    /// consecutive offsets from `first_offset`. Records are appended now, and retention reads
+    /// the append time to find where the expired records end.
+    async fn append_times(
+        storage: &Postgres,
+        topition: &Topition,
+        first_offset: i64,
+        appended: &[i64],
+    ) -> Result<()> {
+        let c = storage.connection().await?;
+
+        let updated = c
+            .execute(
+                "update record r \
+                 set created_at = cast(to_timestamp(a.ms / 1000.0) as timestamp) \
+                 from unnest($4::bigint[]) with ordinality as a(ms, n) \
+                 where r.topition = ( \
+                     select tp.id \
+                     from cluster c \
+                     join topic t on t.cluster = c.id \
+                     join topition tp on tp.topic = t.id \
+                     where c.name = $1 and t.name = $2 and tp.partition = $3) \
+                 and r.offset_id = $5 + a.n - 1",
+                &[
+                    &storage.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &appended,
+                    &first_offset,
+                ],
+            )
+            .await?;
+
+        assert_eq!(u64::try_from(appended.len())?, updated);
+
+        Ok(())
+    }
+
+    /// Removes the records at the offsets, as compaction leaves a gap.
+    async fn remove_offsets(
+        storage: &Postgres,
+        topition: &Topition,
+        offsets: std::ops::Range<i64>,
+    ) -> Result<()> {
+        let c = storage.connection().await?;
+
+        _ = c
+            .execute(
+                "delete from record r \
+                 where r.topition = ( \
+                     select tp.id \
+                     from cluster c \
+                     join topic t on t.cluster = c.id \
+                     join topition tp on tp.topic = t.id \
+                     where c.name = $1 and t.name = $2 and tp.partition = $3) \
+                 and r.offset_id >= $4 and r.offset_id < $5",
+                &[
+                    &storage.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &offsets.start,
+                    &offsets.end,
+                ],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// The offsets that are still stored for the partition, in order.
+    async fn stored_offsets(storage: &Postgres, topition: &Topition) -> Result<Vec<i64>> {
+        let c = storage.connection().await?;
+
+        c.query(
+            "select r.offset_id \
+             from record r \
+             join topition tp on tp.id = r.topition \
+             join topic t on t.id = tp.topic \
+             join cluster c on c.id = t.cluster \
+             where c.name = $1 and t.name = $2 and tp.partition = $3 \
+             order by r.offset_id",
+            &[&storage.cluster, &topition.topic(), &topition.partition()],
+        )
+        .await?
+        .iter()
+        .map(|row| row.try_get::<_, i64>(0).map_err(Into::into))
+        .collect()
+    }
+
+    fn now_ms() -> Result<i64> {
+        Ok(i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_millis(),
+        )?)
+    }
+
+    /// Retention deletes the records below an offset that a search over the append times finds,
+    /// in place of testing every record. When the append times rise with offsets, that must
+    /// delete every expired record and no other.
+    #[tokio::test]
+    async fn retention_deletes_every_expired_record_when_timestamps_rise_with_offsets() -> Result<()>
+    {
+        const EXPIRED: i64 = 1_200;
+        const RECORDS: i64 = 2_000;
+
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if offset < EXPIRED {
+                    now - 600_000 + offset
+                } else {
+                    now - 10_000 + (offset - EXPIRED)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+        append_times(&storage, &topition, 0, &timestamps).await?;
+
+        let deleted = storage.policy_delete(SystemTime::now()).await?;
+
+        assert_eq!(u64::try_from(EXPIRED)?, deleted);
+        assert_eq!(
+            (EXPIRED..RECORDS).collect::<Vec<_>>(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        Ok(())
+    }
+
+    /// A record with a timestamp ahead of the records around it, from a producer clock that is
+    /// wrong, has not expired and is kept. It must not hold back the deletion of the records after
+    /// it.
+    #[tokio::test]
+    async fn retention_keeps_a_record_that_has_not_expired_and_deletes_the_rest() -> Result<()> {
+        const RECORDS: i64 = 1_000;
+        const AHEAD: [i64; 2] = [100, 500];
+
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if AHEAD.contains(&offset) {
+                    now + 86_400_000
+                } else {
+                    now - 600_000 + offset
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+        append_times(
+            &storage,
+            &topition,
+            0,
+            &(0..RECORDS)
+                .map(|offset| now - 600_000 + offset)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+        let deleted = storage.policy_delete(SystemTime::now()).await?;
+
+        assert_eq!(u64::try_from(RECORDS - 2)?, deleted);
+        assert_eq!(AHEAD.to_vec(), stored_offsets(&storage, &topition).await?);
+
+        Ok(())
+    }
+
+    /// Retention does not advance the low watermark, so a sweep after the first searches a range
+    /// that starts with offsets that are no longer stored. It must end, and delete exactly the
+    /// records that have expired since.
+    #[tokio::test]
+    async fn retention_sweeps_again_after_more_records_arrive() -> Result<()> {
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let first = (0..600)
+            .map(|offset| now - 600_000 + offset)
+            .collect::<Vec<_>>();
+        produce_at(&storage, &topition, &first).await?;
+        append_times(&storage, &topition, 0, &first).await?;
+
+        assert_eq!(600, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            Vec::<i64>::new(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        let second = (0..400)
+            .map(|offset| {
+                if offset < 200 {
+                    now - 300_000 + offset
+                } else {
+                    now - 10_000 + offset
+                }
+            })
+            .collect::<Vec<_>>();
+        produce_at(&storage, &topition, &second).await?;
+        append_times(&storage, &topition, 600, &second).await?;
+
+        assert_eq!(200, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            (800..1_000).collect::<Vec<_>>(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        assert_eq!(0, storage.policy_delete(SystemTime::now()).await?);
+
+        Ok(())
+    }
+
+    /// Compaction leaves gaps in the offsets of a partition. A search whose probes land in a gap
+    /// must still find the boundary and delete every expired record on both sides of the gap.
+    #[tokio::test]
+    async fn retention_deletes_expired_records_on_both_sides_of_a_gap() -> Result<()> {
+        const EXPIRED: i64 = 800;
+        const RECORDS: i64 = 1_000;
+
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if offset < EXPIRED {
+                    now - 600_000 + offset
+                } else {
+                    now - 10_000 + offset
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+        append_times(&storage, &topition, 0, &timestamps).await?;
+        remove_offsets(&storage, &topition, 300..700).await?;
+
+        assert_eq!(400, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            (EXPIRED..RECORDS).collect::<Vec<_>>(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        Ok(())
+    }
+
+    /// A keyed fetch of a virtual topic names the topic as `base/key`, and that name has no row in
+    /// `topic`. Its records still carry their headers, and the headers read are those of the
+    /// records returned, not of the records in between.
+    #[tokio::test]
+    async fn keyed_fetch_attaches_headers_of_the_records_it_returns() -> Result<()> {
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        let c = storage.connection().await?;
+        _ = c
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, 'tansu.virtual', 'true' \
+                 from topic t join cluster c on c.id = t.cluster \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        let batch = (0..6)
+            .fold(Batch::builder(), |builder, delta| {
+                let key = if delta % 2 == 0 { "key-a" } else { "key-b" };
+                let header = format!("header-{delta}");
+
+                builder.record(
+                    Record::builder()
+                        .key(Bytes::copy_from_slice(key.as_bytes()).into())
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(delta)
+                        .header(
+                            Header::builder()
+                                .key(Bytes::copy_from_slice(header.as_bytes()))
+                                .value(Bytes::copy_from_slice(header.as_bytes())),
+                        ),
+                )
+            })
+            .last_offset_delta(5)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let records = records_with_offsets(
+            storage
+                .fetch(
+                    &Topition::new(format!("{}/key-a", topition.topic()), 0),
+                    0,
+                    1,
+                    8 * 1024,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(5),
+                )
+                .await?,
+        )?;
+
+        let fetched = records
+            .iter()
+            .map(|(offset, record)| {
+                (
+                    *offset,
+                    record
+                        .headers
+                        .iter()
+                        .filter_map(|header| header.key.as_deref())
+                        .map(|key| String::from_utf8_lossy(key).into_owned())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![
+                (0, vec!["header-0".to_string()]),
+                (2, vec!["header-2".to_string()]),
+                (4, vec!["header-4".to_string()]),
+            ],
+            fetched
+        );
+
+        Ok(())
+    }
+
+    /// Headers are read for the whole range of a fetch at once, and each must end up on the
+    /// record at its own offset: records without headers stay without, the first and last record of
+    /// the range get theirs, and a record keeps its headers in produce order.
+    #[tokio::test]
+    async fn fetch_attaches_each_header_to_its_own_record() -> Result<()> {
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        let headers: [&[&str]; 5] = [&["zero"], &["one"], &[], &["two-a", "two-b"], &["four"]];
+
+        let batch = headers
+            .iter()
+            .enumerate()
+            .fold(Batch::builder(), |builder, (delta, keys)| {
+                builder.record(
+                    keys.iter().fold(
+                        Record::builder()
+                            .value(Bytes::from_static(b"a").into())
+                            .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                        |record, key| {
+                            record.header(
+                                Header::builder()
+                                    .key(Bytes::copy_from_slice(key.as_bytes()))
+                                    .value(Bytes::copy_from_slice(key.as_bytes())),
+                            )
+                        },
+                    ),
+                )
+            })
+            .last_offset_delta(i32::try_from(headers.len() - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let records = records_with_offsets(
+            storage
+                .fetch(
+                    &topition,
+                    0,
+                    1,
+                    8 * 1024,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(5),
+                )
+                .await?,
+        )?;
+
+        let fetched = records
+            .iter()
+            .map(|(_, record)| {
+                record
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        header
+                            .key
+                            .as_deref()
+                            .map(|key| String::from_utf8_lossy(key).into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            headers
+                .iter()
+                .map(|keys| keys.iter().map(|key| key.to_string()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            fetched,
         );
 
         Ok(())

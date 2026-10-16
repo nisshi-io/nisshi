@@ -13,21 +13,30 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+-- The compacted partitions are found before record is read, and the CTE is materialized so that
+-- the planner cannot move the join to record above the join to topic_configuration. When it
+-- did, it read every partition of every topic, then discarded the rows of partitions that are
+-- not compacted: on 48 million records, one sweep took 48 seconds and removed nothing.
 with
 
-dup as (
-    select
-    tp.id as topition, r.k as k, max(r.offset_id) as offset_id
-    from record r
-    join topition tp on tp.id = r.topition
-    join topic t on tp.topic = t.id
-    join cluster c on t.cluster = c.id
+compacted as materialized (
+    select tp.id as topition
+    from topition tp
+    join topic t on t.id = tp.topic
+    join cluster c on c.id = t.cluster
     join topic_configuration tc on tc.topic = t.id
     where c.name = $1
     and tc.name = 'cleanup.policy'
     and tc.value like '%compact%'
-    and r.k is not null
-    group by tp.id,r.k having count(r.k) > 1
+),
+
+dup as (
+    select
+    r.topition as topition, r.k as k, max(r.offset_id) as offset_id
+    from compacted
+    join record r on r.topition = compacted.topition
+    where r.k is not null
+    group by r.topition, r.k having count(r.k) > 1
 ),
 
 compaction as (

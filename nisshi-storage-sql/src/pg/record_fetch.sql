@@ -13,8 +13,22 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch (text, text, integer, integer, integer, integer) as
-with sized as (
+-- prepare record_fetch (text, text, integer, integer, integer, integer, bigint) as
+-- A fetch reads at most $7 rows past the fetch offset (ROWS_PER_FETCH in pg.rs, 10000). The running byte total below is
+-- computed over every row that this query reads, so without the limit, one fetch costs as much
+-- as the whole backlog between the fetch offset and the high watermark, however few rows the
+-- client can take. The fetch service reads again from the last offset that it received, so a
+-- limit that ends a read early costs one more query.
+--
+-- The record table is read directly, with the topition id looked up in a scalar subquery. A join
+-- between the two hides from the planner that the rows come out in offset order, and it then sorts
+-- all of them, which for 10000 rows of 1 KiB spills to a temp file. Without the join, the limit
+-- stops an ordered walk of the primary key, and the running byte total reads that order as it is.
+--
+-- The fetch runs with the settings in FETCH_PLAN_SETTINGS (pg.rs), which turn off bitmap and
+-- sequential scans, so that this query keeps the ordered scan that the limit relies on. Run it
+-- with them to see the plan that a fetch uses: `run.sh explain` does.
+with candidates as (
 select
 
 r.offset_id,
@@ -22,23 +36,43 @@ r.attributes,
 r.timestamp,
 r.k,
 r.v,
-sum(coalesce(length(r.k), 0) + coalesce(length(r.v), 0)) over (order by r.offset_id) as bytes,
 r.producer_id,
 r.producer_epoch
 
 from
 
-cluster c
-join topic t on t.cluster = c.id
-join topition tp on tp.topic = t.id
-join record r on r.topition = tp.id
+record r
 
 where
 
-c.name = $1
-and t.name = $2
-and tp.partition = $3
+r.topition = (
+    select tp.id
+    from cluster c
+    join topic t on t.cluster = c.id
+    join topition tp on tp.topic = t.id
+    where c.name = $1
+    and t.name = $2
+    and tp.partition = $3)
 and r.offset_id >= $4
-and r.offset_id < $6)
+and r.offset_id < $6
+
+order by r.offset_id
+limit $7),
+
+sized as (
+select
+
+offset_id,
+attributes,
+timestamp,
+k,
+v,
+sum(coalesce(length(k), 0) + coalesce(length(v), 0)) over (order by offset_id) as bytes,
+producer_id,
+producer_epoch
+
+from
+
+candidates)
 
 select * from sized where bytes < $5 order by offset_id;
