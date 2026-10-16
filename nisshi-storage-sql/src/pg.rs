@@ -1460,10 +1460,11 @@ impl Postgres {
             }
         }
 
-        // This transaction is READ COMMITTED whatever the server's default isolation level is,
-        // because a broker that waited for the lock reads the schema that another broker committed
-        // during the wait. A REPEATABLE READ transaction keeps the snapshot that it took before
-        // the wait, and doesn't see that schema.
+        // This transaction is READ COMMITTED, regardless of the server's default isolation level.
+        // A broker that waited for the lock must see the schema that another broker committed
+        // during the wait. Each statement of a READ COMMITTED transaction sees every commit made
+        // before the statement started. A REPEATABLE READ transaction sees only the commits made
+        // before its first statement, and that statement ran before the wait.
         let tx = c
             .build_transaction()
             .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
