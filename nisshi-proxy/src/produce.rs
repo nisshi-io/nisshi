@@ -17,7 +17,7 @@ use std::{
     fmt::Debug,
     ops::DerefMut as _,
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
     task::{self, Poll, Waker},
     time::{Duration, SystemTime},
     vec::IntoIter,
@@ -36,7 +36,7 @@ use nisshi_sans_io::{
 use opentelemetry::metrics::{Counter, Histogram};
 use rama::{Layer, Service};
 use tokio::time::sleep;
-use tracing::debug;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::{Error, METER, topic::ResourceConfig};
@@ -153,6 +153,20 @@ pub(crate) fn number_of_bytes(req: &ProduceRequest) -> usize {
     size_of(req, |batch| batch.record_data.len())
 }
 
+/// Lock `mutex`, aborting the process if a panic poisoned it.
+///
+/// A panic part way through updating the pending requests or responses leaves
+/// tickets that never get an answer, and recovering the lock cannot repair
+/// that: those requests would wait forever while the proxy kept accepting
+/// more. The proxy is stateless, so it is better to stop and let a supervisor
+/// restart it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        error!(?poisoned, "produce batch lock poisoned, aborting");
+        std::process::abort()
+    })
+}
+
 impl<S> BatchProduceService<S>
 where
     S: Clone + Debug,
@@ -166,13 +180,11 @@ where
 
         SEND_PENDING_BATCH_COUNTER.add(1, &[]);
 
-        let requests = self
-            .requests
-            .lock()
-            .map(|mut guard| std::mem::take(guard.deref_mut()))
-            .inspect(|request| debug!(?request))
-            .inspect_err(|err| debug!(?err))
-            .expect("poison");
+        let requests = {
+            let mut guard = lock(&self.requests);
+            std::mem::take(guard.deref_mut())
+        };
+        debug!(?requests);
 
         if requests.is_empty() {
             SEND_PENDING_EMPTY_BATCH_COUNTER.add(1, &[]);
@@ -201,11 +213,7 @@ where
                 })?
         };
 
-        let mut responses = self
-            .responses
-            .lock()
-            .inspect_err(|err| debug!(?err))
-            .expect("poison");
+        let mut responses = lock(&self.responses);
 
         let mut owners = owners.split(produce_response);
         debug!(?owners);
@@ -307,35 +315,26 @@ where
             .inspect(|max_records| debug!(?max_records))
             .unwrap_or(1_000);
 
-        let ticket = self
-            .requests
-            .lock()
-            .map(|mut requests| {
-                let ticket = Ticket::new(self.clone());
-                requests.push(BatchRequest {
-                    id: ticket.id,
-                    request: request.request,
-                });
-                ticket
-            })
-            .expect("poison");
+        let ticket = {
+            let mut requests = lock(&self.requests);
+            let ticket = Ticket::new(self.clone());
+            requests.push(BatchRequest {
+                id: ticket.id,
+                request: request.request,
+            });
+            ticket
+        };
 
         loop {
             let id = ticket.id;
 
-            if self
-                .requests
-                .lock()
-                .map(|requests| {
-                    requests
-                        .iter()
-                        .map(|batch_request| batch_request.number_of_records())
-                        .sum::<usize>()
-                })
-                .inspect(|num_records| debug!(num_records, max_records))
-                .expect("poison")
-                >= max_records
-            {
+            let num_records = lock(&self.requests)
+                .iter()
+                .map(|batch_request| batch_request.number_of_records())
+                .sum::<usize>();
+            debug!(num_records, max_records);
+
+            if num_records >= max_records {
                 BATCH_OVERFLOW_COUNTER.add(1, &[]);
 
                 if let Ok(Some(produce_response)) =
@@ -652,7 +651,7 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error>
                         .map(|record| Record {
                             offset_delta: record.offset_delta + sink.last_offset_delta + 1,
                             timestamp_delta: record.timestamp_delta
-                                + (sink.base_timestamp - batch.base_timestamp),
+                                + (batch.base_timestamp - sink.base_timestamp),
                             ..record
                         })
                         .collect::<Vec<_>>(),
@@ -707,25 +706,19 @@ where
     type Output = Result<ProduceResponse, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        match self
-            .batch
-            .responses
-            .lock()
-            .inspect(|responses| debug!(?responses))
-        {
-            Ok(ref mut responses) => match responses
-                .remove(&self.id)
-                .inspect(|response| debug!(id = ?self.id, ?response))
-            {
-                Some(BatchResponse::Response(response)) => Poll::Ready(Ok(response)),
-                Some(_) => Poll::Pending,
-                None => {
-                    _ = responses.insert(self.id, BatchResponse::Waker(cx.waker().clone()));
-                    Poll::Pending
-                }
-            },
+        let mut responses = lock(&self.batch.responses);
+        debug!(?responses);
 
-            Err(error) => panic!("{error:?}"),
+        match responses
+            .remove(&self.id)
+            .inspect(|response| debug!(id = ?self.id, ?response))
+        {
+            Some(BatchResponse::Response(response)) => Poll::Ready(Ok(response)),
+            Some(_) => Poll::Pending,
+            None => {
+                _ = responses.insert(self.id, BatchResponse::Waker(cx.waker().clone()));
+                Poll::Pending
+            }
         }
     }
 }
@@ -745,6 +738,42 @@ mod tests {
     use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
     use super::*;
+
+    const POISON_CHILD: &str = "NISSHI_PROXY_POISON_CHILD";
+
+    #[test]
+    fn poisoned_lock_aborts_the_process() {
+        if std::env::var_os(POISON_CHILD).is_some() {
+            let mutex = Arc::new(Mutex::new(()));
+
+            let poisoner = mutex.clone();
+            _ = thread::spawn(move || {
+                let _guard = poisoner.lock();
+                panic!("poison the lock");
+            })
+            .join();
+
+            drop(lock(&mutex));
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().expect("current exe"))
+            .args([
+                "--exact",
+                "produce::tests::poisoned_lock_aborts_the_process",
+            ])
+            .env(POISON_CHILD, "1")
+            .status()
+            .expect("child");
+
+        assert!(!status.success(), "{status:?}");
+
+        #[cfg(unix)]
+        assert_eq!(
+            Some(6),
+            std::os::unix::process::ExitStatusExt::signal(&status)
+        );
+    }
 
     #[derive(Clone, Default, Debug)]
     struct MockProduceService {
@@ -902,6 +931,176 @@ mod tests {
         assert_eq!(65, records.len());
         assert_eq!(64, records[64].offset_delta);
         assert_eq!(Some(Bytes::from_static(b"b")), records[64].value);
+
+        Ok(())
+    }
+
+    // The batches have different base timestamps, so `combine` must rebase the
+    // second batch's timestamp deltas onto the first batch's base.
+    #[test]
+    fn combine_preserves_timestamps_across_different_base_timestamps() -> Result<(), Error> {
+        let first = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(0)
+            .last_offset_delta(1)
+            .base_sequence(0)
+            .base_timestamp(1_000)
+            .max_timestamp(1_005)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1)
+                    .timestamp_delta(5),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let second = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(2)
+            .last_offset_delta(1)
+            .base_sequence(2)
+            .base_timestamp(1_010)
+            .max_timestamp(1_013)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"c").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"d").into())
+                    .offset_delta(1)
+                    .timestamp_delta(3),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let original_times: BTreeMap<&'static [u8], i64> = BTreeMap::from([
+            (&b"a"[..], 1_000),
+            (&b"b"[..], 1_005),
+            (&b"c"[..], 1_010),
+            (&b"d"[..], 1_013),
+        ]);
+
+        let combined = combine(vec![first, second])?;
+        assert_eq!(1, combined.len());
+
+        let combined = inflated::Batch::try_from(combined[0].clone())?;
+
+        assert_eq!(4, combined.records.len());
+
+        assert_eq!(1_000, combined.base_timestamp);
+        assert_eq!(1_013, combined.max_timestamp);
+
+        for record in &combined.records {
+            let value = record.value.as_deref().expect("value");
+            let expected = original_times[value];
+            let actual = combined.base_timestamp + record.timestamp_delta;
+            assert_eq!(
+                expected, actual,
+                "record {value:?} should keep its original absolute timestamp"
+            );
+        }
+
+        Ok(())
+    }
+
+    // The second batch's base timestamp is earlier than the first's, so the
+    // rebased deltas are negative and the first batch's maximum stays the
+    // combined maximum.
+    #[test]
+    fn combine_preserves_timestamps_when_second_base_timestamp_is_earlier() -> Result<(), Error> {
+        let first = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(0)
+            .last_offset_delta(1)
+            .base_sequence(0)
+            .base_timestamp(1_000)
+            .max_timestamp(1_005)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1)
+                    .timestamp_delta(5),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let second = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(2)
+            .last_offset_delta(1)
+            .base_sequence(2)
+            .base_timestamp(990)
+            .max_timestamp(993)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"c").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"d").into())
+                    .offset_delta(1)
+                    .timestamp_delta(3),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let original_times: BTreeMap<&'static [u8], i64> = BTreeMap::from([
+            (&b"a"[..], 1_000),
+            (&b"b"[..], 1_005),
+            (&b"c"[..], 990),
+            (&b"d"[..], 993),
+        ]);
+
+        let combined = combine(vec![first, second])?;
+        assert_eq!(1, combined.len());
+
+        let combined = inflated::Batch::try_from(combined[0].clone())?;
+
+        assert_eq!(4, combined.records.len());
+
+        assert_eq!(1_000, combined.base_timestamp);
+        assert_eq!(1_005, combined.max_timestamp);
+
+        assert_eq!(
+            vec![0, 5, -10, -7],
+            combined
+                .records
+                .iter()
+                .map(|record| record.timestamp_delta)
+                .collect::<Vec<_>>()
+        );
+
+        for record in &combined.records {
+            let value = record.value.as_deref().expect("value");
+            let expected = original_times[value];
+            let actual = combined.base_timestamp + record.timestamp_delta;
+            assert_eq!(
+                expected, actual,
+                "record {value:?} should keep its original absolute timestamp"
+            );
+        }
 
         Ok(())
     }

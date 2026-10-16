@@ -370,7 +370,7 @@ impl<'a> FieldGenerator<'a> {
                     engine
                         .eval::<String>(script)
                         .inspect(|name| debug!(name))
-                        .map(|name| {
+                        .and_then(|name| {
                             descriptor
                                 .value_by_name(&name[..])
                                 .inspect(|value_descriptor| debug!(?value_descriptor))
@@ -381,7 +381,7 @@ impl<'a> FieldGenerator<'a> {
                                     )
                                 })
                                 .inspect(|value| debug!(?value))
-                                .unwrap()
+                                .ok_or_else(|| format!("unknown enum value name: {name}").into())
                         })
                         .inspect_err(|err| debug!(script, ?err))
                 })

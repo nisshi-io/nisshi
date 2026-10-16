@@ -37,6 +37,11 @@ changes.
   `Connection` and some data about it, return the `Connection` and a type named for the data,
   such as `(Connection, Handshake)`. A name like `ConnectionWithHandshake` reads as a kind of
   `Connection`, and hides that it bundles separate values.
+- **Name the fields instead of using a tuple of plain types.** A tuple's fields have no names, so
+  with `(i64, &str, &str)` a reader has to work out from the code around it which number is the
+  offset and which string is the key. Define a small struct, such as `Record { offset, key,
+  value }`. A tuple of distinct named types is fine, because each type names its field:
+  `(Connection, Handshake)`.
 - **Make a boolean read as a statement.** `is_empty`, `port_is_free`, `include_defaults`.
 - **Use one name for one thing.** If the code already has a name for a concept, use that name
   everywhere, and do not invent a synonym. Do not give two different things the same name.

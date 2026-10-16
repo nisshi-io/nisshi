@@ -46,6 +46,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_batch_records"
+path = "fuzz_targets/fuzz_batch_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_varint"
 path = "fuzz_targets/fuzz_varint.rs"
 test = false

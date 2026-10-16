@@ -1170,7 +1170,7 @@ impl AsArrow for Schema {
                                         ]
                                     },
                                 ),
-                            )
+                            )?
                             .into(),
                         )
                     })
@@ -1399,7 +1399,7 @@ mod tests {
                     ("g", Vec::from(&b"abcdef"[..]).into()),
                     ("h", "pqr".into()),
                 ],
-            )];
+            )?];
 
             for value in values {
                 batch = batch.record(
@@ -1499,7 +1499,7 @@ mod tests {
                         Value::Array(vec!["abc".into(), "pqr".into(), "xyz".into()]),
                     ),
                 ],
-            )];
+            )?];
 
             for value in values {
                 batch = batch.record(
@@ -1915,7 +1915,7 @@ mod tests {
                         ("name", "alice".into()),
                         ("lucky", Value::Array([6.into()].into())),
                     ],
-                ),
+                )?,
                 r(
                     schema.value.as_ref().unwrap(),
                     [
@@ -1923,7 +1923,7 @@ mod tests {
                         ("name", "bob".into()),
                         ("lucky", Value::Array([5.into(), 9.into()].into())),
                     ],
-                ),
+                )?,
             ];
 
             for value in values {

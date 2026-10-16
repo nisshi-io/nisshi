@@ -35,7 +35,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    record::{Record, deflated, inflated},
+    record::{Record, deflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::{
@@ -51,7 +51,7 @@ use crate::{
     BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
     ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    TxnOffsetCommitRequest, UpdateError, Version, inflate_produced, offload,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -284,7 +284,9 @@ where
         // both cases every owner (not just whichever caller happened to
         // trigger this flush) must be told the outcome, not just the one
         // that happened to call `send_queued`.
-        let outcome = match combine(queued.into_iter().map(|queued| queued.batch).collect()) {
+        let batches = queued.into_iter().map(|queued| queued.batch).collect();
+
+        let outcome = match offload(move || combine(batches)).await {
             Ok(Some(combined)) => {
                 let record_count = (combined.last_offset_delta + 1) as u64;
 
@@ -706,14 +708,14 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
         return Ok(None);
     };
 
-    let mut sink = inflated::Batch::try_from(first)?;
+    let mut sink = inflate_produced(first)?;
     debug!(
         sink.base_offset,
         sink.last_offset_delta, sink.base_sequence, sink.max_timestamp
     );
 
     for batch in i {
-        let batch = inflated::Batch::try_from(batch)?;
+        let batch = inflate_produced(batch)?;
 
         debug!(
             sink.last_offset_delta,
@@ -727,7 +729,7 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
                 .map(|record| Record {
                     offset_delta: record.offset_delta + sink.last_offset_delta + 1,
                     timestamp_delta: record.timestamp_delta
-                        + (sink.base_timestamp - batch.base_timestamp),
+                        + (batch.base_timestamp - sink.base_timestamp),
                     ..record
                 })
                 .collect::<Vec<_>>(),
@@ -752,7 +754,7 @@ mod tests {
 
     use bytes::Bytes;
     use nisshi_sans_io::{
-        BatchAttribute,
+        BatchAttribute, Compression,
         record::{Record, deflated, inflated},
     };
     use tokio::{task::yield_now, time::advance};
@@ -1460,9 +1462,94 @@ mod tests {
         Ok(())
     }
 
+    // The test runtime has a single thread. If `send_queued` combined the
+    // batch inline, the produce task would decode, store and resolve its
+    // ticket within its first poll, so it would already be finished when
+    // `yield_now` returns. Offloaded, it is still waiting on the decode.
+    #[tokio::test]
+    async fn combine_runs_off_the_runtime_thread() -> Result<()> {
+        const RECORDS: usize = 1_000;
+        const RECORD_SIZE: usize = 1_024;
+
+        let recorder = FlightRecorder::new();
+        let storage = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)))
+            .with_minimum_size(Some(0));
+
+        let abc0 = Topition::new("abc", 0);
+        let attributes: i16 = BatchAttribute::default()
+            .compression(Compression::Gzip)
+            .into();
+
+        // Pseudo-random values, so gzip has real work to do on decode.
+        let mut seed = 0x2545_f491_u32;
+        let values = (0..RECORDS)
+            .map(|_| {
+                (0..RECORD_SIZE)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        seed as u8
+                    })
+                    .collect::<Bytes>()
+            })
+            .collect::<Vec<_>>();
+
+        let batch = into_batch(attributes, 54345, 32123, 0, &values)?;
+
+        let produce = {
+            let storage = storage.clone();
+            let abc0 = abc0.clone();
+
+            tokio::spawn(async move { storage.produce(None, &abc0, batch).await })
+        };
+
+        yield_now().await;
+
+        assert!(
+            !produce.is_finished(),
+            "the batch was combined on the runtime thread"
+        );
+
+        assert_eq!(0, produce.await.expect("join_handle")?);
+
+        let sent = recorder.produced(&abc0)?.unwrap();
+        assert_eq!(1, sent.len());
+        assert_eq!(RECORDS, sent[0].records.len());
+
+        Ok(())
+    }
+
     #[test]
     fn combine_empty() -> Result<()> {
         assert_eq!(None, combine(vec![])?);
+        Ok(())
+    }
+
+    #[test]
+    fn combine_rejects_an_undecodable_batch() -> Result<()> {
+        let attributes: i16 = BatchAttribute::default().into();
+
+        let mut batches = into_batches(
+            attributes,
+            54345,
+            32123,
+            0,
+            &[
+                vec![Bytes::from_static(b"a")],
+                vec![Bytes::from_static(b"b")],
+            ],
+        )?;
+
+        let len = batches[1].record_data.len();
+        batches[1].record_data = batches[1].record_data.slice(0..len / 2);
+
+        assert!(matches!(
+            combine(batches),
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        ));
+
         Ok(())
     }
 
@@ -1631,6 +1718,170 @@ mod tests {
         assert_eq!(None, combined.records[index].key);
         assert_eq!(Some(batches[5][3].clone()), combined.records[index].value);
         assert_eq!(index, combined.records[index].offset_delta as usize);
+
+        Ok(())
+    }
+
+    /// The batches have different base timestamps, so `combine` must rebase the
+    /// second batch's timestamp deltas onto the first batch's base.
+    #[test]
+    fn combine_batches_preserves_timestamps_across_different_base_timestamps() -> Result<()> {
+        let first = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(0)
+            .last_offset_delta(1)
+            .base_sequence(0)
+            .base_timestamp(1_000)
+            .max_timestamp(1_005)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1)
+                    .timestamp_delta(5),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let second = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(2)
+            .last_offset_delta(1)
+            .base_sequence(2)
+            .base_timestamp(1_010)
+            .max_timestamp(1_013)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"c").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"d").into())
+                    .offset_delta(1)
+                    .timestamp_delta(3),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let original_times: BTreeMap<&'static [u8], i64> = BTreeMap::from([
+            (&b"a"[..], 1_000),
+            (&b"b"[..], 1_005),
+            (&b"c"[..], 1_010),
+            (&b"d"[..], 1_013),
+        ]);
+
+        let combined = inflated::Batch::try_from(combine(vec![first, second])?.expect("a batch"))?;
+
+        assert_eq!(4, combined.records.len());
+
+        assert_eq!(1_000, combined.base_timestamp);
+        assert_eq!(1_013, combined.max_timestamp);
+
+        for record in &combined.records {
+            let value = record.value.as_deref().expect("value");
+            let expected = original_times[value];
+            let actual = combined.base_timestamp + record.timestamp_delta;
+            assert_eq!(
+                expected, actual,
+                "record {value:?} should keep its original absolute timestamp"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The second batch's base timestamp is earlier than the first's, so the
+    /// rebased deltas are negative and the first batch's maximum stays the
+    /// combined maximum.
+    #[test]
+    fn combine_batches_preserves_timestamps_when_second_base_timestamp_is_earlier() -> Result<()> {
+        let first = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(0)
+            .last_offset_delta(1)
+            .base_sequence(0)
+            .base_timestamp(1_000)
+            .max_timestamp(1_005)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1)
+                    .timestamp_delta(5),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let second = inflated::Batch::builder()
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_offset(2)
+            .last_offset_delta(1)
+            .base_sequence(2)
+            .base_timestamp(990)
+            .max_timestamp(993)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"c").into())
+                    .offset_delta(0)
+                    .timestamp_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"d").into())
+                    .offset_delta(1)
+                    .timestamp_delta(3),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let original_times: BTreeMap<&'static [u8], i64> = BTreeMap::from([
+            (&b"a"[..], 1_000),
+            (&b"b"[..], 1_005),
+            (&b"c"[..], 990),
+            (&b"d"[..], 993),
+        ]);
+
+        let combined = inflated::Batch::try_from(combine(vec![first, second])?.expect("a batch"))?;
+
+        assert_eq!(4, combined.records.len());
+
+        assert_eq!(1_000, combined.base_timestamp);
+        assert_eq!(1_005, combined.max_timestamp);
+
+        assert_eq!(
+            vec![0, 5, -10, -7],
+            combined
+                .records
+                .iter()
+                .map(|record| record.timestamp_delta)
+                .collect::<Vec<_>>()
+        );
+
+        for record in &combined.records {
+            let value = record.value.as_deref().expect("value");
+            let expected = original_times[value];
+            let actual = combined.base_timestamp + record.timestamp_delta;
+            assert_eq!(
+                expected, actual,
+                "record {value:?} should keep its original absolute timestamp"
+            );
+        }
 
         Ok(())
     }

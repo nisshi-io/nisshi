@@ -19,20 +19,23 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     hash::Hash,
+    io,
     marker::PhantomData,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, LazyLock},
+    task::{Context, Poll, ready},
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use deadpool::managed;
 use deadpool_postgres::{
     Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
     Transaction,
 };
 use futures::pin_mut;
-use futures_util::future;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -52,7 +55,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated::Batch},
     to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
@@ -62,22 +65,38 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff, inflate,
+    producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
-use tokio_postgres::{
-    Config, Row, RowStream,
-    binary_copy::BinaryCopyInWriter,
-    error::SqlState,
-    types::{BorrowToSql, ToSql, Type},
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    runtime::Handle,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{Instant, timeout, timeout_at},
 };
-use tracing::{debug, error, instrument};
+use tokio_postgres::{
+    CancelToken, Config, Row,
+    binary_copy::BinaryCopyInWriter,
+    config::Host,
+    error::SqlState,
+    tls::MakeTlsConnect,
+    types::{ToSql, Type},
+};
+use tokio_postgres_rustls::MakeRustlsConnect;
+#[cfg(unix)]
+use tokio_util::either::Either;
+use tracing::{Instrument as _, debug, error, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -92,6 +111,13 @@ pub struct Postgres {
     node: i32,
     advertised_listener: Url,
     pool: Pool,
+    cancel: Option<CancelRequests>,
+    /// Permits for the ListOffsets partition reads in flight, see
+    /// [`LIST_OFFSETS_READS`].
+    list_offsets_reads: Arc<Semaphore>,
+    /// How long an abandoned statement's connection stays out of the pool
+    /// before it is closed, see [`cancel_and_return`].
+    abandoned_statement_bound: Duration,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -103,6 +129,8 @@ pub struct Builder<C, N, L, P> {
     node: N,
     advertised_listener: L,
     pool: P,
+    cancel: Option<CancelRequests>,
+    abandoned_statement_bound: Duration,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -114,6 +142,8 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -125,6 +155,8 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -136,6 +168,8 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -157,11 +191,37 @@ impl Builder<String, i32, Url, Pool> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            cancel: self.cancel,
+            list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
+            abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
         }
     }
 }
+
+/// How many connections the pool opens at most.
+const POOL_MAX_SIZE: usize = 16;
+
+/// How many ListOffsets partition reads this engine has in flight at once,
+/// across every request, counting an abandoned read until its statement
+/// has ended, its connection has failed, or the bound on it has passed,
+/// see [`cancel_and_return`].
+///
+/// Each read holds a pooled connection, so this limit leaves half the pool
+/// for other requests. A read past this limit waits for a permit, and
+/// [`ListOffsetsService`]'s deadline drops it if the wait lasts too long.
+///
+/// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
+const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
+
+/// How much longer than its connection's `statement_timeout` an abandoned
+/// statement is waited for before its connection is closed, see
+/// [`cancel_and_return`].
+///
+/// The server ends the statement itself at `statement_timeout`, and this
+/// margin gives its answer time to arrive.
+const ABANDONED_STATEMENT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Postgres statement timeout applied to every connection by default, so a stalled query
 /// (e.g. a lock wait) is aborted server-side instead of holding a pooled connection open
@@ -213,6 +273,55 @@ fn merge_statement_timeout_option(existing: Option<&str>, default_ms: u64) -> St
     }
 }
 
+/// Reads the `statement_timeout` that `options`, a libpq options startup
+/// string, sets on each connection: the last one wins, as on the server.
+/// The server reads `-c name=value`, `-cname=value` and `--name=value`.
+///
+/// Returns `None` when `options` sets no timeout, disables it with `0`, or
+/// sets a value the server rejects, in which case no connection opens.
+fn statement_timeout_option(options: &str) -> Option<Duration> {
+    let mut tokens = options.split_whitespace();
+    let mut statement_timeout = None;
+
+    while let Some(token) = tokens.next() {
+        let setting = match token {
+            "-c" => tokens.next(),
+            short if short.starts_with("-c") => short.strip_prefix("-c"),
+            long => long.strip_prefix("--"),
+        };
+
+        if let Some(value) = setting.and_then(|setting| setting.strip_prefix("statement_timeout="))
+        {
+            statement_timeout = Some(statement_timeout_value(value));
+        }
+    }
+
+    statement_timeout
+        .flatten()
+        .filter(|timeout| !timeout.is_zero())
+}
+
+/// Parses a `statement_timeout` value as the server does: a number of
+/// milliseconds, or a number with one of the server's time units, with a
+/// fraction allowed either way.
+fn statement_timeout_value(value: &str) -> Option<Duration> {
+    let number = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &value[number.len()..];
+    let count = number.parse::<f64>().ok()?;
+
+    let seconds = match unit {
+        "us" => count / 1_000_000.0,
+        "" | "ms" => count / 1_000.0,
+        "s" => count,
+        "min" => count * 60.0,
+        "h" => count * 3_600.0,
+        "d" => count * 86_400.0,
+        _ => return None,
+    };
+
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
 impl<C, N> FromStr for Builder<C, N, Url, Pool>
 where
     C: Default,
@@ -225,6 +334,9 @@ where
 
         let options =
             merge_statement_timeout_option(pg_config.get_options(), DEFAULT_STATEMENT_TIMEOUT_MS);
+        let abandoned_statement_bound = statement_timeout_option(&options)
+            .unwrap_or(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
+            + ABANDONED_STATEMENT_MARGIN;
         _ = pg_config.options(options);
         _ = pg_config.connect_timeout(DEFAULT_POOL_CREATE_TIMEOUT);
 
@@ -247,19 +359,25 @@ where
         .map(|config| config.with_root_certificates(root_store))
         .map(|config| config.with_no_client_auth())?;
 
-        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(config);
+        let tls = MakeRustlsConnect::new(config);
+        let cancel = Some(CancelRequests {
+            config: pg_config.clone(),
+            tls: tls.clone(),
+        });
 
         let mgr = Manager::from_config(pg_config, tls, mgr_config);
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
 
         Pool::builder(mgr)
-            .max_size(16)
+            .max_size(POOL_MAX_SIZE)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
             .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
             .build()
             .map(|pool| Self {
                 pool,
+                cancel,
+                abandoned_statement_bound,
                 advertised_listener,
                 node: N::default(),
                 cluster: C::default(),
@@ -267,6 +385,423 @@ where
                 lake: None,
             })
             .map_err(Into::into)
+    }
+}
+
+/// What a cancel request needs to reach the server on a connection of its
+/// own: the connection config, and the TLS connector.
+#[derive(Clone)]
+struct CancelRequests {
+    config: Config,
+    tls: MakeRustlsConnect,
+}
+
+impl Debug for CancelRequests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelRequests")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A cancel request that did not reach the server, and the host it was
+/// sent to.
+#[derive(Debug)]
+struct CancelFailed {
+    host: String,
+    error: Error,
+}
+
+/// The transport a cancel socket connects over: a Unix socket is a second
+/// variant only where [`Host::Unix`] can occur, since Postgres accepts one
+/// only on a Unix domain socket.
+#[cfg(unix)]
+type CancelTransport = Either<TcpStream, UnixStream>;
+#[cfg(not(unix))]
+type CancelTransport = TcpStream;
+
+/// Wraps a TCP connection as a [`CancelTransport`], matching whichever
+/// variant that type is on this platform.
+#[cfg(unix)]
+fn tcp_cancel_transport(stream: TcpStream) -> CancelTransport {
+    Either::Left(stream)
+}
+#[cfg(not(unix))]
+fn tcp_cancel_transport(stream: TcpStream) -> CancelTransport {
+    stream
+}
+
+/// A socket to one configured host, with the host name that TLS verifies
+/// and the name a log line gives the host.
+struct CancelSocket {
+    stream: CancelTransport,
+    tls_hostname: Option<String>,
+    host: String,
+}
+
+impl CancelRequests {
+    /// Asks the server to cancel the statement that `token` identifies, and
+    /// returns the host it asked once the server has passed the request on
+    /// to its backend.
+    ///
+    /// [`CancelToken::cancel_query`] returns as soon as it has written the
+    /// request, so a statement sent on the connection after it could be the
+    /// one cancelled instead. The server closes the cancel connection once
+    /// it has signalled the backend, and libpq's `PQcancel` waits for that
+    /// close; so does this, through [`ClosedByPeer`].
+    ///
+    /// This relies on a direct connection to PostgreSQL: a proxy that
+    /// closes the cancel connection before forwarding the request breaks
+    /// the ordering, for libpq as well.
+    ///
+    /// The request goes to the first configured host that accepts a
+    /// connection, as a new connection would. A server other than the one
+    /// running the statement ignores it, and the statement then runs until
+    /// it ends on its own or at `statement_timeout`.
+    async fn cancel(&self, token: &CancelToken) -> std::result::Result<String, CancelFailed> {
+        let CancelSocket {
+            stream,
+            tls_hostname,
+            host,
+        } = self.connect().await?;
+
+        let tls = match MakeTlsConnect::<CancelStream>::make_tls_connect(
+            &mut self.tls.clone(),
+            tls_hostname.as_deref().unwrap_or_default(),
+        ) {
+            Ok(tls) => tls,
+            Err(err) => {
+                return Err(CancelFailed {
+                    host,
+                    error: io::Error::other(err).into(),
+                });
+            }
+        };
+
+        match timeout(
+            DEFAULT_POOL_CREATE_TIMEOUT,
+            token.cancel_query_raw(ClosedByPeer::new(stream), tls),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(host),
+            Ok(Err(err)) => Err(CancelFailed {
+                host,
+                error: err.into(),
+            }),
+            Err(elapsed) => Err(CancelFailed {
+                host,
+                error: io::Error::from(elapsed).into(),
+            }),
+        }
+    }
+
+    /// Opens a socket to the first configured host that accepts one. The
+    /// error names the last host tried.
+    async fn connect(&self) -> std::result::Result<CancelSocket, CancelFailed> {
+        let hosts = self.config.get_hosts();
+        let ports = self.config.get_ports();
+        let hostaddrs = self.config.get_hostaddrs();
+        let connect_timeout = self
+            .config
+            .get_connect_timeout()
+            .copied()
+            .unwrap_or(DEFAULT_POOL_CREATE_TIMEOUT);
+
+        let mut last = CancelFailed {
+            host: "none".into(),
+            error: io::Error::new(io::ErrorKind::NotFound, "no host configured").into(),
+        };
+
+        for (index, host) in hosts.iter().enumerate() {
+            let port = ports.get(index).or(ports.first()).copied().unwrap_or(5432);
+
+            let name = match (hostaddrs.get(index), host) {
+                (Some(addr), _) => format!("{addr}:{port}"),
+                (None, Host::Tcp(host)) => format!("{host}:{port}"),
+                #[cfg(unix)]
+                (None, Host::Unix(dir)) => {
+                    dir.join(format!(".s.PGSQL.{port}")).display().to_string()
+                }
+            };
+
+            let connect = async {
+                match (hostaddrs.get(index), host) {
+                    (Some(addr), _) => TcpStream::connect((*addr, port))
+                        .await
+                        .map(tcp_cancel_transport),
+
+                    (None, Host::Tcp(host)) => TcpStream::connect((host.as_str(), port))
+                        .await
+                        .map(tcp_cancel_transport),
+
+                    #[cfg(unix)]
+                    (None, Host::Unix(dir)) => {
+                        UnixStream::connect(dir.join(format!(".s.PGSQL.{port}")))
+                            .await
+                            .map(Either::Right)
+                    }
+                }
+            };
+
+            match timeout(connect_timeout, connect).await {
+                Ok(Ok(stream)) => {
+                    let tls_hostname = match host {
+                        Host::Tcp(hostname) => Some(hostname.clone()),
+                        #[cfg(unix)]
+                        Host::Unix(_) => None,
+                    };
+
+                    return Ok(CancelSocket {
+                        stream,
+                        tls_hostname,
+                        host: name,
+                    });
+                }
+
+                Ok(Err(err)) => {
+                    last = CancelFailed {
+                        host: name,
+                        error: err.into(),
+                    }
+                }
+
+                Err(_) => {
+                    last = CancelFailed {
+                        host: name,
+                        error: io::Error::new(io::ErrorKind::TimedOut, "connect timed out").into(),
+                    }
+                }
+            }
+        }
+
+        Err(last)
+    }
+}
+
+/// The stream a cancel request travels on.
+type CancelStream = ClosedByPeer<CancelTransport>;
+
+/// A stream whose shutdown also waits for the peer to close its side.
+struct ClosedByPeer<S> {
+    stream: S,
+    writes_shut: bool,
+}
+
+impl<S> ClosedByPeer<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            writes_shut: false,
+        }
+    }
+}
+
+impl<S> AsyncRead for ClosedByPeer<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for ClosedByPeer<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.writes_shut {
+            match ready!(Pin::new(&mut self.stream).poll_shutdown(cx)) {
+                // A peer that has already closed makes some systems refuse
+                // the shutdown, and the close is what this waits for.
+                Ok(()) | Err(_) => self.writes_shut = true,
+            }
+        }
+
+        let mut scratch = [0; 64];
+
+        loop {
+            let mut buf = ReadBuf::new(&mut scratch);
+
+            match ready!(Pin::new(&mut self.stream).poll_read(cx, &mut buf)) {
+                Ok(()) if buf.filled().is_empty() => return Poll::Ready(Ok(())),
+                Ok(()) => {}
+                // An abrupt close is still a close.
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return Poll::Ready(Ok(()));
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+    }
+}
+
+/// A pooled object that goes back to its pool only through
+/// [`Abandonable::release`].
+///
+/// The pool recycles a connection after checking only that it is open
+/// ([`RecyclingMethod::Fast`]). A connection dropped while a statement runs
+/// on the server would go back to the pool still busy, and the next caller
+/// would wait behind that statement. Dropping this guard instead passes the
+/// object, still checked out of its pool, to `abandon`, which decides when
+/// the object may go back.
+struct Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    object: Option<managed::Object<M>>,
+    abandon: Option<F>,
+}
+
+impl<M, F> Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    fn new(object: managed::Object<M>, abandon: F) -> Self {
+        Self {
+            object: Some(object),
+            abandon: Some(abandon),
+        }
+    }
+
+    fn object(&self) -> Result<&managed::Object<M>> {
+        self.object
+            .as_ref()
+            .ok_or_else(|| Error::Message("the abandonable object has been released".into()))
+    }
+
+    /// Returns the object to its pool, once its work has finished.
+    fn release(mut self) {
+        drop(self.object.take());
+    }
+}
+
+impl<M, F> Drop for Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    fn drop(&mut self) {
+        if let (Some(object), Some(abandon)) = (self.object.take(), self.abandon.take()) {
+            abandon(object);
+        }
+    }
+}
+
+impl<M, F> Debug for Abandonable<M, F>
+where
+    M: managed::Manager,
+    F: FnOnce(managed::Object<M>),
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Abandonable")
+            .field("held", &self.object.is_some())
+            .finish()
+    }
+}
+
+/// Cancels the statement running on an abandoned `connection`, and returns
+/// the connection to its pool once that statement has ended, so the pool
+/// stays within its [`POOL_MAX_SIZE`] server connections.
+///
+/// The connection and `permit` are held until the statement has ended,
+/// whether or not the cancel request reached the server, so the statement
+/// counts against [`LIST_OFFSETS_READS`] meanwhile. A cancel request that
+/// misses its statement (a host other than the one running the statement,
+/// or a proxy that does not forward it) then shows as ListOffsets reads
+/// that wait for a permit, under the `queued` stage, rather than as server
+/// connections beyond the pool.
+///
+/// The statement has ended once an empty query on `connection` answers,
+/// because the server runs the two in order. The connection is closed and
+/// taken out of the pool instead, and the pool opens a replacement, when
+/// that query fails or has not answered within `bound`. The bound sits
+/// past the connection's `statement_timeout`
+/// ([`ABANDONED_STATEMENT_MARGIN`]), at which the server ends the statement
+/// itself unless an operator has disabled the timeout. deadpool-postgres
+/// closes a dropped connection's socket at once, and a backend notices a
+/// closed socket only when it next sends a result, so a statement still
+/// running then keeps its backend until it ends.
+async fn cancel_and_return(
+    connection: Object,
+    cancel: Option<CancelRequests>,
+    bound: Duration,
+    permit: OwnedSemaphorePermit,
+) {
+    let _permit = permit;
+    let settle_by = Instant::now() + bound;
+
+    let host = match cancel {
+        Some(cancel) => match cancel.cancel(&connection.cancel_token()).await {
+            Ok(host) => host,
+
+            Err(CancelFailed { host, error }) => {
+                warn!(
+                    host,
+                    ?error,
+                    ?bound,
+                    "the cancel request for an abandoned statement did not reach the server; waiting for the statement to end"
+                );
+                host
+            }
+        },
+
+        None => {
+            warn!(
+                ?bound,
+                "no cancel request is configured for an abandoned statement; waiting for it to end"
+            );
+            "none".into()
+        }
+    };
+
+    match timeout_at(settle_by, connection.batch_execute("")).await {
+        Ok(Ok(())) => drop(connection),
+
+        Ok(Err(error)) => {
+            warn!(
+                host,
+                ?error,
+                "an abandoned statement's connection failed before the statement ended; closing it"
+            );
+            drop(Object::take(connection));
+        }
+
+        Err(_elapsed) => {
+            warn!(
+                host,
+                ?bound,
+                "an abandoned statement did not end within the bound; closing its connection"
+            );
+            drop(Object::take(connection));
+        }
     }
 }
 
@@ -303,6 +838,75 @@ impl TryFrom<Row> for Txn {
 }
 
 impl Postgres {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let mut c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        let topic = &resource.resource_name;
+
+        if self
+            .tx_prepare_query_opt(
+                &tx,
+                "topic_select_name_for_update.sql",
+                &[&self.cluster, topic],
+            )
+            .await?
+            .is_none()
+        {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        for config in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(config.config_operation)?;
+
+            let current = if matches!(op, OpType::Append | OpType::Subtract) {
+                self.tx_prepare_query_opt(
+                    &tx,
+                    "topic_configuration_select_name.sql",
+                    &[&self.cluster, topic, &config.name],
+                )
+                .await?
+                .map(|row| row.try_get::<_, Option<String>>(0))
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+
+            match apply_op(
+                ConfigResource::Topic,
+                &config.name,
+                current.as_deref(),
+                op,
+                config.value.as_deref(),
+            )? {
+                Some(value) => {
+                    _ = self
+                        .tx_prepare_query_opt(
+                            &tx,
+                            "topic_configuration_upsert.sql",
+                            &[&self.cluster, topic, &config.name, &value],
+                        )
+                        .await?;
+                }
+
+                None => {
+                    _ = self
+                        .tx_prepare_execute(
+                            &tx,
+                            "topic_configuration_delete.sql",
+                            &[&self.cluster, topic, &config.name],
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(Into::into)
+    }
+
     pub fn builder(
         connection: &str,
     ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, Pool>> {
@@ -335,6 +939,142 @@ impl Postgres {
                 }
             })
             .map_err(Into::into)
+    }
+
+    /// Checks out a connection for a ListOffsets read that a caller may drop
+    /// mid-statement, holding `permit` from [`LIST_OFFSETS_READS`].
+    ///
+    /// Dropping the guard before [`Abandonable::release`] asks the server to
+    /// cancel the statement, so it stops instead of running until
+    /// `statement_timeout`, and keeps the connection and the permit until
+    /// the statement has ended, see [`cancel_and_return`].
+    async fn abandonable_connection(
+        &self,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Abandonable<Manager, impl FnOnce(Object) + use<>>> {
+        let cancel = self.cancel.clone();
+        let bound = self.abandoned_statement_bound;
+
+        self.connection().await.map(|connection| {
+            Abandonable::new(connection, move |connection: Object| {
+                match Handle::try_current() {
+                    // The task keeps the request's span, so its warnings
+                    // name the peer, the correlation id and the partition.
+                    Ok(runtime) => {
+                        _ = runtime.spawn(
+                            cancel_and_return(connection, cancel, bound, permit).in_current_span(),
+                        );
+                    }
+
+                    // Without a runtime the cancel request cannot be sent.
+                    // Closing the connection still keeps the pool from
+                    // handing out one that is busy.
+                    Err(_) => drop(Object::take(connection)),
+                }
+            })
+        })
+    }
+
+    /// Reads `offsets` one statement at a time on `c`.
+    async fn list_offsets_on(
+        &self,
+        c: &Object,
+        isolation_level: IsolationLevel,
+        offsets: &[(Topition, ListOffset)],
+    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        let mut responses = vec![];
+
+        for (topition, offset_type) in offsets {
+            let query = match (offset_type, isolation_level) {
+                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
+                (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
+                    "list_latest_offset_committed.sql"
+                }
+                (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
+                    "list_latest_offset_uncommitted.sql"
+                }
+                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
+            };
+
+            debug!(?query);
+
+            let list_offset = match offset_type {
+                ListOffset::Earliest | ListOffset::Latest => self
+                    .prepare_query_opt(
+                        c,
+                        query,
+                        &[&self.cluster, &topition.topic(), &topition.partition()],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
+
+                ListOffset::Timestamp(timestamp) => self
+                    .prepare_query_opt(
+                        c,
+                        query,
+                        &[
+                            &self.cluster.as_str(),
+                            &topition.topic(),
+                            &topition.partition(),
+                            timestamp,
+                        ],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err)),
+            }
+            .inspect_err(|err| {
+                error!(?err, cluster = self.cluster, ?topition);
+            })
+            .inspect(|result| debug!(?result))?
+            .map_or_else(
+                || {
+                    // No record row: Earliest/Latest answer 0, a Timestamp
+                    // lookup answers no offset (see `ListOffsetResponse::offset`).
+                    let (offset, timestamp) = match offset_type {
+                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
+                        ListOffset::Timestamp(_) => (None, None),
+                    };
+                    debug!(
+                        cluster = self.cluster,
+                        ?topition,
+                        ?offset_type,
+                        offset,
+                        ?timestamp
+                    );
+
+                    Ok(ListOffsetResponse {
+                        timestamp,
+                        offset,
+                        ..Default::default()
+                    })
+                },
+                |row| {
+                    debug!(?row);
+
+                    row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
+                        row.try_get::<_, Option<SystemTime>>(1).map(|timestamp| {
+                            debug!(
+                                cluster = self.cluster,
+                                ?topition,
+                                ?offset_type,
+                                offset,
+                                ?timestamp
+                            );
+
+                            ListOffsetResponse {
+                                timestamp,
+                                offset,
+                                ..Default::default()
+                            }
+                        })
+                    })
+                },
+            )?;
+
+            responses.push((topition.clone(), list_offset));
+        }
+
+        Ok(responses)
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
@@ -447,6 +1187,98 @@ impl Postgres {
         } else {
             Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
         }
+    }
+
+    /// Advances one partition's log start for DeleteRecords, answering the
+    /// error code and new low watermark.
+    ///
+    /// The watermark advance is the delete: it commits first, in a short
+    /// transaction that holds the watermark row lock. Removing the records
+    /// below it follows in a separate transaction under the default statement
+    /// timeout. That removal is best effort: a failure is logged, and
+    /// `maintain` removes the rows on its next run.
+    async fn delete_records_partition(
+        &self,
+        c: &mut Object,
+        topition: &Topition,
+        offset: i64,
+    ) -> Result<(ErrorCode, i64)> {
+        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+        let (low, high) = self.watermark_select_for_update(topition, &tx).await?;
+
+        let stage = OffsetStage {
+            last_stable: high.unwrap_or_default(),
+            high_watermark: high.unwrap_or_default(),
+            log_start: low.unwrap_or_default(),
+        };
+
+        let cutoff = match delete_records_cutoff(offset, &stage) {
+            Ok(cutoff) => cutoff,
+            Err(error_code) => return Ok((error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)),
+        };
+
+        _ = self
+            .tx_prepare_execute(
+                &tx,
+                "watermark_update.sql",
+                &[
+                    &self.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &cutoff,
+                    &high.unwrap_or_default(),
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        tx.commit().await.inspect_err(|err| error!(?err))?;
+
+        // This keeps the record at `high_watermark - 1`, because
+        // `list_latest_offset_committed.sql` and
+        // `list_latest_offset_uncommitted.sql` answer `Latest` from that
+        // record. `list_latest_offset_committed.sql` also joins the record at
+        // an open transaction's `offset_start`, which this cut does not keep:
+        // a cut past that offset makes read_committed `Latest` answer the
+        // high watermark instead of the last stable offset. A produce only
+        // inserts at or above the high watermark, so these rows need no
+        // watermark lock.
+        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
+
+        if cutoff > stage.log_start
+            && let Err(err) = self.record_delete_below(c, topition, physical_cutoff).await
+        {
+            warn!(?err, cluster = ?self.cluster, ?topition, physical_cutoff);
+        }
+
+        Ok((ErrorCode::None, cutoff))
+    }
+
+    async fn record_delete_below(
+        &self,
+        c: &mut Object,
+        topition: &Topition,
+        physical_cutoff: i64,
+    ) -> Result<u64> {
+        let tx = c.transaction().await?;
+
+        let deleted = self
+            .tx_prepare_execute(
+                &tx,
+                "record_delete_by_offset.sql",
+                &[
+                    &self.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &physical_cutoff,
+                ],
+            )
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(deleted)
     }
 
     fn attributes_for_error(
@@ -821,34 +1653,13 @@ impl Postgres {
             .map_err(Into::into)
     }
 
-    #[instrument(skip(self, tx, params))]
-    async fn tx_prepare_query_raw<P, I>(
-        &self,
-        tx: &Transaction<'_>,
-        sql: &str,
-        params: I,
-    ) -> Result<RowStream, Error>
-    where
-        P: BorrowToSql,
-        I: IntoIterator<Item = P>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = tx
-            .prepare_cached(sql)
-            .await
-            .inspect_err(|err| error!(?err))?;
-
-        tx.query_raw(&prepared, params).await.map_err(Into::into)
-    }
-
     #[instrument(skip_all)]
     async fn produce_in_tx(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
+        inflated: Batch,
         tx: &Transaction<'_>,
     ) -> Result<i64> {
         debug!(cluster = ?self.cluster, ?transaction_id, ?topition, ?deflated);
@@ -887,8 +1698,6 @@ impl Postgres {
         // re-deflates with the codec the producer used, as Kafka does with
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
-
-        let inflated = Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -1260,8 +2069,13 @@ impl Postgres {
                     .and_then(TryInto::try_into)
                     .inspect(|deflated| debug!(?deflated))?;
 
+                // A control batch holds one uncompressed record, so it is
+                // inflated inline. `inflate` would wait for a decode permit
+                // while this transaction holds its watermark row locks.
+                let inflated = Batch::try_from(&batch)?;
+
                 let offset = self
-                    .produce_in_tx(Some(transaction_id), &topition, batch, tx)
+                    .produce_in_tx(Some(transaction_id), &topition, batch, inflated, tx)
                     .await?;
 
                 debug!(offset, ?topition);
@@ -1791,6 +2605,32 @@ impl Postgres {
             )
             .await?;
 
+        let deleted_by_bytes = self
+            .tx_prepare_execute(&tx, "policy_delete_bytes.sql", &[&self.cluster])
+            .await?;
+
+        tx.commit()
+            .await
+            .map_err(Into::into)
+            .and(Ok(deleted + deleted_by_bytes))
+    }
+
+    /// Removes the records that DeleteRecords left below each partition's log
+    /// start, when its own removal failed or timed out.
+    #[instrument(skip(self), ret)]
+    async fn record_delete_below_log_start(&self) -> Result<u64> {
+        let mut c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        // see policy_compact: exempt this sweep from the default statement_timeout.
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        let deleted = self
+            .tx_prepare_execute(&tx, "record_delete_below_log_start.sql", &[&self.cluster])
+            .await?;
+
         tx.commit().await.map_err(Into::into).and(Ok(deleted))
     }
 
@@ -1933,30 +2773,25 @@ impl Storage for Postgres {
 
         debug!(?topic_uuid, cluster = self.cluster, ?topic);
 
-        _ = future::try_join_all(
-            (0..topic.num_partitions)
-                .map(|partition| {
-                    let cluster = Box::new(self.cluster.clone()) as Box<dyn ToSql + Sync + Send>;
-                    let name = Box::new(topic.name.clone()) as Box<dyn ToSql + Sync + Send>;
-                    let partition = Box::new(partition) as Box<dyn ToSql + Sync + Send>;
-                    [cluster, name, partition]
-                })
-                .map(|parameters| self.tx_prepare_query_raw(&tx, "topition_insert.sql", parameters))
-                .chain(
-                    (0..topic.num_partitions)
-                        .map(|partition| {
-                            let cluster =
-                                Box::new(self.cluster.clone()) as Box<dyn ToSql + Sync + Send>;
-                            let name = Box::new(topic.name.clone()) as Box<dyn ToSql + Sync + Send>;
-                            let partition = Box::new(partition) as Box<dyn ToSql + Sync + Send>;
-                            [cluster, name, partition]
-                        })
-                        .map(|parameters| {
-                            self.tx_prepare_query_raw(&tx, "watermark_insert.sql", parameters)
-                        }),
-                ),
-        )
-        .await?;
+        // The watermark insert selects the topition rows that the topition insert creates, so
+        // every topition insert must finish before the first watermark insert is sent. Each
+        // statement is awaited before the next one is sent on this transaction's connection,
+        // which keeps that order. A watermark insert that finds no topition row matches no
+        // rows without an error, leaving a topic that rejects every produce.
+        for sql in ["topition_insert.sql", "watermark_insert.sql"] {
+            for partition in 0..topic.num_partitions {
+                let inserted = self
+                    .tx_prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
+                    .await?;
+
+                if inserted != 1 {
+                    return Err(Error::Message(format!(
+                        "{sql} did not insert one row per partition of {} in {}",
+                        topic.name, self.cluster
+                    )));
+                }
+            }
+        }
 
         if let Some(configs) = topic.configs {
             for config in configs {
@@ -1990,125 +2825,52 @@ impl Storage for Postgres {
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(cluster = self.cluster, ?topics);
 
-        let c = self.connection().await?;
+        let mut c = self.connection().await?;
+        let mut responses = Vec::with_capacity(topics.len());
 
-        let delete_records = c
-            .prepare(concat!(
-                "delete from record",
-                " using topic, cluster",
-                " where",
-                " cluster.name=$1",
-                " and topic.name = $2",
-                " and record.partition = $3",
-                " and record.id >= $4",
-                " and topic.cluster = cluster.id",
-                " and record.topic = topic.id",
-            ))
-            .await
-            .inspect_err(|err| error!(?err, ?topics))?;
-
-        let mut responses = vec![];
-
+        // Each partition commits on its own, so the request holds at most one
+        // watermark row lock at a time. It cannot then deadlock with EndTxn,
+        // and a produce waits only while its own partition advances.
         for topic in topics {
-            let mut partition_responses = vec![];
+            let mut partitions = Vec::with_capacity(topic.partitions.as_ref().map_or(0, Vec::len));
 
-            if let Some(ref partitions) = topic.partitions {
-                for partition in partitions {
-                    _ = c
-                        .execute(
-                            &delete_records,
-                            &[
-                                &self.cluster,
-                                &topic.name,
-                                &partition.partition_index,
-                                &partition.offset,
-                            ],
-                        )
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
+            for partition in topic.partitions.iter().flatten() {
+                let topition = Topition::new(topic.name.as_str(), partition.partition_index);
 
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })?;
+                let (error_code, low_watermark) = self
+                    .delete_records_partition(&mut c, &topition, partition.offset)
+                    .await
+                    .unwrap_or_else(|err| match err {
+                        Error::Api(error_code) => {
+                            (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                        }
 
-                    let prepared = c
-                        .prepare(concat!(
-                            "select",
-                            " id as offset",
-                            " from",
-                            " record",
-                            " join (",
-                            " select",
-                            " coalesce(min(record.id), (select last_value from record_id_seq)) as offset",
-                            " from record, topic, cluster",
-                            " where",
-                            " topic.cluster = cluster.id",
-                            " and cluster.name = $1",
-                            " and topic.name = $2",
-                            " and record.partition = $3",
-                            " and record.topic = topic.id) as minimum",
-                            " on record.id = minimum.offset",
-                        ))
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
+                        // Retriable, as Kafka answers a storage failure. A retry
+                        // is safe: at or below the log start it changes nothing.
+                        err => {
+                            error!(?err, cluster = ?self.cluster, ?topition);
+                            (
+                                ErrorCode::KafkaStorageError,
+                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                            )
+                        }
+                    });
 
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })?;
-
-                    let partition_result = c
-                        .query_opt(
-                            &prepared,
-                            &[&self.cluster, &topic.name, &partition.partition_index],
-                        )
-                        .await
-                        .inspect_err(|err| {
-                            let cluster = self.cluster.as_str();
-                            let topic = topic.name.as_str();
-                            let partition_index = partition.partition_index;
-                            let offset = partition.offset;
-
-                            error!(?err, ?cluster, ?topic, ?partition_index, ?offset)
-                        })
-                        .map_or(
-                            Ok(DeleteRecordsPartitionResult::default()
-                                .partition_index(partition.partition_index)
-                                .low_watermark(0)
-                                .error_code(ErrorCode::UnknownServerError.into())),
-                            |row| {
-                                row.map_or(
-                                    Ok(DeleteRecordsPartitionResult::default()
-                                        .partition_index(partition.partition_index)
-                                        .low_watermark(0)
-                                        .error_code(ErrorCode::UnknownServerError.into())),
-                                    |row| {
-                                        row.try_get::<_, i64>(0).map(|low_watermark| {
-                                            DeleteRecordsPartitionResult::default()
-                                                .partition_index(partition.partition_index)
-                                                .low_watermark(low_watermark)
-                                                .error_code(ErrorCode::None.into())
-                                        })
-                                    },
-                                )
-                            },
-                        )?;
-
-                    partition_responses.push(partition_result);
-                }
+                partitions.push(
+                    DeleteRecordsPartitionResult::default()
+                        .partition_index(partition.partition_index)
+                        .low_watermark(low_watermark)
+                        .error_code(error_code.into()),
+                );
             }
 
             responses.push(
                 DeleteRecordsTopicResult::default()
                     .name(topic.name.clone())
-                    .partitions(Some(partition_responses)),
+                    .partitions(Some(partitions)),
             );
         }
+
         Ok(responses)
     }
 
@@ -2137,6 +2899,18 @@ impl Storage for Postgres {
 
         let topic_name = row.try_get::<_, String>(1)?;
 
+        _ = self
+            .tx_prepare_query_opt(
+                &tx,
+                "topic_select_name_for_update.sql",
+                &[&self.cluster, &topic_name],
+            )
+            .await?;
+
+        // The foreign keys on `record` and `header` cascade from `topition`, so deleting
+        // the topitions below deletes the records and headers. Deleting them here with a
+        // join lets the planner scan the whole `record` table when its statistics are
+        // skewed (#982).
         for (description, sql) in [
             ("consumer_offsets", "consumer_offset_delete_by_topic.sql"),
             (
@@ -2144,8 +2918,6 @@ impl Storage for Postgres {
                 "topic_configuration_delete_by_topic.sql",
             ),
             ("watermarks", "watermark_delete_by_topic.sql"),
-            ("headers", "header_delete_by_topic.sql"),
-            ("records", "record_delete_by_topic.sql"),
             (
                 "txn_offset_commit_tp",
                 "txn_offset_commit_tp_delete_by_topic.sql",
@@ -2204,56 +2976,10 @@ impl Storage for Postgres {
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
             ConfigResource::Topic => {
-                let mut error_code = ErrorCode::None;
-
-                for config in resource.configs.unwrap_or_default() {
-                    match OpType::try_from(config.config_operation)? {
-                        OpType::Set => {
-                            let c = self.connection().await?;
-
-                            if self
-                                .prepare_query(
-                                    &c,
-                                    "topic_configuration_upsert.sql",
-                                    &[
-                                        &self.cluster,
-                                        &resource.resource_name,
-                                        &config.name,
-                                        &config.value,
-                                    ],
-                                )
-                                .await
-                                .inspect_err(|err| error!(?err))
-                                .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Delete => {
-                            let c = self.connection().await?;
-
-                            if self
-                                .prepare_query(
-                                    &c,
-                                    "topic_configuration_delete.sql",
-                                    &[&self.cluster, &resource.resource_name, &config.name],
-                                )
-                                .await
-                                .inspect_err(|err| error!(?err))
-                                .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Append => todo!(),
-                        OpType::Subtract => todo!(),
-                    }
-                }
+                self.alter_topic(&resource).await?;
 
                 Ok(AlterConfigsResourceResponse::default()
-                    .error_code(error_code.into())
+                    .error_code(ErrorCode::None.into())
                     .error_message(Some("".into()))
                     .resource_type(resource.resource_type)
                     .resource_name(resource.resource_name))
@@ -2275,12 +3001,19 @@ impl Storage for Postgres {
     ) -> Result<i64> {
         debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
 
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a pooled connection
+        // or the partition's watermark row lock.
+        let inflated = inflate(deflated.clone())
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
         let mut c = self.connection().await?;
 
         let tx = c.transaction().await?;
 
         let high = self
-            .produce_in_tx(transaction_id, topition, deflated, &tx)
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
             .await?;
 
         tx.commit().await?;
@@ -2762,109 +3495,22 @@ impl Storage for Postgres {
         Ok(offsets)
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(?offsets))]
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        debug!(cluster = self.cluster, ?isolation_level, ?offsets);
+        debug!(cluster = self.cluster, ?isolation_level);
 
-        let c = self.connection().await?;
+        let permit = deadline::queued(self.list_offsets_reads.clone().acquire_owned()).await?;
+        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let responses = self
+            .list_offsets_on(connection.object()?, isolation_level, offsets)
+            .await;
+        connection.release();
 
-        let mut responses = vec![];
-
-        for (topition, offset_type) in offsets {
-            let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
-                (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
-                    "list_latest_offset_committed.sql"
-                }
-                (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
-                    "list_latest_offset_uncommitted.sql"
-                }
-                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
-            };
-
-            debug!(?query);
-
-            let list_offset = match offset_type {
-                ListOffset::Earliest | ListOffset::Latest => self
-                    .prepare_query_opt(
-                        &c,
-                        query,
-                        &[&self.cluster, &topition.topic(), &topition.partition()],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
-
-                ListOffset::Timestamp(timestamp) => self
-                    .prepare_query_opt(
-                        &c,
-                        query,
-                        &[
-                            &self.cluster.as_str(),
-                            &topition.topic(),
-                            &topition.partition(),
-                            timestamp,
-                        ],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err)),
-            }
-            .inspect_err(|err| {
-                error!(?err, cluster = self.cluster, ?topition);
-            })
-            .inspect(|result| debug!(?result))?
-            .map_or_else(
-                || {
-                    // No record row: Earliest/Latest answer 0, a Timestamp
-                    // lookup answers no offset (see `ListOffsetResponse::offset`).
-                    let (offset, timestamp) = match offset_type {
-                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
-                        ListOffset::Timestamp(_) => (None, None),
-                    };
-                    debug!(
-                        cluster = self.cluster,
-                        ?topition,
-                        ?offset_type,
-                        offset,
-                        ?timestamp
-                    );
-
-                    Ok(ListOffsetResponse {
-                        timestamp,
-                        offset,
-                        ..Default::default()
-                    })
-                },
-                |row| {
-                    debug!(?row);
-
-                    row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
-                        row.try_get::<_, SystemTime>(1).map(Some).map(|timestamp| {
-                            debug!(
-                                cluster = self.cluster,
-                                ?topition,
-                                ?offset_type,
-                                offset,
-                                ?timestamp
-                            );
-
-                            ListOffsetResponse {
-                                timestamp,
-                                offset,
-                                ..Default::default()
-                            }
-                        })
-                    })
-                },
-            )?;
-
-            responses.push((topition.clone(), list_offset));
-        }
-
-        Ok(responses).inspect(|r| debug!(?r))
+        responses.inspect(|r| debug!(?r))
     }
 
     #[instrument(skip_all)]
@@ -2944,33 +3590,13 @@ impl Storage for Postgres {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(0))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        0,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -3036,33 +3662,13 @@ impl Storage for Postgres {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(0))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        0,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -3124,31 +3730,13 @@ impl Storage for Postgres {
                                 brokers.iter().map(|broker| broker.node_id).collect();
                             broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
-
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
-
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
-
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
+                            let partitions = Some(nisshi_storage::assign_replicas(
+                                &broker_ids,
+                                partitions,
+                                replication_factor,
+                                error_code,
+                                0,
+                            )?);
 
                             responses.push(
                                 MetadataResponseTopic::default()
@@ -3815,7 +4403,7 @@ impl Storage for Postgres {
             }
 
             TxnAddPartitionsRequest::VersionFourPlus { .. } => {
-                todo!()
+                Err(Error::UnsupportedTxnAddPartitionsVersion)
             }
         }
     }
@@ -3977,6 +4565,12 @@ impl Storage for Postgres {
     async fn maintain(&self, now: SystemTime) -> Result<()> {
         let deleted = self.policy_delete(now).await?;
         debug!(deleted);
+
+        // Best effort: a failure here must not stop compaction or the lake.
+        match self.record_delete_below_log_start().await {
+            Ok(below_log_start) => debug!(below_log_start),
+            Err(err) => warn!(?err),
+        }
 
         let compacted = self.policy_compact().await?;
         debug!(compacted);
@@ -4165,6 +4759,7 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
     use rand::distr::Alphanumeric;
 
@@ -4210,6 +4805,87 @@ mod tests {
         );
     }
 
+    /// The last `statement_timeout` in the options wins, as on the server,
+    /// in either spelling and with the server's time units.
+    #[test]
+    fn statement_timeout_option_reads_the_last_setting() {
+        assert_eq!(
+            Some(Duration::from_secs(30)),
+            statement_timeout_option("-c statement_timeout=30000")
+        );
+        assert_eq!(
+            Some(Duration::from_secs(120)),
+            statement_timeout_option("-c statement_timeout=30000 -c statement_timeout=120s")
+        );
+        assert_eq!(
+            Some(Duration::from_secs(120)),
+            statement_timeout_option("-c statement_timeout=30000 --statement_timeout=2min")
+        );
+        assert_eq!(
+            Some(Duration::from_millis(100)),
+            statement_timeout_option(
+                "-c statement_timeout=30000 -c search_path=foo -c statement_timeout=100"
+            )
+        );
+        assert_eq!(
+            Some(Duration::from_secs(120)),
+            statement_timeout_option("-c statement_timeout=30000 -cstatement_timeout=120s")
+        );
+        assert_eq!(
+            Some(Duration::from_secs(150)),
+            statement_timeout_option("-c statement_timeout=2.5min")
+        );
+        assert_eq!(
+            Some(Duration::from_micros(500)),
+            statement_timeout_option("-c statement_timeout=500us")
+        );
+    }
+
+    /// No setting, a disabled timeout and a value the server would reject
+    /// all leave the default in place.
+    #[test]
+    fn statement_timeout_option_without_a_usable_setting() {
+        assert_eq!(None, statement_timeout_option(""));
+        assert_eq!(None, statement_timeout_option("-c search_path=foo"));
+        assert_eq!(
+            None,
+            statement_timeout_option("-c statement_timeout=30000 -c statement_timeout=0")
+        );
+        assert_eq!(None, statement_timeout_option("-c statement_timeout=soon"));
+        assert_eq!(
+            None,
+            statement_timeout_option("-c statement_timeout=5fortnights")
+        );
+        assert_eq!(None, statement_timeout_option("-c statement_timeout=-1"));
+    }
+
+    /// The bound on an abandoned statement follows the connection's
+    /// `statement_timeout`: the default, or an operator's own in the URL.
+    #[test]
+    fn abandoned_statement_bound_follows_the_statement_timeout() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster("default")
+            .node(0)
+            .build();
+        assert_eq!(
+            Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS) + ABANDONED_STATEMENT_MARGIN,
+            storage.abandoned_statement_bound
+        );
+
+        let storage = Postgres::builder(&format!(
+            "{CONNECTION}?options=-c%20statement_timeout%3D120000"
+        ))?
+        .cluster("longer")
+        .node(0)
+        .build();
+        assert_eq!(
+            Duration::from_secs(120) + ABANDONED_STATEMENT_MARGIN,
+            storage.abandoned_statement_bound
+        );
+
+        Ok(())
+    }
+
     /// Regression test for a real blocker found in review: deadpool's `PoolBuilder::build()`
     /// returns `Err(BuildError::NoRuntimeSpecified)` if `wait_timeout`/`create_timeout` are
     /// set without also configuring `.runtime(..)`. This doesn't need a live Postgres:
@@ -4235,6 +4911,508 @@ mod tests {
             .expect_err("an option that tokio-postgres does not read must be rejected");
 
         assert!(error.to_string().contains("vacuum_into"), "{error}");
+    }
+
+    /// Hands out numbered objects, so a test can tell a fresh object from a
+    /// recycled one.
+    #[derive(Debug, Default)]
+    struct Numbered(std::sync::atomic::AtomicU32);
+
+    impl managed::Manager for Numbered {
+        type Type = u32;
+        type Error = std::convert::Infallible;
+
+        async fn create(&self) -> std::result::Result<u32, Self::Error> {
+            Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        }
+
+        async fn recycle(
+            &self,
+            _object: &mut u32,
+            _metrics: &managed::Metrics,
+        ) -> managed::RecycleResult<Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// A released object goes back to the pool. A dropped one reaches
+    /// `abandon` still checked out, so the pool cannot hand it out until
+    /// `abandon` lets it go.
+    #[tokio::test]
+    async fn abandoned_object_is_handed_to_abandon_still_checked_out() -> Result<()> {
+        let pool = managed::Pool::<Numbered>::builder(Numbered::default())
+            .max_size(1)
+            .build()
+            .map_err(|err| Error::Message(err.to_string()))?;
+
+        let abandoned = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let get = async || {
+            let abandoned = abandoned.clone();
+            pool.get()
+                .await
+                .map(|object| {
+                    Abandonable::new(object, move |object| {
+                        abandoned.lock().expect("abandoned").push(object)
+                    })
+                })
+                .map_err(|err| Error::Message(err.to_string()))
+        };
+
+        let first = get().await?;
+        assert_eq!(0, **first.object()?);
+        first.release();
+        assert_eq!(1, pool.status().available);
+
+        let second = get().await?;
+        assert_eq!(0, **second.object()?);
+        drop(second);
+
+        assert_eq!(1, pool.status().size);
+        assert_eq!(0, pool.status().available);
+        assert!(
+            timeout(Duration::from_millis(50), pool.get())
+                .await
+                .is_err(),
+            "the abandoned object is still checked out"
+        );
+
+        let held = abandoned
+            .lock()
+            .expect("abandoned")
+            .pop()
+            .expect("abandon received the object");
+        assert_eq!(0, *held);
+        drop(held);
+
+        let third = get().await?;
+        assert_eq!(0, **third.object()?);
+        third.release();
+
+        Ok(())
+    }
+
+    /// Shutting down a `ClosedByPeer` stream finishes only once the peer
+    /// has closed its side, and everything the peer sent meanwhile is
+    /// discarded.
+    #[tokio::test]
+    async fn closed_by_peer_shutdown_waits_for_the_peer() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (ours, mut peer) = tokio::io::duplex(64);
+        let mut ours = ClosedByPeer::new(ours);
+
+        ours.write_all(b"cancel").await?;
+        ours.flush().await?;
+
+        let mut shutdown = tokio::spawn(async move { ours.shutdown().await.map(|()| ours) });
+
+        let mut request = [0; 6];
+        _ = peer.read_exact(&mut request).await?;
+        assert_eq!(b"cancel", &request);
+        peer.write_all(b"busy").await?;
+
+        assert!(
+            timeout(Duration::from_millis(100), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown finished before the peer closed"
+        );
+
+        drop(peer);
+
+        let ours = timeout(Duration::from_secs(1), shutdown)
+            .await
+            .map_err(|_| Error::Message("shutdown did not finish after the peer closed".into()))?
+            .map_err(|err| Error::Message(err.to_string()))??;
+        assert!(ours.writes_shut);
+
+        Ok(())
+    }
+
+    /// At most `LIST_OFFSETS_READS` ListOffsets reads reach the pool at
+    /// once; the rest wait for a permit, and the permits come back when the
+    /// reads are dropped.
+    ///
+    /// The pool has no permits at all, so each read that has a ListOffsets
+    /// permit waits in the pool, where the pool counts it, without a server.
+    #[tokio::test]
+    async fn list_offsets_reads_are_limited_before_the_pool() -> Result<()> {
+        let pool = Pool::builder(Manager::new(
+            Config::from_str(CONNECTION)?,
+            tokio_postgres::NoTls,
+        ))
+        .max_size(0)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+        .build()?;
+
+        let storage = Postgres {
+            pool,
+            ..Postgres::builder(CONNECTION)?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(rng().random_range(0..i32::MAX))
+                .build()
+        };
+
+        let topition = Topition::new("limited", 0);
+        let reads = (0..LIST_OFFSETS_READS + 3)
+            .map(|_| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+
+                tokio::spawn(async move {
+                    storage
+                        .list_offsets(
+                            IsolationLevel::ReadUncommitted,
+                            &[(topition, ListOffset::Latest)],
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let settled = Instant::now() + Duration::from_secs(5);
+        while storage.pool.status().waiting < LIST_OFFSETS_READS {
+            assert!(Instant::now() < settled, "{:?}", storage.pool.status());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(LIST_OFFSETS_READS, storage.pool.status().waiting);
+        assert_eq!(0, storage.list_offsets_reads.available_permits());
+
+        for read in &reads {
+            read.abort();
+        }
+        for read in reads {
+            let outcome = read.await;
+            assert!(
+                outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+                "{outcome:?}"
+            );
+        }
+
+        assert_eq!(0, storage.pool.status().waiting);
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// Dropping an abandonable connection mid-statement stops the statement
+    /// on the server and returns the connection to the pool, with its
+    /// permit.
+    #[tokio::test]
+    async fn abandoned_statement_is_cancelled_and_its_connection_returned() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_statement_is_cancelled_and_its_connection_returned: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let marker = alphanumeric_string(15);
+        let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
+
+        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
+        let connection = storage.abandonable_connection(permit).await?;
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                connection.object()?.batch_execute(&sleep)
+            )
+            .await
+            .is_err(),
+            "pg_sleep(30) is still running"
+        );
+        drop(connection);
+
+        // The cancel task holds the permit, so the statement still counts
+        // against the limit while it runs.
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        let settled = Instant::now() + Duration::from_secs(10);
+        loop {
+            let running = monitor
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1",
+                    &[&format!("%{marker}%")],
+                )
+                .await?
+                .get::<_, i64>(0);
+            let status = storage.pool.status();
+
+            if running == 0 && status.available == 1 {
+                break;
+            }
+
+            assert!(
+                Instant::now() < settled,
+                "statement still running on {running} backend(s), pool {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(2, storage.pool.status().size);
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// How many backends run a statement marked `marker`, other than
+    /// `monitor`'s own.
+    async fn backends_running(monitor: &Object, marker: &str) -> Result<i64> {
+        monitor
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1 AND pid <> pg_backend_pid()",
+                &[&format!("%{marker}%")],
+            )
+            .await
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(Into::into)
+    }
+
+    /// Ends every statement marked `marker` through the server, as the
+    /// cancel request would have, and returns how many it ended.
+    async fn cancel_backends(monitor: &Object, marker: &str) -> Result<usize> {
+        monitor
+            .query(
+                "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1 AND pid <> pg_backend_pid()",
+                &[&format!("%{marker}%")],
+            )
+            .await
+            .map(|rows| rows.len())
+            .map_err(Into::into)
+    }
+
+    /// Points `storage`'s cancel requests at a port nothing listens on, so
+    /// each one fails without reaching the server, as one sent to a host
+    /// other than the one running the statement would.
+    async fn with_cancel_requests_refused(storage: Postgres) -> Result<Postgres> {
+        let closed_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await?
+            .local_addr()?
+            .port();
+
+        let tls = storage
+            .cancel
+            .as_ref()
+            .expect("cancel requests are configured from a URL")
+            .tls
+            .clone();
+
+        let mut config = Config::new();
+        _ = config.host("127.0.0.1").port(closed_port);
+
+        Ok(Postgres {
+            cancel: Some(CancelRequests { config, tls }),
+            ..storage
+        })
+    }
+
+    /// Runs `SELECT pg_sleep(30)` marked `marker` on an abandonable
+    /// connection and drops the connection mid-statement, returning once the
+    /// cancel task has had time to send its cancel request.
+    async fn abandon_sleeping_statement(storage: &Postgres, marker: &str) -> Result<()> {
+        let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
+
+        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
+        let connection = storage.abandonable_connection(permit).await?;
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                connection.object()?.batch_execute(&sleep)
+            )
+            .await
+            .is_err(),
+            "pg_sleep(30) is still running"
+        );
+        drop(connection);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        Ok(())
+    }
+
+    /// Waits until `settled` holds, failing after 10 seconds.
+    async fn wait_until(storage: &Postgres, settled: impl Fn(&Postgres) -> bool) {
+        let give_up = Instant::now() + Duration::from_secs(10);
+
+        while !settled(storage) {
+            assert!(
+                Instant::now() < give_up,
+                "pool {:?}, permits {}",
+                storage.pool.status(),
+                storage.list_offsets_reads.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A cancel request that does not reach the server leaves the
+    /// statement running, and the connection and its permit stay held
+    /// until the statement ends; then both come back.
+    #[tokio::test]
+    async fn abandoned_statement_outliving_its_cancel_keeps_its_connection_and_permit() -> Result<()>
+    {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_statement_outliving_its_cancel_keeps_its_connection_and_permit: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let marker = alphanumeric_string(15);
+
+        abandon_sleeping_statement(&storage, &marker).await?;
+
+        assert_eq!(1, backends_running(&monitor, &marker).await?);
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+        assert_eq!(0, storage.pool.status().available);
+        assert_eq!(2, storage.pool.status().size);
+
+        assert_eq!(1, cancel_backends(&monitor, &marker).await?);
+
+        wait_until(&storage, |storage| storage.pool.status().available == 1).await;
+
+        assert_eq!(0, backends_running(&monitor, &marker).await?);
+        assert_eq!(2, storage.pool.status().size);
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// A statement still running at the bound has its connection closed
+    /// and taken out of the pool, and its permit comes back; the backend
+    /// runs on until the statement ends.
+    #[tokio::test]
+    async fn abandoned_statement_still_running_at_the_bound_loses_its_connection() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_statement_still_running_at_the_bound_loses_its_connection: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = Postgres {
+            abandoned_statement_bound: Duration::from_secs(2),
+            ..with_cancel_requests_refused(storage).await?
+        };
+        let marker = alphanumeric_string(15);
+
+        abandon_sleeping_statement(&storage, &marker).await?;
+
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+        assert_eq!(2, storage.pool.status().size);
+
+        wait_until(&storage, |storage| {
+            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+        })
+        .await;
+
+        assert_eq!(1, storage.pool.status().size);
+        assert_eq!(0, storage.pool.status().available);
+        assert_eq!(1, backends_running(&monitor, &marker).await?);
+
+        assert_eq!(1, cancel_backends(&monitor, &marker).await?);
+
+        Ok(())
+    }
+
+    /// A connection that fails while its abandoned statement runs is taken
+    /// out of the pool, and its permit comes back.
+    #[tokio::test]
+    async fn abandoned_statement_whose_connection_fails_loses_it() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!("skipping abandoned_statement_whose_connection_fails_loses_it: {err:?}");
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let marker = alphanumeric_string(15);
+
+        abandon_sleeping_statement(&storage, &marker).await?;
+
+        assert_eq!(
+            LIST_OFFSETS_READS - 1,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        let terminated = monitor
+            .query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state <> 'idle' AND query LIKE $1 AND pid <> pg_backend_pid()",
+                &[&format!("%{marker}%")],
+            )
+            .await?
+            .len();
+        assert_eq!(1, terminated);
+
+        wait_until(&storage, |storage| {
+            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+        })
+        .await;
+
+        assert_eq!(1, storage.pool.status().size);
+        assert_eq!(0, storage.pool.status().available);
+        assert_eq!(0, backends_running(&monitor, &marker).await?);
+
+        Ok(())
     }
 
     #[test]
@@ -4355,6 +5533,112 @@ mod tests {
 
         _ = storage.policy_compact().await?;
         _ = storage.policy_delete(SystemTime::now()).await?;
+        _ = storage.record_delete_below_log_start().await?;
+
+        Ok(())
+    }
+
+    /// DeleteRecords commits the new log start before it removes the records
+    /// below it. When that removal fails, `maintain` removes them, and keeps
+    /// the record at `high_watermark - 1` that `Latest` reads.
+    #[tokio::test]
+    async fn maintain_removes_records_left_below_log_start() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintain_removes_records_left_below_log_start: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+        let record_count = 6i64;
+
+        for _ in 0..record_count {
+            let batch = Batch::builder()
+                .record(Record::builder().value(Bytes::from_static(b"r").into()))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = storage.produce(None, &topition, batch).await?;
+        }
+
+        let stored = async || -> Result<i64> {
+            let c = storage.connection().await?;
+            let row = c
+                .query_one(
+                    "select count(*) from record r \
+                     join topition tp on r.topition = tp.id \
+                     join topic t on tp.topic = t.id \
+                     join cluster c on t.cluster = c.id \
+                     where c.name = $1 and t.name = $2",
+                    &[&cluster, &topic_name],
+                )
+                .await?;
+            row.try_get::<_, i64>(0).map_err(Into::into)
+        };
+
+        // the log start advances, as a DeleteRecords whose removal failed leaves it
+        let advance_log_start = async |low: i64| -> Result<()> {
+            let mut c = storage.connection().await?;
+            let tx = c.transaction().await?;
+
+            _ = storage
+                .tx_prepare_execute(
+                    &tx,
+                    "watermark_update.sql",
+                    &[&cluster, &topic_name, &0i32, &low, &record_count],
+                )
+                .await?;
+
+            tx.commit().await.map_err(Into::into)
+        };
+
+        advance_log_start(3).await?;
+        assert_eq!(record_count, stored().await?);
+
+        storage.maintain(SystemTime::now()).await?;
+        assert_eq!(record_count - 3, stored().await?);
+
+        advance_log_start(record_count).await?;
+        storage.maintain(SystemTime::now()).await?;
+        assert_eq!(1, stored().await?);
+
+        let latest = storage
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), ListOffset::Latest)],
+            )
+            .await?;
+
+        assert_eq!(Some(record_count), latest[0].1.offset);
 
         Ok(())
     }
@@ -6594,6 +7878,71 @@ mod tests {
             records.len(),
             "all committed records must be served regardless of unrelated open transactions",
         );
+
+        Ok(())
+    }
+
+    /// The watermark insert selects the topition row that the topition insert creates, so
+    /// `create_topic` must finish the second before sending the first. When it sent both
+    /// together, a connection holding only the watermark statement in its statement cache
+    /// sent the watermark insert first; it matched no rows without an error, and the topic
+    /// had no watermark, so every produce to it failed with `UnknownTopicOrPartition`. No
+    /// current caller leaves the cache in that state; this test sets it up directly.
+    #[tokio::test]
+    async fn create_topic_writes_the_watermark_when_only_its_statement_is_cached() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping create_topic_writes_the_watermark_when_only_its_statement_is_cached: {err:?}"
+            );
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        {
+            let c = storage.connection().await?;
+            _ = c
+                .prepare_cached(storage.sql_lookup("watermark_insert.sql")?)
+                .await?;
+        }
+
+        assert_eq!(
+            1,
+            storage.pool.status().size,
+            "one connection holds the cache"
+        );
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let stage = storage.offset_stage(&Topition::new(topic_name, 0)).await?;
+
+        assert_eq!(0, stage.high_watermark);
 
         Ok(())
     }

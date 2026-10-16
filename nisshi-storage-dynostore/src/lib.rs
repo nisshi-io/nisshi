@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod dynostore;
 mod factory;
 mod gcs;
 
-pub use factory::GoogleCloudStorageEngineFactory;
-pub use factory::MemoryEngineFactory;
-pub use factory::S3OptimisticConcurrencyEngineFactory;
+pub use {
+    dynostore::DynoStore,
+    factory::{
+        GoogleCloudStorageEngineFactory, MemoryEngineFactory, S3OptimisticConcurrencyEngineFactory,
+    },
+};

@@ -18,7 +18,7 @@
 
 /// Creating and describing users, on a broker that doesn't require a login.
 mod user_creation {
-    use nisshi_smoke_test::{KafkaCli, ScramMechanism, random_password, unique_name};
+    use nisshi_smoke_test::{KafkaCli, ScramMechanism, unique};
 
     /// `kafka-configs --add-config` creates credentials with both mechanisms, and `kafka-configs
     /// --describe` must list both for the user. A user checks the list before giving a client
@@ -28,10 +28,13 @@ mod user_creation {
                 broker doesn't support (#922)"]
     fn kafka_configs_user_is_described_with_both_mechanisms() {
         let cli = KafkaCli::shared();
-        let user = unique_name("user");
-        _ = cli.add_scram_user(&user, &random_password()).succeeded();
+        let user = unique::name("user");
+        _ = cli
+            .configs()
+            .add_scram_user(&user, &unique::password())
+            .succeeded();
 
-        let described = cli.describe_users();
+        let described = cli.configs().describe_users();
 
         assert_eq!(
             described
@@ -58,23 +61,24 @@ mod login {
     use std::time::Duration;
 
     use nisshi_smoke_test::{
-        Broker, KafkaCli, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism,
-        random_password, unique_name,
+        Broker, KafkaCli, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism, unique,
     };
 
     fn login_for_new_user(mechanism: ScramMechanism) -> ScramLogin {
         ScramLogin {
-            user: unique_name("user"),
-            password: random_password(),
+            user: unique::name("user"),
+            password: unique::password(),
             mechanism,
         }
     }
 
     /// Creates `login`'s user with `kafka-configs` on a new broker, and restarts the broker with
     /// `--authentication`.
+    #[track_caller]
     fn broker_requiring_kafka_configs_user(login: &ScramLogin) -> Broker {
         let broker = Broker::isolated();
         _ = KafkaCli::new(broker.bootstrap())
+            .configs()
             .add_scram_user(&login.user, &login.password)
             .succeeded();
 
@@ -84,7 +88,9 @@ mod login {
     /// Asserts that a client that logs in as `login` can list the broker's topics.
     #[track_caller]
     fn assert_logs_in(broker: &Broker, login: &ScramLogin) {
-        let listed = KafkaCli::logged_in_as(broker.bootstrap(), login).list_topics();
+        let listed = KafkaCli::logged_in_as(broker.bootstrap(), login)
+            .topics()
+            .list();
 
         assert_eq!(
             listed.code,
@@ -122,11 +128,13 @@ mod login {
         let login = login_for_new_user(ScramMechanism::Sha256);
         let broker = broker_requiring_kafka_configs_user(&login);
         let wrong_login = ScramLogin {
-            password: random_password(),
+            password: unique::password(),
             ..login
         };
 
-        let listed = KafkaCli::logged_in_as(broker.bootstrap(), &wrong_login).list_topics();
+        let listed = KafkaCli::logged_in_as(broker.bootstrap(), &wrong_login)
+            .topics()
+            .list();
 
         assert!(
             listed.code != Some(0) && listed.mentions(SASL_AUTHENTICATION_EXCEPTION),
@@ -151,7 +159,8 @@ mod login {
 
         let listed = KafkaCli::new(broker.bootstrap())
             .with_api_timeout(CLIENT_API_TIMEOUT)
-            .list_topics();
+            .topics()
+            .list();
 
         assert!(
             listed.timeout.is_none() && listed.code != Some(0),

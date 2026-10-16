@@ -17,10 +17,22 @@
 use super::{KafkaCli, Output, Tool};
 use crate::Record;
 
+/// What the console producer logs on stderr for each record that the broker rejects.
+const CONSOLE_PRODUCER_SEND_ERROR: &str = "Error when sending message";
+
 /// The text the console producer reads as a null value, for a tombstone.
 const NULL_MARKER: &str = "<null>";
 
-impl KafkaCli {
+/// Runs `kafka-console-producer` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaConsoleProducer<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaConsoleProducer<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Produces `records` to `topic`, keys and headers included, with the console producer.
     ///
     /// Sends `InitProducerId`, because the producer is idempotent, and `Produce`.
@@ -28,7 +40,7 @@ impl KafkaCli {
     /// Panics if the producer fails, or if the broker rejects a record.
     #[track_caller]
     pub fn produce(&self, topic: &str, records: &[Record<'_>]) -> Output {
-        let produced = self.run_with_input(
+        let produced = self.cli.run_with_input(
             Tool::ConsoleProducer,
             &[
                 "--topic",
@@ -41,7 +53,7 @@ impl KafkaCli {
             &Record::console_input(records),
         );
 
-        produced.assert_every_record_accepted();
+        assert_every_record_accepted(&produced);
         produced
     }
 
@@ -55,8 +67,9 @@ impl KafkaCli {
         self.produce_values_with(topic, values, &[])
     }
 
-    /// Like [`KafkaCli::produce_values`], with each of `properties` as a `name=value` producer
-    /// config. The producer sends `InitProducerId` unless a property turns idempotence off.
+    /// Like [`KafkaConsoleProducer::produce_values`], with each of `properties` as a `name=value`
+    /// producer config. The producer sends `InitProducerId` unless a property turns idempotence
+    /// off.
     #[track_caller]
     pub fn produce_values_with(
         &self,
@@ -65,16 +78,18 @@ impl KafkaCli {
         properties: &[&str],
     ) -> Output {
         let produced = self.run_console_producer(topic, values, properties);
-        produced.assert_every_record_accepted();
+        assert_every_record_accepted(&produced);
         produced
     }
 
-    /// Like [`KafkaCli::produce_values`], but returns the producer's output without checking it,
-    /// for a test that expects the broker to reject a record.
+    /// Like [`KafkaConsoleProducer::produce_values`], but returns the producer's output without
+    /// checking it, for a test that expects the broker to reject a record.
+    #[track_caller]
     pub fn try_produce_values(&self, topic: &str, values: &[impl AsRef<str>]) -> Output {
         self.run_console_producer(topic, values, &[])
     }
 
+    #[track_caller]
     fn run_console_producer(
         &self,
         topic: &str,
@@ -91,7 +106,8 @@ impl KafkaCli {
             .iter()
             .map(|value| format!("{}\n", value.as_ref()))
             .collect::<String>();
-        self.run_with_input(Tool::ConsoleProducer, &args, &input)
+        self.cli
+            .run_with_input(Tool::ConsoleProducer, &args, &input)
     }
 
     /// Produces `records` to `topic`, each a key and a value, with the console producer. A
@@ -108,7 +124,7 @@ impl KafkaCli {
             .map(|(key, value)| format!("{key}\t{}\n", value.unwrap_or(NULL_MARKER)))
             .collect::<String>();
 
-        let produced = self.run_with_input(
+        let produced = self.cli.run_with_input(
             Tool::ConsoleProducer,
             &[
                 "--topic",
@@ -121,7 +137,20 @@ impl KafkaCli {
             &input,
         );
 
-        produced.assert_every_record_accepted();
+        assert_every_record_accepted(&produced);
         produced
     }
+}
+
+/// Asserts that a console producer exited with 0 and did not log an error for a record. The
+/// console producer exits with 0 even if the broker rejects a record, and only logs the error.
+#[track_caller]
+fn assert_every_record_accepted(produced: &Output) {
+    assert!(
+        !produced
+            .succeeded()
+            .stderr
+            .contains(CONSOLE_PRODUCER_SEND_ERROR),
+        "the broker rejected a record: {produced}"
+    );
 }

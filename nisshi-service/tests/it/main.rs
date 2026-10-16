@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 mod common;
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
 pub mod ch;
 pub mod route;
 pub mod tcp;
+pub mod version_gate;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a
 // `pub mod` line would never compile or run. Fail instead of skipping it silently.

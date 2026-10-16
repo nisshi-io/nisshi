@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    borrow::Cow,
     sync::LazyLock,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -21,14 +22,14 @@ use nisshi_sans_io::{
     Ack, ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
     SuppressResponseExtension, TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
-    produce_response::{PartitionProduceResponse, TopicProduceResponse},
-    record::deflated,
+    produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse, TopicProduceResponse},
+    record::{deflated, inflated},
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
-use tracing::{error, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, METER, Result, Storage, Topition};
+use crate::{Error, METER, Result, Storage, Topition, offload};
 
 /// Counts the connections closed by a failed `acks=0` Produce, by the error
 /// code of the first failing partition.
@@ -43,6 +44,78 @@ static ACKS_ZERO_PRODUCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Inflate a batch that a client sent in a Produce request, mapping a
+/// decode failure to `INVALID_RECORD`.
+///
+/// Accepts both a `deflated::Batch` and a `&deflated::Batch`. The two
+/// conversions take different decode paths and fail with different
+/// [`nisshi_sans_io::Error`] variants for the same bytes: by value, an
+/// uncompressed batch is parsed directly and a short record fails with
+/// `Overflow` or `TryGet`. By reference, every batch goes through the serde
+/// decoder and the same record fails with `Io(UnexpectedEof)`. Mapping every
+/// error keeps the client-visible code the same on every backend, whichever
+/// path it uses.
+///
+/// Every error is safe to treat as the client's fault, because decoding only
+/// reads bytes already in memory: decompression, varints, lengths and record
+/// fields all come from the request. Retrying the same bytes fails the same
+/// way, so the client needs `INVALID_RECORD` rather than
+/// `UNKNOWN_SERVER_ERROR`.
+///
+/// For a compressed batch this differs from Kafka on purpose. Kafka answers
+/// `INVALID_RECORD` for a truncated uncompressed record, but it wraps a
+/// decompression failure, including record data that is not a stream of the
+/// declared codec, in a `KafkaException`, and the client gets
+/// `UNKNOWN_SERVER_ERROR`. That code invites a retry of the same bytes, which
+/// cannot succeed. See
+/// <https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L633-L641>.
+///
+/// The decode error is logged at debug: [`ProduceService`] logs each
+/// rejection once, at warn, with the topic and partition, and a client can
+/// send any number of batches that do not decode.
+///
+/// A batch over the decoded-size limit keeps its
+/// [`nisshi_sans_io::Error::MessageMaxSizeExceeded`], so that
+/// [`ProduceService`] answers `MESSAGE_TOO_LARGE`, which a producer can
+/// recover from by splitting the batch.
+///
+/// Only use this on a batch from a client Produce request. A stored batch
+/// that fails to decode is a broker fault, and must keep its own error.
+pub fn inflate_produced<B>(batch: B) -> Result<inflated::Batch>
+where
+    inflated::Batch: TryFrom<B, Error = nisshi_sans_io::Error>,
+{
+    inflated::Batch::try_from(batch).map_err(|err| match err {
+        nisshi_sans_io::Error::MessageMaxSizeExceeded(_) => Error::SansIo(err),
+        err => {
+            debug!(?err, "produce batch does not decode");
+            Error::Api(ErrorCode::InvalidRecord)
+        }
+    })
+}
+
+/// Kafka's wire sentinel for "no timestamp", also the fold-start value
+/// `LogValidator` uses for a batch's running maximum.
+const NO_TIMESTAMP: i64 = -1;
+
+/// How far ahead of the broker's clock a `CreateTime` record may claim to be.
+///
+/// This is the `log.message.timestamp.after.max.ms` default of Kafka 4.0
+/// ([KIP-1030], [`ServerLogConfigs` 4.0.0]). It differs from Kafka 3.9.1,
+/// whose protocol this broker follows: 3.9.1 defaults to `Long.MAX_VALUE`
+/// ([`ServerLogConfigs` 3.9.1]) and accepts any future timestamp. A record
+/// far in the future keeps its batch's `max_timestamp` ahead of every
+/// retention deadline, so the broker uses the 4.0 limit.
+///
+/// [KIP-1030]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-1030%3A+Change+constraints+and+default+values+for+various+configurations
+/// [`ServerLogConfigs` 4.0.0]: https://github.com/apache/kafka/blob/4.0.0/server-common/src/main/java/org/apache/kafka/server/config/ServerLogConfigs.java#L121
+/// [`ServerLogConfigs` 3.9.1]: https://github.com/apache/kafka/blob/3.9.1/server-common/src/main/java/org/apache/kafka/server/config/ServerLogConfigs.java#L148
+const TIMESTAMP_AFTER_MAX_MS: i64 = 3_600_000;
+
+/// Kafka's own `log.message.timestamp.before.max.ms` default
+/// (`Long.MAX_VALUE`): no lower bound.
+const TIMESTAMP_BEFORE_MAX_MS: i64 = i64::MAX;
+
 /// Why a client batch must be rejected before anything is written, with the
 /// error code to send, or `None` if it may be stored. Kafka's `LogValidator`
 /// rejects the same batches.
@@ -52,6 +125,12 @@ static ACKS_ZERO_PRODUCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 ///   [`ProduceService`]. Every backend skips schema validation and lake
 ///   writes for a control batch, so a client must not be able to set the bit.
 ///   `INVALID_RECORD`.
+/// - The compression codec in the attributes must be one Kafka defines. An
+///   unknown codec id is a defect in the client's batch header, like a bad
+///   record count. Kafka returns `UNKNOWN_SERVER_ERROR` for it only because
+///   its codec lookup throws an unchecked exception that reaches the generic
+///   handler. Checking here also stops a backend from advancing the high
+///   watermark before it parses the attributes. `INVALID_RECORD`.
 /// - A consistent header has at least one record and
 ///   `last_offset_delta + 1 == record_count`. Every backend uses
 ///   `last_offset_delta` to advance the high watermark, so a mismatch corrupts
@@ -68,6 +147,10 @@ fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
             ErrorCode::InvalidRecord,
             "clients may not write control batches",
         ));
+    }
+
+    if BatchAttribute::try_from(batch.attributes).is_err() {
+        return Some((ErrorCode::InvalidRecord, "unknown compression codec"));
     }
 
     let Ok(record_count) = i32::try_from(batch.record_count) else {
@@ -110,6 +193,8 @@ fn storage_error_code(error: &Error) -> ErrorCode {
 
 #[cfg(test)]
 mod rejection_tests {
+    use nisshi_sans_io::Compression;
+
     use super::*;
 
     #[test]
@@ -175,6 +260,46 @@ mod rejection_tests {
         );
     }
 
+    /// The batch is compressed: on the by-value path an uncompressed batch
+    /// whose `record_count` exceeds what its `record_data` could hold is
+    /// reported as corrupt before the decoded-size limit is checked.
+    #[test]
+    fn a_produced_batch_over_the_decoded_size_limit_is_message_too_large() {
+        let oversized = || deflated::Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::Gzip)
+                .into(),
+            record_count: 1_000_000,
+            last_offset_delta: 999_999,
+            ..Default::default()
+        };
+
+        for result in [
+            inflate_produced(&oversized()),
+            inflate_produced(oversized()),
+        ] {
+            let error = result.expect_err("an oversized batch must not decode");
+            assert_eq!(ErrorCode::MessageTooLarge, storage_error_code(&error));
+        }
+    }
+
+    #[test]
+    fn a_produced_batch_that_does_not_decode_is_an_invalid_record() {
+        let truncated = || deflated::Batch {
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        };
+
+        for result in [
+            inflate_produced(&truncated()),
+            inflate_produced(truncated()),
+        ] {
+            let error = result.expect_err("a batch without record data must not decode");
+            assert_eq!(ErrorCode::InvalidRecord, storage_error_code(&error));
+        }
+    }
+
     #[test]
     fn other_storage_errors_are_unknown_server_error() {
         assert_eq!(
@@ -205,6 +330,419 @@ fn first_error(responses: &[TopicProduceResponse]) -> Option<(String, i32, Error
                 )
             })
     })
+}
+
+/// A batch that the broker rejects before it writes anything, with what the
+/// client and the operator need to find the cause.
+#[derive(Clone, Debug, PartialEq)]
+struct Rejection {
+    error_code: ErrorCode,
+    message: Cow<'static, str>,
+    record_error: Option<BatchIndexAndErrorMessage>,
+}
+
+impl Rejection {
+    fn new(error_code: ErrorCode, message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            error_code,
+            message: message.into(),
+            record_error: None,
+        }
+    }
+}
+
+impl From<(ErrorCode, &'static str)> for Rejection {
+    fn from((error_code, message): (ErrorCode, &'static str)) -> Self {
+        Self::new(error_code, message)
+    }
+}
+
+/// Validates the timestamp of each record in a `CreateTime` batch, and
+/// rewrites the batch's `max_timestamp` to the largest record timestamp
+/// when the header claims a different value.
+///
+/// Kafka's `LogValidator` does the same: it starts from [`NO_TIMESTAMP`],
+/// takes the maximum record timestamp, and overwrites only the header. It
+/// exempts a record timestamped [`NO_TIMESTAMP`] from the bounds check.
+///
+/// Returns `Ok(Some(_))` for a batch that the client must not store: a
+/// record timestamp outside the window that [`TIMESTAMP_BEFORE_MAX_MS`] and
+/// [`TIMESTAMP_AFTER_MAX_MS`] set around `now`, a timestamp that overflows,
+/// a batch that does not decode, or a header rewrite on a batch whose CRC
+/// does not match its contents. `Err` is a broker-side failure.
+///
+/// The batch decodes through [`inflate_produced`], so a batch that does not
+/// decode gets the same error code here as on every other produce path.
+fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<Rejection>> {
+    let inflated = match inflate_produced(&*batch) {
+        Ok(inflated) => inflated,
+        Err(error) => return Ok(Some(undecodable_batch(&error))),
+    };
+
+    let lower = now.saturating_sub(TIMESTAMP_BEFORE_MAX_MS);
+    let upper = now.saturating_add(TIMESTAMP_AFTER_MAX_MS);
+
+    let mut actual_max = NO_TIMESTAMP;
+
+    for (batch_index, record) in inflated.records.iter().enumerate() {
+        let batch_index = i32::try_from(batch_index)?;
+
+        let Some(timestamp) = batch.base_timestamp.checked_add(record.timestamp_delta) else {
+            return Ok(Some(Rejection {
+                record_error: Some(
+                    BatchIndexAndErrorMessage::default()
+                        .batch_index(batch_index)
+                        .batch_index_error_message(Some(format!(
+                            "base_timestamp {} plus timestamp_delta {} of the record at batch \
+                             index {batch_index} overflows",
+                            batch.base_timestamp, record.timestamp_delta
+                        ))),
+                ),
+                ..Rejection::new(ErrorCode::InvalidRecord, "record timestamp overflows i64")
+            }));
+        };
+
+        // Kafka's check is strict, so a timestamp exactly at a bound is
+        // accepted.
+        if timestamp != NO_TIMESTAMP && (timestamp > upper || timestamp < lower) {
+            return Ok(Some(Rejection {
+                record_error: Some(
+                    BatchIndexAndErrorMessage::default()
+                        .batch_index(batch_index)
+                        .batch_index_error_message(Some(format!(
+                            "Timestamp {timestamp} of the record at batch index {batch_index} \
+                             is out of range. The timestamp should be within [{lower}, \
+                             {upper}], from the broker's clock at {now}"
+                        ))),
+                ),
+                ..Rejection::new(
+                    ErrorCode::InvalidTimestamp,
+                    "One or more records have been rejected due to invalid timestamp",
+                )
+            }));
+        }
+
+        actual_max = actual_max.max(timestamp);
+    }
+
+    if actual_max == batch.max_timestamp {
+        return Ok(None);
+    }
+
+    match batch.set_timestamps(batch.base_timestamp, actual_max) {
+        Ok(()) => Ok(None),
+        Err(nisshi_sans_io::Error::ApiError(ErrorCode::CorruptMessage)) => {
+            Ok(Some(corrupt_batch()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Runs [`rewrite_create_time`] on Tokio's blocking thread pool, through
+/// [`offload`], and hands the batch back with the outcome.
+///
+/// The batch moves into the closure and back out, because `offload` needs a
+/// `'static` closure. A clone would only add a handle to the same record
+/// bytes, so moving the batch keeps one owner.
+async fn rewrite_create_time_offloaded(
+    batch: deflated::Batch,
+    now: i64,
+) -> Result<(deflated::Batch, Option<Rejection>)> {
+    offload(move || {
+        let mut batch = batch;
+        let rejection = rewrite_create_time(&mut batch, now)?;
+        Ok((batch, rejection))
+    })
+    .await
+}
+
+/// The rejection for a client batch that [`inflate_produced`] did not decode,
+/// with the error code [`storage_error_code`] gives `error`: `MESSAGE_TOO_LARGE`
+/// for a batch over the decoded-size limit, which a producer recovers from by
+/// splitting the batch, and `INVALID_RECORD` for any other decode failure.
+fn undecodable_batch(error: &Error) -> Rejection {
+    let error_code = storage_error_code(error);
+
+    let message = if error_code == ErrorCode::MessageTooLarge {
+        "batch exceeds the maximum decoded batch size"
+    } else {
+        "batch could not be decoded"
+    };
+
+    Rejection::new(error_code, message)
+}
+
+/// The rejection for a batch whose CRC does not match its contents. Kafka
+/// rejects such a batch before it validates timestamps.
+fn corrupt_batch() -> Rejection {
+    Rejection::new(
+        ErrorCode::CorruptMessage,
+        "batch crc does not match its contents",
+    )
+}
+
+#[cfg(test)]
+mod rewrite_create_time_tests {
+    use bytes::{BufMut as _, BytesMut};
+    use nisshi_sans_io::{Compression, record::Record};
+    use tokio::task::yield_now;
+
+    use super::*;
+
+    const FIXED_NOW: i64 = 1_800_000_000_000;
+
+    fn batch(base_timestamp: i64, max_timestamp: i64, deltas: &[i64]) -> Result<deflated::Batch> {
+        let builder = deltas.iter().enumerate().try_fold(
+            inflated::Batch::builder()
+                .base_timestamp(base_timestamp)
+                .max_timestamp(max_timestamp)
+                .last_offset_delta(i32::try_from(deltas.len())? - 1),
+            |builder, (offset_delta, timestamp_delta)| {
+                i32::try_from(offset_delta).map(|offset_delta| {
+                    builder.record(
+                        Record::builder()
+                            .offset_delta(offset_delta)
+                            .timestamp_delta(*timestamp_delta),
+                    )
+                })
+            },
+        )?;
+
+        builder
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    fn record_error_index(rejection: &Rejection) -> Option<i32> {
+        rejection
+            .record_error
+            .as_ref()
+            .map(|record_error| record_error.batch_index)
+    }
+
+    #[test]
+    fn max_timestamp_is_the_largest_record_not_the_last() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0, 300, 100])?;
+
+        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(FIXED_NOW + 300, batch.max_timestamp);
+        assert_eq!(batch.computed_crc(), batch.crc);
+
+        Ok(())
+    }
+
+    #[test]
+    fn negative_delta_folds_into_the_maximum() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, FIXED_NOW, &[-5_000, -1_000])?;
+
+        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(FIXED_NOW - 1_000, batch.max_timestamp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_header_that_already_matches_is_unchanged() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, FIXED_NOW + 7, &[0, 7])?;
+        let original = batch.clone();
+
+        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(original, batch);
+
+        Ok(())
+    }
+
+    #[test]
+    fn exactly_the_upper_bound_is_accepted() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[TIMESTAMP_AFTER_MAX_MS])?;
+
+        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(FIXED_NOW + TIMESTAMP_AFTER_MAX_MS, batch.max_timestamp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn one_past_the_upper_bound_is_rejected() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[TIMESTAMP_AFTER_MAX_MS + 1])?;
+
+        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+            .expect("one millisecond past the upper bound must be rejected");
+
+        assert_eq!(ErrorCode::InvalidTimestamp, rejection.error_code);
+        assert_eq!(Some(0), record_error_index(&rejection));
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_future_record_after_a_sane_one_is_rejected_with_its_index() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, FIXED_NOW, &[0, 2 * TIMESTAMP_AFTER_MAX_MS, 0])?;
+        let original = batch.clone();
+
+        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+            .expect("a record two hours ahead must be rejected");
+
+        assert_eq!(ErrorCode::InvalidTimestamp, rejection.error_code);
+        assert_eq!(Some(1), record_error_index(&rejection));
+
+        let message = rejection
+            .record_error
+            .and_then(|record_error| record_error.batch_index_error_message)
+            .unwrap_or_default();
+        assert!(message.contains(&(FIXED_NOW + 2 * TIMESTAMP_AFTER_MAX_MS).to_string()));
+        assert!(message.contains(&(FIXED_NOW + TIMESTAMP_AFTER_MAX_MS).to_string()));
+        assert!(message.contains(&FIXED_NOW.to_string()));
+
+        assert_eq!(original, batch);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_timestamp_that_overflows_is_rejected() -> Result<()> {
+        let mut batch = batch(i64::MAX - 1, -1, &[10])?;
+
+        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+            .expect("an overflowing timestamp must be rejected");
+
+        assert_eq!(ErrorCode::InvalidRecord, rejection.error_code);
+        assert_eq!(Some(0), record_error_index(&rejection));
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_timestamp_is_exempt_from_the_bounds_check() -> Result<()> {
+        let mut only_no_timestamp = batch(NO_TIMESTAMP, FIXED_NOW, &[0])?;
+
+        assert_eq!(
+            None,
+            rewrite_create_time(&mut only_no_timestamp, FIXED_NOW)?
+        );
+        assert_eq!(NO_TIMESTAMP, only_no_timestamp.max_timestamp);
+
+        let mut mixed = batch(NO_TIMESTAMP, NO_TIMESTAMP, &[0, FIXED_NOW + 1])?;
+
+        assert_eq!(None, rewrite_create_time(&mut mixed, FIXED_NOW)?);
+        assert_eq!(FIXED_NOW, mixed.max_timestamp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_that_does_not_decode_is_an_invalid_record() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0])?;
+        batch.record_data = bytes::Bytes::from_static(&[0xff, 0xff, 0xff]);
+
+        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+            .expect("a batch that does not decode must be rejected");
+
+        assert_eq!(ErrorCode::InvalidRecord, rejection.error_code);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_over_the_decoded_size_limit_is_message_too_large() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0])?;
+        batch.attributes = BatchAttribute::default()
+            .compression(Compression::Snappy)
+            .into();
+
+        // A raw snappy block starts with its uncompressed length as a
+        // varint. This one claims 2,000,000,000 bytes.
+        let mut claimed = 2_000_000_000u64;
+        let mut record_data = BytesMut::new();
+        while claimed >= 0x80 {
+            record_data.put_u8((claimed as u8) | 0x80);
+            claimed >>= 7;
+        }
+        record_data.put_u8(claimed as u8);
+        batch.record_data = record_data.freeze();
+
+        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+            .expect("a batch over the decoded size limit must be rejected");
+
+        assert_eq!(ErrorCode::MessageTooLarge, rejection.error_code);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_rewrite_of_a_batch_with_a_bad_crc_is_a_corrupt_message() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0])?;
+        batch.crc ^= 1;
+        let damaged = batch.clone();
+
+        assert_eq!(
+            Some(corrupt_batch()),
+            rewrite_create_time(&mut batch, FIXED_NOW)?
+        );
+        assert_eq!(damaged, batch);
+
+        Ok(())
+    }
+
+    // The test runtime has a single thread. If the rewrite decoded the batch
+    // inline, the spawned task would decode, rewrite and return within its
+    // first poll, so it would already be finished when `yield_now` returns.
+    // Offloaded, it is still waiting on the decode.
+    #[tokio::test]
+    async fn rewrite_runs_off_the_runtime_thread() -> Result<()> {
+        const RECORDS: usize = 1_000;
+        const RECORD_SIZE: usize = 1_024;
+
+        // Pseudo-random values, so gzip has real work to do on decode.
+        let mut seed = 0x2545_f491_u32;
+        let mut builder = inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+            )
+            .base_timestamp(FIXED_NOW)
+            .max_timestamp(NO_TIMESTAMP)
+            .last_offset_delta(i32::try_from(RECORDS)? - 1);
+
+        for offset_delta in 0..RECORDS {
+            let value = (0..RECORD_SIZE)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect::<bytes::Bytes>();
+
+            builder = builder.record(
+                Record::builder()
+                    .value(value.into())
+                    .offset_delta(i32::try_from(offset_delta)?)
+                    .timestamp_delta(i64::try_from(offset_delta)?),
+            );
+        }
+
+        let batch: deflated::Batch = builder.build().and_then(TryInto::try_into)?;
+
+        let rewrite = tokio::spawn(rewrite_create_time_offloaded(batch, FIXED_NOW));
+
+        yield_now().await;
+
+        assert!(
+            !rewrite.is_finished(),
+            "the batch was decoded on the runtime thread"
+        );
+
+        let (batch, rejection) = rewrite.await??;
+
+        assert_eq!(None, rejection);
+        assert_eq!(FIXED_NOW + i64::try_from(RECORDS)? - 1, batch.max_timestamp);
+        assert_eq!(batch.computed_crc(), batch.crc);
+
+        Ok(())
+    }
 }
 
 /// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
@@ -332,6 +870,36 @@ where
             .current_leader(None)
     }
 
+    fn reject(
+        &self,
+        name: &str,
+        index: i32,
+        batch: &deflated::Batch,
+        rejection: Rejection,
+    ) -> PartitionProduceResponse {
+        warn!(
+            topic = name,
+            partition = index,
+            producer_id = batch.producer_id,
+            attributes = batch.attributes,
+            record_count = batch.record_count,
+            last_offset_delta = batch.last_offset_delta,
+            base_timestamp = batch.base_timestamp,
+            max_timestamp = batch.max_timestamp,
+            error_code = ?rejection.error_code,
+            reason = %rejection.message,
+            record_error = rejection
+                .record_error
+                .as_ref()
+                .and_then(|record_error| record_error.batch_index_error_message.as_deref()),
+            "rejecting produce batch",
+        );
+
+        self.error(index, rejection.error_code)
+            .error_message(Some(rejection.message.into_owned()))
+            .record_errors(Some(rejection.record_error.into_iter().collect()))
+    }
+
     #[instrument(skip_all)]
     async fn partition(
         &self,
@@ -339,89 +907,119 @@ where
         name: &str,
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
-        if let Some(records) = partition.records {
-            if let Some((rejected, error_code, reason)) = records.batches.iter().find_map(|batch| {
-                rejection(batch).map(|(error_code, reason)| (batch, error_code, reason))
-            }) {
-                warn!(
-                    topic = name,
-                    partition = partition.index,
-                    record_count = rejected.record_count,
-                    last_offset_delta = rejected.last_offset_delta,
-                    ?error_code,
-                    reason,
-                    "rejecting produce batch",
-                );
+        // The decoder turns a zero-length records field into `None`, so it
+        // counts as zero batches.
+        let batches = partition
+            .records
+            .map(|records| records.batches)
+            .unwrap_or_default();
 
-                return self
-                    .error(partition.index, error_code)
-                    .error_message(Some(reason.into()));
-            }
+        // Kafka allows exactly one batch per partition from Produce v3, the
+        // first version that carries record batches, which is the only format
+        // this broker decodes. Kafka checks the count before it validates any
+        // batch, so this check runs before `rejection`. See
+        // https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
+        let batch_count = batches.len();
+        let Ok([mut batch]) = <[deflated::Batch; 1]>::try_from(batches) else {
+            const REASON: &str =
+                "a produce request must contain exactly one record batch per partition";
 
-            let mut base_offset = None;
+            warn!(
+                topic = name,
+                partition = partition.index,
+                batch_count,
+                reason = REASON,
+                "rejecting produce request",
+            );
 
-            for mut batch in records.batches {
-                let tp = Topition::new(name, partition.index);
+            return self
+                .error(partition.index, ErrorCode::InvalidRecord)
+                .error_message(Some(REASON.into()));
+        };
 
-                if BatchAttribute::try_from(batch.attributes)
-                    .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
-                    .unwrap_or_default()
-                {
-                    let base_timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_millis() as i64)
-                        .unwrap_or_default();
+        if let Some(rejection) = rejection(&batch) {
+            return self.reject(name, partition.index, &batch, rejection.into());
+        }
 
-                    batch.base_timestamp = base_timestamp;
-                    batch.max_timestamp = base_timestamp;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+
+        // The batch's own timestamp-type bit selects `LogAppendTime`
+        // here. Kafka takes the type from the topic's
+        // `message.timestamp.type` instead: on a `CreateTime` topic it
+        // validates such a batch like any `CreateTime` batch and
+        // clears the bit. A client that sets the bit here skips the
+        // timestamp window.
+        if BatchAttribute::try_from(batch.attributes)
+            .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
+            .unwrap_or_default()
+        {
+            match batch.set_timestamps(now, now) {
+                Ok(()) => {}
+                Err(nisshi_sans_io::Error::ApiError(ErrorCode::CorruptMessage)) => {
+                    return self.reject(name, partition.index, &batch, corrupt_batch());
                 }
-
-                match self.storage.produce(transaction_id, &tp, batch).await {
-                    Ok(offset) => _ = base_offset.get_or_insert(offset),
-
-                    Err(error) => {
-                        let error_code = storage_error_code(&error);
-
-                        // Logged once, here, with the partition: a rejection
-                        // the client caused is a warning, an internal failure
-                        // is an error.
-                        if error_code == ErrorCode::UnknownServerError {
-                            error!(
-                                topic = name,
-                                partition = partition.index,
-                                ?error,
-                                "produce failed"
-                            );
-                        } else {
-                            warn!(
-                                topic = name,
-                                partition = partition.index,
-                                ?error_code,
-                                %error,
-                                "rejecting produce batch"
-                            );
-                        }
-
-                        return self.error(partition.index, error_code);
-                    }
+                Err(err) => {
+                    error!(?err);
+                    return self.error(partition.index, ErrorCode::UnknownServerError);
                 }
-            }
-
-            if let Some(base_offset) = base_offset {
-                PartitionProduceResponse::default()
-                    .index(partition.index)
-                    .error_code(ErrorCode::None.into())
-                    .base_offset(base_offset)
-                    .log_append_time_ms(Some(-1))
-                    .log_start_offset(Some(0))
-                    .record_errors(Some([].into()))
-                    .error_message(None)
-                    .current_leader(None)
-            } else {
-                self.error(partition.index, ErrorCode::UnknownServerError)
             }
         } else {
-            self.error(partition.index, ErrorCode::UnknownServerError)
+            match rewrite_create_time_offloaded(batch, now).await {
+                Ok((rewritten, None)) => batch = rewritten,
+                Ok((rewritten, Some(rejection))) => {
+                    return self.reject(name, partition.index, &rewritten, rejection);
+                }
+                Err(err) => {
+                    error!(?err);
+                    return self.error(partition.index, ErrorCode::UnknownServerError);
+                }
+            }
+        }
+
+        let tp = Topition::new(name, partition.index);
+        let producer_id = batch.producer_id;
+
+        match self.storage.produce(transaction_id, &tp, batch).await {
+            Ok(base_offset) => PartitionProduceResponse::default()
+                .index(partition.index)
+                .error_code(ErrorCode::None.into())
+                .base_offset(base_offset)
+                .log_append_time_ms(Some(-1))
+                .log_start_offset(Some(0))
+                .record_errors(Some([].into()))
+                .error_message(None)
+                .current_leader(None),
+
+            Err(error) => {
+                let error_code = storage_error_code(&error);
+
+                // Logged once, here, with the partition: a rejection
+                // the client caused is a warning, an internal failure
+                // is an error.
+                if error_code == ErrorCode::UnknownServerError {
+                    error!(
+                        topic = name,
+                        partition = partition.index,
+                        producer_id,
+                        ?error,
+                        "produce failed"
+                    );
+                } else {
+                    warn!(
+                        topic = name,
+                        partition = partition.index,
+                        producer_id,
+                        ?error_code,
+                        %error,
+                        "rejecting produce batch"
+                    );
+                }
+
+                self.error(partition.index, error_code)
+            }
         }
     }
 

@@ -28,11 +28,11 @@ pub const LOG_APPEND_TIME: &str = "LogAppendTime";
 /// tombstone's value.
 pub const PRINTED_NULL: &str = "null";
 
-/// The command of [`KafkaCli::consume`]'s [`Output`].
+/// The command of [`KafkaConsoleConsumer::consume`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum Consume {}
 
-/// The command of [`KafkaCli::consume_matching`]'s [`Output`].
+/// The command of [`KafkaConsoleConsumer::consume_matching`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum ConsumeMatching {}
 
@@ -43,7 +43,16 @@ pub trait PrintsPartitionLines {}
 impl PrintsPartitionLines for Consume {}
 impl PrintsPartitionLines for ConsumeMatching {}
 
-impl KafkaCli {
+/// Runs `kafka-console-consumer` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaConsoleConsumer<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaConsoleConsumer<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Consumes `topic` from the beginning as a member of `group`, and stops after `max_messages`
     /// records or 30 seconds without one.
     ///
@@ -51,10 +60,11 @@ impl KafkaCli {
     ///
     /// The consumer prints each record as `Partition:<n>\tOffset:<n>\t` followed by
     /// [`Record::console_line`](crate::Record::console_line).
+    #[track_caller]
     pub fn consume(&self, topic: &str, group: &str, max_messages: usize) -> Output<Consume> {
         let max_messages = max_messages.to_string();
 
-        self.run(
+        self.cli.run(
             Tool::ConsoleConsumer,
             &[
                 "--timeout-ms",
@@ -104,8 +114,8 @@ impl KafkaCli {
         self.read_records_from(topic, partition, &offset.to_string(), count)
     }
 
-    /// Like [`KafkaCli::read_records`], but starts at the partition's earliest offset, for a test
-    /// that doesn't know which records retention or compaction left.
+    /// Like [`KafkaConsoleConsumer::read_records`], but starts at the partition's earliest offset,
+    /// for a test that doesn't know which records retention or compaction left.
     #[track_caller]
     pub fn read_records_from_earliest(
         &self,
@@ -116,8 +126,8 @@ impl KafkaCli {
         self.read_records_from(topic, partition, "earliest", count)
     }
 
-    /// Reads `count` records as [`KafkaCli::read_records`] does, from `offset`, which is an
-    /// offset or `earliest`.
+    /// Reads `count` records as [`KafkaConsoleConsumer::read_records`] does, from `offset`, which
+    /// is an offset or `earliest`.
     #[track_caller]
     fn read_records_from(
         &self,
@@ -129,7 +139,7 @@ impl KafkaCli {
         let partition = partition.to_string();
         let max_messages = count.to_string();
 
-        let read: Output = self.run(
+        let read: Output = self.cli.run(
             Tool::ConsoleConsumer,
             &[
                 "--timeout-ms",
@@ -174,6 +184,7 @@ impl KafkaCli {
     ///
     /// Sends `Metadata`, `FindCoordinator`, `JoinGroup`, `SyncGroup`, `Fetch`, `OffsetCommit` and
     /// `LeaveGroup`.
+    #[track_caller]
     pub fn consume_matching(
         &self,
         pattern: &str,
@@ -191,7 +202,7 @@ impl KafkaCli {
         let max_messages = max_messages.to_string();
         let idle_timeout = IDLE_TIMEOUT.as_millis().to_string();
 
-        self.exec_until_timeout(
+        self.cli.exec_until_timeout(
             Tool::ConsoleConsumer,
             &[
                 "--timeout-ms",
@@ -221,8 +232,9 @@ impl KafkaCli {
 }
 
 impl<PrintedBy: PrintsPartitionLines> Output<PrintedBy> {
-    /// Returns the record lines that the consumer printed, each as tab-separated fields starting with `Partition:` and ending with the value.
-    /// Other lines, such as the warnings that Kafka 4 tools print on stdout, are left out.
+    /// Returns the record lines that the consumer printed, each as tab-separated fields starting
+    /// with `Partition:` and ending with the value. Other lines, such as the warnings that Kafka 4
+    /// tools print on stdout, are left out.
     pub fn consumed_lines(&self) -> Vec<&str> {
         self.lines()
             .into_iter()
@@ -267,7 +279,7 @@ impl Output<Consume> {
     }
 }
 
-/// A record as [`KafkaCli::read_records`] reads it.
+/// A record as [`KafkaConsoleConsumer::read_records`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumedRecord {
     /// `CreateTime` if the producer set the timestamp, `LogAppendTime` if the broker set it.

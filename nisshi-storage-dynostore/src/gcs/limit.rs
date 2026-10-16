@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use cached::{CachedExt as _, stores::TtlSortedCache};
 use futures::stream::BoxStream;
 use governor::{DefaultDirectRateLimiter, Jitter, Quota, RateLimiter};
-use nisshi_storage::Result;
+use nisshi_storage::{Error, Result};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
@@ -53,18 +53,18 @@ impl<O> Display for PutRateLimiter<O> {
 }
 
 impl<O> PutRateLimiter<O> {
-    pub(crate) fn new(object_store: O, ttl: Duration) -> Self {
-        Self {
+    pub(crate) fn new(object_store: O, ttl: Duration) -> Result<Self> {
+        Ok(Self {
             object_store,
             entries: Arc::new(Mutex::new(
                 TtlSortedCache::builder()
                     .ttl(ttl)
                     .build()
-                    .expect("rate limiter ttl must be non-zero"),
+                    .map_err(|_| Error::Message("rate limiter ttl must be non-zero".into()))?,
             )),
             rate_per_second: Default::default(),
             jitter: Default::default(),
-        }
+        })
     }
 
     pub(crate) fn with_rate_per_second(self, rate_per_second: Option<NonZero<u32>>) -> Self {
@@ -243,7 +243,7 @@ mod tests {
 
         let ttl = Duration::from_millis(100);
         let prl =
-            PutRateLimiter::new(InMemory::new(), ttl).with_rate_per_second(NonZeroU32::new(1_000));
+            PutRateLimiter::new(InMemory::new(), ttl)?.with_rate_per_second(NonZeroU32::new(1_000));
 
         for (i, id) in ["a", "b"].into_iter().enumerate() {
             if i > 0 {
@@ -270,7 +270,7 @@ mod tests {
 
         const EXPECTED_DELAY: u64 = 900;
 
-        let prl = PutRateLimiter::new(InMemory::new(), Duration::from_mins(5))
+        let prl = PutRateLimiter::new(InMemory::new(), Duration::from_mins(5))?
             .with_rate_per_second(NonZeroU32::new(1));
 
         let location = Path::from("a");

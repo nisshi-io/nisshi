@@ -30,7 +30,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
+    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::{
@@ -40,7 +40,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
     to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
@@ -51,12 +51,13 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
-    ScramCredential, SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel, check_claim, producer_claim,
+    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, bounded_channel, check_claim, config::apply_op,
+    delete_records_cutoff, inflate, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -534,18 +535,94 @@ impl managed::Manager for ConnectionManager {
             .inspect(|_| CONNECT_DURATION.record(elapsed_millis(start), &[]))
     }
 
+    /// Rejects a connection still inside a transaction, for example one whose
+    /// rollback failed when its `Transaction` was dropped. Such a connection
+    /// holds SQLite's write lock. Rejecting it makes the pool drop it, which
+    /// closes the handle and rolls the transaction back, and hand out a fresh
+    /// connection instead.
     async fn recycle(
         &self,
-        _obj: &mut Self::Type,
+        obj: &mut Self::Type,
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<Self::Error> {
-        Ok(())
+        if obj.connection.is_autocommit() {
+            Ok(())
+        } else {
+            // deadpool discards a recycle error without logging it.
+            warn!("discarding a pooled connection left inside an open transaction");
+
+            Err(managed::RecycleError::message(
+                "connection is inside an open transaction",
+            ))
+        }
     }
 }
 
 pub(crate) type Pool = managed::Pool<ConnectionManager>;
 
 impl Delegate {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let c = self.connection().await?;
+        let tx = c.transaction().await?;
+
+        let topic = resource.resource_name.as_str();
+
+        if c.query_opt("topic_select_name.sql", (self.cluster.as_str(), topic))
+            .await?
+            .is_none()
+        {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        for config in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(config.config_operation)?;
+            let name = config.name.as_str();
+
+            let current = if matches!(op, OpType::Append | OpType::Subtract) {
+                c.query_opt(
+                    "topic_configuration_select_name.sql",
+                    (self.cluster.as_str(), topic, name),
+                )
+                .await?
+                .map(|row| row.get::<Option<String>>(0))
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+
+            match apply_op(
+                ConfigResource::Topic,
+                name,
+                current.as_deref(),
+                op,
+                config.value.as_deref(),
+            )? {
+                Some(value) => {
+                    _ = c
+                        .query_opt(
+                            "topic_configuration_upsert.sql",
+                            (self.cluster.as_str(), topic, name, value.as_str()),
+                        )
+                        .await?;
+                }
+
+                None => {
+                    _ = c
+                        .query_opt(
+                            "topic_configuration_delete.sql",
+                            (self.cluster.as_str(), topic, name),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        c.commit(tx).await
+    }
+
     #[instrument(skip_all)]
     async fn connection(&self) -> Result<managed::Object<ConnectionManager>> {
         let start = SystemTime::now();
@@ -678,6 +755,7 @@ impl Delegate {
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
+        inflated: inflated::Batch,
         connection: &PoolConnection,
     ) -> Result<i64> {
         let start = SystemTime::now();
@@ -708,10 +786,6 @@ impl Delegate {
         // re-deflates with the codec the producer used, as Kafka does with
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
-
-        let inflated = inflated::Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
-
-        debug!(after_inflate = elapsed_millis(start));
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -967,8 +1041,13 @@ impl Delegate {
                 .and_then(TryInto::try_into)
                 .inspect(|deflated| debug!(?deflated))?;
 
+            // A control batch holds one uncompressed record, so it is
+            // inflated inline. `inflate` would wait for a decode permit
+            // while this transaction holds the database write lock.
+            let inflated = inflated::Batch::try_from(&batch)?;
+
             let offset = self
-                .produce_in_tx(Some(transaction_id), &topition, batch, connection)
+                .produce_in_tx(Some(transaction_id), &topition, batch, inflated, connection)
                 .await?;
 
             debug!(offset, ?topition);
@@ -1335,19 +1414,23 @@ impl Delegate {
 
         let pc = self.connection().await?;
 
-        pc.execute(
-            "lite/policy_delete.sql",
-            (self.cluster.as_str(), now, retention_ms),
-        )
-        .await
-        .map(|deleted| deleted as u64)
-        .map_err(Into::into)
-        .inspect(|_| {
-            DELEGATE_REQUEST_DURATION.record(
-                elapsed_millis(start),
-                &[KeyValue::new("operation", "policy_delete")],
+        let by_age = pc
+            .execute(
+                "lite/policy_delete.sql",
+                (self.cluster.as_str(), now, retention_ms),
             )
-        })
+            .await?;
+
+        pc.execute("lite/policy_delete_bytes.sql", [self.cluster.as_str()])
+            .await
+            .map(|by_bytes| (by_age + by_bytes) as u64)
+            .map_err(Into::into)
+            .inspect(|_| {
+                DELEGATE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[KeyValue::new("operation", "policy_delete")],
+                )
+            })
     }
 
     async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {
@@ -2514,7 +2597,106 @@ impl Storage for Delegate {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(?topics);
-        todo!()
+
+        let pc = self.connection().await?;
+        let tx = pc.transaction().await?;
+
+        let mut responses = vec![];
+
+        for topic in topics {
+            let mut partition_responses = vec![];
+
+            if let Some(ref partitions) = topic.partitions {
+                for partition in partitions {
+                    let topition = Topition::new(topic.name.as_str(), partition.partition_index);
+
+                    let (error_code, low_watermark) =
+                        match self.watermark_select_for_update(&topition, &pc).await {
+                            Err(Error::Api(error_code)) => {
+                                (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            }
+                            Err(err) => return Err(err),
+
+                            Ok((low, high)) => {
+                                let stage = OffsetStage {
+                                    last_stable: high.unwrap_or_default(),
+                                    high_watermark: high.unwrap_or_default(),
+                                    log_start: low.unwrap_or_default(),
+                                };
+
+                                match delete_records_cutoff(partition.offset, &stage) {
+                                    Err(error_code) => {
+                                        (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                    }
+
+                                    Ok(cutoff) => {
+                                        // This keeps the record at `high_watermark - 1`, because
+                                        // `list_latest_offset_committed.sql` and
+                                        // `list_latest_offset_uncommitted.sql` answer `Latest` from
+                                        // that record. `list_latest_offset_committed.sql` also joins
+                                        // the record at an open transaction's `offset_start`, which
+                                        // this cut does not keep: a cut past that offset makes
+                                        // read_committed `Latest` answer the high watermark instead
+                                        // of the last stable offset. The watermark still advances
+                                        // to `cutoff`.
+                                        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
+
+                                        if physical_cutoff > stage.log_start {
+                                            _ = pc
+                                                .execute(
+                                                    "record_delete_by_offset.sql",
+                                                    (
+                                                        self.cluster.as_str(),
+                                                        topic.name.as_str(),
+                                                        partition.partition_index,
+                                                        physical_cutoff,
+                                                    ),
+                                                )
+                                                .await
+                                                .inspect_err(|err| {
+                                                    error!(?err, ?topition, physical_cutoff)
+                                                })?;
+                                        }
+
+                                        _ = pc
+                                            .execute(
+                                                "watermark_update.sql",
+                                                (
+                                                    self.cluster.as_str(),
+                                                    topic.name.as_str(),
+                                                    partition.partition_index,
+                                                    cutoff,
+                                                    high.unwrap_or_default(),
+                                                ),
+                                            )
+                                            .await
+                                            .inspect_err(|err| error!(?err, ?topition))?;
+
+                                        (ErrorCode::None, cutoff)
+                                    }
+                                }
+                            }
+                        };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
+                }
+            }
+
+            responses.push(
+                DeleteRecordsTopicResult::default()
+                    .name(topic.name.clone())
+                    .partitions(Some(partition_responses)),
+            );
+        }
+
+        pc.commit(tx).await.inspect_err(|err| error!(?err))?;
+
+        Ok(responses)
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
@@ -2606,56 +2788,10 @@ impl Storage for Delegate {
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
             ConfigResource::Topic => {
-                let mut error_code = ErrorCode::None;
-
-                for config in resource.configs.unwrap_or_default() {
-                    match OpType::try_from(config.config_operation)? {
-                        OpType::Set => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                "topic_configuration_upsert.sql",
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                    config.value.as_deref(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Delete => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                "topic_configuration_delete.sql",
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Append => todo!(),
-                        OpType::Subtract => todo!(),
-                    }
-                }
+                self.alter_topic(&resource).await?;
 
                 Ok(AlterConfigsResourceResponse::default()
-                    .error_code(error_code.into())
+                    .error_code(ErrorCode::None.into())
                     .error_message(Some("".into()))
                     .resource_type(resource.resource_type)
                     .resource_name(resource.resource_name))
@@ -2688,6 +2824,15 @@ impl Storage for Delegate {
     ) -> Result<i64> {
         let start = SystemTime::now();
 
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = inflate(deflated.clone())
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
+        debug!(after_inflate = elapsed_millis(start));
+
         let pc = self.connection().await?;
 
         let tx = pc.transaction().await.inspect(|_| {
@@ -2695,7 +2840,7 @@ impl Storage for Delegate {
         })?;
 
         let high = self
-            .produce_in_tx(transaction_id, topition, deflated, &pc)
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &pc)
             .await
             .inspect(|_| {
                 debug!(after_produce_in_tx = elapsed_millis(start));
@@ -3362,9 +3507,12 @@ impl Storage for Delegate {
                         .and_then(|offset| {
                             row.get_value(1)
                                 .map_err(Into::into)
-                                .and_then(LiteTimestamp::try_from)
-                                .map(SystemTime::from)
-                                .map(Some)
+                                .and_then(|value| match value {
+                                    Value::Null => Ok(None),
+                                    value => LiteTimestamp::try_from(value)
+                                        .map(SystemTime::from)
+                                        .map(Some),
+                                })
                                 .map(|timestamp| {
                                     debug!(
                                         cluster = self.cluster,
@@ -3472,33 +3620,13 @@ impl Storage for Delegate {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(0))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        0,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -3567,33 +3695,13 @@ impl Storage for Delegate {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(0))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        0,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -3662,31 +3770,13 @@ impl Storage for Delegate {
                         brokers.iter().map(|broker| broker.node_id).collect();
                     broker_ids.shuffle(&mut rng);
 
-                    let mut brokers = broker_ids.into_iter().cycle();
-
-                    let partitions = Some(
-                        (0..partitions)
-                            .map(|partition_index| {
-                                let leader_id = brokers.next().expect("cycling");
-
-                                let replica_nodes = Some(
-                                    (0..replication_factor)
-                                        .map(|_replica| brokers.next().expect("cycling"))
-                                        .collect(),
-                                );
-                                let isr_nodes = replica_nodes.clone();
-
-                                MetadataResponsePartition::default()
-                                    .error_code(error_code)
-                                    .partition_index(partition_index)
-                                    .leader_id(leader_id)
-                                    .leader_epoch(Some(0))
-                                    .replica_nodes(replica_nodes)
-                                    .isr_nodes(isr_nodes)
-                                    .offline_replicas(Some([].into()))
-                            })
-                            .collect(),
-                    );
+                    let partitions = Some(nisshi_storage::assign_replicas(
+                        &broker_ids,
+                        partitions,
+                        replication_factor,
+                        error_code,
+                        0,
+                    )?);
 
                     responses.push(
                         MetadataResponseTopic::default()
@@ -4657,7 +4747,7 @@ impl Storage for Delegate {
             }
 
             TxnAddPartitionsRequest::VersionFourPlus { .. } => {
-                todo!()
+                Err(Error::UnsupportedTxnAddPartitionsVersion)
             }
         }
     }
@@ -5067,9 +5157,10 @@ impl TryFrom<Value> for LiteTimestamp {
 mod tests {
     use std::thread;
 
+    use nisshi_sans_io::Compression;
     use nisshi_storage::{ArcDynStorage, StorageContainer};
-    use tempfile::tempdir;
-    use tokio::fs::remove_file;
+    use tempfile::{tempdir, tempdir_in};
+    use tokio::{fs::remove_file, task::yield_now};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -5648,6 +5739,117 @@ mod tests {
         Ok(())
     }
 
+    /// The storage URL has `?mode=direct`, so `produce` runs on the test
+    /// task itself, with no channel to another task in between.
+    ///
+    /// The test runtime has a single thread. If `produce` inflated the batch
+    /// inline, the produce task would decode and store it within its first
+    /// poll, so it would already be finished when `yield_now` returns.
+    /// Offloaded, it is still waiting on the decode.
+    #[tokio::test]
+    async fn produce_inflates_off_the_runtime_thread() -> Result<()> {
+        const RECORDS: usize = 1_000;
+        const RECORD_SIZE: usize = 1_024;
+
+        let _guard = init_tracing()?;
+
+        // The builder resolves the storage path against the current
+        // directory, so the database lives in a temporary directory there.
+        let current_dir = env::current_dir()?;
+        let temp_dir = tempdir_in(&current_dir).inspect(|temporary| debug!(?temporary))?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(&current_dir)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let storage = Url::parse(&format!("file:///{}?mode=direct", relative.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // Pseudo-random values, so gzip has real work to do on decode.
+        let mut seed = 0x2545_f491_u32;
+        let mut builder = inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+            )
+            .producer_id(-1)
+            .producer_epoch(-1)
+            .base_sequence(-1)
+            .last_offset_delta(RECORDS as i32 - 1);
+
+        for offset_delta in 0..RECORDS {
+            let value = (0..RECORD_SIZE)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect::<Bytes>();
+
+            builder = builder.record(
+                Record::builder()
+                    .value(value.into())
+                    .offset_delta(offset_delta as i32),
+            );
+        }
+
+        let batch: deflated::Batch = builder.build().and_then(TryInto::try_into)?;
+
+        let topition = Topition::new(topic, 0);
+
+        let produce = {
+            let engine = engine.clone();
+            let topition = topition.clone();
+
+            tokio::spawn(async move { engine.produce(None, &topition, batch).await })
+        };
+
+        yield_now().await;
+
+        assert!(
+            !produce.is_finished(),
+            "the batch was inflated on the runtime thread"
+        );
+
+        assert_eq!(0, produce.await??);
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     async fn clean_up() -> Result<()> {
         let relative = db_path().map(|path| format!("{path}*"))?;
@@ -5715,6 +5917,36 @@ mod tests {
             .expect("deflated txn batch")
     }
 
+    /// A crate-local database file that is removed, with its WAL and SHM
+    /// sidecars, when the guard is created and when it is dropped, including
+    /// on a panic.
+    ///
+    /// lite's `build()` resolves the URL path relative to the crate directory
+    /// (it strips the leading "/" and pushes onto cwd), so a test that reads
+    /// the database file itself uses a crate-local file. A tempdir does not
+    /// work here.
+    struct DbFileGuard(&'static str);
+
+    impl DbFileGuard {
+        fn new(db_file: &'static str) -> Self {
+            let guard = Self(db_file);
+            guard.remove();
+            guard
+        }
+
+        fn remove(&self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
+            }
+        }
+    }
+
+    impl Drop for DbFileGuard {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+
     /// An open (uncommitted) transaction must pin the read_committed last stable
     /// offset below the high watermark. Regressed when `offset_stage` read the
     /// high-watermark column instead of the stable-offset column, so
@@ -5725,25 +5957,8 @@ mod tests {
 
         let _guard = init_tracing()?;
 
-        // lite's build() resolves the URL path relative to the crate dir (it
-        // strips the leading "/" and pushes onto cwd), so use a crate-local db
-        // file. A tempdir won't work here. The guard removes the file (and its
-        // WAL/SHM sidecars) on drop -- including on panic -- so no artifacts are
-        // left behind, while the up-front removal keeps re-runs deterministic.
-        struct DbFileGuard(&'static str);
-        impl Drop for DbFileGuard {
-            fn drop(&mut self) {
-                for suffix in ["", "-wal", "-shm"] {
-                    let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
-                }
-            }
-        }
-
         let db_file = "read-committed-last-stable-offset-test.db";
-        let _db_file_guard = DbFileGuard(db_file);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{db_file}{suffix}"));
-        }
+        let _db_file_guard = DbFileGuard::new(db_file);
         let storage = Url::parse(&format!("file:///{db_file}"))?;
         let cluster = "nisshi";
         let node = 12321;
@@ -5813,6 +6028,158 @@ mod tests {
             stage.last_stable,
             stage.high_watermark,
         );
+
+        Ok(())
+    }
+
+    /// A DeleteRecords cut removes the rows below it from the `record` table
+    /// and keeps the row at `high_watermark - 1`. The watermark alone does
+    /// not show this, so the test counts the rows in the database file.
+    #[tokio::test]
+    async fn delete_records_removes_rows_below_the_cut() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic};
+
+        let _guard = init_tracing()?;
+
+        let db_file = "delete-records-removes-rows-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let storage = Url::parse(&format!("file:///{db_file}"))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+        let record_count = 6i64;
+
+        for n in 0..record_count {
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Some(Bytes::from(format!("record-{n}")))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        // the engine opened `file:///{db_file}` as `{cwd}/{db_file}`
+        let connection = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?;
+
+        // the stored rows, as (count, lowest offset), -1 when none remain
+        let stored_rows = async || -> Result<(i64, i64)> {
+            let mut rows = connection
+                .query(
+                    "select count(*), coalesce(min(offset_id), -1) from record",
+                    (),
+                )
+                .await?;
+
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| Error::Message(String::from("no count row")))?;
+
+            Ok((row.get::<i64>(0)?, row.get::<i64>(1)?))
+        };
+
+        let delete_up_to = async |offset: i64| -> Result<(ErrorCode, i64)> {
+            let results = engine
+                .delete_records(&[DeleteRecordsTopic::default()
+                    .name("t".into())
+                    .partitions(Some(
+                        [DeleteRecordsPartition::default()
+                            .partition_index(0)
+                            .offset(offset)]
+                        .into(),
+                    ))])
+                .await?;
+
+            let partitions = results[0].partitions.clone().unwrap_or_default();
+
+            Ok((
+                ErrorCode::try_from(partitions[0].error_code)?,
+                partitions[0].low_watermark,
+            ))
+        };
+
+        assert_eq!((record_count, 0), stored_rows().await?);
+
+        let cutoff = 3;
+        assert_eq!((ErrorCode::None, cutoff), delete_up_to(cutoff).await?);
+        assert_eq!((record_count - cutoff, cutoff), stored_rows().await?);
+
+        // a cut to the high watermark keeps the row at `high_watermark - 1`
+        assert_eq!((ErrorCode::None, record_count), delete_up_to(-1).await?);
+        assert_eq!((1, record_count - 1), stored_rows().await?);
+
+        Ok(())
+    }
+
+    /// A connection returned to the pool inside an open transaction holds
+    /// SQLite's write lock. The pool discards it on its next checkout of that
+    /// object, not on return: `recycle` rejects it, dropping it closes the
+    /// handle and rolls the transaction back, and the pool hands out a fresh
+    /// connection instead. Until that checkout, a writer that pops another
+    /// idle connection first can still see `SQLITE_BUSY` (the queue is FIFO,
+    /// so this is bounded by the number of idle connections ahead of it).
+    #[tokio::test]
+    async fn pool_discards_connection_left_in_open_transaction() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let db = libsql::Builder::new_local(temp_dir.path().join("nisshi.db"))
+            .build()
+            .await?;
+
+        let pool = Pool::builder(ConnectionManager {
+            db: Arc::new(Mutex::new(db)),
+            busy_timeout: Duration::from_millis(100),
+        })
+        .build()?;
+
+        {
+            let stale = pool.get().await?;
+            _ = stale.connection.execute("BEGIN IMMEDIATE", ()).await?;
+            assert!(!stale.connection.is_autocommit());
+        }
+
+        let next = pool.get().await?;
+        assert!(next.connection.is_autocommit());
+        assert_eq!(0, managed::Object::metrics(&next).recycle_count);
+        assert_eq!(1, pool.status().size);
+
+        let other = pool.get().await?;
+        let tx = other.transaction().await?;
+        other.commit(tx).await?;
 
         Ok(())
     }

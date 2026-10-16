@@ -66,11 +66,11 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-assert_matches.workspace = true
 criterion.workspace = true
 dotenv.workspace = true
 pretty_assertions.workspace = true
 nisshi-schema.workspace = true
+opentelemetry_sdk.workspace = true
 tempfile.workspace = true
 time.workspace = true
 tracing-subscriber.workspace = true

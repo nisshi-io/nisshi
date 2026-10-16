@@ -18,9 +18,8 @@ use nisshi_sans_io::{
     DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest, DescribeClusterRequest,
     DescribeConfigsRequest, DescribeGroupsRequest, DescribeTopicPartitionsRequest,
     DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
-    GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest, InitProducerIdRequest,
-    ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
-    ProduceRequest, TxnOffsetCommitRequest,
+    IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
+    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
 use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
 use nisshi_storage::{
@@ -28,10 +27,10 @@ use nisshi_storage::{
     CreateTopicsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
+    FindCoordinatorService, IncrementalAlterConfigsService, InitProducerIdService,
+    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
+    ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService,
 };
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
@@ -61,7 +60,6 @@ where
         describe_user_scram_credentials,
         fetch,
         find_coordinator,
-        get_telemetry_subscriptions,
         incremental_alter_configs,
         init_producer_id,
         list_groups,
@@ -426,15 +424,7 @@ where
     S: Storage,
 {
     builder
-        .with_route(
-            ListOffsetsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<ListOffsetsRequest>::new(),
-            )
-                .into_layer(ListOffsetsService { storage })
-                .boxed(),
-        )
+        .with_capped_route::<ListOffsetsRequest, _>(ListOffsetsService { storage })
         .map_err(Into::into)
 }
 
@@ -486,35 +476,7 @@ where
     S: Storage,
 {
     builder
-        .with_route(
-            ProduceRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<ProduceRequest>::new(),
-            )
-                .into_layer(ProduceService { storage })
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
-pub fn get_telemetry_subscriptions<S>(
-    builder: FrameRouteBuilder<Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<Error>, Error>
-where
-    S: Storage,
-{
-    builder
-        .with_route(
-            GetTelemetrySubscriptionsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<GetTelemetrySubscriptionsRequest>::new(),
-            )
-                .into_layer(GetTelemetrySubscriptionsService { storage })
-                .boxed(),
-        )
+        .with_capped_route::<ProduceRequest, _>(ProduceService { storage })
         .map_err(Into::into)
 }
 
@@ -546,15 +508,7 @@ where
     S: Storage,
 {
     builder
-        .with_route(
-            AddPartitionsToTxnRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<AddPartitionsToTxnRequest>::new(),
-            )
-                .into_layer(TxnAddPartitionService { storage })
-                .boxed(),
-        )
+        .with_capped_route::<AddPartitionsToTxnRequest, _>(TxnAddPartitionService { storage })
         .map_err(Into::into)
 }
 

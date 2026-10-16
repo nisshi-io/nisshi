@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 mod common;
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
@@ -33,7 +34,6 @@ pub mod describe_topic_partitions;
 pub mod fetch;
 pub mod fetch_wire;
 pub mod find_coordinator;
-pub mod get_telemetry_subscriptions;
 pub mod group_cache_miss;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;
@@ -43,6 +43,7 @@ pub mod list_offsets;
 pub mod log_redaction;
 pub mod metadata;
 pub mod new_cg;
+pub mod offset_fetch_storage_error;
 pub mod person;
 pub mod pg_init_producer;
 pub mod pg_txn;
@@ -52,7 +53,11 @@ pub mod pre_authentication_frame_size;
 pub mod produce;
 pub mod produce_acks_zero;
 pub mod produce_fetch;
+pub mod produce_invalid_record;
+pub mod produce_post_write_advance_failed;
+pub mod retention_bytes;
 pub mod sasl_scram_enforcement;
+pub mod startup_failure;
 pub mod storage_describe_cluster;
 pub mod storage_describe_configs;
 pub mod storage_fetch;
@@ -62,9 +67,15 @@ pub mod storage_options;
 pub mod tls;
 pub mod topic;
 pub mod topic_lifecycle;
+pub mod traceforge_delete_topic_object_store_fault;
+pub mod traceforge_group_join;
+pub mod traceforge_offset_commit;
+pub mod traceforge_produce_idempotent;
+pub mod traceforge_produce_object_store_fault;
 pub mod txn;
 pub mod unauthenticated;
 pub mod update_group_conditional;
+pub mod version_gate;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a
 // `pub mod` line would never compile or run. Fail instead of skipping it silently.

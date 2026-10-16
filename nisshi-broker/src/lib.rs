@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::{
     collections::HashMap,
     env::vars,
@@ -101,6 +102,8 @@ pub enum Error {
     Pattern(Arc<PatternError>),
     Poison,
 
+    ProgressStyleTemplate(Arc<indicatif::style::TemplateError>),
+
     Regex(#[from] regex::Error),
 
     SchemaRegistry(Arc<nisshi_schema::Error>),
@@ -135,6 +138,12 @@ impl From<SendError<CancelKind>> for Error {
 impl From<hyper::http::Error> for Error {
     fn from(value: hyper::http::Error) -> Self {
         Self::Hyper(Arc::new(value))
+    }
+}
+
+impl From<indicatif::style::TemplateError> for Error {
+    fn from(value: indicatif::style::TemplateError) -> Self {
+        Self::ProgressStyleTemplate(Arc::new(value))
     }
 }
 

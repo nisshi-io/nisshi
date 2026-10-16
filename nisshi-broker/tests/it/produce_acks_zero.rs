@@ -314,7 +314,8 @@ where
     let frame = round_trip(
         stream,
         ListOffsetsRequest::KEY,
-        7,
+        // The highest version the broker advertises for ListOffsets.
+        6,
         2,
         ListOffsetsRequest::default()
             .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))

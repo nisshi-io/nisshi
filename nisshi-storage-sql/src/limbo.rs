@@ -37,7 +37,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
+    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::{
@@ -47,7 +47,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
     to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
@@ -58,10 +58,11 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
     producer_claim,
 };
 use opentelemetry::{
@@ -184,6 +185,80 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let mut connection = self.connection().await?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+
+        let topic = resource.resource_name.as_str();
+
+        if tx
+            .query(
+                &sql_lookup("topic_select_name.sql")?,
+                (self.cluster.as_str(), topic),
+            )
+            .await?
+            .next()
+            .await?
+            .is_none()
+        {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        for config in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(config.config_operation)?;
+            let name = config.name.as_str();
+
+            let current = if matches!(op, OpType::Append | OpType::Subtract) {
+                tx.query(
+                    &sql_lookup("topic_configuration_select_name.sql")?,
+                    (self.cluster.as_str(), topic, name),
+                )
+                .await?
+                .next()
+                .await?
+                .map(|row| row.get_value(0).map(|value| value.as_text().cloned()))
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+
+            match apply_op(
+                ConfigResource::Topic,
+                name,
+                current.as_deref(),
+                op,
+                config.value.as_deref(),
+            )? {
+                Some(value) => {
+                    _ = tx
+                        .query(
+                            &sql_lookup("topic_configuration_upsert.sql")?,
+                            (self.cluster.as_str(), topic, name, value.as_str()),
+                        )
+                        .await?
+                        .next()
+                        .await?;
+                }
+
+                None => {
+                    _ = tx
+                        .execute(
+                            &sql_lookup("topic_configuration_delete.sql")?,
+                            (self.cluster.as_str(), topic, name),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(Into::into)
+    }
+
     pub fn builder()
     -> Builder<PhantomData<String>, PhantomData<i32>, PhantomData<Url>, PhantomData<Url>> {
         Builder::default()
@@ -486,6 +561,7 @@ impl Engine {
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
+        inflated: inflated::Batch,
         tx: &Transaction<'conn>,
     ) -> Result<i64> {
         debug!(cluster = ?self.cluster, ?transaction_id, ?topition, ?deflated);
@@ -509,8 +585,6 @@ impl Engine {
         // re-deflates with the codec the producer used, as Kafka does with
         // compression.type=producer.
         let produced_attributes = BatchAttribute::try_from(deflated.attributes).map(i16::from)?;
-
-        let inflated = inflated::Batch::try_from(deflated).inspect_err(|err| debug!(?err))?;
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
@@ -718,8 +792,13 @@ impl Engine {
                 .and_then(TryInto::try_into)
                 .inspect(|deflated| debug!(?deflated))?;
 
+            // A control batch holds one uncompressed record, so it is
+            // inflated inline. `inflate` would wait for a decode permit
+            // while this transaction holds the database write lock.
+            let inflated = inflated::Batch::try_from(&batch)?;
+
             let offset = self
-                .produce_in_tx(Some(transaction_id), &topition, batch, tx)
+                .produce_in_tx(Some(transaction_id), &topition, batch, inflated, tx)
                 .await?;
 
             debug!(offset, ?topition);
@@ -1073,9 +1152,12 @@ impl Builder<String, i32, Url, Url> {
 
         debug!(?path);
 
-        let db = turso::Builder::new_local(path.to_str().unwrap())
-            .build()
-            .await?;
+        let db = turso::Builder::new_local(
+            path.to_str()
+                .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?,
+        )
+        .build()
+        .await?;
 
         let connection = db.connect()?;
 
@@ -1180,9 +1262,13 @@ impl Storage for Engine {
                 .inspect(|row| debug!(?parameters, ?row))
                 .and_then(|row| {
                     row.get_value(0)
-                        .map(|value| value.as_text().cloned().unwrap())
-                        .inspect_err(|err| error!(?err))
                         .map_err(Into::into)
+                        .and_then(|value| {
+                            value.as_text().cloned().ok_or_else(|| {
+                                Error::Message("expected a text column value".into())
+                            })
+                        })
+                        .inspect_err(|err| error!(?err))
                 })
                 .and_then(|id| Uuid::parse_str(id.as_str()).map_err(Into::into))
         }
@@ -1233,7 +1319,110 @@ impl Storage for Engine {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(?topics);
-        todo!()
+
+        let mut connection = self.connection().await?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+
+        let mut responses = vec![];
+
+        for topic in topics {
+            let mut partition_responses = vec![];
+
+            if let Some(ref partitions) = topic.partitions {
+                for partition in partitions {
+                    let topition = Topition::new(topic.name.as_str(), partition.partition_index);
+
+                    let (error_code, low_watermark) =
+                        match self.watermark_select_for_update(&topition, &tx).await {
+                            Err(Error::Api(error_code)) => {
+                                (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            }
+                            Err(err) => return Err(err),
+
+                            Ok((low, high)) => {
+                                let stage = OffsetStage {
+                                    last_stable: high.unwrap_or_default(),
+                                    high_watermark: high.unwrap_or_default(),
+                                    log_start: low.unwrap_or_default(),
+                                };
+
+                                match delete_records_cutoff(partition.offset, &stage) {
+                                    Err(error_code) => {
+                                        (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                    }
+
+                                    Ok(cutoff) => {
+                                        // This keeps the record at `high_watermark - 1`, because
+                                        // `list_latest_offset_committed.sql` and
+                                        // `list_latest_offset_uncommitted.sql` answer `Latest` from
+                                        // that record. `list_latest_offset_committed.sql` also joins
+                                        // the record at an open transaction's `offset_start`, which
+                                        // this cut does not keep: a cut past that offset makes
+                                        // read_committed `Latest` answer the high watermark instead
+                                        // of the last stable offset. The watermark still advances
+                                        // to `cutoff`.
+                                        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
+
+                                        if physical_cutoff > stage.log_start {
+                                            _ = self
+                                                .prepare_execute(
+                                                    &tx,
+                                                    &sql_lookup("record_delete_by_offset.sql")?,
+                                                    (
+                                                        self.cluster.as_str(),
+                                                        topic.name.as_str(),
+                                                        partition.partition_index,
+                                                        physical_cutoff,
+                                                    ),
+                                                )
+                                                .await
+                                                .inspect_err(|err| {
+                                                    error!(?err, ?topition, physical_cutoff)
+                                                })?;
+                                        }
+
+                                        _ = self
+                                            .prepare_execute(
+                                                &tx,
+                                                &sql_lookup("watermark_update.sql")?,
+                                                (
+                                                    self.cluster.as_str(),
+                                                    topic.name.as_str(),
+                                                    partition.partition_index,
+                                                    cutoff,
+                                                    high.unwrap_or_default(),
+                                                ),
+                                            )
+                                            .await
+                                            .inspect_err(|err| error!(?err, ?topition))?;
+
+                                        (ErrorCode::None, cutoff)
+                                    }
+                                }
+                            }
+                        };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
+                }
+            }
+
+            responses.push(
+                DeleteRecordsTopicResult::default()
+                    .name(topic.name.clone())
+                    .partitions(Some(partition_responses)),
+            );
+        }
+
+        tx.commit().await.inspect_err(|err| error!(?err))?;
+
+        Ok(responses)
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
@@ -1332,56 +1521,10 @@ impl Storage for Engine {
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
             ConfigResource::Topic => {
-                let mut error_code = ErrorCode::None;
-
-                for config in resource.configs.unwrap_or_default() {
-                    match OpType::try_from(config.config_operation)? {
-                        OpType::Set => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                &sql_lookup("topic_configuration_upsert.sql")?,
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                    config.value.as_deref(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Delete => {
-                            let c = self.connection().await?;
-
-                            if c.query(
-                                &sql_lookup("topic_configuration_delete.sql")?,
-                                (
-                                    self.cluster.as_str(),
-                                    resource.resource_name.as_str(),
-                                    config.name.as_str(),
-                                ),
-                            )
-                            .await
-                            .inspect_err(|err| error!(?err))
-                            .is_err()
-                            {
-                                error_code = ErrorCode::UnknownServerError;
-                                break;
-                            }
-                        }
-                        OpType::Append => todo!(),
-                        OpType::Subtract => todo!(),
-                    }
-                }
+                self.alter_topic(&resource).await?;
 
                 Ok(AlterConfigsResourceResponse::default()
-                    .error_code(error_code.into())
+                    .error_code(ErrorCode::None.into())
                     .error_message(Some("".into()))
                     .resource_type(resource.resource_type)
                     .resource_name(resource.resource_name))
@@ -1402,13 +1545,20 @@ impl Storage for Engine {
     ) -> Result<i64> {
         debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
 
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = inflate(deflated.clone())
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
         let mut connection = self.connection().await?;
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
 
         let high = self
-            .produce_in_tx(transaction_id, topition, deflated, &tx)
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
             .await?;
 
         tx.commit().await.map_err(Into::into).and(Ok(high))
@@ -2065,9 +2215,12 @@ impl Storage for Engine {
                         .and_then(|offset| {
                             row.get_value(1)
                                 .map_err(Into::into)
-                                .and_then(LiteTimestamp::try_from)
-                                .map(SystemTime::from)
-                                .map(Some)
+                                .and_then(|value| match value {
+                                    Value::Null => Ok(None),
+                                    value => LiteTimestamp::try_from(value)
+                                        .map(SystemTime::from)
+                                        .map(Some),
+                                })
                                 .map(|timestamp| {
                                     debug!(
                                         cluster = self.cluster,
@@ -2189,33 +2342,13 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -2316,33 +2449,13 @@ impl Storage for Engine {
                                         brokers.iter().map(|broker| broker.node_id).collect();
                                     broker_ids.shuffle(&mut rng);
 
-                                    let mut brokers = broker_ids.into_iter().cycle();
-
-                                    let partitions = Some(
-                                        (0..partitions)
-                                            .map(|partition_index| {
-                                                let leader_id = brokers.next().expect("cycling");
-
-                                                let replica_nodes = Some(
-                                                    (0..replication_factor)
-                                                        .map(|_replica| {
-                                                            brokers.next().expect("cycling")
-                                                        })
-                                                        .collect(),
-                                                );
-                                                let isr_nodes = replica_nodes.clone();
-
-                                                MetadataResponsePartition::default()
-                                                    .error_code(error_code)
-                                                    .partition_index(partition_index)
-                                                    .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
-                                                    .replica_nodes(replica_nodes)
-                                                    .isr_nodes(isr_nodes)
-                                                    .offline_replicas(Some([].into()))
-                                            })
-                                            .collect(),
-                                    );
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
@@ -2442,31 +2555,13 @@ impl Storage for Engine {
                         brokers.iter().map(|broker| broker.node_id).collect();
                     broker_ids.shuffle(&mut rng);
 
-                    let mut brokers = broker_ids.into_iter().cycle();
-
-                    let partitions = Some(
-                        (0..partitions)
-                            .map(|partition_index| {
-                                let leader_id = brokers.next().expect("cycling");
-
-                                let replica_nodes = Some(
-                                    (0..replication_factor)
-                                        .map(|_replica| brokers.next().expect("cycling"))
-                                        .collect(),
-                                );
-                                let isr_nodes = replica_nodes.clone();
-
-                                MetadataResponsePartition::default()
-                                    .error_code(error_code)
-                                    .partition_index(partition_index)
-                                    .leader_id(leader_id)
-                                    .leader_epoch(Some(-1))
-                                    .replica_nodes(replica_nodes)
-                                    .isr_nodes(isr_nodes)
-                                    .offline_replicas(Some([].into()))
-                            })
-                            .collect(),
-                    );
+                    let partitions = Some(nisshi_storage::assign_replicas(
+                        &broker_ids,
+                        partitions,
+                        replication_factor,
+                        error_code,
+                        -1,
+                    )?);
 
                     responses.push(
                         MetadataResponseTopic::default()
@@ -3530,7 +3625,7 @@ impl Storage for Engine {
             }
 
             TxnAddPartitionsRequest::VersionFourPlus { .. } => {
-                todo!()
+                Err(Error::UnsupportedTxnAddPartitionsVersion)
             }
         }
     }
@@ -4240,6 +4335,102 @@ mod tests {
 
     #[ignore]
     #[tokio::test]
+    async fn incremental_alter_resource() -> Result<()> {
+        use nisshi_sans_io::incremental_alter_configs_request::AlterableConfig;
+
+        let _guard = init_tracing()?;
+
+        // The engine resolves the path of its URL against the working
+        // directory, so the database lives in a temporary directory there.
+        let temp_dir =
+            tempfile::tempdir_in(env::current_dir()?).inspect(|temporary| debug!(?temporary))?;
+        let relative = temp_dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+
+        let storage = Url::parse(&format!("file:///{relative}/nisshi.db"))?;
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+        let cleanup_policy = "cleanup.policy";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let alter = |name: &str, op: OpType, value: &str| {
+            AlterConfigsResource::default()
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name(name.to_owned())
+                .configs(Some(vec![
+                    AlterableConfig::default()
+                        .name(cleanup_policy.to_owned())
+                        .config_operation(op.into())
+                        .value(Some(value.to_owned())),
+                ]))
+        };
+
+        for (op, value, expected) in [
+            (OpType::Append, "compact", "compact"),
+            (OpType::Append, "delete", "compact,delete"),
+            (OpType::Subtract, "compact", "delete"),
+        ] {
+            let response = engine
+                .incremental_alter_resource(alter(topic, op, value))
+                .await?;
+            assert_eq!(i16::from(ErrorCode::None), response.error_code);
+
+            let described = engine
+                .describe_config(
+                    topic,
+                    ConfigResource::Topic,
+                    Some(&[cleanup_policy.to_owned()]),
+                )
+                .await?;
+            let configs = described.configs.unwrap_or_default();
+            assert_eq!(1, configs.len());
+            assert_eq!(Some(expected), configs[0].value.as_deref());
+        }
+
+        assert!(matches!(
+            engine
+                .incremental_alter_resource(alter("missing", OpType::Append, "compact"))
+                .await,
+            Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
+        ));
+
+        Ok(())
+    }
+
+    #[ignore]
+    #[tokio::test]
     async fn produce() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -4381,6 +4572,306 @@ mod tests {
             stage.last_stable,
             stage.high_watermark,
         );
+
+        Ok(())
+    }
+
+    /// `#[ignore]`d like every other engine-level test here: turso/limbo
+    /// cannot yet run the full produce flow in CI. Run manually against
+    /// turso with `cargo nextest run --features turso -- --ignored`.
+    #[ignore]
+    #[tokio::test]
+    async fn delete_records_advances_log_start() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let file_path = temp_dir.path().join("nisshi.db");
+
+        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        let record_count = 6;
+        for n in 0..record_count {
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Some(Bytes::from(format!("record-{n}")))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        let cutoff = 3;
+
+        let results = engine
+            .delete_records(&[DeleteRecordsTopic::default()
+                .name("t".into())
+                .partitions(Some(
+                    [DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(cutoff)]
+                    .into(),
+                ))])
+            .await?;
+
+        assert_eq!(1, results.len());
+        let partitions = results[0].partitions.clone().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(cutoff, partitions[0].low_watermark);
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(cutoff, stage.log_start);
+        assert_eq!(record_count, stage.high_watermark);
+
+        Ok(())
+    }
+
+    /// `offset == -1` ("delete everything up to the high watermark") must
+    /// never remove the active batch holding `high_watermark - 1`: the log
+    /// start catches up to the high watermark, but the high watermark
+    /// itself, and hence `ListOffsets(Latest)`, is unaffected.
+    ///
+    /// `#[ignore]`d like every other engine-level test here: turso/limbo
+    /// cannot yet run the full produce flow in CI. Run manually against
+    /// turso with `cargo nextest run --features turso -- --ignored`.
+    #[ignore]
+    #[tokio::test]
+    async fn delete_records_to_high_watermark_keeps_latest() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let file_path = temp_dir.path().join("nisshi.db");
+
+        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        let record_count = 6;
+        for n in 0..record_count {
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Some(Bytes::from(format!("record-{n}")))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        let results = engine
+            .delete_records(&[DeleteRecordsTopic::default()
+                .name("t".into())
+                .partitions(Some(
+                    [DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(-1)]
+                    .into(),
+                ))])
+            .await?;
+
+        let partitions = results[0].partitions.clone().unwrap_or_default();
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(record_count, partitions[0].low_watermark);
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(record_count, stage.log_start);
+        assert_eq!(
+            record_count, stage.high_watermark,
+            "the active batch holding high_watermark - 1 must survive a -1 delete"
+        );
+
+        // `offset_stage` reads the watermark only, so these check the
+        // records: `Latest` needs the record at `high_watermark - 1`, and
+        // `Earliest` must answer the log start and not that record.
+        let offsets = engine
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[
+                    (topition.clone(), ListOffsetRequest::Latest),
+                    (topition.clone(), ListOffsetRequest::Earliest),
+                ],
+            )
+            .await?;
+
+        assert_eq!(Some(record_count), offsets[0].1.offset, "{offsets:?}");
+        assert_eq!(Some(record_count), offsets[1].1.offset, "{offsets:?}");
+
+        Ok(())
+    }
+
+    /// An unknown topic in a `DeleteRecords` request must never fail the
+    /// whole call: it reports `UnknownTopicOrPartition` for that one
+    /// partition while a sibling topic in the same request still succeeds.
+    ///
+    /// `#[ignore]`d like every other engine-level test here: turso/limbo
+    /// cannot yet run the full produce flow in CI. Run manually against
+    /// turso with `cargo nextest run --features turso -- --ignored`.
+    #[ignore]
+    #[tokio::test]
+    async fn delete_records_unknown_topic_does_not_fail_sibling() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let file_path = temp_dir.path().join("nisshi.db");
+
+        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        let batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from_static(b"one"))))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = engine.produce(None, &topition, batch).await?;
+
+        let results = engine
+            .delete_records(&[
+                DeleteRecordsTopic::default()
+                    .name("missing".into())
+                    .partitions(Some(
+                        [DeleteRecordsPartition::default()
+                            .partition_index(0)
+                            .offset(0)]
+                        .into(),
+                    )),
+                DeleteRecordsTopic::default()
+                    .name("t".into())
+                    .partitions(Some(
+                        [DeleteRecordsPartition::default()
+                            .partition_index(0)
+                            .offset(1)]
+                        .into(),
+                    )),
+            ])
+            .await?;
+
+        assert_eq!(2, results.len());
+
+        let missing = results
+            .iter()
+            .find(|topic| topic.name == "missing")
+            .expect("missing topic result");
+        let missing_partitions = missing.partitions.clone().unwrap_or_default();
+        assert_eq!(
+            ErrorCode::UnknownTopicOrPartition,
+            ErrorCode::try_from(missing_partitions[0].error_code)?
+        );
+
+        let known = results
+            .iter()
+            .find(|topic| topic.name == "t")
+            .expect("known topic result");
+        let known_partitions = known.partitions.clone().unwrap_or_default();
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(known_partitions[0].error_code)?
+        );
+        assert_eq!(1, known_partitions[0].low_watermark);
 
         Ok(())
     }

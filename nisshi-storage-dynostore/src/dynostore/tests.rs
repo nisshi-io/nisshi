@@ -25,8 +25,12 @@ use tracing_subscriber::EnvFilter;
 
 use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
+mod delete_records;
 mod latency;
+mod list_offsets;
 mod ping;
+mod post_write_failure_reason;
+mod produce_topic_guard;
 mod stale_watermark;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
@@ -167,7 +171,7 @@ fn decode_group_segment_rejects_invalid_utf8() {
 /// `Path::from(format!(..))` from these templates.
 #[test]
 fn group_keys_are_stable_for_ids_without_a_slash() -> Result<()> {
-    let storage = DynoStore::new("c", 111, InMemory::new());
+    let storage = DynoStore::new("c", 111, InMemory::new())?;
     let topition = Topition::new("t", 3);
 
     assert_eq!(
@@ -203,7 +207,7 @@ fn group_keys_are_stable_for_ids_without_a_slash() -> Result<()> {
 /// keeps the committed offset key it had, which `delete_topic` matches on.
 #[test]
 fn committed_offset_key_keeps_the_topic_segment_rule() -> Result<()> {
-    let storage = DynoStore::new("c", 111, InMemory::new());
+    let storage = DynoStore::new("c", 111, InMemory::new())?;
 
     for topic in ["t", "a/b", "a#b", "café"] {
         assert_eq!(
@@ -214,5 +218,56 @@ fn committed_offset_key_keeps_the_topic_segment_rule() -> Result<()> {
             "committed offset key moved for topic {topic:?}"
         );
     }
+    Ok(())
+}
+
+/// Checked-in version of the serde-compatibility claim in
+/// [`super::Watermark::time_index`]'s doc comment: every shape of
+/// pre-time-index watermark document on disk decodes cleanly into the
+/// current [`super::Watermark`], with an empty, incomplete time index.
+#[test]
+fn watermark_decodes_pre_time_index_documents() -> Result<()> {
+    use super::{Watermark, time_index::TimeIndex};
+
+    // Every watermark document written before the time index has
+    // `timestamps` explicitly `null`.
+    let null_timestamps: Watermark =
+        serde_json::from_str(r#"{"low":6,"high":66,"timestamps":null}"#)?;
+    assert_eq!(Some(6), null_timestamps.low);
+    assert_eq!(Some(66), null_timestamps.high);
+    assert_eq!(TimeIndex::default(), null_timestamps.time_index);
+    assert!(!null_timestamps.time_index.is_complete());
+
+    // Documents written before the `timestamps` key existed at all lack it
+    // entirely.
+    let key_omitted: Watermark = serde_json::from_str(r#"{"low":6,"high":66}"#)?;
+    assert_eq!(Some(6), key_omitted.low);
+    assert_eq!(Some(66), key_omitted.high);
+    assert_eq!(TimeIndex::default(), key_omitted.time_index);
+
+    // The current code writes no `timestamps` key, and a binary without the
+    // time index, whose watermark has the shape of `Legacy`, reads the
+    // document it writes.
+    #[derive(Deserialize)]
+    struct Legacy {
+        low: Option<i64>,
+        high: Option<i64>,
+        timestamps: Option<BTreeMap<i64, i64>>,
+    }
+
+    let written = serde_json::to_string(&Watermark {
+        low: Some(6),
+        high: Some(66),
+        time_index: TimeIndex::complete(),
+    })?;
+    assert!(!written.contains("timestamps"), "{written}");
+    let round_trip: Watermark = serde_json::from_str(&written)?;
+    assert!(round_trip.time_index.is_complete());
+    let legacy: Legacy = serde_json::from_str(&written)?;
+    assert_eq!(
+        (Some(6), Some(66), None),
+        (legacy.low, legacy.high, legacy.timestamps)
+    );
+
     Ok(())
 }

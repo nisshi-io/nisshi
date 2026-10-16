@@ -21,27 +21,34 @@ const PARTITION_LINE_PREFIX: &str = "partition: ";
 /// How `kafka-delete-records` starts the field that holds a partition's new low watermark.
 const LOW_WATERMARK_FIELD_PREFIX: &str = "low_watermark: ";
 
-/// The command of [`KafkaCli::delete_records_before`]'s [`Output`].
+/// The command of [`KafkaDeleteRecords::before`]'s [`Output`].
 #[derive(Clone, Copy, Debug)]
 pub enum DeleteRecords {}
 
-impl KafkaCli {
+/// Runs `kafka-delete-records` against the broker of a [`KafkaCli`].
+#[derive(Clone, Copy, Debug)]
+pub struct KafkaDeleteRecords<'cli> {
+    cli: &'cli KafkaCli,
+}
+
+impl<'cli> KafkaDeleteRecords<'cli> {
+    pub(super) fn new(cli: &'cli KafkaCli) -> Self {
+        Self { cli }
+    }
     /// Deletes the records of `topic`'s `partition` before `offset`. The tool prints a
     /// `partition: <topic>-<partition>\tlow_watermark: <offset>` line for the partition.
     ///
     /// Sends `DeleteRecords`.
-    pub fn delete_records_before(
-        &self,
-        topic: &str,
-        partition: u32,
-        offset: i64,
-    ) -> Output<DeleteRecords> {
+    #[track_caller]
+    pub fn before(&self, topic: &str, partition: u32, offset: i64) -> Output<DeleteRecords> {
         let offsets = format!(
             r#"{{"partitions":[{{"topic":"{topic}","partition":{partition},"offset":{offset}}}],"#
         ) + r#""version":1}"#;
-        let offset_json_file = self.write_file_in_container("delete-records", "json", &offsets);
+        let offset_json_file = self
+            .cli
+            .write_file_in_container("delete-records", "json", &offsets);
 
-        self.run(
+        self.cli.run(
             Tool::DeleteRecords,
             &["--offset-json-file", &offset_json_file],
         )

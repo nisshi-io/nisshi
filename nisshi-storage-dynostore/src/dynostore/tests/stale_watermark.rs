@@ -37,8 +37,8 @@ async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let bucket = Arc::new(InMemory::new());
-    let a = DynoStore::new("nisshi", 1, bucket.clone());
-    let b = DynoStore::new("nisshi", 2, bucket);
+    let a = DynoStore::new("nisshi", 1, bucket.clone())?;
+    let b = DynoStore::new("nisshi", 2, bucket)?;
 
     let name = "abc";
 

@@ -50,13 +50,16 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, producer_claim,
+    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
+    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
+    producer_claim,
 };
-use serde::Serialize;
-use tracing::{debug, warn};
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::time::sleep;
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::engine::Engine;
@@ -76,7 +79,76 @@ const RETENTION_MS: &str = "retention.ms";
 /// configuration, matching the PG engine.
 const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The number of times an alter of a topic's configuration tries to commit.
+const ALTER_ATTEMPTS: u32 = 8;
+
+/// The delay before an alter retries its first conflict. It doubles for each
+/// later conflict, so the alter waits about 1.3 seconds in all before it fails.
+const ALTER_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Decodes a stored committed offset key or value.
+///
+/// A committed offset that doesn't decode stays that way, so the error is
+/// `UNKNOWN_SERVER_ERROR`, which OffsetFetch reports to the client instead of
+/// a code that the client retries.
+fn decode_offset<T: DeserializeOwned>(encoded: &[u8]) -> Result<T> {
+    postcard::from_bytes(encoded)
+        .inspect_err(|err| error!(?err))
+        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+}
+
 impl Engine {
+    /// Applies every change in `resource` to its topic in one transaction, so
+    /// that a failed change leaves the topic's configuration unchanged.
+    async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
+        let tx = self
+            .db
+            .begin(slatedb::IsolationLevel::SerializableSnapshot)
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
+        let mut topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
+
+        let metadata = topics
+            .get_mut(&resource.resource_name[..])
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))?;
+
+        let mut configuration: BTreeMap<String, Option<String>> = metadata
+            .topic
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| (item.name.clone(), item.value.clone()))
+            .collect();
+
+        for change in resource.configs.as_deref().unwrap_or_default() {
+            let op = OpType::try_from(change.config_operation)?;
+            let current = configuration.get(&change.name).and_then(Option::as_deref);
+
+            match apply_op(
+                ConfigResource::Topic,
+                &change.name,
+                current,
+                op,
+                change.value.as_deref(),
+            )? {
+                Some(value) => _ = configuration.insert(change.name.clone(), Some(value)),
+                None => _ = configuration.remove(&change.name),
+            }
+        }
+
+        _ = metadata.topic.configs.replace(
+            configuration
+                .into_iter()
+                .map(|(key, value)| CreatableTopicConfig::default().name(key).value(value))
+                .collect(),
+        );
+
+        self.save_metadata(&tx, Self::TOPICS, &topics)?;
+        tx.commit().await.map_err(Error::from).and(Ok(()))
+    }
+
     fn topic_config<'a>(metadata: &'a TopicMetadata, name: &str) -> Option<&'a str> {
         metadata
             .topic
@@ -509,42 +581,11 @@ impl Storage for Engine {
                         if partition.partition_index < 0
                             || partition.partition_index >= metadata.topic.num_partitions
                         {
-                            (ErrorCode::UnknownTopicOrPartition, 0)
+                            (
+                                ErrorCode::UnknownTopicOrPartition,
+                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                            )
                         } else {
-                            // Delete batches below the specified offset
-                            let batch_prefix = postcard::to_stdvec(&BatchKeyPrefix::new(
-                                metadata.id,
-                                partition.partition_index,
-                            ))?;
-                            let scan_start = postcard::to_stdvec(&BatchKey::scan_from(
-                                metadata.id,
-                                partition.partition_index,
-                                0,
-                            ))?;
-
-                            let mut scan = self.db.scan(scan_start..).await?;
-                            while let Some(kv) = scan.next().await? {
-                                if !kv.key.starts_with(&batch_prefix) {
-                                    break;
-                                }
-
-                                let batch_key: BatchKey = match postcard::from_bytes(&kv.key) {
-                                    Ok(key) => key,
-                                    Err(_) => continue,
-                                };
-
-                                // Delete batches with offset < specified offset
-                                if batch_key.offset >= partition.offset {
-                                    break;
-                                }
-
-                                tx.delete(&kv.key)?;
-                            }
-
-                            // The new low watermark is the requested offset
-                            let new_low_watermark = partition.offset;
-
-                            // Update the watermark
                             let watermark_key = postcard::to_stdvec(&WatermarkKey::new(
                                 metadata.id,
                                 partition.partition_index,
@@ -559,20 +600,89 @@ impl Storage for Engine {
                                     },
                                 )?;
 
-                            watermark.low = Some(new_low_watermark);
+                            let high_watermark = watermark.high.unwrap_or(0);
+                            let log_start = watermark.low.unwrap_or(0);
 
-                            // Remove timestamps before the new low watermark
-                            if let Some(ref mut timestamps) = watermark.timestamps {
-                                timestamps.retain(|_, offset| *offset >= new_low_watermark);
+                            let stage = OffsetStage {
+                                last_stable: high_watermark,
+                                high_watermark,
+                                log_start,
+                            };
+
+                            match delete_records_cutoff(partition.offset, &stage) {
+                                Err(error_code) => {
+                                    (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                }
+
+                                Ok(cutoff) => {
+                                    if cutoff > log_start {
+                                        // A batch key holds the base offset of the batch,
+                                        // and not its end offset. A batch ends before the
+                                        // base offset of the next batch, so this deletes a
+                                        // batch when the next batch's base offset is at or
+                                        // below the cutoff, without decoding either batch.
+                                        // A batch that straddles the cutoff stays whole.
+                                        // The last batch has no successor, so this never
+                                        // deletes it. That batch holds `high_watermark - 1`.
+                                        let batch_prefix =
+                                            postcard::to_stdvec(&BatchKeyPrefix::new(
+                                                metadata.id,
+                                                partition.partition_index,
+                                            ))?;
+                                        let scan_start =
+                                            postcard::to_stdvec(&BatchKey::scan_from(
+                                                metadata.id,
+                                                partition.partition_index,
+                                                0,
+                                            ))?;
+
+                                        let mut previous: Option<Bytes> = None;
+
+                                        let mut scan = self.db.scan(scan_start..).await?;
+                                        while let Some(kv) = scan.next().await? {
+                                            if !kv.key.starts_with(&batch_prefix) {
+                                                break;
+                                            }
+
+                                            let Ok(batch_key) =
+                                                postcard::from_bytes::<BatchKey>(&kv.key)
+                                            else {
+                                                continue;
+                                            };
+
+                                            if batch_key.offset > cutoff {
+                                                break;
+                                            }
+
+                                            if let Some(key) = previous.replace(kv.key) {
+                                                tx.delete(&key)?;
+                                            }
+
+                                            if batch_key.offset == cutoff {
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    watermark.low = Some(cutoff);
+
+                                    // Remove timestamps before the new low watermark
+                                    if let Some(ref mut timestamps) = watermark.timestamps {
+                                        timestamps.retain(|_, offset| *offset >= cutoff);
+                                    }
+
+                                    let watermark_value = postcard::to_stdvec(&watermark)?;
+                                    tx.put(&watermark_key, watermark_value)?;
+
+                                    (ErrorCode::None, cutoff)
+                                }
                             }
-
-                            let watermark_value = postcard::to_stdvec(&watermark)?;
-                            tx.put(&watermark_key, watermark_value)?;
-
-                            (ErrorCode::None, new_low_watermark)
                         }
                     } else {
-                        (ErrorCode::UnknownTopicOrPartition, 0)
+                        (
+                            ErrorCode::UnknownTopicOrPartition,
+                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                        )
                     };
 
                     partition_results.push(
@@ -703,58 +813,28 @@ impl Storage for Engine {
     ) -> Result<AlterConfigsResourceResponse> {
         match ConfigResource::from(resource.resource_type) {
             ConfigResource::Topic => {
-                let tx = self
-                    .db
-                    .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                    .await
-                    .inspect_err(|err| debug!(?err))?;
+                // Every alter, create and delete of a topic rewrites the one
+                // TOPICS key, so concurrent writers conflict at commit. The
+                // alter retries a conflict with a growing delay, and gives up
+                // after ALTER_ATTEMPTS so that constant topic churn can't hold
+                // one request forever.
+                let mut delay = ALTER_RETRY_DELAY;
+                let mut attempt = 1;
 
-                let mut topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
-
-                if let Some(metadata) = topics.get_mut(&resource.resource_name[..]) {
-                    // Build current config map
-                    let mut configuration: BTreeMap<&str, Option<&str>> = metadata
-                        .topic
-                        .configs
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .fold(BTreeMap::new(), |mut acc, item| {
-                            _ = acc.insert(item.name.as_str(), item.value.as_deref());
-                            acc
-                        });
-
-                    // Apply changes
-                    for change in resource.configs.as_deref().unwrap_or_default() {
-                        match OpType::try_from(change.config_operation)? {
-                            OpType::Set => {
-                                _ = configuration
-                                    .insert(change.name.as_str(), change.value.as_deref());
-                            }
-                            OpType::Delete => {
-                                _ = configuration.remove(change.name.as_str());
-                            }
-                            OpType::Append | OpType::Subtract => {
-                                // Not implemented yet
-                                debug!("Append/Subtract operations not implemented");
-                            }
+                loop {
+                    match self.alter_topic(&resource).await {
+                        Err(Error::Slate(error))
+                            if error.kind() == slatedb::ErrorKind::Transaction
+                                && attempt < ALTER_ATTEMPTS =>
+                        {
+                            debug!(?error, attempt, resource = resource.resource_name);
+                            sleep(delay).await;
+                            delay *= 2;
+                            attempt += 1;
                         }
+
+                        otherwise => break otherwise?,
                     }
-
-                    // Convert back to configs vec
-                    _ = metadata.topic.configs.replace(
-                        configuration
-                            .into_iter()
-                            .map(|(key, value)| {
-                                CreatableTopicConfig::default()
-                                    .name(key.to_owned())
-                                    .value(value.map(|v| v.to_owned()))
-                            })
-                            .collect(),
-                    );
-
-                    self.save_metadata(&tx, Self::TOPICS, &topics)?;
-                    _ = tx.commit().await.map_err(Error::from)?;
                 }
 
                 Ok(AlterConfigsResourceResponse::default()
@@ -778,6 +858,15 @@ impl Storage for Engine {
         topition: &Topition,
         deflated: Batch,
     ) -> Result<i64> {
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not lengthen the optimistic
+        // transaction.
+        let inflated = if self.schemas.is_some() || self.lake.is_some() {
+            Some(inflate(deflated.clone()).await?)
+        } else {
+            None
+        };
+
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
@@ -795,13 +884,14 @@ impl Storage for Engine {
         }
 
         // Schema validation (if schemas registry is configured)
-        if let Some(ref schemas) = self.schemas {
-            let inflated = InflatedBatch::try_from(deflated.clone())?;
+        if let Some(ref schemas) = self.schemas
+            && let Some(ref inflated) = inflated
+        {
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             // Only validate non-control batches
             if !attributes.control {
-                schemas.validate(topition.topic(), &inflated).await?;
+                schemas.validate(topition.topic(), inflated).await?;
             }
         }
 
@@ -936,8 +1026,9 @@ impl Storage for Engine {
         tx.put(watermark_key, watermark_value)?;
 
         // Store to data lake if configured
-        if let Some(ref lake) = self.lake {
-            let inflated = InflatedBatch::try_from(deflated.clone())?;
+        if let Some(ref lake) = self.lake
+            && let Some(ref inflated) = inflated
+        {
             let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
             if !attributes.control {
@@ -952,7 +1043,7 @@ impl Storage for Engine {
                     topition.topic(),
                     topition.partition(),
                     offset,
-                    &inflated,
+                    inflated,
                     config,
                 )
                 .await?;
@@ -1216,8 +1307,8 @@ impl Storage for Engine {
                 break;
             }
 
-            let key: OffsetCommitKey = postcard::from_bytes(&kv.key)?;
-            let value: OffsetCommitValue = postcard::from_bytes(&kv.value)?;
+            let key: OffsetCommitKey = decode_offset(&kv.key)?;
+            let value: OffsetCommitValue = decode_offset(&kv.value)?;
 
             _ = topitions.insert(Topition::new(key.topic, key.partition), value.offset);
         }
@@ -1260,7 +1351,7 @@ impl Storage for Engine {
 
                 let offset = match self.db.get(&key).await {
                     Ok(Some(encoded)) => {
-                        let value: OffsetCommitValue = postcard::from_bytes(&encoded)?;
+                        let value: OffsetCommitValue = decode_offset(&encoded)?;
                         value.offset
                     }
                     Ok(None) => -1, // No committed offset
@@ -1919,7 +2010,9 @@ impl Storage for Engine {
 
             // Check if transaction already exists
             if transactions.contains_key(transaction_id) {
-                let existing_txn = transactions.get_mut(transaction_id).unwrap();
+                let existing_txn = transactions
+                    .get_mut(transaction_id)
+                    .ok_or_else(|| Error::Message("transaction not found".into()))?;
                 let producer_id = existing_txn.producer;
 
                 // Check if there's an active epoch that needs to be aborted
@@ -2024,7 +2117,9 @@ impl Storage for Engine {
                 let new_epoch = old_epoch + 1;
 
                 // Re-get mutable reference after potential modification
-                let existing_txn = transactions.get_mut(transaction_id).unwrap();
+                let existing_txn = transactions
+                    .get_mut(transaction_id)
+                    .ok_or_else(|| Error::Message("transaction not found".into()))?;
                 _ = existing_txn.epochs.insert(
                     new_epoch,
                     TxnDetail {
@@ -2656,8 +2751,13 @@ impl Storage for Engine {
 
             // Mark current transaction as complete
             {
-                let transaction = transactions.get_mut(transaction_id).unwrap();
-                let txn_detail = transaction.epochs.get_mut(&producer_epoch).unwrap();
+                let transaction = transactions
+                    .get_mut(transaction_id)
+                    .ok_or_else(|| Error::Message("transaction not found".into()))?;
+                let txn_detail = transaction
+                    .epochs
+                    .get_mut(&producer_epoch)
+                    .ok_or_else(|| Error::Message("transaction epoch not found".into()))?;
                 txn_detail.state = Some(if committed {
                     TxnState::Committed
                 } else {

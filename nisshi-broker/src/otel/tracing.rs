@@ -40,12 +40,8 @@ impl Drop for Guard {
 /// redaction, so `RUST_LOG=debug` (routine when troubleshooting, and what
 /// CI's test job uses) prints AWS secrets in cleartext through this
 /// subscriber's `log` compatibility layer.
-fn env_filter() -> EnvFilter {
-    EnvFilter::from_default_env().add_directive(
-        "reqsign_core=info"
-            .parse()
-            .expect("reqsign_core=info is a valid directive"),
-    )
+fn env_filter() -> Result<EnvFilter> {
+    Ok(EnvFilter::from_default_env().add_directive("reqsign_core=info".parse()?))
 }
 
 pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<Guard> {
@@ -55,7 +51,7 @@ pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<G
 
     match tracing_format {
         TracingFormat::Text => tracing_subscriber::registry()
-            .with(env_filter())
+            .with(env_filter()?)
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_level(true)
@@ -67,7 +63,7 @@ pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<G
             .init(),
 
         TracingFormat::Json => tracing_subscriber::registry()
-            .with(env_filter())
+            .with(env_filter()?)
             .with(tracing_subscriber::fmt::layer().json())
             // .with(OpenTelemetryLayer::new(tracer))
             .init(),

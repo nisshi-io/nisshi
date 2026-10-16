@@ -1,8 +1,8 @@
 ---
 # CodeQL "advanced setup". Replaces the repository-settings "default setup",
-# which never scans pull requests opened from forks. This workflow reproduces
-# the default setup's coverage exactly: the `rust` and `actions` languages,
-# both in build-mode `none`.
+# which never scans pull requests opened from forks. This workflow scans the
+# same languages as the default setup, `rust` and `actions`, both in
+# build-mode `none`. Unlike the default setup, it skips the Rust test code.
 #
 # A green `Analyze` job means the scan uploaded, not that it found nothing.
 # Findings appear in the Security tab and on the `github-advanced-security`
@@ -106,6 +106,15 @@ jobs:
         with:
           languages: rust
           build-mode: none
+          # The scan skips the test code, which never ships. Each finding there
+          # blocks a merge until someone dismisses it, and
+          # `rust/cleartext-logging` reports each Kafka API key, the number of
+          # a request type, as a credential.
+          config: |
+            paths-ignore:
+              - "**/tests/**"
+              - "**/benches/**"
+              - nisshi-smoke-test/**
       - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           category: "/language:rust"

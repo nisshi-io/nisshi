@@ -25,6 +25,8 @@
 //! every test passes. The `suite` row is FAIL if the command fails, including a run that stopped
 //! before any test reported. run.sh parses these rows from the `smoke-broker: result` lines.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::process::{Command, ExitCode};
 
 use clap::Parser;

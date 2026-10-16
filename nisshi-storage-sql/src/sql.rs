@@ -162,9 +162,17 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             "lite/policy_delete.sql",
             include_sql!("lite/policy_delete.sql"),
         ),
+        (
+            "lite/policy_delete_bytes.sql",
+            include_sql!("lite/policy_delete_bytes.sql"),
+        ),
         ("lite/vacuum_into.sql", include_sql!("lite/vacuum_into.sql")),
         ("policy_compact.sql", include_sql!("sql/policy_compact.sql")),
         ("policy_delete.sql", include_sql!("sql/policy_delete.sql")),
+        (
+            "policy_delete_bytes.sql",
+            include_sql!("sql/policy_delete_bytes.sql"),
+        ),
         ("ping.sql", "select 1 + 1".to_string()),
         (
             "producer_detail_delete_by_topic.sql",
@@ -203,6 +211,14 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/producer_update_sequence.sql"),
         ),
         ("record_copy.sql", include_sql!("sql/record_copy.sql")),
+        (
+            "record_delete_by_offset.sql",
+            include_sql!("sql/record_delete_by_offset.sql"),
+        ),
+        (
+            "record_delete_below_log_start.sql",
+            include_sql!("sql/record_delete_below_log_start.sql"),
+        ),
         (
             "record_delete_by_topic.sql",
             include_sql!("sql/record_delete_by_topic.sql"),
@@ -252,6 +268,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/topic_configuration_select.sql"),
         ),
         (
+            "topic_configuration_select_name.sql",
+            include_sql!("sql/topic_configuration_select_name.sql"),
+        ),
+        (
             "topic_configuration_upsert.sql",
             include_sql!("sql/topic_configuration_upsert.sql"),
         ),
@@ -261,6 +281,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         ),
         ("topic_insert.sql", include_sql!("sql/topic_insert.sql")),
         ("topic_select.sql", include_sql!("sql/topic_select.sql")),
+        (
+            "topic_select_name_for_update.sql",
+            include_sql!("sql/topic_select_name_for_update.sql"),
+        ),
         (
             "topic_select_name.sql",
             include_sql!("sql/topic_select_name.sql"),

@@ -50,6 +50,8 @@ include = [
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+expect_used = "deny"
+unwrap_used = "deny"
 
 [workspace.lints.rust]
 deprecated_in_future = "warn"
@@ -76,7 +78,6 @@ private_intra_doc_links = "deny"
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
 arrow = { version = "58" }
-assert_matches = "1.5.0"
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}
 bytes = { version = "1", features = ["serde"] }
@@ -97,7 +98,6 @@ deadpool-postgres = "0.14.2"
 # builds against. Pin to 1.1.0 until deltalake bumps its buoyant_kernel dep.
 buoyant_kernel_derive = "=1.1.0"
 deltalake = { version = "0.32", features = ["datafusion", "s3"] }
-digest = "0.11.3"
 dotenv = "0.15.0"
 fake = "5.1.0"
 flate2 = "1.1"
@@ -121,7 +121,7 @@ jsonschema = "0.58.3"
 lazy_static = "1.4.0"
 libc = "0.2.189"
 libfuzzer-sys = "0.4"
-libsql = { version = "0.9.18", default-features = false, features = ["core"] }
+libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
 nanoid = "0.5.0"
 nonzero_ext = "0.3.0"
@@ -189,14 +189,15 @@ thiserror = "2.0"
 time = { version = "0.3.47", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1","with-uuid-1",] }
-tokio-postgres-rustls = "0.13.0"
+tokio-postgres-rustls = "0.14.0"
 tokio-rustls = "0.26.4"
 tokio-util = { version = "0.7", features = ["full"] }
+traceforge = "0.2"
 tracing = "0.1"
 tracing-core = { version = "0.1" }
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-turso = "0.7.1"
+turso = "0.8.2"
 url = { version = "2.5.4", features = ["serde"] }
 zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }

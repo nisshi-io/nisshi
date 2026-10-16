@@ -16,6 +16,7 @@ mod alter_user_scram_credentials;
 mod consumer_group_describe;
 mod create_acls;
 mod create_topics;
+pub mod deadline;
 mod delete_groups;
 mod delete_records;
 mod delete_topics;
@@ -27,7 +28,6 @@ mod describe_topic_partitions;
 mod describe_user_scram_credentials;
 mod fetch;
 mod find_coordinator;
-mod get_telemetry_subscriptions;
 mod incremental_alter_configs;
 mod init_producer_id;
 mod list_groups;
@@ -60,7 +60,6 @@ pub use describe_topic_partitions::DescribeTopicPartitionsService;
 pub use describe_user_scram_credentials::DescribeUserScramCredentialsService;
 pub use fetch::FetchService;
 pub use find_coordinator::FindCoordinatorService;
-pub use get_telemetry_subscriptions::GetTelemetrySubscriptionsService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
 pub use init_producer_id::InitProducerIdService;
 pub use list_groups::ListGroupsService;
@@ -83,7 +82,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-pub use produce::ProduceService;
+pub use produce::{ProduceService, inflate_produced};
 use rama::{Layer, Service};
 use tokio::sync::{
     mpsc::{self, error::SendError},
@@ -422,8 +421,7 @@ impl Service<Request> for RequestChannelService {
         STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &attributes);
         debug!(operation, capacity);
 
-        self.tx
-            .reserve()
+        deadline::queued(self.tx.reserve())
             .await
             .map(|permit| permit.send((input, resp_tx)))
             .inspect(|_| {
