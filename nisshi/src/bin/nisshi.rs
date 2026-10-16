@@ -121,10 +121,12 @@ async fn main() -> Result<ErrorCode> {
                             if err.code().map(|code| code.code()) == Some("42501") =>
                         {
                             error!(
-                                "storage {storage} failed its schema setup: {source}. The broker's \
-                                database role must own Nisshi's tables and views, and must be \
-                                allowed to create a table in their schema. See the PostgreSQL \
-                                section of README.md."
+                                "storage {storage} failed its schema setup: {source}. The \
+                                database records no schema version that this release can use, so \
+                                the broker must change the schema, and its role isn't allowed \
+                                to. Start one broker once with the credentials of the role that \
+                                owns Nisshi's tables, then start the others with this role. See \
+                                the PostgreSQL section of README.md."
                             )
                         }
                         _ => error!("storage {storage} failed its schema setup: {source}"),
