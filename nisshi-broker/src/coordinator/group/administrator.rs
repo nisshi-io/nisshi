@@ -2442,8 +2442,40 @@ where
     /// Starts a join phase in a group with members, which ends when every member has rejoined, or
     /// at the rebalance timeout, as Kafka's
     /// [`prepareRebalance`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4627)
-    /// does. Each member waiting to sync gets `REBALANCE_IN_PROGRESS`.
+    /// does. Each member waiting to sync gets `REBALANCE_IN_PROGRESS`, and its session starts
+    /// again.
     fn prepare_rebalance(&mut self, now: SystemTime) {
+        // A member with a SyncGroup in progress couldn't heartbeat while it waited. Kafka
+        // answers the request when the rebalance starts and then reschedules the member's
+        // heartbeat, so the member gets a full session timeout to rejoin.
+        if self.is_completing_rebalance() {
+            self.restart_sessions_of_synced_members(now);
+        }
+
+        self.start_join_phase(now);
+    }
+
+    /// Restarts the session of each member that has sent `SyncGroup` in this rebalance: each
+    /// member that `pending_sync` doesn't list, which is every member when it is `None`. Such a
+    /// member waits for the leader's assignment and can't heartbeat while it waits, so its
+    /// session starts again when its `SyncGroup` is answered, as Kafka's
+    /// [`propagateAssignment`](https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java#L4787-L4796)
+    /// reschedules each member's heartbeat.
+    fn restart_sessions_of_synced_members(&mut self, now: SystemTime) {
+        let pending_sync = self
+            .pending_sync
+            .as_ref()
+            .map(|pending_sync| &pending_sync.members);
+
+        for (member_id, member) in &mut self.members {
+            if pending_sync.is_none_or(|pending_sync| !pending_sync.contains(member_id)) {
+                member.last_contact = Some(now);
+            }
+        }
+    }
+
+    /// Starts a join phase that ends when every member has rejoined, or at the rebalance timeout.
+    fn start_join_phase(&mut self, now: SystemTime) {
         info!(generation_id = self.generation_id, "preparing to rebalance");
 
         self.pending_sync = None;
@@ -2851,7 +2883,9 @@ where
             pending_sync: None,
         };
 
-        forming.prepare_rebalance(now);
+        // A stable group holds no SyncGroup, so no member's session starts again, as Kafka's
+        // `prepareRebalance` answers held syncs only in COMPLETING_REBALANCE.
+        forming.start_join_phase(now);
         forming
     }
 
@@ -3175,19 +3209,7 @@ where
                 .or_insert_with(|| Bytes::from_static(b""));
         }
 
-        // Each member that waits for this assignment couldn't heartbeat while it waited, so its
-        // session starts again now, as Kafka's `propagateAssignment` reschedules each member's
-        // heartbeat.
-        let pending_sync = self
-            .pending_sync
-            .as_ref()
-            .map(|pending_sync| &pending_sync.members);
-
-        for (member_id, member) in &mut self.members {
-            if pending_sync.is_none_or(|pending_sync| !pending_sync.contains(member_id)) {
-                member.last_contact = Some(now);
-            }
-        }
+        self.restart_sessions_of_synced_members(now);
 
         info!(
             generation_id = self.generation_id,

@@ -854,6 +854,110 @@ async fn followers_waiting_for_a_slow_leader_keep_their_sessions() -> Result<()>
 }
 
 #[tokio::test]
+async fn followers_waiting_for_a_leader_that_never_syncs_survive_the_next_rebalance() -> Result<()>
+{
+    let mut harness = Harness::new().await?;
+    let (_, followers) = followers_waiting_for_the_leader(&mut harness).await;
+
+    // The leader never sends SyncGroup, so its session expires 45 s after the join phase ended,
+    // and the group rebalances. The followers' syncs are still held, so they haven't heard of the
+    // rebalance yet, and they can't heartbeat.
+    harness.settle(at(51_001));
+    assert!(harness.is_preparing_rebalance());
+    assert_eq!(followers, harness.member_ids());
+
+    // A request just after the followers' last contact plus their session timeout must not remove
+    // them: each still has a SyncGroup in progress, which Kafka answers at once with
+    // REBALANCE_IN_PROGRESS.
+    harness.settle(at(51_200));
+    assert_eq!(followers, harness.member_ids());
+
+    for follower in &followers {
+        let reply = harness.sync(at(51_300), follower, 1, &[]).await;
+        assert_eq!(
+            ErrorCode::RebalanceInProgress,
+            error_code(sync_response(&reply).error_code)
+        );
+    }
+
+    for follower in &followers {
+        _ = harness.join(at(51_400), follower).await;
+    }
+    assert_eq!(2, harness.group().generation_id());
+    assert_eq!(followers, harness.member_ids());
+    Ok(())
+}
+
+/// Forms a group of three dynamic members whose join phase ends at 6 s, and has each follower
+/// send SyncGroup at 6.1 s, where it is held for the leader's assignment. Returns the leader and
+/// the followers.
+async fn followers_waiting_for_the_leader(harness: &mut Harness) -> (String, BTreeSet<String>) {
+    harness.rebalance_timeout_ms = 300_000;
+    for _ in 0..3 {
+        _ = harness.add_member(at(0)).await;
+    }
+    harness.settle(at(6_000));
+
+    let leader = harness.group().leader().expect("a leader").to_owned();
+    let followers = harness
+        .member_ids()
+        .into_iter()
+        .filter(|member_id| *member_id != leader)
+        .collect::<BTreeSet<_>>();
+
+    for follower in &followers {
+        assert_eq!(
+            held(follower),
+            harness.sync(at(6_100), follower, 1, &[]).await
+        );
+    }
+
+    (leader, followers)
+}
+
+#[tokio::test]
+async fn followers_waiting_for_a_leader_that_leaves_survive_the_next_rebalance() -> Result<()> {
+    let mut harness = Harness::new().await?;
+    let (leader, followers) = followers_waiting_for_the_leader(&mut harness).await;
+
+    // The leader keeps its session alive, then leaves without sending SyncGroup, as a Java
+    // leader does when its poll interval expires while it computes the assignment.
+    assert_eq!(
+        ErrorCode::None,
+        harness.heartbeat(at(40_000), &leader, 1).await
+    );
+    harness.leave(at(60_000), &leader).await;
+    assert!(harness.is_preparing_rebalance());
+
+    harness.settle(at(60_100));
+    assert_eq!(followers, harness.member_ids());
+    Ok(())
+}
+
+#[tokio::test]
+async fn followers_waiting_for_a_leader_that_misses_the_sync_deadline_survive_the_next_rebalance()
+-> Result<()> {
+    let mut harness = Harness::new().await?;
+    let (leader, followers) = followers_waiting_for_the_leader(&mut harness).await;
+
+    // The leader keeps its session alive but never sends SyncGroup, so the coordinator removes
+    // it at the sync deadline, a rebalance timeout after the join phase ended.
+    for heartbeat_at in (40_000..=280_000).step_by(40_000) {
+        assert_eq!(
+            ErrorCode::None,
+            harness.heartbeat(at(heartbeat_at), &leader, 1).await
+        );
+    }
+    harness.settle(at(306_001));
+    assert!(harness.is_preparing_rebalance());
+    assert_eq!(followers, harness.member_ids());
+
+    harness.settle(at(306_100));
+    assert_eq!(followers, harness.member_ids());
+    Ok(())
+}
+
+#[tokio::test]
 async fn joined_member_outlasts_its_session_timeout_in_a_long_join_phase() -> Result<()> {
     let mut harness = Harness::new().await?;
     harness.rebalance_timeout_ms = 300_000;

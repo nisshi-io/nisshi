@@ -50,9 +50,11 @@ const SESSION_TIMEOUT_MS: i32 = 45_000;
 
 const REBALANCE_TIMEOUT_MS: i32 = 300_000;
 
-/// A short initial delay and poll interval, so that each rebalance ends quickly.
+/// A short poll interval, so that each rebalance ends quickly. The initial delay must outlast
+/// the four members' first joins, two requests each, on a slow storage: a member that joins after
+/// the first join phase ends starts another generation, and the test expects one.
 const GROUP_COORDINATOR: GroupCoordinatorConfig = GroupCoordinatorConfig {
-    initial_rebalance_delay: Duration::from_millis(100),
+    initial_rebalance_delay: Duration::from_secs(1),
     poll_interval: Duration::from_millis(100),
 };
 
