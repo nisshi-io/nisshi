@@ -86,7 +86,7 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 use tokio_postgres::{
-    CancelToken, Config, Row,
+    CancelToken, Config, Row, SimpleQueryMessage,
     binary_copy::BinaryCopyInWriter,
     config::Host,
     error::SqlState,
@@ -118,6 +118,8 @@ pub struct Postgres {
     /// Permits for the ListOffsets partition reads in flight, see
     /// [`LIST_OFFSETS_READS`].
     list_offsets_reads: Arc<Semaphore>,
+    /// Permits for the Fetch partition reads in flight, see [`FETCH_READS`].
+    fetch_reads: Arc<Semaphore>,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
@@ -196,6 +198,7 @@ impl Builder<String, i32, Url, Pool> {
             pool: self.pool,
             cancel: self.cancel,
             list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
+            fetch_reads: Arc::new(Semaphore::new(FETCH_READS)),
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -211,12 +214,33 @@ const POOL_MAX_SIZE: usize = 16;
 /// has ended, its connection has failed, or the bound on it has passed,
 /// see [`cancel_and_return`].
 ///
-/// Each read holds a pooled connection, so this limit leaves half the pool
-/// for other requests. A read past this limit waits for a permit, and
+/// Each read holds a pooled connection, so ListOffsets reads alone take at
+/// most half the pool. Together with [`FETCH_READS`], they can take all of
+/// it, see [`FETCH_READS`]. A read past this limit waits for a permit, and
 /// [`ListOffsetsService`]'s deadline drops it if the wait lasts too long.
 ///
 /// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
 const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
+
+/// How many Fetch partition reads, of records or of an offset stage, this
+/// engine has in flight at once, across every request, counting an
+/// abandoned read until its statement has ended, its connection has failed,
+/// or the bound on it has passed, see [`cancel_and_return`].
+///
+/// Each read holds a pooled connection, so Fetch reads alone take at most
+/// half the pool. Fetch reads have their own limit instead of sharing
+/// [`LIST_OFFSETS_READS`], so slow fetches cannot hold up the ListOffsets
+/// reads that a consumer needs to start or reset. The two limits together
+/// equal the pool, so when slow reads use up both, other requests wait for
+/// a connection. A smaller limit would slow down healthy consumers, because
+/// a fetch read holds its connection for its whole storage budget. A read
+/// past this limit waits for a permit, and [`FetchService`]'s deadline drops
+/// it if the wait lasts too long.
+///
+/// [`FetchService`]: nisshi_storage::FetchService
+const FETCH_READS: usize = POOL_MAX_SIZE / 2;
+
+const _: () = assert!(LIST_OFFSETS_READS + FETCH_READS <= POOL_MAX_SIZE);
 
 /// How much longer than its connection's `statement_timeout` an abandoned
 /// statement is waited for before its connection is closed, see
@@ -704,6 +728,12 @@ where
             .ok_or_else(|| Error::Message("the abandonable object has been released".into()))
     }
 
+    fn object_mut(&mut self) -> Result<&mut managed::Object<M>> {
+        self.object
+            .as_mut()
+            .ok_or_else(|| Error::Message("the abandonable object has been released".into()))
+    }
+
     /// Returns the object to its pool, once its work has finished.
     fn release(mut self) {
         drop(self.object.take());
@@ -734,23 +764,53 @@ where
     }
 }
 
+/// The query that [`cancel_and_return`] runs on an abandoned read's
+/// connection. It answers only after the read's own statement has ended,
+/// and it answers `t` only outside a transaction block.
+///
+/// Outside a block, the server runs the query in a transaction of its own,
+/// so the transaction and the statement start at the same time. Inside a
+/// block, the transaction started with an earlier statement, so the query
+/// answers `f`. Inside a failed block, the server rejects the query.
+///
+/// A read can leave a block open: tokio-postgres queues a `ROLLBACK` when a
+/// `Transaction` is dropped, but the cancel request ends that `ROLLBACK`
+/// instead of the read's statement when the statement finishes just before
+/// the cancel request arrives. The query detects the block without writing
+/// to the server log, which a second `ROLLBACK` would do on every abandoned
+/// read that left no block open.
+const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp()";
+
+/// Waits for the statement on `connection` to end, then returns whether the
+/// connection is outside any transaction block, see [`SETTLE_QUERY`].
+async fn settled_outside_a_transaction(connection: &Object) -> Result<bool, tokio_postgres::Error> {
+    connection.simple_query(SETTLE_QUERY).await.map(|messages| {
+        messages.iter().any(
+            |message| matches!(message, SimpleQueryMessage::Row(row) if row.get(0) == Some("t")),
+        )
+    })
+}
+
 /// Cancels the statement running on an abandoned `connection`, and returns
 /// the connection to its pool once that statement has ended, so the pool
 /// stays within its [`POOL_MAX_SIZE`] server connections.
 ///
 /// The connection and `permit` are held until the statement has ended,
 /// whether or not the cancel request reached the server, so the statement
-/// counts against [`LIST_OFFSETS_READS`] meanwhile. A cancel request that
-/// misses its statement (a host other than the one running the statement,
-/// or a proxy that does not forward it) then shows as ListOffsets reads
-/// that wait for a permit, under the `queued` stage, rather than as server
-/// connections beyond the pool.
+/// counts against the limit that `permit` comes from ([`LIST_OFFSETS_READS`]
+/// or [`FETCH_READS`]) meanwhile. A cancel request that misses its
+/// statement (a host other than the one running the statement, or a proxy
+/// that does not forward it) then shows as reads that wait for a permit,
+/// under the `queued` stage, rather than as server connections beyond the
+/// pool.
 ///
-/// The statement has ended once an empty query on `connection` answers,
-/// because the server runs the two in order. The connection is closed and
-/// taken out of the pool instead, and the pool opens a replacement, when
-/// that query fails or has not answered within `bound`. The bound sits
-/// past the connection's `statement_timeout`
+/// The connection goes back to the pool only when [`SETTLE_QUERY`] shows it
+/// outside any transaction block. The connection is closed and taken out of
+/// the pool instead, and the pool opens a replacement, when that query
+/// fails, shows a transaction block, or has not answered within `bound`. A
+/// connection inside a block would fail every statement of the next caller
+/// that checks it out. The bound sits past the connection's
+/// `statement_timeout`
 /// ([`ABANDONED_STATEMENT_MARGIN`]), at which the server ends the statement
 /// itself unless an operator has disabled the timeout. deadpool-postgres
 /// closes a dropped connection's socket at once, and a backend notices a
@@ -789,14 +849,22 @@ async fn cancel_and_return(
         }
     };
 
-    match timeout_at(settle_by, connection.batch_execute("")).await {
-        Ok(Ok(())) => drop(connection),
+    match timeout_at(settle_by, settled_outside_a_transaction(&connection)).await {
+        Ok(Ok(true)) => drop(connection),
+
+        Ok(Ok(false)) => {
+            warn!(
+                host,
+                "an abandoned statement left its connection inside a transaction; closing it"
+            );
+            drop(Object::take(connection));
+        }
 
         Ok(Err(error)) => {
             warn!(
                 host,
                 ?error,
-                "an abandoned statement's connection failed before the statement ended; closing it"
+                "an abandoned statement's connection failed its settle query; closing it"
             );
             drop(Object::take(connection));
         }
@@ -948,8 +1016,9 @@ impl Postgres {
             .map_err(Into::into)
     }
 
-    /// Checks out a connection for a ListOffsets read that a caller may drop
-    /// mid-statement, holding `permit` from [`LIST_OFFSETS_READS`].
+    /// Checks out a connection for a read that a caller may drop
+    /// mid-statement, holding `permit` from the read's limit on reads in
+    /// flight.
     ///
     /// Dropping the guard before [`Abandonable::release`] asks the server to
     /// cancel the statement, so it stops instead of running until
@@ -979,6 +1048,291 @@ impl Postgres {
                     Err(_) => drop(Object::take(connection)),
                 }
             })
+        })
+    }
+
+    /// Reads the records of `topition` from `offset` on `c`, in one
+    /// transaction, up to the partition's high watermark or, for
+    /// `ReadCommitted`, its last stable offset.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_on(
+        &self,
+        c: &mut Object,
+        topition: &Topition,
+        base_topic: &str,
+        key_filter: Option<&str>,
+        offset: i64,
+        min_bytes: u32,
+        max_bytes: u32,
+        isolation_level: IsolationLevel,
+        has_deadline_expired: impl Fn() -> bool,
+    ) -> Result<Vec<deflated::Batch>> {
+        let high_watermark = self
+            .offset_stage_on(c, base_topic, topition.partition())
+            .await
+            .map(|offset_stage| {
+                if isolation_level == IsolationLevel::ReadCommitted {
+                    offset_stage.last_stable
+                } else {
+                    offset_stage.high_watermark
+                }
+            })?;
+
+        debug!(
+            cluster = self.cluster,
+            ?topition,
+            offset,
+            ?isolation_level,
+            high_watermark,
+            min_bytes,
+            max_bytes
+        );
+
+        let tx = c.transaction().await?;
+
+        let records = if let Some(key) = key_filter {
+            self.tx_prepare_query(
+                &tx,
+                "record_fetch_pg_keyed.sql",
+                &[
+                    &self.cluster,
+                    &base_topic,
+                    &topition.partition(),
+                    &offset,
+                    &(max_bytes as i64),
+                    &high_watermark,
+                    &key,
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        } else {
+            self.tx_prepare_query(
+                &tx,
+                "record_fetch_pg.sql",
+                &[
+                    &self.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &offset,
+                    &(max_bytes as i64),
+                    &high_watermark,
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        };
+
+        let mut batches = vec![];
+
+        if let Some(first) = records.first() {
+            let mut batch_builder = Batch::builder()
+                .base_offset(
+                    first
+                        .try_get::<_, i64>(0)
+                        .inspect(|base_offset| debug!(base_offset))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .attributes(
+                    first
+                        .try_get::<_, Option<i16>>(1)
+                        .map(|attributes| attributes.unwrap_or(0))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .base_timestamp(
+                    first
+                        .try_get::<_, SystemTime>(2)
+                        .map_err(Error::from)
+                        .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .producer_id(
+                    first
+                        .try_get::<_, Option<i64>>(6)
+                        .map(|producer_id| producer_id.unwrap_or(-1))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .producer_epoch(
+                    first
+                        .try_get::<_, Option<i16>>(7)
+                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                        .inspect_err(|err| error!(?err))?,
+                );
+
+            for record in records.iter() {
+                let attributes = record
+                    .try_get::<_, Option<i16>>(1)
+                    .map(|attributes| attributes.unwrap_or(0))
+                    .inspect_err(|err| error!(?err))?;
+
+                let producer_id = record
+                    .try_get::<_, Option<i64>>(6)
+                    .map(|producer_id| producer_id.unwrap_or(-1))
+                    .inspect_err(|err| error!(?err))?;
+                let producer_epoch = record
+                    .try_get::<_, Option<i16>>(7)
+                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                    .inspect_err(|err| error!(?err))?;
+
+                if batch_builder.attributes != attributes
+                    || batch_builder.producer_id != producer_id
+                    || batch_builder.producer_epoch != producer_epoch
+                {
+                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+
+                    batch_builder = Batch::builder()
+                        .base_offset(
+                            record
+                                .try_get::<_, i64>(0)
+                                .inspect(|base_offset| debug!(base_offset))
+                                .inspect_err(|err| error!(?err))?,
+                        )
+                        .base_timestamp(
+                            record
+                                .try_get::<_, SystemTime>(2)
+                                .map_err(Error::from)
+                                .and_then(|system_time| {
+                                    to_timestamp(&system_time).map_err(Into::into)
+                                })
+                                .inspect_err(|err| error!(?err))?,
+                        )
+                        .attributes(attributes)
+                        .producer_id(producer_id)
+                        .producer_epoch(producer_epoch);
+                }
+
+                let offset = record
+                    .try_get::<_, i64>(0)
+                    .inspect(|offset| debug!(offset))
+                    .inspect_err(|err| error!(?err))?;
+
+                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
+
+                let timestamp_delta = record
+                    .try_get::<_, SystemTime>(2)
+                    .map_err(Error::from)
+                    .and_then(|system_time| {
+                        to_timestamp(&system_time)
+                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
+                            .map_err(Into::into)
+                    })
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?;
+
+                let k = record
+                    .try_get::<_, Option<&[u8]>>(3)
+                    .map(|o| o.map(Bytes::copy_from_slice))
+                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?;
+
+                let v = record
+                    .try_get::<_, Option<&[u8]>>(4)
+                    .map(|o| o.map(Bytes::copy_from_slice))
+                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?;
+
+                let mut record_builder = Record::builder()
+                    .offset_delta(offset_delta)
+                    .timestamp_delta(timestamp_delta)
+                    .key(k)
+                    .value(v);
+
+                for header in self
+                    .tx_prepare_query(
+                        &tx,
+                        "header_fetch.sql",
+                        &[
+                            &self.cluster,
+                            &topition.topic(),
+                            &topition.partition(),
+                            &offset,
+                        ],
+                    )
+                    .await
+                    .inspect(|row| debug!(?row))
+                    .inspect_err(|err| error!(?err))?
+                {
+                    let mut header_builder = Header::builder();
+
+                    if let Some(k) = header
+                        .try_get::<_, Option<&[u8]>>(0)
+                        .inspect_err(|err| error!(?err))?
+                    {
+                        header_builder = header_builder.key(Bytes::copy_from_slice(k));
+                    }
+
+                    if let Some(v) = header
+                        .try_get::<_, Option<&[u8]>>(1)
+                        .inspect_err(|err| error!(?err))?
+                    {
+                        header_builder = header_builder.value(Bytes::copy_from_slice(v));
+                    }
+
+                    record_builder = record_builder.header(header_builder);
+                }
+
+                batch_builder = batch_builder
+                    .record(record_builder)
+                    .last_offset_delta(offset_delta);
+
+                if has_deadline_expired() {
+                    break;
+                }
+            }
+
+            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+        } else {
+            batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
+        }
+
+        tx.commit().await?;
+
+        debug!(batches_len = batches.len());
+
+        Ok(batches)
+    }
+
+    /// Reads the log start, high watermark and last stable offset of
+    /// `base_topic`'s `partition` on `c`.
+    async fn offset_stage_on(
+        &self,
+        c: &Object,
+        base_topic: &str,
+        partition: i32,
+    ) -> Result<OffsetStage> {
+        let row = self
+            .prepare_query_one(
+                c,
+                "watermark_select.sql",
+                &[&self.cluster, &base_topic, &partition],
+            )
+            .await
+            .inspect_err(|err| error!(base_topic, partition, ?err))?;
+
+        let log_start = row
+            .try_get::<_, Option<i64>>(0)
+            .inspect_err(|err| error!(base_topic, partition, ?err))?
+            .unwrap_or_default();
+
+        let high_watermark = row
+            .try_get::<_, Option<i64>>(1)
+            .inspect_err(|err| error!(base_topic, partition, ?err))?
+            .unwrap_or_default();
+
+        let last_stable = row
+            .try_get::<_, Option<i64>>(2)
+            .inspect_err(|err| error!(base_topic, partition, ?err))?
+            .unwrap_or(high_watermark);
+
+        debug!(
+            cluster = self.cluster,
+            base_topic, partition, log_start, high_watermark,
+        );
+
+        Ok(OffsetStage {
+            last_stable,
+            high_watermark,
+            log_start,
         })
     }
 
@@ -3186,272 +3540,45 @@ impl Storage for Postgres {
                 .unwrap_or_default()
         };
 
+        // A `/` in the name checks out a connection of its own, so this
+        // runs before the read holds its connection.
         let (base_topic, key_filter): (&str, Option<&str>) =
             self.topic_with_key(topition.topic()).await?;
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
-
-        debug!(
-            cluster = self.cluster,
-            ?topition,
-            offset,
-            ?isolation_level,
-            high_watermark,
-            min_bytes,
-            max_bytes
-        );
-
-        let mut c = self.connection().await?;
-        let tx = c.transaction().await?;
-
-        let records = if let Some(key) = key_filter {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg_keyed.sql",
-                &[
-                    &self.cluster,
-                    &base_topic,
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &key,
-                ],
+        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
+        let mut connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let batches = self
+            .fetch_on(
+                connection.object_mut()?,
+                topition,
+                base_topic,
+                key_filter,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation_level,
+                has_deadline_expired,
             )
-            .await
-            .inspect_err(|err| error!(?err))?
-        } else {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg.sql",
-                &[
-                    &self.cluster,
-                    &topition.topic(),
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
-        };
+            .await;
+        connection.release();
 
-        let mut batches = vec![];
-
-        if let Some(first) = records.first() {
-            let mut batch_builder = Batch::builder()
-                .base_offset(
-                    first
-                        .try_get::<_, i64>(0)
-                        .inspect(|base_offset| debug!(base_offset))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .attributes(
-                    first
-                        .try_get::<_, Option<i16>>(1)
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .base_timestamp(
-                    first
-                        .try_get::<_, SystemTime>(2)
-                        .map_err(Error::from)
-                        .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_id(
-                    first
-                        .try_get::<_, Option<i64>>(6)
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(
-                    first
-                        .try_get::<_, Option<i16>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                );
-
-            for record in records.iter() {
-                let attributes = record
-                    .try_get::<_, Option<i16>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?;
-
-                let producer_id = record
-                    .try_get::<_, Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-                let producer_epoch = record
-                    .try_get::<_, Option<i16>>(7)
-                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-
-                if batch_builder.attributes != attributes
-                    || batch_builder.producer_id != producer_id
-                    || batch_builder.producer_epoch != producer_epoch
-                {
-                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
-
-                    batch_builder = Batch::builder()
-                        .base_offset(
-                            record
-                                .try_get::<_, i64>(0)
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .base_timestamp(
-                            record
-                                .try_get::<_, SystemTime>(2)
-                                .map_err(Error::from)
-                                .and_then(|system_time| {
-                                    to_timestamp(&system_time).map_err(Into::into)
-                                })
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .attributes(attributes)
-                        .producer_id(producer_id)
-                        .producer_epoch(producer_epoch);
-                }
-
-                let offset = record
-                    .try_get::<_, i64>(0)
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-
-                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
-
-                let timestamp_delta = record
-                    .try_get::<_, SystemTime>(2)
-                    .map_err(Error::from)
-                    .and_then(|system_time| {
-                        to_timestamp(&system_time)
-                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
-                            .map_err(Into::into)
-                    })
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
-
-                let k = record
-                    .try_get::<_, Option<&[u8]>>(3)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
-
-                let v = record
-                    .try_get::<_, Option<&[u8]>>(4)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
-
-                let mut record_builder = Record::builder()
-                    .offset_delta(offset_delta)
-                    .timestamp_delta(timestamp_delta)
-                    .key(k)
-                    .value(v);
-
-                for header in self
-                    .tx_prepare_query(
-                        &tx,
-                        "header_fetch.sql",
-                        &[
-                            &self.cluster,
-                            &topition.topic(),
-                            &topition.partition(),
-                            &offset,
-                        ],
-                    )
-                    .await
-                    .inspect(|row| debug!(?row))
-                    .inspect_err(|err| error!(?err))?
-                {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(0)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::copy_from_slice(k));
-                    }
-
-                    if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::copy_from_slice(v));
-                    }
-
-                    record_builder = record_builder.header(header_builder);
-                }
-
-                batch_builder = batch_builder
-                    .record(record_builder)
-                    .last_offset_delta(offset_delta);
-
-                if has_deadline_expired() {
-                    break;
-                }
-            }
-
-            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
-        } else {
-            batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
-        }
-
-        tx.commit().await?;
-
-        debug!(batches_len = batches.len());
-
-        Ok(batches)
+        batches
     }
 
     #[instrument(skip_all)]
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         debug!(cluster = self.cluster, ?topition);
-        let c = self.connection().await?;
 
-        let row = self
-            .prepare_query_one(
-                &c,
-                "watermark_select.sql",
-                &[
-                    &self.cluster,
-                    &self.base_topic(topition.topic()).await?,
-                    &topition.partition(),
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?topition, ?err))?;
+        let base_topic = self.base_topic(topition.topic()).await?;
 
-        let log_start = row
-            .try_get::<_, Option<i64>>(0)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
+        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
+        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let offset_stage = self
+            .offset_stage_on(connection.object()?, base_topic, topition.partition())
+            .await;
+        connection.release();
 
-        let high_watermark = row
-            .try_get::<_, Option<i64>>(1)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
-
-        let last_stable = row
-            .try_get::<_, Option<i64>>(2)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or(high_watermark);
-
-        debug!(cluster = self.cluster, ?topition, log_start, high_watermark,);
-
-        Ok(OffsetStage {
-            last_stable,
-            high_watermark,
-            log_start,
-        })
+        offset_stage
     }
 
     #[instrument(skip_all)]
@@ -5449,9 +5576,10 @@ mod tests {
         while !settled(storage) {
             assert!(
                 Instant::now() < give_up,
-                "pool {:?}, permits {}",
+                "pool {:?}, ListOffsets permits {}, Fetch permits {}",
                 storage.pool.status(),
-                storage.list_offsets_reads.available_permits()
+                storage.list_offsets_reads.available_permits(),
+                storage.fetch_reads.available_permits()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -5597,6 +5725,486 @@ mod tests {
         assert_eq!(1, storage.pool.status().size);
         assert_eq!(0, storage.pool.status().available);
         assert_eq!(0, backends_running(&monitor, &marker).await?);
+
+        Ok(())
+    }
+
+    /// At most `FETCH_READS` Fetch reads, of records and of offset stages
+    /// alike, reach the pool at once; the rest wait for a permit, and the
+    /// permits come back when the reads are dropped.
+    ///
+    /// The pool has no permits at all, so each read that has a Fetch
+    /// permit waits in the pool, where the pool counts it, without a server.
+    #[tokio::test]
+    async fn fetch_reads_are_limited_before_the_pool() -> Result<()> {
+        let pool = Pool::builder(Manager::new(
+            Config::from_str(CONNECTION)?,
+            tokio_postgres::NoTls,
+        ))
+        .max_size(0)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+        .build()?;
+
+        let storage = Postgres {
+            pool,
+            ..Postgres::builder(CONNECTION)?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(rng().random_range(0..i32::MAX))
+                .build()
+        };
+
+        let topition = Topition::new("limited", 0);
+        let reads = (0..FETCH_READS + 3)
+            .map(|read| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+
+                tokio::spawn(async move {
+                    if read % 2 == 0 {
+                        storage
+                            .fetch(
+                                &topition,
+                                0,
+                                1,
+                                8 * 1024,
+                                IsolationLevel::ReadUncommitted,
+                                Duration::from_secs(5),
+                            )
+                            .await
+                            .map(drop)
+                    } else {
+                        storage.offset_stage(&topition).await.map(drop)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let settled = Instant::now() + Duration::from_secs(5);
+        while storage.pool.status().waiting < FETCH_READS {
+            assert!(Instant::now() < settled, "{:?}", storage.pool.status());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(FETCH_READS, storage.pool.status().waiting);
+        assert_eq!(0, storage.fetch_reads.available_permits());
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        for read in &reads {
+            read.abort();
+        }
+        for read in reads {
+            let outcome = read.await;
+            assert!(
+                outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+                "{outcome:?}"
+            );
+        }
+
+        assert_eq!(0, storage.pool.status().waiting);
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// An abandoned read that leaves its connection inside a transaction
+    /// block, open or failed, loses that connection, so the pool never
+    /// hands it out. The permit still comes back.
+    ///
+    /// The read opens its block with a plain `BEGIN`, so dropping it queues
+    /// no `ROLLBACK`, as when the cancel request ends the `ROLLBACK` that
+    /// tokio-postgres queues for a dropped `Transaction`.
+    #[tokio::test]
+    async fn abandoned_read_left_inside_a_transaction_loses_its_connection() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+        storage.pool.resize(1);
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping abandoned_read_left_inside_a_transaction_loses_its_connection: {err:?}"
+            );
+            return Ok(());
+        }
+
+        let marker = alphanumeric_string(15);
+        let open = "BEGIN; SET LOCAL enable_seqscan = off".to_owned();
+        let failed = format!("BEGIN; SELECT pg_sleep(30) /* {marker} */");
+
+        for read in [open, failed] {
+            let permit = storage.fetch_reads.clone().acquire_owned().await?;
+            let connection = storage.abandonable_connection(permit).await?;
+            let backend = connection
+                .object()?
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get::<_, i32>(0);
+
+            // The open block finishes at once, and the cancel request then
+            // finds no statement to end. The sleep is still running at the
+            // timeout, and the cancel request ends it, which fails the block.
+            _ = timeout(
+                Duration::from_millis(200),
+                connection.object()?.batch_execute(&read),
+            )
+            .await;
+            drop(connection);
+
+            wait_until(&storage, |storage| {
+                storage.pool.status().size == 0
+                    && storage.fetch_reads.available_permits() == FETCH_READS
+            })
+            .await;
+
+            let c = storage.connection().await?;
+            assert_ne!(
+                backend,
+                c.query_one("SELECT pg_backend_pid()", &[])
+                    .await?
+                    .get::<_, i32>(0),
+                "the pool handed out the connection left by {read:?}"
+            );
+            assert_eq!(
+                "on",
+                c.query_one("SELECT current_setting('enable_seqscan')", &[])
+                    .await?
+                    .get::<_, String>(0)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Registers a broker for `cluster`, creates a topic of one partition,
+    /// and produces one record with a header to it.
+    async fn topic_with_one_record(storage: &Postgres, cluster: &str) -> Result<Topition> {
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.into(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name, 0);
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .header(
+                        Header::builder()
+                            .key(Bytes::from_static(b"k"))
+                            .value(Bytes::from_static(b"v")),
+                    )
+                    .offset_delta(0),
+            )
+            .last_offset_delta(0)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        Ok(topition)
+    }
+
+    /// Reads `topition` from offset 0 with a 5 second budget.
+    async fn fetch_from_start(storage: &Postgres, topition: &Topition) -> Result<()> {
+        storage
+            .fetch(
+                topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await
+            .map(drop)
+    }
+
+    /// More fetches than `FETCH_READS` at once all finish: each fetch reads
+    /// its watermark on the connection it already holds, so no fetch waits
+    /// for a second permit while it holds one.
+    #[tokio::test]
+    async fn fetches_beyond_the_limit_all_finish() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping fetches_beyond_the_limit_all_finish: {err:?}");
+            return Ok(());
+        }
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        let fetches = (0..FETCH_READS + 2)
+            .map(|_| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+                tokio::spawn(async move { fetch_from_start(&storage, &topition).await })
+            })
+            .collect::<Vec<_>>();
+
+        for fetch in fetches {
+            timeout(Duration::from_secs(10), fetch)
+                .await
+                .map_err(|_| Error::Message("a fetch did not finish".into()))?
+                .map_err(|err| Error::Message(err.to_string()))??;
+        }
+
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// Runs `read` while `monitor` holds an exclusive lock on `table`, and
+    /// aborts `read` once its backend waits for that lock in a statement
+    /// that contains `statement`. While the lock is still held, checks that
+    /// the backend ends up idle after [`SETTLE_QUERY`], with its connection
+    /// back in `storage`'s pool and its Fetch permit returned. Returns the
+    /// backend's process id.
+    ///
+    /// `storage` must have a pool of one connection, and connect with
+    /// `application_name`. Other tests that use `table` wait for the lock
+    /// too, for about a second.
+    async fn abandon_read_waiting_for_a_lock(
+        storage: &Postgres,
+        monitor: &Postgres,
+        application_name: &str,
+        table: &str,
+        statement: &str,
+        read: impl Future<Output = Result<()>> + Send + 'static,
+    ) -> Result<i32> {
+        let mut locking = monitor.connection().await?;
+
+        // A transaction reads one snapshot of `pg_stat_activity`, so the
+        // test watches the read from outside the locking transaction.
+        let watching = monitor.connection().await?;
+
+        // The test releases the lock before it returns. The timeouts bound
+        // how long the lock holds up other tests when this test stops early.
+        let lock = locking.transaction().await?;
+        lock.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '5s'; SET LOCAL idle_in_transaction_session_timeout = '10s'; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .await?;
+
+        let reading = tokio::spawn(read);
+
+        let give_up = Instant::now() + Duration::from_secs(10);
+        let backend = loop {
+            if let Some(row) = watching
+                .query_opt(
+                    "SELECT pid FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE $2",
+                    &[&application_name, &format!("%{statement}%")],
+                )
+                .await?
+            {
+                break row.get::<_, i32>(0);
+            }
+
+            assert!(
+                Instant::now() < give_up,
+                "the read did not wait for the lock on {table}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        reading.abort();
+        let outcome = reading.await;
+        assert!(
+            outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+            "{outcome:?}"
+        );
+
+        let give_up = Instant::now() + Duration::from_secs(10);
+        let last_query = loop {
+            let activity = watching
+                .query_one(
+                    "SELECT state, query FROM pg_stat_activity WHERE pid = $1",
+                    &[&backend],
+                )
+                .await?;
+            let state = activity.get::<_, Option<String>>(0);
+            let status = storage.pool.status();
+
+            if state.as_deref() == Some("idle") && status.available == 1 {
+                break activity.get::<_, Option<String>>(1);
+            }
+
+            assert!(
+                Instant::now() < give_up,
+                "backend {backend} is {state:?} while the lock on {table} is held, pool {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(Some(SETTLE_QUERY), last_query.as_deref());
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        lock.rollback().await?;
+
+        Ok(backend)
+    }
+
+    /// Returns storage on a pool of one connection that connects with a
+    /// unique `application_name`, a monitor on a pool of its own, and that
+    /// name, or `None` when no server answers.
+    async fn storage_on_one_connection(
+        cluster: &str,
+    ) -> Result<Option<(Postgres, Postgres, String)>> {
+        let application_name = format!("abandoned_read_{}", alphanumeric_string(15));
+
+        let storage =
+            Postgres::builder(&format!("{CONNECTION}?application_name={application_name}"))?
+                .cluster(cluster)
+                .node(rng().random_range(0..i32::MAX))
+                .build();
+        storage.pool.resize(1);
+
+        let monitor = Postgres::builder(CONNECTION)?
+            .cluster(cluster)
+            .node(0)
+            .build();
+
+        match monitor.connection().await {
+            Ok(_) => Ok(Some((storage, monitor, application_name))),
+            Err(err) => {
+                eprintln!("skipping: {err:?}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// A fetch dropped while its statement waits has that statement
+    /// cancelled, and its connection goes back to the pool idle and outside
+    /// any transaction, while the statement would still be waiting. A fetch
+    /// or an offset stage that finishes returns its connection and its
+    /// permit before it returns.
+    ///
+    /// The fetch waits for a lock on `header`, so it waits in its header
+    /// query, inside its transaction and after its record query.
+    #[tokio::test]
+    async fn abandoned_fetch_is_cancelled_and_its_connection_returned() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let Some((storage, monitor, application_name)) =
+            storage_on_one_connection(&cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        // Nothing awaits between each read and the checks after it, so a
+        // read that returned its connection through the abandon path
+        // instead would not have it back yet.
+        fetch_from_start(&storage, &topition).await?;
+        assert_eq!(1, storage.pool.status().available);
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        _ = storage.offset_stage(&topition).await?;
+        assert_eq!(1, storage.pool.status().available);
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        let fetching = {
+            let storage = storage.clone();
+            let topition = topition.clone();
+            async move { fetch_from_start(&storage, &topition).await }
+        };
+
+        let backend = abandon_read_waiting_for_a_lock(
+            &storage,
+            &monitor,
+            &application_name,
+            "header",
+            "from header",
+            fetching,
+        )
+        .await?;
+
+        let mut c = storage.connection().await?;
+        assert_eq!(1, storage.pool.status().size);
+        assert_eq!(
+            backend,
+            c.query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get::<_, i32>(0),
+            "the pool kept the abandoned fetch's connection"
+        );
+
+        let tx = c.transaction().await?;
+        assert_eq!(1, tx.query_one("SELECT 1", &[]).await?.get::<_, i32>(0));
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// An offset stage dropped while its statement waits has that statement
+    /// cancelled, and its connection goes back to the pool idle, while the
+    /// statement would still be waiting.
+    ///
+    /// The offset stage waits for a lock on `txn_produce_offset`, which only
+    /// transactional produces write.
+    #[tokio::test]
+    async fn abandoned_offset_stage_is_cancelled_and_its_connection_returned() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let Some((storage, monitor, application_name)) =
+            storage_on_one_connection(&cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        let reading = {
+            let storage = storage.clone();
+            let topition = topition.clone();
+            async move { storage.offset_stage(&topition).await.map(drop) }
+        };
+
+        let backend = abandon_read_waiting_for_a_lock(
+            &storage,
+            &monitor,
+            &application_name,
+            "txn_produce_offset",
+            "txn_produce_offset",
+            reading,
+        )
+        .await?;
+
+        let c = storage.connection().await?;
+        assert_eq!(
+            backend,
+            c.query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get::<_, i32>(0),
+            "the pool kept the abandoned offset stage's connection"
+        );
 
         Ok(())
     }

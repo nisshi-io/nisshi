@@ -23,10 +23,13 @@ use nisshi_sans_io::{
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
-use tokio::time::{Duration, Instant, sleep, timeout_at};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, METER, OffsetStage, Result, Storage, Topition};
+use crate::{
+    Error, METER, OffsetStage, Result, Storage, Topition,
+    service::deadline::{self, Missed},
+};
 
 /// Partition reads whose fetch offset falls outside the partition, by
 /// `topic` and by `bound`: `below_log_start` (answered with
@@ -96,42 +99,14 @@ static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// What a read bounded by [`before`] was doing when its deadline passed.
-///
-/// An operator reads it from the `stage` attribute of the
-/// `nisshi_storage_read_deadline_exceeded` counter: `reading` points at a
-/// slow storage engine, and `not_started` at a request with more
-/// partitions than could be read before the deadline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Missed {
-    /// The deadline had passed before the read was polled, so no storage
-    /// call was made.
-    NotStarted,
-
-    /// The read was in storage.
-    Reading,
-}
-
-impl Missed {
-    fn stage(self) -> &'static str {
-        match self {
-            Self::NotStarted => "not_started",
-            Self::Reading => "reading",
-        }
-    }
-}
-
-/// Runs `read` until `deadline`.
-///
-/// A read is not started at all once the deadline has passed:
-/// [`tokio::time::timeout_at`] polls its future once before looking at the
-/// clock, which would send a storage request only to drop it.
+/// Runs `read` until `deadline`, see [`deadline::bounded`].
 ///
 /// Dropping the read cancels nisshi's side of it, and only that side.
 ///
-/// - Postgres: the connection goes back to the pool while its statement
-///   still runs, and the next checkout of that connection waits for the
-///   statement to finish.
+/// - Postgres: the engine asks the server to cancel the statement, and
+///   keeps the connection and a permit from its limit on Fetch reads in
+///   flight until the statement has ended. The connection then goes back
+///   to the pool if it is outside any transaction, and is closed if not.
 /// - libSQL: a local statement runs synchronously inside the read's
 ///   `async fn`, so the deadline interrupts only a wait for a permit or a
 ///   connection, never a slow statement.
@@ -143,13 +118,7 @@ async fn before<F>(deadline: Instant, read: F) -> Result<F::Output, Missed>
 where
     F: Future,
 {
-    if Instant::now() >= deadline {
-        Err(Missed::NotStarted)
-    } else {
-        timeout_at(deadline, read)
-            .await
-            .map_err(|_| Missed::Reading)
-    }
+    deadline::bounded(deadline, read).await
 }
 
 /// Records a read of `tp` at `offset` that [`before`] abandoned, in the
@@ -184,7 +153,7 @@ fn missed(
         Missed::NotStarted => {
             debug!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
         }
-        Missed::Reading => {
+        Missed::Queued | Missed::Reading => {
             warn!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
         }
     }
@@ -2842,5 +2811,21 @@ mod tests {
 
         assert_eq!(Err(Missed::NotStarted), before(deadline, read).await);
         assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    /// A read abandoned while it waits for its engine's limit on reads in
+    /// flight is reported as queued, not as a slow read.
+    #[tokio::test(start_paused = true)]
+    async fn before_reports_a_read_abandoned_in_its_engines_queue() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        assert_eq!(
+            Err(Missed::Queued),
+            before(
+                deadline,
+                crate::service::deadline::queued(std::future::pending::<()>())
+            )
+            .await
+        );
     }
 }
