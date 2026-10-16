@@ -30,7 +30,6 @@ services:
       - ${NISSHI_DB_PORTS:-5432:5432}
     volumes:
       - db:/var/lib/postgresql
-      - ./etc/initdb.d/:/docker-entrypoint-initdb.d/
     healthcheck:
       test: /usr/bin/pg_isready
       interval: 5s

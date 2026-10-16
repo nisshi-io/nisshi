@@ -22,7 +22,7 @@
 //! closes to connections. Only a server of its own can stop answering on open connections. A
 //! mistake in a test's outage then also can't reach the shared broker.
 
-use std::{fs, path::Path, time::Duration};
+use std::time::Duration;
 
 use crate::{
     ReservedPort, StorageUrl,
@@ -30,12 +30,11 @@ use crate::{
     settings,
 };
 
-/// How long a server has to accept connections after it starts. A new server first runs the
-/// scripts in `etc/initdb.d`.
+/// How long a server has to accept connections after it starts.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A PostgreSQL server in a container, with the schema that `etc/initdb.d` creates. Dropping it
-/// removes the container and its data.
+/// A PostgreSQL server in a container, with an empty database. The broker creates its tables there
+/// at startup. Dropping the server removes the container and its data.
 #[derive(Debug)]
 pub struct PostgresServer {
     container: String,
@@ -45,17 +44,10 @@ pub struct PostgresServer {
 }
 
 impl PostgresServer {
-    /// Starts a server from the image in `NISSHI_SMOKE_POSTGRES_IMAGE`, with the schema from
-    /// `etc/initdb.d`, and waits until it accepts connections. Panics if it doesn't within a
-    /// minute.
+    /// Starts a server from the image in `NISSHI_SMOKE_POSTGRES_IMAGE`, and waits until it accepts
+    /// connections. Panics if it doesn't within a minute.
     #[track_caller]
     pub fn start() -> Self {
-        let initdb = Path::new(env!("CARGO_MANIFEST_DIR")).join("../etc/initdb.d");
-        let initdb = match fs::canonicalize(&initdb) {
-            Ok(initdb) => initdb,
-            Err(err) => panic!("{}: {err}", initdb.display()),
-        };
-
         let server = Self {
             container: unique::name("nisshi-smoke-postgres"),
             port: ReservedPort::reserve(),
@@ -73,8 +65,6 @@ impl PostgresServer {
             "POSTGRES_PASSWORD=postgres",
             "--env",
             "PGUSER=postgres",
-            "--volume",
-            &format!("{}:/docker-entrypoint-initdb.d:ro", initdb.display()),
             &settings::postgres_image(),
         ]);
 
@@ -128,9 +118,9 @@ impl PostgresServer {
         self.docker_or_panic(&["unpause", &self.container]);
     }
 
-    /// Waits until the server accepts connections over TCP. The image's entrypoint first runs the
-    /// init scripts on a server that listens only on its socket. A check over the socket passes
-    /// during that time, so this check connects over TCP.
+    /// Waits until the server accepts connections over TCP. The image's entrypoint first sets up
+    /// the database on a temporary server that listens only on its socket. A check over the socket
+    /// passes during that time, so this check connects over TCP.
     #[track_caller]
     fn wait_until_ready(&self) {
         polling::wait_until(READY_TIMEOUT, || {

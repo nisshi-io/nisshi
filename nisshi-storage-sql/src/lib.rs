@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod schema;
 mod sql;
 
 #[cfg(feature = "libsql")]

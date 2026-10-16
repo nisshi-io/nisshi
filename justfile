@@ -263,7 +263,6 @@ docker-run-postgres:
         --publish 5432:5432 \
         --env PGUSER=postgres \
         --env POSTGRES_PASSWORD=postgres \
-        --volume ./etc/initdb.d/:/docker-entrypoint-initdb.d/ \
         postgres:16.4
 
 docker-prune:

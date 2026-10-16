@@ -223,6 +223,15 @@ pub use service::{
 #[cfg(feature = "dynostore")]
 mod os;
 
+/// The ways that the broker's storage can fail at startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupFailure {
+    /// The storage failed the broker's startup [`Storage::ping`].
+    StorageUnreachable,
+    /// The broker failed to check or create its tables in the storage.
+    SchemaSetup,
+}
+
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -256,6 +265,22 @@ pub enum Error {
     },
 
     Glob(Arc<GlobError>),
+
+    /// The database records schema `recorded_version`, which a broker of `schema_version` can't
+    /// use. Only a broker of `oldest_compatible_version` or later can use it.
+    IncompatibleSchema {
+        recorded_version: i32,
+        oldest_compatible_version: i32,
+        schema_version: i32,
+    },
+
+    /// The database records schema `recorded_version`, which is older than `schema_version`. A
+    /// broker of `schema_version` can't upgrade the recorded schema.
+    OutdatedSchema {
+        recorded_version: i32,
+        schema_version: i32,
+    },
+
     InsufficientCapacity(#[from] InsufficientCapacity),
     Io(Arc<io::Error>),
 
@@ -289,11 +314,12 @@ pub enum Error {
     NoSuchOffset(i64),
     OsString(OsString),
 
-    /// The storage at `storage` failed the startup check in
-    /// [`Builder::build`], so the broker cannot use it.
-    StartupCheck {
+    /// The error when the storage at `storage` fails at startup. `failure` names what failed.
+    /// `source` is the error that the storage returned.
+    StartupFailed {
         /// The storage URL, with any password removed.
-        storage: Url,
+        storage: Arc<Url>,
+        failure: StartupFailure,
         source: Arc<Error>,
     },
 
@@ -2576,10 +2602,14 @@ impl Builder<i32, String, Url, Url> {
             Some(pb)
         };
 
-        storage.ping().await.map_err(|source| Error::StartupCheck {
-            storage: redacted,
-            source: Arc::new(source),
-        })?;
+        storage
+            .ping()
+            .await
+            .map_err(|source| Error::StartupFailed {
+                storage: Arc::new(redacted),
+                failure: StartupFailure::StorageUnreachable,
+                source: Arc::new(source),
+            })?;
 
         if let Some(pb) = pb {
             pb.inc(1);

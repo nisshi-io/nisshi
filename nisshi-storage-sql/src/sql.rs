@@ -38,7 +38,7 @@ impl Cache {
         Self(inner)
     }
 
-    #[cfg(any(feature = "postgres", feature = "turso"))]
+    #[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
     pub(crate) fn get(&self, key: &str) -> Result<&str> {
         self.0
             .get(key)
@@ -163,6 +163,26 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("lite/policy_delete_bytes.sql"),
         ),
         ("lite/vacuum_into.sql", include_sql!("lite/vacuum_into.sql")),
+        (
+            "nisshi_schema_version_create.sql",
+            include_sql!("sql/nisshi_schema_version_create.sql"),
+        ),
+        (
+            "nisshi_schema_version_insert.sql",
+            include_sql!("sql/nisshi_schema_version_insert.sql"),
+        ),
+        (
+            "nisshi_schema_version_select.sql",
+            include_sql!("sql/nisshi_schema_version_select.sql"),
+        ),
+        (
+            "pg/nisshi_schema_version_exists.sql",
+            include_sql!("pg/nisshi_schema_version_exists.sql"),
+        ),
+        (
+            "pg/search_path_set_to_cluster_namespace.sql",
+            include_sql!("pg/search_path_set_to_cluster_namespace.sql"),
+        ),
         ("policy_compact.sql", include_sql!("sql/policy_compact.sql")),
         ("policy_delete.sql", include_sql!("sql/policy_delete.sql")),
         (
