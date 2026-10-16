@@ -1460,7 +1460,15 @@ impl Postgres {
             }
         }
 
-        let tx = c.transaction().await?;
+        // This transaction is READ COMMITTED whatever the server's default isolation level is,
+        // because a broker that waited for the lock reads the schema that another broker committed
+        // during the wait. A REPEATABLE READ transaction keeps the snapshot that it took before
+        // the wait, and doesn't see that schema.
+        let tx = c
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
 
         // This transaction sets its own `statement_timeout`, because an operator's short timeout
         // bounds a request and can abort this setup. The setup can wait for another broker's lock
@@ -9305,63 +9313,93 @@ mod tests {
         .await
     }
 
-    /// A broker finds no schema, and then waits for the setup lock while another broker creates
-    /// the schema. The broker must find the committed schema after the wait, and must not create
-    /// it again.
-    ///
-    /// The test fixes the order of the two brokers. It can't make the waiting broker's catalog
-    /// cache miss the new table, because the server decides when a session applies other
-    /// sessions' catalog changes.
+    /// A broker finds no schema, and then waits for the setup lock while another broker records
+    /// the schema version. The broker must find the recorded version after the wait, and must not
+    /// create the schema again.
     #[tokio::test]
     async fn ensure_schema_finds_the_schema_committed_while_it_waits_for_the_lock() -> Result<()> {
         with_empty_database(
             "ensure_schema_finds_the_schema_committed_while_it_waits_for_the_lock",
+            async |database| assert_waiting_broker_finds_the_recorded_version(database).await,
+        )
+        .await
+    }
+
+    /// The same as [`ensure_schema_finds_the_schema_committed_while_it_waits_for_the_lock`], on a
+    /// database whose transactions are REPEATABLE READ unless they ask for another level.
+    #[tokio::test]
+    async fn ensure_schema_finds_the_schema_committed_while_it_waits_under_repeatable_read()
+    -> Result<()> {
+        with_empty_database(
+            "ensure_schema_finds_the_schema_committed_while_it_waits_under_repeatable_read",
             async |database| {
-                let other = database.storage()?;
-                let mut c = other.connection().await?;
-                let tx = c.transaction().await?;
-                tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
+                database
+                    .execute(&format!(
+                        "alter database {} set default_transaction_isolation = 'repeatable read'",
+                        database.name
+                    ))
                     .await?;
-
-                let waiting = database.storage()?;
-                let (waited, created) = future::join(waiting.ensure_schema(), async {
-                    // The schema must be created only after the waiting broker has read that
-                    // there is none, which it does before it asks for the lock.
-                    let observer = database.storage()?.connection().await?;
-                    while !observer
-                        .query_one(
-                            "select exists (select from pg_locks \
-                             where locktype = 'advisory' and not granted \
-                             and database = (select oid from pg_database \
-                             where datname = current_database()))",
-                            &[],
-                        )
-                        .await?
-                        .try_get::<_, bool>(0)?
-                    {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-
-                    tx.batch_execute(crate::sql::SQL.get("nisshi_schema_version_create.sql")?)
-                        .await?;
-                    tx.batch_execute(SCHEMA).await?;
-                    _ = tx
-                        .execute(
-                            crate::sql::SQL.get("nisshi_schema_version_insert.sql")?,
-                            &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
-                        )
-                        .await?;
-                    tx.commit().await.map_err(Error::from)
-                })
-                .await;
-
-                created?;
-                waited?;
-                assert_eq!(recorded_version(&waiting).await?, Some(SCHEMA_VERSION));
-                Ok(())
+                assert_waiting_broker_finds_the_recorded_version(database).await
             },
         )
         .await
+    }
+
+    /// Records the schema version on `database` while a broker waits for the setup lock, and
+    /// asserts that the broker finds the recorded version.
+    async fn assert_waiting_broker_finds_the_recorded_version(
+        database: &EmptyDatabase,
+    ) -> Result<()> {
+        let other = database.storage()?;
+        let mut c = other.connection().await?;
+        let tx = c.transaction().await?;
+        tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
+            .await?;
+
+        let waiting = database.storage()?;
+        let (waited, created) = future::join(waiting.ensure_schema(), async {
+            // The version must be recorded only after the waiting broker has read that there is
+            // none, which it does before it asks for the lock. The wait has a limit, so that the
+            // test fails instead of hanging when `ensure_schema` fails before it asks for the lock.
+            let observer = database.storage()?.connection().await?;
+            timeout(Duration::from_secs(30), async {
+                while !observer
+                    .query_one(
+                        "select exists (select from pg_locks \
+                         where locktype = 'advisory' and not granted \
+                         and database = (select oid from pg_database \
+                         where datname = current_database()))",
+                        &[],
+                    )
+                    .await?
+                    .try_get::<_, bool>(0)?
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, Error>(())
+            })
+            .await
+            .map_err(|_| Error::Message("the broker didn't wait for the setup lock".into()))??;
+
+            // The other broker creates only the version table, not the whole schema. A commit that
+            // changes many catalog entries makes the server refresh the waiting broker's cache of
+            // table names, which hides a check that reads that cache.
+            tx.batch_execute(crate::sql::SQL.get("nisshi_schema_version_create.sql")?)
+                .await?;
+            _ = tx
+                .execute(
+                    crate::sql::SQL.get("nisshi_schema_version_insert.sql")?,
+                    &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
+                )
+                .await?;
+            tx.commit().await.map_err(Error::from)
+        })
+        .await;
+
+        created?;
+        waited?;
+        assert_eq!(recorded_version(&waiting).await?, Some(SCHEMA_VERSION));
+        Ok(())
     }
 
     /// The database is already set up, and the broker's database user can read and write the tables
