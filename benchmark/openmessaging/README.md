@@ -13,8 +13,33 @@ toolchain, a JDK and Maven for the benchmark, and a Homebrew `postgresql@18`. Do
 ./run.sh stop
 ```
 
-Result JSON lands in `results/`. `HEAP_OPTS` overrides the benchmark JVM heap (upstream default `-Xms4G -Xmx4G`).
-`POSTGRES=docker` runs postgres 18 in a container instead; see the header of `run.sh` for the postgres settings.
+Result JSON lands in `results/`.
+
+| Variable | Effect |
+|---|---|
+| `HEAP_OPTS` | benchmark JVM heap (upstream default `-Xms4G -Xmx4G`) |
+| `DRIVER` | driver file for `run`, instead of `driver-nisshi.yaml` |
+| `POSTGRES=docker` | postgres 18 in a container instead of Homebrew; pass it to every subcommand that talks to postgres |
+| `PG_BIN` | postgres `bin` directory, default `/opt/homebrew/opt/postgresql@18/bin` |
+| `POSTGRES_PORT` | postgres port, default 5432 |
+| `POSTGRES_ARGS` | extra arguments for the postgres server, e.g. `-c track_io_timing=on` |
+| `OMB_COMMIT` | upstream benchmark commit to build |
+
+## Things to know
+
+- `./run.sh broker` deletes and recreates `.pg/`, so every start begins with an empty database. It also
+  builds the release binary first, which takes 2 to 4 minutes after a source change.
+- The 15 minute upstream workload takes about 17 minutes with its 1 minute warm-up and writes 45 to 55 GB
+  into `.pg/`. The 3 minute workload writes about 9 GB. `./run.sh stop` stops the broker and postgres but
+  leaves `.pg/` on disk.
+- One run says little about the publish latency tail. Runs with identical settings on one machine have
+  differed by an order of magnitude in aggregate p99.9, and the worst publish of a 15 minute run was
+  about 2 s in most of them. Compare several runs, and record the host's memory pressure and disk.
+- `fetch.max.wait.ms` changes the result a lot. With the default of 500 the single consumer on 16
+  partitions held a standing backlog of several hundred thousand records. With 100 it kept up. Copy
+  `driver-nisshi.yaml`, add `fetch.max.wait.ms=100` under `consumerConfig`, and pass the copy as
+  `DRIVER=/path/to/copy.yaml ./run.sh run ...`. A very small value, such as 10, made the consumer fall
+  far behind in one run, so do not take smaller as better.
 
 ## Checking queries against large volumes
 

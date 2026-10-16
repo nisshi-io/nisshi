@@ -24,6 +24,9 @@
 #
 # POSTGRES_ARGS adds arguments to the postgres server, for example
 # "-c shared_preload_libraries=auto_explain"
+#
+# DRIVER is the benchmark driver file `run` uses, driver-nisshi.yaml by default. Copy that file to
+# change the producer or consumer settings, for example consumerConfig's fetch.max.wait.ms.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -144,7 +147,7 @@ run() {
     # directory, and writes result JSON there, so run in the distribution and move the results
     # out afterwards. Without HEAP_OPTS, bin/benchmark uses a 4 GB heap.
     local status=0
-    (cd "$dist" && bin/benchmark --drivers "$here/driver-nisshi.yaml" "$workload") || status=$?
+    (cd "$dist" && bin/benchmark --drivers "${DRIVER:-$here/driver-nisshi.yaml}" "$workload") || status=$?
     mv -f "$dist"/*.json "$results/" 2>/dev/null || true
     return "$status"
 }
