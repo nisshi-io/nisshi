@@ -1,0 +1,87 @@
+# franz-go pkg/kgo tests known to pass against tansu (run by run.sh).
+#
+# FINDINGS.md records the compatibility gaps behind the tests that are
+# excluded: TestClient_ProduceLargeMessages (max.message.bytes not
+# enforced), TestGroupETL (UNKNOWN_MEMBER_ID under concurrent
+# rebalances), TestTxnEtl (aborted records visible to read_committed).
+#
+# TestSCRAMAuth/TestSCRAMAuthBadCredentials self-skip without
+# KGO_TEST_SCRAM; TestShareGroup*/Test*848* self-skip because tansu does
+# not advertise ShareFetch v2 / ConsumerGroupHeartbeat v1.
+
+# client
+TestMaxVersions
+TestParseBrokerAddr
+TestParseBrokerAddrErrors
+TestUnknownGroupOffsetFetchPinned
+TestProcessHooks
+TestProcessHooksErrors
+TestHookPollStartRecognized
+TestPing
+TestIssue1034
+TestSCRAMAuth
+TestSCRAMAuthBadCredentials
+TestShareGroup
+
+# compression
+TestCompressionCodecLZ4WithSpecifiedLevel
+TestNewCompressor
+TestCompressDecompress
+Test_xerialDecode
+
+# consumer
+TestIssue325
+TestConsumeTopicRetrieval
+TestConsumeTopicRetrieval_Many
+TestConsumeRegex
+TestIssue337
+TestDirectPartitionPurge
+TestIssue434
+TestAddRemovePartitions
+TestPauseIssue489
+TestPauseIssueOct2023
+TestIssue523
+TestIssue648
+TestIssue810
+TestIssue865
+TestPooling
+TestGroupSimple
+TestHookPollStart
+TestFetchManagerQuitDrainsPendingFetches
+
+# group balancers
+Test_stickyAdjustCooperative
+TestRangeBalancerRackAware
+TestRangeBalancerNoRacks
+TestRangeBalancerRackNoMatchingRacks
+TestRangeBalancerRackMixedMemberRacks
+TestRangeBalancerRackShortRackSlice
+TestRangeBalancerRackOddPartitions
+TestRangeBalancerRackMultiTopicDisjoint
+TestNewConsumerBalancerIssue493
+
+# producer
+TestClient_Produce
+TestIssue769
+TestIssueProduceSyncManualPartitionNegativeDoesNotPanic
+TestIssue831
+TestPromisedRecAppendTo
+TestRecBatchAppendTo
+TestMessageSetAppendTo
+
+# record formatting / internals
+TestRecordFormatter
+TestRecordFormatterUnpack
+TestRecordReader
+TestRecordReaderJson
+TestRing
+TestRingMaxLen
+TestRingMaxLenDie
+
+# share groups (self-skip: ShareFetch v2 not advertised)
+TestShareGroupETL
+TestShareGroupAckOnClose
+TestShareGroupOffsetsAdmin
+
+# topics and partitions
+TestDelTopicsWithCoexistingPartitionPauses

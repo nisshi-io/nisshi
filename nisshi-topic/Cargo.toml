@@ -1,0 +1,29 @@
+[package]
+name = "nisshi-topic"
+description = "Topic administration"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+futures-core.workspace = true
+futures-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+nisshi-client.workspace = true
+nisshi-sans-io.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true

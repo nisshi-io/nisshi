@@ -1,32 +1,190 @@
 ---
 name: ci
+
+# `cache-save-if: github.ref == 'refs/heads/main'` on a job's toolchain
+# setup means every PR and queue entry restores main's cache but only a
+# push to main refreshes it; a release run on a `v*` tag doesn't save either. This isn't
+# a poisoning fix (GitHub already scopes a run's cache writes to its own
+# ref) - it's hygiene, keeping the repo's cache budget from being consumed
+# by entries on refs nothing else can restore from. Applies to fmt, clippy,
+# test (postgres:16, its only leg), cargo-publish-dry-run,
+# third-party-license, release and macos below (release and macos also skip
+# the cache entirely on tags). The two compat jobs only restore test's entry,
+# through the `dev` shared key, and never save. build-storage and
+# build-storage-lake use no cache: they run `cargo check`, which reuses little
+# of a full build's artifacts.
+#
+# Two tiers. The split was made on GitHub's Free plan (20 concurrent jobs),
+# where a full run of this workflow (~60 jobs, 31 of them with no `needs`) on
+# every pull_request push starved every other PR of runners. The org is now
+# on Enterprise (500 concurrent jobs), so the split no longer works around a
+# cap; it keeps per-push runner time and queue time down. So:
+#
+# - Tier A runs on every pull_request push: fmt, clippy, typos, shellcheck,
+#   third-party-license, the single non-experimental leg of each compat
+#   suite, `test` on postgres:16 (the oldest version the project tests), and
+#   ci-gate.
+# - Tier B runs once per merge-queue entry (`merge_group`) and, trimmed, on
+#   push to main: the full build-storage/build-storage-lake matrix, `test` on
+#   postgres:16 again (Postgres 17, 18 and 19 run nightly in tier-c.yml), the
+#   experimental compat legs (postgres and sqlite; S3 compat runs nightly),
+#   cargo-publish-dry-run, src, release,
+#   macos, smoke, smoke-oldest-client, smoke-report.
+#
+# Only `typos` runs ahead of `release`, and only `release` runs ahead of
+# `smoke`, so the release -> smoke chain starts with the rest of the run.
+# `macos` is a compile-only check except on a `v*` tag, where it builds the
+# release tarball (tier-c.yml builds the macOS release nightly). smoke builds
+# a single-platform image from release's binaries on each os and pushes
+# nothing. No job in this workflow pushes an image: tier-c.yml's edge-publish
+# pushes the `edge` image from the binaries that `release` uploads on a push
+# to main, and release.yml pushes the version tags.
+#
+# The push to main repeats a tree that the merge queue has already tested, so
+# it runs only the jobs that save a cache (see the first paragraph), plus
+# `changes`, `typos`, `shellcheck` and ci-gate. `github.ref !=
+# 'refs/heads/main'` turns off every other job. pull_request, merge_group
+# and tag runs do not have that ref, so they run what they ran before.
+# ci-gate's "Only trimmed jobs skipped on main" step names the jobs that may
+# skip there, so a job added later must run on main until someone lists it.
+# The trim assumes the merge queue: it does not read `vars.MERGE_QUEUE`, so
+# with the queue off, the tree that merges gets no Tier B run, and tier-c.yml's
+# edge-gate finds no merge-queue run to publish from. Change the trim
+# together with that variable.
+#
+# A `v*` tag doesn't trigger this workflow. release.yml runs on the tag,
+# calls this workflow through `workflow_call`, and publishes the release only
+# after it passes. A called run keeps the tag's `push` event and
+# `refs/tags/v*` ref, so the conditions below treat it as a push, and macos
+# builds the full release.
+#
+# On top of the tiers, the `changes` job skips every Rust job on a
+# pull_request that only touches CI config this workflow doesn't read, or
+# prose (the list is in .github/scripts/ci-changes.sh). Those jobs carry
+# `needs.changes.outputs.rust == 'true'` in their `if:`, and ci-gate needs
+# `changes` too, so a failed classification fails the gate.
+#
+# Tier B jobs carry `if: github.event_name != 'pull_request' ||
+# (vars.MERGE_QUEUE != 'on' && <same-repo PR>)`, written once as the `tier_b`
+# anchor on cargo-publish-dry-run and aliased by the others. The jobs that
+# skip on a push to main add `&& github.ref != 'refs/heads/main'`; that
+# second condition is the `tier_b_off_main` anchor on build-storage. The trimmed matrices pick
+# the smaller list under the inverse condition, so a leg's check-run name
+# (`compat-librdkafka (ubuntu-latest, memory, memory://, dynostore, false)`) means the same thing whichever tier
+# produced it. The `MERGE_QUEUE` repository variable is the rollback switch:
+# the split only makes sense while a merge queue runs Tier B before merge,
+# so when the queue is off (variable unset or not `on`) pull_request runs
+# everything, as before the split. Flip the variable together with the
+# ruleset's merge_queue rule, in both directions.
+#
+# A pull_request from a fork can't read repository variables, so
+# `vars.MERGE_QUEUE` is empty there and the checks above would run Tier B on
+# every push. A fork PR therefore takes the queue-on path whatever the
+# variable says, as `smoke` already did. With the queue off, the push to
+# `main` runs only the trimmed job set, so a fork PR's Tier B runs nowhere.
+# Turning the queue off therefore needs a follow-up that gates the trim on
+# `vars.MERGE_QUEUE` as well.
+#
+# No Tier A job may `needs` a Tier B job: GitHub marks a job `skipped` (not
+# `failure`) when its own `needs` didn't run, which would silently skip Tier A
+# on every PR.
+#
+# `merge_group` is here because the queue tests each entry on a
+# `gh-readonly-queue/...` branch; bound to `pull_request` alone, ci-gate
+# would never report there and every entry would hang until ejected. `push`
+# is scoped to `main`, so the queue branch itself doesn't also trigger a
+# push run. The queue fast-forwards main to the exact commit it tested, so
+# the post-merge push run repeats that tree; it exists to refresh the caches
+# and to leave the `image-*` artifacts that the scheduled edge image reads.
 permissions:
   contents: read
 on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   pull_request:
     branches:
       - main
+  merge_group:
+    types: [checks_requested]
+  workflow_call:
+# Cancel a superseded pull_request run only. Off pull_request the group is
+# `ref@sha`, not `sha`: the queue fast-forwards main to the commit it just
+# tested, so the merge_group run and the post-merge push run share a sha,
+# and a `v*` tag on main's tip makes a third. Sharing a group would make the
+# push run pend behind the still-running queue run, and GitHub cancels a
+# pending run in a group whenever a newer one arrives, whatever
+# `cancel-in-progress` says. Cancelling a merge_group run also fails that
+# queue entry outright.
+#
+# The prefix is a literal, not `github.workflow`: in a called run that is the
+# caller's name, so another workflow the same caller runs would land in this
+# group and GitHub would cancel one of them.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
-  REGISTRY: ghcr.io
   CLICOLOR: 1
+  # Pinned release + its published checksum for duckdb_cli-linux-amd64.gz,
+  # single source of truth for both report jobs below. Downloaded directly
+  # from github.com/duckdb/duckdb/releases (not the install.duckdb.org CDN
+  # redirector, which resolves to whatever is newest and isn't checksummed).
+  DUCKDB_VERSION: "1.5.6"
+  DUCKDB_SHA256: cce2687a38681db644c248198b99ecd86170ff47e324c5f33e50c0042f142839
 jobs:
+  # Whether a pull_request run needs the Rust jobs at all. A PR that only
+  # touches CI config this workflow doesn't read, or prose, skips every job
+  # below except typos, shellcheck and ci-gate (see
+  # .github/scripts/ci-changes.sh for the list). merge_group and push always get rust=true. The classifier is
+  # checked out from the PR's base, so a PR can't widen its own skip list.
+  # The same job is in dependencies.yml, codeql.yml and fuzz.yml.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          run_all() { echo "$1, running everything"; echo "rust=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          [ "$EVENT_NAME" = pull_request ] || run_all "$EVENT_NAME run"
+          [ -f .github/scripts/ci-changes.sh ] || run_all "base has no ci-changes.sh"
+          bash .github/scripts/ci-changes.test.sh
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > "$RUNNER_TEMP/files"
+          listed=$(wc -l < "$RUNNER_TEMP/files")
+          # The files API stops at 3000; a short list could hide a Rust change.
+          [ "$listed" -eq "$CHANGED_FILES" ] || run_all "listed $listed of $CHANGED_FILES changed files"
+          bash .github/scripts/ci-changes.sh < "$RUNNER_TEMP/files"
   test:
-    needs: [check, fmt, clippy, build-storage, build-storage-lake]
+    # Postgres 16, the oldest version the project tests, on every tier: a query
+    # that needs a newer function or syntax then fails before merge. The newer
+    # versions run nightly in tier-c.yml. build-storage/build-storage-lake are
+    # Tier B, so they can't be `needs` here (see the header).
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
-        pg:
-          - postgres:16
-          - postgres:17
-          - postgres:18
+        pg: [postgres:16]
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -34,42 +192,59 @@ jobs:
       AWS_DEFAULT_REGION: eu-west-2
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
-      CARGO_BUILD_BUILD_DIR: /mnt/build
-      CLUSTER_ID: tansu-ci
+      CLUSTER_ID: nisshi-ci
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
-      ICEBERG_WAREHOUSE: tansu
+      ICEBERG_WAREHOUSE: nisshi
       LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
+      NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
-      RUST_BACKTRACE: 1
-      RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
       SCHEMA_REGISTRY: file://./etc/schema
-      STORAGE_ENGINE: s3://tansu/
-      TANSU_IMAGE: ghcr.io/tansu-io/tansu
+      STORAGE_ENGINE: s3://nisshi/
+      NISSHI_IMAGE: ghcr.io/nisshi-io/nisshi
     steps:
-      - run: sudo mkdir /mnt/build
-      - run: sudo chmod a+rwxt /mnt/build
-      - run: echo "PG_IMAGE_DASH=${POSTGRES_IMAGE/:/-}" >> $GITHUB_ENV
-      - run: echo ${PG_IMAGE_DASH}
+      - run: echo "PG_IMAGE_DASH=${POSTGRES_IMAGE/:/-}" >> "$GITHUB_ENV"
+      - run: echo "${PG_IMAGE_DASH}"
       - run: df -h
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/docker-hub-mirror
+        with:
+          ecr-fallback-images: ${{matrix.pg}}
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
       - run: just ci
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache: false
-      - run: cargo install cargo-nextest --locked
+          # Only a push to main saves this entry. The compat jobs restore it
+          # under the same key and never save it.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-shared-key: dev
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.146
       - run: df -h
+      # Set on the step, not the job: rust-cache hashes every variable that
+      # starts with RUST into its key, and the jobs that restore this entry
+      # don't set these, so a job-level value would give every job a key of
+      # its own.
       - run: just test
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
       - run: df -h
         if: always()
       - run: ls -l
         if: always()
       - run: tar --create --verbose --gzip --file=logs-${{env.PG_IMAGE_DASH}}.tar.gz logs
         if: always()
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: logs-${{env.PG_IMAGE_DASH}}.tar.gz
@@ -78,50 +253,59 @@ jobs:
       - run: du -sh target
       - run: docker system df
       - run: df -h
-  check:
-    runs-on: ${{matrix.os}}
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
-          cache: false
-      - run: just check
   fmt:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 10
     strategy:
       matrix:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just fmt
   clippy:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 15
     strategy:
       matrix:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
-          cache: false
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just clippy
+      # `just doc` reuses the dependencies that clippy built, so it runs in
+      # this job instead of in a job of its own.
+      - run: just doc
   build-storage:
+    # Every Tier B job that skips on a push to main reuses this condition as
+    # `*tier_b_off_main`. The others use `*tier_b`, defined on
+    # cargo-publish-dry-run.
+    if: &tier_b_off_main needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository)) && github.ref != 'refs/heads/main'
+    needs: [changes]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -132,119 +316,313 @@ jobs:
           - libsql
           - postgres
           - slatedb
+          - turso
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
           cache: false
-      - run: cargo build --features ${{matrix.storage}}
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev
+      # This leg only proves the feature compiles, so check skips codegen
+      # and linking.
+      - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}}
   build-storage-lake:
+    if: *tier_b_off_main
+    needs: [changes]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
-        storage:
-          - dynostore
-          - libsql
-          - postgres
-          - slatedb
+        # The lake features (nisshi-schema) and the storage features
+        # (nisshi-broker, nisshi-storage) are independent, so one storage
+        # covers every lake format.
         lake:
           - delta
           - iceberg
           - parquet
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
           cache: false
-      - run: cargo build --features ${{matrix.storage}} --features ${{matrix.lake}}
-  cargo-publish-dry-run:
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev
+      # The same flags as build-storage, so only these features are on: a
+      # bare `cargo check --features` keeps every member's defaults enabled.
+      # Check proves the combination compiles without codegen or linking.
+      - run: cargo check --bin nisshi --no-default-features --features dynostore,${{matrix.lake}}
+  compat-librdkafka:
+    if: needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
+    needs: [changes]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.storage.experimental }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os:
+          - ubuntu-latest
+        # Tier A runs the one non-experimental leg (memory); merge_group/push
+        # run the three. compat-franz-go reuses this list as `*compat_storage`.
+        storage: &compat_storage >-
+          ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
+          && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
+          || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
+          {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": true},
+          {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": true}]') }}
+    env:
+      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: true
+      AWS_DEFAULT_REGION: eu-west-2
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLUSTER_ID: librdkafka-integration
+      LAKEKEEPER_IMAGE: unused
+      RESULTS_FILE: results-${{matrix.storage.name}}.csv
+      STORAGE_ENGINE: ${{matrix.storage.engine}}
+      NISSHI_IMAGE: hello-world
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/docker-hub-mirror
+        with:
+          ecr-fallback-images: postgres:18
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache-shared-key: dev
+          cache-save-if: false
+      - run: just compat-infra-up
+      # RUST_* on the step, not the job, for the cache key (see `test`).
+      - run: just compat-librdkafka '${{matrix.storage.engine}}' '${{matrix.storage.features}}'
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: warn
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compat-librdkafka-results-${{matrix.storage.name}}
+          path: ${{env.RESULTS_FILE}}
+          if-no-files-found: warn
+  compat-librdkafka-report:
+    if: always() && needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
+    needs: [changes, compat-librdkafka]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/scripts/pivot-integration-report.sql
+          sparse-checkout-cone-mode: false
+          path: reports
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: compat-librdkafka-results-*
+          path: results
+          merge-multiple: true
+      - name: Install duckdb (pinned version, checksum-verified)
+        run: |
+          curl -fsSL -o duckdb_cli.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.gz"
+          echo "${DUCKDB_SHA256}  duckdb_cli.gz" | sha256sum -c -
+          mkdir -p "${DUCKDB_CLI}"
+          gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
+          chmod +x "${DUCKDB_CLI}/duckdb"
+      - run: echo "## librdkafka compatibility report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
+  compat-franz-go:
+    if: needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
+    needs: [changes]
+    runs-on: ${{matrix.os}}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.storage.experimental }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os:
+          - ubuntu-latest
+        storage: *compat_storage
+    env:
+      ADVERTISED_LISTENER_URL: tcp://localhost:9092
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_ALLOW_HTTP: true
+      AWS_DEFAULT_REGION: eu-west-2
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLUSTER_ID: librdkafka-integration
+      LAKEKEEPER_IMAGE: unused
+      RESULTS_FILE: results-${{matrix.storage.name}}.csv
+      STORAGE_ENGINE: ${{matrix.storage.engine}}
+      NISSHI_IMAGE: hello-world
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/docker-hub-mirror
+        with:
+          ecr-fallback-images: postgres:18
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache-shared-key: dev
+          cache-save-if: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+      - run: just compat-infra-up
+      - run: just compat-franz-go '${{matrix.storage.engine}}' '${{matrix.storage.features}}'
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: warn
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compat-franz-go-results-${{matrix.storage.name}}
+          path: ${{env.RESULTS_FILE}}
+          if-no-files-found: warn
+  compat-franz-go-report:
+    if: always() && needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
+    needs: [changes, compat-franz-go]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/scripts/pivot-integration-report.sql
+          sparse-checkout-cone-mode: false
+          path: reports
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: compat-franz-go-results-*
+          path: results
+          merge-multiple: true
+      - name: Install duckdb (pinned version, checksum-verified)
+        run: |
+          curl -fsSL -o duckdb_cli.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.gz"
+          echo "${DUCKDB_SHA256}  duckdb_cli.gz" | sha256sum -c -
+          mkdir -p "${DUCKDB_CLI}"
+          gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
+          chmod +x "${DUCKDB_CLI}/duckdb"
+      - run: echo "## franz-go compatibility report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
+  cargo-publish-dry-run:
+    if: &tier_b needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
+    needs: [changes]
+    runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo publish --dry-run --workspace
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y libclang-dev libkrb5-dev
+      - run: cargo publish --dry-run --locked --workspace
   typos:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: crate-ci/typos@v1.43.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
         with:
           config: typos.toml
-  third-party-license:
+  # actionlint already runs shellcheck on each workflow `run:` block. This
+  # job checks the shell scripts in the repository.
+  shellcheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - env:
-          CARGO_ABOUT_VERSION: 0.8.2
-        run: |
-          cargo install "cargo-about@$CARGO_ABOUT_VERSION"
-          cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
-      - uses: actions/upload-artifact@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      # We install a pinned version instead of using the runner image's copy,
+      # so that a runner image update cannot fail this check on unchanged code.
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: shellcheck@0.11.0
+      - run: just shellcheck
+  third-party-license:
+    if: needs.changes.outputs.rust == 'true'
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-about@0.8.4
+      - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: third-party-license
           path: THIRD-PARTY-LICENSE.html
           if-no-files-found: error
   src:
+    if: *tier_b_off_main
+    needs: [changes]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: |
           git archive --format=tar.gz HEAD >${{runner.temp}}/src.tar.gz
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: src
           path: ${{runner.temp}}/src.tar.gz
           if-no-files-found: error
-  package:
-    needs: [test, cargo-publish-dry-run, third-party-license, typos]
-    runs-on: ${{matrix.os}}
-    permissions:
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{env.REGISTRY}}/${{github.repository}}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-      - uses: docker/setup-buildx-action@v3
-        with:
-          buildkitd-flags: --debug
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{env.REGISTRY}}
-          username: ${{github.actor}}
-          password: ${{secrets.GITHUB_TOKEN}}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{github.actor == 'shortishly'}}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+  # Runs the nisshi-smoke-test suite (`just smoke <storage>`): the Kafka CLI
+  # tools from each Kafka image against an image the job builds from
+  # release's binaries, on each storage engine.
   smoke:
-    if: ${{github.actor == 'shortishly'}}
-    needs: [package]
+    if: *tier_b_off_main
+    needs: [changes, release]
     strategy:
       fail-fast: false
       matrix:
@@ -252,147 +630,421 @@ jobs:
           - ubuntu-latest
           - ubuntu-24.04-arm
         storage:
-          - s3://tansu/
-          - postgres://postgres:postgres@db
-          - sqlite://tansu.db
+          - postgres
+          - sqlite
+          - memory
+          - s3
         kafka:
-          - apache/kafka:3.9.0
-          - apache/kafka:3.8.1
-          - apache/kafka:3.7.0
+          - apache/kafka:3.9.2
+          - apache/kafka:4.3.1
     runs-on: ${{matrix.os}}
+    timeout-minutes: 30
     env:
-      ADVERTISED_LISTENER_URL: tcp://tansu:9092
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_ALLOW_HTTP: true
-      AWS_DEFAULT_REGION: auto
-      AWS_ENDPOINT: http://minio:9000
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      CLUSTER_ID: kafka-python-integration
       KAFKA_IMAGE: ${{matrix.kafka}}
-      PROMETHEUS_LISTENER_URL: tcp://localhost:9100
       RUST_BACKTRACE: 1
-      RUST_LOG: warn,tansu_broker=debug,tansu_storage=debug,tansu_schema=debug
-      STORAGE_ENGINE: ${{matrix.storage}}
+      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
+      STORAGE: ${{matrix.storage}}
     steps:
-      - uses: docker/metadata-action@v5
-        id: meta
+      # The leg name is set first, so the results upload has a name even when
+      # a later setup step fails. It is one word: the report reads the storage
+      # column from the results file name with `(\w+).csv`.
+      - run: |
+          kafka=${KAFKA_IMAGE#*:}
+          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          images: ${{env.REGISTRY}}/${{github.repository}}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-      - uses: actions/checkout@v6
+          persist-credentials: false
+      - uses: ./.github/actions/docker-hub-mirror
         with:
-          repository: tansu-io/example-java
-          path: integration
-      - uses: actions/checkout@v6
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
+          just-version: 1.58.0
+      # The job does not build the broker, so it uses no cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.146
+      # The image is built here from release's binaries and never pushed.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: dist
+      - run: |
+          docker build --tag nisshi:smoke .
+          echo "NISSHI_SMOKE_IMAGE=nisshi:smoke" >> "$GITHUB_ENV"
+      # The step stops well before the job's timeout, so the steps that
+      # upload the results and logs still run when the suite hangs.
+      - run: just smoke "${STORAGE}"
+        timeout-minutes: 20
+      # `just smoke` writes the results file even when it fails. A leg that
+      # failed before `just smoke` ran gets a failed row here instead, so it
+      # still has a column in the report.
+      - if: always()
+        run: |
+          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
+          if [[ ! -f "${results}" ]]; then
+            mkdir -p target/smoke
+            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/results-*.csv
+          if-no-files-found: warn
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
+          path: |
+            target/smoke/*.log
+            target/smoke/brokers-*/*/*.log
+          if-no-files-found: warn
+  # Runs the smoke suite with the Kafka CLI tools from the oldest Kafka release that CI tests, so
+  # CI checks that an older Java client still negotiates API versions with the broker.
+  smoke-oldest-client:
+    if: *tier_b_off_main
+    needs: [changes, release]
+    strategy:
+      fail-fast: false
+      # The job runs on every storage engine, because an older client can call other APIs than a
+      # newer one, and each engine implements those APIs in its own code.
+      matrix:
+        storage:
+          - postgres
+          - sqlite
+          - memory
+          - s3
+    # A Java client sends the same requests on any CPU, so this job runs on x86 only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KAFKA_IMAGE: apache/kafka:3.7.2
+      RUST_BACKTRACE: 1
+      RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
+      STORAGE: ${{matrix.storage}}
+    steps:
+      # The leg name is set first, so the results upload has a name even when
+      # a later setup step fails. It is one word: the report reads the storage
+      # column from the results file name with `(\w+).csv`.
+      - run: |
+          kafka=${KAFKA_IMAGE#*:}
+          echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/docker-hub-mirror
+        with:
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.58.0
+      # The job does not build the broker, so it uses no cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.146
+      # The image is built here from release's binaries and never pushed.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: dist
+      - run: |
+          docker build --tag nisshi:smoke .
+          echo "NISSHI_SMOKE_IMAGE=nisshi:smoke" >> "$GITHUB_ENV"
+      # The step stops well before the job's timeout, so the steps that
+      # upload the results and logs still run when the suite hangs.
+      - run: just smoke "${STORAGE}"
+        timeout-minutes: 20
+      # `just smoke` writes the results file even when it fails. A leg that
+      # failed before `just smoke` ran gets a failed row here instead, so it
+      # still has a column in the report.
+      - if: always()
+        run: |
+          results=target/smoke/results-${NISSHI_SMOKE_LEG}.csv
+          if [[ ! -f "${results}" ]]; then
+            mkdir -p target/smoke
+            echo "setup: the job failed before the smoke suite ran,FAIL" >"${results}"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-results-${{env.NISSHI_SMOKE_LEG}}
+          path: target/smoke/results-*.csv
+          if-no-files-found: warn
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-logs-${{env.NISSHI_SMOKE_LEG}}
+          path: |
+            target/smoke/*.log
+            target/smoke/brokers-*/*/*.log
+          if-no-files-found: warn
+  # Reports every leg of the two smoke jobs. `always()` with the result
+  # check runs it when any of them ran, so a job that release's failure
+  # skipped still leaves the others' legs in the grid.
+  smoke-report:
+    if: always() && github.ref != 'refs/heads/main' && (needs.smoke.result != 'skipped' || needs.smoke-oldest-client.result != 'skipped')
+    needs: [smoke, smoke-oldest-client]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DUCKDB_CLI: /home/runner/.duckdb/cli/latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
           sparse-checkout: |
-            etc/initdb.d/010-schema.sql
+            .github/workflows/scripts/pivot-integration-report.sql
           sparse-checkout-cone-mode: false
-          path: initdb
-      - run: ls -lR
-      - run: cp -v initdb/etc/initdb.d/010-schema.sql integration/etc/initdb.d
-      - run: docker compose --ansi never --progress plain up --no-color --quiet-pull --detach
-        working-directory: integration
-        env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never exec minio /usr/bin/mc ready local
-        working-directory: integration
-        env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never exec minio /usr/bin/mc alias set local http://localhost:9000 ${{ env.AWS_ACCESS_KEY_ID }} ${{ env.AWS_SECRET_ACCESS_KEY }}
-        working-directory: integration
-        env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
-      - run: docker compose --ansi never exec minio /usr/bin/mc mb local/tansu
-        working-directory: integration
-        env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
-      - run: sudo apt-get update
-      - run: sudo apt-get install -y bats
-      - run: docker compose exec db /usr/bin/pg_isready --timeout=60
-        working-directory: integration
-        env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
-      - run: docker compose logs
-        working-directory: integration
-        env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
-      - run: bats --trace --verbose-run tests
-        working-directory: integration
-        env:
-          TANSU_IMAGE: ghcr.io/tansu-io/tansu:${{steps.meta.outputs.version}}
+          path: reports
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: smoke-results-*
+          path: results
+          merge-multiple: true
+      - name: Install duckdb (pinned version, checksum-verified)
+        run: |
+          curl -fsSL -o duckdb_cli.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.gz"
+          echo "${DUCKDB_SHA256}  duckdb_cli.gz" | sha256sum -c -
+          mkdir -p "${DUCKDB_CLI}"
+          gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
+          chmod +x "${DUCKDB_CLI}/duckdb"
+      - run: echo "## Smoke report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
+  # The static Linux binaries: smoke, release.yml's publish-image and
+  # tier-c.yml's edge-publish build the image from them. macos is the same
+  # build for macOS, in a job of its own so smoke needn't wait for it.
   release:
-    if: ${{github.actor == 'shortishly'}}
-    needs: [test, src, third-party-license, typos]
-    permissions:
-      contents: write
+    if: *tier_b
+    # test, src and the build matrices are not here, so this leg starts with
+    # the rest of the run. typos stays: it takes seconds and stops a run
+    # before the expensive jobs.
+    needs: [changes, typos]
     runs-on: ${{matrix.os}}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            flags: ""
-            enabled: true
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            flags: ""
-            enabled: true
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            flags: ""
-            enabled: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            flags: ""
-            enabled: true
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+    env:
+      # cc-rs otherwise looks for aarch64-linux-musl-gcc, which Ubuntu doesn't
+      # ship, and falls back to glibc gcc for the C deps (aws-lc-sys, ring,
+      # libsql-ffi, zstd-sys, ...).
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache: false
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # The action otherwise sets RUSTFLAGS to "-D warnings".
+          rustflags: ""
+          # v2 replaced that default with CARGO_BUILD_WARNINGS=deny (the
+          # build-warnings input); opt out of that too so this job keeps not
+          # denying warnings on release builds.
+          build-warnings: ""
+          # A tag's release build never restores a cache (cache poisoning).
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # Keyed per target so each leg restores its own cache.
+          cache-key: ${{ matrix.target }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustc -vV
-      - uses: actions/download-artifact@v7
+      - env:
+          TARGET: ${{matrix.target}}
+        run: rustup target add "$TARGET"
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      # Embeds the crate list so scanners can read the binary's dependencies.
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          path: artifacts
-          merge-multiple: true
-      - if: ${{matrix.os == 'macos-latest'}}
-        run: |
-          rustup target add x86_64-apple-darwin
-          rustup target add aarch64-apple-darwin
-      - if: ${{matrix.target == 'aarch64-unknown-linux-gnu'}}
-        run: |
-          sudo apt update
-          sudo apt install -y musl-tools zlib1g-dev libzstd-dev
-      - if: ${{matrix.target == 'x86_64-unknown-linux-gnu'}}
-        run: |
-          sudo apt update
-          sudo apt install -y musl-tools zlib1g-dev libzstd-dev
-      - if: ${{matrix.enabled}}
-        env:
-          RUSTFLAGS: ${{matrix.flags}}
+          tool: cargo-auditable@0.7.6
+          fallback: none
+      - env:
+          TARGET: ${{matrix.target}}
+        run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+      - env:
           TARGET: ${{matrix.target}}
         run: |
-          cargo build --release --target ${{matrix.target}} --features delta,dynostore,iceberg,libsql,parquet,postgres
+          bin=target/"${TARGET}"/release/nisshi
+          file "$bin"
+          file "$bin" | grep -Eq 'static(-pie|ally) linked' || { echo "::error::$bin is not statically linked"; exit 1; }
+      - env:
+          TARGET: ${{matrix.target}}
+        run: |
           dist=$(mktemp -d -p ${{runner.temp}})
           mkdir "$dist"/bin
-          cp target/"${TARGET}"/release/tansu "$dist"/bin
+          cp target/"${TARGET}"/release/nisshi "$dist"/bin
           cp compose.yaml example.env LICENSE README.md "$dist"
           cp -r etc "$dist"
-          cp artifacts/THIRD-PARTY-LICENSE.html "$dist"
-          tar --create --verbose --gzip --file=tansu-"${TARGET}".tar.gz -C "$dist" .
-      - if: ${{matrix.enabled && github.ref_type != 'tag'}}
-        uses: actions/upload-artifact@v6
+          tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
+      # release.yml attaches the tarballs to the GitHub release, on a tag.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: tansu-${{matrix.target}}
-          path: tansu-${{matrix.target}}.tar.gz
+          name: nisshi-${{matrix.target}}
+          path: nisshi-${{matrix.target}}.tar.gz
           if-no-files-found: error
-      - if: ${{matrix.enabled && github.ref_type == 'tag'}}
-        uses: softprops/action-gh-release@v2
+      # The Dockerfile copies dist/<platform>/nisshi into the image, in smoke
+      # and in the publish jobs of release.yml and tier-c.yml.
+      - env:
+          PLATFORM: ${{matrix.platform}}
+          TARGET: ${{matrix.target}}
+        run: |
+          mkdir -p dist/"${PLATFORM}"
+          cp target/"${TARGET}"/release/nisshi dist/"${PLATFORM}"/nisshi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: tansu-${{matrix.target}}.tar.gz
+          name: image-${{matrix.target}}
+          path: dist/
+          # tier-c.yml's edge-publish reads this from the push run of main's
+          # tip, and a manual run can come weeks later. release.yml reads it
+          # on a tag, and a re-run can come days later. Other runs only need
+          # it for smoke.
+          retention-days: ${{ github.ref == 'refs/heads/main' && 30 || github.event_name == 'push' && 3 || 1 }}
+          if-no-files-found: error
+  # The full release build (about 20 minutes) runs on a `v*` tag only. Every
+  # other run compiles the binary without optimizing or linking it, which
+  # keeps the queue's critical path short. The nightly
+  # macos-release job in tier-c.yml builds the release on main's tip, so a
+  # link or release-profile break shows up before a tag.
+  macos:
+    if: *tier_b
+    needs: [changes, typos]
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # The same settings as release, for the same reasons.
+          rustflags: ""
+          build-warnings: ""
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # Not release's key: `check` writes different artifacts.
+          cache-key: ${{ env.TARGET }}-check
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: rustc -vV
+      - run: rustup target add "$TARGET"
+      - if: ${{github.ref_type != 'tag'}}
+        run: cargo check --bin nisshi --all-features --target "$TARGET"
+      - if: ${{github.ref_type == 'tag'}}
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-auditable@0.7.6
+          fallback: none
+      - if: ${{github.ref_type == 'tag'}}
+        run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+      - if: ${{github.ref_type == 'tag'}}
+        run: |
+          dist=$(mktemp -d -p ${{runner.temp}})
+          mkdir "$dist"/bin
+          cp target/"${TARGET}"/release/nisshi "$dist"/bin
+          cp compose.yaml example.env LICENSE README.md "$dist"
+          cp -r etc "$dist"
+          tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
+      - if: ${{github.ref_type == 'tag'}}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nisshi-${{env.TARGET}}
+          path: nisshi-${{env.TARGET}}.tar.gz
+          if-no-files-found: error
+
+  # Single stable required-check context for branch protection. Every other
+  # job in this workflow is either matrixed (its context name bakes in the
+  # matrix values, so it shifts whenever a leg is added/removed/renamed) or
+  # Tier B, intentionally skipped on pull_request. Neither shape survives
+  # being named directly in a ruleset's required_status_checks list, so this
+  # job fans all of them into one name that does. Each job is listed directly
+  # (not relied on transitively through e.g. `test`) so a failure surfaces as
+  # `failure` here even when it also cascades a downstream job to `skipped` -
+  # `needs.*.result` reads each listed job's own outcome, not the masked one.
+  ci-gate:
+    if: always()
+    needs:
+      - changes
+      - fmt
+      - clippy
+      - build-storage
+      - build-storage-lake
+      - test
+      - compat-librdkafka
+      - compat-franz-go
+      - cargo-publish-dry-run
+      - typos
+      - shellcheck
+      - third-party-license
+      - src
+      - smoke
+      - smoke-oldest-client
+      - release
+      - macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NEEDS: ${{ toJSON(needs) }}
+    steps:
+      # This is the one check people land on when an entry is ejected, so
+      # say which job did it rather than making them scan every job.
+      - name: Job results
+        run: |
+          {
+            echo '```'
+            jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' <<<"$NEEDS" | sort
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: No job failed or was cancelled
+        run: |
+          bad=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "\(.key)=\(.value.result)"' <<<"$NEEDS")
+          [ -z "$bad" ] || { echo "::error::$(tr '\n' ' ' <<<"$bad")"; exit 1; }
+      # `skipped` is tolerated above because Tier B legitimately skips on
+      # pull_request. Off pull_request (merge_group, a tag run) nothing may skip:
+      # a Tier B job whose `if:` is wrong must fail the gate, not slide
+      # through as "didn't fail".
+      - name: Nothing skipped off pull_request and main
+        if: github.event_name != 'pull_request' && github.ref != 'refs/heads/main'
+        run: |
+          skipped=$(jq -r 'to_entries[] | select(.value.result == "skipped") | .key' <<<"$NEEDS")
+          [ -z "$skipped" ] || { echo "::error::skipped on a ${GITHUB_EVENT_NAME} run, every listed job must run and succeed here: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
+      # And on pull_request only Tier B may skip. A Tier A job is marked
+      # `skipped` if it gains a `needs` on a Tier B job, and without this the
+      # PR gate would stay green with no Tier A signal at all. The list names
+      # the Tier B exemptions, so a newly added job defaults to must-not-skip.
+      # Skipped when `changes` found no Rust-relevant path, since then
+      # every Tier A job but typos and shellcheck skips by design.
+      - name: Tier A ran on pull_request
+        if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
+        env:
+          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src smoke smoke-oldest-client release macos
+        run: |
+          skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
+          [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
+      # A push to main skips the jobs that only repeat what the merge queue
+      # tested. The list names them, so a job added later defaults to
+      # must-run on main, and a cache-saving job that skips fails the gate.
+      - name: Only trimmed jobs skipped on main
+        if: github.ref == 'refs/heads/main'
+        env:
+          MAY_SKIP: build-storage build-storage-lake compat-librdkafka compat-franz-go src smoke smoke-oldest-client
+        run: |
+          skipped=$(jq -r --arg may_skip "$MAY_SKIP" '($may_skip | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
+          [ -z "$skipped" ] || { echo "::error::skipped on a push to main, only the trimmed jobs may skip here: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f35591a681c0f897c4a844178ee8b42778cd3bf2d242e84d3cf38564634849fa # shrinks to base_offset = 0, partition_leader_epoch = 0, base_timestamp = 0, max_timestamp = 18308, producer_id = 2879527020295715980, producer_epoch = 12639, base_sequence = 537202499, compression = None, rec_keys = [Some(b"\xd0\xa1\xe0\xea\xb2\xca3>K\xf1 z\x14\xf4\xba\x89\xc9\xcd+\xd8\"\xce\xac\xf1\xd9\x9a\x9a"), Some(b"\xa8\0'\x8d\xf3\xef")], rec_values = [Some(b"?l\xe2~\x90^\xcd\xa7.8\xc0\xfb\x13`\x94\xb8\x9b!\xeb\xec~[\xcf\xe9\xde\r\x15T$\x06\xf7Z"), Some(b"F\xfb\x01D\xd8\x80\xf6\t\x13\xa7l*\xb7\xd8w\xa6\xa1\xec\x1a\xaeF\xd1\x98\x1b\x8a\x83\x85\xd2\x97|R\x04)\xb4i\x02f\xfa+nT\xef\x99\"\x91\x16\xfb\xca\xbb\x10\x83\xa2(\x02Q\xbc\xcb\"G")]
+cc 9e6a7c1322cdd15e952778d2a30338d6b2c2ec9507b49d56f80bc73208832b21 # shrinks to base_offset = 0, partition_leader_epoch = 0, base_timestamp = 0, max_timestamp = 3295, producer_id = 5710791703922736978, producer_epoch = -30267, base_sequence = -115559524, compression = Lz4, rec_keys = [None, Some(b"I\xe6\x97\xe4\x9f#h\x90QR\xcb~\xed\x93I\xb9r*\xdc\xbe\xe7\xef"), Some(b"s!\x83\xfe#\x80\xfa\xa1\x88aM\xccW{`\xec\xea\xeeo\xc9p<B\xb46R\xf7\xcc\x98c?\xf7\x1e\x91\x8e\x88\xa3\xc9\xb1o\xe6\x1a\xe3\x9d\xbf<\xf4\x1an")], rec_values = [Some(b"1\x99\x91\xe1\xff\xa3\xd5\xd5\x1f\xaf\"/c\"\x83\x94\xc6\x91\x12+M\xe2\x83az\xf8\x08m\xef\x05\x86\xc0\x83\x16\x9aJ{E\x1c8\x95\xb7\xf2\x9a")]

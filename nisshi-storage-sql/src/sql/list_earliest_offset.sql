@@ -1,0 +1,82 @@
+-- -*- mode: sql; sql-product: postgres; -*-
+-- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+-- http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+
+-- prepare list_earliest_offset (text, text, integer) as
+
+-- Kafka answers Earliest with the log start offset, which is watermark.low.
+-- DeleteRecords advances watermark.low and keeps the record at
+-- watermark.high - 1, so a record below watermark.low can remain. The query
+-- answers with the first record at or above watermark.low, or with
+-- watermark.low and no timestamp when none remains.
+--
+-- The first branch takes its own limit 1 so it stays one probe of the
+-- record primary key. With only the outer limit, the constant o hides the
+-- index order and the engine can read every record at or above
+-- watermark.low before choosing one.
+
+select offset_id, timestamp
+
+from
+
+(select
+
+1 as o, offset_id, timestamp
+
+from
+
+(select
+
+r.offset_id, r.timestamp
+
+from
+
+cluster c
+join topic t on t.cluster = c.id
+join topition tp on tp.topic = t.id
+left join watermark w on w.topition = tp.id
+join record r on r.topition = tp.id
+
+where
+
+c.name = $1
+and t.name = $2
+and tp.partition = $3
+and r.offset_id >= coalesce(w.low, 0)
+
+order by r.offset_id asc
+limit 1) first_record
+
+union all
+
+select
+
+2 as o, w.low, null
+
+from
+
+cluster c
+join topic t on t.cluster = c.id
+join topition tp on tp.topic = t.id
+join watermark w on w.topition = tp.id
+
+where
+
+c.name = $1
+and t.name = $2
+and tp.partition = $3
+and w.low is not null
+
+order by o, offset_id asc
+limit 1) earliest;

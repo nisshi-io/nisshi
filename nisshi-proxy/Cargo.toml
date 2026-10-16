@@ -1,0 +1,40 @@
+[package]
+name = "nisshi-proxy"
+description = "A Kafka API Proxy"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+console.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+rama.workspace = true
+regex.workspace = true
+syn.workspace = true
+nisshi-client.workspace = true
+nisshi-otel.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-service.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true

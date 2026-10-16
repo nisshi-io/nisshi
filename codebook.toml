@@ -1,6 +1,11 @@
 words = [
     "clippy",
+    "deltalake",
+    "lakekeeper",
+    "rdkafka",
     "rustfmt",
     "temporality",
+    "tokio",
     "topition",
+    "topitions",
 ]
