@@ -24,8 +24,10 @@ use nisshi_sans_io::{
     fetch_request::{FetchPartition, FetchTopic},
     record::{Record, inflated},
 };
-use nisshi_storage::{DeleteRecordsService, FetchService, ListOffsetResponse, Storage, Topition};
-use rama::{Service, extensions::Extensions};
+use nisshi_storage::{
+    DeleteRecordsService, FetchService, FetchValidationLayer, ListOffsetResponse, Storage, Topition,
+};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use std::time::Duration;
 use tracing::debug;
@@ -139,19 +141,20 @@ where
             .into(),
         ))];
 
-    let fetch = FetchService {
-        storage: sc.clone(),
-    }
-    .serve(RequestInput {
-        request: FetchRequest::default()
-            .max_wait_ms(500)
-            .min_bytes(1)
-            .max_bytes(Some(50 * 1024))
-            .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
-            .topics(Some(topics.into())),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let fetch = FetchValidationLayer::new()
+        .layer(FetchService {
+            storage: sc.clone(),
+        })
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(500)
+                .min_bytes(1)
+                .max_bytes(Some(50 * 1024))
+                .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+                .topics(Some(topics.into())),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     assert_eq!(
         ErrorCode::None,
