@@ -28,7 +28,6 @@ mod describe_topic_partitions;
 mod describe_user_scram_credentials;
 mod fetch;
 mod find_coordinator;
-mod get_telemetry_subscriptions;
 mod incremental_alter_configs;
 mod init_producer_id;
 mod list_groups;
@@ -72,7 +71,6 @@ pub use fetch::{
     },
 };
 pub use find_coordinator::FindCoordinatorService;
-pub use get_telemetry_subscriptions::GetTelemetrySubscriptionsService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
 pub use init_producer_id::InitProducerIdService;
 pub use list_groups::ListGroupsService;

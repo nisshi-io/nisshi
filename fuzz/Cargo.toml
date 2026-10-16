@@ -171,13 +171,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_get_telemetry_subscriptions_storage"
-path = "fuzz_targets/fuzz_get_telemetry_subscriptions_storage.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "fuzz_incremental_alter_configs_storage"
 path = "fuzz_targets/fuzz_incremental_alter_configs_storage.rs"
 test = false

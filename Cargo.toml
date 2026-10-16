@@ -99,7 +99,6 @@ deadpool-postgres = "0.14.2"
 # builds against. Pin to 1.1.0 until deltalake bumps its buoyant_kernel dep.
 buoyant_kernel_derive = "=1.1.0"
 deltalake = { version = "0.32", features = ["datafusion", "s3"] }
-digest = "0.11.3"
 dotenv = "0.15.0"
 fake = "5.1.0"
 flate2 = "1.1"
@@ -199,7 +198,7 @@ tracing = "0.1"
 tracing-core = { version = "0.1" }
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-turso = "0.7.1"
+turso = "0.8.2"
 url = { version = "2.5.4", features = ["serde"] }
 zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }

@@ -24,7 +24,6 @@
     "fuzz_describe_user_scram_credentials_storage": 900,
     "fuzz_fetch_storage": 900,
     "fuzz_find_coordinator_storage": 900,
-    "fuzz_get_telemetry_subscriptions_storage": 900,
     "fuzz_incremental_alter_configs_storage": 900,
     "fuzz_init_producer_id_storage": 900,
     "fuzz_list_groups_storage": 900,

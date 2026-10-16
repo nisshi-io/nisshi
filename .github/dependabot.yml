@@ -70,10 +70,39 @@ updates:
       # nisshi-storage::alter_user_scram_credentials passes into
       # rsasl::mechanisms::scram::tools::derive_keys. Dependabot cannot see
       # that constraint and will keep proposing 0.11.x, which fails to
-      # build. Drop this once rsasl ships a release built against digest
+      # build. The range starts at 0.11.0, so 0.10 patch releases still
+      # arrive. Drop this once rsasl ships a release built against digest
       # 0.11.
       - dependency-name: "sha2"
-        versions: [">0.10.9"]
+        versions: [">=0.11.0"]
+      # The lake stack moves as one set, and no released set exists past the
+      # current one. deltalake 1.x builds against arrow 59, parquet 59 and
+      # datafusion 55, but iceberg 0.10.1 and the 0.11.0 release candidates
+      # build against arrow 58, parquet 58 and datafusion 54, and arrow 60
+      # has no consumer in the stack at all. Dependabot cannot see that, so
+      # each arrow-lake PR fails to build. iceberg* stays unignored so its
+      # release PRs are the signal; expect the 0.11 one to fail too
+      # (datafusion 54 against deltalake 0.32's 53). Drop these four entries
+      # once a released iceberg builds against arrow 59 and datafusion 55
+      # (main does since apache/iceberg-rust#2958), then move arrow, parquet,
+      # datafusion, deltalake and iceberg* in one PR.
+      - dependency-name: "arrow"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "datafusion"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "deltalake"
+        update-types: ["version-update:semver-major"]
+      # pbkdf2 0.13 builds on digest 0.11 through hmac 0.13 and sha2 0.11,
+      # and the rsasl constraint above keeps sha2 on 0.10, so nisshi-cli::user
+      # and the log_redaction test cannot name one Hmac<Sha256> both accept.
+      # Dependabot counts 0.12 -> 0.13 as a minor bump, so this uses a
+      # version range like the sha2 entry. The range starts at the first
+      # incompatible release, so 0.12 patch releases still arrive. Drop it
+      # together with the sha2 entry.
+      - dependency-name: "pbkdf2"
+        versions: [">=0.13.0"]
     cooldown:
       default-days: 7
       semver-major-days: 14

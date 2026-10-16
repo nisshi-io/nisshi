@@ -374,6 +374,17 @@ where
     }
 
     #[instrument(skip_all, fields(prefix))]
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        debug!(?prefix, %offset);
+        REQUESTS.add(1, &[KeyValue::new("method", "list_with_offset")]);
+        self.object_store.list_with_offset(prefix, offset)
+    }
+
+    #[instrument(skip_all, fields(prefix))]
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,

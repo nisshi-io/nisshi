@@ -21,8 +21,8 @@ use std::{
 use bytes::{BufMut as _, Bytes, BytesMut};
 use nisshi_auth::AuthenticationExtension;
 use nisshi_sans_io::{
-    ApiKey, ApiVersionsRequest, Body, BodyInput, BytesInput, Frame, FrameInput, Header, Request,
-    RequestInput, Response, RootMessageMeta, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    ApiKey, ApiVersionsRequest, Body, BodyInput, BytesInput, ErrorCode, Frame, FrameInput, Header,
+    Request, RequestInput, Response, SaslAuthenticateRequest, SaslAuthenticateResponse,
     SaslHandshakeRequest,
 };
 use opentelemetry::KeyValue;
@@ -252,6 +252,34 @@ fn peek<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..offset + N)?.try_into().ok()
 }
 
+/// The header fields of an `ApiVersions` request whose version is outside the protocol range.
+#[derive(Clone, Copy, Debug)]
+struct UnsupportedApiVersionsHeader {
+    api_version: i16,
+    correlation_id: i32,
+}
+
+/// Returns the header of an `ApiVersions` request whose version is outside the protocol range,
+/// read from the fixed offsets of the request header, `[size:4][api_key:2][api_version:2]
+/// [correlation_id:4]`.
+///
+/// The broker must not decode the body of such a request, because a later version can add
+/// fields that this build's decoder does not know, and the decode then fails. Kafka also skips
+/// the body in this case
+/// (<https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/RequestContext.java#L111-L115>).
+fn unsupported_api_versions_header(bytes: &Bytes) -> Option<UnsupportedApiVersionsHeader> {
+    let api_key = peek::<2>(bytes, 4).map(i16::from_be_bytes)?;
+    let api_version = peek::<2>(bytes, 6).map(i16::from_be_bytes)?;
+    let correlation_id = peek::<4>(bytes, 8).map(i32::from_be_bytes)?;
+
+    (api_key == ApiVersionsRequest::KEY
+        && !crate::api::is_within_protocol_range(api_key, api_version))
+    .then_some(UnsupportedApiVersionsHeader {
+        api_version,
+        correlation_id,
+    })
+}
+
 /// A [`Service`] transforming [`Bytes`]s into [`Frame`]s
 #[derive(Clone, Default)]
 pub struct BytesFrameService<S> {
@@ -298,6 +326,10 @@ where
 
         let extensions = req.extensions;
 
+        // The version of an `ApiVersions` request outside the protocol range. The broker
+        // answers such a request with `UNSUPPORTED_VERSION`, encoded at v0.
+        let mut unsupported_api_versions = None;
+
         let req = if sasl_handshake_v0 {
             //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
             //  corresponding to the mechanism are sent as opaque packets without wrapping the
@@ -341,9 +373,28 @@ where
                 correlation_id = ?peek::<4>(&req.bytes, 8).map(i32::from_be_bytes),
             );
 
-            spawn_blocking(|| Frame::request_from_bytes(req.bytes))
-                .await?
-                .inspect(|request| debug!(?request))?
+            if let Some(header) = unsupported_api_versions_header(&req.bytes) {
+                debug!(?header, "ApiVersions request outside the protocol range");
+                unsupported_api_versions = Some(header.api_version);
+
+                // The broker routes the request at v0, inside the protocol range, so that
+                // `FrameRouteService` passes it to the `ApiVersions` handler. The body is
+                // empty, because the request fields do not change the response.
+                Frame {
+                    size: 0,
+                    header: Header::Request {
+                        api_key: ApiVersionsRequest::KEY,
+                        api_version: 0,
+                        correlation_id: header.correlation_id,
+                        client_id: None,
+                    },
+                    body: ApiVersionsRequest::default().into(),
+                }
+            } else {
+                spawn_blocking(|| Frame::request_from_bytes(req.bytes))
+                    .await?
+                    .inspect(|request| debug!(?request))?
+            }
         };
 
         let api_key = req.api_key()?;
@@ -360,18 +411,19 @@ where
 
         let api_version = req.api_version()?;
         let correlation_id = req.correlation_id()?;
+        let requested_version = unsupported_api_versions.unwrap_or(api_version);
 
         if let Some(pb) = extensions.get_ref::<ProgressBarExtension>() {
             let api_name = req.api_name();
 
             pb.as_ref()
-                .set_message(format!("{api_name} v{api_version}/{correlation_id}"));
+                .set_message(format!("{api_name} v{requested_version}/{correlation_id}"));
             pb.as_ref().tick();
         }
 
         let attributes = vec![
             KeyValue::new("api_key", api_key as i64),
-            KeyValue::new("api_version", api_version as i64),
+            KeyValue::new("api_version", requested_version as i64),
         ];
 
         if !extensions.contains::<AuthenticationExtension>()
@@ -428,6 +480,20 @@ where
             {
                 *v0 = Some(true)
             }
+
+            // Kafka answers an `ApiVersions` request outside the protocol range with
+            // `UNSUPPORTED_VERSION`, encoded at v0, so that the client reads the `ApiVersions`
+            // entry and retries at a version in range
+            // (https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiVersionsRequest.java#L112-L126).
+            // `api_version` is already 0 for such a request.
+            let body = match body {
+                Body::ApiVersionsResponse(response) if unsupported_api_versions.is_some() => {
+                    Body::ApiVersionsResponse(
+                        response.error_code(ErrorCode::UnsupportedVersion.into()),
+                    )
+                }
+                body => body,
+            };
 
             spawn_blocking(move || {
                 Frame::response(
@@ -641,11 +707,7 @@ where
         debug!(?req);
 
         let api_key = Q::KEY;
-        let api_version = RootMessageMeta::messages()
-            .requests()
-            .get(&api_key)
-            .map(|message_meta| message_meta.version.valid().end)
-            .unwrap_or_default();
+        let api_version = crate::routable_max_version(api_key).unwrap_or_default();
         let correlation_id = 0;
         let client_id = Some(env!("CARGO_CRATE_NAME").into());
 

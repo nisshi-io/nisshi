@@ -214,8 +214,8 @@ pub use service::{
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
     DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
-    FetchValidationService, FindCoordinatorService, GetTelemetrySubscriptionsService,
-    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
+    FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
+    InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
     MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
     RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
@@ -373,6 +373,9 @@ pub enum Error {
         option: String,
     },
 
+    /// The v4+ (multi-transaction) field shape of `AddPartitionsToTxn` is not implemented on
+    /// this backend.
+    UnsupportedTxnAddPartitionsVersion,
     UnexpectedAddPartitionsToTxnRequest(Box<AddPartitionsToTxnRequest>),
     Url(#[from] url::ParseError),
     UnknownTxnState(String),
