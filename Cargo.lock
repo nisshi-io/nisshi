@@ -4406,9 +4406,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "human-units"
-version = "0.5.4"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de83553769446dd944c447e8379c92872bd8d507a84053eeb0982529e809d59e"
+checksum = "8d5aca994af84541436bb295a90f7c2e9ae5831afd37590eeb2b612a5927b490"
 dependencies = [
  "human-units-derive",
  "pastey",
@@ -4416,9 +4416,9 @@ dependencies = [
 
 [[package]]
 name = "human-units-derive"
-version = "0.5.4"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df5eefd8ef768af6001b5da388a31820eec1bc1fc63ee9ec2208830617e94fca"
+checksum = "4add73c953c7af69c1d12a730e3ffec053e25656e64640553add2f792352b6db"
 dependencies = [
  "quote",
  "syn 2.0.119",
