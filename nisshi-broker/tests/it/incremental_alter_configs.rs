@@ -255,12 +255,12 @@ async fn append_and_subtract(storage: impl Storage + Clone) -> Result<()> {
     let name = &alphanumeric_string(15)[..];
     create_topic(storage.clone(), name).await?;
 
-    // An unset cleanup.policy is an empty list, not Kafka's default of
-    // `delete`, so the first APPEND doesn't turn on deletion.
+    // An unset cleanup.policy is Kafka's default of `delete`, so the first
+    // APPEND keeps deletion on.
     for (op, value, expected) in [
-        (OpType::Append, "compact", "compact"),
-        (OpType::Append, "compact", "compact"),
-        (OpType::Append, "delete,x", "compact,delete,x"),
+        (OpType::Append, "compact", "delete,compact"),
+        (OpType::Append, "compact", "delete,compact"),
+        (OpType::Append, "delete,x", "delete,compact,x"),
         (OpType::Subtract, "delete", "compact,x"),
         (OpType::Subtract, "x,compact", ""),
     ] {
@@ -412,7 +412,7 @@ async fn multiple_changes(storage: impl Storage + Clone) -> Result<()> {
         config_value(storage.clone(), name, "a").await?.as_deref()
     );
     assert_eq!(
-        Some("compact"),
+        Some("delete,compact"),
         config_value(storage.clone(), name, CLEANUP_POLICY)
             .await?
             .as_deref()
@@ -520,8 +520,9 @@ async fn concurrent_appends(storage: impl Storage + Clone) -> Result<()> {
     let items: BTreeSet<&str> = value.split(',').collect();
 
     assert_eq!(
-        (0..APPENDS)
-            .map(|item| format!("item-{item}"))
+        // The topic starts with Kafka's default cleanup.policy, delete.
+        std::iter::once("delete".to_owned())
+            .chain((0..APPENDS).map(|item| format!("item-{item}")))
             .collect::<BTreeSet<_>>(),
         items.into_iter().map(ToOwned::to_owned).collect()
     );

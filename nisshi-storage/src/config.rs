@@ -52,6 +52,9 @@ pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<(), Strin
     ))
 }
 
+/// Kafka's default `cleanup.policy`, which applies to a topic that doesn't set one.
+const DEFAULT_CLEANUP_POLICY: &str = "delete";
+
 /// The topic configuration keys whose type is `LIST`.
 ///
 /// Kafka defines them in `LogConfig`: [`cleanup.policy`],
@@ -80,10 +83,8 @@ pub fn is_list_config(resource: ConfigResource, key: &str) -> bool {
 /// - `APPEND` adds each item of `value` that isn't already present;
 /// - `SUBTRACT` removes the first occurrence of each item of `value`.
 ///
-/// An unset `current` is an empty list. Kafka uses the default of `key` instead, which makes
-/// `APPEND compact` to an unset `cleanup.policy` give `delete,compact`. Nisshi deletes old records
-/// only when `cleanup.policy` is set and contains `delete`, so that default would turn on deletion
-/// the client didn't ask for.
+/// An unset `current` is the default of `key`, as in Kafka, so `APPEND compact` to an unset
+/// `cleanup.policy` gives `delete,compact`.
 ///
 /// # Errors
 ///
@@ -110,8 +111,14 @@ pub fn apply_op(
         return Err(Error::Api(ErrorCode::InvalidConfig));
     }
 
+    let default = if key == "cleanup.policy" {
+        DEFAULT_CLEANUP_POLICY
+    } else {
+        ""
+    };
+
     let mut items: Vec<&str> = current
-        .unwrap_or_default()
+        .unwrap_or(default)
         .split(',')
         .filter(|item| !item.is_empty())
         .collect();
@@ -222,11 +229,31 @@ mod tests {
         }
     }
 
+    /// A topic without a `cleanup.policy` deletes old records, so `APPEND compact` must keep
+    /// `delete`, or the topic stops deleting old records.
     #[test]
-    fn append_to_unset_does_not_add_kafka_default() -> Result<()> {
+    fn append_to_unset_cleanup_policy_keeps_kafka_default() -> Result<()> {
         assert_eq!(
-            Some("compact"),
+            Some("delete,compact"),
             apply(None, OpType::Append, "compact")?.as_deref()
+        );
+        Ok(())
+    }
+
+    /// Kafka's default for a replication throttle list is an empty list, so the `delete` default
+    /// of `cleanup.policy` must not end up in it.
+    #[test]
+    fn append_to_unset_replication_throttle_list_starts_empty() -> Result<()> {
+        assert_eq!(
+            Some("0:111"),
+            apply_op(
+                ConfigResource::Topic,
+                "leader.replication.throttled.replicas",
+                None,
+                OpType::Append,
+                Some("0:111")
+            )?
+            .as_deref()
         );
         Ok(())
     }
@@ -341,7 +368,7 @@ mod tests {
     fn empty_items_are_ignored() -> Result<()> {
         assert_eq!(
             Some("a,b"),
-            apply(None, OpType::Append, "a,,b,")?.as_deref()
+            apply(Some(""), OpType::Append, "a,,b,")?.as_deref()
         );
 
         assert_eq!(
@@ -358,7 +385,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
 
-        let appended = apply(None, OpType::Append, &value)?;
+        let appended = apply(Some(""), OpType::Append, &value)?;
         assert_eq!(Some(value.as_str()), appended.as_deref());
 
         assert_eq!(

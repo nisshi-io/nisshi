@@ -4591,8 +4591,8 @@ mod tests {
         };
 
         for (op, value, expected) in [
-            (OpType::Append, "compact", "compact"),
-            (OpType::Append, "delete", "compact,delete"),
+            (OpType::Append, "compact", "delete,compact"),
+            (OpType::Append, "delete", "delete,compact"),
             (OpType::Subtract, "compact", "delete"),
         ] {
             let response = engine
