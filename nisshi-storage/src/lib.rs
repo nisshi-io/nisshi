@@ -1554,6 +1554,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()>;
 
     /// Create a topic on this storage.
+    ///
+    /// An implementation creates the topic whatever `validate_only` says.
+    /// [`CreateTopicsService`] answers a `validate_only` request itself and
+    /// calls this method with `false`.
     async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid>;
 
     /// Incrementally alter a resource on this storage.
