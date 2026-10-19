@@ -399,6 +399,17 @@ docker compose up -d db
 
 The `db` service runs PostgreSQL 18, and that image does not start on a `db` volume that holds PostgreSQL 17 data. Run `docker compose down --volumes` once before the first start, or set `POSTGRES_IMAGE=postgres:17` in [.env](.env) to stay on 17.
 
+Nisshi creates its tables when it starts on an empty database, and records the schema version there. On a PostgreSQL server of your own, give Nisshi a role that owns its database:
+
+```sql
+create role nisshi login password '...';
+create database nisshi owner nisshi;
+```
+
+A broker changes the schema only when the database doesn't record the broker's schema version: on the first start, and on the first start of a release that changes the schema. To run brokers with a role that can only read and write rows, start one broker once with the credentials of the role that owns the tables, then start every broker with the read/write role. Do the same before you upgrade to a release that changes the schema. A broker whose role can't change the schema refuses to start until that has happened.
+
+Nisshi is tested on PostgreSQL 16 and later. On PostgreSQL 16 or later, an administrator who isn't a superuser, such as the admin user of a managed service, must first run `grant nisshi to <admin>`. Nisshi supports a database that 0.7.0-pre.3 or a later release set up.
+
 Bring Nisshi back up:
 
 ```shell
@@ -458,6 +469,46 @@ Consumer:
   -t test -p 1 \
   -b localhost:9092
 ```
+
+## proxy
+
+The `nisshi proxy` command runs a Kafka API proxy in front of an origin broker:
+
+```shell
+nisshi proxy --help
+Apache Kafka compatible proxy
+
+Usage: nisshi proxy [OPTIONS]
+
+Options:
+      --listener-url <LISTENER_URL>
+          The proxy will listen on this address [env: LISTENER_URL=] [default: tcp://0.0.0.0:9092]
+      --advertised-listener-url <ADVERTISED_LISTENER_URL>
+          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=] [default: tcp://127.0.0.1:9092]
+      --origin-url <ORIGIN_URL>
+          The proxy will forward traffic to this origin broker, which must not require authentication [env: ORIGIN_URL=] [default: tcp://127.0.0.1:9092]
+      --otlp-endpoint-url <OTLP_ENDPOINT_URL>
+          OTEL Exporter OTLP endpoint [env: OTEL_EXPORTER_OTLP_ENDPOINT=]
+      --schema-registry <SCHEMA_REGISTRY>
+          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
+  -h, --help
+          Print help
+```
+
+To proxy a broker that listens on `localhost:19092`:
+
+```shell
+nisshi proxy --origin-url tcp://localhost:19092
+```
+
+The proxy does not authenticate its clients, and it connects to the origin
+over plain TCP without SASL. So the origin listener must not require
+authentication, as with a Kafka `PLAINTEXT` listener. Every client that can
+reach the proxy listener gets the proxy's access to the origin.
+
+The proxy answers SaslHandshake and SaslAuthenticate itself with
+`ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not
+forward them to the origin. So a client configured for SASL fails to connect.
 
 ## Feedback
 

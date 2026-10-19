@@ -17,7 +17,10 @@ mod maintenance;
 
 use crate::{
     CancelKind, Error, Result,
-    coordinator::group::{Coordinator, administrator::Controller},
+    coordinator::group::{
+        Coordinator,
+        administrator::{Controller, GroupCoordinatorConfig},
+    },
     otel,
     service::services,
 };
@@ -714,6 +717,7 @@ pub struct Builder<N, C, I, A, S, L> {
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
     silent: bool,
+    group_coordinator: GroupCoordinatorConfig,
 
     cancellation: CancellationToken,
 }
@@ -742,6 +746,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            group_coordinator: self.group_coordinator,
             cancellation: self.cancellation,
         }
     }
@@ -760,6 +765,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            group_coordinator: self.group_coordinator,
 
             cancellation: self.cancellation,
         }
@@ -779,6 +785,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            group_coordinator: self.group_coordinator,
 
             cancellation: self.cancellation,
         }
@@ -801,6 +808,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            group_coordinator: self.group_coordinator,
 
             cancellation: self.cancellation,
         }
@@ -822,6 +830,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            group_coordinator: self.group_coordinator,
 
             cancellation: self.cancellation,
         }
@@ -843,6 +852,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            group_coordinator: self.group_coordinator,
 
             cancellation: self.cancellation,
         }
@@ -885,6 +895,13 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    pub fn group_coordinator(self, group_coordinator: GroupCoordinatorConfig) -> Self {
+        Self {
+            group_coordinator,
+            ..self
+        }
     }
 }
 
@@ -946,7 +963,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .await
             .map(|storage| Arc::new(storage) as ArcDynStorage)?;
 
-        let groups = Controller::with_storage(storage.clone())?;
+        let groups = Controller::new(storage.clone(), self.group_coordinator);
 
         let sasl_config = if self.authentication {
             nisshi_auth::configuration(storage.clone()).map(Some)?

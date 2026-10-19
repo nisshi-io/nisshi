@@ -67,8 +67,7 @@ static ACKS_ZERO_PRODUCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// decompression failure, including record data that is not a stream of the
 /// declared codec, in a `KafkaException`, and the client gets
 /// `UNKNOWN_SERVER_ERROR`. That code invites a retry of the same bytes, which
-/// cannot succeed. See
-/// <https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L633-L641>.
+/// cannot succeed. See [DefaultRecordBatch.java#L633-L641].
 ///
 /// The decode error is logged at debug: [`ProduceService`] logs each
 /// rejection once, at warn, with the topic and partition, and a client can
@@ -81,6 +80,8 @@ static ACKS_ZERO_PRODUCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 ///
 /// Only use this on a batch from a client Produce request. A stored batch
 /// that fails to decode is a broker fault, and must keep its own error.
+///
+/// [DefaultRecordBatch.java#L633-L641]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L633-L641
 pub fn inflate_produced<B>(batch: B) -> Result<inflated::Batch>
 where
     inflated::Batch: TryFrom<B, Error = nisshi_sans_io::Error>,
@@ -918,7 +919,9 @@ where
         // first version that carries record batches, which is the only format
         // this broker decodes. Kafka checks the count before it validates any
         // batch, so this check runs before `rejection`. See
-        // https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
+        // [ProduceRequest.java#L225-L246].
+        //
+        // [ProduceRequest.java#L225-L246]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
         let batch_count = batches.len();
         let Ok([mut batch]) = <[deflated::Batch; 1]>::try_from(batches) else {
             const REASON: &str =

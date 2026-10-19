@@ -30,9 +30,10 @@ use crate::ProducerIdResponse;
 ///
 /// A request with only one of the two set to -1 is an
 /// [`InvalidRequest`](ErrorCode::InvalidRequest), as in Kafka 3.9.1
-/// ([KafkaApis.scala](https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2343-L2347)).
+/// ([KafkaApis.scala]).
 ///
 /// [KIP-360]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-360%3A+Improve+reliability+of+idempotent%2Ftransactional+producer
+/// [KafkaApis.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2343-L2347
 pub fn producer_claim(
     producer_id: Option<i64>,
     producer_epoch: Option<i16>,
@@ -50,11 +51,13 @@ pub fn producer_claim(
 ///
 /// Kafka 3.9.1 also accepts a claim of the previous epoch, from a producer retrying
 /// a bump whose response it never received, and answers with the current epoch
-/// ([TransactionMetadata.scala](https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L294-L299)).
-/// The backends do not store the previous epoch, so this check fences that claim,
-/// and the producer initialises again. We do not take the previous epoch to be the
-/// current one minus one, because after a fresh InitProducerId from another producer
-/// that guess lets the fenced producer take over.
+/// ([TransactionMetadata.scala]). The backends do not store the previous epoch, so
+/// this check fences that claim, and the producer initialises again. We do not take
+/// the previous epoch to be the current one minus one, because after a fresh
+/// InitProducerId from another producer that guess lets the fenced producer take
+/// over.
+///
+/// [TransactionMetadata.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L294-L299
 pub fn check_claim(stored: (i64, i16), claim: (i64, i16)) -> ErrorCode {
     if stored == claim {
         ErrorCode::None

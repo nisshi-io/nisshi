@@ -170,7 +170,7 @@ use serde::{Deserialize, Serialize};
 use std::error;
 use std::{
     array::TryFromSliceError,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fmt::{self, Debug, Display, Formatter},
     fs::DirEntry,
@@ -199,7 +199,7 @@ mod producer;
 mod proxy;
 mod service;
 
-pub use assignment::assign_replicas;
+pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
@@ -225,6 +225,15 @@ pub use service::{
 
 #[cfg(feature = "dynostore")]
 mod os;
+
+/// The ways that the broker's storage can fail at startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupFailure {
+    /// The storage failed the broker's startup [`Storage::ping`].
+    StorageUnreachable,
+    /// The broker failed to check or create its tables in the storage.
+    SchemaSetup,
+}
 
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
@@ -259,6 +268,22 @@ pub enum Error {
     },
 
     Glob(Arc<GlobError>),
+
+    /// The database records schema `recorded_version`, which a broker of `schema_version` can't
+    /// use. Only a broker of `oldest_compatible_version` or later can use it.
+    IncompatibleSchema {
+        recorded_version: i32,
+        oldest_compatible_version: i32,
+        schema_version: i32,
+    },
+
+    /// The database records schema `recorded_version`, which is older than `schema_version`. A
+    /// broker of `schema_version` can't upgrade the recorded schema.
+    OutdatedSchema {
+        recorded_version: i32,
+        schema_version: i32,
+    },
+
     InsufficientCapacity(#[from] InsufficientCapacity),
     Io(Arc<io::Error>),
 
@@ -292,11 +317,12 @@ pub enum Error {
     NoSuchOffset(i64),
     OsString(OsString),
 
-    /// The storage at `storage` failed the startup check in
-    /// [`Builder::build`], so the broker cannot use it.
-    StartupCheck {
+    /// The error when the storage at `storage` fails at startup. `failure` names what failed.
+    /// `source` is the error that the storage returned.
+    StartupFailed {
         /// The storage URL, with any password removed.
-        storage: Url,
+        storage: Arc<Url>,
+        failure: StartupFailure,
         source: Arc<Error>,
     },
 
@@ -1064,6 +1090,10 @@ pub struct GroupDetail {
     pub skip_assignment: Option<bool>,
     pub inception: SystemTime,
     pub state: GroupState,
+    /// A group stored before this field existed has no rebalance in progress. The field is
+    /// boxed to keep `GroupDetail` small in the enums that carry it.
+    #[serde(default)]
+    pub rebalance: Box<GroupRebalance>,
 }
 
 impl Default for GroupDetail {
@@ -1076,8 +1106,58 @@ impl Default for GroupDetail {
             skip_assignment: Some(false),
             inception: SystemTime::now(),
             state: GroupState::default(),
+            rebalance: Box::default(),
         }
     }
+}
+
+/// The progress of a group's rebalance, which the group coordinator stores with the group so that
+/// any broker sharing the storage can coordinate the group.
+///
+/// Kafka keeps this state in the memory of the one broker that coordinates the group. Nisshi has
+/// no such broker, so each deadline is a wall-clock time that every broker can compare with its own
+/// clock.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct GroupRebalance {
+    /// The join phase in progress, which Kafka calls `PreparingRebalance`.
+    pub join_phase: Option<JoinPhase>,
+    /// The members that must still send `SyncGroup` for the current generation.
+    pub pending_sync: Option<PendingSync>,
+    /// The member ids that `MEMBER_ID_REQUIRED` gave out and that have not joined yet, each with
+    /// the time after which the coordinator forgets it.
+    pub pending_members: BTreeMap<String, SystemTime>,
+}
+
+/// A join phase: the coordinator holds each `JoinGroup` until the phase ends.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct JoinPhase {
+    /// When the phase ends whether or not every member has rejoined.
+    pub deadline: SystemTime,
+    /// The members that have joined in this phase.
+    pub joined: BTreeSet<String>,
+    /// Set while the group forms from empty, when the phase lasts for a delay instead of ending
+    /// once every member has joined.
+    pub initial_delay: Option<InitialDelay>,
+}
+
+/// The delay of a join phase that forms a group from empty, as Kafka's
+/// `group.initial.rebalance.delay.ms` gives it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct InitialDelay {
+    /// The length of the delay that ends at the phase's deadline.
+    pub delay_ms: u64,
+    /// How much longer than the deadline the phase may still be extended.
+    pub remaining_ms: u64,
+    /// Whether a new member joined during the delay that ends at the deadline.
+    pub new_member_added: bool,
+}
+
+/// The members that must still send `SyncGroup`, and when the coordinator removes those that have
+/// not.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct PendingSync {
+    pub deadline: SystemTime,
+    pub members: BTreeSet<String>,
 }
 
 impl From<&GroupDetail> for ConsumerGroupState {
@@ -1528,6 +1608,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<i64>;
 
     /// Fetch deflated batches from storage.
+    ///
+    /// For a topic or partition that does not exist, see
+    /// [`Storage::offset_stage`].
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -1539,6 +1622,20 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Vec<deflated::Batch>>;
 
     /// Query the offset stage for a topic partition.
+    ///
+    /// The partition index comes from the client, so an engine must not
+    /// keep state for a partition that does not exist: a client can send
+    /// any number of indexes.
+    ///
+    /// # Errors
+    ///
+    /// An engine should return [`Error::Api`] with
+    /// [`ErrorCode::UnknownTopicOrPartition`] for a topic or partition that
+    /// does not exist. Fetch reads the metadata before storage, so it sees
+    /// this error only when the topic is deleted, or recreated with fewer
+    /// partitions, in between, and it then answers the partition with that
+    /// error in the response. Any other error closes the client's
+    /// connection.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
     /// Query the offsets for one or more topic partitions. See
@@ -1591,6 +1688,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Option<ScramCredential>>;
 
     /// Query the configuration of a resource in this storage.
+    ///
+    /// [`DescribeConfigsService`] answers a [`ConfigResource::Broker`] resource itself, so an
+    /// implementation needs to answer only the other resource types.
     async fn describe_config(
         &self,
         name: &str,
@@ -1621,6 +1721,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
         partition_limit: i32,
         cursor: Option<Topition>,
     ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>>;
+
+    /// Returns the stored state of a group and the version that a following
+    /// [`Storage::update_group`] must pass, or `None` when no state is stored for the
+    /// group.
+    ///
+    /// The read does not change the stored version, so the returned version stays
+    /// valid until the stored group changes.
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>>;
 
     /// Conditionally update the state of a group in this storage.
     ///
@@ -1879,6 +1987,10 @@ where
         self.as_ref()
             .describe_topic_partitions(topics, partition_limit, cursor)
             .await
+    }
+
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.as_ref().group_with_version(group_id).await
     }
 
     async fn update_group(
@@ -2149,6 +2261,10 @@ where
         self.as_ref()
             .describe_topic_partitions(topics, partition_limit, cursor)
             .await
+    }
+
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.as_ref().group_with_version(group_id).await
     }
 
     async fn update_group(
@@ -2493,10 +2609,14 @@ impl Builder<i32, String, Url, Url> {
             Some(pb)
         };
 
-        storage.ping().await.map_err(|source| Error::StartupCheck {
-            storage: redacted,
-            source: Arc::new(source),
-        })?;
+        storage
+            .ping()
+            .await
+            .map_err(|source| Error::StartupFailed {
+                storage: Arc::new(redacted),
+                failure: StartupFailure::StorageUnreachable,
+                source: Arc::new(source),
+            })?;
 
         if let Some(pb) = pb {
             pb.inc(1);

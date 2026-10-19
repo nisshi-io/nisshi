@@ -125,7 +125,6 @@ fn describe_shows_partition_count() {
 
 /// `kafka-topics --describe` shows only the configs that a topic sets itself, not defaults.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-topics hides them (#904)"]
 fn describe_shows_topic_configs() {
     let cli = KafkaCli::shared();
     let topic = create_test_topic(&cli);

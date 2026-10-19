@@ -119,6 +119,15 @@ impl<'cli> KafkaConfigs<'cli> {
         )
     }
 
+    /// Describes each broker that the cluster lists, by its id, and then the broker defaults.
+    ///
+    /// Sends `DescribeCluster`, then `DescribeConfigs`.
+    #[track_caller]
+    pub fn describe_brokers(&self) -> Output<DescribeConfigs> {
+        self.cli
+            .run(Tool::Configs, &["--entity-type", "brokers", "--describe"])
+    }
+
     /// Creates credentials for `user` with each mechanism in [`ScramMechanism::ALL`].
     ///
     /// Sends `AlterUserScramCredentials`.

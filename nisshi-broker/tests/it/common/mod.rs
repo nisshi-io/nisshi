@@ -328,6 +328,7 @@ where
 {
     controller
         .join(
+            JOIN_GROUP_VERSION,
             client_id,
             group_id,
             session_timeout_ms,
@@ -468,6 +469,9 @@ impl JoinResponse {
         }
     }
 }
+
+/// The newest `JoinGroup` version, which the test helpers send.
+pub(crate) const JOIN_GROUP_VERSION: i16 = 9;
 
 pub(crate) const CLIENT_ID: &str = "console-consumer";
 pub(crate) const RANGE: &str = "range";

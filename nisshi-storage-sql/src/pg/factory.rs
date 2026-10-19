@@ -15,7 +15,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nisshi_storage::{ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration};
+use nisshi_schema::redact_url;
+use nisshi_storage::{
+    ArcDynStorage, Error, Result, StartupFailure, Storage as _, StorageFactory,
+    StorageFactoryConfiguration,
+};
 use regex::Regex;
 
 use super::Postgres;
@@ -30,14 +34,32 @@ impl StorageFactory for PostgresFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
-        Postgres::builder(configuration.storage.to_string().as_str())
+        let storage = Postgres::builder(configuration.storage.to_string().as_str())
             .map(|builder| builder.cluster(&configuration.cluster))
             .map(|builder| builder.node(configuration.node_id))
             .map(|builder| builder.advertised_listener(configuration.advertised_listener.clone()))
             .map(|builder| builder.schemas(configuration.schema_registry.clone()))
             .map(|builder| builder.lake(configuration.lake_house.clone()))
-            .map(|builder| builder.build())
-            .map(Box::new)
-            .map(|storage| Arc::new(storage) as ArcDynStorage)
+            .map(|builder| builder.build())?;
+
+        storage
+            .ping()
+            .await
+            .map_err(|source| Error::StartupFailed {
+                storage: Arc::new(redact_url(&configuration.storage)),
+                failure: StartupFailure::StorageUnreachable,
+                source: Arc::new(source),
+            })?;
+
+        storage
+            .ensure_schema()
+            .await
+            .map_err(|source| Error::StartupFailed {
+                storage: Arc::new(redact_url(&configuration.storage)),
+                failure: StartupFailure::SchemaSetup,
+                source: Arc::new(source),
+            })?;
+
+        Ok(Arc::new(Box::new(storage)) as ArcDynStorage)
     }
 }

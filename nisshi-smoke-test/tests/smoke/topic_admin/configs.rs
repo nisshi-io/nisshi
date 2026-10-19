@@ -23,7 +23,6 @@ const NON_DEFAULT_RETENTION: &str = "retention.ms=123456";
 
 /// A setting given when the topic was created must show.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn describe_shows_topic_overrides() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[NON_DEFAULT_RETENTION]);
@@ -40,7 +39,6 @@ fn describe_shows_topic_overrides() {
 
 /// A setting added to an existing topic must show.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn add_config_shows_in_describe() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);
@@ -61,7 +59,6 @@ fn add_config_shows_in_describe() {
 
 /// A setting removed from a topic must stop showing, because the topic now uses the default.
 #[test]
-#[ignore = "a topic's own configs are reported as defaults, so kafka-configs hides them (#904)"]
 fn delete_config_removes_it_from_describe() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[NON_DEFAULT_RETENTION]);
@@ -84,15 +81,21 @@ fn delete_config_removes_it_from_describe() {
     );
 }
 
-/// A user sets a config for every broker in the cluster with `--entity-default`, and must be able
-/// to read those settings back. The tool exits with an error when the broker answers with one.
+/// A user describes the configs for every broker in the cluster with `--entity-default`. The tool
+/// exits with an error when the broker answers with one. Nisshi keeps no broker configs, so the
+/// test checks only that the describe succeeds.
 #[test]
-#[cfg_attr(
-    any(feature = "postgres", feature = "sqlite"),
-    ignore = "DescribeConfigs for a broker answers UNKNOWN_TOPIC_OR_PARTITION (#905)"
-)]
 fn broker_defaults_are_described() {
     let cli = KafkaCli::shared();
 
     _ = cli.configs().describe_broker_defaults().succeeded();
+}
+
+/// A user describes the brokers without naming one. The tool asks for the configs of each broker
+/// id that `DescribeCluster` lists, so the broker must answer `DescribeConfigs` for its own id.
+#[test]
+fn every_broker_is_described() {
+    let cli = KafkaCli::shared();
+
+    _ = cli.configs().describe_brokers().succeeded();
 }

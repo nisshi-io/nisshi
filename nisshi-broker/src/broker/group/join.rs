@@ -37,6 +37,7 @@ where
     #[instrument(skip(self, req))]
     async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
         let correlation_id = req.frame.correlation_id()?;
+        let api_version = req.frame.api_version()?;
 
         let client_id = req
             .frame
@@ -47,6 +48,7 @@ where
 
         self.coordinator
             .join(
+                api_version,
                 client_id.as_deref(),
                 join_group.group_id.as_str(),
                 join_group.session_timeout_ms,

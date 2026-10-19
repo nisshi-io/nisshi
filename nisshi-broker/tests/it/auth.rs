@@ -1006,6 +1006,14 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn group_with_version(
+        &self,
+        _group_id: &str,
+    ) -> nisshi_storage::Result<Option<(GroupDetail, Version)>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
     async fn update_group(
         &self,
         _group_id: &str,

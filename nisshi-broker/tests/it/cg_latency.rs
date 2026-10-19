@@ -120,14 +120,14 @@ async fn stack() -> Result<(), Error> {
         })
         .await?;
     assert_eq!(i16::from(ErrorCode::None), r1.error_code);
-    assert_eq!(0, r1.generation_id);
+    assert_eq!(1, r1.generation_id);
     assert_eq!(r1.leader, r1.member_id);
     assert_eq!(1, r1.members.as_deref().unwrap_or_default().len());
 
     let next_action = consumer.next_action(Some(r1.into()))?;
     let sync = SyncGroupRequest::try_from(next_action)?;
     assert_eq!(group_id, sync.group_id);
-    assert_eq!(0, sync.generation_id);
+    assert_eq!(1, sync.generation_id);
     assert_eq!(1, sync.assignments.as_deref().unwrap_or_default().len());
 
     let r2 = sut
@@ -144,7 +144,7 @@ async fn stack() -> Result<(), Error> {
 
     let next_action = consumer.next_action(Some(r2.into()))?;
     let heartbeat = HeartbeatRequest::try_from(next_action)?;
-    assert_eq!(0, heartbeat.generation_id);
+    assert_eq!(1, heartbeat.generation_id);
 
     Ok(())
 }

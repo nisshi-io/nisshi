@@ -32,7 +32,7 @@ pub(super) struct Arg {
     )]
     pub(super) advertised_listener_url: EnvVarExp<Url>,
 
-    /// The proxy will forward traffic to this origin broker
+    /// The proxy will forward traffic to this origin broker, which must not require authentication
     #[arg(long, env = "ORIGIN_URL", default_value = DEFAULT_BROKER)]
     pub(super) origin_url: EnvVarExp<Url>,
 

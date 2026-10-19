@@ -86,7 +86,7 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 use tokio_postgres::{
-    CancelToken, Config, Row,
+    CancelToken, Config, Row, SimpleQueryMessage,
     binary_copy::BinaryCopyInWriter,
     config::Host,
     error::SqlState,
@@ -96,11 +96,14 @@ use tokio_postgres::{
 use tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(unix)]
 use tokio_util::either::Either;
-use tracing::{Instrument as _, debug, error, instrument, warn};
+use tracing::{Instrument as _, debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
-use crate::sql::{default_hash, idempotent_sequence_check};
+use crate::{
+    schema::{RecordedSchema, should_create_schema},
+    sql::{default_hash, idempotent_sequence_check},
+};
 
 pub mod factory;
 
@@ -115,6 +118,8 @@ pub struct Postgres {
     /// Permits for the ListOffsets partition reads in flight, see
     /// [`LIST_OFFSETS_READS`].
     list_offsets_reads: Arc<Semaphore>,
+    /// Permits for the Fetch partition reads in flight, see [`FETCH_READS`].
+    fetch_reads: Arc<Semaphore>,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
@@ -193,6 +198,7 @@ impl Builder<String, i32, Url, Pool> {
             pool: self.pool,
             cancel: self.cancel,
             list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
+            fetch_reads: Arc::new(Semaphore::new(FETCH_READS)),
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -208,12 +214,33 @@ const POOL_MAX_SIZE: usize = 16;
 /// has ended, its connection has failed, or the bound on it has passed,
 /// see [`cancel_and_return`].
 ///
-/// Each read holds a pooled connection, so this limit leaves half the pool
-/// for other requests. A read past this limit waits for a permit, and
+/// Each read holds a pooled connection, so ListOffsets reads alone take at
+/// most half the pool. Together with [`FETCH_READS`], they can take all of
+/// it, see [`FETCH_READS`]. A read past this limit waits for a permit, and
 /// [`ListOffsetsService`]'s deadline drops it if the wait lasts too long.
 ///
 /// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
 const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
+
+/// How many Fetch partition reads, of records or of an offset stage, this
+/// engine has in flight at once, across every request, counting an
+/// abandoned read until its statement has ended, its connection has failed,
+/// or the bound on it has passed, see [`cancel_and_return`].
+///
+/// Each read holds a pooled connection, so Fetch reads alone take at most
+/// half the pool. Fetch reads have their own limit instead of sharing
+/// [`LIST_OFFSETS_READS`], so slow fetches cannot hold up the ListOffsets
+/// reads that a consumer needs to start or reset. The two limits together
+/// equal the pool, so when slow reads use up both, other requests wait for
+/// a connection. A smaller limit would slow down healthy consumers, because
+/// a fetch read holds its connection for its whole storage budget. A read
+/// past this limit waits for a permit, and [`FetchService`]'s deadline drops
+/// it if the wait lasts too long.
+///
+/// [`FetchService`]: nisshi_storage::FetchService
+const FETCH_READS: usize = POOL_MAX_SIZE / 2;
+
+const _: () = assert!(LIST_OFFSETS_READS + FETCH_READS <= POOL_MAX_SIZE);
 
 /// How much longer than its connection's `statement_timeout` an abandoned
 /// statement is waited for before its connection is closed, see
@@ -222,6 +249,27 @@ const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
 /// The server ends the statement itself at `statement_timeout`, and this
 /// margin gives its answer time to arrive.
 const ABANDONED_STATEMENT_MARGIN: Duration = Duration::from_secs(5);
+
+/// The statements that create the schema of [`SCHEMA_VERSION`].
+const SCHEMA: &str = include_str!("pg/schema.sql");
+
+/// The version of the schema that [`SCHEMA`] creates. A database records the version of its
+/// schema in its `nisshi_schema_version` table.
+const SCHEMA_VERSION: i32 = 1;
+
+// The build fails here when someone changes `SCHEMA_VERSION`. In a database with tables but no
+// recorded version, `ensure_schema` creates only the missing tables, and then records
+// `SCHEMA_VERSION`. A new version needs an upgrade step there, because such a database has the
+// tables of version 1.
+const _: () = assert!(SCHEMA_VERSION == 1);
+
+/// The oldest schema version whose broker can use the schema that [`SCHEMA`] creates.
+const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
+
+/// The key of the advisory lock that [`Postgres::ensure_schema`] holds. Advisory locks share one
+/// key space per database. The key spells `nisshi`, so that it is unlikely to match another
+/// application's key.
+const SCHEMA_LOCK: i64 = i64::from_be_bytes(*b"\0\0nisshi");
 
 /// Postgres statement timeout applied to every connection by default, so a stalled query
 /// (e.g. a lock wait) is aborted server-side instead of holding a pooled connection open
@@ -680,6 +728,12 @@ where
             .ok_or_else(|| Error::Message("the abandonable object has been released".into()))
     }
 
+    fn object_mut(&mut self) -> Result<&mut managed::Object<M>> {
+        self.object
+            .as_mut()
+            .ok_or_else(|| Error::Message("the abandonable object has been released".into()))
+    }
+
     /// Returns the object to its pool, once its work has finished.
     fn release(mut self) {
         drop(self.object.take());
@@ -710,23 +764,53 @@ where
     }
 }
 
+/// The query that [`cancel_and_return`] runs on an abandoned read's
+/// connection. It answers only after the read's own statement has ended,
+/// and it answers `t` only outside a transaction block.
+///
+/// Outside a block, the server runs the query in a transaction of its own,
+/// so the transaction and the statement start at the same time. Inside a
+/// block, the transaction started with an earlier statement, so the query
+/// answers `f`. Inside a failed block, the server rejects the query.
+///
+/// A read can leave a block open: tokio-postgres queues a `ROLLBACK` when a
+/// `Transaction` is dropped, but the cancel request ends that `ROLLBACK`
+/// instead of the read's statement when the statement finishes just before
+/// the cancel request arrives. The query detects the block without writing
+/// to the server log, which a second `ROLLBACK` would do on every abandoned
+/// read that left no block open.
+const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp()";
+
+/// Waits for the statement on `connection` to end, then returns whether the
+/// connection is outside any transaction block, see [`SETTLE_QUERY`].
+async fn settled_outside_a_transaction(connection: &Object) -> Result<bool, tokio_postgres::Error> {
+    connection.simple_query(SETTLE_QUERY).await.map(|messages| {
+        messages.iter().any(
+            |message| matches!(message, SimpleQueryMessage::Row(row) if row.get(0) == Some("t")),
+        )
+    })
+}
+
 /// Cancels the statement running on an abandoned `connection`, and returns
 /// the connection to its pool once that statement has ended, so the pool
 /// stays within its [`POOL_MAX_SIZE`] server connections.
 ///
 /// The connection and `permit` are held until the statement has ended,
 /// whether or not the cancel request reached the server, so the statement
-/// counts against [`LIST_OFFSETS_READS`] meanwhile. A cancel request that
-/// misses its statement (a host other than the one running the statement,
-/// or a proxy that does not forward it) then shows as ListOffsets reads
-/// that wait for a permit, under the `queued` stage, rather than as server
-/// connections beyond the pool.
+/// counts against the limit that `permit` comes from ([`LIST_OFFSETS_READS`]
+/// or [`FETCH_READS`]) meanwhile. A cancel request that misses its
+/// statement (a host other than the one running the statement, or a proxy
+/// that does not forward it) then shows as reads that wait for a permit,
+/// under the `queued` stage, rather than as server connections beyond the
+/// pool.
 ///
-/// The statement has ended once an empty query on `connection` answers,
-/// because the server runs the two in order. The connection is closed and
-/// taken out of the pool instead, and the pool opens a replacement, when
-/// that query fails or has not answered within `bound`. The bound sits
-/// past the connection's `statement_timeout`
+/// The connection goes back to the pool only when [`SETTLE_QUERY`] shows it
+/// outside any transaction block. The connection is closed and taken out of
+/// the pool instead, and the pool opens a replacement, when that query
+/// fails, shows a transaction block, or has not answered within `bound`. A
+/// connection inside a block would fail every statement of the next caller
+/// that checks it out. The bound sits past the connection's
+/// `statement_timeout`
 /// ([`ABANDONED_STATEMENT_MARGIN`]), at which the server ends the statement
 /// itself unless an operator has disabled the timeout. deadpool-postgres
 /// closes a dropped connection's socket at once, and a backend notices a
@@ -765,14 +849,22 @@ async fn cancel_and_return(
         }
     };
 
-    match timeout_at(settle_by, connection.batch_execute("")).await {
-        Ok(Ok(())) => drop(connection),
+    match timeout_at(settle_by, settled_outside_a_transaction(&connection)).await {
+        Ok(Ok(true)) => drop(connection),
+
+        Ok(Ok(false)) => {
+            warn!(
+                host,
+                "an abandoned statement left its connection inside a transaction; closing it"
+            );
+            drop(Object::take(connection));
+        }
 
         Ok(Err(error)) => {
             warn!(
                 host,
                 ?error,
-                "an abandoned statement's connection failed before the statement ended; closing it"
+                "an abandoned statement's connection failed its settle query; closing it"
             );
             drop(Object::take(connection));
         }
@@ -924,8 +1016,9 @@ impl Postgres {
             .map_err(Into::into)
     }
 
-    /// Checks out a connection for a ListOffsets read that a caller may drop
-    /// mid-statement, holding `permit` from [`LIST_OFFSETS_READS`].
+    /// Checks out a connection for a read that a caller may drop
+    /// mid-statement, holding `permit` from the read's limit on reads in
+    /// flight.
     ///
     /// Dropping the guard before [`Abandonable::release`] asks the server to
     /// cancel the statement, so it stops instead of running until
@@ -955,6 +1048,291 @@ impl Postgres {
                     Err(_) => drop(Object::take(connection)),
                 }
             })
+        })
+    }
+
+    /// Reads the records of `topition` from `offset` on `c`, in one
+    /// transaction, up to the partition's high watermark or, for
+    /// `ReadCommitted`, its last stable offset.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_on(
+        &self,
+        c: &mut Object,
+        topition: &Topition,
+        base_topic: &str,
+        key_filter: Option<&str>,
+        offset: i64,
+        min_bytes: u32,
+        max_bytes: u32,
+        isolation_level: IsolationLevel,
+        has_deadline_expired: impl Fn() -> bool,
+    ) -> Result<Vec<deflated::Batch>> {
+        let high_watermark = self
+            .offset_stage_on(c, base_topic, topition.partition())
+            .await
+            .map(|offset_stage| {
+                if isolation_level == IsolationLevel::ReadCommitted {
+                    offset_stage.last_stable
+                } else {
+                    offset_stage.high_watermark
+                }
+            })?;
+
+        debug!(
+            cluster = self.cluster,
+            ?topition,
+            offset,
+            ?isolation_level,
+            high_watermark,
+            min_bytes,
+            max_bytes
+        );
+
+        let tx = c.transaction().await?;
+
+        let records = if let Some(key) = key_filter {
+            self.tx_prepare_query(
+                &tx,
+                "record_fetch_pg_keyed.sql",
+                &[
+                    &self.cluster,
+                    &base_topic,
+                    &topition.partition(),
+                    &offset,
+                    &(max_bytes as i64),
+                    &high_watermark,
+                    &key,
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        } else {
+            self.tx_prepare_query(
+                &tx,
+                "record_fetch_pg.sql",
+                &[
+                    &self.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &offset,
+                    &(max_bytes as i64),
+                    &high_watermark,
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        };
+
+        let mut batches = vec![];
+
+        if let Some(first) = records.first() {
+            let mut batch_builder = Batch::builder()
+                .base_offset(
+                    first
+                        .try_get::<_, i64>(0)
+                        .inspect(|base_offset| debug!(base_offset))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .attributes(
+                    first
+                        .try_get::<_, Option<i16>>(1)
+                        .map(|attributes| attributes.unwrap_or(0))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .base_timestamp(
+                    first
+                        .try_get::<_, SystemTime>(2)
+                        .map_err(Error::from)
+                        .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .producer_id(
+                    first
+                        .try_get::<_, Option<i64>>(6)
+                        .map(|producer_id| producer_id.unwrap_or(-1))
+                        .inspect_err(|err| error!(?err))?,
+                )
+                .producer_epoch(
+                    first
+                        .try_get::<_, Option<i16>>(7)
+                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                        .inspect_err(|err| error!(?err))?,
+                );
+
+            for record in records.iter() {
+                let attributes = record
+                    .try_get::<_, Option<i16>>(1)
+                    .map(|attributes| attributes.unwrap_or(0))
+                    .inspect_err(|err| error!(?err))?;
+
+                let producer_id = record
+                    .try_get::<_, Option<i64>>(6)
+                    .map(|producer_id| producer_id.unwrap_or(-1))
+                    .inspect_err(|err| error!(?err))?;
+                let producer_epoch = record
+                    .try_get::<_, Option<i16>>(7)
+                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                    .inspect_err(|err| error!(?err))?;
+
+                if batch_builder.attributes != attributes
+                    || batch_builder.producer_id != producer_id
+                    || batch_builder.producer_epoch != producer_epoch
+                {
+                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+
+                    batch_builder = Batch::builder()
+                        .base_offset(
+                            record
+                                .try_get::<_, i64>(0)
+                                .inspect(|base_offset| debug!(base_offset))
+                                .inspect_err(|err| error!(?err))?,
+                        )
+                        .base_timestamp(
+                            record
+                                .try_get::<_, SystemTime>(2)
+                                .map_err(Error::from)
+                                .and_then(|system_time| {
+                                    to_timestamp(&system_time).map_err(Into::into)
+                                })
+                                .inspect_err(|err| error!(?err))?,
+                        )
+                        .attributes(attributes)
+                        .producer_id(producer_id)
+                        .producer_epoch(producer_epoch);
+                }
+
+                let offset = record
+                    .try_get::<_, i64>(0)
+                    .inspect(|offset| debug!(offset))
+                    .inspect_err(|err| error!(?err))?;
+
+                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
+
+                let timestamp_delta = record
+                    .try_get::<_, SystemTime>(2)
+                    .map_err(Error::from)
+                    .and_then(|system_time| {
+                        to_timestamp(&system_time)
+                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
+                            .map_err(Into::into)
+                    })
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?;
+
+                let k = record
+                    .try_get::<_, Option<&[u8]>>(3)
+                    .map(|o| o.map(Bytes::copy_from_slice))
+                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?;
+
+                let v = record
+                    .try_get::<_, Option<&[u8]>>(4)
+                    .map(|o| o.map(Bytes::copy_from_slice))
+                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?;
+
+                let mut record_builder = Record::builder()
+                    .offset_delta(offset_delta)
+                    .timestamp_delta(timestamp_delta)
+                    .key(k)
+                    .value(v);
+
+                for header in self
+                    .tx_prepare_query(
+                        &tx,
+                        "header_fetch.sql",
+                        &[
+                            &self.cluster,
+                            &topition.topic(),
+                            &topition.partition(),
+                            &offset,
+                        ],
+                    )
+                    .await
+                    .inspect(|row| debug!(?row))
+                    .inspect_err(|err| error!(?err))?
+                {
+                    let mut header_builder = Header::builder();
+
+                    if let Some(k) = header
+                        .try_get::<_, Option<&[u8]>>(0)
+                        .inspect_err(|err| error!(?err))?
+                    {
+                        header_builder = header_builder.key(Bytes::copy_from_slice(k));
+                    }
+
+                    if let Some(v) = header
+                        .try_get::<_, Option<&[u8]>>(1)
+                        .inspect_err(|err| error!(?err))?
+                    {
+                        header_builder = header_builder.value(Bytes::copy_from_slice(v));
+                    }
+
+                    record_builder = record_builder.header(header_builder);
+                }
+
+                batch_builder = batch_builder
+                    .record(record_builder)
+                    .last_offset_delta(offset_delta);
+
+                if has_deadline_expired() {
+                    break;
+                }
+            }
+
+            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+        } else {
+            batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
+        }
+
+        tx.commit().await?;
+
+        debug!(batches_len = batches.len());
+
+        Ok(batches)
+    }
+
+    /// Reads the log start, high watermark and last stable offset of
+    /// `base_topic`'s `partition` on `c`.
+    async fn offset_stage_on(
+        &self,
+        c: &Object,
+        base_topic: &str,
+        partition: i32,
+    ) -> Result<OffsetStage> {
+        let row = self
+            .prepare_query_one(
+                c,
+                "watermark_select.sql",
+                &[&self.cluster, &base_topic, &partition],
+            )
+            .await
+            .inspect_err(|err| error!(base_topic, partition, ?err))?;
+
+        let log_start = row
+            .try_get::<_, Option<i64>>(0)
+            .inspect_err(|err| error!(base_topic, partition, ?err))?
+            .unwrap_or_default();
+
+        let high_watermark = row
+            .try_get::<_, Option<i64>>(1)
+            .inspect_err(|err| error!(base_topic, partition, ?err))?
+            .unwrap_or_default();
+
+        let last_stable = row
+            .try_get::<_, Option<i64>>(2)
+            .inspect_err(|err| error!(base_topic, partition, ?err))?
+            .unwrap_or(high_watermark);
+
+        debug!(
+            cluster = self.cluster,
+            base_topic, partition, log_start, high_watermark,
+        );
+
+        Ok(OffsetStage {
+            last_stable,
+            high_watermark,
+            log_start,
         })
     }
 
@@ -1058,6 +1436,125 @@ impl Postgres {
         }
 
         Ok(responses)
+    }
+
+    /// Makes sure that the database has the broker's schema before the broker serves a request.
+    ///
+    /// When the database records no schema version, this function creates the missing tables and
+    /// records [`SCHEMA_VERSION`]. It leaves existing tables and their data as they are.
+    ///
+    /// This function runs no DDL on a database that records a version. A database user that cannot
+    /// create tables can therefore start a broker on a database that records a version.
+    pub(crate) async fn ensure_schema(&self) -> Result<()> {
+        let mut c = self.connection().await?;
+
+        // The broker reads the version without the lock first, because a broker that holds the
+        // lock and then stops answering blocks every broker that waits for it. A recorded version
+        // means a complete schema, because the transaction that creates the schema also records
+        // the version.
+        {
+            let tx = c.transaction().await?;
+            let recorded = self.recorded_schema(&tx).await?;
+            if !should_create_schema(recorded, SCHEMA_VERSION)? {
+                return tx.commit().await.map_err(Into::into);
+            }
+        }
+
+        let tx = c.transaction().await?;
+
+        // This transaction sets its own `statement_timeout`, because an operator's short timeout
+        // bounds a request and can abort this setup. The setup can wait for another broker's lock
+        // below. A broker whose lock wait reaches 5 minutes exits. Its orchestrator then restarts
+        // it.
+        tx.batch_execute("SET LOCAL statement_timeout = '5min'")
+            .await?;
+
+        // The server ends this session when the session stays idle in this transaction for a
+        // minute. The lock of a broker that stops answering is then released after a minute,
+        // instead of when TCP keepalive notices that the broker is gone.
+        tx.batch_execute("SET LOCAL idle_in_transaction_session_timeout = '1min'")
+            .await?;
+
+        // This lock makes a second broker wait until the first broker commits the schema. The
+        // second broker then finds the recorded version. Without the lock, PostgreSQL fails one of
+        // two concurrent `create table if not exists` statements with a unique violation.
+        let locked_at_once = tx
+            .query_one(
+                &format!("select pg_try_advisory_xact_lock({SCHEMA_LOCK})"),
+                &[],
+            )
+            .await?
+            .try_get::<_, bool>(0)?;
+        if !locked_at_once {
+            info!("waiting for another broker to set up the schema");
+            tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
+                .await?;
+        }
+
+        let recorded = self.recorded_schema(&tx).await?;
+        if !should_create_schema(recorded, SCHEMA_VERSION)? {
+            return tx.commit().await.map_err(Into::into);
+        }
+
+        // This query puts only the namespace that holds the existing `cluster` table on the search
+        // path, for this transaction. PostgreSQL calls a namespace a schema. An unqualified `create
+        // table` creates its table in the first namespace on the search path. That namespace can
+        // differ from the one that holds the existing tables. The broker then finds new, empty
+        // tables instead of its data. The query returns a row only when `cluster` exists.
+        let has_tables = tx
+            .query_opt(
+                self.sql_lookup("pg/search_path_set_to_cluster_namespace.sql")?,
+                &[],
+            )
+            .await?
+            .is_some();
+
+        tx.batch_execute(self.sql_lookup("nisshi_schema_version_create.sql")?)
+            .await?;
+        tx.batch_execute(SCHEMA).await?;
+        _ = tx
+            .execute(
+                self.sql_lookup("nisshi_schema_version_insert.sql")?,
+                &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
+            )
+            .await?;
+
+        tx.commit().await?;
+
+        if has_tables {
+            warn!(
+                schema_version = SCHEMA_VERSION,
+                "recorded the schema version in a database whose tables an earlier release created"
+            );
+        } else {
+            info!(schema_version = SCHEMA_VERSION, "created the schema");
+        }
+
+        Ok(())
+    }
+
+    /// Returns the schema version that the database records, or `None` when it records none.
+    async fn recorded_schema(&self, tx: &Transaction<'_>) -> Result<Option<RecordedSchema>> {
+        let version_table_exists = tx
+            .query_one(self.sql_lookup("pg/nisshi_schema_version_exists.sql")?, &[])
+            .await?
+            .try_get::<_, bool>(0)?;
+        if !version_table_exists {
+            return Ok(None);
+        }
+
+        let recorded = tx
+            .query_opt(self.sql_lookup("nisshi_schema_version_select.sql")?, &[])
+            .await?
+            .map(|row| {
+                Ok::<_, Error>(RecordedSchema {
+                    version: row.try_get(0)?,
+                    oldest_compatible_version: row.try_get(1)?,
+                })
+            })
+            .transpose()?;
+        debug!(?recorded);
+        Ok(recorded)
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
@@ -2676,6 +3173,25 @@ impl Postgres {
     }
 }
 
+/// Reads a `consumer_group_detail.sql` row as the stored group and the version that
+/// `update_group` compares against.
+fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
+    let version = row
+        .try_get::<_, Uuid>(0)
+        .inspect_err(|err| error!(?err))
+        .map(|uuid| Version {
+            e_tag: Some(uuid.to_string()),
+            version: None,
+        })
+        .inspect(|version| debug!(?version))?;
+
+    let value = row.try_get::<_, Value>(1)?;
+    let current =
+        serde_json::from_value::<GroupDetail>(value).inspect(|current| debug!(?current))?;
+
+    Ok((current, version))
+}
+
 #[async_trait]
 impl Storage for Postgres {
     #[instrument(skip_all)]
@@ -3024,272 +3540,45 @@ impl Storage for Postgres {
                 .unwrap_or_default()
         };
 
+        // A `/` in the name checks out a connection of its own, so this
+        // runs before the read holds its connection.
         let (base_topic, key_filter): (&str, Option<&str>) =
             self.topic_with_key(topition.topic()).await?;
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
-
-        debug!(
-            cluster = self.cluster,
-            ?topition,
-            offset,
-            ?isolation_level,
-            high_watermark,
-            min_bytes,
-            max_bytes
-        );
-
-        let mut c = self.connection().await?;
-        let tx = c.transaction().await?;
-
-        let records = if let Some(key) = key_filter {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg_keyed.sql",
-                &[
-                    &self.cluster,
-                    &base_topic,
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &key,
-                ],
+        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
+        let mut connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let batches = self
+            .fetch_on(
+                connection.object_mut()?,
+                topition,
+                base_topic,
+                key_filter,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation_level,
+                has_deadline_expired,
             )
-            .await
-            .inspect_err(|err| error!(?err))?
-        } else {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg.sql",
-                &[
-                    &self.cluster,
-                    &topition.topic(),
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
-        };
+            .await;
+        connection.release();
 
-        let mut batches = vec![];
-
-        if let Some(first) = records.first() {
-            let mut batch_builder = Batch::builder()
-                .base_offset(
-                    first
-                        .try_get::<_, i64>(0)
-                        .inspect(|base_offset| debug!(base_offset))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .attributes(
-                    first
-                        .try_get::<_, Option<i16>>(1)
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .base_timestamp(
-                    first
-                        .try_get::<_, SystemTime>(2)
-                        .map_err(Error::from)
-                        .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_id(
-                    first
-                        .try_get::<_, Option<i64>>(6)
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(
-                    first
-                        .try_get::<_, Option<i16>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                );
-
-            for record in records.iter() {
-                let attributes = record
-                    .try_get::<_, Option<i16>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?;
-
-                let producer_id = record
-                    .try_get::<_, Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-                let producer_epoch = record
-                    .try_get::<_, Option<i16>>(7)
-                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-
-                if batch_builder.attributes != attributes
-                    || batch_builder.producer_id != producer_id
-                    || batch_builder.producer_epoch != producer_epoch
-                {
-                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
-
-                    batch_builder = Batch::builder()
-                        .base_offset(
-                            record
-                                .try_get::<_, i64>(0)
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .base_timestamp(
-                            record
-                                .try_get::<_, SystemTime>(2)
-                                .map_err(Error::from)
-                                .and_then(|system_time| {
-                                    to_timestamp(&system_time).map_err(Into::into)
-                                })
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .attributes(attributes)
-                        .producer_id(producer_id)
-                        .producer_epoch(producer_epoch);
-                }
-
-                let offset = record
-                    .try_get::<_, i64>(0)
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-
-                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
-
-                let timestamp_delta = record
-                    .try_get::<_, SystemTime>(2)
-                    .map_err(Error::from)
-                    .and_then(|system_time| {
-                        to_timestamp(&system_time)
-                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
-                            .map_err(Into::into)
-                    })
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
-
-                let k = record
-                    .try_get::<_, Option<&[u8]>>(3)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
-
-                let v = record
-                    .try_get::<_, Option<&[u8]>>(4)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
-
-                let mut record_builder = Record::builder()
-                    .offset_delta(offset_delta)
-                    .timestamp_delta(timestamp_delta)
-                    .key(k)
-                    .value(v);
-
-                for header in self
-                    .tx_prepare_query(
-                        &tx,
-                        "header_fetch.sql",
-                        &[
-                            &self.cluster,
-                            &topition.topic(),
-                            &topition.partition(),
-                            &offset,
-                        ],
-                    )
-                    .await
-                    .inspect(|row| debug!(?row))
-                    .inspect_err(|err| error!(?err))?
-                {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(0)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::copy_from_slice(k));
-                    }
-
-                    if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::copy_from_slice(v));
-                    }
-
-                    record_builder = record_builder.header(header_builder);
-                }
-
-                batch_builder = batch_builder
-                    .record(record_builder)
-                    .last_offset_delta(offset_delta);
-
-                if has_deadline_expired() {
-                    break;
-                }
-            }
-
-            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
-        } else {
-            batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
-        }
-
-        tx.commit().await?;
-
-        debug!(batches_len = batches.len());
-
-        Ok(batches)
+        batches
     }
 
     #[instrument(skip_all)]
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         debug!(cluster = self.cluster, ?topition);
-        let c = self.connection().await?;
 
-        let row = self
-            .prepare_query_one(
-                &c,
-                "watermark_select.sql",
-                &[
-                    &self.cluster,
-                    &self.base_topic(topition.topic()).await?,
-                    &topition.partition(),
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?topition, ?err))?;
+        let base_topic = self.base_topic(topition.topic()).await?;
 
-        let log_start = row
-            .try_get::<_, Option<i64>>(0)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
+        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
+        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let offset_stage = self
+            .offset_stage_on(connection.object()?, base_topic, topition.partition())
+            .await;
+        connection.release();
 
-        let high_watermark = row
-            .try_get::<_, Option<i64>>(1)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
-
-        let last_stable = row
-            .try_get::<_, Option<i64>>(2)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or(high_watermark);
-
-        debug!(cluster = self.cluster, ?topition, log_start, high_watermark,);
-
-        Ok(OffsetStage {
-            last_stable,
-            high_watermark,
-            log_start,
-        })
+        offset_stage
     }
 
     #[instrument(skip_all)]
@@ -3791,7 +4080,7 @@ impl Storage for Postgres {
                         .value(value)
                         .read_only(false)
                         .is_default(None)
-                        .config_source(Some(ConfigSource::DefaultConfig.into()))
+                        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
                         .config_type(Some(ConfigType::String.into()))
@@ -3876,15 +4165,18 @@ impl Storage for Postgres {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(0)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))
@@ -3961,15 +4253,18 @@ impl Storage for Postgres {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(0)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))
@@ -4140,6 +4435,25 @@ impl Storage for Postgres {
     }
 
     #[instrument(skip_all)]
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        self.prepare_query_opt(
+            &c,
+            "consumer_group_detail.sql",
+            &[&group_id, &self.cluster.as_str()],
+        )
+        .await
+        .inspect_err(|err| error!(?err, group_id))?
+        .as_ref()
+        .map(group_detail_with_version)
+        .transpose()
+        .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
+    }
+
+    #[instrument(skip_all)]
     async fn update_group(
         &self,
         group_id: &str,
@@ -4214,23 +4528,12 @@ impl Storage for Postgres {
                 .inspect(|row| debug!(?row))
                 .inspect_err(|err| error!(?err))?;
 
-            let version = row
-                .try_get::<_, Uuid>(0)
-                .inspect_err(|err| error!(?err))
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))?;
+            let (current, version) = group_detail_with_version(&row)?;
 
-            let value = row.try_get::<_, Value>(1)?;
-            let current = serde_json::from_value::<GroupDetail>(value)
-                .inspect(|current| debug!(?current))
-                .map(Box::new)?;
-
-            Err(UpdateError::Outdated { current, version })
+            Err(UpdateError::Outdated {
+                current: Box::new(current),
+                version,
+            })
         };
 
         tx.commit().await.inspect_err(|err| error!(?err))?;
@@ -4728,7 +5031,11 @@ mod tests {
     use super::*;
     use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use nisshi_storage::{
+        ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
+    };
     use rand::distr::Alphanumeric;
+    use std::assert_matches;
 
     // mirrors nisshi-broker/tests/it/common/mod.rs storage_container(StorageType::Postgres)
     const CONNECTION: &str = "postgres://postgres:postgres@localhost";
@@ -4739,6 +5046,45 @@ mod tests {
             .take(length)
             .map(char::from)
             .collect()
+    }
+
+    /// A change to the schema must come with a new [`SCHEMA_VERSION`], and with an upgrade step for
+    /// databases of the earlier version. A database that records a version keeps the tables that
+    /// it has, so a change without a new version reaches only new databases. Update the digest
+    /// here once both are in place.
+    #[test]
+    fn schema_matches_its_version() -> Result<()> {
+        let digest = crate::schema::schema_digest([
+            crate::sql::remove_comments(SCHEMA).as_str(),
+            crate::sql::SQL.get("nisshi_schema_version_create.sql")?,
+        ]);
+
+        assert_eq!(
+            (SCHEMA_VERSION, digest.as_str()),
+            (
+                1,
+                "c453a24e053100c8c68e7f31694fa6f9920d20225b1d245aac671b9c198c9dad"
+            )
+        );
+        Ok(())
+    }
+
+    /// Returns a [`Postgres`] storage engine for `cluster` on the server at `url`, with the schema
+    /// created. Returns `None` when the server can't be reached. The caller then skips `test`.
+    async fn storage_with_schema(test: &str, url: &str, cluster: &str) -> Result<Option<Postgres>> {
+        let storage = Postgres::builder(url)?
+            .cluster(cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        // The test skips only when the server can't be reached. Any later error fails it.
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping {test}: {err:?}");
+            return Ok(None);
+        }
+
+        storage.ensure_schema().await?;
+        Ok(Some(storage))
     }
 
     #[test]
@@ -5230,9 +5576,10 @@ mod tests {
         while !settled(storage) {
             assert!(
                 Instant::now() < give_up,
-                "pool {:?}, permits {}",
+                "pool {:?}, ListOffsets permits {}, Fetch permits {}",
                 storage.pool.status(),
-                storage.list_offsets_reads.available_permits()
+                storage.list_offsets_reads.available_permits(),
+                storage.fetch_reads.available_permits()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -5382,6 +5729,486 @@ mod tests {
         Ok(())
     }
 
+    /// At most `FETCH_READS` Fetch reads, of records and of offset stages
+    /// alike, reach the pool at once; the rest wait for a permit, and the
+    /// permits come back when the reads are dropped.
+    ///
+    /// The pool has no permits at all, so each read that has a Fetch
+    /// permit waits in the pool, where the pool counts it, without a server.
+    #[tokio::test]
+    async fn fetch_reads_are_limited_before_the_pool() -> Result<()> {
+        let pool = Pool::builder(Manager::new(
+            Config::from_str(CONNECTION)?,
+            tokio_postgres::NoTls,
+        ))
+        .max_size(0)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+        .build()?;
+
+        let storage = Postgres {
+            pool,
+            ..Postgres::builder(CONNECTION)?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(rng().random_range(0..i32::MAX))
+                .build()
+        };
+
+        let topition = Topition::new("limited", 0);
+        let reads = (0..FETCH_READS + 3)
+            .map(|read| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+
+                tokio::spawn(async move {
+                    if read % 2 == 0 {
+                        storage
+                            .fetch(
+                                &topition,
+                                0,
+                                1,
+                                8 * 1024,
+                                IsolationLevel::ReadUncommitted,
+                                Duration::from_secs(5),
+                            )
+                            .await
+                            .map(drop)
+                    } else {
+                        storage.offset_stage(&topition).await.map(drop)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let settled = Instant::now() + Duration::from_secs(5);
+        while storage.pool.status().waiting < FETCH_READS {
+            assert!(Instant::now() < settled, "{:?}", storage.pool.status());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(FETCH_READS, storage.pool.status().waiting);
+        assert_eq!(0, storage.fetch_reads.available_permits());
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        for read in &reads {
+            read.abort();
+        }
+        for read in reads {
+            let outcome = read.await;
+            assert!(
+                outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+                "{outcome:?}"
+            );
+        }
+
+        assert_eq!(0, storage.pool.status().waiting);
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// An abandoned read that leaves its connection inside a transaction
+    /// block, open or failed, loses that connection, so the pool never
+    /// hands it out. The permit still comes back.
+    ///
+    /// The read opens its block with a plain `BEGIN`, so dropping it queues
+    /// no `ROLLBACK`, as when the cancel request ends the `ROLLBACK` that
+    /// tokio-postgres queues for a dropped `Transaction`.
+    #[tokio::test]
+    async fn abandoned_read_left_inside_a_transaction_loses_its_connection() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+        storage.pool.resize(1);
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping abandoned_read_left_inside_a_transaction_loses_its_connection: {err:?}"
+            );
+            return Ok(());
+        }
+
+        let marker = alphanumeric_string(15);
+        let open = "BEGIN; SET LOCAL enable_seqscan = off".to_owned();
+        let failed = format!("BEGIN; SELECT pg_sleep(30) /* {marker} */");
+
+        for read in [open, failed] {
+            let permit = storage.fetch_reads.clone().acquire_owned().await?;
+            let connection = storage.abandonable_connection(permit).await?;
+            let backend = connection
+                .object()?
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get::<_, i32>(0);
+
+            // The open block finishes at once, and the cancel request then
+            // finds no statement to end. The sleep is still running at the
+            // timeout, and the cancel request ends it, which fails the block.
+            _ = timeout(
+                Duration::from_millis(200),
+                connection.object()?.batch_execute(&read),
+            )
+            .await;
+            drop(connection);
+
+            wait_until(&storage, |storage| {
+                storage.pool.status().size == 0
+                    && storage.fetch_reads.available_permits() == FETCH_READS
+            })
+            .await;
+
+            let c = storage.connection().await?;
+            assert_ne!(
+                backend,
+                c.query_one("SELECT pg_backend_pid()", &[])
+                    .await?
+                    .get::<_, i32>(0),
+                "the pool handed out the connection left by {read:?}"
+            );
+            assert_eq!(
+                "on",
+                c.query_one("SELECT current_setting('enable_seqscan')", &[])
+                    .await?
+                    .get::<_, String>(0)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Registers a broker for `cluster`, creates a topic of one partition,
+    /// and produces one record with a header to it.
+    async fn topic_with_one_record(storage: &Postgres, cluster: &str) -> Result<Topition> {
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.into(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name, 0);
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .header(
+                        Header::builder()
+                            .key(Bytes::from_static(b"k"))
+                            .value(Bytes::from_static(b"v")),
+                    )
+                    .offset_delta(0),
+            )
+            .last_offset_delta(0)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        Ok(topition)
+    }
+
+    /// Reads `topition` from offset 0 with a 5 second budget.
+    async fn fetch_from_start(storage: &Postgres, topition: &Topition) -> Result<()> {
+        storage
+            .fetch(
+                topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await
+            .map(drop)
+    }
+
+    /// More fetches than `FETCH_READS` at once all finish: each fetch reads
+    /// its watermark on the connection it already holds, so no fetch waits
+    /// for a second permit while it holds one.
+    #[tokio::test]
+    async fn fetches_beyond_the_limit_all_finish() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping fetches_beyond_the_limit_all_finish: {err:?}");
+            return Ok(());
+        }
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        let fetches = (0..FETCH_READS + 2)
+            .map(|_| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+                tokio::spawn(async move { fetch_from_start(&storage, &topition).await })
+            })
+            .collect::<Vec<_>>();
+
+        for fetch in fetches {
+            timeout(Duration::from_secs(10), fetch)
+                .await
+                .map_err(|_| Error::Message("a fetch did not finish".into()))?
+                .map_err(|err| Error::Message(err.to_string()))??;
+        }
+
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// Runs `read` while `monitor` holds an exclusive lock on `table`, and
+    /// aborts `read` once its backend waits for that lock in a statement
+    /// that contains `statement`. While the lock is still held, checks that
+    /// the backend ends up idle after [`SETTLE_QUERY`], with its connection
+    /// back in `storage`'s pool and its Fetch permit returned. Returns the
+    /// backend's process id.
+    ///
+    /// `storage` must have a pool of one connection, and connect with
+    /// `application_name`. Other tests that use `table` wait for the lock
+    /// too, for about a second.
+    async fn abandon_read_waiting_for_a_lock(
+        storage: &Postgres,
+        monitor: &Postgres,
+        application_name: &str,
+        table: &str,
+        statement: &str,
+        read: impl Future<Output = Result<()>> + Send + 'static,
+    ) -> Result<i32> {
+        let mut locking = monitor.connection().await?;
+
+        // A transaction reads one snapshot of `pg_stat_activity`, so the
+        // test watches the read from outside the locking transaction.
+        let watching = monitor.connection().await?;
+
+        // The test releases the lock before it returns. The timeouts bound
+        // how long the lock holds up other tests when this test stops early.
+        let lock = locking.transaction().await?;
+        lock.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '5s'; SET LOCAL idle_in_transaction_session_timeout = '10s'; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .await?;
+
+        let reading = tokio::spawn(read);
+
+        let give_up = Instant::now() + Duration::from_secs(10);
+        let backend = loop {
+            if let Some(row) = watching
+                .query_opt(
+                    "SELECT pid FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE $2",
+                    &[&application_name, &format!("%{statement}%")],
+                )
+                .await?
+            {
+                break row.get::<_, i32>(0);
+            }
+
+            assert!(
+                Instant::now() < give_up,
+                "the read did not wait for the lock on {table}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        reading.abort();
+        let outcome = reading.await;
+        assert!(
+            outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+            "{outcome:?}"
+        );
+
+        let give_up = Instant::now() + Duration::from_secs(10);
+        let last_query = loop {
+            let activity = watching
+                .query_one(
+                    "SELECT state, query FROM pg_stat_activity WHERE pid = $1",
+                    &[&backend],
+                )
+                .await?;
+            let state = activity.get::<_, Option<String>>(0);
+            let status = storage.pool.status();
+
+            if state.as_deref() == Some("idle") && status.available == 1 {
+                break activity.get::<_, Option<String>>(1);
+            }
+
+            assert!(
+                Instant::now() < give_up,
+                "backend {backend} is {state:?} while the lock on {table} is held, pool {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(Some(SETTLE_QUERY), last_query.as_deref());
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        lock.rollback().await?;
+
+        Ok(backend)
+    }
+
+    /// Returns storage on a pool of one connection that connects with a
+    /// unique `application_name`, a monitor on a pool of its own, and that
+    /// name, or `None` when no server answers.
+    async fn storage_on_one_connection(
+        cluster: &str,
+    ) -> Result<Option<(Postgres, Postgres, String)>> {
+        let application_name = format!("abandoned_read_{}", alphanumeric_string(15));
+
+        let storage =
+            Postgres::builder(&format!("{CONNECTION}?application_name={application_name}"))?
+                .cluster(cluster)
+                .node(rng().random_range(0..i32::MAX))
+                .build();
+        storage.pool.resize(1);
+
+        let monitor = Postgres::builder(CONNECTION)?
+            .cluster(cluster)
+            .node(0)
+            .build();
+
+        match monitor.connection().await {
+            Ok(_) => Ok(Some((storage, monitor, application_name))),
+            Err(err) => {
+                eprintln!("skipping: {err:?}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// A fetch dropped while its statement waits has that statement
+    /// cancelled, and its connection goes back to the pool idle and outside
+    /// any transaction, while the statement would still be waiting. A fetch
+    /// or an offset stage that finishes returns its connection and its
+    /// permit before it returns.
+    ///
+    /// The fetch waits for a lock on `header`, so it waits in its header
+    /// query, inside its transaction and after its record query.
+    #[tokio::test]
+    async fn abandoned_fetch_is_cancelled_and_its_connection_returned() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let Some((storage, monitor, application_name)) =
+            storage_on_one_connection(&cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        // Nothing awaits between each read and the checks after it, so a
+        // read that returned its connection through the abandon path
+        // instead would not have it back yet.
+        fetch_from_start(&storage, &topition).await?;
+        assert_eq!(1, storage.pool.status().available);
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        _ = storage.offset_stage(&topition).await?;
+        assert_eq!(1, storage.pool.status().available);
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        let fetching = {
+            let storage = storage.clone();
+            let topition = topition.clone();
+            async move { fetch_from_start(&storage, &topition).await }
+        };
+
+        let backend = abandon_read_waiting_for_a_lock(
+            &storage,
+            &monitor,
+            &application_name,
+            "header",
+            "from header",
+            fetching,
+        )
+        .await?;
+
+        let mut c = storage.connection().await?;
+        assert_eq!(1, storage.pool.status().size);
+        assert_eq!(
+            backend,
+            c.query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get::<_, i32>(0),
+            "the pool kept the abandoned fetch's connection"
+        );
+
+        let tx = c.transaction().await?;
+        assert_eq!(1, tx.query_one("SELECT 1", &[]).await?.get::<_, i32>(0));
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// An offset stage dropped while its statement waits has that statement
+    /// cancelled, and its connection goes back to the pool idle, while the
+    /// statement would still be waiting.
+    ///
+    /// The offset stage waits for a lock on `txn_produce_offset`, which only
+    /// transactional produces write.
+    #[tokio::test]
+    async fn abandoned_offset_stage_is_cancelled_and_its_connection_returned() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let Some((storage, monitor, application_name)) =
+            storage_on_one_connection(&cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        let reading = {
+            let storage = storage.clone();
+            let topition = topition.clone();
+            async move { storage.offset_stage(&topition).await.map(drop) }
+        };
+
+        let backend = abandon_read_waiting_for_a_lock(
+            &storage,
+            &monitor,
+            &application_name,
+            "txn_produce_offset",
+            "txn_produce_offset",
+            reading,
+        )
+        .await?;
+
+        let c = storage.connection().await?;
+        assert_eq!(
+            backend,
+            c.query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get::<_, i32>(0),
+            "the pool kept the abandoned offset stage's connection"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn pool_error_timeout_maps_to_retriable_error_code() {
         let error = Error::from(PoolError::Timeout(TimeoutType::Wait));
@@ -5477,17 +6304,15 @@ mod tests {
     async fn maintenance_sweeps_are_exempt_from_statement_timeout() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(&format!(
-            "{CONNECTION}?options=-c%20statement_timeout%3D100"
-        ))?
-        .cluster(cluster.as_str())
-        .node(rng().random_range(0..i32::MAX))
-        .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintenance_sweeps_are_exempt_from_statement_timeout: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintenance_sweeps_are_exempt_from_statement_timeout",
+            &format!("{CONNECTION}?options=-c%20statement_timeout%3D100"),
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5512,15 +6337,15 @@ mod tests {
     async fn maintain_removes_records_left_below_log_start() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintain_removes_records_left_below_log_start: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintain_removes_records_left_below_log_start",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5618,19 +6443,15 @@ mod tests {
     async fn read_committed_last_stable_offset_pinned_by_open_transaction() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        // Probe connectivity explicitly: only a genuinely unreachable postgres
-        // should skip. Any later schema/query error must fail the test.
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping read_committed_last_stable_offset_pinned_by_open_transaction: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "read_committed_last_stable_offset_pinned_by_open_transaction",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5714,15 +6535,15 @@ mod tests {
     async fn maintain_transactions_aborts_timed_out_transaction() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintain_transactions_aborts_timed_out_transaction: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintain_transactions_aborts_timed_out_transaction",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5816,15 +6637,15 @@ mod tests {
     async fn maintain_transactions_leaves_transaction_before_timeout() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintain_transactions_leaves_transaction_before_timeout: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "maintain_transactions_leaves_transaction_before_timeout",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -5918,17 +6739,15 @@ mod tests {
     -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping maintain_transactions_defers_when_older_overlapping_transaction_still_open: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "maintain_transactions_defers_when_older_overlapping_transaction_still_open",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6058,15 +6877,15 @@ mod tests {
     async fn txn_end_after_already_finalized_with_conflicting_outcome_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_after_already_finalized_is_a_no_op: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_after_already_finalized_is_a_no_op",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6173,15 +6992,15 @@ mod tests {
     async fn deferred_txn_end_retry_does_not_duplicate_marker() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping deferred_txn_end_retry_does_not_duplicate_marker: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "deferred_txn_end_retry_does_not_duplicate_marker",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6330,15 +7149,15 @@ mod tests {
     async fn late_commit_after_sweep_abort_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping late_commit_after_sweep_abort_is_rejected: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "late_commit_after_sweep_abort_is_rejected",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6463,15 +7282,15 @@ mod tests {
     async fn txn_end_scopes_bookkeeping_delete_to_its_own_epoch() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_scopes_bookkeeping_delete_to_its_own_epoch: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_scopes_bookkeeping_delete_to_its_own_epoch",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6678,15 +7497,11 @@ mod tests {
     async fn race_concurrent_commit_and_abort() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping race_concurrent_commit_and_abort: {err:?}");
+        let Some(storage) =
+            storage_with_schema("race_concurrent_commit_and_abort", CONNECTION, &cluster).await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6814,15 +7629,15 @@ mod tests {
     async fn sweep_fenced_producer_zombie_produce_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping sweep_fenced_producer_zombie_produce_is_rejected: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "sweep_fenced_producer_zombie_produce_is_rejected",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -6925,15 +7740,15 @@ mod tests {
     async fn sweep_fenced_producer_can_reconnect_and_produce_normally() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping sweep_fenced_producer_can_reconnect_and_produce_normally: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "sweep_fenced_producer_can_reconnect_and_produce_normally",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7055,15 +7870,15 @@ mod tests {
     async fn txn_end_for_unknown_producer_is_unknown_producer_id() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_for_unknown_producer_is_unknown_producer_id: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_for_unknown_producer_is_unknown_producer_id",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7092,15 +7907,15 @@ mod tests {
     async fn txn_end_with_future_epoch_is_invalid_producer_epoch() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_end_with_future_epoch_is_invalid_producer_epoch: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "txn_end_with_future_epoch_is_invalid_producer_epoch",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7134,15 +7949,15 @@ mod tests {
     async fn sweep_abort_retry_is_fenced_and_does_not_double_bump() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping sweep_abort_retry_is_fenced_and_does_not_double_bump: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "sweep_abort_retry_is_fenced_and_does_not_double_bump",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7300,15 +8115,15 @@ mod tests {
     async fn init_producer_old_api_version_is_treated_as_fresh() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_old_api_version_is_treated_as_fresh: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_old_api_version_is_treated_as_fresh",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7337,15 +8152,15 @@ mod tests {
     async fn init_producer_recovery_with_current_epoch_succeeds() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_recovery_with_current_epoch_succeeds: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_recovery_with_current_epoch_succeeds",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7390,15 +8205,15 @@ mod tests {
     async fn init_producer_recovery_with_stale_epoch_is_fenced() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_recovery_with_stale_epoch_is_fenced: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_recovery_with_stale_epoch_is_fenced",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7445,15 +8260,15 @@ mod tests {
     async fn init_producer_recovery_after_sweep_is_fenced() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_recovery_after_sweep_is_fenced: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_recovery_after_sweep_is_fenced",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7547,15 +8362,15 @@ mod tests {
 
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_concurrent_claims_bump_once: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_concurrent_claims_bump_once",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7634,15 +8449,15 @@ mod tests {
     async fn init_producer_malformed_partial_fields_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping init_producer_malformed_partial_fields_is_rejected: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "init_producer_malformed_partial_fields_is_rejected",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7672,15 +8487,11 @@ mod tests {
     async fn txn_add_partitions_is_idempotent() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping txn_add_partitions_is_idempotent: {err:?}");
+        let Some(storage) =
+            storage_with_schema("txn_add_partitions_is_idempotent", CONNECTION, &cluster).await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7753,17 +8564,15 @@ mod tests {
     async fn fetch_serves_committed_records_despite_concurrent_transaction() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping fetch_serves_committed_records_despite_concurrent_transaction: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "fetch_serves_committed_records_despite_concurrent_transaction",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7859,17 +8668,15 @@ mod tests {
     async fn create_topic_writes_the_watermark_when_only_its_statement_is_cached() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping create_topic_writes_the_watermark_when_only_its_statement_is_cached: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "create_topic_writes_the_watermark_when_only_its_statement_is_cached",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -7923,17 +8730,15 @@ mod tests {
     async fn delete_topic_leaves_the_other_topics_in_the_cluster_intact() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!(
-                "skipping delete_topic_leaves_the_other_topics_in_the_cluster_intact: {err:?}"
-            );
+        let Some(storage) = storage_with_schema(
+            "delete_topic_leaves_the_other_topics_in_the_cluster_intact",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -8030,15 +8835,15 @@ mod tests {
     async fn headers_keep_produce_order_and_allow_repeated_keys() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping headers_keep_produce_order_and_allow_repeated_keys: {err:?}");
+        let Some(storage) = storage_with_schema(
+            "headers_keep_produce_order_and_allow_repeated_keys",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -8133,5 +8938,450 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// An empty database that one test creates on the server at [`CONNECTION`].
+    struct EmptyDatabase {
+        name: String,
+        admin: Postgres,
+    }
+
+    impl EmptyDatabase {
+        /// Creates the database. Returns `None` when the server isn't reachable.
+        async fn create(test: &str) -> Result<Option<Self>> {
+            let admin = Postgres::builder(CONNECTION)?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(0)
+                .build();
+
+            let c = match admin.connection().await {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("skipping {test}: {err:?}");
+                    return Ok(None);
+                }
+            };
+
+            let name = format!("nisshi_test_{}", alphanumeric_string(12).to_lowercase());
+            c.batch_execute(&format!("create database {name}")).await?;
+
+            Ok(Some(Self { name, admin }))
+        }
+
+        fn url(&self) -> Result<Url> {
+            let mut url = Url::parse(CONNECTION)?;
+            url.set_path(&self.name);
+            Ok(url)
+        }
+
+        /// Returns a [`Postgres`] storage engine for a new cluster on this database, as the user
+        /// in [`CONNECTION`].
+        fn storage(&self) -> Result<Postgres> {
+            self.storage_at(&self.url()?)
+        }
+
+        fn storage_at(&self, url: &Url) -> Result<Postgres> {
+            Ok(Postgres::builder(url.as_str())?
+                .cluster(alphanumeric_string(15).as_str())
+                .node(111)
+                .build())
+        }
+
+        /// Runs `sql` on this database as the user in [`CONNECTION`].
+        async fn execute(&self, sql: &str) -> Result<()> {
+            self.storage()?
+                .connection()
+                .await?
+                .batch_execute(sql)
+                .await
+                .map_err(Into::into)
+        }
+
+        /// Records `version` and `oldest_compatible_version` in the database's
+        /// `nisshi_schema_version` table.
+        async fn record_schema_version(
+            &self,
+            version: i32,
+            oldest_compatible_version: i32,
+        ) -> Result<()> {
+            self.execute(&format!(
+                "update nisshi_schema_version set version = {version}, \
+                 oldest_compatible_version = {oldest_compatible_version}"
+            ))
+            .await
+        }
+
+        /// Creates a login role that can't create anything in the `public` namespace, and returns
+        /// the URL that logs in to this database as the role. [`EmptyDatabase::remove`] drops
+        /// the role.
+        async fn create_role(&self) -> Result<Url> {
+            let role = format!("{}_role", self.name);
+            let password = alphanumeric_string(12);
+
+            self.admin
+                .connection()
+                .await?
+                .batch_execute(&format!("create role {role} login password '{password}'"))
+                .await?;
+            self.execute("revoke create on schema public from public")
+                .await?;
+
+            let mut url = self.url()?;
+            url.set_username(&role)
+                .and_then(|()| url.set_password(Some(&password)))
+                .map_err(|()| Error::Message(format!("{url} can't hold a user")))?;
+            Ok(url)
+        }
+
+        /// Drops the database, and the role of [`EmptyDatabase::create_role`] if there is one.
+        async fn remove(self) -> Result<()> {
+            let c = self.admin.connection().await?;
+            c.batch_execute(&format!("drop database {} with (force)", self.name))
+                .await?;
+            c.batch_execute(&format!("drop role if exists {}_role", self.name))
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    /// Runs `body` on an empty database of its own, then drops the database when `body` returns.
+    /// Skips `test` when the server can't be reached.
+    async fn with_empty_database(
+        test: &str,
+        body: impl AsyncFnOnce(&EmptyDatabase) -> Result<()>,
+    ) -> Result<()> {
+        let Some(database) = EmptyDatabase::create(test).await? else {
+            return Ok(());
+        };
+
+        let outcome = body(&database).await;
+        let removed = database.remove().await;
+        outcome.and(removed)
+    }
+
+    /// Returns the version that the `nisshi_schema_version` table in `storage`'s database records,
+    /// or `None` when it records none.
+    async fn recorded_version(storage: &Postgres) -> Result<Option<i32>> {
+        storage
+            .connection()
+            .await?
+            .query_opt("select version from nisshi_schema_version", &[])
+            .await?
+            .map(|row| row.try_get(0))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn register(storage: &Postgres) -> Result<()> {
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: storage.node,
+                cluster_id: storage.cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await
+    }
+
+    /// Returns whether `storage`'s cluster is stored in its database.
+    async fn cluster_is_stored(storage: &Postgres) -> Result<bool> {
+        storage
+            .connection()
+            .await?
+            .query_one(
+                "select count(*) from cluster where name = $1",
+                &[&storage.cluster],
+            )
+            .await?
+            .try_get::<_, i64>(0)
+            .map(|count| count == 1)
+            .map_err(Into::into)
+    }
+
+    /// Builds a storage on `storage` through the factory, as a broker does at startup.
+    ///
+    /// The server reserves some connections for superusers. The other tests connect as a superuser
+    /// and can hold every other connection. When `storage` logs in as a role that isn't a
+    /// superuser, this function then waits up to 30 seconds for a free connection.
+    async fn build_with_factory(storage: Url) -> Result<ArcDynStorage> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+        loop {
+            let built = factory::PostgresFactory
+                .build(StorageFactoryConfiguration {
+                    node_id: 111,
+                    cluster: alphanumeric_string(15),
+                    advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                    storage: storage.clone(),
+                    schema_registry: None,
+                    lake_house: None,
+                    cancellation: Default::default(),
+                })
+                .await;
+
+            match built {
+                Err(Error::StartupFailed {
+                    failure: StartupFailure::StorageUnreachable,
+                    ref source,
+                    ..
+                }) if server_has_no_free_connection(source)
+                    && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(500)).await
+                }
+                built => return built,
+            }
+        }
+    }
+
+    /// Returns whether the server refused a connection because it had no free connection.
+    fn server_has_no_free_connection(error: &Error) -> bool {
+        let Error::Pool(pool_error) = error else {
+            return false;
+        };
+
+        matches!(
+            pool_error.downcast_ref::<PoolError>(),
+            Some(PoolError::Backend(err)) if err.code() == Some(&SqlState::TOO_MANY_CONNECTIONS)
+        )
+    }
+
+    /// In an empty database, `ensure_schema` must create every table and record [`SCHEMA_VERSION`].
+    #[tokio::test]
+    async fn ensure_schema_creates_the_schema_on_an_empty_database() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_creates_the_schema_on_an_empty_database",
+            async |database| {
+                let storage = database.storage()?;
+
+                storage.ensure_schema().await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                register(&storage).await?;
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A newer release set up this database with a schema that this release can use.
+    /// `ensure_schema` must leave the tables, the data and the recorded version as they are.
+    #[tokio::test]
+    async fn ensure_schema_keeps_a_database_that_records_a_version() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_keeps_a_database_that_records_a_version",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                register(&storage).await?;
+                database.record_schema_version(2, 1).await?;
+
+                storage.ensure_schema().await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// An earlier release created the tables in this database without recording a version.
+    /// `ensure_schema` must record [`SCHEMA_VERSION`] and keep the data.
+    #[tokio::test]
+    async fn ensure_schema_records_the_version_of_a_database_created_without_one() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_records_the_version_of_a_database_created_without_one",
+            async |database| {
+                let storage = database.storage()?;
+                database.execute(SCHEMA).await?;
+                register(&storage).await?;
+
+                storage.ensure_schema().await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// When an existing deployment keeps its tables in PostgreSQL's `public` namespace (which
+    /// PostgreSQL calls a schema), `ensure_schema` must add the version table there too, even when
+    /// the broker's search path puts another, empty namespace first. It must create nothing in that
+    /// other namespace, because reads would then find empty copies of the tables instead of data.
+    #[tokio::test]
+    async fn ensure_schema_uses_the_namespace_that_holds_the_existing_tables() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_uses_the_namespace_that_holds_the_existing_tables",
+            async |database| {
+                database.execute(SCHEMA).await?;
+                database.execute("create schema first_on_path").await?;
+
+                // tokio-postgres reads a `+` in the URL as a `+`, so the space is written as `%20`.
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20search_path%3Dfirst_on_path%2Cpublic"));
+                let storage = database.storage_at(&url)?;
+                register(&storage).await?;
+
+                storage.ensure_schema().await?;
+
+                let tables_in_first_on_path = storage
+                    .connection()
+                    .await?
+                    .query_one(
+                        "select count(*) from pg_tables where schemaname = 'first_on_path'",
+                        &[],
+                    )
+                    .await?
+                    .try_get::<_, i64>(0)?;
+                assert_eq!(tables_in_first_on_path, 0);
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// `ensure_schema` must wait for the schema lock on a database that records no version, so that
+    /// two brokers never create the schema at the same time.
+    #[tokio::test]
+    async fn ensure_schema_waits_for_the_schema_lock() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_waits_for_the_schema_lock",
+            async |database| {
+                let holder_storage = database.storage()?;
+                let holder = holder_storage.connection().await?;
+                holder
+                    .batch_execute(&format!("select pg_advisory_lock({SCHEMA_LOCK})"))
+                    .await?;
+
+                let storage = database.storage()?;
+                let setup = tokio::spawn(async move { storage.ensure_schema().await });
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(!setup.is_finished());
+
+                holder
+                    .batch_execute(&format!("select pg_advisory_unlock({SCHEMA_LOCK})"))
+                    .await?;
+                setup.await??;
+
+                assert_eq!(
+                    recorded_version(&database.storage()?).await?,
+                    Some(SCHEMA_VERSION)
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// Four brokers run `ensure_schema` at the same time on one empty database. Each one must
+    /// succeed, and the database must record [`SCHEMA_VERSION`].
+    #[tokio::test]
+    async fn ensure_schema_succeeds_for_brokers_that_start_together() -> Result<()> {
+        const BROKERS: usize = 4;
+
+        with_empty_database(
+            "ensure_schema_succeeds_for_brokers_that_start_together",
+            async |database| {
+                let storages = (0..BROKERS)
+                    .map(|_| database.storage())
+                    .collect::<Result<Vec<_>>>()?;
+
+                for result in
+                    future::join_all(storages.iter().map(|storage| storage.ensure_schema())).await
+                {
+                    result?;
+                }
+
+                assert_eq!(recorded_version(&storages[0]).await?, Some(SCHEMA_VERSION));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The database is already set up, and the broker's database user can read and write the tables
+    /// but can't create them. The broker must start.
+    #[tokio::test]
+    async fn factory_starts_without_create_permission_on_a_database_that_is_set_up() -> Result<()> {
+        with_empty_database(
+            "factory_starts_without_create_permission_on_a_database_that_is_set_up",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                let role = database.create_role().await?;
+                database
+                    .execute(&format!(
+                        "grant select, insert, update, delete on all tables in schema public to {0}; \
+                         grant usage on all sequences in schema public to {0}",
+                        role.username()
+                    ))
+                    .await?;
+
+                _ = build_with_factory(role).await?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The database is empty, and the broker's database user can't create tables. The broker must
+    /// stop at startup with a `SchemaSetup` failure.
+    #[tokio::test]
+    async fn factory_fails_with_schema_setup_when_the_user_cannot_create_tables() -> Result<()> {
+        with_empty_database(
+            "factory_fails_with_schema_setup_when_the_user_cannot_create_tables",
+            async |database| {
+                let role = database.create_role().await?;
+
+                let Err(Error::StartupFailed {
+                    storage: reported,
+                    failure,
+                    source,
+                }) = build_with_factory(role.clone()).await
+                else {
+                    panic!("expected a startup failure");
+                };
+
+                assert_eq!(failure, StartupFailure::SchemaSetup);
+                assert_eq!(*reported, nisshi_schema::redact_url(&role));
+                assert_eq!(reported.password(), None);
+                assert_matches!(
+                    &*source,
+                    Error::TokioPostgres(err) if err.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A newer release set up this database with a schema that this release can't use. The broker
+    /// must stop at startup with an `IncompatibleSchema` error.
+    #[tokio::test]
+    async fn factory_refuses_a_database_whose_schema_this_release_cannot_use() -> Result<()> {
+        with_empty_database(
+            "factory_refuses_a_database_whose_schema_this_release_cannot_use",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                database.record_schema_version(2, 2).await?;
+
+                let Err(Error::StartupFailed {
+                    failure, source, ..
+                }) = build_with_factory(database.url()?).await
+                else {
+                    panic!("expected a startup failure");
+                };
+
+                assert_eq!(failure, StartupFailure::SchemaSetup);
+                assert_matches!(*source, Error::IncompatibleSchema { .. });
+                Ok(())
+            },
+        )
+        .await
     }
 }

@@ -177,9 +177,20 @@ where
     );
     assert_eq!(Some(PROTOCOL_TYPE.into()), rejoin_response.protocol_type);
     assert_eq!(Some(RANGE.into()), rejoin_response.protocol_name);
-    assert_eq!(rejoin_response.leader, join_response.leader);
-    assert_eq!(rejoin_response.member_id, join_response.member_id);
-    assert_eq!(rejoin_response.generation_id, join_response.generation_id);
+    // As in Kafka, the restarted instance gets a new member id and takes the place of the
+    // earlier one. The group was waiting for the leader's assignment, which may name the old
+    // member id, so it rebalances into the next generation.
+    assert_ne!(rejoin_response.member_id, join_response.member_id);
+    assert!(
+        rejoin_response
+            .member_id
+            .starts_with(group_instance_id.as_str())
+    );
+    assert_eq!(rejoin_response.member_id, rejoin_response.leader);
+    assert_eq!(
+        join_response.generation_id + 1,
+        rejoin_response.generation_id
+    );
     assert_eq!(1, rejoin_response.members.unwrap().len());
 
     Ok(())

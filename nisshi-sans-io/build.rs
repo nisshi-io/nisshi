@@ -38,13 +38,11 @@ use syn::{Expr, Type};
 /// `[hidden]`, so logging a message, `Body` or `Frame` doesn't log them.
 ///
 /// Kafka 3.9.1 keeps SASL auth bytes out of its logs by never passing them to
-/// the request logger
-/// (<https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/authenticator/SaslServerAuthenticator.java#L425-L504>).
-/// It does log `SaltedPassword` and delegation token `Hmac` values, since its
-/// request logger only redacts configs
-/// (<https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/RequestChannel.scala#L186-L212>).
-/// We hide those as well, following `DelegationToken.toString`
-/// (<https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/token/delegation/DelegationToken.java#L74-L79>).
+/// the request logger ([SaslServerAuthenticator.java#L425-L504]). It does log
+/// `SaltedPassword` and delegation token `Hmac` values, since its request
+/// logger only redacts configs ([RequestChannel.scala#L186-L212]). We hide
+/// those as well, following `DelegationToken.toString`
+/// ([DelegationToken.java#L74-L79]).
 ///
 /// Kafka hides an `AlterConfigs` or `IncrementalAlterConfigs` value only when
 /// the config it names is sensitive, such as a password. We hide every value,
@@ -52,6 +50,10 @@ use syn::{Expr, Type};
 ///
 /// The build fails if an entry matches no field, so a renamed field can't
 /// silently stop being hidden.
+///
+/// [SaslServerAuthenticator.java#L425-L504]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/authenticator/SaslServerAuthenticator.java#L425-L504
+/// [RequestChannel.scala#L186-L212]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/RequestChannel.scala#L186-L212
+/// [DelegationToken.java#L74-L79]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/token/delegation/DelegationToken.java#L74-L79
 const SENSITIVE_FIELDS: &[(&str, &str, &str)] = &[
     ("AlterConfigsRequest", "AlterableConfig", "Value"),
     ("IncrementalAlterConfigsRequest", "AlterableConfig", "Value"),

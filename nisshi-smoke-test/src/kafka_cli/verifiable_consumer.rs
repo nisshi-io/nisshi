@@ -81,7 +81,9 @@ pub enum ConsumerEvent {
         offsets: Vec<CommittedOffset>,
         success: bool,
     },
-    /// An event that no test reads, such as `startup_complete`.
+    /// The consumer started, just before it subscribed to its topic.
+    StartupComplete,
+    /// An event that no test reads.
     #[serde(other)]
     Other,
 }
