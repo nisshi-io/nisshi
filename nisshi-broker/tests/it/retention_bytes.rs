@@ -61,6 +61,9 @@ const VALUE_BYTES: usize = 1000;
 const RETENTION_BYTES: usize = 5 * VALUE_BYTES;
 const PRODUCED: i64 = 20;
 
+/// How many of the newest records fit within [`RETENTION_BYTES`], and remain after maintenance.
+const KEPT: i64 = (RETENTION_BYTES / VALUE_BYTES) as i64;
+
 async fn create_topic(
     broker: &Broker,
     extensions: &Extensions,
@@ -208,7 +211,7 @@ where
     sc.maintain(SystemTime::now()).await?;
 
     assert_eq!(
-        Some(15),
+        Some(PRODUCED - KEPT),
         list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
     );
     assert_eq!(
@@ -219,6 +222,38 @@ where
     let value = Bytes::from(format!("{PRODUCED:0>VALUE_BYTES$}"));
     assert_eq!(PRODUCED, produce(&broker, &extensions, topic, value).await?);
 
+    Ok(())
+}
+
+/// Kafka's default `cleanup.policy` is `delete`, so a topic that sets only `retention.bytes` must
+/// stay within it. A broker that skips the topic lets it grow forever.
+pub async fn retention_bytes_without_cleanup_policy_deletes_oldest<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[("retention.bytes", &RETENTION_BYTES.to_string())],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(PRODUCED - KEPT),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
     Ok(())
 }
 
@@ -312,6 +347,15 @@ macro_rules! backend {
             async fn deletes_oldest() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::retention_bytes_deletes_oldest(storage_container().await?).await
+            }
+
+            #[tokio::test]
+            async fn without_cleanup_policy_deletes_oldest() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_without_cleanup_policy_deletes_oldest(
+                    storage_container().await?,
+                )
+                .await
             }
 
             #[tokio::test]

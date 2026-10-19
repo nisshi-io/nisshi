@@ -68,6 +68,7 @@ pub mod produce_post_write_advance_failed;
 pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;
+pub mod retention_ms;
 #[cfg(feature = "libsql")]
 pub mod sasl_handshake;
 pub mod sasl_scram_enforcement;
