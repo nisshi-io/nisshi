@@ -31,10 +31,17 @@ const LENGTHS: [usize; 2] = [16, 16 * 1024];
 
 /// The longest `Debug` or `Display` text the error may have, whatever the
 /// field's length.
-const MAXIMUM_TEXT: usize = 256;
+const MAXIMUM_TEXT: usize = 128;
 
-/// Replaces the only run of `len` `b'a'` bytes in `frame` with `0xff`, which
-/// is never valid UTF-8, keeping every length prefix intact.
+/// The invalid field's bytes, which are never valid UTF-8, repeated.
+const FILL: [u8; 2] = [0xfe, 0xff];
+
+/// Renderings of [`FILL`] that a text holding the field's bytes would
+/// contain: a decimal list, `Bytes`-style escapes, and hex.
+const FILL_FORMS: [&str; 4] = ["254, 255", r"\xfe\xff", "fe, ff", "feff"];
+
+/// Replaces the only run of `len` `b'a'` bytes in `frame` with [`FILL`],
+/// keeping every length prefix intact.
 fn invalid_utf8(frame: Bytes, len: usize) -> Bytes {
     let placeholder = vec![b'a'; len];
     let start = frame
@@ -43,23 +50,40 @@ fn invalid_utf8(frame: Bytes, len: usize) -> Bytes {
         .expect("the frame holds the placeholder");
 
     let mut patched = frame.to_vec();
-    patched[start..start + len].fill(0xff);
+    for (byte, fill) in patched[start..start + len]
+        .iter_mut()
+        .zip(FILL.iter().cycle())
+    {
+        *byte = *fill;
+    }
     Bytes::from(patched)
 }
 
 /// Decodes `frame`, which must fail on a string of `len` invalid bytes, and
 /// asserts that the error's `Debug` and `Display` text stay within
-/// [`MAXIMUM_TEXT`].
+/// [`MAXIMUM_TEXT`] and hold none of the field's bytes, so a short prefix of
+/// them can't leak either.
 fn assert_bounded(frame: Bytes, len: usize) {
     let error = Frame::request_from_bytes(frame).expect_err("the frame has an invalid string");
     assert_matches!(error, Error::FromUtf8 { len: found, .. } if found == len);
 
-    let debug = format!("{error:?}").len();
-    let display = format!("{error}").len();
-    assert!(
-        debug <= MAXIMUM_TEXT && display <= MAXIMUM_TEXT,
-        "a {len} byte field gives {debug} bytes of Debug and {display} of Display text"
-    );
+    for (name, text) in [
+        ("Debug", format!("{error:?}")),
+        ("Display", format!("{error}")),
+    ] {
+        assert!(
+            text.len() <= MAXIMUM_TEXT,
+            "a {len} byte field gives {} bytes of {name} text",
+            text.len()
+        );
+
+        for form in FILL_FORMS {
+            assert!(
+                !text.contains(form),
+                "the {name} text of a {len} byte field holds its bytes as {form:?}"
+            );
+        }
+    }
 }
 
 fn metadata(client_id: Option<String>, topic: String) -> Result<Bytes> {

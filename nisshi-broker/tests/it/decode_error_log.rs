@@ -48,7 +48,20 @@ const SMALL: usize = 1024;
 const LARGE: usize = 256 * 1024;
 
 /// The longest log line a failed request may write.
-const MAXIMUM_LINE: usize = 1024;
+const MAXIMUM_LINE: usize = 512;
+
+/// The bytes of the invalid or unrouted field, repeated. They are never
+/// valid UTF-8.
+const FILL: [u8; 2] = [0xfe, 0xff];
+
+/// Renderings of [`FILL`] that a log holding the request's bytes would
+/// contain: a decimal list, `Bytes`-style escapes, and hex.
+const FILL_FORMS: [&str; 4] = ["254, 255", r"\xfe\xff", "fe, ff", "feff"];
+
+/// `len` bytes of [`FILL`].
+fn filled(len: usize) -> Vec<u8> {
+    FILL.iter().copied().cycle().take(len).collect()
+}
 
 /// How much the log of the large request may differ in size from the log of
 /// the small one: room for the digits of the lengths in the error.
@@ -138,8 +151,9 @@ async fn logs_for(frame: Bytes) -> Result<String> {
 }
 
 /// Asserts that the logs of the small and large request are about the same
-/// size and that no line is longer than [`MAXIMUM_LINE`]. A failure names
-/// sizes only, so it doesn't print the bytes it found.
+/// size, that no line is longer than [`MAXIMUM_LINE`], and that no line holds
+/// the request's bytes, even as a short prefix. A failure names sizes and
+/// forms only, so it doesn't print the bytes it found.
 fn assert_bounded(small: &str, large: &str) {
     for (name, logs) in [("small", small), ("large", large)] {
         for line in logs.lines() {
@@ -147,6 +161,13 @@ fn assert_bounded(small: &str, large: &str) {
                 line.len() <= MAXIMUM_LINE,
                 "the {name} request logged a line of {} bytes",
                 line.len()
+            );
+        }
+
+        for form in FILL_FORMS {
+            assert!(
+                !logs.contains(form),
+                "the {name} request logged its bytes as {form:?}"
             );
         }
     }
@@ -159,7 +180,7 @@ fn assert_bounded(small: &str, large: &str) {
     );
 }
 
-/// A Metadata request whose topic name is `len` bytes of `0xff`.
+/// A Metadata request whose topic name is `len` bytes of [`FILL`].
 fn invalid_topic_name(len: usize) -> Result<Bytes> {
     let frame = Frame::request(
         Header::Request {
@@ -189,12 +210,12 @@ fn invalid_topic_name(len: usize) -> Result<Bytes> {
         .ok_or_else(|| anyhow!("the frame holds the topic name"))?;
 
     let mut patched = frame.to_vec();
-    patched[start..start + len].fill(0xff);
+    patched[start..start + len].copy_from_slice(&filled(len));
     Ok(Bytes::from(patched))
 }
 
 /// A PushTelemetry request, which the broker doesn't route, carrying `len`
-/// bytes of metrics.
+/// bytes of [`FILL`] as metrics.
 fn unrouted(len: usize) -> Result<Bytes> {
     Frame::request(
         Header::Request {
@@ -205,7 +226,7 @@ fn unrouted(len: usize) -> Result<Bytes> {
         },
         PushTelemetryRequest::default()
             .client_instance_id([0; 16])
-            .metrics(Bytes::from(vec![0xff; len]))
+            .metrics(Bytes::from(filled(len)))
             .into(),
     )
     .map_err(Into::into)
