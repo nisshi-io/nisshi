@@ -307,6 +307,12 @@ where
             .await
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.introduce_latency().await?;
+
+        self.storage.group_with_version(group_id).await
+    }
+
     async fn update_group(
         &self,
         group_id: &str,

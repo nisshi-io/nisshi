@@ -2,181 +2,195 @@
 
 All notable changes to this project will be documented in this file.
 
-This file is generated from the commit history when a release is cut. Pull
-requests don't edit it; describe user- and operator-visible changes in the
-pull request description instead, which becomes the body of the commit on
-`main`.
+This file is generated from the commit history when a release is cut. Pull requests don't edit it; describe user- and operator-visible changes in the pull request description instead, which becomes the body of the commit on `main`.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-10-16
+
+### Upgrade notes
+
+- **The project is now Nisshi (formerly Tansu).** The binary is `nisshi`, the image is `ghcr.io/nisshi-io/nisshi`, and the crates are `nisshi-*`. Prefixed metrics are named `nisshi_*` instead of `tansu_*`, `RUST_LOG` targets are `nisshi_broker`, `nisshi_storage` and so on, and the default OpenTelemetry `service.name` is `nisshi-broker`, `nisshi-proxy` or `nisshi-generator`. Update dashboards, alerts and log filters. Topic configuration keys keep their `tansu.` prefix (`tansu.batch`, `tansu.lake.*`, `tansu.virtual`).
+- **The default cluster id is now `nisshi_cluster` (was `tansu_cluster`).** Every storage engine keys its data by cluster id, so a broker upgraded without `--cluster-id` or `CLUSTER_ID` starts on an empty cluster. Set `CLUSTER_ID=tansu_cluster` to keep using existing data. The default storage engine is now `memory://nisshi/`.
+- **SlateDB: the database path is now `nisshi-<cluster id>.slatedb` (was `tansu-<cluster id>.slatedb`).** Setting `CLUSTER_ID=tansu_cluster` alone doesn't find existing SlateDB data, which stays under `tansu-<cluster id>.slatedb/` in the bucket. A `slatedb://` or `s3://` URL without a bucket now defaults to bucket `nisshi` (was `tansu`).
+- **Lake defaults: `ICEBERG_NAMESPACE` and `DELTA_DATABASE` default to `nisshi` (were `tansu`).** A broker upgraded without them writes Iceberg tables to a new namespace and Delta tables to new `nisshi.<topic>` paths. Set `ICEBERG_NAMESPACE=tansu` and `DELTA_DATABASE=tansu` to keep writing the existing tables.
+- **PostgreSQL, SQLite and Turso schema changes, with no automatic migration** ([#715](https://github.com/nisshi-io/nisshi/pull/715), [#655](https://github.com/nisshi-io/nisshi/pull/655), [#712](https://github.com/nisshi-io/nisshi/pull/712)):
+  - The `header` table gains an `ordinal` column and is keyed on `(topition, offset_id, ordinal)`, so headers keep their produce order and a record can repeat a header key. Produce and Fetch fail against the old table. Recreate the database, or on PostgreSQL migrate it by hand with the statements from #715:
+    ```sql
+    alter table header add column ordinal int;
+    update header h set ordinal = n.rn - 1
+    from (select topition, offset_id, k,
+                 row_number() over (partition by topition, offset_id order by k) as rn
+          from header) n
+    where h.topition = n.topition and h.offset_id = n.offset_id and h.k = n.k;
+    alter table header alter column ordinal set not null;
+    alter table header drop constraint header_pkey;
+    alter table header add primary key (topition, offset_id, ordinal);
+    ```
+    On SQLite and Turso, rebuild the table to the definition in `nisshi-storage-sql/src/ddl/040-header.sql`, or recreate the database.
+  - PostgreSQL has a new `virtual_topic` table, which lookups by topic id read. The broker creates it at startup, as on SQLite and Turso.
+  - PostgreSQL `txn_detail.started_at` is now `timestamptz`, so the transaction timeout sweep measures elapsed time correctly when the server is not on UTC. An existing database keeps `timestamp`. If its server is not on UTC, drop the `v_txn_detail` view and run `alter table txn_detail alter column started_at type timestamptz` before starting the upgraded broker, which recreates the view.
+- **The broker creates the PostgreSQL and SQLite schema at startup** and records its version in a new `nisshi_schema_version` table ([#987](https://github.com/nisshi-io/nisshi/pull/987)). A new deployment needs no setup step, and the `etc/initdb.d` scripts, which Docker Compose's PostgreSQL ran on its first start, are gone. The broker creates only what is missing and never changes existing tables, so its database role must be able to create tables and replace views; a role that can't stops the broker with an error that says so. A database from an earlier release is recorded as schema version 1 without its tables being checked, so make the `header` and `txn_detail` changes above before its first start. The broker refuses to start on a database whose recorded schema is older than its own, or newer and incompatible. If the setup fails, the broker stops; SQLite used to log the failed statement and start with tables missing. PostgreSQL 13 or later is required. Turso keeps running its DDL at startup and records no version.
+- **`--cert` and `--key` now serve TLS.** Before, the two flags together failed at argument parsing, and either flag alone was accepted and ignored, so the broker only ever served plaintext. The two flags together now serve TLS only, and plaintext clients are refused at the handshake. Either flag alone is now an error, and a certificate or key that does not load stops the broker with an error that names the file ([#735](https://github.com/nisshi-io/nisshi/pull/735)).
+- **S3 and in-memory (DynoStore): some consumer group keys move, with no migration** ([#842](https://github.com/nisshi-io/nisshi/pull/842)). The engine stores each consumer group id as exactly one segment of its object key. Keys for other ids are unchanged. These keys move, and data under the old keys is not migrated:
+  - an id containing `/`: its committed offsets and group state;
+  - the empty id `""`, which consumers using `assign()` commit under: its committed offsets and group state;
+  - `.` and `..`: the group state only.
+
+  An affected group's consumers find no committed offset and start from `auto.offset.reset`. With the Java client default, `latest`, they skip records they had not yet consumed. Old data stays visible in ListGroups: old `""` data lists as a group named `offsets`, and old `a/b` data as a group named `a`. Deleting that group removes it. Upgrade every broker sharing a bucket before using these ids: an old and a new broker read and write different keys for them, so members connected to different brokers form two separate groups. A rollback returns these groups to the offsets they had before the upgrade.
+- **S3 and in-memory (DynoStore): keys for a topic whose name contains `/` move to one encoded segment, with no migration.** Objects under the old keys stay in place. CreateTopics rejects such names in this release, so only topics created by an earlier version are affected ([#977](https://github.com/nisshi-io/nisshi/pull/977)).
+- **SlateDB: consumers below the log start offset now reset.** A consumer whose position is below a partition's log start offset now applies `auto.offset.reset`, as with Apache Kafka: Fetch answers `OFFSET_OUT_OF_RANGE` straight away, where it used to return the earliest surviving record. This shows on SlateDB after retention, DeleteRecords, or compaction by an earlier version: `v0.7.0-pre.1` and `v0.7.0-pre.2` moved the log start to the first surviving batch on compaction, and their Fetch had no bounds check, so a consumer behind that log start read the first surviving batch. After the upgrade that log start stays where it is, so on a compacted SlateDB topic a group that is offline or lagging resets for the first time. With the default `latest`, the consumer skips the retained backlog, which on a topic that rewrites a few keys often (such as a config topic) can be nearly all of it; with `none`, the application gets an exception. Before you upgrade, compare each group's committed offsets with ListOffsets `earliest` on SlateDB topics, compacted ones in particular, and reset lagging groups to `earliest`. Run consumers of compacted SlateDB topics with `auto.offset.reset=earliest` across the upgrade, because compaction by the old version keeps raising the log start between that check and the upgrade itself. The log start is the batch the old version would have served, so a reset to it loses nothing. These answers are counted in `nisshi_fetch_offset_out_of_bounds` with `bound` set to `below_log_start`, which after the upgrade also shows consumers that the group comparison misses, such as those that use `assign` with offsets stored outside Kafka ([#826](https://github.com/nisshi-io/nisshi/pull/826)).
+- **Listener defaults.** The broker's default `--listener-url` is now `tcp://[::]:9092`, which accepts both IPv6 and IPv4 clients. On a host without IPv6 support, Windows included, the broker falls back to `0.0.0.0` on the same port and logs a warning ([#894](https://github.com/nisshi-io/nisshi/pull/894)); set `LISTENER_URL=tcp://0.0.0.0:9092` to listen on IPv4 only. The default advertised listener, the default broker URL of the `nisshi` client subcommands, and `nisshi proxy`'s default `--origin-url` and advertised listener are now `127.0.0.1:9092` instead of `localhost:9092`, so a client whose resolver returns `::1` for `localhost` first no longer gets connection refused ([#843](https://github.com/nisshi-io/nisshi/pull/843)).
+- **Configuration the broker used to ignore now stops it at startup** ([#850](https://github.com/nisshi-io/nisshi/pull/850), [#844](https://github.com/nisshi-io/nisshi/pull/844)):
+  - a storage URL query option that the storage engine does not read, such as a misspelt option or `vacuum_into` on an `s3://` or `slatedb://` URL. The error names the option and the engine (PostgreSQL already rejected unknown options);
+  - `maintenance_interval` or `transaction_maintenance_interval` with an invalid value: unparsable, zero, longer than 365 days, or a bare number without a unit. Previously an unparsable value fell back to the default interval, and zero panicked the maintenance task. Give a bare number its unit, for example `600s` or `10m` instead of `600`. Compound values such as `1h30m` and `5min` still work;
+  - a `parquet`, `iceberg` or `delta` broker without `--schema-registry` stops with an error that names the missing option, instead of panicking. `--schema-registry` is accepted before or after the subcommand;
+  - a broker on S3 or Google Cloud Storage exits when it cannot list its cluster's prefix in the bucket, or when its AWS credential provider does not return a credential. The error names the storage URL and the cause. Previously the broker started and failed on its first request.
+- **Upgrade `nisshi proxy` before the brokers behind it.** The proxy forwards a batched Produce (`tansu.batch=true`) with the strictest `acks` among the batched requests, and at least `acks=1`, so the origin answers it. An older proxy forwards batches with `acks=0` and waits for a response that an upgraded broker no longer sends. Known limitation: the proxy still waits for a response to an `acks=0` Produce that it passes through unbatched. Against an upgraded broker, that request stalls until the broker's connection idle timeout closes the upstream connection ([#845](https://github.com/nisshi-io/nisshi/pull/845)).
+- **`nisshi proxy` no longer forwards SASL.** It answers SaslHandshake and SaslAuthenticate itself with `ILLEGAL_SASL_STATE`. Clients must connect to the proxy with `security.protocol=PLAINTEXT`, and the origin listener must not require authentication ([#993](https://github.com/nisshi-io/nisshi/pull/993)).
+- **Advertised API versions are narrower:** Produce 3-11 (was 0-11), ListOffsets 0-6 (was 0-9), AddPartitionsToTxn 0-3 (was 0-5), and GetTelemetrySubscriptions is no longer advertised. A request at a version outside the advertised range closes the connection, except ApiVersions, which is answered with `UNSUPPORTED_VERSION`. The Java admin client's `OffsetSpec.maxTimestamp()`, `earliestLocal()` and `latestTiered()` now fail in the client ([#849](https://github.com/nisshi-io/nisshi/pull/849)).
+- **Produce validation is stricter.** Batches the broker used to store now get an error: a record timestamped more than an hour ahead of the broker's clock (`INVALID_TIMESTAMP`), and with `INVALID_RECORD` a batch whose `last_offset_delta` disagrees with `record_count`, a client batch with the control bit set, more than one batch per partition, an unknown compression codec, a record that does not decode, and a compressed record whose declared length is wrong or a compressed batch with bytes after its last record; and with `MESSAGE_TOO_LARGE` a batch that decodes to more than 100 MiB. Well-formed producers see no change. See Changed and Security for each.
+- **PostgreSQL and SQLite partitions damaged by an earlier version.** A batch whose `last_offset_delta` did not match its record count, such as the one the README quickstart (`nisshi cat produce taxi etc/data/trips.json`) sent, wedged its partition. This release stops new damage but does not repair it. A partition is damaged when `max(record.offset_id)` for its topition is at or above its `watermark.high`; set that partition's `watermark.high` to `max(record.offset_id) + 1`. DynoStore and SlateDB don't wedge, but later batches can overlap earlier offsets; recreate the topic ([#783](https://github.com/nisshi-io/nisshi/pull/783)).
+- **PostgreSQL timeouts.** A pool checkout waits at most 10s, and each statement, except in the retention and compaction sweeps, has a server-side `statement_timeout` of 30s unless the storage URL sets one; both answer `REQUEST_TIMED_OUT`, which clients retry. The timeout is sent as a startup `options` parameter, which PgBouncer rejects by default, so a broker behind PgBouncer fails to start ([#730](https://github.com/nisshi-io/nisshi/pull/730)).
+- **Consumer group rebalances follow Kafka's timing.** Every empty group waits `--group-initial-rebalance-delay` (3s) on its first join, as on Kafka, and `JoinGroup` and `SyncGroup` are held until the phase ends, up to the rebalance timeout. The first generation is 1, and a static member that restarts gets a new member id. The `method` label values `join_follower_pause` (`join_group_pause` in the 0.7.0 pre-releases), `join_group_instance_pause` and `sync_group_instance_pause` of the coordinator request counter are replaced by `join_held` and `sync_held`; update dashboards that use them ([#990](https://github.com/nisshi-io/nisshi/pull/990)).
+- **Idle and stalled connections are closed.** A connection with no request for 10 minutes (Kafka's `connections.max.idle.ms` default) is closed, and so is one whose transfer stalls for 30s ([#729](https://github.com/nisshi-io/nisshi/pull/729)).
+- **OpenTelemetry.** The metrics `service.name` now comes from `OTEL_SERVICE_NAME`, then `service.name` in `OTEL_RESOURCE_ATTRIBUTES`. A broker that inherits either variable, for example injected for another agent, exports its series under that name; unset it or set `OTEL_SERVICE_NAME=nisshi-broker`. `v1/metrics` is now appended to the endpoint path, so `http://gateway/otlp` exports to `http://gateway/otlp/v1/metrics` instead of `http://gateway/v1/metrics` ([#740](https://github.com/nisshi-io/nisshi/pull/740)). An invalid `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` now stops a broker with an OTLP endpoint at startup ([#804](https://github.com/nisshi-io/nisshi/pull/804)).
+- **S3 and in-memory: ListOffsets by timestamp** can land on a different offset after the upgrade, because it now answers from record timestamps. The first lookup on each existing partition reads every stored batch to build a time index. Upgrade every broker sharing a bucket before relying on these lookups, because a produce from an older broker discards the partition's time index ([#840](https://github.com/nisshi-io/nisshi/pull/840)).
+- **Rollback.** SlateDB writes manifest format v2, which an older broker cannot open ([#802](https://github.com/nisshi-io/nisshi/pull/802)). On PostgreSQL, SQLite and Turso, rows now keep the producer's codec, and an older broker fails to fetch a partition holding a Snappy row ([#734](https://github.com/nisshi-io/nisshi/pull/734)).
+- **Release artifacts.** The Linux tarballs are static musl binaries built with every storage engine, and there is no Intel macOS binary any more (see Changed and Removed).
+- **Library users.** The storage engines moved to their own crates (`nisshi-storage-dynostore`, `-sql`, `-slatedb`, `-null`), and `StorageContainer` needs each engine's factory registered. The service crates use rama 0.4, `nisshi_schema::Error` and `nisshi_service::Error` changed, `TcpContext::default()` now bounds frames at 100 MiB, the `Storage` trait has a new required method, `group_with_version` ([#989](https://github.com/nisshi-io/nisshi/pull/989)), and `nisshi_storage::Error` gains `StartupFailed`, `IncompatibleSchema` and `OutdatedSchema` ([#987](https://github.com/nisshi-io/nisshi/pull/987)). See Changed. Building from source uses Rust 1.98 (was 1.94).
+
+### Added
+
+- Transactional producers can commit and abort: the broker serves and advertises EndTxn, which 0.6.0 neither routed nor advertised.
+- Google Cloud Storage (`gs://`) storage engine ([#642](https://github.com/nisshi-io/nisshi/pull/642)).
+- Produce request batching on S3 and Google Cloud Storage, set with the `batch_max_delay` and `batch_min_size` storage URL options ([#658](https://github.com/nisshi-io/nisshi/pull/658)).
+- A Metadata request creates the topics it names that don't exist, when `allow_auto_topic_creation` permits it, with 4 partitions and replication factor 1. Invalid names get `INVALID_TOPIC_EXCEPTION`.
+- Virtual keyed topics on PostgreSQL and SQLite: on a topic with `tansu.virtual=true`, a fetch of `topic/key` returns only the records with that key ([#652](https://github.com/nisshi-io/nisshi/pull/652), [#655](https://github.com/nisshi-io/nisshi/pull/655)).
+- DeleteRecords works on every storage engine except the `null://` stub. It panicked on libSQL, Turso and DynoStore, and on PostgreSQL it failed or had no lasting effect. ListOffsets `earliest` answers the new log start afterwards ([#835](https://github.com/nisshi-io/nisshi/pull/835)).
+- `retention.bytes` on PostgreSQL and SQLite, counting key and value bytes per partition and always keeping the newest record ([#938](https://github.com/nisshi-io/nisshi/pull/938)).
+- SlateDB applies the `delete` and `compact` cleanup policies during maintenance, stores SCRAM credentials, and supports transactional offset commits.
+- PostgreSQL aborts transactions that run past their timeout and fences their producer, so an abandoned transaction no longer holds back the last stable offset. The sweep runs every `transaction_maintenance_interval` (storage URL option, default 10s) ([#712](https://github.com/nisshi-io/nisshi/pull/712), [#692](https://github.com/nisshi-io/nisshi/pull/692)).
+- `--key-passphrase-file` for a passphrase-protected PKCS#8 TLS key ([#737](https://github.com/nisshi-io/nisshi/pull/737)).
+- The `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` variables apply to exported metrics ([#740](https://github.com/nisshi-io/nisshi/pull/740)).
+- SQLite storage URL options `busy_timeout` (default 5s), `mode` (`semaphore`, the default, `mpsc` or `direct`) and `compaction` (`multi`, the default, or `single`).
+- The broker, `nisshi-generator` and `nisshi-perf` build on Windows. Ctrl+C or closing the console starts a graceful shutdown ([#863](https://github.com/nisshi-io/nisshi/pull/863)).
+- Metrics: `nisshi_fetch_offset_out_of_bounds`, `nisshi_frames_rejected`, `nisshi_storage_read_deadline_exceeded`, `nisshi_produce_acks_zero_failed`, `nisshi_produce_post_write_advance_failed`, `nisshi_storage_offload_permit_acquire_duration`, `nisshi_storage_offload_run_duration`, `nisshi_storage_proxy_semaphore_acquire_duration`, `nisshi_storage_channel_response_discarded`, `nisshi_storage_channel_server_failure`, `nisshi_fetch_unknown_partition` (by `topic` and `source`), the produce batcher's `batch_*` metrics, and in the proxy and CLI tools `request_timeouts`, `pool_get_errors` (by `error`), `pool_connections_discarded` (by `reason`) and `pool_get_duration`.
+- Release binaries embed their crate list (`cargo auditable`), so image scanners such as Trivy and Grype can read it ([#891](https://github.com/nisshi-io/nisshi/pull/891)).
+- A multi-arch `ghcr.io/nisshi-io/nisshi:edge` image of `main`, published by the scheduled CI run once `main`'s tip has passed CI. It is also tagged `main` for now ([#966](https://github.com/nisshi-io/nisshi/pull/966)).
 
 ### Changed
 
-- The S3 and in-memory (DynoStore) storage engine stores each consumer
-  group id as exactly one segment of its object key. Keys for other ids
-  are unchanged. These keys move, and data under the old keys is not
-  migrated:
-  - an id containing `/`: its committed offsets and group state;
-  - the empty id `""`, which consumers using `assign()` commit under: its
-    committed offsets and group state;
-  - `.` and `..`: the group state only.
-  An affected group's consumers find no committed offset and start from
-  `auto.offset.reset`. With the Java client default, `latest`, they skip
-  records they had not yet consumed. Old data stays visible in ListGroups:
-  old `""` data lists as a group named `offsets`, and old `a/b` data as a
-  group named `a`. Deleting that group removes it.
-- Upgrade every broker sharing a bucket before using these ids. An old and
-  a new broker read and write different keys for them, so members connected
-  to different brokers form two separate groups. A rollback returns these
-  groups to the offsets they had before the upgrade.
-- The broker's default `--kafka-listener-url` is now `tcp://[::]:9092`, which accepts both IPv6 and IPv4 clients. On a host without IPv6 support, the broker falls back to `0.0.0.0` on the same port and logs a warning; set `LISTENER_URL=tcp://0.0.0.0:9092` to listen on IPv4 only.
-- The default advertised listener, and the default broker URL of the `nisshi` client subcommands, are now `127.0.0.1:9092` instead of `localhost:9092`. A client whose resolver returns `::1` for `localhost` first no longer gets connection refused.
-- A consumer whose position is below a partition's log start offset now applies `auto.offset.reset`, as with Apache Kafka: Fetch answers `OFFSET_OUT_OF_RANGE` straight away, where it used to return the earliest surviving record. This shows on slatedb after retention, DeleteRecords, or compaction by an earlier version: `v0.7.0-pre.1` and `v0.7.0-pre.2` moved the log start to the first surviving batch on compaction, and their Fetch had no bounds check, so a consumer behind that log start read the first surviving batch. After the upgrade that log start stays where it is, so on a compacted slatedb topic a group that is offline or lagging resets for the first time. With the default `latest`, the consumer skips the retained backlog, which on a topic that rewrites a few keys often (such as a config topic) can be nearly all of it; with `none`, the application gets an exception. Before you upgrade, compare each group's committed offsets with ListOffsets `earliest` on slatedb topics, compacted ones in particular, and reset lagging groups to `earliest`. Run consumers of compacted slatedb topics with `auto.offset.reset=earliest` across the upgrade, because compaction by the old version keeps raising the log start between that check and the upgrade itself. The log start is the batch the old version would have served, so a reset to it loses nothing. These answers are counted in `nisshi_fetch_offset_out_of_bounds` with `bound` set to `below_log_start`, which after the upgrade also shows consumers that the group comparison misses, such as those that use `assign` with offsets stored outside Kafka.
-- Fetch answers straight away, instead of after `max_wait`, when any partition is `OFFSET_OUT_OF_RANGE` or every partition has an error. A consumer assigned only to a deleted topic now fetches at its error backoff rather than once per `max_wait`.
-- A listener with SASL configured closes a connection that sends a frame larger than 512KiB before the client authenticates, matching the Apache Kafka default for `sasl.server.max.receive.size`. The same limit applies while a client re-authenticates. The broker logs this rejection as `PreAuthenticationFrameTooBig`, and counts it in `nisshi_frames_rejected`.
-- The proxy forwards a batched Produce (`tansu.batch=true`) with the strictest `acks` among the batched requests, and at least `acks=1`, so the origin answers it. Upgrade proxies before brokers: an older proxy forwards batches with `acks=0` and waits for a response that an upgraded broker no longer sends.
-- Known limitation: the proxy still waits for a response to an `acks=0` Produce that it passes through unbatched. Against an upgraded broker, that request stalls until the broker's connection idle timeout closes the upstream connection.
-- The broker stops at startup when its storage URL has a query option that the storage engine does not read, such as a misspelt option or `vacuum_into` on a `postgres://` URL. The error names the option and the engine. Previously the broker ignored the option.
-- The broker stops at startup when `maintenance_interval` or `transaction_maintenance_interval` has an invalid value: unparsable, zero, longer than 365 days, or a bare number without a unit. Previously the broker ignored an invalid value and used the default interval. Give a bare number its unit, for example `600s` or `10m` instead of `600`. Compound values such as `1h30m` and `5min` still work.
-- A `parquet`, `iceberg` or `delta` broker without `--schema-registry` stops at startup with an error that names the missing option, instead of panicking. `--schema-registry` is accepted before or after the subcommand.
-- When the broker closes the connection of a client that sends a request other than ApiVersions, SaslHandshake or SaslAuthenticate before it authenticates, it logs an ERROR line that names the client's address.
-- `nisshi proxy` and the CLI tools bound every wait on the broker they connect to ([#882](https://github.com/nisshi-io/nisshi/issues/882)):
+- Each route advertises only the API versions it implements, and a request outside that range, or outside the protocol range, closes the connection and logs a warning. ApiVersions above v4 is answered at v0 with `UNSUPPORTED_VERSION`, and ListOffsets v0 now gets `old_style_offsets` ([#849](https://github.com/nisshi-io/nisshi/pull/849)).
+- Fetch answers straight away, instead of after `max_wait`, when any partition is `OFFSET_OUT_OF_RANGE` or every partition has an error. A consumer assigned only to a deleted topic now fetches at its error backoff rather than once per `max_wait` ([#826](https://github.com/nisshi-io/nisshi/pull/826)).
+- Each Fetch partition's reads are bounded by a share of a `max_wait + 5s` deadline, so one slow partition no longer starves the partitions after it. A partition that stalls answers with what it has read ([#852](https://github.com/nisshi-io/nisshi/pull/852)). On PostgreSQL an abandoned Fetch read cancels its statement, and at most 8 Fetch reads run at once, apart from the 8 for ListOffsets ([#997](https://github.com/nisshi-io/nisshi/pull/997)).
+- ListOffsets reads up to 4 partitions at once under a 5s deadline, and a partition not read in time answers `REQUEST_TIMED_OUT`. On PostgreSQL a dropped read cancels its statement ([#827](https://github.com/nisshi-io/nisshi/pull/827)).
+- Produced batches are decoded on Tokio's blocking pool, so a large compressed batch no longer holds up other connections on the same worker ([#851](https://github.com/nisshi-io/nisshi/pull/851)), and a compressed batch decodes about 30 to 110 times faster ([#969](https://github.com/nisshi-io/nisshi/pull/969)).
+- A `CreateTime` batch's `max_timestamp` is rewritten from its records when they disagree, and a record more than an hour ahead of the broker's clock is rejected with `INVALID_TIMESTAMP`, as Kafka's `log.message.timestamp.after.max.ms` default does ([#847](https://github.com/nisshi-io/nisshi/pull/847)).
+- Produce answers `INVALID_RECORD`, instead of `UNKNOWN_SERVER_ERROR` or storing the batch, for: a batch that does not decode, an unknown compression codec, more than one batch for a partition ([#853](https://github.com/nisshi-io/nisshi/pull/853)); a batch whose `last_offset_delta + 1` is not its `record_count` ([#783](https://github.com/nisshi-io/nisshi/pull/783)); and a compressed record whose declared length is wrong, or a compressed batch with bytes after its last record, as Kafka does ([#969](https://github.com/nisshi-io/nisshi/pull/969)). A `LogAppendTime` batch on the memory, S3, GCS and SlateDB engines is still stored without being decoded, unless a schema registry or data lake is configured.
+- CreateTopics checks each topic before storage, also under `validate_only`, and answers as Kafka does: `INVALID_TOPIC_EXCEPTION` for a name outside 1 to 249 characters of `[A-Za-z0-9._-]`, or `.` or `..`; `INVALID_PARTITIONS` for 0 or below -1 partitions ([#786](https://github.com/nisshi-io/nisshi/pull/786)); and `POLICY_VIOLATION` for every topic of a request asking for more than 10,000 partitions in total ([#830](https://github.com/nisshi-io/nisshi/pull/830)).
+- CreateTopics rejects a replication factor above 64 with `INVALID_REPLICATION_FACTOR`, and its error message names the cause. Metadata and DescribeTopicPartitions list at most 64 replicas per partition; a topic stored with a factor from 1 to 64 describes as before ([#996](https://github.com/nisshi-io/nisshi/pull/996)).
+- The group coordinator follows Kafka 3.9.1's classic coordinator, so rebalances take as long as on Kafka instead of several times longer (a first record after about 7s instead of 24s with default clients). The join phase ends as soon as every member has rejoined, or at the rebalance timeout; a dynamic member that didn't rejoin, or a member that didn't send `SyncGroup` in time, is removed. `Heartbeat`, `SyncGroup` and `OffsetCommit` answer with Kafka's error code in each state, and `MEMBER_ID_REQUIRED` goes only to `JoinGroup` v4 and later. The state of a rebalance is stored with the group, so any broker sharing the storage can complete it, and held requests no longer rewrite the group in a loop. New broker flags: `--group-initial-rebalance-delay` (`GROUP_INITIAL_REBALANCE_DELAY`, default `3s`) and `--group-poll-interval` (`GROUP_POLL_INTERVAL`, default `500ms`) ([#990](https://github.com/nisshi-io/nisshi/pull/990)).
+- JoinGroup answers `INVALID_SESSION_TIMEOUT` for a `session_timeout_ms` of 0 or less, or above 30 minutes ([#788](https://github.com/nisshi-io/nisshi/pull/788)).
+- The broker and proxy bound request frames at 100 MiB by default (`TcpContext::default()`), and a negative length prefix closes the connection with `InvalidFrameLength` ([#723](https://github.com/nisshi-io/nisshi/pull/723)).
+- When the broker closes the connection of a client that sends a request other than ApiVersions, SaslHandshake or SaslAuthenticate before it authenticates, it logs an ERROR line that names the client's address ([#850](https://github.com/nisshi-io/nisshi/pull/850)).
+- `nisshi proxy` and the CLI tools bound every wait on the broker they connect to ([#885](https://github.com/nisshi-io/nisshi/pull/885), [#882](https://github.com/nisshi-io/nisshi/issues/882)):
   - A request fails with `Timeout` when the broker does not answer within 30s. A request that asks the broker to wait (Fetch, Produce, JoinGroup, and the topic and partition admin requests) gets that wait plus 5s instead, when that is longer, with the wait capped at 5 minutes. `nisshi proxy` then closes the client's connection, and the client retries.
   - A request fails with `Pool(Timeout(Wait))` after 30s without a free connection, and with `Pool(Timeout(Create))` when a new connection takes more than 30s to open.
   - `nisshi proxy` opens up to 256 connections to its origin, instead of twice the number of CPUs.
   - `nisshi_client::Builder` sets these with `request_timeout`, `max_request_wait`, `wait_timeout`, `connect_timeout`, `max_idle` and `max_size`.
-  - New metrics: `request_timeouts`, `pool_get_errors` (by `error`) and `pool_connections_discarded` (by `reason`).
-- Logs write `[hidden]` in place of SASL auth bytes, SCRAM salted passwords, delegation token HMACs, stored SCRAM keys, and config values in `AlterConfigs` and `IncrementalAlterConfigs` requests, at every log level. Frames, record batches, record keys and values, and record header values are logged with the length of their bytes, not the bytes. SQL statements are logged without their parameters, and schema validation and lake conversion log the field and the kind of value, not the value.
-- `nisshi_schema::Error`: `AvroToJson` and `InvalidValue` hold an Avro `SchemaKind`, and `JsonToAvro` and `UnsupportedSchemaRuntimeValue` hold the kind of JSON value, in place of the value. `JsonToAvroFieldNotFound` no longer has a `value` field. The new `AvroRecord` variant reports an Avro record that fails to read or write against its schema, without the `apache_avro` error, whose message holds the record's values.
-- A broker on S3 or Google Cloud Storage exits at startup when it cannot list its cluster's prefix in the bucket, or when its AWS credential provider does not return a credential. The error names the storage URL and the cause. Previously the broker started and failed on its first request.
-- InitProducerId follows Apache Kafka 3.9.1 on every storage engine when a producer
-  sends its current producer ID and epoch to bump its epoch after an error (KIP-360):
-  - Without a transactional ID, the producer gets a new producer ID, whatever it
-    sends.
+- InitProducerId follows Apache Kafka 3.9.1 on every storage engine when a producer sends its current producer ID and epoch to bump its epoch after an error ([KIP-360](https://cwiki.apache.org/confluence/display/KAFKA/KIP-360%3A+Improve+reliability+of+idempotent%2Ftransactional+producer), [#887](https://github.com/nisshi-io/nisshi/pull/887)):
+  - Without a transactional ID, the producer gets a new producer ID, whatever it sends.
   - With a transactional ID that has no producer yet, the broker creates one.
-  - With a transactional ID that has a producer, the broker bumps the epoch only
-    when the request has that producer's ID and current epoch. Otherwise it
-    answers `PRODUCER_FENCED`. On PostgreSQL, this replaces `UNKNOWN_PRODUCER_ID`
-    for an unknown producer ID.
-  - A request that sets only one of producer ID and epoch to -1 gets
-    `INVALID_REQUEST`.
-  - A failed InitProducerId answers producer ID and epoch -1, and the broker logs
-    the request at info.
-- Two differences from Apache Kafka remain. Kafka also accepts the previous epoch,
-  from a producer that retries a bump whose response it lost; the broker answers
-  `PRODUCER_FENCED`, and the producer must initialise again. Kafka answers
-  `INVALID_PRODUCER_EPOCH` instead of `PRODUCER_FENCED` to InitProducerId v3 and
-  older; the broker answers `PRODUCER_FENCED` at every version.
-- Releases no longer include an `x86_64-apple-darwin` (Intel macOS) binary. Apple silicon (`aarch64-apple-darwin`) is the only macOS build.
-- IncrementalAlterConfigs checks each resource the way Apache Kafka 3.9.1
-  does, and answers each failing resource with its own error, without
-  closing the connection:
-  - `INVALID_REQUEST` for a resource that appears twice, duplicate config
-    keys, a null value on any operation except `DELETE`, or an unknown
-    operation;
-  - `INVALID_CONFIG` for `APPEND` or `SUBTRACT` on a key whose type isn't a
-    list. The topic list keys are `cleanup.policy`,
-    `leader.replication.throttled.replicas` and
-    `follower.replication.throttled.replicas`;
-  - `UNKNOWN_TOPIC_OR_PARTITION` for a topic that doesn't exist, on every
-    storage engine. The memory, S3, GCS and SlateDB engines used to report
-    success.
-- IncrementalAlterConfigs with `validate_only` no longer changes anything.
-  It used to apply the changes.
-- A topic applies all the changes of one IncrementalAlterConfigs resource,
-  or none of them. A storage failure fails only that resource, with
-  `UNKNOWN_SERVER_ERROR`.
-- `APPEND` and `SUBTRACT` follow Kafka: each item of a comma-separated value
-  is added if missing, or its first occurrence is removed. An unset value is
-  an empty list. Kafka starts from the key's default instead, so `APPEND
-  compact` to an unset `cleanup.policy` gives `compact` here and
-  `delete,compact` in Kafka. Nisshi deletes old records only when
-  `cleanup.policy` contains `delete`.
+  - With a transactional ID that has a producer, the broker bumps the epoch only when the request has that producer's ID and current epoch. Otherwise it answers `PRODUCER_FENCED`. On PostgreSQL, this replaces `UNKNOWN_PRODUCER_ID` for an unknown producer ID.
+  - A request that sets only one of producer ID and epoch to -1 gets `INVALID_REQUEST`.
+  - A failed InitProducerId answers producer ID and epoch -1, and the broker logs the request at info.
+  - Two differences from Apache Kafka remain. Kafka also accepts the previous epoch, from a producer that retries a bump whose response it lost; the broker answers `PRODUCER_FENCED`, and the producer must initialise again. Kafka answers `INVALID_PRODUCER_EPOCH` instead of `PRODUCER_FENCED` to InitProducerId v3 and older; the broker answers `PRODUCER_FENCED` at every version.
+- IncrementalAlterConfigs follows Apache Kafka 3.9.1 ([#888](https://github.com/nisshi-io/nisshi/pull/888)):
+  - Each resource is checked the way Kafka does, and each failing resource gets its own error without closing the connection: `INVALID_REQUEST` for a resource that appears twice, duplicate config keys, a null value on any operation except `DELETE`, or an unknown operation; `INVALID_CONFIG` for `APPEND` or `SUBTRACT` on a key whose type isn't a list (the topic list keys are `cleanup.policy`, `leader.replication.throttled.replicas` and `follower.replication.throttled.replicas`); `UNKNOWN_TOPIC_OR_PARTITION` for a topic that doesn't exist, on every storage engine. The memory, S3, GCS and SlateDB engines used to report success.
+  - `validate_only` no longer changes anything. It used to apply the changes.
+  - A topic applies all the changes of one resource, or none of them. A storage failure fails only that resource, with `UNKNOWN_SERVER_ERROR`.
+  - `APPEND` and `SUBTRACT` follow Kafka: each item of a comma-separated value is added if missing, or its first occurrence is removed. An unset value is an empty list. Kafka starts from the key's default instead, so `APPEND compact` to an unset `cleanup.policy` gives `compact` here and `delete,compact` in Kafka. Nisshi deletes old records only when `cleanup.policy` contains `delete`.
+- PostgreSQL pool checkouts and statements are bounded (10s and 30s), and both timeouts answer `REQUEST_TIMED_OUT`. Maintenance sweeps are exempt from the statement timeout ([#730](https://github.com/nisshi-io/nisshi/pull/730)).
+- A connection idle for 10 minutes, or a transfer stalled for 30s, is closed, and the broker reads a frame as its bytes arrive instead of allocating its declared size up front ([#729](https://github.com/nisshi-io/nisshi/pull/729)).
+- The Linux release tarballs are static musl binaries built with every storage engine (they were glibc builds without `slatedb` and `turso`). They run on older distributions such as Rocky 8, Amazon Linux 2 and Ubuntu 20.04. The image and the tarballs use the same binary, so the image's arm64 binary is now built natively instead of cross-compiled ([#755](https://github.com/nisshi-io/nisshi/pull/755)).
+- OTLP metric exports retry up to 3 times on 429, 502, 503 or 504 ([#924](https://github.com/nisshi-io/nisshi/pull/924)).
+- On the memory, S3 and GCS engines, an out-of-order or duplicate producer sequence number is no longer logged as an error.
+- `nisshi_schema::Error`: `AvroToJson` and `InvalidValue` hold an Avro `SchemaKind`, and `JsonToAvro` and `UnsupportedSchemaRuntimeValue` hold the kind of JSON value, in place of the value. `JsonToAvroFieldNotFound` no longer has a `value` field. The new `AvroRecord` variant reports an Avro record that fails to read or write against its schema, without the `apache_avro` error, whose message holds the record's values ([#889](https://github.com/nisshi-io/nisshi/pull/889)).
+- Library crates: the storage engines moved out of `nisshi-storage` into `nisshi-storage-dynostore`, `nisshi-storage-sql`, `nisshi-storage-slatedb` and `nisshi-storage-null`, and `StorageContainer` dispatches through each registered engine's `StorageFactory`. The service layers use rama 0.4.
+- The pinned Rust toolchain is 1.98 (was 1.94).
+- The Docker Compose stack's broker service is `nisshi`, and its image variable is `NISSHI_IMAGE` (was `TANSU_IMAGE`). PostgreSQL defaults to 18, which doesn't use a `db` volume created by 17; set `POSTGRES_IMAGE=postgres:17` or recreate the volume.
 
-### Security
+### Removed
 
-- Decoding a produce batch is bounded. Previously a few KB of compressed
-  data could decompress into gigabytes, and a record carrying millions of
-  empty headers expanded 32x on decode. Now a batch is rejected with
-  `MESSAGE_TOO_LARGE` once its decompressed bytes, or its decoded records
-  and headers, pass a 100 MiB budget, or up front when its `record_count`
-  alone would. A producer can recover by splitting the batch (the Java
-  producer does this on its own for a batch of more than one record).
-- Peak memory while decoding one batch is a small multiple of that budget
-  (roughly 2 to 3x), not 100 MiB exactly:
-  - an uncompressed record's headers are charged after they are allocated,
-    so the record that crosses the budget can add up to about 100 MiB more;
-  - a Snappy batch holds its decompressed block (up to 100 MiB) alongside
-    the records decoded from it;
-  - zstd's decoder window, up to 128 MiB, sits outside the budget.
-  The budget applies per batch; concurrent batches each have their own.
+- Releases no longer include an `x86_64-apple-darwin` (Intel macOS) binary. Apple silicon (`aarch64-apple-darwin`) is the only macOS build ([#892](https://github.com/nisshi-io/nisshi/pull/892)).
+- The broker no longer advertises GetTelemetrySubscriptions ([KIP-714](https://cwiki.apache.org/confluence/display/KAFKA/KIP-714%3A+Client+metrics+and+observability)), which had nothing behind it ([#849](https://github.com/nisshi-io/nisshi/pull/849)).
+- The `nisshi_storage_container_requests` and `nisshi_storage_container_errors` metrics (`tansu_storage_container_*` in 0.6.0) are no longer recorded.
 
 ### Fixed
 
-- On S3 and in-memory storage, a consumer group whose id contains `/` or is
-  empty no longer shares offsets or group state with another group. Group
-  `a/` no longer reads or overwrites the committed offsets of group `a`, and
-  deleting group `a` no longer deletes group `a/b`. Deleting a topic now also
-  removes the committed offsets that such groups hold for it.
-- On S3 and in-memory storage, ListGroups returns each group's real id. For
-  an id with a reserved character it returned the encoded form (`a%23b` for
-  `a#b`, `%2E` for `.`), which DescribeGroups and DeleteGroups could not
-  find.
-- On S3 and in-memory storage, DeleteGroups accepts the empty group id, as
-  the other storage engines do, instead of answering `INVALID_GROUP_ID`.
-- IncrementalAlterConfigs `APPEND` and `SUBTRACT` on a topic no longer panic
-  the connection on the PostgreSQL, SQLite and Turso engines, and are no
-  longer ignored on SlateDB.
-- An OffsetFetch whose storage fails no longer panics the connection. The
-  response reports `COORDINATOR_NOT_AVAILABLE`, which clients retry, for a
-  transient failure, or the storage's own error code. From version 8 each
-  group reports its own error, and the other groups still get their offsets.
-- A Snappy batch with a truncated xerial header is rejected with an error
-  instead of panicking the decoder.
-- CreateTopics rejects a `replication_factor` of 0 or below -1 with `INVALID_REPLICATION_FACTOR` (38), as Apache Kafka does. -1 still selects the default (1).
-- `DeleteGroups` refuses a group that still has members with
-  `NON_EMPTY_GROUP` (68), instead of deleting its state and committed
-  offsets out from under a live consumer. A member whose session has
-  expired does not count. The broker decides from stored group state, so a
-  member connected through another broker counts too, and a group whose
-  state the storage engine reports it cannot read is not deleted. The S3
-  and in-memory storage engine still reports a group it cannot read as an
-  empty group, and SlateDB does the same for group state it cannot decode;
-  both are tracked separately. Only the broker that served the request
-  forgets its cached state for the deleted group; another broker that
-  cached the group can still write it back. A group named more than once
-  in one request is processed once.
-- `DescribeGroups` and `DeleteGroups` on the PostgreSQL and libSQL
-  (including Turso) storage engines report a group that only ever
-  committed offsets, and never ran `JoinGroup`, as an empty group instead
-  of failing.
-- SlateDB compaction skips a stored batch it cannot inflate, with a warning,
-  instead of abandoning the whole maintenance pass.
-- DeleteTopics on the object-store backends (`s3://`, `gs://`, `memory://`) no longer deletes other topics' data or committed offsets when the deleted topic's name is empty or contains `/`. Such a topic is removed from metadata and the request answers `NONE`, but its data objects stay in the bucket, and so do its committed offsets when the name has an empty segment (`a/`, `/a`, `a//b`, or empty). The broker logs each kept location at `warn` with the topic id. Do not delete those objects by key prefix: for several of these names they share keys with a live topic of the plain name, and must stay while it exists. Creating a topic whose name collapses onto such kept objects (`a` after `a/` was deleted) finds them in place and its first produce fails; delete `a` and create it again.
-- The broker no longer writes a Produce response for an `acks=0` request. A storage or validation failure on an `acks=0` Produce now closes the connection (matching Apache Kafka) instead of silently dropping the batch.
-- ListOffsets by timestamp now answers offset -1 and timestamp -1 with error NONE when no record has a timestamp at or after the target, as Apache Kafka does. The broker answered offset 0 before. That made the Java consumer's `offsetsForTimes()` throw `IllegalArgumentException: Invalid negative timestamp`, and it sent a client that seeks to the returned offset back to the start of the partition. A partition answered with an error code now also carries offset -1 instead of 0.
-- `nisshi proxy` and the CLI tools no longer reuse a connection to the broker
-  that the broker closed, that has bytes nobody read, that was idle for more
-  than 9 minutes, or whose last request failed, timed out or was cancelled.
-  Such a connection could fail the next request, or give it the response to
-  an earlier one ([#882](https://github.com/nisshi-io/nisshi/issues/882)).
-- Fetch for a topic name that doesn't exist now answers `UNKNOWN_TOPIC_OR_PARTITION`. Before, `postgres://`, `sqlite://` and `slatedb://` brokers closed the connection, and `memory://` and `s3://` brokers waited out `max_wait` and then answered with no error. A fetch that names only unknown topics answers at once; one that also names an existing topic waits for that topic's data as usual. A fetch by topic id for an id that doesn't exist gets its requested id back instead of the null id, so a Java consumer on a deleted topic refreshes its metadata instead of fetching again.
-- InitProducerId v0 to v2 works on every storage engine. These versions do not
-  carry a producer ID or epoch. libSQL and Turso panicked on them, and on a
-  KIP-360 epoch bump, ending the connection. The object store engines
-  (`memory://`, `s3://`, `gs://`) answered `UNKNOWN_SERVER_ERROR`, and so did
-  SlateDB without a transactional ID.
-- On PostgreSQL, concurrent InitProducerId requests for one transactional ID
-  bump its epoch one at a time. Before, two of them could both succeed, and one
-  could fail with a storage error.
-- Fetch checks the fetch offset before it reaches the storage engine, so a storage engine never receives an offset such as `i64::MAX`. Above the high watermark, Fetch answers `NONE` with no records on every engine. Apache Kafka answers `NONE` only up to the log end offset and `OFFSET_OUT_OF_RANGE` above it; Nisshi answers `NONE` because a broker on dynostore can read a high watermark that lags a write through another broker. A consumer whose position is past the end of the log therefore waits there instead of applying `auto.offset.reset`. Such a consumer shows in `nisshi_fetch_offset_out_of_bounds` with `bound` set to `above_high_watermark`, counted once per poll round of a Fetch, so the counter shows whether parked fetches exist rather than how many; a short burst on dynostore with several brokers is expected.
-- SlateDB compaction no longer moves a partition's log start offset, as in Apache Kafka, whose cleaner never does. ListOffsets `earliest` and the `log_start_offset` in Fetch now stay at the log start through compaction, rather than moving to the first surviving batch.
-- Fetch no longer sends a `current_leader` hint with `UNKNOWN_TOPIC_OR_PARTITION`, as in Apache Kafka.
-- The broker's IPv6-to-IPv4 listener fallback recognizes "address family not
-  supported" on Windows. `is_address_family_unsupported` checked only the
-  Unix errno `libc::EAFNOSUPPORT`; Windows reports socket errors through
-  `WSAGetLastError`, so `raw_os_error()` there is `WSAEAFNOSUPPORT` (10047),
-  a different number, and a Windows host without IPv6 support failed to bind
-  `[::]` instead of falling back to `0.0.0.0`.
+- On PostgreSQL, SQLite and Turso, DeleteTopics deleted every topic and record in the cluster ([#714](https://github.com/nisshi-io/nisshi/pull/714)).
+- On S3 and in-memory storage, a consumer group whose id contains `/` or is empty no longer shares offsets or group state with another group. Group `a/` no longer reads or overwrites the committed offsets of group `a`, deleting group `a` no longer deletes group `a/b`, and DeleteGroups for an empty id no longer deletes every group. Deleting a topic now also removes the committed offsets that such groups hold for it ([#842](https://github.com/nisshi-io/nisshi/pull/842), [#784](https://github.com/nisshi-io/nisshi/pull/784)).
+- On S3 and in-memory storage, ListGroups returns each group's real id. For an id with a reserved character it returned the encoded form (`a%23b` for `a#b`, `%2E` for `.`), which DescribeGroups and DeleteGroups could not find ([#842](https://github.com/nisshi-io/nisshi/pull/842)).
+- DeleteTopics on the object-store backends (`s3://`, `gs://`, `memory://`) no longer deletes other topics' data or committed offsets when the deleted topic's name is empty or contains `/`. Such a topic is removed from metadata and the request answers `NONE`. The data of a topic named `""` stays in the bucket; for a name containing `/`, data written by this release is deleted and objects under the old keys stay. Committed offsets stay when the name has an empty segment (`a/`, `/a`, `a//b`, or empty). The broker logs each kept location at `warn` with the topic id. Do not delete those objects by key prefix: for several of these names they share keys with a live topic of the plain name, and must stay while it exists. Creating a topic whose name collapses onto such kept objects (`a` after `a/` was deleted) finds them in place and its first produce fails; delete `a` and create it again ([#833](https://github.com/nisshi-io/nisshi/pull/833), [#977](https://github.com/nisshi-io/nisshi/pull/977)).
+- `DeleteGroups` refuses a group that still has members with `NON_EMPTY_GROUP` (68), instead of deleting its state and committed offsets out from under a live consumer. A member whose session has expired does not count. The broker decides from stored group state, so a member connected through another broker counts too, and a group whose state the storage engine reports it cannot read is not deleted. The S3 and in-memory storage engine still reports a group whose state object it cannot fetch as an empty group; this is tracked separately. Only the broker that served the request forgets its cached state for the deleted group; another broker that cached the group can still write it back. A group named more than once in one request is processed once ([#837](https://github.com/nisshi-io/nisshi/pull/837)).
+- `DescribeGroups` on the PostgreSQL and libSQL (including Turso) storage engines report a group that only ever committed offsets, and never ran `JoinGroup`, as an empty group instead of failing ([#837](https://github.com/nisshi-io/nisshi/pull/837)).
+- The broker no longer writes a Produce response for an `acks=0` request. A storage or validation failure on an `acks=0` Produce now closes the connection (matching Apache Kafka) instead of silently dropping the batch. `nisshi-generator` and `nisshi-perf` now produce with `acks=1` ([#845](https://github.com/nisshi-io/nisshi/pull/845)).
+- Fetch checks the fetch offset before it reaches the storage engine, so a storage engine never receives an offset such as `i64::MAX`. Above the high watermark, Fetch answers `NONE` with no records on every engine. Apache Kafka answers `NONE` only up to the log end offset and `OFFSET_OUT_OF_RANGE` above it; Nisshi answers `NONE` because a broker on dynostore can read a high watermark that lags a write through another broker. A consumer whose position is past the end of the log therefore waits there instead of applying `auto.offset.reset`. Such a consumer shows in `nisshi_fetch_offset_out_of_bounds` with `bound` set to `above_high_watermark`, counted once per poll round of a Fetch, so the counter shows whether parked fetches exist rather than how many; a short burst on dynostore with several brokers is expected ([#826](https://github.com/nisshi-io/nisshi/pull/826)).
+- Fetch no longer sends a `current_leader` hint with `UNKNOWN_TOPIC_OR_PARTITION`, as in Apache Kafka, which sends one only with a leadership error. librdkafka acts on the hint, and with Fetch now answering an unknown topic straight away, its consumers hung or crashed on close after their topic was deleted ([#826](https://github.com/nisshi-io/nisshi/pull/826)).
+- Fetch for a topic name that doesn't exist now answers `UNKNOWN_TOPIC_OR_PARTITION`. Before, `postgres://`, `sqlite://` and `slatedb://` brokers closed the connection, and `memory://` and `s3://` brokers waited out `max_wait` and then answered with no error. A fetch that names only unknown topics answers at once; one that also names an existing topic waits for that topic's data as usual. A fetch by topic id for an id that doesn't exist gets its requested id back instead of the null id, so a Java consumer on a deleted topic refreshes its metadata instead of fetching again ([#834](https://github.com/nisshi-io/nisshi/pull/834)).
+- On S3, in-memory and SlateDB storage, a fetch offset inside a batch returns that batch, as Kafka does. Before, the records from that offset to the next batch were unreachable, and a consumer positioned inside a partition's last batch polled empty forever ([87db6ea](https://github.com/nisshi-io/nisshi/commit/87db6ea154e1bf792418ecae522cf953b59b5d21)).
+- On PostgreSQL, SQLite and Turso, Fetch returns batches with the producer's compression codec instead of uncompressed, and no longer runs one query per record after `max_wait`, which made some consumers time out and retry forever ([#734](https://github.com/nisshi-io/nisshi/pull/734)).
+- PostgreSQL Fetch no longer withholds committed records while an unrelated transaction is open in the database ([#713](https://github.com/nisshi-io/nisshi/pull/713)).
+- `read_committed` consumers on PostgreSQL, SQLite and Turso no longer read past the last stable offset into open transactions ([#689](https://github.com/nisshi-io/nisshi/pull/689)).
+- On PostgreSQL, a repeated EndTxn no longer writes a second marker, and a repeated AddPartitionsToTxn is a no-op instead of closing the connection ([#712](https://github.com/nisshi-io/nisshi/pull/712)).
+- Fetch answers `UNKNOWN_TOPIC_OR_PARTITION` for a partition index the topic doesn't have, before any storage read, as Kafka does. On PostgreSQL, SQLite, Turso and SlateDB the broker closed the connection. A partition that storage reports unknown, because its topic was deleted between the metadata and storage reads, is answered the same way on the object store engines and SlateDB. On S3 and in-memory storage, ListOffsets answers a partition that doesn't exist with `UNKNOWN_TOPIC_OR_PARTITION` and offset -1 instead of `NONE` and offset 0 ([#1000](https://github.com/nisshi-io/nisshi/pull/1000)).
+- An `OffsetCommit` from a member that another broker removed from the group is no longer stored. The commit is checked against the group in storage, and the group is written before the offsets ([#990](https://github.com/nisshi-io/nisshi/pull/990)).
+- ListOffsets by timestamp now answers offset -1 and timestamp -1 with error NONE when no record has a timestamp at or after the target, as Apache Kafka does. The broker answered offset 0 before. That made the Java consumer's `offsetsForTimes()` throw `IllegalArgumentException: Invalid negative timestamp`, and it sent a client that seeks to the returned offset back to the start of the partition. A partition answered with an error code now also carries offset -1 instead of 0 ([#838](https://github.com/nisshi-io/nisshi/pull/838)).
+- On S3 and in-memory storage, ListOffsets by timestamp answers the first record whose own timestamp is at or after the target. It matched object write times, used `>` instead of `>=`, returned a batch's base offset, and listed every batch of the partition on every call. A batch it cannot read answers `KAFKA_STORAGE_ERROR` for that partition ([#840](https://github.com/nisshi-io/nisshi/pull/840)).
+- InitProducerId v0 to v2 works on every storage engine. These versions do not carry a producer ID or epoch. PostgreSQL, libSQL and Turso panicked on them, and on a KIP-360 epoch bump, ending the connection. The object store engines (`memory://`, `s3://`, `gs://`) answered `UNKNOWN_SERVER_ERROR`, and so did SlateDB without a transactional ID ([#712](https://github.com/nisshi-io/nisshi/pull/712), [#887](https://github.com/nisshi-io/nisshi/pull/887)).
+- On PostgreSQL, concurrent InitProducerId requests for one transactional ID bump its epoch one at a time. Before, two of them could both succeed, and one could fail with a storage error ([#887](https://github.com/nisshi-io/nisshi/pull/887)).
+- IncrementalAlterConfigs `APPEND` and `SUBTRACT` on a topic no longer panic the connection on the PostgreSQL, SQLite, Turso, S3 and in-memory engines, and are no longer ignored on SlateDB ([#888](https://github.com/nisshi-io/nisshi/pull/888)).
+- An OffsetFetch whose storage fails no longer panics the connection. The response reports `COORDINATOR_NOT_AVAILABLE`, which clients retry, for a transient failure, or the storage's own error code. From version 8 each group reports its own error, and the other groups still get their offsets ([#888](https://github.com/nisshi-io/nisshi/pull/888)).
+- DescribeConfigs for a `BROKER` resource works on PostgreSQL, SQLite and Turso (`kafka-configs --entity-type brokers` failed with `UNKNOWN_TOPIC_OR_PARTITION`), and a name other than empty or the node id gets `INVALID_REQUEST` on every engine, as in Kafka ([#998](https://github.com/nisshi-io/nisshi/pull/998)).
+- CreateTopics rejects a `replication_factor` of 0 or below -1 with `INVALID_REPLICATION_FACTOR` (38), as Apache Kafka does. -1 still selects the default (1) ([#829](https://github.com/nisshi-io/nisshi/pull/829)). A factor of -2 or less stored by an earlier version no longer panics Metadata or DescribeTopicPartitions ([#996](https://github.com/nisshi-io/nisshi/pull/996)).
+- On S3 and in-memory storage, a failed record write no longer leaves the producer's sequence advanced, which made its retry look like a duplicate and lost the batch. A failed EndTxn retry now writes the missing markers, and a DeleteTopics that fails part-way can be retried ([#805](https://github.com/nisshi-io/nisshi/pull/805)). A batch rejected for a decode or schema failure no longer advances the sequence either ([#853](https://github.com/nisshi-io/nisshi/pull/853)).
+- `nisshi proxy`'s batch combiner keeps each record's timestamp when the batches it combines have different base timestamps ([#841](https://github.com/nisshi-io/nisshi/pull/841)).
+- PostgreSQL `create_topic` no longer reports success for a topic whose partition or watermark rows were not written ([#929](https://github.com/nisshi-io/nisshi/pull/929)).
+- PostgreSQL DeleteTopics no longer scans the whole `record` table, which could make it time out on a large database ([#983](https://github.com/nisshi-io/nisshi/pull/983)).
+- On SQLite, a pooled connection left inside an open transaction is discarded instead of holding the write lock for the next request ([#975](https://github.com/nisshi-io/nisshi/pull/975)). A panic or cancelled request no longer stops every later storage request; 0.6.0 always ran in what is now `mpsc` mode, and the new default, `semaphore`, was never affected ([#836](https://github.com/nisshi-io/nisshi/pull/836)).
+- libSQL and Turso recover consumer group state after a restart instead of failing to read it ([#662](https://github.com/nisshi-io/nisshi/pull/662)).
+- SlateDB: concurrent requests for one group, or the first request after a restart, no longer drop the group's members ([#763](https://github.com/nisshi-io/nisshi/pull/763)).
+- On SQLite and Turso, the first record of a fetch after compaction keeps its own headers.
+- A Snappy batch with a truncated xerial header is rejected with an error instead of panicking the decoder ([#821](https://github.com/nisshi-io/nisshi/pull/821)).
+- A compressed record with an overlong varint fails to decode instead of panicking or decoding to a wrapped value ([#908](https://github.com/nisshi-io/nisshi/pull/908)).
+- A JoinGroup with an empty protocol list gets `INCONSISTENT_GROUP_PROTOCOL` instead of panicking the connection ([#728](https://github.com/nisshi-io/nisshi/pull/728)).
+- Followers that join or sync before the leader has sent its assignment wait for it, instead of getting an empty assignment that made franz-go fail with "response did not contain enough data to be valid" and caused continuous rebalances ([#680](https://github.com/nisshi-io/nisshi/pull/680)).
+- SASL re-authentication on an existing connection ([KIP-368](https://cwiki.apache.org/confluence/display/KAFKA/KIP-368%3A+Allow+SASL+Connections+to+Periodically+Re-Authenticate)) works. Long-lived Java clients failed with "Client SASL mechanism ... not enabled" ([#665](https://github.com/nisshi-io/nisshi/pull/665)).
+- A transient `accept()` error no longer stops a listener accepting connections ([#727](https://github.com/nisshi-io/nisshi/pull/727)).
+- Optional tagged fields that a negotiated version does not support are no longer encoded, which produced invalid responses such as FetchResponse v12 with node endpoints.
+- `nisshi proxy` and the CLI tools no longer reuse a connection to the broker that the broker closed, that has bytes nobody read, that was idle for more than 9 minutes, or whose last request failed, timed out or was cancelled. Such a connection could fail the next request, or give it the response to an earlier one ([#885](https://github.com/nisshi-io/nisshi/pull/885), [#882](https://github.com/nisshi-io/nisshi/issues/882)).
+- `nisshi cat`, `nisshi-generator`, `nisshi-perf` and the proxy's batch combiner set `last_offset_delta` correctly ([#783](https://github.com/nisshi-io/nisshi/pull/783)).
+
+### Security
+
+- SCRAM authentication with a wrong password no longer authenticates the connection. The broker treated any finished SASL exchange as authenticated, including one whose client proof did not verify ([#696](https://github.com/nisshi-io/nisshi/pull/696), [#694](https://github.com/nisshi-io/nisshi/issues/694)).
+- `nisshi proxy` no longer forwards SASL requests over its shared connection pool, where one client's login applied to every later client of the same pooled connection ([#993](https://github.com/nisshi-io/nisshi/pull/993)).
+- `--cert` and `--key` together now make the listener TLS-only. In 0.6.0 the two flags together were rejected as conflicting, a single flag was ignored, and the broker dropped any TLS configuration, so it only ever served plaintext ([#735](https://github.com/nisshi-io/nisshi/pull/735)).
+- Decoding a produce batch is bounded. Previously a few KB of compressed data could decompress into gigabytes, and a record carrying millions of empty headers expanded 32x on decode. Now a batch is rejected with `MESSAGE_TOO_LARGE` once its decompressed bytes, or its decoded records and headers, pass a 100 MiB budget, or up front when its `record_count` alone would. A producer can recover by splitting the batch (the Java producer does this on its own for a batch of more than one record). Peak memory while decoding one batch is a small multiple of that budget (roughly 2 to 3x), not 100 MiB exactly:
+  - an uncompressed record's headers are charged after they are allocated, so the record that crosses the budget can add up to about 100 MiB more;
+  - a Snappy batch holds its decompressed block (up to 100 MiB) alongside the records decoded from it;
+  - zstd's decoder window, up to 128 MiB, sits outside the budget.
+
+  The budget applies per batch; concurrent batches each have their own ([#821](https://github.com/nisshi-io/nisshi/pull/821)).
+- Counts and lengths read from the wire are checked before they size an allocation. A `record_count` near `u32::MAX` aborted the broker, and a negative batch length or header count panicked the connection ([#782](https://github.com/nisshi-io/nisshi/pull/782)). A record's fields are read within its declared length, so a bad header count no longer reads into the next record ([#831](https://github.com/nisshi-io/nisshi/pull/831)).
+- A request's length-prefixed fields are bounded by the frame's own size, and before authentication a request the client may not send yet is rejected by its API key before its body is decoded. A 24-byte frame could ask for a 1 GiB allocation ([#823](https://github.com/nisshi-io/nisshi/pull/823)). A frame's 4-byte length prefix could make the broker or proxy allocate 2 GiB per connection, or panic on a negative value ([#723](https://github.com/nisshi-io/nisshi/pull/723)).
+- A listener with SASL configured closes a connection that sends a frame larger than 512KiB before the client authenticates, matching the Apache Kafka default for `sasl.server.max.receive.size`. The same limit applies while a client re-authenticates. The broker logs this rejection as `PreAuthenticationFrameTooBig`, and counts it in `nisshi_frames_rejected` ([#823](https://github.com/nisshi-io/nisshi/pull/823)).
+- Produce rejects a client batch with the control bit set, which bypassed schema validation and lake writes and looked like a transaction marker to consumers ([#795](https://github.com/nisshi-io/nisshi/pull/795)).
+- On S3 and in-memory storage, Produce answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic or partition that doesn't exist and writes nothing. A produce to a crafted topic name could write into another topic's keys and make every Fetch of it panic ([#977](https://github.com/nisshi-io/nisshi/pull/977)).
+- On S3, Google Cloud Storage and in-memory storage, a Fetch for partition indexes a topic doesn't have no longer caches a watermark for each one, which let a client grow the broker's memory without bound. DeleteTopics also drops the topic's cached watermarks on the broker that handles it ([#1000](https://github.com/nisshi-io/nisshi/pull/1000)).
+- A `tansu.lake.generate.*` topic config must be `CAST(<column> AS DATE|INT|INTEGER)`. Any other expression inside a `CAST` was executed by DataFusion during Delta Lake writes, and a value that wasn't a `CAST` panicked the write ([#745](https://github.com/nisshi-io/nisshi/pull/745)).
+- Logs write `[hidden]` in place of SASL auth bytes, SCRAM salted passwords, delegation token HMACs, stored SCRAM keys, and config values in `AlterConfigs` and `IncrementalAlterConfigs` requests, at every log level. Frames, record batches, record keys and values, and record header values are logged with the length of their bytes, not the bytes. SQL statements are logged without their parameters, and schema validation and lake conversion log the field and the kind of value, not the value ([#889](https://github.com/nisshi-io/nisshi/pull/889)). A password in the `user:password@` part of a storage, schema registry or lake URL is removed before logging; one given as a `?password=` query parameter is not ([#747](https://github.com/nisshi-io/nisshi/pull/747)).
+- Dependency updates: rustls 0.23.46 for [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346.html), [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347.html), [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348.html) and [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349.html) ([#967](https://github.com/nisshi-io/nisshi/pull/967)), and `opentelemetry_sdk` 0.33.0 (fixed from 0.32.1) for [GHSA-w9wp-h8wv-79jx](https://github.com/advisories/GHSA-w9wp-h8wv-79jx) ([#804](https://github.com/nisshi-io/nisshi/pull/804), [#924](https://github.com/nisshi-io/nisshi/pull/924)).
+
+[0.7.0]: https://github.com/nisshi-io/nisshi/compare/v0.6.0...v0.7.0

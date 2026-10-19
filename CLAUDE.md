@@ -166,7 +166,7 @@ On a pull_request, a `changes` job in `ci.yml`, `codeql.yml`, `dependencies.yml`
 | `justfile` | All build/test/run tasks |
 | `example.env` | Template for local `.env` config |
 | `compose.yaml` | Docker Compose: postgres, minio, grafana, jaeger, prometheus, lakehouse |
-| `etc/initdb.d/010-schema.sql` | PostgreSQL schema DDL |
+| `nisshi-storage-sql/src/pg/schema.sql` | PostgreSQL schema DDL that the broker applies at startup |
 | `etc/schema/` | Sample schemas: `.avsc` (Avro), `.json` (JSON Schema), `.proto` (Protobuf) |
 | `nisshi-sans-io/message/` | Kafka JSON protocol descriptors (upstream, ~185 files) |
 | `nisshi-sans-io/build.rs` | Code generator: JSON descriptors -> Rust types |

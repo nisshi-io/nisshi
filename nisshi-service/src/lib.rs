@@ -274,8 +274,8 @@ pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
 
 pub use frame::{
     BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,
-    FrameBytesLayer, FrameBytesService, FrameRequestLayer, FrameService, RequestApiKeyMatcher,
-    RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService,
+    FrameBytesLayer, FrameBytesService, FrameRequestLayer, FrameRequestService, FrameService,
+    RequestApiKeyMatcher, RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService,
 };
 
 pub use stream::{

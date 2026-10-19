@@ -56,6 +56,7 @@ use crate::{
 };
 
 mod produce;
+mod sasl;
 mod topic;
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -150,11 +151,16 @@ impl Proxy {
     }
 
     pub async fn listen(&self) -> Result<(), Error> {
+        let listener = TcpListener::bind(host_port(self.listener.clone()).await?).await?;
+        self.serve(listener).await
+    }
+
+    /// Serves clients that connect to `listener`, which the caller has already bound,
+    /// instead of binding the proxy's listener URL.
+    pub async fn serve(&self, listener: TcpListener) -> Result<(), Error> {
         debug!(%self.listener, %self.advertised_listener, %self.origin);
 
         let configuration = ResourceConfig::default();
-
-        let listener = TcpListener::bind(host_port(self.listener.clone()).await?).await?;
 
         let token = CancellationToken::new();
 
@@ -322,16 +328,20 @@ impl Proxy {
                 ),
         );
 
+        // We box the frame service, because its nested type is deep enough that the
+        // compiler exceeds its query depth limit when it computes the layout of the
+        // listener's accept loop.
+        let frame = (sasl::reject_layer(), meta, produce, find_coordinator)
+            .into_layer(frame_origin)
+            .boxed();
+
         let s = (
             TcpListenerLayer::new(token),
             TcpContextLayer::default(),
             TcpBytesLayer,
             BytesFrameLayer::default(),
-            meta,
-            produce,
-            find_coordinator,
         )
-            .into_layer(frame_origin);
+            .into_layer(frame);
 
         s.serve(TcpListenerInput {
             listener,

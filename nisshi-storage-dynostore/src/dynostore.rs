@@ -623,6 +623,28 @@ impl DynoStore {
             .await
     }
 
+    /// Ensures that `topition` names an existing partition: its topic
+    /// exists, and its index is below the topic's partition count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`]
+    /// for an unknown topic or an index outside the topic.
+    async fn ensure_partition_exists(&self, topition: &Topition) -> Result<()> {
+        let Some(metadata) = self
+            .topic_metadata(&TopicId::Name(topition.topic.clone()))
+            .await?
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        if topition.partition < 0 || topition.partition >= metadata.topic.num_partitions {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        }
+
+        Ok(())
+    }
+
     fn encode(&self, deflated: deflated::Batch) -> Result<PutPayload> {
         Ok(PutPayload::from(Bytes::from(deflated)))
     }
@@ -740,16 +762,28 @@ impl DynoStore {
         }
     }
 
+    /// Returns [`Self::watermark_for`] `topition`, after it ensures, on the
+    /// partition's first read, that the partition exists.
+    ///
+    /// The partition index comes from the client, and the broker keeps each
+    /// cached watermark until the topic is deleted, so the first read checks
+    /// the partition (see [`Self::ensure_partition_exists`]). A later read
+    /// skips that check, because it would read the metadata again on each
+    /// Fetch of the partition.
+    async fn checked_watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
+        if let Some(watermark) = self.watermarks.lock()?.get(topition) {
+            return Ok(watermark.to_owned());
+        }
+
+        self.ensure_partition_exists(topition).await?;
+
+        self.watermark_for(topition)
+    }
+
     /// Returns the low watermark of one partition: its log start offset.
     async fn log_start(&self, topition: &Topition) -> Result<i64> {
-        let watermark = self.watermarks.lock().map(|mut locked| {
-            locked
-                .entry(topition.to_owned())
-                .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                .to_owned()
-        })?;
-
-        watermark
+        self.checked_watermark_for(topition)
+            .await?
             .with(&self.object_store, |watermark| {
                 Ok(watermark.low.unwrap_or(0))
             })
@@ -759,6 +793,10 @@ impl DynoStore {
     /// Returns the (cached, shared) `OptiCon` handle for `topition`'s
     /// watermark document, inserting one if this is the first time this
     /// partition has been touched in this process.
+    ///
+    /// The caller must already know that the partition exists, because the
+    /// broker keeps the handle until the topic is deleted. For an index from
+    /// the client, use [`Self::checked_watermark_for`].
     fn watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
         self.watermarks
             .lock()
@@ -1173,9 +1211,10 @@ impl DynoStore {
 
         let start_offset = time_index.floor_offset(target);
 
-        // Under READ_COMMITTED, Kafka answers only a record before the last
-        // stable offset, and answers no match otherwise
-        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589).
+        // Under READ_COMMITTED, Kafka answers only a record before the last stable offset, and
+        // answers no match otherwise ([Partition.scala#L1589]).
+        //
+        // [Partition.scala#L1589]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589
         let found = self
             .sequential_timestamp_scan(topition, start_offset, target, low)
             .await?
@@ -1635,6 +1674,18 @@ impl Storage for DynoStore {
                 })
                 .await?;
 
+            // The broker keeps a cached watermark for each partition that it
+            // reads, so it drops the topic's watermarks here, and creating
+            // and deleting topics through it does not grow its cache. This
+            // cleanup is per broker: with several brokers on one object
+            // store, another broker that read the topic keeps its entries
+            // until it restarts. That broker never reads those entries again,
+            // because Fetch, ListOffsets and Produce check the partition
+            // against the metadata before they read its watermark.
+            self.watermarks
+                .lock()?
+                .retain(|topition, _| topition.topic != metadata.topic.name);
+
             Ok(ErrorCode::None)
         } else {
             Ok(ErrorCode::UnknownTopicOrPartition)
@@ -1668,16 +1719,7 @@ impl Storage for DynoStore {
     ) -> Result<i64> {
         // Checked before any key is built, so a produce to a topic or
         // partition that does not exist writes nothing, as in Kafka.
-        let Some(metadata) = self
-            .topic_metadata(&TopicId::Name(topition.topic.clone()))
-            .await?
-        else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        if topition.partition < 0 || topition.partition >= metadata.topic.num_partitions {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        }
+        self.ensure_partition_exists(topition).await?;
 
         let config = self
             .describe_config(topition.topic(), ConfigResource::Topic, None)
@@ -2252,9 +2294,8 @@ impl Storage for DynoStore {
 
         debug!(?stable);
 
-        let watermark = self.watermark_for(topition)?;
-
-        watermark
+        self.checked_watermark_for(topition)
+            .await?
             .with(&self.object_store, |watermark| {
                 debug!(?watermark);
                 let high_watermark = watermark.high.unwrap_or(0);
@@ -2317,6 +2358,28 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
+            // Kafka answers a partition that does not exist in the response,
+            // with no offset ([KafkaApis.scala#L1231-L1239]). The check
+            // comes before every lookup, because each one caches the
+            // partition's watermark.
+            //
+            // [KafkaApis.scala#L1231-L1239]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
+            match self.ensure_partition_exists(topition).await {
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                    responses.push((
+                        topition.to_owned(),
+                        ListOffsetResponse {
+                            error_code: ErrorCode::UnknownTopicOrPartition,
+                            offset: None,
+                            timestamp: None,
+                        },
+                    ));
+
+                    continue;
+                }
+                checked => checked?,
+            }
+
             if let ListOffset::Timestamp(system_time) = offset_request {
                 let target = to_timestamp(system_time)?;
 
@@ -2782,7 +2845,9 @@ impl Storage for DynoStore {
                                         .value(config.value.clone())
                                         .read_only(false)
                                         .is_default(None)
-                                        .config_source(Some(ConfigSource::DefaultConfig.into()))
+                                        .config_source(Some(
+                                            ConfigSource::DynamicTopicConfig.into(),
+                                        ))
                                         .is_sensitive(false)
                                         .synonyms(Some([].into()))
                                         .config_type(Some(ConfigType::String.into()))
@@ -2842,16 +2907,14 @@ impl Storage for DynoStore {
                                         .partition_index(partition_index)
                                         .leader_id(self.node)
                                         .leader_epoch(0)
-                                        .replica_nodes(Some(vec![
-                                            self.node;
-                                            topic_metadata.topic.replication_factor
-                                                as usize
-                                        ]))
-                                        .isr_nodes(Some(vec![
-                                            self.node;
-                                            topic_metadata.topic.replication_factor
-                                                as usize
-                                        ]))
+                                        .replica_nodes(Some(nisshi_storage::single_node_replicas(
+                                            self.node,
+                                            topic_metadata.topic.replication_factor,
+                                        )))
+                                        .isr_nodes(Some(nisshi_storage::single_node_replicas(
+                                            self.node,
+                                            topic_metadata.topic.replication_factor,
+                                        )))
                                         .eligible_leader_replicas(Some(vec![]))
                                         .last_known_elr(Some(vec![]))
                                         .offline_replicas(Some(vec![]))
@@ -3033,6 +3096,22 @@ impl Storage for DynoStore {
         }
 
         Ok(results)
+    }
+
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let location = self.group_state_location(group_id)?;
+
+        match self.get::<GroupDetail>(&location).await {
+            Ok(stored) => Ok(Some(stored)),
+
+            Err(Error::ObjectStore(error))
+                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+            {
+                Ok(None)
+            }
+
+            Err(otherwise) => Err(otherwise).inspect_err(|err| error!(?err, group_id)),
+        }
     }
 
     async fn update_group(

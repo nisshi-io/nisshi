@@ -23,9 +23,11 @@ use crate::{Error, Result};
 
 /// The topic configuration keys whose type is `LIST`.
 ///
-/// Kafka defines them in `LogConfig`:
-/// [`cleanup.policy`](https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L295),
-/// [`leader.replication.throttled.replicas` and `follower.replication.throttled.replicas`](https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L320-L323).
+/// Kafka defines them in `LogConfig`: [`cleanup.policy`],
+/// [`leader.replication.throttled.replicas` and `follower.replication.throttled.replicas`].
+///
+/// [`cleanup.policy`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L295
+/// [`leader.replication.throttled.replicas` and `follower.replication.throttled.replicas`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L320-L323
 pub const TOPIC_LIST_CONFIGS: [&str; 3] = [
     "cleanup.policy",
     "leader.replication.throttled.replicas",
@@ -41,9 +43,8 @@ pub fn is_list_config(resource: ConfigResource, key: &str) -> bool {
 /// Returns the value of the configuration `key` of `resource` after applying
 /// `op` with `value` to `current`, or `None` when `op` removes the key.
 ///
-/// `APPEND` and `SUBTRACT` follow Kafka's
-/// [`incrementalAlterConfigResource`](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L250)
-/// and [`getParts`](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L389-L404):
+/// `APPEND` and `SUBTRACT` follow Kafka's [`incrementalAlterConfigResource`]
+/// and [`getParts`]:
 ///
 /// - `APPEND` adds each item of `value` that isn't already present;
 /// - `SUBTRACT` removes the first occurrence of each item of `value`.
@@ -58,6 +59,9 @@ pub fn is_list_config(resource: ConfigResource, key: &str) -> bool {
 ///
 /// Returns [`ErrorCode::InvalidConfig`] for `APPEND` or `SUBTRACT` on a key
 /// that [isn't a list](is_list_config).
+///
+/// [`incrementalAlterConfigResource`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L250
+/// [`getParts`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L389-L404
 pub fn apply_op(
     resource: ConfigResource,
     key: &str,

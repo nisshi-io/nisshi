@@ -1194,6 +1194,13 @@ mod unreadable_groups {
                 .await
         }
 
+        async fn group_with_version(
+            &self,
+            group_id: &str,
+        ) -> Result<Option<(GroupDetail, Version)>> {
+            self.storage.group_with_version(group_id).await
+        }
+
         async fn update_group(
             &self,
             group_id: &str,

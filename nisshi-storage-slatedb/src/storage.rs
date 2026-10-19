@@ -16,7 +16,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    iter,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -42,7 +41,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated::Batch, inflated::Batch as InflatedBatch},
     ser::RecordBatchEncoder,
     to_system_time,
@@ -1513,33 +1512,21 @@ impl Storage for Engine {
             let num_partitions = topic_metadata.topic.num_partitions;
             let replication_factor = topic_metadata.topic.replication_factor;
 
-            let partitions = Some(
-                (0..num_partitions)
-                    .map(|partition_index| {
-                        let leader_id = self.node;
-                        let replica_nodes =
-                            Some(iter::repeat_n(self.node, replication_factor as usize).collect());
-                        let isr_nodes = replica_nodes.clone();
+            let partitions = Some(nisshi_storage::assign_replicas(
+                &[self.node],
+                num_partitions,
+                replication_factor,
+                error_code,
+                0,
+            )?);
 
-                        MetadataResponsePartition::default()
-                            .error_code(error_code)
-                            .partition_index(partition_index)
-                            .leader_id(leader_id)
-                            .leader_epoch(Some(0))
-                            .replica_nodes(replica_nodes)
-                            .isr_nodes(isr_nodes)
-                            .offline_replicas(Some([].into()))
-                    })
-                    .collect(),
-            );
-
-            MetadataResponseTopic::default()
+            Ok(MetadataResponseTopic::default()
                 .error_code(error_code)
                 .name(name)
                 .topic_id(topic_id)
                 .is_internal(is_internal)
                 .partitions(partitions)
-                .topic_authorized_operations(Some(i32::MIN))
+                .topic_authorized_operations(Some(i32::MIN)))
         };
 
         let topic_responses = match topics {
@@ -1551,7 +1538,7 @@ impl Storage for Engine {
                     match topic_id {
                         TopicId::Name(name) => {
                             if let Some(metadata) = existing_topics.get(name.as_str()) {
-                                responses.push(topic_to_response(metadata));
+                                responses.push(topic_to_response(metadata)?);
                             } else {
                                 // Topic not found - return error response
                                 responses.push(
@@ -1571,7 +1558,7 @@ impl Storage for Engine {
                                 existing_topics.values().find(|metadata| metadata.id == *id);
 
                             if let Some(metadata) = found {
-                                responses.push(topic_to_response(metadata));
+                                responses.push(topic_to_response(metadata)?);
                             } else {
                                 // Topic not found - return error response
                                 responses.push(
@@ -1592,7 +1579,10 @@ impl Storage for Engine {
             }
             _ => {
                 // Return all topics
-                existing_topics.values().map(topic_to_response).collect()
+                existing_topics
+                    .values()
+                    .map(topic_to_response)
+                    .collect::<Result<_>>()?
             }
         };
 
@@ -1712,16 +1702,16 @@ impl Storage for Engine {
                                             .partition_index(partition_index)
                                             .leader_id(self.node)
                                             .leader_epoch(0)
-                                            .replica_nodes(Some(vec![
-                                                self.node;
-                                                topic_metadata.topic.replication_factor
-                                                    as usize
-                                            ]))
-                                            .isr_nodes(Some(vec![
-                                                self.node;
-                                                topic_metadata.topic.replication_factor
-                                                    as usize
-                                            ]))
+                                            .replica_nodes(Some(
+                                                nisshi_storage::single_node_replicas(
+                                                    self.node,
+                                                    topic_metadata.topic.replication_factor,
+                                                ),
+                                            ))
+                                            .isr_nodes(Some(nisshi_storage::single_node_replicas(
+                                                self.node,
+                                                topic_metadata.topic.replication_factor,
+                                            )))
                                             .eligible_leader_replicas(Some(vec![]))
                                             .last_known_elr(Some(vec![]))
                                             .offline_replicas(Some(vec![]))
@@ -1878,19 +1868,20 @@ impl Storage for Engine {
                 let key = postcard::to_stdvec(&GroupKey::new(group_id))?;
 
                 match self.db.get(&key).await {
-                    Ok(Some(encoded)) => {
-                        match postcard::from_bytes::<GroupDetailVersion>(&encoded) {
-                            Ok(gdv) => {
-                                results.push(NamedGroupDetail::found(group_id.into(), gdv.detail));
-                            }
-                            Err(_) => {
-                                results.push(NamedGroupDetail::found(
-                                    group_id.into(),
-                                    GroupDetail::default(),
-                                ));
-                            }
+                    Ok(Some(encoded)) => match GroupDetailVersion::decode(&encoded) {
+                        Ok(gdv) => {
+                            results.push(NamedGroupDetail::found(group_id.into(), gdv.detail));
                         }
-                    }
+                        // A group that can't be decoded is reported as an error, not as an empty
+                        // group, so that a delete of the group refuses it instead of deleting it.
+                        Err(err) => {
+                            warn!(?err, group_id, "the stored group can't be decoded");
+                            results.push(NamedGroupDetail::error_code(
+                                group_id.into(),
+                                ErrorCode::UnknownServerError,
+                            ));
+                        }
+                    },
                     Ok(None) => {
                         results.push(NamedGroupDetail::found(
                             group_id.into(),
@@ -1908,6 +1899,27 @@ impl Storage for Engine {
         }
 
         Ok(results)
+    }
+
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let key = postcard::to_stdvec(&GroupKey::new(group_id))?;
+
+        let stored = self
+            .db
+            .get(&key)
+            .await
+            .map_err(Error::from)
+            .inspect_err(|err| debug!(?err, group_id))?
+            .map(|encoded| GroupDetailVersion::decode(&encoded))
+            .transpose()
+            .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))?;
+
+        // An offset commit stores a placeholder for a group without state, with the default
+        // version, which no `update_group` stores. The group reads as having no state, as on the
+        // other backends, and `update_group` accepts no version for the placeholder.
+        Ok(stored
+            .filter(|stored| stored.version != Version::default())
+            .map(|stored| (stored.detail, stored.version)))
     }
 
     async fn update_group(
@@ -1931,8 +1943,8 @@ impl Storage for Engine {
         // only a missing group or the empty placeholder that offset_commit
         // stores, so a group with state is reported as outdated rather than
         // silently overwritten.
-        let current: GroupDetailVersion = self
-            .load_metadata(&tx, &key)
+        let current = self
+            .load_group(&tx, &key)
             .await
             .map_err(UpdateError::Error)?;
 
@@ -1969,7 +1981,7 @@ impl Storage for Engine {
                     .map_err(Error::from)
                     .and_then(|encoded| {
                         encoded.map_or(Ok(GroupDetailVersion::default()), |encoded| {
-                            postcard::from_bytes(&encoded[..]).map_err(Into::into)
+                            GroupDetailVersion::decode(&encoded).map_err(Into::into)
                         })
                     })
                     .map_err(UpdateError::Error)?;

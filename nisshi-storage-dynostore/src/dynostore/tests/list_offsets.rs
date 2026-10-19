@@ -690,17 +690,25 @@ async fn index_stays_within_the_cap_and_answers_after_thinning() -> Result<()> {
     Ok(())
 }
 
-/// A lookup on a partition without a watermark document answers no match,
-/// and does not create the document.
+/// A lookup on a partition that does not exist answers
+/// `UNKNOWN_TOPIC_OR_PARTITION` with no offset, as Kafka does, and does not
+/// create the partition's watermark document.
 #[tokio::test]
 async fn lookup_does_not_create_a_watermark_document() -> Result<()> {
     let _guard = init_tracing()?;
     let storage = storage()?;
     let topition = Topition::new("absent", 0);
 
-    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0).await?;
-    assert_eq!(None, offset);
-    assert_eq!(None, timestamp);
+    let responses = list_offsets_timestamp_responses(
+        &storage,
+        IsolationLevel::ReadUncommitted,
+        &[(&topition, T0)],
+    )
+    .await?;
+    assert_eq!(1, responses.len());
+    assert_eq!(ErrorCode::UnknownTopicOrPartition, responses[0].error_code);
+    assert_eq!(None, responses[0].offset);
+    assert_eq!(None, responses[0].timestamp);
 
     let path = Path::from("clusters/nisshi/topics/absent/partitions/0000000000/watermark.json");
     assert!(matches!(

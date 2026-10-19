@@ -350,12 +350,43 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         .await?;
     assert_eq!(Some(&offset), offset_fetch.get(&good_topition));
 
+    let doomed_topition = Topition::new(doomed_name.clone(), 0);
+
+    assert_matches!(
+        storage
+            .fetch(
+                &doomed_topition,
+                0,
+                min_bytes,
+                max_bytes,
+                isolation,
+                max_wait
+            )
+            .await,
+        Err(nisshi_storage::Error::Api(
+            ErrorCode::UnknownTopicOrPartition
+        ))
+    );
+
     // doomed_name has a safe name, so its data was swept, not only its
     // metadata: dynostore's fetch reads by path, so a guard that skipped the
-    // sweep for too many names would still find the records here.
+    // sweep for too many names would find the records again in a topic
+    // created with the same name.
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(doomed_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
     let doomed_fetch = storage
         .fetch(
-            &Topition::new(doomed_name.clone(), 0),
+            &doomed_topition,
             0,
             min_bytes,
             max_bytes,

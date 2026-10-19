@@ -1199,6 +1199,40 @@ fn unique_constraint(error_code: ErrorCode) -> impl Fn(turso::Error) -> Error {
     }
 }
 
+/// Reads a `consumer_group_detail.sql` row as the stored group and the version that
+/// `update_group` compares against.
+fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
+    let version = row
+        .get_value(0)
+        .map_err(Error::from)
+        .and_then(|value| {
+            value
+                .as_text()
+                .ok_or(Error::UnexpectedValue(value.clone()))
+                .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
+        })
+        .inspect_err(|err| error!(?err))
+        .map(|uuid| Version {
+            e_tag: Some(uuid.to_string()),
+            version: None,
+        })
+        .inspect(|version| debug!(?version))?;
+
+    let current = row
+        .get_value(1)
+        .map_err(Error::from)
+        .and_then(|value| {
+            value
+                .as_text()
+                .map(|v| v.as_str())
+                .ok_or(Error::UnexpectedValue(value.clone()))
+                .and_then(|s| serde_json::from_str::<GroupDetail>(s).map_err(Into::into))
+        })
+        .inspect(|current| debug!(?current))?;
+
+    Ok((current, version))
+}
+
 #[async_trait]
 impl Storage for Engine {
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
@@ -2636,7 +2670,7 @@ impl Storage for Engine {
                         .value(value)
                         .read_only(false)
                         .is_default(None)
-                        .config_source(Some(ConfigSource::DefaultConfig.into()))
+                        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
                         .config_type(Some(ConfigType::String.into()))
@@ -2752,15 +2786,18 @@ impl Storage for Engine {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(-1)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))
@@ -2876,15 +2913,18 @@ impl Storage for Engine {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(-1)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))
@@ -3067,6 +3107,25 @@ impl Storage for Engine {
         Ok(results)
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        self.prepare_query_opt(
+            &c,
+            &sql_lookup("consumer_group_detail.sql")?,
+            (group_id, self.cluster.as_str()),
+        )
+        .await
+        .map_err(Error::from)
+        .inspect_err(|err| error!(?err, group_id))?
+        .as_ref()
+        .map(group_detail_with_version)
+        .transpose()
+        .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
+    }
+
     async fn update_group(
         &self,
         group_id: &str,
@@ -3149,38 +3208,12 @@ impl Storage for Engine {
                 .inspect(|row| debug!(?row))
                 .inspect_err(|err| error!(?err))?;
 
-            let version = row
-                .get_value(0)
-                .map_err(Error::from)
-                .and_then(|value| {
-                    value
-                        .as_text()
-                        .ok_or(Error::UnexpectedValue(value.clone()))
-                        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                })
-                .inspect_err(|err| error!(?err))
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))?;
+            let (current, version) = group_detail_with_version(&row)?;
 
-            let current = row
-                .get_value(1)
-                .map_err(Error::from)
-                .and_then(|value| {
-                    value
-                        .as_text()
-                        .map(|v| v.as_str())
-                        .ok_or(Error::UnexpectedValue(value.clone()))
-                        .and_then(|s| serde_json::from_str::<GroupDetail>(s).map_err(Into::into))
-                })
-                .inspect(|current| debug!(?current))
-                .map(Box::new)?;
-
-            Err(UpdateError::Outdated { current, version })
+            Err(UpdateError::Outdated {
+                current: Box::new(current),
+                version,
+            })
         };
 
         tx.commit().await.inspect_err(|err| error!(?err))?;

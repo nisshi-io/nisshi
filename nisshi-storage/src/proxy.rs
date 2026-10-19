@@ -417,6 +417,17 @@ where
             .await
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let start = SystemTime::now();
+        let _permit = self.semaphore.acquire().await.inspect(|_| {
+            SEMAPHORE_ACQUIRE_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "group_with_version")],
+            )
+        })?;
+        self.storage.group_with_version(group_id).await
+    }
+
     async fn update_group(
         &self,
         group_id: &str,

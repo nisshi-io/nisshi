@@ -16,6 +16,7 @@
 
 pub mod broker;
 pub mod durability;
+pub mod fresh_database;
 pub mod restart;
 pub mod sqlite_snapshot;
 pub mod storage_down_at_startup;

@@ -33,10 +33,12 @@ Check your internet connection, verify the server address, and try again.";
 fn startup_check_hint(scheme: &str) -> &'static str {
     match scheme {
         "s3" => {
-            ". Check that the bucket exists, that AWS_ENDPOINT and AWS_REGION are correct, and that the AWS credentials allow listing the cluster's prefix in the bucket."
+            ". Check that the bucket exists, that AWS_ENDPOINT and AWS_REGION are correct, and \
+            that the AWS credentials allow listing the cluster's prefix in the bucket."
         }
         "gs" => {
-            ". Check that the bucket exists, and that the Google Cloud credentials allow listing the cluster's prefix in the bucket."
+            ". Check that the bucket exists, and that the Google Cloud credentials allow listing \
+            the cluster's prefix in the bucket."
         }
         _ => "",
     }
@@ -79,31 +81,74 @@ async fn main() -> Result<ErrorCode> {
                 #[cfg(any(feature = "dynostore", feature = "slatedb"))]
                 nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
                     error!(
-                        "could not get AWS credentials from the configured provider: {source}. AWS credentials come from static keys (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY), a web identity token (AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN), an ECS or EKS container credential endpoint, or the EC2 instance metadata service."
+                        "could not get AWS credentials from the configured provider: {source}. AWS \
+                        credentials come from static keys (AWS_ACCESS_KEY_ID and \
+                        AWS_SECRET_ACCESS_KEY), a web identity token (AWS_WEB_IDENTITY_TOKEN_FILE \
+                        and AWS_ROLE_ARN), an ECS or EKS container credential endpoint, or the EC2 \
+                        instance metadata service."
                     )
                 }
-                nisshi_broker::Error::Storage(nisshi_storage::Error::StartupCheck {
+                nisshi_broker::Error::Storage(nisshi_storage::Error::StartupFailed {
                     storage,
+                    failure,
                     source,
-                }) => error!(
-                    "storage {storage} failed its startup check: {source}{}",
-                    startup_check_hint(storage.scheme())
-                ),
+                }) => match failure {
+                    nisshi_storage::StartupFailure::StorageUnreachable => error!(
+                        "storage {storage} failed its startup check: {source}{}",
+                        startup_check_hint(storage.scheme())
+                    ),
+                    nisshi_storage::StartupFailure::SchemaSetup => match &**source {
+                        nisshi_storage::Error::IncompatibleSchema {
+                            recorded_version,
+                            oldest_compatible_version,
+                            schema_version,
+                        } => error!(
+                            "storage {storage} records schema version {recorded_version}, which a \
+                            release with schema version {oldest_compatible_version} or later can \
+                            use. This release has schema version {schema_version}: upgrade Nisshi."
+                        ),
+                        nisshi_storage::Error::OutdatedSchema {
+                            recorded_version,
+                            schema_version,
+                        } => error!(
+                            "storage {storage} records schema version {recorded_version}, which is \
+                            older than this release's schema version {schema_version}. This \
+                            release can't upgrade the schema: run the release that set up this \
+                            database."
+                        ),
+                        #[cfg(feature = "postgres")]
+                        nisshi_storage::Error::TokioPostgres(err)
+                            if err.code().map(|code| code.code()) == Some("42501") =>
+                        {
+                            error!(
+                                "storage {storage} failed its schema setup: {source}. The \
+                                database records no schema version that this release can use, so \
+                                the broker must change the schema, and its role isn't allowed \
+                                to. Start one broker once with the credentials of the role that \
+                                owns Nisshi's tables, then start the others with this role. See \
+                                the PostgreSQL section of README.md."
+                            )
+                        }
+                        _ => error!("storage {storage} failed its schema setup: {source}"),
+                    },
+                },
                 nisshi_broker::Error::InvalidStorageOptionValue { option, value } => error!(
-                    "storage option {option}={value} is not a valid interval: give a non-zero duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"
+                    "storage option {option}={value} is not a valid interval: give a non-zero \
+                    duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"
                 ),
-                nisshi_broker::Error::Storage(nisshi_storage::Error::UnrecognizedStorageOption {
-                    scheme,
-                    option,
-                }) => error!("storage option {option} is not recognised by the {scheme} engine"),
+                nisshi_broker::Error::Storage(
+                    nisshi_storage::Error::UnrecognizedStorageOption { scheme, option },
+                ) => error!("storage option {option} is not recognised by the {scheme} engine"),
                 _ => error!("Unknown error occurred during command: {}", err),
             },
             nisshi_cli::Error::TlsCertificate { path, source } => error!(
-                "TLS certificate {} could not be loaded: {source}. Expected one or more PEM certificates (--cert).",
+                "TLS certificate {} could not be loaded: {source}. Expected one or more PEM \
+                certificates (--cert).",
                 path.display()
             ),
             nisshi_cli::Error::TlsPrivateKey { path, source } => error!(
-                "TLS private key {} could not be loaded: {source}. Expected a PKCS#8, SEC1 or RSA PEM key (--key).",
+                "TLS private key {} could not be loaded: {source}. Expected a PKCS#8, SEC1 or RSA \
+                PEM key (--key).",
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyPassphraseRequired { path } => error!(
@@ -111,15 +156,20 @@ async fn main() -> Result<ErrorCode> {
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyDecrypt { path, source } => error!(
-                "TLS private key {} could not be decrypted: {source}. Check the passphrase in --key-passphrase-file.",
+                "TLS private key {} could not be decrypted: {source}. Check the passphrase in \
+                --key-passphrase-file.",
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyUnsupportedEncryption { path, algorithm } => error!(
-                "TLS private key {} is encrypted with {algorithm}, which is not supported. Supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES. Re-encrypt it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem -v2 aes-256-cbc -v2prf hmacWithSHA256",
+                "TLS private key {} is encrypted with {algorithm}, which is not supported. \
+                Supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES. \
+                Re-encrypt it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem -v2 aes-256-cbc \
+                -v2prf hmacWithSHA256",
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => error!(
-                "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
+                "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. \
+                Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
                 path.display()
             ),
             nisshi_cli::Error::TlsKeyPassphraseFile { path, source } => error!(
@@ -127,13 +177,15 @@ async fn main() -> Result<ErrorCode> {
                 path.display()
             ),
             nisshi_cli::Error::Tls(error) => error!(
-                "TLS configuration rejected: {error}. Check that --key is the private key for the certificate in --cert and, for an encrypted key, that the passphrase is correct."
+                "TLS configuration rejected: {error}. Check that --key is the private key for the \
+                certificate in --cert and, for an encrypted key, that the passphrase is correct."
             ),
             nisshi_cli::Error::TlsRequiresCertAndKey => {
                 error!("TLS requires both --cert and --key.")
             }
             nisshi_cli::Error::LakeRequiresSchemaRegistry { lake } => error!(
-                "{lake} requires --schema-registry: a data lake writer validates every record against a schema."
+                "{lake} requires --schema-registry: a data lake writer validates every record \
+                against a schema."
             ),
             _ => error!("Unknown error occurred during command: {}", err),
         })

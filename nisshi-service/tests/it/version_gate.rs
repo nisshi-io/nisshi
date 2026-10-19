@@ -138,10 +138,11 @@ async fn version_outside_the_cap_closes_the_connection() -> Result<(), Error> {
 }
 
 // `ApiVersionsRequest` v5 adds `ClusterId` and `NodeId` as non-tagged fields
-// (https://github.com/apache/kafka/blob/e90d6f42c2957f2b970266e3c5b0ff2ebf972b59/clients/src/main/resources/common/message/ApiVersionsRequest.json#L27-L42).
-// This build's decoder knows versions 0-4, so it fails on a v5 body with `ClusterId` set. The
-// broker answers without decoding the body, at v0, with `UNSUPPORTED_VERSION` and the
-// `ApiVersions` range that the client retries with.
+// ([ApiVersionsRequest.json#L27-L42]). This build's decoder knows versions 0-4, so it fails
+// on a v5 body with `ClusterId` set. The broker answers without decoding the body, at v0,
+// with `UNSUPPORTED_VERSION` and the `ApiVersions` range that the client retries with.
+//
+// [ApiVersionsRequest.json#L27-L42]: https://github.com/apache/kafka/blob/e90d6f42c2957f2b970266e3c5b0ff2ebf972b59/clients/src/main/resources/common/message/ApiVersionsRequest.json#L27-L42
 #[tokio::test]
 async fn api_versions_above_the_protocol_range_is_answered_at_v0() -> Result<(), Error> {
     let _guard = crate::common::init_tracing()?;

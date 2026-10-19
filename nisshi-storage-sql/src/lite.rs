@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sql::{Cache, default_hash, idempotent_sequence_check, remove_comments};
+use crate::{
+    schema::{RecordedSchema, should_create_schema},
+    sql::{Cache, default_hash, idempotent_sequence_check, remove_comments},
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::NaiveDateTime;
@@ -54,10 +57,10 @@ use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, bounded_channel, check_claim, config::apply_op,
-    delete_records_cutoff, inflate, producer_claim,
+    RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy,
+    StartupFailure, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
+    config::apply_op, delete_records_cutoff, inflate, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -80,7 +83,7 @@ use std::{
 };
 use tokio::{fs::rename, sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -1573,6 +1576,19 @@ impl<C, N, L, D> Builder<C, N, L, D> {
     }
 }
 
+/// The version of the schema that [`DDL`] creates. A database records the version of its schema
+/// in its `nisshi_schema_version` table.
+const SCHEMA_VERSION: i32 = 1;
+
+// The build fails here when someone changes `SCHEMA_VERSION`. In a file with tables but no
+// recorded version, `ensure_schema` creates only the missing tables, and then records
+// `SCHEMA_VERSION`. A new version needs an upgrade step there, because such a file has the
+// tables of version 1.
+const _: () = assert!(SCHEMA_VERSION == 1);
+
+/// The oldest schema version whose broker can use the schema that [`DDL`] creates.
+const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
+
 static DDL: LazyLock<Cache> = LazyLock::new(|| {
     let mapping = [
         ("010-cluster.sql", include_sql!("ddl/010-cluster.sql")),
@@ -1636,6 +1652,85 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
 
     Cache::new(BTreeMap::from(mapping))
 });
+
+/// Makes sure that the database has the broker's schema before the broker serves a request.
+///
+/// When the database records no schema version, this function creates the missing tables and
+/// records [`SCHEMA_VERSION`]. It leaves existing tables and their data as they are.
+async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
+    let connection = db.connect()?;
+
+    // Another broker on the same file can hold the write lock while it creates the schema. The
+    // busy timeout makes this broker wait for that lock, instead of failing at once.
+    connection.busy_timeout(busy_timeout)?;
+
+    // An immediate transaction takes the write lock before it reads the version. Two brokers that
+    // start together then read the version one at a time, and only the first one applies the
+    // schema.
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+
+    _ = tx
+        .execute(SQL.get("nisshi_schema_version_create.sql")?, ())
+        .await?;
+
+    let recorded = match tx
+        .query(SQL.get("nisshi_schema_version_select.sql")?, ())
+        .await?
+        .next()
+        .await?
+    {
+        Some(row) => Some(RecordedSchema {
+            version: row.get(0)?,
+            oldest_compatible_version: row.get(1)?,
+        }),
+        None => None,
+    };
+    debug!(?recorded);
+
+    if !should_create_schema(recorded, SCHEMA_VERSION)? {
+        return tx.commit().await.map_err(Into::into);
+    }
+
+    let has_tables = tx
+        .query(
+            "select 1 from sqlite_schema where type = 'table' and name = 'cluster'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+
+    for (name, ddl) in DDL.iter() {
+        _ = tx
+            .execute(ddl.as_str(), ())
+            .await
+            .inspect(|rows| debug!(name, rows))
+            .inspect_err(|err| error!(name, ?err))?;
+    }
+
+    _ = tx
+        .execute(
+            SQL.get("nisshi_schema_version_insert.sql")?,
+            [SCHEMA_VERSION, OLDEST_COMPATIBLE_SCHEMA_VERSION],
+        )
+        .await?;
+
+    tx.commit().await?;
+
+    if has_tables {
+        warn!(
+            schema_version = SCHEMA_VERSION,
+            "recorded the schema version in a file whose tables an earlier release created"
+        );
+    } else {
+        info!(schema_version = SCHEMA_VERSION, "created the schema");
+    }
+
+    Ok(())
+}
 
 pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
     Cache::new(
@@ -1967,6 +2062,17 @@ impl Storage for Engine {
                     &[KeyValue::new("operation", "describe_groups")],
                 )
             })
+    }
+
+    #[instrument(skip_all)]
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let start = SystemTime::now();
+        self.inner.group_with_version(group_id).await.inspect(|_| {
+            ENGINE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "group_with_version")],
+            )
+        })
     }
 
     #[instrument(skip_all)]
@@ -2318,17 +2424,13 @@ impl Builder<String, i32, Url, Url> {
 
         let db = libsql::Builder::new_local(path).build().await?;
 
-        {
-            let connection = db.connect()?;
-
-            for (name, ddl) in DDL.iter() {
-                _ = connection
-                    .execute(ddl.as_str(), ())
-                    .await
-                    .inspect(|rows| debug!(name, rows))
-                    .inspect_err(|err| error!(name, ?err));
-            }
-        }
+        ensure_schema(&db, busy_timeout)
+            .await
+            .map_err(|source| Error::StartupFailed {
+                storage: Arc::new(redact_url(&self.storage)),
+                failure: StartupFailure::SchemaSetup,
+                source: Arc::new(source),
+            })?;
 
         match self
             .storage
@@ -2452,6 +2554,31 @@ fn unique_constraint(error_code: ErrorCode) -> impl Fn(libsql::Error) -> Error {
             err.into()
         }
     }
+}
+
+/// Reads a `consumer_group_detail.sql` row as the stored group and the version that
+/// `update_group` compares against.
+fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
+    let version = row
+        .get_str(0)
+        .map_err(Error::from)
+        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
+        .inspect_err(|err| error!(?err))
+        .map(|uuid| Version {
+            e_tag: Some(uuid.to_string()),
+            version: None,
+        })
+        .inspect(|version| debug!(?version))?;
+
+    let current = row
+        .get_str(1)
+        .map_err(Error::from)
+        .inspect(|value| debug!(%value))
+        .and_then(|value| serde_json::from_str::<GroupDetail>(value).map_err(Into::into))
+        .inspect(|current| debug!(?current))
+        .inspect_err(|err| error!(?err))?;
+
+    Ok((current, version))
 }
 
 #[async_trait]
@@ -3847,7 +3974,7 @@ impl Storage for Delegate {
                         .value(value)
                         .read_only(false)
                         .is_default(None)
-                        .config_source(Some(ConfigSource::DefaultConfig.into()))
+                        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
                         .config_type(Some(ConfigType::String.into()))
@@ -3945,15 +4072,18 @@ impl Storage for Delegate {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(0)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))
@@ -4036,15 +4166,18 @@ impl Storage for Delegate {
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
                                                 .leader_epoch(0)
-                                                .replica_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor
-                                                        as usize
-                                                ]))
-                                                .isr_nodes(Some(vec![
-                                                    self.node;
-                                                    replication_factor as usize
-                                                ]))
+                                                .replica_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
+                                                .isr_nodes(Some(
+                                                    nisshi_storage::single_node_replicas(
+                                                        self.node,
+                                                        replication_factor,
+                                                    ),
+                                                ))
                                                 .eligible_leader_replicas(Some(vec![]))
                                                 .last_known_elr(Some(vec![]))
                                                 .offline_replicas(Some(vec![]))
@@ -4233,6 +4366,32 @@ impl Storage for Delegate {
         })
     }
 
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let start = SystemTime::now();
+
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        c.query_opt(
+            "consumer_group_detail.sql",
+            (group_id, self.cluster.as_str()),
+        )
+        .await
+        .map_err(Error::from)
+        .inspect_err(|err| error!(?err, group_id))?
+        .as_ref()
+        .map(group_detail_with_version)
+        .transpose()
+        .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
+        .inspect(|_| {
+            DELEGATE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "group_with_version")],
+            )
+        })
+    }
+
     async fn update_group(
         &self,
         group_id: &str,
@@ -4308,32 +4467,12 @@ impl Storage for Delegate {
                 .inspect(|row| debug!(?row))
                 .inspect_err(|err| error!(?err))?;
 
-            let version = row
-                .get_str(0)
-                .map_err(Error::from)
-                .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                .inspect_err(|err| error!(?err))
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))?;
+            let (current, version) = group_detail_with_version(&row)?;
 
-            let value = row
-                .get_str(1)
-                .map_err(Error::from)
-                .inspect(|value| debug!(%value))
-                .and_then(|value| serde_json::from_str(value).map_err(Into::into))
-                .inspect(|value| debug!(%value))?;
-
-            let current = serde_json::from_value::<GroupDetail>(value)
-                .inspect(|current| debug!(?current))
-                .inspect_err(|err| error!(?err))
-                .map(Box::new)?;
-
-            Err(UpdateError::Outdated { current, version })
+            Err(UpdateError::Outdated {
+                current: Box::new(current),
+                version,
+            })
         };
 
         pc.commit(tx).await?;
@@ -5155,10 +5294,11 @@ impl TryFrom<Value> for LiteTimestamp {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::thread;
 
     use nisshi_sans_io::Compression;
-    use nisshi_storage::{ArcDynStorage, StorageContainer};
+    use nisshi_storage::{ArcDynStorage, StorageContainer, StorageFactory as _};
     use tempfile::{tempdir, tempdir_in};
     use tokio::{fs::remove_file, task::yield_now};
     use tracing::subscriber::DefaultGuard;
@@ -6180,6 +6320,215 @@ mod tests {
         let other = pool.get().await?;
         let tx = other.transaction().await?;
         other.commit(tx).await?;
+
+        Ok(())
+    }
+
+    /// A change to the schema must come with a new [`SCHEMA_VERSION`], and with an upgrade step for
+    /// databases of the earlier version. A database that records a version keeps the tables that
+    /// it has, so a change without a new version reaches only new databases. Update the digest
+    /// here once both are in place.
+    #[test]
+    fn schema_matches_its_version() -> Result<()> {
+        let digest = crate::schema::schema_digest(
+            DDL.values()
+                .map(|statement| statement.as_str())
+                .chain([SQL.get("nisshi_schema_version_create.sql")?]),
+        );
+
+        assert_eq!(
+            (SCHEMA_VERSION, digest.as_str()),
+            (
+                1,
+                "4b97d00984999b16629d9d0a7a6da18e8458adc6a57cd0affa36f407b819d1dd"
+            )
+        );
+        Ok(())
+    }
+
+    /// Returns the version that `db`'s `nisshi_schema_version` table records, or `None` when it
+    /// records none.
+    async fn recorded_version(db: &Database) -> Result<Option<i32>> {
+        db.connect()?
+            .query("select version from nisshi_schema_version", ())
+            .await?
+            .next()
+            .await?
+            .map(|row| row.get::<i32>(0))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// In a new file, `ensure_schema` must create every table and record [`SCHEMA_VERSION`].
+    #[tokio::test]
+    async fn ensure_schema_creates_the_schema_in_a_new_file() -> Result<()> {
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        for table in ["cluster", "topic", "record", "scram_credential"] {
+            _ = db
+                .connect()?
+                .query(&format!("select count(*) from {table}"), ())
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Brokers that start together on one new file must all start, and the file must record
+    /// [`SCHEMA_VERSION`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_schema_succeeds_for_brokers_that_start_together() -> Result<()> {
+        const BROKERS: usize = 4;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let barrier = Arc::new(tokio::sync::Barrier::new(BROKERS));
+
+        let mut setups = Vec::with_capacity(BROKERS);
+        for _ in 0..BROKERS {
+            let db = libsql::Builder::new_local(&path).build().await?;
+            let barrier = Arc::clone(&barrier);
+            setups.push(tokio::spawn(async move {
+                _ = barrier.wait().await;
+                ensure_schema(&db, Duration::from_secs(5)).await
+            }));
+        }
+        for setup in setups {
+            setup.await??;
+        }
+
+        let db = libsql::Builder::new_local(&path).build().await?;
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        Ok(())
+    }
+
+    /// A newer release set up this file with a schema that this release can use. `ensure_schema`
+    /// must leave the tables and the recorded version as they are.
+    #[tokio::test]
+    async fn ensure_schema_keeps_a_file_that_records_a_version() -> Result<()> {
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        // This makes the file look as if a newer release set it up.
+        _ = db
+            .connect()?
+            .execute("update nisshi_schema_version set version = 2", ())
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(2));
+
+        Ok(())
+    }
+
+    /// A file whose tables an earlier release created records no version. `ensure_schema` must
+    /// record version 1 in it.
+    #[tokio::test]
+    async fn ensure_schema_records_the_version_of_a_file_created_without_one() -> Result<()> {
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        // This makes the file look as if a release before 0.7.0 set it up.
+        _ = db
+            .connect()?
+            .execute("drop table nisshi_schema_version", ())
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        Ok(())
+    }
+
+    /// The storage file isn't a SQLite database. The broker must stop at startup with a
+    /// `SchemaSetup` failure, instead of running without tables.
+    #[tokio::test]
+    async fn factory_fails_with_schema_setup_on_a_file_that_is_not_a_database() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        std::fs::write(&path, [0x5a_u8; 8192])?;
+
+        let storage = Url::parse(&format!("sqlite:///{}", path.display()))?;
+
+        let built = factory::LiteFactory
+            .build(nisshi_storage::StorageFactoryConfiguration {
+                node_id: 111,
+                cluster: String::from("nisshi"),
+                advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                storage: storage.clone(),
+                schema_registry: None,
+                lake_house: None,
+                cancellation: CancellationToken::new(),
+            })
+            .await;
+
+        match built {
+            Err(Error::StartupFailed {
+                storage: reported,
+                failure: StartupFailure::SchemaSetup,
+                ..
+            }) => assert_eq!(*reported, storage),
+            Err(err) => panic!("expected the SchemaSetup failure, got {err:?}"),
+            Ok(_) => panic!("expected the SchemaSetup failure, got a storage"),
+        }
+
+        Ok(())
+    }
+
+    /// A newer release set up this file with a schema that this release can't use. The broker must
+    /// stop at startup with an `IncompatibleSchema` error.
+    #[tokio::test]
+    async fn factory_refuses_a_file_whose_schema_this_release_cannot_use() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = libsql::Builder::new_local(&path).build().await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        // This makes the file look as if a newer release set it up with a schema that this
+        // release can't use.
+        _ = db
+            .connect()?
+            .execute(
+                "update nisshi_schema_version set version = 2, oldest_compatible_version = 2",
+                (),
+            )
+            .await?;
+        drop(db);
+
+        let built = factory::LiteFactory
+            .build(nisshi_storage::StorageFactoryConfiguration {
+                node_id: 111,
+                cluster: String::from("nisshi"),
+                advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                storage: Url::parse(&format!("sqlite:///{}", path.display()))?,
+                schema_registry: None,
+                lake_house: None,
+                cancellation: CancellationToken::new(),
+            })
+            .await;
+
+        match built {
+            Err(Error::StartupFailed {
+                failure: StartupFailure::SchemaSetup,
+                source,
+                ..
+            }) => assert_matches!(*source, Error::IncompatibleSchema { .. }),
+            Err(err) => panic!("expected the SchemaSetup failure, got {err:?}"),
+            Ok(_) => panic!("expected the SchemaSetup failure, got a storage"),
+        }
 
         Ok(())
     }
