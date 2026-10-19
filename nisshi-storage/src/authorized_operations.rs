@@ -77,4 +77,33 @@ mod tests {
             assert_eq!(i32::MIN, group(false, error_code.into()));
         }
     }
+
+    #[test]
+    fn group_conversions_omit_authorized_operations() {
+        use nisshi_sans_io::{consumer_group_describe_response, describe_groups_response};
+
+        use crate::{GroupDetail, NamedGroupDetail};
+
+        let rows = [
+            NamedGroupDetail::found("found".into(), GroupDetail::default()),
+            NamedGroupDetail::error_code("error".into(), ErrorCode::GroupIdNotFound),
+        ];
+
+        for row in &rows {
+            assert_eq!(
+                Some(i32::MIN),
+                describe_groups_response::DescribedGroup::from(row).authorized_operations
+            );
+            assert_eq!(
+                i32::MIN,
+                consumer_group_describe_response::DescribedGroup::from(row).authorized_operations
+            );
+        }
+
+        assert_eq!(
+            i32::MIN,
+            consumer_group_describe_response::DescribedGroup::from(&GroupDetail::default())
+                .authorized_operations
+        );
+    }
 }
