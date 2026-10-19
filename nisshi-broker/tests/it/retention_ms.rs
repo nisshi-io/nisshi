@@ -111,6 +111,40 @@ async fn create_topic(
     Ok(())
 }
 
+/// Creates a topic through [`Storage::create_topic`], which stores `configs` without the checks
+/// that the broker makes, as a topic created before the broker checked its configuration holds
+/// them.
+async fn create_topic_without_validation<G>(
+    sc: &G,
+    name: &str,
+    configs: &[(&str, &str)],
+) -> Result<()>
+where
+    G: Storage,
+{
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(name.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some(
+                    configs
+                        .iter()
+                        .map(|(name, value)| {
+                            CreatableTopicConfig::default()
+                                .name((*name).into())
+                                .value(Some((*value).into()))
+                        })
+                        .collect(),
+                )),
+            false,
+        )
+        .await?;
+    Ok(())
+}
+
 /// Produces one record to partition 0 of `name`, with the current time as its timestamp, and
 /// returns its offset.
 async fn produce(broker: &Broker, extensions: &Extensions, name: &str) -> Result<i64> {
@@ -348,8 +382,7 @@ where
 
 /// A `retention.ms` that isn't a whole number must not stop maintenance deleting the expired
 /// records of another topic, and must not delete the records of its own topic. The broker rejects
-/// such a value, so the test stores it through [`Storage::create_topic`], as a topic created
-/// before the broker checked the value holds it.
+/// such a value, so only a topic created before the broker checked the value holds it.
 pub async fn stored_retention_ms_that_is_not_a_number_does_not_stop_retention<G>(
     sc: G,
 ) -> Result<()>
@@ -359,26 +392,12 @@ where
     let broker = broker(sc.clone())?;
     let extensions = Extensions::default();
     let not_a_number_topic = &alphanumeric_string(15)[..];
-    _ = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(not_a_number_topic.into())
-                .num_partitions(1)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some(
-                    [DELETE_POLICY, ("retention.ms", "abc")]
-                        .iter()
-                        .map(|(name, value)| {
-                            CreatableTopicConfig::default()
-                                .name((*name).into())
-                                .value(Some((*value).into()))
-                        })
-                        .collect(),
-                )),
-            false,
-        )
-        .await?;
+    create_topic_without_validation(
+        &sc,
+        not_a_number_topic,
+        &[DELETE_POLICY, ("retention.ms", "abc")],
+    )
+    .await?;
     produce_records_before_maintenance(&broker, &extensions, not_a_number_topic).await?;
     let ten_minute_topic = &alphanumeric_string(15)[..];
     create_topic(
@@ -399,6 +418,29 @@ where
     assert_eq!(
         Some(0),
         earliest_offset_after_maintenance(&broker, &extensions, not_a_number_topic).await?
+    );
+    Ok(())
+}
+
+/// A stored `retention.ms` below -1 means that the topic keeps every record, because Kafka reads
+/// any negative value as no limit. The broker rejects such a value, so only a topic created before
+/// the broker checked the value holds it. A broker that reads it as a limit deletes every record of
+/// a topic that is the only copy of its data.
+pub async fn stored_retention_ms_below_minus_1_keeps_every_record<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+    create_topic_without_validation(&sc, topic, &[DELETE_POLICY, ("retention.ms", "-2")]).await?;
+    produce_records_before_maintenance(&broker, &extensions, topic).await?;
+
+    maintain_an_hour_later(&sc).await?;
+
+    assert_eq!(
+        Some(0),
+        earliest_offset_after_maintenance(&broker, &extensions, topic).await?
     );
     Ok(())
 }
@@ -463,6 +505,15 @@ macro_rules! backend {
             -> Result<()> {
                 let _guard = init_tracing()?;
                 super::stored_retention_ms_that_is_not_a_number_does_not_stop_retention(
+                    storage_container().await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn stored_retention_ms_below_minus_1_keeps_every_record() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::stored_retention_ms_below_minus_1_keeps_every_record(
                     storage_container().await?,
                 )
                 .await
