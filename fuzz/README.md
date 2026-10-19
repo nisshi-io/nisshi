@@ -18,7 +18,9 @@ cargo-fuzz targets for the Kafka wire protocol in `nisshi-sans-io`. Each target 
 
 To move a target between tiers, change its budget, or stop running it in CI, edit this file. Nothing in `.github/workflows/fuzz.yml` needs to change. A name in the file that isn't a target fails the run. A target that's in neither tier gets a warning, so a new target isn't silently skipped.
 
-The PR job has a 50 minute timeout and each nightly job 75 minutes. The six `pr` budgets add up to 6 minutes of fuzzing, after a build that takes about 33 minutes from scratch (10 of it dependencies, which the Rust cache saves from `main`) and, measured on a PR run with that cache, about 19 minutes. If the budgets outgrow those, raise `timeout-minutes` in `.github/workflows/fuzz.yml` too.
+The PR job has a 50 minute timeout and each nightly job 75 minutes. The six `pr` budgets add up to 6 minutes of fuzzing, after the build. If the budgets outgrow the timeouts, raise `timeout-minutes` in `.github/workflows/fuzz.yml` too.
+
+The fuzz recipes in the `justfile` build with `CARGO_PROFILE_RELEASE_LTO=false`, which turns off the workspace's cross-crate LTO (`lto = "thin"` in `Cargo.toml`) for fuzz builds only. With LTO, every target generates the machine code for its whole dependency graph when it links, which takes minutes per target, and the targets run fewer inputs per second. Without it, the dependencies compile once, and each further target compiles only its own code.
 
 The `fuzz_<api>_storage` targets run in `nightly` only, 15 minutes each. `just fuzz-ci pr` builds only the targets of the `pr` tier, because a storage target links the whole storage stack and takes several minutes to build, which the `pr` job's timeout can't afford for all of them.
 

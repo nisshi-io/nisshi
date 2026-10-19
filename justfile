@@ -86,7 +86,7 @@ doc *args:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items {{ args }}
 
 cargo-fuzz +args:
-    cargo +nightly fuzz {{ args }}
+    CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz {{ args }}
 
 fuzz-request-decode: (cargo-fuzz "run" "fuzz_request_decode" "--" "-max_total_time=60")
 
@@ -125,13 +125,21 @@ fuzz-ci tier target="":
     # rebuilds from scratch. (--codegen-units above 1 would build faster,
     # but nightly rustc segfaults on typenum with it and the sanitizer.)
     opts=(--target "$(rustc +nightly -vV | sed -n 's/^host: //p')")
+    # Fuzz builds turn off the workspace's cross-crate LTO instead of
+    # inheriting `lto = "thin"` from Cargo.toml. With LTO, cargo compiles each
+    # dependency to bitcode only, and every target then generates the machine
+    # code for its whole dependency graph when it links, which takes minutes
+    # per target. LTO also makes the targets run fewer inputs per second.
+    # fuzz-cmin sets the same value, because cmin must get the same flags as
+    # build and run. The cargo-fuzz recipe sets it to build as fast.
+    export CARGO_PROFILE_RELEASE_LTO=false
     cargo +nightly run --quiet --package fuzz --bin generate_seeds > /dev/null
     # Build only the targets of this tier, up front, so a failure to compile
     # shows before any fuzzing starts. `fuzz build` without a target builds
     # every target in fuzz/Cargo.toml, and the storage targets, which link the
     # whole storage stack, take longer to build than the pr tier's budget.
     # `fuzz build` takes one target, so loop; the dependencies compile once,
-    # and the targets after the first only link.
+    # and each target after the first compiles only its own code.
     for t in $targets; do
         cargo +nightly fuzz build "${opts[@]}" "$t"
     done
@@ -149,7 +157,7 @@ fuzz-ci tier target="":
 fuzz-cmin target:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo +nightly fuzz cmin --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{ quote(target) }}
+    CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz cmin --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{ quote(target) }}
 
 # the target names under `tier` in fuzz/ci-targets.json, as a JSON array
 fuzz-ci-matrix tier:
