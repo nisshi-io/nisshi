@@ -17,10 +17,7 @@
 //! reassignment in progress waits for one that never ends. The broker must answer
 //! `ListPartitionReassignments` with no reassignment in progress.
 
-use nisshi_smoke_test::KafkaCli;
-
-/// What `kafka-reassign-partitions --list` prints when no reassignment is in progress.
-const NO_REASSIGNMENTS: &str = "No partition reassignments found.";
+use nisshi_smoke_test::{KafkaCli, NO_REASSIGNMENTS};
 
 #[test]
 fn list_does_not_report_a_new_partition_as_reassigned() {
