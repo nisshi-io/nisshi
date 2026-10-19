@@ -7,8 +7,8 @@ name: fuzz
 # matches CI.
 #
 # - pull_request: every `pr` target, back to back in one job. One job rather
-#   than a matrix because one `cargo fuzz build` compiles every target in
-#   parallel, where a matrix would pay for a cold build per target.
+#   than a matrix because the targets share their dependencies, which a
+#   matrix would compile once per target. Only the `pr` targets are built.
 #   Report-only: this workflow isn't in ci.yml's ci-gate or the required
 #   checks, so a crash fails this check without blocking the merge. A find
 #   isn't necessarily caused by the PR it shows up on.

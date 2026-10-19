@@ -8,13 +8,14 @@
     "fuzz_varint": 60
   },
   "nightly": {
-    "fuzz_batch_records": 1800,
     "fuzz_alter_user_scram_credentials_storage": 900,
+    "fuzz_batch_records": 1800,
     "fuzz_consumer_group_describe_storage": 900,
     "fuzz_create_acls_storage": 900,
     "fuzz_create_topics_storage": 900,
     "fuzz_deflated_batch": 1800,
     "fuzz_delete_groups_storage": 900,
+    "fuzz_delete_records_storage": 900,
     "fuzz_delete_topics_storage": 900,
     "fuzz_describe_acls_storage": 900,
     "fuzz_describe_cluster_storage": 900,

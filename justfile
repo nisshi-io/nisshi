@@ -126,10 +126,15 @@ fuzz-ci tier target="":
     # but nightly rustc segfaults on typenum with it and the sanitizer.)
     opts=(--target "$(rustc +nightly -vV | sed -n 's/^host: //p')")
     cargo +nightly run --quiet --package fuzz --bin generate_seeds > /dev/null
-    # One build up front so the targets compile in parallel; each takes
-    # minutes on its own, and `fuzz run` would build them one at a time.
-    # Without a target, `fuzz build` builds them all.
-    cargo +nightly fuzz build "${opts[@]}" $only
+    # Build only the targets of this tier, up front, so a failure to compile
+    # shows before any fuzzing starts. `fuzz build` without a target builds
+    # every target in fuzz/Cargo.toml, and the storage targets, which link the
+    # whole storage stack, take longer to build than the pr tier's budget.
+    # `fuzz build` takes one target, so loop; the dependencies compile once,
+    # and the targets after the first only link.
+    for t in $targets; do
+        cargo +nightly fuzz build "${opts[@]}" "$t"
+    done
     failed=""
     for t in $targets; do
         secs=$(jq -r --arg tier "$tier" --arg t "$t" '.[$tier][$t]' "$config")
