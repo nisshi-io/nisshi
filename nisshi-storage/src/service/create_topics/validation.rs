@@ -22,7 +22,7 @@ use nisshi_sans_io::{
 use rama::{Layer, Service, extensions::Extensions};
 use tracing::{debug, instrument, warn};
 
-use crate::{Error, MAX_REPLICATION_FACTOR, Result};
+use crate::{Error, MAX_REPLICATION_FACTOR, Result, config::validate_topic_config};
 
 /// Build the [`CreatableTopicResult`] for a topic that was rejected, either
 /// by storage or by validation performed before storage is ever consulted.
@@ -217,6 +217,26 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
 
     if !is_valid_topic_name(&name) {
         return reject(ErrorCode::InvalidTopicException);
+    }
+
+    // Check configs before the assignments, the replication factor and the partition count, like
+    // Kafka.
+    if let Some(message) = topic
+        .configs
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find_map(|config| validate_topic_config(&config.name, config.value.as_deref()).err())
+    {
+        return ValidatedTopic::Rejected(
+            error_result(
+                name,
+                num_partitions,
+                replication_factor,
+                ErrorCode::InvalidConfig,
+            )
+            .error_message(Some(message)),
+        );
     }
 
     // Manual assignments fix the partitions and replicas, so the counts must be left at
