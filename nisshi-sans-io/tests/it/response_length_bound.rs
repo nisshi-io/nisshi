@@ -24,7 +24,13 @@ use std::assert_matches;
 
 use crate::common::init_tracing;
 use bytes::{BufMut, Bytes, BytesMut};
-use nisshi_sans_io::{ApiKey, Body, Error, Frame, Result, SaslAuthenticateResponse};
+use nisshi_sans_io::{
+    ApiKey, ApiVersionsResponse, Body, Error, FetchResponse, Frame, Header, Result,
+    SaslAuthenticateResponse,
+    api_versions_response::ApiVersion,
+    fetch_response::{FetchableTopicResponse, PartitionData},
+    record::{Record, inflated},
+};
 
 /// Larger than any frame these tests build, well under the 1 GiB fallback.
 const CLAIMED_LENGTH: usize = 100_000_000;
@@ -106,12 +112,13 @@ fn flexible_bytes_claim_beyond_the_frame_is_rejected() -> Result<()> {
 }
 
 /// Bounding by the frame's length must not reject a valid response, in
-/// either encoding.
+/// either encoding. The payload is far larger than any small fixed cap, so
+/// this also pins the bound to the frame's own length.
 #[test]
 fn valid_response_still_decodes() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let expected = Bytes::from_static(b"server-final-message");
+    let expected = Bytes::from(vec![0x5a; 4 * 1024 * 1024]);
 
     let encoded = non_flexible(i32::try_from(expected.len())?, &expected);
     let frame = Frame::response_from_bytes(encoded, SaslAuthenticateResponse::KEY, 0)?;
@@ -121,5 +128,132 @@ fn valid_response_still_decodes() -> Result<()> {
     let frame = Frame::response_from_bytes(encoded, SaslAuthenticateResponse::KEY, 2)?;
     assert_eq!(expected, auth_bytes(frame)?);
 
+    Ok(())
+}
+
+/// A Fetch response's records pass through the records length check, the
+/// largest field a valid response carries. An 8 MiB records blob must decode
+/// with every record intact.
+#[test]
+fn large_fetch_records_decode() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    const RECORDS: usize = 64;
+    const VALUE_LEN: usize = 128 * 1024;
+
+    let values = (0..RECORDS)
+        .map(|i| Bytes::from(vec![u8::try_from(i % 256).unwrap_or_default(); VALUE_LEN]))
+        .collect::<Vec<_>>();
+
+    let batch = values
+        .iter()
+        .fold(inflated::Batch::builder(), |builder, value| {
+            builder.record(Record::builder().value(value.clone().into()))
+        })
+        .producer_id(-1)
+        .producer_epoch(-1)
+        .build()?;
+
+    let api_version = 12;
+
+    let body = FetchResponse::default()
+        .throttle_time_ms(Some(0))
+        .error_code(Some(0))
+        .session_id(Some(0))
+        .responses(Some(
+            [FetchableTopicResponse::default()
+                .topic(Some("t".into()))
+                .topic_id(None)
+                .partitions(Some(
+                    [PartitionData::default()
+                        .partition_index(0)
+                        .error_code(0)
+                        .high_watermark(i64::try_from(RECORDS)?)
+                        .last_stable_offset(Some(i64::try_from(RECORDS)?))
+                        .log_start_offset(Some(0))
+                        .diverging_epoch(None)
+                        .current_leader(None)
+                        .snapshot_id(None)
+                        .aborted_transactions(Some([].into()))
+                        .preferred_read_replica(Some(-1))
+                        .records(Some(
+                            inflated::Frame {
+                                batches: [batch].into(),
+                            }
+                            .try_into()?,
+                        ))]
+                    .into(),
+                ))]
+            .into(),
+        ))
+        .node_endpoints(None);
+
+    let encoded = Frame::response(
+        Header::Response { correlation_id: 1 },
+        body.into(),
+        FetchResponse::KEY,
+        api_version,
+    )?;
+    assert!(encoded.len() > RECORDS * VALUE_LEN, "{}", encoded.len());
+
+    let frame = Frame::response_from_bytes(encoded, FetchResponse::KEY, api_version)?;
+    assert_matches!(frame.body, Body::FetchResponse(_));
+
+    let decoded = FetchResponse::try_from(frame.body)?
+        .responses
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|topic| topic.partitions.unwrap_or_default())
+        .filter_map(|partition| partition.records)
+        .flat_map(|records| records.batches)
+        .map(inflated::Batch::try_from)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .filter_map(|record| record.value)
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, decoded);
+    Ok(())
+}
+
+/// Array element counts are not byte lengths and are not checked against the
+/// frame bound: a 30,000 element compact array must decode.
+#[test]
+fn large_compact_array_decodes() -> Result<()> {
+    // No tracing subscriber: debug logging every element of a 30,000
+    // element array makes this test take seconds instead of milliseconds.
+
+    const ELEMENTS: i16 = 30_000;
+    let api_version = 3;
+
+    let api_keys = (0..ELEMENTS)
+        .map(|api_key| {
+            ApiVersion::default()
+                .api_key(api_key)
+                .min_version(0)
+                .max_version(1)
+        })
+        .collect::<Vec<_>>();
+
+    let body = ApiVersionsResponse::default()
+        .error_code(0)
+        .api_keys(Some(api_keys.clone()))
+        .throttle_time_ms(Some(0));
+
+    let encoded = Frame::response(
+        Header::Response { correlation_id: 1 },
+        body.into(),
+        ApiVersionsResponse::KEY,
+        api_version,
+    )?;
+
+    let frame = Frame::response_from_bytes(encoded, ApiVersionsResponse::KEY, api_version)?;
+    assert_matches!(frame.body, Body::ApiVersionsResponse(_));
+
+    let decoded = ApiVersionsResponse::try_from(frame.body)?
+        .api_keys
+        .unwrap_or_default();
+    assert_eq!(api_keys, decoded);
     Ok(())
 }
