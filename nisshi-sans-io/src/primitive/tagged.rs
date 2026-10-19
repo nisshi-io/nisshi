@@ -42,9 +42,13 @@ const MAXIMUM_TAGGED_FIELDS: usize = 128;
 /// reallocations as the vec grows one `push` at a time.
 const MAXIMUM_PREALLOCATED_TAG_DATA: usize = 4096;
 
-/// Up-front capacity for a tag field's data, given the length claimed on the wire.
-fn preallocated_capacity(claimed_length: usize) -> usize {
-    claimed_length.min(MAXIMUM_PREALLOCATED_TAG_DATA)
+/// A vec for a tag field's data, sized for the length claimed on the wire but never more than
+/// `MAXIMUM_PREALLOCATED_TAG_DATA` up front.
+///
+/// The decoder must get its vec only from here: the claim is an attacker-controlled varint,
+/// and `Vec::with_capacity` on it directly is the allocation the cap exists to prevent.
+fn with_claimed_capacity(claimed_length: usize) -> Vec<u8> {
+    Vec::with_capacity(claimed_length.min(MAXIMUM_PREALLOCATED_TAG_DATA))
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -132,17 +136,14 @@ impl<'de> Deserialize<'de> for TagField {
                     .into();
 
                 (0..length)
-                    .try_fold(
-                        Vec::with_capacity(preallocated_capacity(length)),
-                        |mut acc, _| {
-                            seq.next_element::<u8>()?
-                                .ok_or_else(|| serde::de::Error::custom("byte"))
-                                .map(|byte| {
-                                    acc.push(byte);
-                                    acc
-                                })
-                        },
-                    )
+                    .try_fold(with_claimed_capacity(length), |mut acc, _| {
+                        seq.next_element::<u8>()?
+                            .ok_or_else(|| serde::de::Error::custom("byte"))
+                            .map(|byte| {
+                                acc.push(byte);
+                                acc
+                            })
+                    })
                     .inspect(|data| debug!(?tag, ?data))
                     .map(|data| TagField(tag, data))
             }
@@ -484,19 +485,40 @@ mod tests {
     }
 
     /// Unlike a decode, which an overcommitting OS lets succeed even for a ~3.5GB
-    /// `Vec::with_capacity`, this fails if the cap is lost.
+    /// `Vec::with_capacity`, this fails if the cap is lost: `usize::MAX` bytes can never be
+    /// allocated, so an uncapped call panics.
     #[test]
-    fn preallocation_ignores_the_claimed_length_beyond_the_cap() {
-        assert_eq!(0, preallocated_capacity(0));
-        assert_eq!(10, preallocated_capacity(10));
-        assert_eq!(
-            MAXIMUM_PREALLOCATED_TAG_DATA,
-            preallocated_capacity(MAXIMUM_PREALLOCATED_TAG_DATA + 1)
+    fn claimed_capacity_is_capped() {
+        assert_eq!(0, with_claimed_capacity(0).capacity());
+        assert!(with_claimed_capacity(10).capacity() >= 10);
+        assert!(with_claimed_capacity(usize::MAX).capacity() <= MAXIMUM_PREALLOCATED_TAG_DATA * 2);
+    }
+
+    /// The decoder must allocate through `with_claimed_capacity`. A field one byte over the
+    /// cap, decoded with an uncapped `Vec::with_capacity(length)`, would hold exactly its
+    /// length; through the cap the vec starts at the cap and grows past the length as the
+    /// last byte arrives. This fails if the decoder stops using the helper.
+    #[test]
+    fn decode_preallocates_no_more_than_the_cap() -> Result<()> {
+        let length = MAXIMUM_PREALLOCATED_TAG_DATA + 1;
+        let expected = TagField(42, vec![7; length]);
+
+        let mut encoder = crate::ser::Encoder::new(bytes::BytesMut::new());
+        expected.serialize(&mut encoder)?;
+        let encoded = bytes::Bytes::from(encoder);
+
+        let mut reader = Cursor::new(encoded);
+        let actual = TagField::deserialize(&mut crate::de::Decoder::new(&mut reader))?;
+
+        assert_eq!(expected, actual);
+        assert!(
+            actual.1.capacity() > length,
+            "capacity {} is not above the length {length}, so the vec was allocated for the \
+             claimed length up front",
+            actual.1.capacity()
         );
-        assert_eq!(
-            MAXIMUM_PREALLOCATED_TAG_DATA,
-            preallocated_capacity(usize::MAX)
-        );
+
+        Ok(())
     }
 
     /// The up-front allocation for a tag field's data is capped at
