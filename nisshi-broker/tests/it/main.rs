@@ -61,6 +61,7 @@ pub mod produce_post_write_advance_failed;
 pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;
+pub mod sasl_handshake;
 pub mod sasl_scram_enforcement;
 pub mod startup_failure;
 pub mod storage_alter_user_scram_credentials;

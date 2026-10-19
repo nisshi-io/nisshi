@@ -75,6 +75,9 @@ pub const RECORD_TOO_LARGE_EXCEPTION: &str = "RecordTooLargeException";
 pub const UNSUPPORTED_VERSION_EXCEPTION: &str = "UnsupportedVersionException";
 /// The name the tools print when the broker refuses a login.
 pub const SASL_AUTHENTICATION_EXCEPTION: &str = "SaslAuthenticationException";
+/// What the tools print when the broker answers a SaslHandshake with
+/// `UNSUPPORTED_SASL_MECHANISM`, ahead of the broker's list of enabled mechanisms.
+pub const SASL_MECHANISM_NOT_ENABLED: &str = "not enabled in the server, enabled mechanisms are";
 /// The name the tools print for the broker's `GROUP_ID_NOT_FOUND` error.
 pub const GROUP_ID_NOT_FOUND_EXCEPTION: &str = "GroupIdNotFoundException";
 /// The name the tools print for the broker's `NON_EMPTY_GROUP` error.
@@ -166,6 +169,17 @@ impl KafkaCli {
             login.mechanism.name(),
             login.user,
             login.password
+        ))
+    }
+
+    /// Like [`KafkaCli::logged_in_as`], but every tool logs in with SASL PLAIN as `user`.
+    #[track_caller]
+    pub fn logged_in_with_plain(bootstrap: &str, user: &str, password: &str) -> Self {
+        Self::new(bootstrap).with_client_properties(&format!(
+            "security.protocol=SASL_PLAINTEXT\n\
+             sasl.mechanism=PLAIN\n\
+             sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
+             username=\"{user}\" password=\"{password}\";\n"
         ))
     }
 

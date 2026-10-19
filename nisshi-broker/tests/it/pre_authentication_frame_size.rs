@@ -248,7 +248,7 @@ async fn oversized_request_is_answered(
     }
 }
 
-async fn sasl_handshake(stream: &mut TcpStream, correlation_id: &mut i32) -> Result<Vec<String>> {
+async fn sasl_handshake(stream: &mut TcpStream, correlation_id: &mut i32) -> Result<()> {
     *correlation_id += 1;
 
     let frame = round_trip(
@@ -264,18 +264,13 @@ async fn sasl_handshake(stream: &mut TcpStream, correlation_id: &mut i32) -> Res
 
     let response = SaslHandshakeResponse::try_from(frame.body)?;
     ensure!(ErrorCode::None == ErrorCode::try_from(response.error_code)?);
-    Ok(response.mechanisms.unwrap_or_default())
+    Ok(())
 }
 
-async fn sasl_authenticate(
-    stream: &mut TcpStream,
-    correlation_id: &mut i32,
-    mechanisms: &[String],
-) -> Result<()> {
-    let offered = mechanisms
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
+async fn sasl_authenticate(stream: &mut TcpStream, correlation_id: &mut i32) -> Result<()> {
+    // A Kafka client logs in with the mechanism that it requested, not one that
+    // it picks from the list.
+    let offered = [Mechname::parse(b"SCRAM-SHA-256")?];
 
     let client = SASLClient::new(SASLConfig::with_credentials(
         None,
@@ -315,8 +310,8 @@ async fn sasl_authenticate(
 }
 
 async fn authenticate(stream: &mut TcpStream, correlation_id: &mut i32) -> Result<()> {
-    let mechanisms = sasl_handshake(stream, correlation_id).await?;
-    sasl_authenticate(stream, correlation_id, &mechanisms).await
+    sasl_handshake(stream, correlation_id).await?;
+    sasl_authenticate(stream, correlation_id).await
 }
 
 #[tokio::test]
@@ -360,7 +355,7 @@ async fn sasl_listener_rejects_oversized_frame_during_reauthentication() -> Resu
         let mut correlation_id = 0;
 
         authenticate(&mut stream, &mut correlation_id).await?;
-        _ = sasl_handshake(&mut stream, &mut correlation_id).await?;
+        sasl_handshake(&mut stream, &mut correlation_id).await?;
 
         ensure!(!oversized_request_is_answered(&mut stream, correlation_id + 1).await?);
         Ok(())

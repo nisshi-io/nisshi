@@ -233,13 +233,9 @@ async fn scram_login(
     .await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(handshake.error_code)?);
 
-    let offered = handshake
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
+    // A Kafka client logs in with the mechanism that it requested, not one that
+    // it picks from the list.
+    let offered = [Mechname::parse(b"SCRAM-SHA-256").expect("mechanism name")];
 
     let sasl = SASLClient::new(
         SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())

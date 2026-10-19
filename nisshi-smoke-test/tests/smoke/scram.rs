@@ -61,7 +61,8 @@ mod login {
     use std::time::Duration;
 
     use nisshi_smoke_test::{
-        Broker, KafkaCli, SASL_AUTHENTICATION_EXCEPTION, ScramLogin, ScramMechanism, unique,
+        Broker, KafkaCli, SASL_AUTHENTICATION_EXCEPTION, SASL_MECHANISM_NOT_ENABLED, ScramLogin,
+        ScramMechanism, unique,
     };
 
     fn login_for_new_user(mechanism: ScramMechanism) -> ScramLogin {
@@ -165,6 +166,34 @@ mod login {
         assert!(
             listed.timeout.is_none() && listed.code != Some(0),
             "the broker served a client without credentials: {listed}"
+        );
+        assert_logs_in(&broker, &login);
+    }
+
+    /// The broker must refuse a client that logs in with a mechanism that it hasn't enabled, and
+    /// the tool must fail at once, naming the broker's mechanisms. A broker that drops the
+    /// connection without an answer leaves the client retrying until its API timeout, with an
+    /// error that doesn't point at the mechanism.
+    #[test]
+    fn plain_login_is_refused_at_once() {
+        /// Long enough that a tool which fails only on its API timeout stands out from one that the
+        /// broker refused.
+        const CLIENT_API_TIMEOUT: Duration = Duration::from_secs(30);
+
+        let login = login_for_new_user(ScramMechanism::Sha256);
+        let broker = broker_requiring_kafka_configs_user(&login);
+
+        let listed =
+            KafkaCli::logged_in_with_plain(broker.bootstrap(), &login.user, &login.password)
+                .with_api_timeout(CLIENT_API_TIMEOUT)
+                .topics()
+                .list();
+
+        assert!(
+            listed.timeout.is_none()
+                && listed.code != Some(0)
+                && listed.mentions(SASL_MECHANISM_NOT_ENABLED),
+            "the broker didn't refuse the PLAIN login: {listed}"
         );
         assert_logs_in(&broker, &login);
     }

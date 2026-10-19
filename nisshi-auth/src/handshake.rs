@@ -14,7 +14,8 @@
 
 use crate::{AuthenticationExtension, Error, Stage};
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, RequestInput, SaslHandshakeRequest, SaslHandshakeResponse,
+    ApiKey, CloseAfterResponseExtension, ErrorCode, RequestInput, SaslHandshakeRequest,
+    SaslHandshakeResponse,
 };
 use rama::{Service, extensions::ExtensionsRef as _};
 use rsasl::prelude::Mechname;
@@ -31,20 +32,39 @@ impl Service<RequestInput<SaslHandshakeRequest>> for SaslHandshakeService {
     type Output = SaslHandshakeResponse;
     type Error = Error;
 
+    /// Answers with the mechanisms that the broker enables, whether it accepts
+    /// the requested one or not, as Kafka does ([SaslServerAuthenticator.java]).
+    ///
+    /// For a mechanism that the broker hasn't enabled, the broker answers
+    /// `UNSUPPORTED_SASL_MECHANISM` and then closes the connection. Without
+    /// SASL, it answers `ILLEGAL_SASL_STATE` with no mechanisms, as a Kafka
+    /// listener without SASL does ([KafkaApis.scala]), and keeps the
+    /// connection open.
+    ///
+    /// [SaslServerAuthenticator.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/authenticator/SaslServerAuthenticator.java#L565-L581
+    /// [KafkaApis.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1970-L1973
     #[instrument(skip(self), ret)]
     async fn serve(
         &self,
         input: RequestInput<SaslHandshakeRequest>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Some(authentication) = input
+        let Some(authentication) = input
             .extensions()
             .get_ref::<AuthenticationExtension>()
             .cloned()
-        {
-            authentication.stage
+        else {
+            return Ok(SaslHandshakeResponse::default()
+                .error_code(ErrorCode::IllegalSaslState.into())
+                .mechanisms(Some(vec![])));
+        };
+
+        let enabled = authentication.enabled_mechanisms();
+
+        let accepted = authentication
+            .stage
             .lock()
-            .map_err(Into::into)
-            .and_then(|mut guard| {
+            .map_err(Error::from)
+            .map(|mut guard| {
                 // Re-authentication (KIP-368): a Java kafka-clients
                 // connection periodically issues another SaslHandshake
                 // on the same TCP socket. The previous handshake left
@@ -53,37 +73,39 @@ impl Service<RequestInput<SaslHandshakeRequest>> for SaslHandshakeService {
                 // a perfectly valid mechanism with
                 // `UnsupportedSaslMechanism`. Always start with a
                 // fresh `SASLServer` built from the stored config.
-                if guard.as_ref().is_none_or(|guard|!matches!(guard, Stage::Server(_))) {
+                if guard
+                    .as_ref()
+                    .is_none_or(|guard| !matches!(guard, Stage::Server(_)))
+                {
                     debug!(?guard);
                     _ = guard.replace(authentication.fresh_server());
                 }
 
-                if let Some(Stage::Server(server)) = guard.take() && let Ok(mechanism) = Mechname::parse(input.request.mechanism.as_bytes()) {
-                    debug!(available = ?server.get_available().into_iter().map(|mechanism|mechanism.mechanism.as_str()).collect::<Vec<_>>());
-
+                if let Some(Stage::Server(server)) = guard.take()
+                    && let Ok(mechanism) = Mechname::parse(input.request.mechanism.as_bytes())
+                {
                     server
                         .start_suggested(mechanism)
                         .inspect_err(|err| debug!(?err, ?mechanism))
-                        .map_err(Into::into)
-                        .map(|session| {
-                            let mechanisms = [session.get_mechname().to_string()];
-
-                            _ = guard.replace(Stage::Session(session));
-
-                            SaslHandshakeResponse::default()
-                                .error_code(ErrorCode::None.into())
-                                .mechanisms(Some(mechanisms.into()))
-                        })
+                        .map(|session| _ = guard.replace(Stage::Session(session)))
+                        .is_ok()
                 } else {
-                    Ok(SaslHandshakeResponse::default()
-                        .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                        .mechanisms(Some([input.request.mechanism].into())))
+                    false
                 }
-            })
+            })?;
+
+        if accepted {
+            Ok(SaslHandshakeResponse::default()
+                .error_code(ErrorCode::None.into())
+                .mechanisms(Some(enabled)))
         } else {
+            debug!(?enabled, "requested mechanism is not enabled");
+
+            CloseAfterResponseExtension::mark(input.extensions());
+
             Ok(SaslHandshakeResponse::default()
                 .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                .mechanisms(Some([input.request.mechanism].into())))
+                .mechanisms(Some(enabled)))
         }
     }
 }

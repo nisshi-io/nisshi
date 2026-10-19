@@ -57,6 +57,15 @@ impl Drop for RunningBroker {
 }
 
 pub(crate) async fn spawn_broker(tls: Option<ServerConfig>) -> Result<RunningBroker> {
+    spawn_broker_with_authentication(tls, false).await
+}
+
+/// Like [`spawn_broker`], with `--authentication` on or off. With it on, the
+/// broker has no credentials, so no client can log in.
+pub(crate) async fn spawn_broker_with_authentication(
+    tls: Option<ServerConfig>,
+    authentication: bool,
+) -> Result<RunningBroker> {
     let port = free_port().await?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = Url::parse(&format!("tcp://{addr}"))?;
@@ -69,6 +78,7 @@ pub(crate) async fn spawn_broker(tls: Option<ServerConfig>) -> Result<RunningBro
         .storage(Url::parse("memory://")?)
         .listener(listener)
         .tls_server_config(tls)
+        .authentication(authentication)
         .silent(true)
         .build()
         .await?;
