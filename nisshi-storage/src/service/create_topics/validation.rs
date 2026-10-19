@@ -181,9 +181,18 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
     let explicit_partitions = topic.num_partitions != -1;
     let explicit_replication_factor = topic.replication_factor != -1;
 
+    // A topic with manual assignments has one partition per assignment, which is also how the
+    // partition cap counts it. Storage creates `num_partitions` partitions and ignores the
+    // assignments, so the count has to come from them, not the broker default.
+    let assigned_partitions = topic
+        .assignments
+        .as_deref()
+        .filter(|assignments| !assignments.is_empty())
+        .map(|assignments| i32::try_from(assignments.len()).unwrap_or(i32::MAX));
+
     let num_partitions = Some(match topic.num_partitions {
         -1 => {
-            topic.num_partitions = BROKER_DEFAULT_NUM_PARTITIONS;
+            topic.num_partitions = assigned_partitions.unwrap_or(BROKER_DEFAULT_NUM_PARTITIONS);
             topic.num_partitions
         }
         otherwise => otherwise,
@@ -476,6 +485,23 @@ mod tests {
         .expect("two assignments are under the cap");
 
         assert!(matches!(&validated.topics[..], [ValidatedTopic::Valid(_)]));
+    }
+
+    /// Storage creates `num_partitions` partitions and ignores the assignments, so a topic
+    /// with six assignments must reach it asking for six partitions, not the default three.
+    #[test]
+    fn assignments_set_the_partition_count() {
+        let validated = ValidatedCreateTopicsRequest::try_from(
+            CreateTopicsRequest::default().topics(Some(vec![topic("a", -1, -1, 6)])),
+        )
+        .expect("six assignments are under the cap");
+
+        let [ValidatedTopic::Valid(topic)] = &validated.topics[..] else {
+            panic!("a topic with assignments and default counts is valid");
+        };
+
+        assert_eq!(6, topic.num_partitions);
+        assert_eq!(1, topic.replication_factor);
     }
 
     #[test]
