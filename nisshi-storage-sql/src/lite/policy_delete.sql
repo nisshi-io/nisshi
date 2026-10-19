@@ -16,36 +16,34 @@
 with
 
 deletion as (
-    select tp.id as topition
+    select
+    tp.id as topition,
+    coalesce(cast(trim(rt.value) as integer), $3) as retention_ms
     from topition tp
     join topic t on t.id = tp.topic
     join cluster c on t.cluster = c.id
-    join topic_configuration tc on tc.topic = t.id
+    left join topic_configuration cp on cp.topic = t.id and cp.name = 'cleanup.policy'
+    left join topic_configuration rt on rt.topic = t.id and rt.name = 'retention.ms'
     where c.name = $1
-    and tc.name = 'cleanup.policy'
-    and tc.value like '%delete%'
-),
-
-retention as (
-    select tp.id as topition, tc.value
-    from topition tp
-    join topic t on t.id = tp.topic
-    join cluster c on t.cluster = c.id
-    left join topic_configuration tc on tc.topic = t.id
-    where c.name = $1
-    and tc.name = 'retention.ms'
+    -- A topic without a cleanup.policy has Kafka's default policy, delete.
+    and coalesce(cp.value, 'delete') like '%delete%'
+    -- A retention.ms of -1 keeps every record, as in Kafka. The broker rejects a retention.ms that
+    -- isn't a whole number, and a stored one also keeps every record, instead of being cast to 0
+    -- and deleting every record.
+    and case
+        when rt.value is null then 1
+        when (trim(rt.value) glob '[0-9]*' or trim(rt.value) glob '-[0-9]*')
+            and substr(trim(rt.value), 2) not glob '*[^0-9]*'
+            then cast(trim(rt.value) as integer) <> -1
+        else 0
+    end
 ),
 
 ancient as (
-    select tp.id as topition, r.offset_id as offset_id
+    select r.topition, r.offset_id
     from record r
-    join topition tp on tp.id = r.topition
-    join topic t on t.id = tp.topic
-    join cluster c on t.cluster = c.id
-    join deletion del on del.topition = tp.id
-    left join retention ret on ret.topition = tp.id
-    where c.name = $1
-    and $2 - r.timestamp > coalesce(cast(ret.value as integer), $3)
+    join deletion del on del.topition = r.topition
+    where $2 - r.timestamp > del.retention_ms
 )
 
 delete from record
