@@ -658,8 +658,13 @@ impl Frame {
     pub fn response_from_bytes(bytes: impl Buf, api_key: i16, api_version: i16) -> Result<Frame> {
         let start = SystemTime::now();
 
+        // As for a request: no length-prefixed field can claim more than the
+        // frame holds, so bound the decoder to the frame's own length.
+        let message_max_size = bytes.remaining();
+
         let mut reader = bytes.reader();
-        let mut deserializer = Decoder::response(&mut reader, api_key, api_version);
+        let mut deserializer =
+            Decoder::response(&mut reader, api_key, api_version, Some(message_max_size));
         Frame::deserialize(&mut deserializer)
             .inspect(|encoded| debug!(elapsed_millis = Self::elapsed_millis(start)))
     }

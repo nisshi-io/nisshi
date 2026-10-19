@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{assert_matches, io, sync::Arc};
 
 use crate::common::init_tracing;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use nisshi_sans_io::{
     Body, Error, ErrorCode, HeartbeatResponse, JoinGroupResponse, MetadataResponse, Result,
     SyncGroupResponse,
@@ -749,5 +749,43 @@ fn follower_rebalance_in_progress_yields_join() -> Result<(), Error> {
 
     assert_eq!("me", req.member_id);
 
+    Ok(())
+}
+
+/// Characterization test: a `user_data` length claim far beyond the
+/// encoded metadata fails at the end of the input. The consumer codec reads
+/// `user_data` byte by byte, so it never reserves a buffer of the claimed
+/// size, with or without a bound on the decoder.
+#[test]
+fn member_metadata_user_data_claim_beyond_the_input_fails() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let mut encoded = BytesMut::new();
+    encoded.put_i16(0); // version
+    encoded.put_i32(0); // topics: none
+    encoded.put_i32(100_000_000); // user_data length, no bytes behind it
+
+    let err = MemberMetadata::try_from(encoded.freeze())
+        .expect_err("a claimed length beyond the input must be rejected");
+
+    assert_matches!(err, Error::Io(ref io) if io.kind() == io::ErrorKind::UnexpectedEof);
+    Ok(())
+}
+
+/// Characterization test: as for `MemberMetadata`, a `user_data` length
+/// claim beyond the encoded assignment fails at the end of the input.
+#[test]
+fn member_assignment_user_data_claim_beyond_the_input_fails() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let mut encoded = BytesMut::new();
+    encoded.put_i16(0); // version
+    encoded.put_i32(0); // assigned_partitions: none
+    encoded.put_i32(100_000_000); // user_data length, no bytes behind it
+
+    let err = MemberAssignment::try_from(encoded.freeze())
+        .expect_err("a claimed length beyond the input must be rejected");
+
+    assert_matches!(err, Error::Io(ref io) if io.kind() == io::ErrorKind::UnexpectedEof);
     Ok(())
 }

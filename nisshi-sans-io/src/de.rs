@@ -148,7 +148,24 @@ impl<'de> Decoder<'de> {
         }
     }
 
-    pub(crate) fn response(reader: &'de mut dyn Read, api_key: i16, api_version: i16) -> Self {
+    /// Bounds every length-prefixed field this decoder reads to at most
+    /// `message_max_size`, instead of the much larger `MESSAGE_MAX_SIZE`
+    /// fallback. Callers that already hold the whole encoded value in memory
+    /// should pass its length here.
+    #[must_use]
+    pub fn with_message_max_size(self, message_max_size: usize) -> Self {
+        Self {
+            message_max_size: Some(message_max_size),
+            ..self
+        }
+    }
+
+    pub(crate) fn response(
+        reader: &'de mut dyn Read,
+        api_key: i16,
+        api_version: i16,
+        message_max_size: Option<usize>,
+    ) -> Self {
         Self {
             reader,
             containers: VecDeque::with_capacity(PARSE_DEPTH),
@@ -174,7 +191,7 @@ impl<'de> Decoder<'de> {
             in_seq_of_primitive: false,
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
-            message_max_size: None,
+            message_max_size,
         }
     }
 
@@ -1597,7 +1614,7 @@ mod tests {
         // Unsigned varint 1_000_001: the flexible encoding of a length of
         // 1_000_000, because the wire value is the length plus one.
         let mut encoded: &[u8] = &[0xc1, 0x84, 0x3d];
-        let mut decoder = Decoder::response(&mut encoded, 18, 3);
+        let mut decoder = Decoder::response(&mut encoded, 18, 3, None);
         decoder.message_max_size = Some(10);
 
         let err = Deserializer::deserialize_bytes(&mut decoder, UnreachableVisitor)
@@ -1609,6 +1626,21 @@ mod tests {
         );
     }
 
+    /// `with_message_max_size` must bound a decoder built with
+    /// `Decoder::new`, which otherwise falls back to `MESSAGE_MAX_SIZE`.
+    #[test]
+    fn with_message_max_size_bounds_a_new_decoder() {
+        let declared_length = 1_000_000i32;
+        let encoded = declared_length.to_be_bytes();
+        let mut reader: &[u8] = &encoded;
+        let mut decoder = Decoder::new(&mut reader).with_message_max_size(10);
+
+        let err = Deserializer::deserialize_bytes(&mut decoder, UnreachableVisitor)
+            .expect_err("a length over message_max_size must be rejected");
+
+        std::assert_matches!(err, Error::MessageMaxSizeExceeded(1_000_000));
+    }
+
     /// A flexible length prefix of `0` must be rejected with
     /// `Error::Overflow`. Subtracting one from it underflows, and the wrapped
     /// value would size the allocation.
@@ -1617,7 +1649,7 @@ mod tests {
         // Unsigned varint 0: one byte without the continuation bit.
         let mut encoded: &[u8] = &[0];
         // ApiVersionsResponse (api key 18) is flexible from v3.
-        let mut decoder = Decoder::response(&mut encoded, 18, 3);
+        let mut decoder = Decoder::response(&mut encoded, 18, 3, None);
 
         let err = Deserializer::deserialize_bytes(&mut decoder, UnreachableVisitor)
             .expect_err("a zero flexible length must be rejected");

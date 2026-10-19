@@ -33,6 +33,7 @@ pub mod find_coordinator;
 pub mod gap6;
 pub mod proptest;
 pub mod redact;
+pub mod response_length_bound;
 pub mod snappy;
 pub mod topic;
 pub mod version;
