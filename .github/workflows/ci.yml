@@ -230,40 +230,36 @@ jobs:
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
-      # Set on the step, not the job: rust-cache hashes every variable that
-      # starts with RUST into its key, and the jobs that restore this entry
-      # don't set these, so a job-level value would give every job a key of
-      # its own.
       # The two halves of `just test` run as separate steps, because doctests
       # write no JUnit report, so only a step of its own shows a doctest
-      # failure. `--timings` writes the build's cargo-timing.html.
+      # failure. The doctests also run after a nextest failure, so that one
+      # failure does not hide the other. `--timings` writes the build's
+      # cargo-timing.html.
+      #
+      # RUST_BACKTRACE and RUST_LOG are set on each step, not the job:
+      # rust-cache hashes every variable that starts with RUST into its key,
+      # and the jobs that restore this entry don't set these, so a job-level
+      # value would give every job a key of its own.
       - id: nextest
         run: just test-workspace --timings
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
-      - run: just test-doc
+      - if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        run: just test-doc
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
-      # The summary and the reports also cover a run whose tests fail. The
-      # upload continues on error, so an artifact service failure leaves the
-      # job's result as it is.
+      # The reports also cover a run whose tests fail. The step continues on
+      # error and has a timeout, so a report never changes the job's result.
+      # tier-c.yml's `test` job runs the same action.
       - if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
-        env:
-          TITLE: Rust tests (${{ matrix.pg }})
-        run: python3 .github/workflows/scripts/junit-summary.py "$TITLE" target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
-      - if: ${{ !cancelled() }}
         continue-on-error: true
-        timeout-minutes: 2
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 3
+        uses: ./.github/actions/test-reports
         with:
-          name: test-reports-${{ env.PG_IMAGE_DASH }}
-          path: |
-            target/cargo-timings/cargo-timing.html
-            target/nextest/ci/junit.xml
-          if-no-files-found: warn
-          retention-days: 14
+          title: Rust tests (${{ matrix.pg }})
+          artifact-name: test-reports-${{ env.PG_IMAGE_DASH }}
       - run: df -h
         if: always()
       - run: ls -l
@@ -1097,7 +1093,7 @@ jobs:
                     name, conclusion,
                     queued_s: secs(.created_at; .started_at),
                     duration_s: secs(.started_at; .completed_at),
-                    steps: [.steps[] | {name, conclusion, duration_s: secs(.started_at; .completed_at)}]
+                    steps: [(.steps // [])[] | {name, conclusion, duration_s: secs(.started_at; .completed_at)}]
                   }
                 ]}' >timings.json
           jq -r '
@@ -1106,12 +1102,12 @@ jobs:
             "### Job Timings\n",
             "| Job | Result | Queued | Ran |",
             "| --- | --- | --- | --- |",
-            (.jobs | sort_by(-.duration_s)[] | "| \(.name | cell) | \(.conclusion) | \(.queued_s | fmt) | \(.duration_s | fmt) |"),
+            (.jobs | sort_by(.duration_s // 0) | reverse[] | "| \(.name | cell) | \(.conclusion) | \(.queued_s | fmt) | \(.duration_s | fmt) |"),
             "\n### Slowest Steps\n",
             "| Job | Step | Took |",
             "| --- | --- | --- |",
             ([.jobs[] | .name as $job | .steps[] | select(.duration_s != null) | {job: $job, name, duration_s}]
-              | sort_by(-.duration_s) | .[:10][]
+              | sort_by(.duration_s) | reverse | .[:10][]
               | "| \(.job | cell) | \(.name | cell) | \(.duration_s | fmt) |")
           ' timings.json >>"$GITHUB_STEP_SUMMARY"
       - if: ${{ !cancelled() }}

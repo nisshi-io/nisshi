@@ -1,0 +1,32 @@
+name: Test reports
+description: >-
+  Writes a step summary from nextest's JUnit report (results per suite, the
+  slowest tests, and each failure) and uploads the report with
+  cargo-timing.html. Each step continues on error, so a report never changes
+  the job's result.
+inputs:
+  title:
+    description: The heading of the step summary.
+    required: true
+  artifact-name:
+    description: The name of the artifact that holds junit.xml and cargo-timing.html.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Test summary
+      shell: bash
+      continue-on-error: true
+      env:
+        TITLE: ${{ inputs.title }}
+      run: python3 "$GITHUB_ACTION_PATH/junit-summary.py" "$TITLE" target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload test reports
+      continue-on-error: true
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          target/cargo-timings/cargo-timing.html
+          target/nextest/ci/junit.xml
+        if-no-files-found: warn
+        retention-days: 14

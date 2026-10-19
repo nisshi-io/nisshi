@@ -4,6 +4,11 @@ Usage: junit-summary.py TITLE REPORT
 
 Exits with status 1 when REPORT does not exist, after it prints a line that
 says so.
+
+GitHub drops a step summary larger than 1 MiB, so the summary lists at most
+MAX_FAILURES failures, and clips each failure's text to MAX_DETAIL characters.
+A failure's text can hold a backtrace, and a run where a shared service is down
+fails hundreds of tests.
 """
 
 import re
@@ -13,6 +18,8 @@ from pathlib import Path
 
 SLOWEST = 10
 STDERR_LINES = 20
+MAX_FAILURES = 30
+MAX_DETAIL = 4000
 
 
 def seconds(element: ET.Element) -> float:
@@ -28,12 +35,18 @@ def failure_detail(case: ET.Element, element: ET.Element) -> str:
     """
     message = (element.text or element.get("message") or "").strip()
     if message:
+        # A panic message starts with the panic, so this keeps the start.
+        if len(message) > MAX_DETAIL:
+            return f"{message[:MAX_DETAIL]}\n[{len(message) - MAX_DETAIL} more characters in junit.xml]"
         return message
     stderr = (case.findtext("system-err") or "").strip().splitlines()
     lines = [element.get("type") or "failed without a message"]
     if stderr:
-        lines += ["", f"Last {min(len(stderr), STDERR_LINES)} lines of stderr:"]
-        lines += stderr[-STDERR_LINES:]
+        tail = "\n".join(stderr[-STDERR_LINES:])
+        # The end of stderr is closest to the failure, so this keeps the end.
+        if len(tail) > MAX_DETAIL:
+            tail = f"[{len(tail) - MAX_DETAIL} earlier characters in junit.xml]\n{tail[-MAX_DETAIL:]}"
+        lines += ["", f"Last {min(len(stderr), STDERR_LINES)} lines of stderr:", tail]
     return "\n".join(lines)
 
 
@@ -41,6 +54,11 @@ def fence(text: str) -> str:
     """Returns a code fence longer than any run of backticks in `text`."""
     longest = max((len(run) for run in re.findall("`+", text)), default=0)
     return "`" * max(3, longest + 1)
+
+
+def cell(text: str) -> str:
+    """Escapes `|`, which ends a Markdown table cell."""
+    return text.replace("|", "\\|")
 
 
 def duration(total: float) -> str:
@@ -89,19 +107,21 @@ def main() -> int:
     print("| Suite | Passed | Failed | Skipped | Test time |")
     print("| --- | --- | --- | --- | --- |")
     for suite_name, passed, failed, skipped, suite_time in rows:
-        print(f"| {suite_name} | {passed} | {failed} | {skipped} | {duration(suite_time)} |")
+        print(f"| {cell(suite_name)} | {passed} | {failed} | {skipped} | {duration(suite_time)} |")
 
     print("\n### Slowest Tests\n")
     print("| Suite | Test | Time |")
     print("| --- | --- | --- |")
     for suite_name, case_name, case_time in sorted(timings, key=lambda t: -t[2])[:SLOWEST]:
-        print(f"| {suite_name} | {case_name} | {duration(case_time)} |")
+        print(f"| {cell(suite_name)} | {cell(case_name)} | {duration(case_time)} |")
 
     if failures:
         print("\n### Failed Tests\n")
-        for suite_name, case_name, detail in failures:
+        for suite_name, case_name, detail in failures[:MAX_FAILURES]:
             print(f"**{suite_name}**: {case_name}\n")
             print(f"{fence(detail)}text\n{detail}\n{fence(detail)}\n")
+        if len(failures) > MAX_FAILURES:
+            print(f"{len(failures) - MAX_FAILURES} more failed tests are in junit.xml.")
     return 0
 
 
