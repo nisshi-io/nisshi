@@ -994,6 +994,10 @@ mod tests {
         let decoder = BatchDecoder::new(Bytes::from_static(encoded));
         let decoded = Batch::deserialize(decoder)?;
 
+        // The fixture's CRC is the one its encoder wrote, so this pins the
+        // range `computed_crc` covers to the bytes a client sends.
+        assert_eq!(decoded.crc, decoded.computed_crc());
+
         assert_eq!(
             Compression::Gzip,
             Compression::try_from(decoded.attributes)?
@@ -1080,6 +1084,10 @@ mod tests {
 
         let decoder = BatchDecoder::new(Bytes::from_static(encoded));
         let decoded = Batch::deserialize(decoder)?;
+
+        // The fixture's CRC is the one its encoder wrote, so this pins the
+        // range `computed_crc` covers to the bytes a client sends.
+        assert_eq!(decoded.crc, decoded.computed_crc());
 
         assert_eq!(
             Compression::Zstd,
@@ -1174,6 +1182,10 @@ mod tests {
 
         let decoder = BatchDecoder::new(Bytes::from_static(encoded));
         let decoded = Batch::deserialize(decoder)?;
+
+        // The fixture's CRC is the one its encoder wrote, so this pins the
+        // range `computed_crc` covers to the bytes a client sends.
+        assert_eq!(decoded.crc, decoded.computed_crc());
         assert_eq!(Compression::Lz4, Compression::try_from(decoded.attributes)?);
 
         let mut inflated = crate::record::inflated::Batch::try_from(decoded.clone())?;
@@ -1263,6 +1275,10 @@ mod tests {
 
         let decoder = BatchDecoder::new(Bytes::from_static(encoded));
         let decoded = Batch::deserialize(decoder)?;
+
+        // The fixture's CRC is the one its encoder wrote, so this pins the
+        // range `computed_crc` covers to the bytes a client sends.
+        assert_eq!(decoded.crc, decoded.computed_crc());
         assert_eq!(
             Compression::Snappy,
             Compression::try_from(decoded.attributes)?
