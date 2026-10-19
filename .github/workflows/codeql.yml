@@ -98,6 +98,17 @@ jobs:
       contents: read
       actions: read
       security-events: write
+    # The scan skips the test code, which never ships. Each finding there
+    # blocks a merge until someone dismisses it, and `rust/cleartext-logging`
+    # reports each Kafka API key, the number of a request type, as a
+    # credential.
+    #
+    # The extractor turns on `cfg(test)` by default, and `-test` turns it off,
+    # so the scan leaves out each inline `#[cfg(test)]` module. With
+    # `build-mode: none` the extractor runs in the `analyze` step, so the job
+    # sets the variable instead of the `init` step.
+    env:
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: "-test"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -106,10 +117,8 @@ jobs:
         with:
           languages: rust
           build-mode: none
-          # The scan skips the test code, which never ships. Each finding there
-          # blocks a merge until someone dismisses it, and
-          # `rust/cleartext-logging` reports each Kafka API key, the number of
-          # a request type, as a credential.
+          # `paths-ignore` matches whole files, so it leaves out the test
+          # files that `cfg(test)` does not gate.
           config: |
             paths-ignore:
               - "**/tests/**"
