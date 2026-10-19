@@ -46,6 +46,9 @@ jobs:
       # The `changes` jobs run the base branch's copy of ci-changes.sh, so a
       # PR's edit to it is only tested here.
       - run: bash .github/scripts/ci-changes.test.sh
+      # release.yml runs check-release-tag.sh only on a `v*` tag, so a PR's
+      # edit to it is only tested here, before a release depends on it.
+      - run: bash .github/scripts/check-release-tag.test.sh
 
   zizmor:
     runs-on: ubuntu-latest

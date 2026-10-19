@@ -3,8 +3,11 @@ name: release
 # The only workflow a `v*` tag runs. It calls ci.yml for the build and every
 # test, then publishes in order: the version tags on the image, the tarballs
 # on the GitHub release, then the crates. Each step needs the one before, and
-# the first needs `ci` and `on-main`, so a red run publishes nothing. A check
-# that must also pass before a release goes in publish-image's `needs`.
+# the first needs `ci`, `on-main` and `release-tag`, so a red run publishes
+# nothing. A check that must also pass before a release goes in
+# publish-image's `needs`. This workflow creates the GitHub release without a
+# body. The /cut-release skill drafts the body from CHANGELOG.md after the run
+# and sets it with `gh release edit`.
 #
 # The file name stays release.yml: the crates.io trusted publisher is bound
 # to it.
@@ -51,11 +54,23 @@ jobs:
             *) echo "::error::${GITHUB_REF} is at ${GITHUB_SHA}, which is not on main (${status}); nothing is published"; exit 1 ;;
           esac
 
+  # Fails a tag whose version differs from the tagged commit's Cargo.toml
+  # version, and a stable tag whose CHANGELOG.md section is missing or empty.
+  # See .github/scripts/check-release-tag.sh.
+  release-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/check-release-tag.sh "${GITHUB_REF_NAME}"
+
   # The multi-arch image, built from the binaries smoke tested by the same
   # action as tier-c.yml's `edge-publish`, tagged with the version. `latest` comes with the
   # semver tags, for a tag that isn't a prerelease.
   publish-image:
-    needs: [ci, on-main]
+    needs: [ci, on-main, release-tag]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

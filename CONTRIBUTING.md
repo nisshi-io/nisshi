@@ -80,6 +80,17 @@ type(scope): summary
 - GitHub's Revert button titles its pull request `Revert "<title>"`, which
   fails the check. Retitle it `revert: <title>`.
 
+## Releases
+
+Maintainers cut a release with the `/cut-release X.Y.Z` Claude Code skill
+(`.claude/skills/cut-release/`). The skill opens a release PR that bumps the
+version and adds a `CHANGELOG.md` section for every commit since the previous
+stable tag. After that PR merges, the skill tags its commit on `main`. The
+release workflow refuses a tag whose version differs from `Cargo.toml`, and a
+stable tag that has no `CHANGELOG.md` section. A pre-release
+(`/cut-release X.Y.Z-pre.N`) only bumps the version and has no changelog
+section of its own. The next stable section covers its changes.
+
 ## Sign off your commits (DCO)
 
 This project's contributor-agreement position is the Developer Certificate
