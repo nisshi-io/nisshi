@@ -22,8 +22,9 @@ jobs:
   ci:
     # A called workflow's jobs can't hold more than this job grants, so this
     # lists every permission a ci.yml job declares: `changes` reads the PR
-    # files.
+    # files, and ci-gate lists the run's jobs for its timings.
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     uses: ./.github/workflows/ci.yml

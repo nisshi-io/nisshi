@@ -114,10 +114,31 @@ jobs:
         with:
           tool: cargo-nextest@0.9.146
       # Set on the step, as in ci.yml: the cache key hashes `RUST*` variables.
-      - run: just test
+      # The test, summary and report steps match ci.yml's `test` job.
+      - id: nextest
+        run: just test-workspace --timings
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
+      - run: just test-doc
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
+      - if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        env:
+          TITLE: Rust tests (${{ matrix.pg }})
+        run: python3 .github/workflows/scripts/junit-summary.py "$TITLE" target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
+      - if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports-${{ env.PG_IMAGE_DASH }}
+          path: |
+            target/cargo-timings/cargo-timing.html
+            target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
       - run: df -h
         if: always()
       - run: tar --create --verbose --gzip --file="logs-${PG_IMAGE_DASH}.tar.gz" logs
