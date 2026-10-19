@@ -341,7 +341,15 @@ pub trait IntoVersion {
 pub enum Error {
     ApiError(ErrorCode),
     EnvVar(VarError),
-    FromUtf8(string::FromUtf8Error),
+    /// A string field of `len` bytes is not valid UTF-8.
+    ///
+    /// The error keeps the field's length and the position of the invalid
+    /// sequence, not its bytes: the field comes from the client and can be as
+    /// large as a frame, and this error is logged.
+    FromUtf8 {
+        len: usize,
+        error: str::Utf8Error,
+    },
     InvalidAckValue(i16),
     InvalidConsumerProtocolSubscriptionVersion(i16),
     InvalidCoordinatorType(i8),
@@ -386,6 +394,9 @@ impl Display for Error {
             Error::Message(e) => f.write_str(e),
             Error::MessageMaxSizeExceeded(size) => {
                 write!(f, "message of {size} bytes exceeds the maximum size")
+            }
+            Error::FromUtf8 { len, error } => {
+                write!(f, "string of {len} bytes is not valid UTF-8: {error}")
             }
             e => write!(f, "{e:?}"),
         }
@@ -447,7 +458,10 @@ impl From<str::Utf8Error> for Error {
 
 impl From<string::FromUtf8Error> for Error {
     fn from(value: string::FromUtf8Error) -> Self {
-        Self::FromUtf8(value)
+        Self::FromUtf8 {
+            len: value.as_bytes().len(),
+            error: value.utf8_error(),
+        }
     }
 }
 

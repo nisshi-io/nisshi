@@ -24,6 +24,7 @@ pub mod cg_static;
 pub mod consumer_group_describe;
 pub mod create_topics;
 pub mod create_topics_validate_only;
+pub mod decode_error_log;
 pub mod delete_groups;
 pub mod delete_records;
 pub mod delete_topics;

@@ -214,7 +214,12 @@ where
         let api_key = req.frame.api_key()?;
 
         let Some(service) = self.routes.get(&api_key) else {
-            return Err(E::from(Error::UnknownServiceFrame(Box::new(req.frame))));
+            return Err(E::from(Error::UnknownServiceFrame {
+                api_key,
+                api_version: req.frame.api_version()?,
+                correlation_id: req.frame.correlation_id()?,
+                size: req.frame.size,
+            }));
         };
 
         let api_version = req.frame.api_version()?;

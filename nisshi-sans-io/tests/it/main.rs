@@ -23,6 +23,7 @@ pub mod codec;
 pub mod consumer;
 pub mod create_topics;
 pub mod decode;
+pub mod decode_error_log;
 pub mod describe_configs;
 pub mod describe_topic_partitions;
 pub mod doctest;
