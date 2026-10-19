@@ -155,7 +155,10 @@ use std::{
 use tracing::{debug, error, instrument, warn};
 use tracing_subscriber::filter::ParseError;
 
-pub use input::{BodyInput, BytesInput, FrameInput, RequestInput, SuppressResponseExtension};
+pub use input::{
+    BodyInput, BytesInput, CloseAfterResponseExtension, FrameInput, RequestInput,
+    SuppressResponseExtension,
+};
 
 /// The null topic identifier.
 pub const NULL_TOPIC_ID: [u8; 16] = [0; 16];

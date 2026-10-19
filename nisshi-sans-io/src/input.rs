@@ -196,3 +196,37 @@ impl SuppressResponseExtension {
             .is_some_and(|marker| marker.0.swap(false, Ordering::AcqRel))
     }
 }
+
+/// Marks that the connection must close once the response to its in-flight
+/// request is written.
+///
+/// A handler sets the flag when the protocol requires the broker to answer a
+/// request and then end the connection, as Kafka does for a SaslHandshake that
+/// asks for a mechanism the broker has not enabled. The connection's
+/// request/response loop inserts one marker into the connection's own
+/// [`Extensions`] store before the first request, writes the response, and then
+/// reads and clears the marker with [`Self::take`]. It follows the same rules
+/// as [`SuppressResponseExtension`]: a handler sets the flag and never inserts
+/// the marker.
+#[derive(Clone, Debug, Default, Extension)]
+pub struct CloseAfterResponseExtension(Arc<AtomicBool>);
+
+impl CloseAfterResponseExtension {
+    /// Marks the connection to close after the in-flight request's response.
+    ///
+    /// Does nothing when `extensions` has no marker, because then no
+    /// connection loop owns the connection.
+    pub fn mark(extensions: &Extensions) {
+        if let Some(marker) = extensions.get_ref::<Self>() {
+            marker.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Reads and clears the marker, reporting whether it was set.
+    #[must_use]
+    pub fn take(extensions: &Extensions) -> bool {
+        extensions
+            .get_ref::<Self>()
+            .is_some_and(|marker| marker.0.swap(false, Ordering::AcqRel))
+    }
+}

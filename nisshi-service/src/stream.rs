@@ -24,7 +24,7 @@ use std::{
 use bytes::Bytes;
 use nanoid::nanoid;
 use nisshi_auth::AuthenticationExtension;
-use nisshi_sans_io::{BytesInput, SuppressResponseExtension};
+use nisshi_sans_io::{BytesInput, CloseAfterResponseExtension, SuppressResponseExtension};
 use opentelemetry::KeyValue;
 use rama::{
     Layer, Service,
@@ -1081,12 +1081,23 @@ where
         // stays on this connection.
         let extensions = req.extensions().fork();
         _ = extensions.insert(SuppressResponseExtension::default());
+        _ = extensions.insert(CloseAfterResponseExtension::default());
 
         loop {
             let attributes = attributes.clone();
 
             self.req(&mut req, &extensions, limits, &attributes[..])
-                .await?
+                .await?;
+
+            // The response is already written and flushed, so the peer gets it
+            // before the shutdown's FIN (over TLS, before `close_notify` and the
+            // FIN). A peer that has already hung up fails the shutdown, which
+            // changes nothing: the connection is over either way.
+            if CloseAfterResponseExtension::take(&extensions) {
+                debug!("closing the connection after the response");
+                _ = req.shutdown().await;
+                return Ok(());
+            }
         }
     }
 }
