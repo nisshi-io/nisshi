@@ -42,10 +42,10 @@ just cargo-fuzz run fuzz_varint          # a target with no time limit
 
 ## When CI finds something
 
-Crashing, hanging (over 25s on one input) and out-of-memory (over 2 GB) inputs are written to `artifacts/<target>/` and uploaded as the `fuzz-artifacts-pr` or `fuzz-artifacts-<target>` artifact on the failed run. Download it and replay the input:
+Crashing, hanging (over 25s on one input) and out-of-memory (over 2 GB) inputs are written to `artifacts/<target>/` and uploaded as the `fuzz-artifacts-pr` or `fuzz-artifacts-<target>` artifact on the failed run. Download it and replay the input through the `cargo-fuzz` recipe, which builds without LTO, as CI does:
 
 ```shell
-cargo +nightly fuzz run <target> path/to/crash-<hash>
+just cargo-fuzz run <target> path/to/crash-<hash>
 ```
 
 ## Corpus

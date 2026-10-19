@@ -151,15 +151,15 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 The `fuzz` crate (`cargo-fuzz` + `libfuzzer-sys`) is a dev-only workspace member, excluded from `just test-workspace`. CI runs its targets through `fuzz.yml` (see CI Pipeline below), and you can run any of them locally. It requires the nightly toolchain, which `just` targets invoke explicitly (`cargo +nightly fuzz ...`); you don't need to switch your default toolchain.
 
 ```shell
-just cargo-fuzz +args        # thin wrapper: cargo +nightly fuzz {{args}}
+just cargo-fuzz +args        # cargo +nightly fuzz {{args}}, with LTO off as in fuzz-ci
 just fuzz-request-decode     # fuzz_request_decode, 60s
 just fuzz-member-metadata    # fuzz_member_metadata, 60s
 just fuzz-generate-seed      # (re)generate the corpus seed files, see below
 just fuzz-ci <tier> [target]  # the targets of a tier in fuzz/ci-targets.json, each for its budget
 
 cargo +nightly fuzz list                             # list all targets
-cargo +nightly fuzz run <target> -- -max_total_time=60   # fuzz one target
-cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>  # replay a saved crash
+just cargo-fuzz run <target> -- -max_total_time=60      # fuzz one target
+just cargo-fuzz run <target> fuzz/artifacts/<target>/<crash-file>     # replay a saved crash
 ```
 
 Three target shapes, all in `fuzz/fuzz_targets/`:
@@ -169,7 +169,7 @@ Three target shapes, all in `fuzz/fuzz_targets/`:
 
 `fuzz/src/lib.rs` provides the shared `check_request`/`check_response` helpers used by most storage targets: they encode a value at its API's latest version, decode it, re-encode the decoded value, and decode again — then assert the two decodes are equal. They deliberately do **not** assert the first decode equals the original fuzzed value: a sans-io codec is not required to be lossless against an arbitrary in-memory value (e.g. every generated sequence field is `Option<Vec<T>>` regardless of wire nullability, so a mandatory array left at `None` is wire-equivalent to `Some(vec![])` but not `PartialEq`). The round-trip property that must hold is that re-encoding an already-decoded (version-normalized) value decodes back to exactly the same thing. `normalize_request` returns that decoded value as a typed request, so a target can serve the service what a client could actually send instead of the raw fuzzed value (`fuzz_list_offsets_storage` does).
 
-`fuzz/corpus/`, `fuzz/artifacts/` (crash reproducers) and `fuzz/.gitignore`'s `target`/`coverage` are all untracked — rebuild the corpus locally with `just fuzz-generate-seed` plus whatever `cargo +nightly fuzz run` accumulates. If you fix a bug found by fuzzing, replay every existing artifact for that target (`cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>`) to confirm the fix, not just the one input that was being worked on.
+`fuzz/corpus/`, `fuzz/artifacts/` (crash reproducers) and `fuzz/.gitignore`'s `target`/`coverage` are all untracked — rebuild the corpus locally with `just fuzz-generate-seed` plus whatever `cargo +nightly fuzz run` accumulates. If you fix a bug found by fuzzing, replay every existing artifact for that target (`just cargo-fuzz run <target> fuzz/artifacts/<target>/<crash-file>`) to confirm the fix, not just the one input that was being worked on.
 
 ## CI Pipeline
 
