@@ -77,7 +77,6 @@ docker_postgres() {
     docker rm -f nisshi-omb-postgres >/dev/null 2>&1 || true
     docker run -d --name nisshi-omb-postgres -p "127.0.0.1:$pg_port:5432" \
         -e POSTGRES_PASSWORD=postgres -e PGUSER=postgres \
-        -v "$root/etc/initdb.d:/docker-entrypoint-initdb.d:ro" \
         --health-cmd=pg_isready --health-interval=2s --health-retries=30 \
         postgres:18 postgres ${args[@]+"${args[@]}"} >/dev/null
     until [[ "$(docker inspect -f '{{.State.Health.Status}}' nisshi-omb-postgres)" == healthy ]]; do sleep 1; done
@@ -110,7 +109,6 @@ EOF
     psql -c "create tablespace benchmark_temp location '$pg_dir/temp'" \
         -c "alter system set temp_tablespaces = 'benchmark_temp'" \
         -c "select pg_reload_conf()" >/dev/null
-    psql -f "$root/etc/initdb.d/010-schema.sql" >/dev/null
 }
 
 stop_local_postgres() {
