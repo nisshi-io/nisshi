@@ -19,7 +19,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, authorized_operations};
 
 /// A [`Service`] using its [`Storage`] taking [`DescribeGroupsRequest`] returning [`DescribeGroupsResponse`].
 /// ```no_run
@@ -78,17 +78,26 @@ where
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
+        let include_authorized_operations =
+            input.request.include_authorized_operations.unwrap_or(false);
 
         self.storage
             .describe_groups(
                 input.request.groups.as_deref(),
-                input.request.include_authorized_operations.unwrap_or(false),
+                include_authorized_operations,
             )
             .await
             .map(|described| {
                 described
                     .iter()
                     .map(DescribedGroup::from)
+                    .map(|group| {
+                        let operations = authorized_operations::group(
+                            include_authorized_operations,
+                            group.error_code,
+                        );
+                        group.authorized_operations(Some(operations))
+                    })
                     .collect::<Vec<_>>()
             })
             .map(Some)

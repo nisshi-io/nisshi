@@ -191,6 +191,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod assignment;
+mod authorized_operations;
 mod batch;
 pub mod config;
 mod inflate;
@@ -1201,7 +1202,7 @@ impl From<&GroupDetail> for consumer_group_describe_response::DescribedGroup {
             .assignment_epoch(-1)
             .assignor_name(assignor_name)
             .members(Some([].into()))
-            .authorized_operations(-1)
+            .authorized_operations(authorized_operations::OMITTED)
     }
 }
 
@@ -1260,7 +1261,7 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
                     .assignment_epoch(-1)
                     .assignor_name(assignor_name)
                     .members(Some([].into()))
-                    .authorized_operations(-1)
+                    .authorized_operations(authorized_operations::OMITTED)
             }
 
             NamedGroupDetail {
@@ -1275,7 +1276,7 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
                 .assignment_epoch(-1)
                 .assignor_name("".into())
                 .members(Some([].into()))
-                .authorized_operations(-1),
+                .authorized_operations(authorized_operations::OMITTED),
         }
     }
 }
@@ -1310,7 +1311,7 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                     .protocol_type(group_detail.state.protocol_type().unwrap_or_default())
                     .protocol_data("".into())
                     .members(Some(members))
-                    .authorized_operations(Some(-1))
+                    .authorized_operations(Some(authorized_operations::OMITTED))
             }
 
             NamedGroupDetail {
@@ -1323,7 +1324,7 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                 .protocol_type("".into())
                 .protocol_data("".into())
                 .members(Some(vec![]))
-                .authorized_operations(Some(-1)),
+                .authorized_operations(Some(authorized_operations::OMITTED)),
         }
     }
 }
