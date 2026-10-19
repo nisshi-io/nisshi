@@ -14,6 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod produce_acks_zero;
 pub mod sasl;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a

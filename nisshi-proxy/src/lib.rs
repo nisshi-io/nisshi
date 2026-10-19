@@ -51,10 +51,12 @@ use tracing_subscriber::filter::ParseError;
 use url::Url;
 
 use crate::{
+    acks_zero::AcksZeroLayer,
     produce::BatchProduceLayer,
     topic::{ResourceConfig, ResourceConfigValue, ResourceConfigValueMatcher, TopicConfigLayer},
 };
 
+mod acks_zero;
 mod produce;
 mod sasl;
 mod topic;
@@ -125,7 +127,7 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
     )
 });
 
-/// The maximum number of connections from the proxy to its origin.
+/// The default maximum number of connections from the proxy to its origin.
 ///
 /// Every client of the proxy shares these connections, and the origin holds a fetch or a
 /// JoinGroup on its connection until it answers. So the pool needs about one connection
@@ -139,6 +141,7 @@ pub struct Proxy {
     listener: Url,
     advertised_listener: Url,
     origin: Url,
+    origin_pool_max_size: usize,
 }
 
 impl Proxy {
@@ -147,6 +150,16 @@ impl Proxy {
             listener,
             advertised_listener,
             origin,
+            origin_pool_max_size: ORIGIN_POOL_MAX_SIZE,
+        }
+    }
+
+    /// Returns a proxy with the given origin pool maximum size: the most connections
+    /// that the proxy opens to its origin, by default 256.
+    pub fn origin_pool_max_size(self, origin_pool_max_size: usize) -> Self {
+        Self {
+            origin_pool_max_size,
+            ..self
         }
     }
 
@@ -166,7 +179,7 @@ impl Proxy {
 
         let pool = ConnectionManager::builder(self.origin.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
-            .max_size(ORIGIN_POOL_MAX_SIZE)
+            .max_size(self.origin_pool_max_size)
             .build()
             .await
             .inspect(|pool| debug!(?pool))?;
@@ -308,6 +321,7 @@ impl Proxy {
             FrameApiKeyMatcher(ProduceRequest::KEY),
             (
                 FrameRequestLayer::<ProduceRequest>::new(),
+                AcksZeroLayer,
                 TopicConfigLayer::new(
                     configuration.clone(),
                     MapInputLayer::new(|input: RequestInput<DescribeConfigsRequest>| input.request)
