@@ -16,7 +16,9 @@
 //! On a broker with `--authentication`, a client that can't log in can't do anything, and a broker
 //! that lets in a client with a wrong password or none protects nothing.
 
-/// Creating and describing users, on a broker that doesn't require a login.
+/// Creating and describing users, on a broker that doesn't require a login. Only PostgreSQL and
+/// SQLite store users: the other engines answer each user with an error.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod user_creation {
     use nisshi_smoke_test::{KafkaCli, ScramMechanism, unique};
 

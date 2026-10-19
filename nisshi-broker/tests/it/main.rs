@@ -17,6 +17,7 @@ mod common;
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
 pub mod auth;
+pub mod authentication_storage;
 pub mod cg;
 pub mod cg_dynamic;
 pub mod cg_latency;
@@ -85,6 +86,7 @@ pub mod traceforge_offset_commit;
 pub mod traceforge_produce_idempotent;
 pub mod traceforge_produce_object_store_fault;
 pub mod txn;
+#[cfg(feature = "libsql")]
 pub mod unauthenticated;
 pub mod update_group_conditional;
 pub mod version_gate;

@@ -132,6 +132,12 @@ async fn main() -> Result<ErrorCode> {
                         _ => error!("storage {storage} failed its schema setup: {source}"),
                     },
                 },
+                nisshi_broker::Error::Storage(
+                    nisshi_storage::Error::AuthenticationUnsupported { engine, supported },
+                ) => error!(
+                    "{}",
+                    nisshi_storage::authentication_unsupported_message(engine, supported)
+                ),
                 nisshi_broker::Error::InvalidStorageOptionValue { option, value } => error!(
                     "storage option {option}={value} is not a valid interval: give a non-zero \
                     duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"

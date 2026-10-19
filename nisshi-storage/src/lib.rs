@@ -243,6 +243,20 @@ pub enum Error {
 
     Api(ErrorCode),
 
+    /// The broker was asked for `--authentication` on the `engine` storage engine, which can't
+    /// store SCRAM credentials. `supported` names the storage engines of this build that can,
+    /// and is empty when there are none. See [`authentication_unsupported_message`].
+    AuthenticationUnsupported {
+        engine: &'static str,
+        supported: Vec<&'static str>,
+    },
+
+    /// The `engine` storage engine can't store SCRAM credentials, so a credential upsert or
+    /// deletion changed nothing. See [`user_credentials_unsupported_message`].
+    UserCredentialsUnsupported {
+        engine: &'static str,
+    },
+
     /// An `acks=0` Produce request had at least one non-`None` error code
     /// among its partition responses. The client reads no response either
     /// way under `acks=0`, so the caller closes the connection instead of
@@ -1536,6 +1550,15 @@ pub struct StorageFactoryConfiguration {
 pub trait StorageFactory: Debug + Send + Sync + 'static {
     fn scheme(&self) -> Result<Regex>;
 
+    /// The engine's name for people, with its URL scheme, e.g. `PostgreSQL (postgres://)`.
+    fn name(&self) -> &'static str;
+
+    /// Whether the engine stores SCRAM credentials, so that a broker on it can require
+    /// authentication. An engine that can't must fail
+    /// [`Storage::upsert_user_scram_credential`] and [`Storage::delete_user_scram_credential`]
+    /// instead of reporting success.
+    fn stores_user_credentials(&self) -> bool;
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage>;
 }
 
@@ -2443,6 +2466,7 @@ pub struct Builder<N, C, A, S> {
     schema_registry: Option<Registry>,
     lake_house: Option<House>,
     silent: bool,
+    user_credentials_required: bool,
 
     cancellation: CancellationToken,
 
@@ -2479,6 +2503,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2493,6 +2518,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2507,6 +2533,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2523,6 +2550,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2556,6 +2584,16 @@ impl<N, C, A, S> Builder<N, C, A, S> {
 
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    /// When `true`, [`build`](Builder::build) fails with [`Error::AuthenticationUnsupported`]
+    /// if the storage engine can't store SCRAM credentials, before it connects to the storage.
+    /// A broker that requires authentication sets it.
+    pub fn user_credentials_required(self, user_credentials_required: bool) -> Self {
+        Self {
+            user_credentials_required,
+            ..self
+        }
     }
 
     pub fn with_factory(&mut self, factory: ArcDynStorageFactory) {
@@ -2595,6 +2633,18 @@ impl Builder<i32, String, Url, Url> {
             });
         };
 
+        if self.user_credentials_required && !factory.stores_user_credentials() {
+            return Err(Error::AuthenticationUnsupported {
+                engine: factory.name(),
+                supported: self
+                    .factories
+                    .iter()
+                    .filter(|factory| factory.stores_user_credentials())
+                    .map(|factory| factory.name())
+                    .collect(),
+            });
+        }
+
         let silent = self.silent;
         let redacted = redact_url(&self.storage);
 
@@ -2630,6 +2680,36 @@ impl Builder<i32, String, Url, Url> {
 
         Ok(storage)
     }
+}
+
+/// The message for [`Error::AuthenticationUnsupported`]: `engine` can't store SCRAM users,
+/// and `supported` names the engines of this build that can.
+pub fn authentication_unsupported_message(engine: &str, supported: &[&str]) -> String {
+    let choices = match supported.split_last() {
+        None => {
+            return format!(
+                "the {engine} storage engine can't store SCRAM users, which --authentication \
+                needs, and this build has no storage engine that can: rebuild with the libsql or \
+                postgres feature, or start without --authentication"
+            );
+        }
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    };
+
+    format!(
+        "the {engine} storage engine can't store SCRAM users, which --authentication needs: use \
+        {choices}, or start without --authentication"
+    )
+}
+
+/// The per-user message that AlterUserScramCredentials answers for
+/// [`Error::UserCredentialsUnsupported`].
+pub fn user_credentials_unsupported_message(engine: &str) -> String {
+    format!(
+        "The {engine} storage engine can't store SCRAM credentials, so nothing was changed. \
+        SCRAM users need PostgreSQL or SQLite storage."
+    )
 }
 
 pub static METER: LazyLock<Meter> = LazyLock::new(|| {
@@ -2671,6 +2751,35 @@ mod tests {
     use std::{fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn authentication_unsupported_message_names_the_engines_that_can() {
+        assert_eq!(
+            "the in-memory (memory://) storage engine can't store SCRAM users, which \
+            --authentication needs: use SQLite (sqlite://) or PostgreSQL (postgres://), or start \
+            without --authentication",
+            authentication_unsupported_message(
+                "in-memory (memory://)",
+                &["SQLite (sqlite://)", "PostgreSQL (postgres://)"]
+            )
+        );
+
+        assert_eq!(
+            "the S3 (s3://) storage engine can't store SCRAM users, which --authentication needs: \
+            use A, B or C, or start without --authentication",
+            authentication_unsupported_message("S3 (s3://)", &["A", "B", "C"])
+        );
+    }
+
+    #[test]
+    fn authentication_unsupported_message_without_an_engine_that_can() {
+        assert_eq!(
+            "the in-memory (memory://) storage engine can't store SCRAM users, which \
+            --authentication needs, and this build has no storage engine that can: rebuild with \
+            the libsql or postgres feature, or start without --authentication",
+            authentication_unsupported_message("in-memory (memory://)", &[])
+        );
+    }
 
     #[test]
     fn topition_from_str() -> Result<()> {

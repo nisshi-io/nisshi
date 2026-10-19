@@ -30,6 +30,10 @@ use tracing::{debug, warn};
 
 use crate::{dynostore::DynoStore, gcs::limit::PutRateLimiter};
 
+const MEMORY: &str = "in-memory (memory://)";
+const S3: &str = "S3 (s3://)";
+const GCS: &str = "Google Cloud Storage (gs://)";
+
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryEngineFactory;
 
@@ -37,6 +41,15 @@ pub struct MemoryEngineFactory;
 impl StorageFactory for MemoryEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"memory").map_err(Into::into)
+    }
+
+    fn name(&self) -> &'static str {
+        MEMORY
+    }
+
+    /// Not yet: DynoStore keeps no SCRAM credentials.
+    fn stores_user_credentials(&self) -> bool {
+        false
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
@@ -48,6 +61,7 @@ impl StorageFactory for MemoryEngineFactory {
                 configuration.node_id,
                 InMemory::new(),
             )?
+            .engine(MEMORY)
             .advertised_listener(configuration.advertised_listener.clone())
             .schemas(configuration.schema_registry)
             .lake(configuration.lake_house.clone()),
@@ -62,6 +76,15 @@ pub struct S3OptimisticConcurrencyEngineFactory;
 impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"s3").map_err(Into::into)
+    }
+
+    fn name(&self) -> &'static str {
+        S3
+    }
+
+    /// Not yet: DynoStore keeps no SCRAM credentials.
+    fn stores_user_credentials(&self) -> bool {
+        false
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
@@ -132,6 +155,7 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             configuration.node_id,
             object_store,
         )?
+        .engine(S3)
         .advertised_listener(configuration.advertised_listener.clone())
         .schemas(configuration.schema_registry)
         .lake(configuration.lake_house.clone());
@@ -166,6 +190,15 @@ pub struct GoogleCloudStorageEngineFactory;
 impl StorageFactory for GoogleCloudStorageEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"gs").map_err(Into::into)
+    }
+
+    fn name(&self) -> &'static str {
+        GCS
+    }
+
+    /// Not yet: DynoStore keeps no SCRAM credentials.
+    fn stores_user_credentials(&self) -> bool {
+        false
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
@@ -222,6 +255,7 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
                 )
                 .map(|storage| {
                     storage
+                        .engine(GCS)
                         .advertised_listener(configuration.advertised_listener.clone())
                         .schemas(configuration.schema_registry)
                         .lake(configuration.lake_house.clone())

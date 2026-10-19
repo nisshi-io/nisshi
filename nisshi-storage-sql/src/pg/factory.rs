@@ -33,6 +33,14 @@ impl StorageFactory for PostgresFactory {
         Regex::new(r"postgres|postgresql").map_err(Into::into)
     }
 
+    fn name(&self) -> &'static str {
+        "PostgreSQL (postgres://)"
+    }
+
+    fn stores_user_credentials(&self) -> bool {
+        true
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
         let storage = Postgres::builder(configuration.storage.to_string().as_str())
             .map(|builder| builder.cluster(&configuration.cluster))

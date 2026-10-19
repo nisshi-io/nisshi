@@ -147,36 +147,12 @@ pub(crate) async fn storage_container(
         }
 
         StorageType::Lite => {
-            let relative = thread::current()
-                .name()
-                .ok_or(Error::Message(String::from("unnamed thread")))
-                .map(|name| format!("../logs/{}/{name}.db", env!("CARGO_PKG_NAME")))?;
-
-            let mut path = env::current_dir()?;
-            path.push(relative);
-            debug!(?path);
-
-            match remove_file(path).await {
-                Ok(_) => Ok(()),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-                otherwise @ Err(_) => otherwise,
-            }?;
-
             builder
                 .cluster_id(cluster.clone())
                 .node_id(node)
                 .advertised_listener(advertised_listener)
                 .schema_registry(schemas)
-                .storage(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .map(|name| {
-                            format!("sqlite://../logs/{}/{name}.db", env!("CARGO_PKG_NAME"))
-                        })
-                        .inspect(|url| debug!(url))
-                        .and_then(|url| Url::parse(&url).map_err(Into::into))?,
-                )
+                .storage(lite_url().await?)
                 .build()
                 .await
         }
@@ -236,6 +212,29 @@ pub(crate) async fn storage_container(
     register_broker(cluster, node, &storage).await?;
 
     Ok(storage)
+}
+
+/// A `sqlite://` URL for this test thread's own database file, which is removed first, so
+/// that each test starts with an empty database.
+pub(crate) async fn lite_url() -> Result<Url> {
+    let name = thread::current()
+        .name()
+        .map(String::from)
+        .ok_or(Error::Message(String::from("unnamed thread")))?;
+
+    let mut path = env::current_dir()?;
+    path.push(format!("../logs/{}/{name}.db", env!("CARGO_PKG_NAME")));
+    debug!(?path);
+
+    match remove_file(path).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        otherwise @ Err(_) => otherwise,
+    }?;
+
+    let url = format!("sqlite://../logs/{}/{name}.db", env!("CARGO_PKG_NAME"));
+    debug!(url);
+    Url::parse(&url).map_err(Into::into)
 }
 
 pub(crate) async fn memory_storage(

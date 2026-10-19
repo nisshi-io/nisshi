@@ -82,6 +82,9 @@ impl Engine {
     }
 }
 
+/// The engine's name for people.
+pub(crate) const NAME: &str = "null (null://)";
+
 const FEATURE: &str = "storage";
 const MESSAGE: &str = "storage has not been defined";
 
@@ -546,10 +549,7 @@ impl Storage for Engine {
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<()> {
-        Err(Error::FeatureNotEnabled {
-            feature: FEATURE.into(),
-            message: MESSAGE.into(),
-        })
+        Err(Error::UserCredentialsUnsupported { engine: NAME })
     }
 
     #[instrument(skip(_credential), ret)]
@@ -559,10 +559,7 @@ impl Storage for Engine {
         _mechanism: ScramMechanism,
         _credential: ScramCredential,
     ) -> Result<()> {
-        Err(Error::FeatureNotEnabled {
-            feature: FEATURE.into(),
-            message: MESSAGE.into(),
-        })
+        Err(Error::UserCredentialsUnsupported { engine: NAME })
     }
 
     #[instrument(ret)]

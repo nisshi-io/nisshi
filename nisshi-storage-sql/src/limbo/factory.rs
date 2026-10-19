@@ -31,6 +31,15 @@ impl StorageFactory for LimboFactory {
         Regex::new(r"turso").map_err(Into::into)
     }
 
+    fn name(&self) -> &'static str {
+        "Turso (turso://)"
+    }
+
+    /// Not yet: the Turso engine's SCRAM credential methods are unimplemented.
+    fn stores_user_credentials(&self) -> bool {
+        false
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
         reject_unrecognized_options(&configuration.storage, &[])?;
 

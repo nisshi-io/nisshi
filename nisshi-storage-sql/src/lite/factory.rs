@@ -29,6 +29,14 @@ impl StorageFactory for LiteFactory {
         Regex::new(r"sqlite").map_err(Into::into)
     }
 
+    fn name(&self) -> &'static str {
+        "SQLite (sqlite://)"
+    }
+
+    fn stores_user_credentials(&self) -> bool {
+        true
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
         reject_unrecognized_options(
             &configuration.storage,

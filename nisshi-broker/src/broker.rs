@@ -959,6 +959,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .storage(storage)
             .cancellation(self.cancellation.clone())
             .silent(self.silent)
+            .user_credentials_required(self.authentication)
             .build()
             .await
             .map(|storage| Arc::new(storage) as ArcDynStorage)?;

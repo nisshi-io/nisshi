@@ -29,6 +29,15 @@ impl StorageFactory for EngineFactory {
         Regex::new(r"null").map_err(Into::into)
     }
 
+    fn name(&self) -> &'static str {
+        crate::NAME
+    }
+
+    /// The null engine stores nothing.
+    fn stores_user_credentials(&self) -> bool {
+        false
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
         reject_unrecognized_options(&configuration.storage, &[])?;
 

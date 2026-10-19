@@ -220,6 +220,8 @@ fn decode_group_segment(segment: &str) -> Option<String> {
 
 #[derive(Clone, Debug)]
 pub struct DynoStore {
+    /// The storage engine's name for people, in errors.
+    engine: &'static str,
     cluster: String,
     node: i32,
     advertised_listener: Url,
@@ -553,6 +555,7 @@ impl DynoStore {
 
     fn new_with(cluster: &str, node: i32, object_store: impl ObjectStore) -> Result<Self> {
         Ok(Self {
+            engine: "object storage",
             cluster: cluster.into(),
             node,
             advertised_listener: Url::parse("tcp://127.0.0.1/")?,
@@ -568,6 +571,11 @@ impl DynoStore {
                 Duration::from_millis(5_000),
             )?),
         })
+    }
+
+    /// Names the storage engine, e.g. `S3 (s3://)`, in the errors that it returns.
+    pub(crate) fn engine(self, engine: &'static str) -> Self {
+        Self { engine, ..self }
     }
 
     #[cfg(feature = "test-support")]
@@ -3885,24 +3893,33 @@ impl Storage for DynoStore {
         Ok(self.advertised_listener.clone())
     }
 
+    /// DynoStore keeps no SCRAM credentials, so it refuses the change instead of reporting
+    /// success for a credential that it would drop.
     #[instrument(skip_all)]
     async fn delete_user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<()> {
-        Ok(())
+        Err(Error::UserCredentialsUnsupported {
+            engine: self.engine,
+        })
     }
 
+    /// See [`Self::delete_user_scram_credential`].
+    #[instrument(skip_all)]
     async fn upsert_user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
         _credential: ScramCredential,
     ) -> Result<()> {
-        Ok(())
+        Err(Error::UserCredentialsUnsupported {
+            engine: self.engine,
+        })
     }
 
+    /// No user has a credential here: [`Self::upsert_user_scram_credential`] stores none.
     async fn user_scram_credential(
         &self,
         _user: &str,
