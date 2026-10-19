@@ -12,14 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! List-typed configuration, as altered by the `APPEND` and `SUBTRACT`
-//! operations of [`IncrementalAlterConfigsRequest`](nisshi_sans_io::IncrementalAlterConfigsRequest).
+//! Topic configuration rules from Kafka: the values that Kafka accepts for a topic configuration,
+//! and the list-typed configuration that the `APPEND` and `SUBTRACT` operations of
+//! [`IncrementalAlterConfigsRequest`](nisshi_sans_io::IncrementalAlterConfigsRequest) alter.
 
 use std::collections::{HashMap, HashSet};
 
 use nisshi_sans_io::{ConfigResource, ErrorCode, OpType};
 
 use crate::{Error, Result};
+
+/// Checks `value` against Kafka's rules for the topic configuration `key`, and returns why Kafka
+/// rejects it, in the message that Kafka sends with [`ErrorCode::InvalidConfig`].
+///
+/// The broker checks only the configurations below, with the rules that Kafka defines for them in
+/// [`LogConfig`], and stores the value of any other configuration without a check. The storage
+/// engines read these values in their maintenance queries, so a value that doesn't parse can stop
+/// maintenance for every topic.
+///
+/// [`LogConfig`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L279
+pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<(), String> {
+    let minimum: i64 = match key {
+        "retention.ms" => -1,
+        _ => return Ok(()),
+    };
+    let Some(value) = value else {
+        return Ok(());
+    };
+
+    // Kafka trims the value before it parses it, in `ConfigDef.parseType`.
+    let reason = match value.trim().parse::<i64>() {
+        Ok(number) if number >= minimum => return Ok(()),
+        Ok(_) => format!("Value must be at least {minimum}"),
+        Err(_) => "Not a number of type LONG".to_owned(),
+    };
+
+    Err(format!(
+        "Invalid value {value} for configuration {key}: {reason}"
+    ))
+}
 
 /// The topic configuration keys whose type is `LIST`.
 ///
@@ -34,14 +65,14 @@ pub const TOPIC_LIST_CONFIGS: [&str; 3] = [
     "follower.replication.throttled.replicas",
 ];
 
-/// Whether `key` is a `LIST` configuration of `resource`, the only kind that
-/// `APPEND` and `SUBTRACT` may alter.
+/// Whether `key` is a `LIST` configuration of `resource`, the only kind that `APPEND` and
+/// `SUBTRACT` may alter.
 pub fn is_list_config(resource: ConfigResource, key: &str) -> bool {
     resource == ConfigResource::Topic && TOPIC_LIST_CONFIGS.contains(&key)
 }
 
-/// Returns the value of the configuration `key` of `resource` after applying
-/// `op` with `value` to `current`, or `None` when `op` removes the key.
+/// Returns the value of the configuration `key` of `resource` after applying `op` with `value` to
+/// `current`, or `None` when `op` removes the key.
 ///
 /// `APPEND` and `SUBTRACT` follow Kafka's [`incrementalAlterConfigResource`]
 /// and [`getParts`]:
@@ -49,16 +80,15 @@ pub fn is_list_config(resource: ConfigResource, key: &str) -> bool {
 /// - `APPEND` adds each item of `value` that isn't already present;
 /// - `SUBTRACT` removes the first occurrence of each item of `value`.
 ///
-/// An unset `current` is an empty list. Kafka uses the default of `key`
-/// instead, which makes `APPEND compact` to an unset `cleanup.policy` give
-/// `delete,compact`. Nisshi deletes old records only when `cleanup.policy`
-/// is set and contains `delete`, so that default would turn on deletion the
-/// client didn't ask for.
+/// An unset `current` is an empty list. Kafka uses the default of `key` instead, which makes
+/// `APPEND compact` to an unset `cleanup.policy` give `delete,compact`. Nisshi deletes old records
+/// only when `cleanup.policy` is set and contains `delete`, so that default would turn on deletion
+/// the client didn't ask for.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorCode::InvalidConfig`] for `APPEND` or `SUBTRACT` on a key
-/// that [isn't a list](is_list_config).
+/// Returns [`ErrorCode::InvalidConfig`] for `APPEND` or `SUBTRACT` on a key that
+/// [isn't a list](is_list_config).
 ///
 /// [`incrementalAlterConfigResource`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L250
 /// [`getParts`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L389-L404
@@ -86,16 +116,16 @@ pub fn apply_op(
         .filter(|item| !item.is_empty())
         .collect();
 
-    // Kafka keeps an empty item of `value` (from `a,,b`) and then rejects the
-    // result when it validates the new value. We ignore an empty item instead,
-    // because Nisshi doesn't validate values and would store it.
+    // Kafka keeps an empty item of `value` (from `a,,b`) and then rejects the result when it
+    // validates the new value. We ignore an empty item instead, because Nisshi doesn't validate
+    // list values and would store it.
     let changes = value
         .unwrap_or_default()
         .split(',')
         .filter(|item| !item.is_empty());
 
-    // The sets keep the cost linear in the number of items: a client sets the
-    // size of `value`, and the backends apply it inside a write transaction.
+    // The sets keep the cost linear in the number of items: a client sets the size of `value`, and
+    // the backends apply it inside a write transaction.
     if append {
         let mut present: HashSet<&str> = items.iter().copied().collect();
 
@@ -199,6 +229,36 @@ mod tests {
             apply(None, OpType::Append, "compact")?.as_deref()
         );
         Ok(())
+    }
+
+    #[test]
+    fn retention_ms_accepts_minus_1_and_above() {
+        for value in ["-1", "0", "2592000000", " 600000 "] {
+            assert_eq!(Ok(()), validate_topic_config("retention.ms", Some(value)));
+        }
+    }
+
+    #[test]
+    fn retention_ms_rejects_values_below_minus_1() {
+        assert_eq!(
+            Err(
+                "Invalid value -2 for configuration retention.ms: Value must be at least -1"
+                    .to_owned()
+            ),
+            validate_topic_config("retention.ms", Some("-2"))
+        );
+    }
+
+    #[test]
+    fn retention_ms_rejects_a_value_that_is_not_a_long() {
+        for value in ["abc", "", "1.5", "9223372036854775808"] {
+            assert_eq!(
+                Err(format!(
+                    "Invalid value {value} for configuration retention.ms: Not a number of type LONG"
+                )),
+                validate_topic_config("retention.ms", Some(value))
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,11 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::{debug, instrument, warn};
 
-use crate::{Error, Result, Storage, TopicId, config::is_list_config, max_message_bytes};
+use crate::{
+    Error, Result, Storage, TopicId,
+    config::{is_list_config, validate_topic_config},
+    max_message_bytes,
+};
 
 /// A [`Service`] using its [`Storage`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
 /// ```no_run
@@ -276,12 +280,15 @@ where
 
 /// Returns the error for a `resource` that Kafka rejects before it reads or changes any
 /// configuration, checked in the order of Kafka's [`ConfigAdminManager.preprocess`] and
-/// [`incrementalAlterConfigResource`].
+/// [`incrementalAlterConfigResource`], then the value of each topic configuration, which Kafka
+/// checks in [`validateAlterConfig`] before it checks that the topic exists.
 ///
 /// [`ConfigAdminManager.preprocess`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L105-L165
 /// [`incrementalAlterConfigResource`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L237
+/// [`validateAlterConfig`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L298-L301
 fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
     let configs = resource.configs.as_deref().unwrap_or_default();
+    let is_topic = ConfigResource::from(resource.resource_type) == ConfigResource::Topic;
 
     let mut names = BTreeSet::new();
     if !configs
@@ -326,7 +333,7 @@ fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
             ));
         };
 
-        if ConfigResource::from(resource.resource_type) == ConfigResource::Topic
+        if is_topic
             && matches!(op, OpType::Append | OpType::Subtract)
             && !is_list_config(ConfigResource::Topic, &config.name)
         {
@@ -351,6 +358,13 @@ fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
             && let Some(Err(reason)) = config.value.as_deref().map(max_message_bytes::parse)
         {
             return Some((ErrorCode::InvalidConfig, reason));
+        }
+
+        if is_topic
+            && op == OpType::Set
+            && let Err(message) = validate_topic_config(&config.name, config.value.as_deref())
+        {
+            return Some((ErrorCode::InvalidConfig, message));
         }
     }
 

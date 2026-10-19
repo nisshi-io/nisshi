@@ -555,6 +555,58 @@ async fn validate_only(storage: impl Storage + Clone) -> Result<()> {
     Ok(())
 }
 
+/// A `retention.ms` that Kafka rejects must not be stored: maintenance reads the value, and a
+/// value below -1 or one that isn't a number makes it delete every record or fail for every topic.
+/// Kafka checks the value before it checks that the topic exists, so a missing topic gets the same
+/// error.
+async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<()> {
+    let name = &alphanumeric_string(15)[..];
+    create_topic(storage.clone(), name).await?;
+    let missing = &alphanumeric_string(15)[..];
+
+    for (value, reason) in [
+        ("-2", "Value must be at least -1"),
+        ("abc", "Not a number of type LONG"),
+    ] {
+        for validate_only in [false, true] {
+            let response = alter(
+                storage.clone(),
+                [
+                    topic(
+                        name,
+                        [config(OpType::Set.into(), "retention.ms", Some(value))],
+                    ),
+                    topic(
+                        missing,
+                        [config(OpType::Set.into(), "retention.ms", Some(value))],
+                    ),
+                ],
+                validate_only,
+            )
+            .await?;
+
+            assert_eq!(
+                vec![ErrorCode::InvalidConfig, ErrorCode::InvalidConfig],
+                error_codes(&response)?,
+                "{value}, validate_only = {validate_only}"
+            );
+            assert_eq!(
+                Some(
+                    format!("Invalid value {value} for configuration retention.ms: {reason}")
+                        .as_str()
+                ),
+                response.responses.as_deref().unwrap_or_default()[0]
+                    .error_message
+                    .as_deref()
+            );
+        }
+    }
+
+    assert_eq!(None, config_value(storage, name, "retention.ms").await?);
+
+    Ok(())
+}
+
 macro_rules! backend_tests {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -594,6 +646,7 @@ mod in_memory {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
+        invalid_retention_ms_rejected,
     );
 }
 
@@ -618,6 +671,7 @@ mod lite {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
+        invalid_retention_ms_rejected,
     );
 }
 
@@ -642,6 +696,7 @@ mod slatedb {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
+        invalid_retention_ms_rejected,
     );
 }
 
@@ -666,5 +721,6 @@ mod pg {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
+        invalid_retention_ms_rejected,
     );
 }
