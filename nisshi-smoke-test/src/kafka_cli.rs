@@ -105,8 +105,8 @@ pub use scram_login::{ScramLogin, ScramMechanism};
 use tool::Tool;
 pub use topics::{CreateTopic, DescribeTopic, KafkaTopics, ListTopics, PartitionReplicas};
 pub use verifiable_consumer::{
-    CommittedOffset, ConsumedOffsets, ConsumerEvent, KafkaVerifiableConsumer, TopicPartition,
-    VerifiableConsume,
+    CommittedOffset, ConsumedOffsets, ConsumerEvent, KafkaVerifiableConsumer, PartitionAssignor,
+    TopicPartition, VerifiableConsume,
 };
 pub use verifiable_producer::{
     Acks, KafkaVerifiableProducer, SendResult, StoredRecord, VerifiableProduce,
