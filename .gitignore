@@ -31,8 +31,3 @@ tmp
 .ua/intermediate/
 .ua/diff-overlay.json
 .ua/.trash-*/
-/benchmark/openmessaging/.omb/
-/benchmark/openmessaging/results/
-/benchmark/openmessaging/broker.*
-/benchmark/openmessaging/.pg/
-/benchmark/openmessaging/run-*.log
