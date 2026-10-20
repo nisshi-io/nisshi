@@ -64,8 +64,8 @@ use nisshi_storage::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate_produced,
-    offload, producer_claim,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
+    inflate_produced, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -394,6 +394,26 @@ impl Meta {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
+}
+
+/// Allocates a new producer ID, one more than the newest, and gives it epoch 0.
+///
+/// Returns `None` when the newest producer ID is `i64::MAX`.
+fn allocate_producer_id(
+    producers: &mut BTreeMap<ProducerId, ProducerDetail>,
+) -> Option<ProducerId> {
+    let id = producers
+        .last_key_value()
+        .map_or(Some(1), |(newest, _)| newest.checked_add(1))?;
+
+    _ = producers.insert(
+        id,
+        ProducerDetail {
+            sequences: BTreeMap::from([(0, BTreeMap::new())]),
+        },
+    );
+
+    Some(id)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -3160,30 +3180,23 @@ impl Storage for DynoStore {
                     debug!(?meta, ?claim);
                     match meta.transactions.entry(transaction_id.to_string()) {
                         Entry::Vacant(vacant) => {
-                            let id = meta
-                                .producers
-                                .last_key_value()
-                                .map_or(1.into(), |(k, _v)| k + 1);
+                            let Some(id) = allocate_producer_id(&mut meta.producers) else {
+                                error!(transaction_id, "no producer ID left");
 
-                            let mut pd = ProducerDetail::default();
-                            assert_eq!(None, pd.sequences.insert(0, BTreeMap::new()));
-                            assert_eq!(None, meta.producers.insert(id, pd));
+                                return Ok(InitProducer::Completed(ProducerIdResponse::failed(
+                                    ErrorCode::UnknownServerError,
+                                )));
+                            };
 
-                            let mut epochs = BTreeMap::new();
-                            assert_eq!(
-                                None,
-                                epochs.insert(
+                            _ = vacant.insert(Txn {
+                                producer: id,
+                                epochs: BTreeMap::from([(
                                     0,
                                     TxnDetail {
                                         transaction_timeout_ms,
                                         ..Default::default()
                                     },
-                                )
-                            );
-
-                            _ = vacant.insert(Txn {
-                                producer: id,
-                                epochs,
+                                )]),
                             });
 
                             Ok(InitProducer::Completed(ProducerIdResponse {
@@ -3194,64 +3207,132 @@ impl Storage for DynoStore {
                         }
 
                         Entry::Occupied(mut occupied) => {
-                            if let Some((current_epoch, txn_detail)) =
-                                occupied.get().epochs.last_key_value()
-                            {
-                                if let Some(claim) = claim {
-                                    let error = check_claim(
-                                        (occupied.get().producer, *current_epoch),
-                                        claim,
-                                    );
+                            let txn = occupied.get();
 
-                                    if error != ErrorCode::None {
-                                        return Ok(InitProducer::Completed(
-                                            ProducerIdResponse::failed(error),
-                                        ));
-                                    }
-                                }
-
-                                if txn_detail.state == Some(TxnState::Begin) {
-                                    Ok(InitProducer::NeedToRollback {
-                                        producer_id: occupied.get().producer,
-                                        producer_epoch: *current_epoch,
-                                    })
-                                } else {
-                                    let id = occupied.get().producer;
-                                    let epoch = current_epoch + 1;
-
-                                    _ = meta.producers.entry(id).and_modify(|pd| {
-                                        assert_eq!(
-                                            None,
-                                            pd.sequences.insert(epoch, BTreeMap::new())
-                                        );
-                                    });
-
-                                    assert_eq!(
-                                        None,
-                                        occupied.get_mut().epochs.insert(
-                                            epoch,
-                                            TxnDetail {
-                                                transaction_timeout_ms,
-                                                ..Default::default()
-                                            }
-                                        )
-                                    );
-
-                                    Ok(InitProducer::Completed(ProducerIdResponse {
-                                        id,
-                                        epoch,
-                                        error: ErrorCode::None,
-                                    }))
-                                }
-                            } else {
+                            let Some((&current_epoch, txn_detail)) = txn.epochs.last_key_value()
+                            else {
                                 // Unreachable: every transaction starts with epoch 0,
                                 // and no code removes an epoch.
                                 error!(transaction_id, "transaction has no epoch");
 
-                                Ok(InitProducer::Completed(ProducerIdResponse::failed(
+                                return Ok(InitProducer::Completed(ProducerIdResponse::failed(
                                     ErrorCode::UnknownServerError,
-                                )))
+                                )));
+                            };
+
+                            if let Some(claim) = claim {
+                                let error = check_claim((txn.producer, current_epoch), claim);
+
+                                if error != ErrorCode::None {
+                                    return Ok(InitProducer::Completed(
+                                        ProducerIdResponse::failed(error),
+                                    ));
+                                }
                             }
+
+                            if txn_detail.state == Some(TxnState::Begin) {
+                                return Ok(InitProducer::NeedToRollback {
+                                    producer_id: txn.producer,
+                                    producer_epoch: current_epoch,
+                                });
+                            }
+
+                            let previous_id = txn.producer;
+
+                            // The producer's newest epoch is the epoch of its newest
+                            // transaction, or i16::MAX once the rollback below fences it.
+                            let newest_epoch = meta
+                                .producers
+                                .get(&previous_id)
+                                .and_then(|producer| producer.sequences.last_key_value())
+                                .map_or(current_epoch, |(epoch, _)| current_epoch.max(*epoch));
+
+                            if epoch_is_exhausted(newest_epoch) {
+                                // As in Kafka, only the transaction of the current epoch holds
+                                // back the move: the client retries CONCURRENT_TRANSACTIONS
+                                // until it finishes.
+                                if txn_detail.state.is_some_and(|state| !state.is_finished()) {
+                                    return Ok(InitProducer::Completed(
+                                        ProducerIdResponse::failed(
+                                            ErrorCode::ConcurrentTransactions,
+                                        ),
+                                    ));
+                                }
+
+                                let Some(id) = allocate_producer_id(&mut meta.producers) else {
+                                    error!(transaction_id, "no producer ID left");
+
+                                    return Ok(InitProducer::Completed(
+                                        ProducerIdResponse::failed(ErrorCode::UnknownServerError),
+                                    ));
+                                };
+
+                                // A produce compares the batch's epoch with the producer's
+                                // newest, so epoch i16::MAX fences every batch of the
+                                // previous producer ID. Its older epochs and sequences are
+                                // never read again, so they go, instead of growing meta.json
+                                // by an entry for each epoch.
+                                if let Some(previous) = meta.producers.get_mut(&previous_id) {
+                                    previous.sequences =
+                                        BTreeMap::from([(i16::MAX, BTreeMap::new())]);
+                                }
+
+                                info!(
+                                    transaction_id,
+                                    previous_id,
+                                    id,
+                                    "producer epoch exhausted, moved to a new producer ID"
+                                );
+
+                                _ = occupied.insert(Txn {
+                                    producer: id,
+                                    epochs: BTreeMap::from([(
+                                        0,
+                                        TxnDetail {
+                                            transaction_timeout_ms,
+                                            ..Default::default()
+                                        },
+                                    )]),
+                                });
+
+                                return Ok(InitProducer::Completed(ProducerIdResponse {
+                                    id,
+                                    epoch: 0,
+                                    error: ErrorCode::None,
+                                }));
+                            }
+
+                            // with_mut stores each change that this closure makes, also
+                            // when it then answers an error, so every check runs first.
+                            let Some(epoch) = current_epoch.checked_add(1).filter(|epoch| {
+                                meta.producers
+                                    .get(&previous_id)
+                                    .is_none_or(|producer| !producer.sequences.contains_key(epoch))
+                            }) else {
+                                error!(transaction_id, previous_id, current_epoch, "epoch taken");
+
+                                return Ok(InitProducer::Completed(ProducerIdResponse::failed(
+                                    ErrorCode::UnknownServerError,
+                                )));
+                            };
+
+                            if let Some(producer) = meta.producers.get_mut(&previous_id) {
+                                _ = producer.sequences.insert(epoch, BTreeMap::new());
+                            }
+
+                            _ = occupied.get_mut().epochs.insert(
+                                epoch,
+                                TxnDetail {
+                                    transaction_timeout_ms,
+                                    ..Default::default()
+                                },
+                            );
+
+                            Ok(InitProducer::Completed(ProducerIdResponse {
+                                id: previous_id,
+                                epoch,
+                                error: ErrorCode::None,
+                            }))
                         }
                     }
                 })
@@ -3274,6 +3355,25 @@ impl Storage for DynoStore {
                     debug!(?rollback_producer_id, ?rollback_producer_epoch, ?error_code);
 
                     if error_code == ErrorCode::None {
+                        // The abort can stay prepared behind an older open transaction, and
+                        // the move to a new producer ID then waits for it. Kafka fences the
+                        // producer at that point, so that it cannot add to the aborted
+                        // transaction, and so does this: a produce compares the batch's
+                        // epoch with the producer's newest.
+                        if epoch_is_exhausted(rollback_producer_epoch) {
+                            self.meta
+                                .with_mut(&self.object_store, |meta| {
+                                    if let Some(producer) =
+                                        meta.producers.get_mut(&rollback_producer_id)
+                                    {
+                                        _ = producer.sequences.entry(i16::MAX).or_default();
+                                    }
+
+                                    Ok(())
+                                })
+                                .await?;
+                        }
+
                         return self
                             .init_producer(
                                 Some(transaction_id),
@@ -3295,20 +3395,15 @@ impl Storage for DynoStore {
             self.meta
                 .with_mut(&self.object_store, |meta| {
                     debug!(?meta);
-                    let producer = meta
-                        .producers
-                        .last_key_value()
-                        .map_or(1.into(), |(k, _v)| k + 1);
 
-                    let epoch = 0;
-                    let mut pd = ProducerDetail::default();
-                    assert_eq!(None, pd.sequences.insert(epoch, BTreeMap::new()));
-                    debug!(?producer, ?pd);
-                    assert_eq!(None, meta.producers.insert(producer, pd));
+                    let Some(producer) = allocate_producer_id(&mut meta.producers) else {
+                        error!("no producer ID left");
+                        return Ok(ProducerIdResponse::failed(ErrorCode::UnknownServerError));
+                    };
 
                     Ok(ProducerIdResponse {
                         id: producer,
-                        epoch,
+                        epoch: 0,
                         ..Default::default()
                     })
                 })

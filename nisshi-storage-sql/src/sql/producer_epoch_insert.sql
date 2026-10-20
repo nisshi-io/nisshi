@@ -35,6 +35,10 @@ and p.id = $2
 
 group by p.id
 
+-- Epoch 32767 (i16::MAX) is the largest that the column and the wire hold. A
+-- producer at that epoch gets no row: it is fenced already.
+having coalesce(max(pe.epoch), -1) < 32767
+
 )
 
 insert into producer_epoch (producer, epoch)

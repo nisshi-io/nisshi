@@ -443,6 +443,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/txn_topition_select.sql"),
         ),
         (
+            "txn_update_producer.sql",
+            include_sql!("sql/txn_update_producer.sql"),
+        ),
+        (
             "virtual_topic_upsert.sql",
             include_sql!("sql/virtual_topic_upsert.sql"),
         ),

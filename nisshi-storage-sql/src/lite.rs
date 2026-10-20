@@ -60,7 +60,7 @@ use nisshi_storage::{
     RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy,
     StartupFailure, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
-    config::apply_op, delete_records_cutoff, inflate, producer_claim,
+    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -192,7 +192,7 @@ impl TryFrom<Row> for Txn {
     fn try_from(row: Row) -> Result<Self, Self::Error> {
         let name = row.get::<String>(0).inspect_err(|err| error!(?err))?;
         let producer_id = row.get::<i64>(1).inspect_err(|err| error!(?err))?;
-        let producer_epoch = row.get::<i32>(2).inspect_err(|err| error!(?err))? as i16;
+        let producer_epoch = i16::try_from(row.get::<i32>(2).inspect_err(|err| error!(?err))?)?;
         let status = row
             .get::<Option<String>>(3)
             .map_err(Into::into)
@@ -654,10 +654,10 @@ impl Delegate {
             .await?;
 
         if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
-            let current_epoch = row
-                .get::<i32>(0)
-                .inspect_err(|err| error!(self.cluster, deflated.producer_id, ?err))?
-                as i16;
+            let current_epoch = i16::try_from(
+                row.get::<i32>(0)
+                    .inspect_err(|err| error!(self.cluster, deflated.producer_id, ?err))?,
+            )?;
 
             let row = connection
                 .query_one(
@@ -3160,11 +3160,11 @@ impl Storage for Delegate {
                         .map(|producer_id| producer_id.unwrap_or(-1))
                         .inspect_err(|err| error!(?err))?,
                 )
-                .producer_epoch(
+                .producer_epoch(i16::try_from(
                     row.get::<Option<i32>>(7)
                         .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))? as i16,
-                )
+                        .inspect_err(|err| error!(?err))?,
+                )?)
                 .record(record_builder)
                 .last_offset_delta(offset_delta);
 
@@ -3180,10 +3180,11 @@ impl Storage for Delegate {
                     .get::<Option<i64>>(6)
                     .map(|producer_id| producer_id.unwrap_or(-1))
                     .inspect_err(|err| error!(?err))?;
-                let producer_epoch = row
-                    .get::<Option<i32>>(7)
-                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))? as i16;
+                let producer_epoch = i16::try_from(
+                    row.get::<Option<i32>>(7)
+                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                        .inspect_err(|err| error!(?err))?,
+                )?;
 
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id
@@ -4518,6 +4519,8 @@ impl Storage for Delegate {
                 let pc = self.connection().await?;
                 let tx = pc.transaction().await?;
 
+                let mut rolled_back = false;
+
                 if let Some(row) = pc
                     .query_opt(
                         "producer_epoch_for_current_txn.sql",
@@ -4527,7 +4530,8 @@ impl Storage for Delegate {
                     .inspect_err(|err| error!(?err))?
                 {
                     let id = row.get::<i64>(0).inspect_err(|err| error!(?err))?;
-                    let epoch = row.get::<i32>(1).inspect_err(|err| error!(?err))? as i16;
+                    let epoch = i16::try_from(row.get::<i32>(1).inspect_err(|err| error!(?err))?)
+                        .inspect_err(|err| error!(?err, transaction_id, id))?;
                     let status = row
                         .get::<Option<String>>(2)
                         .inspect_err(|err| error!(?err))?
@@ -4573,6 +4577,8 @@ impl Storage for Delegate {
                                 )
                             });
                         }
+
+                        rolled_back = true;
                     }
                 }
 
@@ -4589,20 +4595,143 @@ impl Storage for Delegate {
                         .inspect_err(|err| error!(?err))
                         .inspect(|producer| debug!(producer))?;
 
-                    let row = pc
-                        .query_one(
-                            "producer_epoch_insert.sql",
+                    // A bump gives the producer its newest epoch plus one, so the limit
+                    // applies to that epoch, not to the newest epoch with a transaction.
+                    let newest = pc
+                        .query_opt(
+                            "producer_epoch_current_for_producer.sql",
                             (self.cluster.as_str(), producer),
                         )
                         .await
-                        .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+                        .inspect_err(|err| error!(?err))?
+                        .map(|row| {
+                            row.get::<i32>(0)
+                                .map_err(Error::from)
+                                .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
+                        })
+                        .transpose()
+                        .inspect_err(|err| error!(?err, transaction_id, producer))?;
 
-                    let epoch = row
-                        .get::<i32>(0)
-                        .inspect(|epoch| debug!(epoch))
-                        .inspect_err(|err| error!(?err))? as i16;
+                    if newest.is_some_and(epoch_is_exhausted) {
+                        // The status after the rollback above, if it ran.
+                        let status = pc
+                            .query_opt(
+                                "producer_epoch_for_current_txn.sql",
+                                (self.cluster.as_str(), transaction_id),
+                            )
+                            .await
+                            .inspect_err(|err| error!(?err))?
+                            .map(|row| row.get::<Option<String>>(2))
+                            .transpose()
+                            .inspect_err(|err| error!(?err))?
+                            .flatten()
+                            .map(|status| TxnState::from_str(status.as_str()))
+                            .transpose()?;
 
-                    (producer, epoch)
+                        // As in Kafka, only the transaction of the current epoch holds back
+                        // the move: the client retries CONCURRENT_TRANSACTIONS until it
+                        // finishes. This commits the rollback above, if it ran.
+                        if status.is_some_and(|status| !status.is_finished()) {
+                            // The rollback leaves its abort prepared behind an older open
+                            // transaction. Kafka fences the producer at that point, so that
+                            // it cannot add to the aborted transaction, and so does this. A
+                            // producer at epoch i16::MAX gets no new epoch, and is fenced
+                            // already.
+                            if rolled_back {
+                                _ = pc
+                                    .query_opt(
+                                        "producer_epoch_insert.sql",
+                                        (self.cluster.as_str(), producer),
+                                    )
+                                    .await
+                                    .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+                            }
+
+                            let error = match pc.commit(tx).await.inspect_err(|err| {
+                                error!(?err, cluster = self.cluster, transaction_id, producer)
+                            }) {
+                                Ok(()) => ErrorCode::ConcurrentTransactions,
+                                Err(_) => ErrorCode::UnknownServerError,
+                            };
+
+                            return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
+                                DELEGATE_REQUEST_DURATION.record(
+                                    elapsed_millis(start),
+                                    &[KeyValue::new("operation", "init_producer")],
+                                )
+                            });
+                        }
+
+                        let previous = producer;
+
+                        let producer: i64 = pc
+                            .query_one("producer_insert.sql", &[self.cluster.as_str()])
+                            .await
+                            .and_then(|row| row.get(0))
+                            .inspect_err(|err| error!(?err))?;
+
+                        let epoch = pc
+                            .query_one(
+                                "producer_epoch_insert.sql",
+                                (self.cluster.as_str(), producer),
+                            )
+                            .await
+                            .and_then(|row| row.get::<i32>(0))
+                            .map_err(Error::from)
+                            .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
+                            .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+                        // A produce with an epoch below the producer's newest is fenced, so
+                        // epoch i16::MAX fences the previous producer ID. A producer at epoch
+                        // i16::MAX gets no new epoch, and is fenced already.
+                        _ = pc
+                            .query_opt(
+                                "producer_epoch_insert.sql",
+                                (self.cluster.as_str(), previous),
+                            )
+                            .await
+                            .inspect_err(|err| error!(self.cluster, previous, ?err))?;
+
+                        let updated = pc
+                            .execute(
+                                "txn_update_producer.sql",
+                                (self.cluster.as_str(), transaction_id, producer),
+                            )
+                            .await
+                            .inspect_err(|err| error!(self.cluster, transaction_id, ?err))?;
+
+                        if updated != 1 {
+                            return Err(Error::Message(format!(
+                                "{updated} transactions named {transaction_id}"
+                            )));
+                        }
+
+                        info!(
+                            cluster = self.cluster,
+                            transaction_id,
+                            previous,
+                            producer,
+                            "producer epoch exhausted, moved to a new producer ID"
+                        );
+
+                        (producer, epoch)
+                    } else {
+                        let row = pc
+                            .query_one(
+                                "producer_epoch_insert.sql",
+                                (self.cluster.as_str(), producer),
+                            )
+                            .await
+                            .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+                        let epoch = i16::try_from(
+                            row.get::<i32>(0)
+                                .inspect(|epoch| debug!(epoch))
+                                .inspect_err(|err| error!(?err))?,
+                        )?;
+
+                        (producer, epoch)
+                    }
                 } else {
                     let row = pc
                         .query_one("producer_insert.sql", &[self.cluster.as_str()])
@@ -4619,7 +4748,7 @@ impl Storage for Delegate {
                         .await
                         .inspect_err(|err| error!(self.cluster, producer, ?err))?;
 
-                    let epoch = row.get::<i32>(0)? as i16;
+                    let epoch = i16::try_from(row.get::<i32>(0)?)?;
 
                     assert_eq!(
                         1,
@@ -4709,7 +4838,8 @@ impl Storage for Delegate {
                     if let Some(row) = rows.next().await? {
                         let epoch = row
                             .get::<i32>(0)
-                            .map(|epoch| epoch as i16)
+                            .map_err(Error::from)
+                            .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
                             .inspect(|epoch| debug!(epoch))?;
 
                         while let Some(row) = rows.next().await? {
@@ -4917,7 +5047,8 @@ impl Storage for Delegate {
 
             let epoch = row
                 .get::<i32>(1)
-                .map(|epoch| epoch as i16)
+                .map_err(Error::from)
+                .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
                 .map(Some)
                 .inspect_err(|err| error!(?err))?;
 
@@ -6529,6 +6660,380 @@ mod tests {
             Err(err) => panic!("expected the SchemaSetup failure, got {err:?}"),
             Ok(_) => panic!("expected the SchemaSetup failure, got a storage"),
         }
+
+        Ok(())
+    }
+
+    /// Returns an engine on `db_file` with a registered broker, and one topic with one
+    /// partition.
+    async fn engine_with_topic(db_file: &str) -> Result<(ArcDynStorage, Topition)> {
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(Url::parse(&format!("file:///{db_file}"))?)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        Ok((engine, Topition::new("t", 0)))
+    }
+
+    /// Runs `sql` with `params` on `db_file`, through a connection of its own. The
+    /// engine opened `file:///{db_file}` as `{cwd}/{db_file}`.
+    async fn execute_on(db_file: &str, sql: &str, params: impl IntoParams) -> Result<()> {
+        _ = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?
+            .execute(sql, params)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Sets the epoch of each `producer_epoch` row of `producer` to `epoch`. A producer
+    /// that has one epoch then has only `epoch`, without 32k InitProducerId requests.
+    async fn seed_producer_epoch(db_file: &str, producer: i64, epoch: i32) -> Result<()> {
+        execute_on(
+            db_file,
+            "update producer_epoch set epoch = ?1 where producer = ?2",
+            (epoch, producer),
+        )
+        .await
+    }
+
+    fn idempotent_batch(producer: &ProducerIdResponse) -> Result<deflated::Batch> {
+        inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from_static(b"idempotent"))))
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)
+            .map_err(Into::into)
+    }
+
+    /// An epoch below the limit bumps. At the limit, a fresh InitProducerId moves the
+    /// transactional ID to a new producer ID at epoch 0, and the previous producer ID is
+    /// fenced, both for a claim and for a produce.
+    #[tokio::test]
+    async fn init_producer_exhausted_epoch_moves_to_a_new_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "init-producer-exhausted-epoch-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        seed_producer_epoch(db_file, producer.id, 32765).await?;
+
+        let bumped = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        assert_eq!(
+            (ErrorCode::None, producer.id, 32766),
+            (bumped.error, bumped.id, bumped.epoch)
+        );
+
+        let rotated = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        assert_eq!((ErrorCode::None, 0), (rotated.error, rotated.epoch));
+        assert_ne!(producer.id, rotated.id);
+
+        assert_eq!(
+            ProducerIdResponse::failed(ErrorCode::ProducerFenced),
+            engine
+                .init_producer(Some("txn"), 10_000, Some(bumped.id), Some(bumped.epoch))
+                .await?
+        );
+
+        assert_matches!(
+            engine
+                .produce(None, &topition, idempotent_batch(&bumped)?)
+                .await,
+            Err(Error::Api(ErrorCode::ProducerFenced))
+        );
+        assert_eq!(
+            0,
+            engine
+                .produce(None, &topition, idempotent_batch(&rotated)?)
+                .await?
+        );
+
+        let claimed = engine
+            .init_producer(Some("txn"), 10_000, Some(rotated.id), Some(rotated.epoch))
+            .await?;
+        assert_eq!(
+            (ErrorCode::None, rotated.id, 1),
+            (claimed.error, claimed.id, claimed.epoch)
+        );
+
+        Ok(())
+    }
+
+    /// A claim of an exhausted epoch moves the transactional ID to a new producer ID.
+    #[tokio::test]
+    async fn init_producer_exhausted_claim_moves_to_a_new_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "init-producer-exhausted-claim-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, _) = engine_with_topic(db_file).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        seed_producer_epoch(db_file, producer.id, 32766).await?;
+
+        let rotated = engine
+            .init_producer(Some("txn"), 10_000, Some(producer.id), Some(32766))
+            .await?;
+        assert_eq!((ErrorCode::None, 0), (rotated.error, rotated.epoch));
+        assert_ne!(producer.id, rotated.id);
+
+        Ok(())
+    }
+
+    /// An exhausted epoch with a prepared transaction answers ConcurrentTransactions.
+    #[tokio::test]
+    async fn init_producer_exhausted_epoch_with_a_prepared_transaction_is_concurrent() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+        let db_file = "init-producer-exhausted-prepared-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, _) = engine_with_topic(db_file).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        seed_producer_epoch(db_file, producer.id, 32766).await?;
+        execute_on(
+            db_file,
+            "update txn_detail set status = 'PREPARE_ABORT'",
+            (),
+        )
+        .await?;
+
+        assert_eq!(
+            ProducerIdResponse::failed(ErrorCode::ConcurrentTransactions),
+            engine
+                .init_producer(Some("txn"), 10_000, None, None)
+                .await?
+        );
+
+        Ok(())
+    }
+
+    /// sqlite does not limit an integer column to `i16`. A stored epoch beyond `i16::MAX`
+    /// is an error, not an epoch that wraps to a negative value.
+    #[tokio::test]
+    async fn init_producer_epoch_beyond_i16_is_an_error() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "init-producer-epoch-beyond-i16-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, _) = engine_with_topic(db_file).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        seed_producer_epoch(db_file, producer.id, 40_000).await?;
+
+        assert_matches!(
+            engine.init_producer(Some("txn"), 10_000, None, None).await,
+            Err(Error::TryFromInt(_))
+        );
+
+        Ok(())
+    }
+
+    fn transactional_batch(
+        producer: &ProducerIdResponse,
+        sequence: i32,
+    ) -> Result<deflated::Batch> {
+        inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from_static(b"transactional"))))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(sequence)
+            .build()
+            .and_then(TryInto::try_into)
+            .map_err(Into::into)
+    }
+
+    /// Opens a transaction for `producer` on `topition`, and produces one record in it.
+    async fn open_transaction(
+        engine: &ArcDynStorage,
+        transaction_id: &str,
+        producer: &ProducerIdResponse,
+        topition: &Topition,
+    ) -> Result<()> {
+        use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+
+        _ = engine
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.to_owned(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topition.topic().to_owned())
+                        .partitions(Some(vec![topition.partition()])),
+                ],
+            })
+            .await?;
+
+        _ = engine
+            .produce(
+                Some(transaction_id),
+                topition,
+                transactional_batch(producer, 0)?,
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Only the transaction of the current epoch holds back the move, as in Kafka. A
+    /// transaction left prepared on an older epoch does not.
+    #[tokio::test]
+    async fn init_producer_older_prepared_transaction_does_not_hold_back_the_move() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "init-producer-older-prepared-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, _) = engine_with_topic(db_file).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        _ = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+
+        execute_on(
+            db_file,
+            "update producer_epoch \
+             set epoch = case when epoch = 0 then 100 else 32766 end \
+             where producer = ?1",
+            [producer.id],
+        )
+        .await?;
+        execute_on(
+            db_file,
+            "update txn_detail set status = 'PREPARE_ABORT' \
+             where producer_epoch = \
+             (select id from producer_epoch where producer = ?1 and epoch = 100)",
+            [producer.id],
+        )
+        .await?;
+
+        let moved = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        assert_eq!((ErrorCode::None, 0), (moved.error, moved.epoch));
+        assert_ne!(producer.id, moved.id);
+
+        Ok(())
+    }
+
+    /// A producer that restarts in the middle of a transaction at the exhausted epoch:
+    /// InitProducerId aborts the transaction, then moves to a new producer ID.
+    #[tokio::test]
+    async fn init_producer_open_transaction_at_the_exhausted_epoch_is_aborted_then_moved()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "init-producer-open-transaction-exhausted-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        seed_producer_epoch(db_file, producer.id, 32766).await?;
+
+        let exhausted = ProducerIdResponse {
+            epoch: 32766,
+            ..producer
+        };
+        open_transaction(&engine, "txn", &exhausted, &topition).await?;
+
+        let moved = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        assert_eq!((ErrorCode::None, 0), (moved.error, moved.epoch));
+        assert_ne!(producer.id, moved.id);
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(stage.high_watermark, stage.last_stable);
+
+        Ok(())
+    }
+
+    /// When the abort of the open transaction waits behind an older open transaction on
+    /// the same partition, the answer is CONCURRENT_TRANSACTIONS, and the producer is
+    /// fenced, as in Kafka.
+    #[tokio::test]
+    async fn init_producer_deferred_abort_at_the_exhausted_epoch_fences_the_producer() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+        let db_file = "init-producer-deferred-abort-exhausted-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        let older = engine
+            .init_producer(Some("older"), 10_000, None, None)
+            .await?;
+        open_transaction(&engine, "older", &older, &topition).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        seed_producer_epoch(db_file, producer.id, 32766).await?;
+
+        let exhausted = ProducerIdResponse {
+            epoch: 32766,
+            ..producer
+        };
+        open_transaction(&engine, "txn", &exhausted, &topition).await?;
+
+        assert_eq!(
+            ProducerIdResponse::failed(ErrorCode::ConcurrentTransactions),
+            engine
+                .init_producer(Some("txn"), 10_000, None, None)
+                .await?
+        );
+
+        assert_matches!(
+            engine
+                .produce(Some("txn"), &topition, transactional_batch(&exhausted, 1)?)
+                .await,
+            Err(Error::Api(ErrorCode::ProducerFenced))
+        );
 
         Ok(())
     }

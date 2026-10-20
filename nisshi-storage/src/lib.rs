@@ -204,7 +204,7 @@ pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replic
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
-pub use producer::{check_claim, producer_claim};
+pub use producer::{check_claim, epoch_is_exhausted, producer_claim};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
 
@@ -1483,6 +1483,12 @@ impl TxnState {
             Self::PrepareAbort | Self::PrepareCommit => true,
             _otherwise => false,
         }
+    }
+
+    /// Whether the transaction has finished: it committed or aborted, and its
+    /// markers are written.
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Committed | Self::Aborted)
     }
 }
 

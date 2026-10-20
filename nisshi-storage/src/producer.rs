@@ -57,13 +57,32 @@ pub fn producer_claim(
 /// InitProducerId from another producer that guess lets the fenced producer take
 /// over.
 ///
+/// After an exhausted epoch moves the transactional ID to a new producer ID (see
+/// [`epoch_is_exhausted`]), this check also fences a claim of the previous producer
+/// ID. Kafka accepts that claim from a producer retrying the request that moved it
+/// ([TransactionMetadata.scala#isValidProducerId]), because it keeps the previous
+/// producer ID and epoch in the transaction's metadata. This check compares the claim
+/// with the current producer ID and epoch only, and the producer initialises again.
+///
 /// [TransactionMetadata.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L294-L299
+/// [TransactionMetadata.scala#isValidProducerId]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L212-L224
 pub fn check_claim(stored: (i64, i16), claim: (i64, i16)) -> ErrorCode {
     if stored == claim {
         ErrorCode::None
     } else {
         ErrorCode::ProducerFenced
     }
+}
+
+/// Whether a producer has exhausted its epoch: an InitProducerId can no longer bump
+/// it, and the transactional ID moves to a new producer ID at epoch 0 instead.
+///
+/// The limit is `i16::MAX - 1`, as in Kafka 3.9.1 ([TransactionMetadata.scala]),
+/// so that `i16::MAX` stays free to fence the previous producer ID.
+///
+/// [TransactionMetadata.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L180
+pub fn epoch_is_exhausted(epoch: i16) -> bool {
+    epoch >= i16::MAX - 1
 }
 
 impl ProducerIdResponse {
@@ -117,5 +136,13 @@ mod tests {
         assert_eq!(ErrorCode::ProducerFenced, check_claim((3, 2), (3, 1)));
         assert_eq!(ErrorCode::ProducerFenced, check_claim((3, 2), (3, 3)));
         assert_eq!(ErrorCode::ProducerFenced, check_claim((3, 2), (4, 2)));
+    }
+
+    #[test]
+    fn exhausted() {
+        assert!(!epoch_is_exhausted(0));
+        assert!(!epoch_is_exhausted(32765));
+        assert!(epoch_is_exhausted(32766));
+        assert!(epoch_is_exhausted(i16::MAX));
     }
 }
