@@ -27,7 +27,12 @@
 #                        hung or was killed
 #
 # The Kafka CLI tools and each broker container use the host network. On
-# macOS, the suite needs Docker Desktop with host networking turned on.
+# macOS, the suite needs Docker Desktop with host networking turned on, or,
+# under colima, NISSHI_SMOKE_DOCKER_HOST_IP=192.168.5.2, the address at which
+# colima's containers reach this machine. That setting covers a broker run as
+# a process here, the default, and not NISSHI_SMOKE_IMAGE. It installs
+# iptables in an alpine container with apk, so it needs access to an Alpine
+# package mirror.
 
 set -euo pipefail
 
@@ -265,8 +270,23 @@ export KAFKA_IMAGE=${KAFKA_IMAGE:-apache/kafka:3.9.2}
 # JVM start faster and use less CPU: the JIT compiles only its fast first tier,
 # and one GC thread collects. They don't change what the Kafka client sends.
 jvm_options="-XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Djava.awt.headless=true"
-NISSHI_SMOKE_KAFKA=$(docker run --detach --rm --label="nisshi-smoke=${NISSHI_SMOKE_RUN}" --network=host \
+# Under a Docker VM whose host network is the VM's own, not this machine's
+# (colima: NISSHI_SMOKE_DOCKER_HOST_IP=192.168.5.2), the tools get a network of
+# their own, where each connection to 127.0.0.1 goes to that address, which
+# reaches this machine's loopback.
+if [[ -n "${NISSHI_SMOKE_DOCKER_HOST_IP:-}" ]]; then
+    kafka_network=(--sysctl net.ipv4.conf.all.route_localnet=1)
+else
+    kafka_network=(--network=host)
+fi
+NISSHI_SMOKE_KAFKA=$(docker run --detach --rm --label="nisshi-smoke=${NISSHI_SMOKE_RUN}" "${kafka_network[@]}" \
     --env "KAFKA_JVM_PERFORMANCE_OPTS=${jvm_options}" --entrypoint=sleep "${KAFKA_IMAGE}" infinity)
+if [[ -n "${NISSHI_SMOKE_DOCKER_HOST_IP:-}" ]]; then
+    docker run --rm --label="nisshi-smoke=${NISSHI_SMOKE_RUN}" --network="container:${NISSHI_SMOKE_KAFKA}" \
+        --cap-add=NET_ADMIN alpine:3.20 sh -ec "apk add --quiet iptables
+        iptables -t nat -A OUTPUT -d 127.0.0.1/32 -p tcp -j DNAT --to-destination ${NISSHI_SMOKE_DOCKER_HOST_IP}
+        iptables -t nat -A POSTROUTING -s 127.0.0.1/32 -p tcp -j MASQUERADE"
+fi
 export NISSHI_SMOKE_KAFKA
 export NISSHI_SMOKE_STORAGE=${storage}
 export NISSHI_SMOKE_LOG=${results}/broker-${leg}.log
