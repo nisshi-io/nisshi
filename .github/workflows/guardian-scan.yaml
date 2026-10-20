@@ -325,9 +325,9 @@ jobs:
           trivy fs . --scanners vuln --list-all-pkgs --format json \
             --output "${RUNNER_TEMP}/trivy_repo.json"
       - name: Guardian DB sync and Jira report
-        # Ahead of the other Guardian actions' pin: the dependency-graph input
-        # is in SolaceDev/solace-public-workflows#144. Re-pin to main once it merges.
-        uses: SolaceDev/solace-public-workflows/guardian-db-sync@5b439271de3e28392f1c15e58c1043461700070a # main
+        # Ahead of the other Guardian actions' pin: the merge commit of
+        # SolaceDev/solace-public-workflows#144, which adds the dependency-graph input.
+        uses: SolaceDev/solace-public-workflows/guardian-db-sync@5b439271de3e28392f1c15e58c1043461700070a # main 2026-10-19, untagged
         with:
           guardian-url: ${{ secrets.GUARDIAN_URL }}
           guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
@@ -419,12 +419,13 @@ jobs:
       # `version` is read back as a FOSSA revision, so it must be the string the
       # FOSSA jobs above stamp - a branch name resolves to nothing.
       #
-      # `image_tag` is the moving `main` tag nisshi's ci.yml `publish` job
-      # pushes on every push to main, so it names an image that exists.
-      # Guardian takes only the tag from this row. It builds the rest of the
-      # image path from the `nisshi` product's own config, as
+      # `image_tag` is the moving `edge` tag tier-c.yml's `edge-publish` job
+      # pushes from main's tip twice a day, so it names an image that exists.
+      # Not `main`: that job also pushes it today, but only until a follow-up
+      # drops it. Guardian takes only the tag from this row. It builds the
+      # rest of the image path from the `nisshi` product's own config, as
       # `<container_registry>/<ecr_image_name>:<image_tag>`, which is
-      # ghcr.io/nisshi-io/nisshi:main. A pull that 404s is not a partial
+      # ghcr.io/nisshi-io/nisshi:edge. A pull that 404s is not a partial
       # result - the scan fetcher discards a product's FOSSA output too unless
       # every enabled scanner succeeded.
       #
@@ -445,6 +446,6 @@ jobs:
           "dev": {
             "sha": "${{ github.sha }}",
             "version": "${{ needs.setup.outputs.full_version }}",
-            "image_tag": "main"
+            "image_tag": "edge"
           }
         }
