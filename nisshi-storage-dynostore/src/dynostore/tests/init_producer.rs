@@ -30,9 +30,7 @@ use nisshi_storage::{
 };
 use object_store::memory::InMemory;
 
-use crate::dynostore::{
-    DynoStore, Meta, ProducerDetail, Txn, TxnDetail, TxnProduceOffset, tests::init_tracing,
-};
+use crate::dynostore::{DynoStore, Meta, ProducerDetail, Txn, TxnDetail, tests::init_tracing};
 
 const TRANSACTION_ID: &str = "txn";
 const TIMEOUT_MS: i32 = 10_000;
@@ -419,67 +417,61 @@ async fn open_transaction_at_the_exhausted_epoch_is_aborted_then_moved() -> Resu
     Ok(())
 }
 
+/// Opens a transaction for `producer` on `topition`, and produces one record in
+/// it.
+async fn open_transaction(
+    storage: &DynoStore,
+    transaction_id: &str,
+    producer: ProducerIdResponse,
+    topition: &Topition,
+) -> Result<(), Error> {
+    _ = storage
+        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: transaction_id.into(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            topics: vec![
+                AddPartitionsToTxnTopic::default()
+                    .name(topition.topic().to_owned())
+                    .partitions(Some(vec![topition.partition()])),
+            ],
+        })
+        .await?;
+
+    _ = storage
+        .produce(
+            Some(transaction_id),
+            topition,
+            transactional_batch(producer.id, producer.epoch)?,
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// When the abort of the open transaction waits behind an older open
 /// transaction on the same partition, the answer is CONCURRENT_TRANSACTIONS,
-/// and the producer is fenced, as in Kafka.
+/// and the producer is fenced, as in Kafka. The move happens once the older
+/// transaction ends, which finishes the abort.
 #[tokio::test]
-async fn deferred_abort_at_the_exhausted_epoch_fences_the_producer() -> Result<(), Error> {
+async fn deferred_abort_at_the_exhausted_epoch_fences_then_moves() -> Result<(), Error> {
     let _guard = init_tracing()?;
     let storage = storage()?;
     let topition = Topition::new("deferred", 0);
     create_topic(&storage, topition.topic()).await?;
+    seed(&storage, PRODUCER_ID, &[(32766, None)]).await?;
 
-    let produced = |offset| {
-        BTreeMap::from([(
-            topition.topic().to_owned(),
-            BTreeMap::from([(
-                topition.partition(),
-                Some(TxnProduceOffset {
-                    offset_start: offset,
-                    offset_end: offset,
-                }),
-            )]),
-        )])
-    };
-
-    let older_producer = PRODUCER_ID + 1;
-
-    storage
-        .meta
-        .with_mut(&storage.object_store, |meta| {
-            for (producer, epoch) in [(PRODUCER_ID, 32766), (older_producer, 0)] {
-                _ = meta.producers.insert(
-                    producer,
-                    ProducerDetail {
-                        sequences: BTreeMap::from([(epoch, BTreeMap::new())]),
-                    },
-                );
-            }
-
-            for (name, producer, epoch, offset) in [
-                ("older", older_producer, 0, 0),
-                (TRANSACTION_ID, PRODUCER_ID, 32766, 1),
-            ] {
-                _ = meta.transactions.insert(
-                    name.into(),
-                    Txn {
-                        producer,
-                        epochs: BTreeMap::from([(
-                            epoch,
-                            TxnDetail {
-                                transaction_timeout_ms: TIMEOUT_MS,
-                                state: Some(TxnState::Begin),
-                                produces: produced(offset),
-                                ..Default::default()
-                            },
-                        )]),
-                    },
-                );
-            }
-
-            Ok(())
-        })
+    let older = storage
+        .init_producer(Some("older"), TIMEOUT_MS, None, None)
         .await?;
+    open_transaction(&storage, "older", older, &topition).await?;
+    open_transaction(
+        &storage,
+        TRANSACTION_ID,
+        granted(PRODUCER_ID, 32766),
+        &topition,
+    )
+    .await?;
 
     assert_eq!(
         ProducerIdResponse::failed(ErrorCode::ConcurrentTransactions),
@@ -495,6 +487,20 @@ async fn deferred_abort_at_the_exhausted_epoch_fences_the_producer() -> Result<(
         ProducerIdResponse::failed(ErrorCode::ConcurrentTransactions),
         init_producer(&storage, None).await?
     );
+
+    assert_eq!(
+        ErrorCode::None,
+        storage
+            .txn_end("older", older.id, older.epoch, true)
+            .await?
+    );
+
+    let moved = init_producer(&storage, None).await?;
+    assert_eq!((ErrorCode::None, 0), (moved.error, moved.epoch));
+    assert_ne!(PRODUCER_ID, moved.id);
+
+    let stage = storage.offset_stage(&topition).await?;
+    assert_eq!(stage.high_watermark, stage.last_stable);
 
     Ok(())
 }

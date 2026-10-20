@@ -6996,10 +6996,10 @@ mod tests {
 
     /// When the abort of the open transaction waits behind an older open transaction on
     /// the same partition, the answer is CONCURRENT_TRANSACTIONS, and the producer is
-    /// fenced, as in Kafka.
+    /// fenced, as in Kafka. The move happens once the older transaction ends, which
+    /// finishes the abort.
     #[tokio::test]
-    async fn init_producer_deferred_abort_at_the_exhausted_epoch_fences_the_producer() -> Result<()>
-    {
+    async fn init_producer_deferred_abort_at_the_exhausted_epoch_fences_then_moves() -> Result<()> {
         let _guard = init_tracing()?;
         let db_file = "init-producer-deferred-abort-exhausted-test.db";
         let _db_file_guard = DbFileGuard::new(db_file);
@@ -7034,6 +7034,20 @@ mod tests {
                 .await,
             Err(Error::Api(ErrorCode::ProducerFenced))
         );
+
+        assert_eq!(
+            ErrorCode::None,
+            engine.txn_end("older", older.id, older.epoch, true).await?
+        );
+
+        let moved = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        assert_eq!((ErrorCode::None, 0), (moved.error, moved.epoch));
+        assert_ne!(producer.id, moved.id);
+
+        let stage = engine.offset_stage(&topition).await?;
+        assert_eq!(stage.high_watermark, stage.last_stable);
 
         Ok(())
     }
