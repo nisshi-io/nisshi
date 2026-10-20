@@ -1,0 +1,416 @@
+name: Guardian Scan
+
+# FOSSA + Prisma scanning that reports to Guardian. PR = report only; merge queue
+# entry = scans skipped, gate passes with an accounted reason; push to main /
+# release = upload + block on Guardian's verdict. Secrets come from the
+# `guardian` Environment (no Vault). `Guardian scan gate` is the required status
+# check.
+#
+# DAG: build (image) and fossa run in parallel; prisma runs after build;
+# guardian-gate runs after fossa + prisma; gate aggregates everything;
+# update-manifest records the merge in the release manifest. guardian-gate and
+# update-manifest are trunk only.
+#
+# Convention: `setup` computes every derived value as a string output; each job
+# maps the ones it needs into `env:` and references `${{ env.* }}` rather than
+# re-interpolating expressions inline, and boolean conditions use fromJSON().
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  push:
+    branches: [main]
+  # `Guardian scan gate` is required, so it must report in a merge queue too; see
+  # `setup` for why a queue entry is its own mode.
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref to scan (branch, tag, or SHA). Empty = current ref."
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      git_ref:
+        required: false
+        type: string
+        default: ""
+      product_full_version:
+        required: false
+        type: string
+        default: ""
+      fail_on_blocked:
+        required: false
+        type: boolean
+        default: true
+
+# Same group as ci.yml rather than plain `sha`: the queue fast-forwards main to
+# the commit it just tested, so the merge_group run and the post-merge push run
+# share a sha, and sharing a group would cancel one of them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: nisshi-io/nisshi
+  IMAGE_REGISTRY: ghcr.io
+  PRODUCT_NAME: nisshi
+  FOSSA_PROJECT_ID: nisshi-io_nisshi
+
+jobs:
+  setup:
+    name: Resolve context
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.ctx.outputs.mode }}
+      ref: ${{ steps.ctx.outputs.ref }}
+      fossa_branch: ${{ steps.ctx.outputs.fossa_branch }}
+      fossa_revision: ${{ steps.ctx.outputs.fossa_revision }}
+      full_version: ${{ steps.ctx.outputs.full_version }}
+      is_fork: ${{ steps.ctx.outputs.is_fork }}
+      is_pr: ${{ steps.ctx.outputs.is_pr }}
+      is_trunk: ${{ steps.ctx.outputs.is_trunk }}
+      is_queue: ${{ steps.ctx.outputs.is_queue }}
+      enforce: ${{ steps.ctx.outputs.enforce }}
+      fossa_mode: ${{ steps.ctx.outputs.fossa_mode }}
+      scan_tag: scan-${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.git_ref || github.ref }}
+          persist-credentials: false
+      # The classification lives in a script with a self-test because it decides
+      # whether a run uploads to Guardian, runs the DB sync + Jira report, and
+      # blocks on Guardian's verdict. The self-test runs first, and is not
+      # decoration: the regressions it pins are a queue entry or a feature-branch
+      # dispatch silently classified as trunk, and a value the PR author chose
+      # reaching the shared actions' bash unfiltered.
+      - name: Self-test the scan context resolution
+        run: .github/scripts/guardian-scan-context.test.sh
+      - name: Resolve
+        id: ctx
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GIT_REF_INPUT: ${{ inputs.git_ref }}
+          FULL_VERSION_INPUT: ${{ inputs.product_full_version }}
+          FAIL_ON_BLOCKED: ${{ inputs.fail_on_blocked }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: .github/scripts/guardian-scan-context.sh
+
+  # Every scan job also skips on a merge queue entry (`is_queue`), not just on
+  # fork PRs. Off trunk the guards are all REPORT-only, so a queue-mode scan
+  # could fail only on scanner infrastructure - no verdict value - while running
+  # it would hand the `guardian` Environment's FOSSA/Prisma secrets to merged
+  # content (fork PRs' included) on a ref that may never land, and couple queue
+  # throughput to FOSSA/Prisma/ghcr availability with no bypass. Coverage is the
+  # PR run before the queue and the trunk run after it; `gate` passes the skip
+  # with an accounted reason, same as fork PRs.
+  #
+  # build and prisma run on PRs too, as in solace-broker-mcp. Prisma never
+  # blocks (bypass_blocking) and only a trunk run uploads to Guardian, so a PR
+  # gets a report-only check run. The Guardian gate enforces the verdict after
+  # merge.
+  build:
+    name: Build image
+    needs: setup
+    if: ${{ !fromJSON(needs.setup.outputs.is_fork) && !fromJSON(needs.setup.outputs.is_queue) }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-image.yaml
+    with:
+      git_ref: ${{ needs.setup.outputs.ref }}
+      scan_tag: ${{ needs.setup.outputs.scan_tag }}
+      artifact_name: guardian-scan-image
+
+  # One analyze, then both guards read the revision it uploaded. Two analyze
+  # jobs would race to upload the same branch/revision.
+  fossa:
+    name: FOSSA
+    needs: setup
+    if: ${{ !fromJSON(needs.setup.outputs.is_fork) && !fromJSON(needs.setup.outputs.is_queue) }}
+    runs-on: ubuntu-latest
+    environment: guardian
+    permissions:
+      contents: read
+      packages: read        # fossa-guard pulls the private maas-build-actions container
+      pull-requests: write  # fossa-guard enable_pr_comment
+      checks: write         # fossa-guard enable_status_check (its README lists both)
+      statuses: write       # fossa-guard enable_status_check
+    env:
+      IS_PR: ${{ needs.setup.outputs.is_pr }}
+      IS_TRUNK: ${{ needs.setup.outputs.is_trunk }}
+      FOSSA_MODE: ${{ needs.setup.outputs.fossa_mode }}
+      FOSSA_BRANCH: ${{ needs.setup.outputs.fossa_branch }}
+      FOSSA_REVISION: ${{ needs.setup.outputs.fossa_revision }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.setup.outputs.ref }}
+          persist-credentials: false
+      # FOSSA's cargo strategy reads `cargo metadata` (no build scripts run);
+      # the channel comes from rust-toolchain.toml. Nothing is compiled, so
+      # no cache.
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+      # sca-scan only installs the FOSSA CLI when `fossa` isn't on PATH, and
+      # then pipes fossa-cli's master-branch install-latest.sh into bash in a
+      # job holding the FOSSA and Guardian secrets. Installing a pinned, checksummed release
+      # first means that branch never runs.
+      - name: Install FOSSA CLI
+        env:
+          FOSSA_VERSION: 3.19.3
+          FOSSA_SHA256: 4a312e74674d87f567e71455af228bafcf6f047c1aff14c47ef34cb2b08b22e2
+        run: |
+          tarball="fossa_${FOSSA_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "${RUNNER_TEMP}/${tarball}" "https://github.com/fossas/fossa-cli/releases/download/v${FOSSA_VERSION}/${tarball}"
+          echo "${FOSSA_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/fossa-bin"
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/fossa-bin" fossa
+          echo "${RUNNER_TEMP}/fossa-bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/fossa-bin/fossa" --version
+      - name: FOSSA analyze and upload
+        id: analyze
+        uses: SolaceDev/solace-public-workflows/.github/actions/sca/sca-scan@28c83e5b0e326469a061ec77f52807ec090c0b02 # main 2026-09-29 (#139), untagged
+        with:
+          scanners: "fossa"
+          additional_scan_params: |
+            fossa.branch=${{ env.FOSSA_BRANCH }}
+            fossa.revision=${{ env.FOSSA_REVISION }}
+          fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
+          # Upload only on trunk (env flag), never on a PR.
+          guardian_url: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_URL || '' }}
+          guardian_token: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_API_TOKEN || '' }}
+      - name: FOSSA licensing guard
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@28c83e5b0e326469a061ec77f52807ec090c0b02 # main 2026-09-29 (#139), untagged
+        with:
+          fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
+          fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
+          fossa_branch: ${{ env.FOSSA_BRANCH }}
+          fossa_revision: ${{ env.FOSSA_REVISION }}
+          fossa_category: licensing
+          fossa_mode: ${{ env.FOSSA_MODE }}
+          block_on: policy_conflict
+          enable_diff_mode: ${{ env.IS_PR }}
+          enable_pr_comment: ${{ env.IS_PR }}
+          enable_status_check: ${{ env.IS_PR }}
+          enable_privacy_mode: ${{ env.IS_PR }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      # Still runs when the licensing guard blocks, so a trunk run reports both,
+      # but not when there is no fresh analysis to read.
+      - name: FOSSA vulnerability guard
+        if: ${{ !cancelled() && steps.analyze.outcome == 'success' }}
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@28c83e5b0e326469a061ec77f52807ec090c0b02 # main 2026-09-29 (#139), untagged
+        with:
+          fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
+          fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
+          fossa_branch: ${{ env.FOSSA_BRANCH }}
+          fossa_revision: ${{ env.FOSSA_REVISION }}
+          fossa_category: vulnerability
+          fossa_mode: REPORT
+          block_on: critical,high
+          enable_diff_mode: ${{ env.IS_PR }}
+          enable_pr_comment: ${{ env.IS_PR }}
+          enable_status_check: ${{ env.IS_PR }}
+          enable_privacy_mode: ${{ env.IS_PR }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  prisma:
+    name: Prisma scan
+    needs: [setup, build]
+    if: ${{ !fromJSON(needs.setup.outputs.is_fork) && !fromJSON(needs.setup.outputs.is_queue) }}
+    runs-on: ubuntu-latest
+    environment: guardian
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write      # prisma-cloud-scan create_status_check posts a check run
+      statuses: write
+    env:
+      IS_TRUNK: ${{ needs.setup.outputs.is_trunk }}
+      SCAN_TAG: ${{ needs.setup.outputs.scan_tag }}
+      FULL_VERSION: ${{ needs.setup.outputs.full_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
+          persist-credentials: false
+      - name: Download scan image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: guardian-scan-image
+      - name: Load image
+        run: docker load -i image.tar
+      # No guardian-vulnerability-diff step: the CVE-diff PR comment it posts is
+      # not wanted on a public repo. The Prisma verdict is enforced by the
+      # Guardian gate on trunk, not on PRs.
+      - name: Prisma Cloud scan
+        uses: SolaceDev/solace-public-workflows/prisma-cloud-scan@28c83e5b0e326469a061ec77f52807ec090c0b02 # main 2026-09-29 (#139), untagged
+        with:
+          image_registry: ${{ env.IMAGE_REGISTRY }}
+          image_repo: ${{ env.IMAGE_REPO }}
+          image_tag: ${{ env.SCAN_TAG }}
+          skip_image_pull: "true"
+          pcc_console_url: ${{ secrets.PRISMACLOUD_CONSOLE_URL }}
+          pcc_user: ${{ secrets.PRISMACLOUD_ACCESS_KEY_ID }}
+          pcc_pass: ${{ secrets.PRISMACLOUD_SECRET_KEY }}
+          bypass_blocking: "true"
+          # Upload only on trunk (env flag), never on a PR.
+          guardian_url: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_URL || '' }}
+          guardian_key: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_API_TOKEN || '' }}
+          guardian_product_name: ${{ env.PRODUCT_NAME }}
+          guardian_product_version: main
+          guardian_product_full_version: ${{ env.FULL_VERSION }}
+
+  guardian-gate:
+    name: Guardian gate
+    needs: [setup, fossa, prisma]
+    if: ${{ !cancelled() && needs.setup.result == 'success' && !fromJSON(needs.setup.outputs.is_fork) && fromJSON(needs.setup.outputs.is_trunk) }}
+    runs-on: ubuntu-latest
+    environment: guardian
+    permissions:
+      contents: read
+    env:
+      FULL_VERSION: ${{ needs.setup.outputs.full_version }}
+      ENFORCE: ${{ needs.setup.outputs.enforce }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
+          persist-credentials: false
+      - name: Guardian DB sync and Jira report
+        uses: SolaceDev/solace-public-workflows/guardian-db-sync@28c83e5b0e326469a061ec77f52807ec090c0b02 # main 2026-09-29 (#139), untagged
+        with:
+          guardian-url: ${{ secrets.GUARDIAN_URL }}
+          guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
+          product-name: ${{ env.PRODUCT_NAME }}
+          product-full-version: ${{ env.FULL_VERSION }}
+          unifiers: "fossa,prisma"
+          upload-logs: "true"
+      - name: Guardian vulnerability gate
+        uses: SolaceDev/solace-public-workflows/guardian-vulnerability-gate@28c83e5b0e326469a061ec77f52807ec090c0b02 # main 2026-09-29 (#139), untagged
+        with:
+          guardian-url: ${{ secrets.GUARDIAN_URL }}
+          guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
+          product-name: ${{ env.PRODUCT_NAME }}
+          product-version: ${{ env.FULL_VERSION }}
+          fail-on-blocked: ${{ env.ENFORCE }}
+          upload-logs: "true"
+
+  gate:
+    name: Guardian scan gate
+    needs: [setup, build, fossa, prisma, guardian-gate]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Aggregate verdict
+        env:
+          R_SETUP: ${{ needs.setup.result }}
+          IS_FORK: ${{ needs.setup.outputs.is_fork }}
+          IS_TRUNK: ${{ needs.setup.outputs.is_trunk }}
+          IS_QUEUE: ${{ needs.setup.outputs.is_queue }}
+          R_BUILD: ${{ needs.build.result }}
+          R_FOSSA: ${{ needs.fossa.result }}
+          R_PRISMA: ${{ needs.prisma.result }}
+          R_GATE: ${{ needs.guardian-gate.result }}
+        run: |
+          set -euo pipefail
+          # A failed setup leaves every output empty, which would otherwise read
+          # as "not a fork, not a queue entry" and report the skips below.
+          if [ "$R_SETUP" != "success" ]; then
+            echo "::error::setup = $R_SETUP"; exit 1
+          fi
+          if [ "$IS_FORK" = "true" ]; then
+            echo "::notice::Fork PR - scans skipped (no Environment secrets)."
+            exit 0
+          fi
+          if [ "$IS_QUEUE" = "true" ]; then
+            echo "::notice::Merge queue entry - scans skipped (PR run already reported; trunk run enforces after merge)."
+            exit 0
+          fi
+          fail=0
+          for pair in "build:$R_BUILD" "fossa:$R_FOSSA" "prisma:$R_PRISMA"; do
+            name="${pair%%:*}"; res="${pair#*:}"
+            if [ "$res" != "success" ]; then echo "::error::$name = $res"; fail=1; fi
+          done
+          # guardian-gate only runs on trunk.
+          if [ "$IS_TRUNK" = "true" ] && [ "$R_GATE" != "success" ]; then
+            echo "::error::guardian-gate = $R_GATE"; fail=1
+          fi
+          [ "$fail" -eq 0 ] && echo "Guardian scan passed." || exit 1
+
+  # Records the merge in the release manifest Guardian's scheduled scan reads to
+  # pick a revision and an image. A blocked gate leaves the row at the previous
+  # commit.
+  #
+  # The shared workflow owns the default-branch check and skips tag pushes unless
+  # asked otherwise, so the guard here only has to cover the event. It is still
+  # needed: a workflow_dispatch scans this workflow's `git_ref` input while
+  # `github.ref_name` is main, which would file that ref's version as trunk's.
+  #
+  # It grants `contents: read` and `id-token: write`, so any future
+  # `workflow_call` caller of this workflow must grant the latter too - a
+  # reusable workflow's permissions must be a subset of its caller's, enforced
+  # at run creation even though this job never runs on that path.
+  update-manifest:
+    name: Update release manifest
+    needs: [setup, gate]
+    if: ${{ github.event_name == 'push' }}
+    permissions:
+      contents: read
+      id-token: write    # OIDC, to assume manifest_aws_role
+    uses: SolaceDev/solace-public-workflows/.github/workflows/update-manifest.yaml@28c83e5b0e326469a061ec77f52807ec090c0b02 # main 2026-09-29 (#139), untagged
+    with:
+      table_name: solace-cloud-manifest
+      manifest_aws_role: arn:aws:iam::868978040651:role/github-solace-cloud-manifest-rw
+      # `version` is read back as a FOSSA revision, so it must be the string the
+      # FOSSA jobs above stamp - a branch name resolves to nothing.
+      #
+      # `image_tag` is the moving `main` tag nisshi's ci.yml `package` job
+      # pushes on every push to main, so it names an image that exists.
+      # Guardian takes only the tag from this row. It builds the rest of the
+      # image path from the `nisshi` product's own config, as
+      # `<container_registry>/<ecr_image_name>:<image_tag>`, which is
+      # ghcr.io/nisshi-io/nisshi:main. A pull that 404s is not a partial
+      # result - the scan fetcher discards a product's FOSSA output too unless
+      # every enabled scanner succeeded.
+      #
+      # The write merges, but a map-valued attribute is replaced wholesale, so
+      # `dev` and `prisma_cloud` each have to be given complete.
+      #
+      # `repository` is the row key Guardian looks the product up by, so it
+      # must equal PRODUCT_NAME, not the repo name. Hardcoded because `env` is
+      # not available in a reusable-workflow caller's `with`. Keeping it
+      # fixed means a repo rename or transfer changes nothing.
+      item: |
+        {
+          "squad": "swift",
+          "repository": "nisshi",
+          "prisma_cloud": {
+            "enabled": ["dev"]
+          },
+          "dev": {
+            "sha": "${{ github.sha }}",
+            "version": "${{ needs.setup.outputs.full_version }}",
+            "image_tag": "main"
+          }
+        }

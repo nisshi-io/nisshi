@@ -1,0 +1,6 @@
+rules:
+  cache-poisoning:
+    ignore:
+      # Restore-only Rust cache on a scan image that is never published; see
+      # the comment on its Setup Rust step.
+      - build-image.yaml
