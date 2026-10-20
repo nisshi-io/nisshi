@@ -15,10 +15,11 @@
 
 -- prepare record_delete_below_log_start (text) as
 
--- Removes the records that DeleteRecords left below a partition's log start
--- (watermark.low). It keeps the record at watermark.high - 1, which the
--- Latest queries join. Postgres's least() ignores a null, so both
--- watermarks must be present.
+-- Maintenance runs this to delete every record below its partition's log
+-- start (watermark.low). DeleteRecords on PostgreSQL commits the new
+-- watermark.low first, and then deletes the records below it in a second
+-- transaction. When that second transaction fails, the records stay stored
+-- until this query deletes them.
 
 delete from record
 
@@ -32,5 +33,4 @@ and tp.topic = t.id
 and w.topition = tp.id
 and record.topition = tp.id
 and w.low is not null
-and w.high is not null
-and record.offset_id < least(w.low, w.high - 1);
+and record.offset_id < w.low;

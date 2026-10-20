@@ -256,10 +256,10 @@ where
 /// would delete this whole batch -- including offsets 2 and 3, which must
 /// still be visible -- because its base (0) is below the cutoff (2).
 ///
-/// A second, standalone record follows the batch so the straddled batch is
-/// never the active segment: this test is purely about the end-vs-start
-/// deletion rule, independent of the `high_watermark - 1` guard covered by
-/// `delete_to_high_watermark_keeps_latest`.
+/// A second, standalone record follows the batch, so that the straddled
+/// batch is not the newest one. DynoStore never deletes its newest batch.
+/// If the straddled batch were the newest, DynoStore would keep it even with
+/// a wrong deletion rule, and the test would pass on a broken backend.
 pub async fn delete_offset_inside_a_batch_keeps_the_whole_batch<G>(
     cluster_id: Uuid,
     broker_id: i32,

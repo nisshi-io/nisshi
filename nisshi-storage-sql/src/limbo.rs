@@ -1368,75 +1368,64 @@ impl Storage for Engine {
                 for partition in partitions {
                     let topition = Topition::new(topic.name.as_str(), partition.partition_index);
 
-                    let (error_code, low_watermark) =
-                        match self.watermark_select_for_update(&topition, &tx).await {
-                            Err(Error::Api(error_code)) => {
-                                (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
-                            }
-                            Err(err) => return Err(err),
+                    let (error_code, low_watermark) = match self
+                        .watermark_select_for_update(&topition, &tx)
+                        .await
+                    {
+                        Err(Error::Api(error_code)) => {
+                            (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                        }
+                        Err(err) => return Err(err),
 
-                            Ok((low, high)) => {
-                                let stage = OffsetStage {
-                                    last_stable: high.unwrap_or_default(),
-                                    high_watermark: high.unwrap_or_default(),
-                                    log_start: low.unwrap_or_default(),
-                                };
+                        Ok((low, high)) => {
+                            let stage = OffsetStage {
+                                last_stable: high.unwrap_or_default(),
+                                high_watermark: high.unwrap_or_default(),
+                                log_start: low.unwrap_or_default(),
+                            };
 
-                                match delete_records_cutoff(partition.offset, &stage) {
-                                    Err(error_code) => {
-                                        (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
-                                    }
+                            match delete_records_cutoff(partition.offset, &stage) {
+                                Err(error_code) => {
+                                    (error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                                }
 
-                                    Ok(cutoff) => {
-                                        // This keeps the record at `high_watermark - 1`, because
-                                        // `list_latest_offset_committed.sql` and
-                                        // `list_latest_offset_uncommitted.sql` answer `Latest` from
-                                        // that record. `list_latest_offset_committed.sql` also joins
-                                        // the record at an open transaction's `offset_start`, which
-                                        // this cut does not keep: a cut past that offset makes
-                                        // read_committed `Latest` answer the high watermark instead
-                                        // of the last stable offset. The watermark still advances
-                                        // to `cutoff`.
-                                        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
-
-                                        if physical_cutoff > stage.log_start {
-                                            _ = self
-                                                .prepare_execute(
-                                                    &tx,
-                                                    &sql_lookup("record_delete_by_offset.sql")?,
-                                                    (
-                                                        self.cluster.as_str(),
-                                                        topic.name.as_str(),
-                                                        partition.partition_index,
-                                                        physical_cutoff,
-                                                    ),
-                                                )
-                                                .await
-                                                .inspect_err(|err| {
-                                                    error!(?err, ?topition, physical_cutoff)
-                                                })?;
-                                        }
-
+                                Ok(cutoff) => {
+                                    if cutoff > stage.log_start {
                                         _ = self
                                             .prepare_execute(
                                                 &tx,
-                                                &sql_lookup("watermark_update.sql")?,
+                                                &sql_lookup("record_delete_by_offset.sql")?,
                                                 (
                                                     self.cluster.as_str(),
                                                     topic.name.as_str(),
                                                     partition.partition_index,
                                                     cutoff,
-                                                    high.unwrap_or_default(),
                                                 ),
                                             )
                                             .await
-                                            .inspect_err(|err| error!(?err, ?topition))?;
-
-                                        (ErrorCode::None, cutoff)
+                                            .inspect_err(|err| error!(?err, ?topition, cutoff))?;
                                     }
+
+                                    _ = self
+                                        .prepare_execute(
+                                            &tx,
+                                            &sql_lookup("watermark_update.sql")?,
+                                            (
+                                                self.cluster.as_str(),
+                                                topic.name.as_str(),
+                                                partition.partition_index,
+                                                cutoff,
+                                                high.unwrap_or_default(),
+                                            ),
+                                        )
+                                        .await
+                                        .inspect_err(|err| error!(?err, ?topition))?;
+
+                                    (ErrorCode::None, cutoff)
                                 }
                             }
-                        };
+                        }
+                    };
 
                     partition_responses.push(
                         DeleteRecordsPartitionResult::default()
@@ -2220,23 +2209,20 @@ impl Storage for Engine {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    // No record row: Earliest/Latest answer 0, a Timestamp
-                    // lookup answers no offset (see `ListOffsetResponse::offset`).
-                    let (offset, timestamp) = match offset_type {
-                        ListOffsetRequest::Earliest | ListOffsetRequest::Latest => (Some(0), None),
-                        ListOffsetRequest::Timestamp(_) => (None, None),
+                    // Earliest and Latest find no row only when the partition does not exist,
+                    // because creating a partition also creates its watermark row. A Timestamp
+                    // lookup finds no row when no record matches, and also when the partition
+                    // does not exist. Both answer no offset (see `ListOffsetResponse::offset`).
+                    let error_code = match offset_type {
+                        ListOffsetRequest::Earliest | ListOffsetRequest::Latest => {
+                            ErrorCode::UnknownTopicOrPartition
+                        }
+                        ListOffsetRequest::Timestamp(_) => ErrorCode::None,
                     };
-                    debug!(
-                        cluster = self.cluster,
-                        ?topition,
-                        ?offset_type,
-                        offset,
-                        ?timestamp
-                    );
+                    debug!(cluster = self.cluster, ?topition, ?offset_type, ?error_code);
 
                     Ok(ListOffsetResponse {
-                        timestamp,
-                        offset,
+                        error_code,
                         ..Default::default()
                     })
                 },
@@ -4696,10 +4682,9 @@ mod tests {
         Ok(())
     }
 
-    /// `offset == -1` ("delete everything up to the high watermark") must
-    /// never remove the active batch holding `high_watermark - 1`: the log
-    /// start catches up to the high watermark, but the high watermark
-    /// itself, and hence `ListOffsets(Latest)`, is unaffected.
+    /// `offset == -1` ("delete everything up to the high watermark") moves the
+    /// log start to the high watermark, and leaves the high watermark, and so
+    /// `ListOffsets(Latest)`, unchanged.
     ///
     /// `#[ignore]`d like every other engine-level test here: turso/limbo
     /// cannot yet run the full produce flow in CI. Run manually against
@@ -4779,14 +4764,10 @@ mod tests {
 
         let stage = engine.offset_stage(&topition).await?;
         assert_eq!(record_count, stage.log_start);
-        assert_eq!(
-            record_count, stage.high_watermark,
-            "the active batch holding high_watermark - 1 must survive a -1 delete"
-        );
+        assert_eq!(record_count, stage.high_watermark);
 
-        // `offset_stage` reads the watermark only, so these check the
-        // records: `Latest` needs the record at `high_watermark - 1`, and
-        // `Earliest` must answer the log start and not that record.
+        // `offset_stage` reads the watermark only, so these check what
+        // `ListOffsets` answers.
         let offsets = engine
             .list_offsets(
                 IsolationLevel::ReadUncommitted,

@@ -42,6 +42,21 @@ const COMPACT: &str = "compact";
 const DELETE: &str = "delete";
 const RETENTION_MS: &str = "retention.ms";
 
+/// The partition that each test produces its records to.
+const PRODUCED_PARTITION: i32 = 0;
+/// How many records each test produces, at offsets 0, 1 and 2.
+const PRODUCED_RECORD_COUNT: i64 = 3;
+
+/// Returns the earliest and latest offset of a partition after retention has deleted every
+/// record that a test produced.
+fn offset_after_retention_deleted_every_record(partition_index: i32) -> i64 {
+    if partition_index == PRODUCED_PARTITION {
+        PRODUCED_RECORD_COUNT
+    } else {
+        0
+    }
+}
+
 type Broker = RequestFrameService<
     FrameBytesService<BytesService<BytesFrameService<FrameRouteService<Error>>>>,
 >;
@@ -131,7 +146,7 @@ where
         })
         .and_then(deflated::Frame::try_from)?;
 
-    let partition = 0;
+    let partition = PRODUCED_PARTITION;
 
     let response = broker
         .serve(RequestInput {
@@ -545,7 +560,7 @@ where
         })
         .and_then(deflated::Frame::try_from)?;
 
-    let partition = 0;
+    let partition = PRODUCED_PARTITION;
 
     let response = broker
         .serve(RequestInput {
@@ -996,7 +1011,12 @@ where
 
     for partition in partitions {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(
+            Some(offset_after_retention_deleted_every_record(
+                partition.partition_index
+            )),
+            partition.offset
+        );
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -1038,7 +1058,12 @@ where
 
     for partition in partitions {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(
+            Some(offset_after_retention_deleted_every_record(
+                partition.partition_index
+            )),
+            partition.offset
+        );
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -1158,7 +1183,7 @@ where
         })
         .and_then(deflated::Frame::try_from)?;
 
-    let partition = 0;
+    let partition = PRODUCED_PARTITION;
 
     let response = broker
         .serve(RequestInput {
@@ -1609,7 +1634,12 @@ where
 
     for partition in partitions {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(
+            Some(offset_after_retention_deleted_every_record(
+                partition.partition_index
+            )),
+            partition.offset
+        );
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -1651,7 +1681,12 @@ where
 
     for partition in partitions {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(
+            Some(offset_after_retention_deleted_every_record(
+                partition.partition_index
+            )),
+            partition.offset
+        );
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -1776,7 +1811,7 @@ where
         })
         .and_then(deflated::Frame::try_from)?;
 
-    let partition = 0;
+    let partition = PRODUCED_PARTITION;
 
     let response = broker
         .serve(RequestInput {
@@ -2249,7 +2284,7 @@ where
         })
         .and_then(deflated::Frame::try_from)?;
 
-    let partition = 0;
+    let partition = PRODUCED_PARTITION;
 
     let response = broker
         .serve(RequestInput {
@@ -2692,7 +2727,12 @@ where
 
     for partition in partitions {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(
+            Some(offset_after_retention_deleted_every_record(
+                partition.partition_index
+            )),
+            partition.offset
+        );
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -2734,7 +2774,12 @@ where
 
     for partition in partitions {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        assert_eq!(
+            Some(offset_after_retention_deleted_every_record(
+                partition.partition_index
+            )),
+            partition.offset
+        );
         assert_eq!(Some(-1), partition.timestamp);
     }
 
