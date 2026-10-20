@@ -30,7 +30,9 @@
 # macOS, the suite needs Docker Desktop with host networking turned on, or,
 # under colima, NISSHI_SMOKE_DOCKER_HOST_IP=192.168.5.2, the address at which
 # colima's containers reach this machine. That setting covers a broker run as
-# a process here, the default, and not NISSHI_SMOKE_IMAGE.
+# a process here, the default, and not NISSHI_SMOKE_IMAGE. It installs
+# iptables in an alpine container with apk, so it needs access to an Alpine
+# package mirror.
 
 set -euo pipefail
 

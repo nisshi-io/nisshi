@@ -1691,3 +1691,71 @@ async fn watermark_read_failure_answers_an_error_for_the_partition() -> Result<(
 
     Ok(())
 }
+
+/// Under READ_COMMITTED, `Latest` answers the last stable offset: the
+/// first offset of the earliest open transaction on the partition. Under
+/// READ_UNCOMMITTED it answers the high watermark.
+#[tokio::test]
+async fn read_committed_latest_answers_the_last_stable_offset() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "latest-open-transaction";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    assert_eq!(0, produce_records(&storage, &topition, 2).await?);
+    assert_eq!(2, produce_records(&storage, &topition, 3).await?);
+
+    storage
+        .meta
+        .with_mut(&storage.object_store, |meta| {
+            _ = meta.transactions.insert(
+                "txn".into(),
+                Txn {
+                    producer: 1,
+                    epochs: BTreeMap::from([(
+                        0,
+                        TxnDetail {
+                            state: Some(TxnState::Begin),
+                            produces: BTreeMap::from([(
+                                topic.into(),
+                                BTreeMap::from([(
+                                    0,
+                                    Some(TxnProduceOffset {
+                                        offset_start: 2,
+                                        offset_end: 4,
+                                    }),
+                                )]),
+                            )]),
+                            ..Default::default()
+                        },
+                    )]),
+                },
+            );
+            Ok(())
+        })
+        .await?;
+
+    assert_eq!(
+        (Some(2), None),
+        list_offset_at(
+            &storage,
+            IsolationLevel::ReadCommitted,
+            &topition,
+            ListOffset::Latest
+        )
+        .await?
+    );
+    assert_eq!(
+        (Some(5), None),
+        list_offset_at(
+            &storage,
+            IsolationLevel::ReadUncommitted,
+            &topition,
+            ListOffset::Latest
+        )
+        .await?
+    );
+
+    Ok(())
+}
