@@ -23,6 +23,7 @@ Result JSON lands in `results/`.
 | `PG_BIN` | postgres `bin` directory, default `/opt/homebrew/opt/postgresql@18/bin` |
 | `POSTGRES_PORT` | postgres port, default 5432 |
 | `WAL_DIR` | directory for the host postgres WAL, e.g. on a RAM disk; `broker` deletes it first |
+| `STORAGE_QUERY` | query string for the broker's storage URL, e.g. `maintenance_interval=10s` to sweep retention every 10 seconds instead of every 10 minutes |
 | `POSTGRES_ARGS` | extra arguments for the postgres server, e.g. `-c track_io_timing=on` |
 | `OMB_COMMIT` | upstream benchmark commit to build |
 

@@ -25,6 +25,9 @@
 # WAL_DIR keeps the write-ahead log of the host postgres in that directory, for example on a RAM
 # disk, to measure without WAL flush latency. `broker` deletes WAL_DIR first.
 #
+# STORAGE_QUERY is appended to the broker's storage URL as its query string, for a storage option such
+# as maintenance_interval=10s (the default sweep interval is 10 minutes).
+#
 # POSTGRES_ARGS adds arguments to the postgres server, for example
 # "-c shared_preload_libraries=auto_explain"
 #
@@ -134,6 +137,7 @@ broker() {
     else
         docker_postgres
     fi
+    storage=$storage${STORAGE_QUERY:+?$STORAGE_QUERY}
     cargo build --release --bin nisshi --no-default-features --features postgres
     pkill -f 'target/release/nisshi broker' 2>/dev/null || true
     RUST_LOG=${RUST_LOG:-warn} nohup target/release/nisshi broker \
