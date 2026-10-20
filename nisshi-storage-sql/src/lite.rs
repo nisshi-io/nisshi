@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{
+    database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{Cache, default_hash, idempotent_sequence_check, remove_comments},
 };
@@ -2371,17 +2372,9 @@ impl Builder<String, i32, Url, Url> {
     pub(crate) async fn build(self) -> Result<ArcDynStorage> {
         debug!(domain = self.storage.domain(), path = self.storage.path());
 
-        let mut path = env::current_dir().inspect(|current_dir| debug!(?current_dir))?;
-
-        if let Some(domain) = self.storage.domain() {
-            path.push(domain);
-        }
-
-        if let Some(relative) = self.storage.path().strip_prefix("/") {
-            path.push(relative);
-        } else if !self.storage.path().is_empty() {
-            path.push(self.storage.path());
-        }
+        let path = env::current_dir()
+            .inspect(|current_dir| debug!(?current_dir))
+            .map(|current_dir| database_file::path(current_dir, &self.storage))?;
 
         debug!(?path);
 

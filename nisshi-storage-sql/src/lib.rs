@@ -18,6 +18,9 @@
 mod schema;
 mod sql;
 
+#[cfg(any(feature = "libsql", feature = "turso"))]
+mod database_file;
+
 #[cfg(feature = "libsql")]
 pub mod lite;
 
