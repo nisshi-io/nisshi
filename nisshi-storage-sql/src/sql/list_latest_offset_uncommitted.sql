@@ -14,9 +14,14 @@
 -- limitations under the License.
 
 -- prepare list_latest_offset (text, text, integer) as
+
+-- Kafka answers Latest with the high watermark: the offset that produce
+-- gives the next record. The query answers watermark.high, and the timestamp
+-- of the newest record, which is at watermark.high - 1.
+
 select
 
-r.offset_id + 1, r.timestamp
+coalesce(w.high, 0), r.timestamp
 
 from
 
@@ -24,7 +29,9 @@ cluster c
 join topic t on t.cluster = c.id
 join topition tp on tp.topic = t.id
 join watermark w on w.topition = tp.id
-join record r on r.topition = tp.id and r.offset_id = w.high - 1
+-- Retention can delete the newest record. The left join keeps the row
+-- when that record is gone, and the timestamp is then null.
+left join record r on r.topition = tp.id and r.offset_id = w.high - 1
 
 where
 

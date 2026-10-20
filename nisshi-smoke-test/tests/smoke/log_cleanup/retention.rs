@@ -74,9 +74,6 @@ fn wait_until_earliest_offset_is(cli: &KafkaCli, topic: &str, expected: i64) {
 }
 
 /// Asserts that `topic` still holds the `count` records produced to it, at offsets from 0.
-///
-/// The test reads the records instead of checking that the earliest offset is still 0, because
-/// the broker also reports 0 for a partition that retention emptied.
 #[track_caller]
 fn assert_every_record_kept(cli: &KafkaCli, topic: &str, count: usize) {
     let offsets = cli
@@ -101,8 +98,6 @@ fn wait_for_maintenance_run(cli: &KafkaCli) {
         .topics()
         .create_unique(1, &[DELETE_POLICY, TEN_MINUTE_RETENTION]);
     produce_hour_old_records(cli, &topic, 1);
-    // The topic keeps a newer record, so retention never empties it. The broker reports the
-    // earliest offset of an empty partition as 0, and the wait would then never end.
     _ = cli.console_producer().produce_values(&topic, &["new-0"]);
     wait_until_earliest_offset_is(cli, &topic, 1);
 }
@@ -166,7 +161,6 @@ fn record_produced_after_retention_gets_the_next_offset() {
 /// committed offset is at that offset, and a latest offset that goes back makes the group's
 /// offset look out of range, so the group starts again from the beginning or the end.
 #[test]
-#[ignore = "the broker reports offsets 0 for a partition that retention emptied (#864)"]
 fn offsets_are_kept_when_retention_empties_a_partition() {
     let broker = Broker::isolated_with_frequent_maintenance();
     let cli = KafkaCli::new(broker.bootstrap());

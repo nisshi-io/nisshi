@@ -324,6 +324,87 @@ async fn invalid_isolation_level(storage: impl Storage + Clone, broker_id: i32) 
     Ok(())
 }
 
+/// A request for the Earliest or Latest offset of a partition that does not
+/// exist gets UNKNOWN_TOPIC_OR_PARTITION with offset -1, as in Kafka.
+async fn unknown_partition(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
+    let extensions = Extensions::default();
+
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+        storage: storage.clone(),
+    });
+
+    let topic = &alphanumeric_string(15)[..];
+    let num_partitions = 3;
+
+    {
+        let response = create_topic
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(topic.into())
+                            .num_partitions(num_partitions)
+                            .replication_factor(1)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    // The topic's partitions are numbered from 0, so the last is num_partitions - 1.
+    let missing_partition = num_partitions;
+
+    let service = ListOffsetsService {
+        storage: storage.clone(),
+    };
+
+    for which in [ListOffset::Earliest, ListOffset::Latest] {
+        let response = service
+            .serve(RequestInput {
+                request: ListOffsetsRequest::default()
+                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                    .replica_id(broker_id)
+                    .topics(Some(
+                        [ListOffsetsTopic::default()
+                            .name(topic.into())
+                            .partitions(Some(
+                                [ListOffsetsPartition::default()
+                                    .current_leader_epoch(Some(-1))
+                                    .max_num_offsets(Some(1))
+                                    .partition_index(missing_partition)
+                                    .timestamp(which.try_into()?)]
+                                .into(),
+                            ))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::UnknownTopicOrPartition,
+            ErrorCode::try_from(partitions[0].error_code)?,
+            "{which:?}"
+        );
+        assert_eq!(Some(-1), partitions[0].offset, "{which:?}");
+    }
+
+    Ok(())
+}
+
 /// Every partition of a request for many partitions answers within the
 /// ListOffsets deadline, in both isolation levels, when each storage call
 /// takes 50 to 150ms.
@@ -488,6 +569,20 @@ mod in_memory {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn unknown_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::unknown_partition(storage, broker_id).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -559,6 +654,20 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::many_partitions_with_latency(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::unknown_partition(storage, broker_id).await?;
 
         Ok(())
     }
@@ -636,6 +745,20 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn unknown_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::unknown_partition(storage, broker_id).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -707,6 +830,20 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::many_partitions_with_latency(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::unknown_partition(storage, broker_id).await?;
 
         Ok(())
     }
