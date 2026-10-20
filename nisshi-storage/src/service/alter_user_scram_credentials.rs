@@ -35,7 +35,7 @@ fn result(user: String, outcome: Result<()>) -> AlterUserScramCredentialsResult 
 
         Err(Error::UserCredentialsUnsupported { engine }) => (
             ErrorCode::UnsupportedVersion,
-            user_credentials_unsupported_message(engine),
+            user_credentials_unsupported_message(&engine),
         ),
 
         Err(error) => {
@@ -190,7 +190,7 @@ mod tests {
         let answered = result(
             "alice".into(),
             Err(Error::UserCredentialsUnsupported {
-                engine: "in-memory (memory://)",
+                engine: "in-memory (memory://)".into(),
             }),
         );
 

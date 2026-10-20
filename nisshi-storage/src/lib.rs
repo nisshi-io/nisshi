@@ -247,14 +247,14 @@ pub enum Error {
     /// store SCRAM credentials. `supported` names the storage engines of this build that can,
     /// and is empty when there are none. See [`authentication_unsupported_message`].
     AuthenticationUnsupported {
-        engine: &'static str,
-        supported: Vec<&'static str>,
+        engine: String,
+        supported: Vec<String>,
     },
 
     /// The `engine` storage engine can't store SCRAM credentials, so a credential upsert or
     /// deletion changed nothing. See [`user_credentials_unsupported_message`].
     UserCredentialsUnsupported {
-        engine: &'static str,
+        engine: String,
     },
 
     /// An `acks=0` Produce request had at least one non-`None` error code
@@ -1546,18 +1546,32 @@ pub struct StorageFactoryConfiguration {
     pub cancellation: CancellationToken,
 }
 
-#[async_trait]
-pub trait StorageFactory: Debug + Send + Sync + 'static {
-    fn scheme(&self) -> Result<Regex>;
-
-    /// The engine's name for people, with its URL scheme, e.g. `PostgreSQL (postgres://)`.
-    fn name(&self) -> &'static str;
-
+/// What a storage engine can do beyond the core [`Storage`] methods, so that the broker can
+/// refuse a configuration the engine can't serve before it starts, instead of failing request
+/// by request.
+///
+/// A new capability is a new field. An engine with no capability returns [`Default`]. An
+/// engine with any lists its capabilities in full, so adding a field makes the compiler name
+/// each engine that has to decide about it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageCapabilities {
     /// Whether the engine stores SCRAM credentials, so that a broker on it can require
     /// authentication. An engine that can't must fail
     /// [`Storage::upsert_user_scram_credential`] and [`Storage::delete_user_scram_credential`]
     /// instead of reporting success.
-    fn stores_user_credentials(&self) -> bool;
+    pub user_credentials: bool,
+}
+
+/// A storage engine's factory.
+///
+/// [`Display`] is the engine's name for people, with its URL scheme, e.g.
+/// `PostgreSQL (postgres://)`.
+#[async_trait]
+pub trait StorageFactory: Debug + Display + Send + Sync + 'static {
+    fn scheme(&self) -> Result<Regex>;
+
+    /// What the engine can do. See [`StorageCapabilities`].
+    fn capabilities(&self) -> StorageCapabilities;
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage>;
 }
@@ -2633,14 +2647,14 @@ impl Builder<i32, String, Url, Url> {
             });
         };
 
-        if self.user_credentials_required && !factory.stores_user_credentials() {
+        if self.user_credentials_required && !factory.capabilities().user_credentials {
             return Err(Error::AuthenticationUnsupported {
-                engine: factory.name(),
+                engine: factory.to_string(),
                 supported: self
                     .factories
                     .iter()
-                    .filter(|factory| factory.stores_user_credentials())
-                    .map(|factory| factory.name())
+                    .filter(|factory| factory.capabilities().user_credentials)
+                    .map(|factory| factory.to_string())
                     .collect(),
             });
         }
@@ -2684,7 +2698,7 @@ impl Builder<i32, String, Url, Url> {
 
 /// The message for [`Error::AuthenticationUnsupported`]: `engine` can't store SCRAM users,
 /// and `supported` names the engines of this build that can.
-pub fn authentication_unsupported_message(engine: &str, supported: &[&str]) -> String {
+pub fn authentication_unsupported_message(engine: &str, supported: &[impl AsRef<str>]) -> String {
     let choices = match supported.split_last() {
         None => {
             return format!(
@@ -2693,8 +2707,15 @@ pub fn authentication_unsupported_message(engine: &str, supported: &[&str]) -> S
                 postgres feature, or start without --authentication"
             );
         }
-        Some((last, [])) => (*last).to_owned(),
-        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        Some((last, [])) => last.as_ref().to_owned(),
+        Some((last, rest)) => format!(
+            "{} or {}",
+            rest.iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", "),
+            last.as_ref()
+        ),
     };
 
     format!(
@@ -2777,7 +2798,7 @@ mod tests {
             "the in-memory (memory://) storage engine can't store SCRAM users, which \
             --authentication needs, and this build has no storage engine that can: rebuild with \
             the libsql or postgres feature, or start without --authentication",
-            authentication_unsupported_message("in-memory (memory://)", &[])
+            authentication_unsupported_message("in-memory (memory://)", &[] as &[&str])
         );
     }
 

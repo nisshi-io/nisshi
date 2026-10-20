@@ -57,9 +57,11 @@ async fn assert_refused(storage: &str, engine: &str) -> Result<()> {
             engine: refused_engine,
             supported,
         })) if *refused_engine == engine
-            && (!cfg!(feature = "libsql") || supported.contains(&"SQLite (sqlite://)"))
-            && (!cfg!(feature = "postgres") || supported.contains(&"PostgreSQL (postgres://)"))
-            && !supported.contains(&engine),
+            && (!cfg!(feature = "libsql")
+                || supported.iter().any(|name| name == "SQLite (sqlite://)"))
+            && (!cfg!(feature = "postgres")
+                || supported.iter().any(|name| name == "PostgreSQL (postgres://)"))
+            && !supported.iter().any(|name| name == engine),
         "{refused:?}"
     );
 

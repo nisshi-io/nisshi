@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use nisshi_storage::{
-    ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration, reject_unrecognized_options,
+    ArcDynStorage, Result, StorageCapabilities, StorageFactory, StorageFactoryConfiguration,
+    reject_unrecognized_options,
 };
 use regex::Regex;
 
@@ -25,19 +29,22 @@ use super::Engine;
 #[derive(Clone, Copy, Debug)]
 pub struct LimboFactory;
 
+impl Display for LimboFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("Turso (turso://)")
+    }
+}
+
 #[async_trait]
 impl StorageFactory for LimboFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"turso").map_err(Into::into)
     }
 
-    fn name(&self) -> &'static str {
-        "Turso (turso://)"
-    }
-
-    /// Not yet: the Turso engine's SCRAM credential methods are unimplemented.
-    fn stores_user_credentials(&self) -> bool {
-        false
+    /// No SCRAM credentials yet: the Turso engine's SCRAM credential methods are
+    /// unimplemented.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {

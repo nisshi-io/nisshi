@@ -549,7 +549,9 @@ impl Storage for Engine {
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<()> {
-        Err(Error::UserCredentialsUnsupported { engine: NAME })
+        Err(Error::UserCredentialsUnsupported {
+            engine: NAME.into(),
+        })
     }
 
     #[instrument(skip(_credential), ret)]
@@ -559,7 +561,9 @@ impl Storage for Engine {
         _mechanism: ScramMechanism,
         _credential: ScramCredential,
     ) -> Result<()> {
-        Err(Error::UserCredentialsUnsupported { engine: NAME })
+        Err(Error::UserCredentialsUnsupported {
+            engine: NAME.into(),
+        })
     }
 
     #[instrument(ret)]

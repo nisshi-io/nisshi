@@ -3902,7 +3902,7 @@ impl Storage for DynoStore {
         _mechanism: ScramMechanism,
     ) -> Result<()> {
         Err(Error::UserCredentialsUnsupported {
-            engine: self.engine,
+            engine: self.engine.into(),
         })
     }
 
@@ -3915,7 +3915,7 @@ impl Storage for DynoStore {
         _credential: ScramCredential,
     ) -> Result<()> {
         Err(Error::UserCredentialsUnsupported {
-            engine: self.engine,
+            engine: self.engine.into(),
         })
     }
 
