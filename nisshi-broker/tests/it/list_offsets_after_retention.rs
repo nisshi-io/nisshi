@@ -584,3 +584,32 @@ macro_rules! backend {
 
 backend!(pg, "postgres", StorageType::Postgres);
 backend!(lite, "libsql", StorageType::Lite);
+
+// DynoStore has no retention, so only the tests that move the log start with
+// DeleteRecords run on it.
+#[cfg(feature = "dynostore")]
+mod in_memory {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_committed_latest_is_log_start_after_delete_records_past_open_transaction()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = common::storage_container(
+            StorageType::InMemory,
+            cluster_id,
+            broker_id,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::read_committed_latest_is_log_start_after_delete_records_past_open_transaction(sc)
+            .await
+    }
+}

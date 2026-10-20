@@ -783,6 +783,89 @@ impl DynoStore {
     /// the partition (see [`Self::ensure_partition_exists`]). A later read
     /// skips that check, because it would read the metadata again on each
     /// Fetch of the partition.
+    /// Returns the open transaction starts: for each partition with an open
+    /// transaction, the first offset of the earliest one.
+    async fn open_transaction_starts(&self) -> Result<BTreeMap<Topition, Offset>> {
+        let starts = self
+            .meta
+            .with(&self.object_store, |meta| {
+                Ok(meta
+                    .transactions
+                    .values()
+                    .flat_map(|txn| {
+                        debug!(?txn);
+
+                        txn.epochs
+                            .values()
+                            .filter(|detail| {
+                                detail.state.is_some_and(|state| {
+                                    state != TxnState::Committed && state != TxnState::Aborted
+                                })
+                            })
+                            .map(BTreeMap::<Topition, Offset>::from)
+                            .collect::<Vec<_>>()
+                    })
+                    .reduce(|mut acc, e| {
+                        debug!(?acc, ?e);
+
+                        for (topition, offset_start) in e.iter() {
+                            _ = acc
+                                .entry(topition.to_owned())
+                                .and_modify(|existing_offset_start| {
+                                    if *existing_offset_start > *offset_start {
+                                        *existing_offset_start = *offset_start
+                                    }
+                                })
+                                .or_insert(*offset_start);
+                        }
+
+                        acc
+                    })
+                    .unwrap_or(BTreeMap::new()))
+            })
+            .await?;
+
+        debug!(?starts);
+
+        Ok(starts)
+    }
+
+    /// Returns the [`OffsetStage`] of `topition`, with its last stable offset
+    /// taken from `open_transaction_starts`, which a caller that reads many
+    /// partitions reads once (see [`Self::open_transaction_starts`]).
+    async fn offset_stage_with(
+        &self,
+        topition: &Topition,
+        open_transaction_starts: &BTreeMap<Topition, Offset>,
+    ) -> Result<OffsetStage> {
+        self.checked_watermark_for(topition)
+            .await?
+            .with(&self.object_store, |watermark| {
+                debug!(?watermark);
+                let high_watermark = watermark.high.unwrap_or(0);
+                let log_start = watermark.low.unwrap_or(0);
+
+                // DeleteRecords can move the log start past the first offset of
+                // an open transaction. Kafka then raises the last stable offset
+                // to the log start ([UnifiedLog.scala#L964-L978]), so that it
+                // never names an offset below the log.
+                //
+                // [UnifiedLog.scala#L964-L978]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L964-L978
+                let last_stable = open_transaction_starts
+                    .get(topition)
+                    .copied()
+                    .unwrap_or(high_watermark)
+                    .max(log_start);
+
+                Ok(OffsetStage {
+                    last_stable,
+                    high_watermark,
+                    log_start,
+                })
+            })
+            .await
+    }
+
     async fn checked_watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
         if let Some(watermark) = self.watermarks.lock()?.get(topition) {
             return Ok(watermark.to_owned());
@@ -2258,61 +2341,8 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        let stable = self
-            .meta
-            .with(&self.object_store, |meta| {
-                Ok(meta
-                    .transactions
-                    .values()
-                    .flat_map(|txn| {
-                        debug!(?txn);
-
-                        txn.epochs
-                            .values()
-                            .filter(|detail| {
-                                detail.state.is_some_and(|state| {
-                                    state != TxnState::Committed && state != TxnState::Aborted
-                                })
-                            })
-                            .map(BTreeMap::<Topition, Offset>::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .reduce(|mut acc, e| {
-                        debug!(?acc, ?e);
-
-                        for (topition, offset_start) in e.iter() {
-                            _ = acc
-                                .entry(topition.to_owned())
-                                .and_modify(|existing_offset_start| {
-                                    if *existing_offset_start > *offset_start {
-                                        *existing_offset_start = *offset_start
-                                    }
-                                })
-                                .or_insert(*offset_start);
-                        }
-
-                        acc
-                    })
-                    .unwrap_or(BTreeMap::new()))
-            })
-            .await?;
-
-        debug!(?stable);
-
-        self.checked_watermark_for(topition)
-            .await?
-            .with(&self.object_store, |watermark| {
-                debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
-                let log_start = watermark.low.unwrap_or(0);
-                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                })
-            })
+        let open_transaction_starts = self.open_transaction_starts().await?;
+        self.offset_stage_with(topition, &open_transaction_starts)
             .await
     }
 
@@ -2321,6 +2351,14 @@ impl Storage for DynoStore {
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        // Only READ_COMMITTED reads a last stable offset, so only it reads the
+        // open transactions, once for the whole request.
+        let open_transaction_starts = if isolation_level == IsolationLevel::ReadCommitted {
+            self.open_transaction_starts().await?
+        } else {
+            BTreeMap::new()
+        };
+
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
@@ -2349,7 +2387,10 @@ impl Storage for DynoStore {
             // A store failure answers `KAFKA_STORAGE_ERROR` in its own
             // partition, which a client retries, so the other partitions of
             // the request still get their answers.
-            let stage = match self.offset_stage(topition).await {
+            let stage = match self
+                .offset_stage_with(topition, &open_transaction_starts)
+                .await
+            {
                 Ok(stage) => stage,
 
                 Err(error) => {
