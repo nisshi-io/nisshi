@@ -78,10 +78,6 @@ fn earliest_offset_moves_to_the_offset_deleted_before() {
 /// The deletion must not change the partition's latest offset. A broker that numbers new records
 /// from a lower offset gives two records one offset, and consumers skip or repeat records.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn latest_offset_is_kept_after_delete_records() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli

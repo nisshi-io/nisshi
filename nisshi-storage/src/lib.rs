@@ -705,6 +705,10 @@ pub type ListOffsetRequest = ListOffset;
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ListOffsetResponse {
     pub error_code: ErrorCode,
+    /// The timestamp of the record that a [`ListOffset::Timestamp`] lookup
+    /// matched. `ListOffsetsService` sends -1 for [`ListOffset::Earliest`]
+    /// and [`ListOffset::Latest`] whatever this holds, as Kafka does, so a
+    /// storage engine need not set it for them.
     pub timestamp: Option<SystemTime>,
     /// `None` when a [`ListOffset::Timestamp`] lookup matches no record, or
     /// when `error_code` is not [`ErrorCode::None`]; `ListOffsetsService`

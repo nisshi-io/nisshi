@@ -104,10 +104,6 @@ fn list_by_state_shows_only_groups_in_that_state() {
 /// broker must answer `OffsetFetch` with the group's committed offset and `ListOffsets` with the
 /// partition's end.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn describe_shows_committed_and_end_offsets() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);

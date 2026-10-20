@@ -213,10 +213,6 @@ fn reset_to_earliest_replays_from_the_first_record() {
 /// A reset to the latest offset must skip every record so far, so the group's next consumer reads
 /// only records produced after the reset.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn reset_to_latest_skips_every_record_so_far() {
     let consumer_group = ConsumerGroup::after_reading(&RECORDS, 5);
     consumer_group.assert_reset_stores(&["--to-latest"], offset_of(RECORDS.len()));
@@ -240,10 +236,6 @@ fn reset_to_latest_skips_every_record_so_far() {
 /// A reset to an offset must move the group to that offset, so that its next consumer starts at
 /// that record.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn reset_to_offset_starts_at_that_record() {
     ConsumerGroup::after_reading(&RECORDS, 5).assert_reset_moves_group_to(
         &["--to-offset", "2"],
@@ -255,10 +247,6 @@ fn reset_to_offset_starts_at_that_record() {
 /// A reset that shifts by a negative count must move the group back from its committed offset by
 /// that many records, so that its next consumer reads those records again.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn reset_shift_by_moves_back_from_the_committed_offset() {
     ConsumerGroup::after_reading(&RECORDS, 5).assert_reset_moves_group_to(
         &["--shift-by", "-3"],

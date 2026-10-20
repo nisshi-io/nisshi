@@ -372,13 +372,9 @@ where
 }
 
 /// `offset == -1` is the common case ("delete everything up to the high
-/// watermark"). The record/batch holding `high_watermark - 1` is Kafka's
-/// active segment and must survive regardless, so `Latest` -- and
-/// `offset_stage`'s `high_watermark`, which `Latest` is ultimately built
-/// from -- must be unaffected by even a "delete everything" request.
-///
-/// `ListOffsets(Earliest)` answers the log start, the high watermark here,
-/// and not the offset of the record that the delete keeps.
+/// watermark"). The delete moves the log start to the high watermark and
+/// leaves the high watermark as it was, so `ListOffsets` answers the high
+/// watermark for both `Earliest` and `Latest`.
 pub async fn delete_to_high_watermark_keeps_latest<G>(
     cluster_id: Uuid,
     broker_id: i32,

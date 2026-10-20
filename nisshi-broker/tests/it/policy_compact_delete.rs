@@ -277,11 +277,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -325,11 +321,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -376,11 +368,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(2), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -424,11 +412,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -709,11 +693,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -757,11 +737,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -865,11 +841,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -913,11 +885,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -1338,11 +1306,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -1386,11 +1350,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -1494,11 +1454,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -1542,11 +1498,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -1972,11 +1924,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -2020,11 +1968,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -2128,11 +2072,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(2), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -2176,11 +2116,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -2461,11 +2397,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -2509,11 +2441,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -2617,11 +2545,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(2), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -2665,11 +2589,7 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
