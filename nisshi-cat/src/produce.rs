@@ -194,32 +194,6 @@ impl Produce {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
         debug!(%self.configuration.file_name);
 
-        let client = ConnectionManager::builder(self.configuration.broker.clone())
-            .client_id(Some(env!("CARGO_PKG_NAME").into()))
-            .build()
-            .await
-            .inspect(|pool| debug!(?pool))
-            .map(Client::new)?;
-
-        // A real Kafka client's first Metadata request allows auto-creation, so a produce
-        // to a topic that doesn't exist yet creates it instead of failing with
-        // UnknownTopicOrPartition. Mirrors the Metadata request in `consume`, but with
-        // auto-creation allowed instead of refused.
-        _ = client
-            .call(
-                MetadataRequest::default()
-                    .allow_auto_topic_creation(Some(true))
-                    .include_cluster_authorized_operations(Some(false))
-                    .include_topic_authorized_operations(Some(false))
-                    .topics(Some(
-                        [MetadataRequestTopic::default()
-                            .name(Some(self.configuration.topic.clone()))
-                            .topic_id(Some(NULL_TOPIC_ID))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
         let schema = if let Some(ref registry) = self.registry {
             registry
                 .schema(&self.configuration.topic)
@@ -279,6 +253,33 @@ impl Produce {
         };
 
         debug!(?frame);
+
+        let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .client_id(Some(env!("CARGO_PKG_NAME").into()))
+            .build()
+            .await
+            .inspect(|pool| debug!(?pool))
+            .map(Client::new)?;
+
+        // A real Kafka client's first Metadata request allows auto-creation, so a produce to a
+        // topic that doesn't exist yet creates it instead of failing with UnknownTopicOrPartition.
+        // Mirrors the Metadata request in `consume`, but with auto-creation allowed instead of
+        // refused. It goes after the input is read, so that a missing or malformed input file
+        // leaves no empty topic behind.
+        _ = client
+            .call(
+                MetadataRequest::default()
+                    .allow_auto_topic_creation(Some(true))
+                    .include_cluster_authorized_operations(Some(false))
+                    .include_topic_authorized_operations(Some(false))
+                    .topics(Some(
+                        [MetadataRequestTopic::default()
+                            .name(Some(self.configuration.topic.clone()))
+                            .topic_id(Some(NULL_TOPIC_ID))]
+                        .into(),
+                    )),
+            )
+            .await?;
 
         let req = ProduceRequest::default()
             .transactional_id(None)
