@@ -1389,23 +1389,20 @@ impl Postgres {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    // No record row: Earliest/Latest answer 0, a Timestamp
-                    // lookup answers no offset (see `ListOffsetResponse::offset`).
-                    let (offset, timestamp) = match offset_type {
-                        ListOffset::Earliest | ListOffset::Latest => (Some(0), None),
-                        ListOffset::Timestamp(_) => (None, None),
+                    // Earliest and Latest find no row only when the partition does not exist,
+                    // because creating a partition also creates its watermark row. A Timestamp
+                    // lookup finds no row when no record matches, and also when the partition
+                    // does not exist. Both answer no offset (see `ListOffsetResponse::offset`).
+                    let error_code = match offset_type {
+                        ListOffset::Earliest | ListOffset::Latest => {
+                            ErrorCode::UnknownTopicOrPartition
+                        }
+                        ListOffset::Timestamp(_) => ErrorCode::None,
                     };
-                    debug!(
-                        cluster = self.cluster,
-                        ?topition,
-                        ?offset_type,
-                        offset,
-                        ?timestamp
-                    );
+                    debug!(cluster = self.cluster, ?topition, ?offset_type, ?error_code);
 
                     Ok(ListOffsetResponse {
-                        timestamp,
-                        offset,
+                        error_code,
                         ..Default::default()
                     })
                 },
@@ -1724,21 +1721,12 @@ impl Postgres {
 
         tx.commit().await.inspect_err(|err| error!(?err))?;
 
-        // This keeps the record at `high_watermark - 1`, because
-        // `list_latest_offset_committed.sql` and
-        // `list_latest_offset_uncommitted.sql` answer `Latest` from that
-        // record. `list_latest_offset_committed.sql` also joins the record at
-        // an open transaction's `offset_start`, which this cut does not keep:
-        // a cut past that offset makes read_committed `Latest` answer the
-        // high watermark instead of the last stable offset. A produce only
-        // inserts at or above the high watermark, so these rows need no
-        // watermark lock.
-        let physical_cutoff = cutoff.min(stage.high_watermark - 1);
-
+        // A produce only inserts at or above the high watermark, so these
+        // rows need no watermark lock.
         if cutoff > stage.log_start
-            && let Err(err) = self.record_delete_below(c, topition, physical_cutoff).await
+            && let Err(err) = self.record_delete_below(c, topition, cutoff).await
         {
-            warn!(?err, cluster = ?self.cluster, ?topition, physical_cutoff);
+            warn!(?err, cluster = ?self.cluster, ?topition, cutoff);
         }
 
         Ok((ErrorCode::None, cutoff))
@@ -1748,7 +1736,7 @@ impl Postgres {
         &self,
         c: &mut Object,
         topition: &Topition,
-        physical_cutoff: i64,
+        cutoff: i64,
     ) -> Result<u64> {
         let tx = c.transaction().await?;
 
@@ -1760,7 +1748,7 @@ impl Postgres {
                     &self.cluster,
                     &topition.topic(),
                     &topition.partition(),
-                    &physical_cutoff,
+                    &cutoff,
                 ],
             )
             .await?;
@@ -6340,8 +6328,7 @@ mod tests {
     }
 
     /// DeleteRecords commits the new log start before it removes the records
-    /// below it. When that removal fails, `maintain` removes them, and keeps
-    /// the record at `high_watermark - 1` that `Latest` reads.
+    /// below it. When that removal fails, `maintain` removes them.
     #[tokio::test]
     async fn maintain_removes_records_left_below_log_start() -> Result<()> {
         let cluster = alphanumeric_string(15);
@@ -6430,7 +6417,7 @@ mod tests {
 
         advance_log_start(record_count).await?;
         storage.maintain(SystemTime::now()).await?;
-        assert_eq!(1, stored().await?);
+        assert_eq!(0, stored().await?);
 
         let latest = storage
             .list_offsets(
