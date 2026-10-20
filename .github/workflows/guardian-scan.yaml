@@ -289,20 +289,54 @@ jobs:
     env:
       FULL_VERSION: ${{ needs.setup.outputs.full_version }}
       ENFORCE: ${{ needs.setup.outputs.enforce }}
+      # The version FOSSA and Prisma uploaded under (main on trunk and tags).
+      PRODUCT_VERSION: ${{ needs.setup.outputs.fossa_branch }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
           persist-credentials: false
+      # Fix reachability: the dependency graph lets Guardian tell when a CVE's
+      # fix can't be reached by upgrading a direct dependency (thrift through
+      # iceberg), so it raises no Jira for it until it can. Same
+      # pinned, checksummed install as the FOSSA CLI, and the version Guardian's
+      # scheduled scan uses, so both produce the same report shape. Non-fatal:
+      # without the graph Guardian holds new fixes as pending until its daily
+      # scan checks them.
+      - name: Install Trivy
+        id: trivy
+        continue-on-error: true
+        env:
+          TRIVY_VERSION: 0.69.2
+          TRIVY_SHA256: affa59a1e37d86e4b8ab2cd02f0ab2e63d22f1bf9cf6a7aa326c884e25e26ce3
+        run: |
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSLo "${RUNNER_TEMP}/${tarball}" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
+          echo "${TRIVY_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/trivy-bin"
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/trivy-bin" trivy
+          echo "${RUNNER_TEMP}/trivy-bin" >> "$GITHUB_PATH"
+      - name: Dependency graph
+        if: ${{ steps.trivy.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          trivy fs . --scanners vuln --list-all-pkgs --format json \
+            --output "${RUNNER_TEMP}/trivy_repo.json"
       - name: Guardian DB sync and Jira report
-        uses: SolaceDev/solace-public-workflows/guardian-db-sync@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        # Ahead of the other Guardian actions' pin: the dependency-graph input
+        # is in SolaceDev/solace-public-workflows#144. Re-pin to main once it merges.
+        uses: SolaceDev/solace-public-workflows/guardian-db-sync@5b439271de3e28392f1c15e58c1043461700070a # main
         with:
           guardian-url: ${{ secrets.GUARDIAN_URL }}
           guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
           product-name: ${{ env.PRODUCT_NAME }}
+          product-version: ${{ env.PRODUCT_VERSION }}
           product-full-version: ${{ env.FULL_VERSION }}
           unifiers: "fossa,prisma"
+          # A missing file (Trivy failed above) is a warning in the action.
+          dependency-graph: ${{ runner.temp }}/trivy_repo.json
           upload-logs: "true"
       - name: Guardian vulnerability gate
         uses: SolaceDev/solace-public-workflows/guardian-vulnerability-gate@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
