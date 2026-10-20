@@ -14,8 +14,61 @@
 
 use crate::common::init_tracing;
 use nisshi_model::{MessageKind, VersionRange};
-use nisshi_sans_io::MESSAGE_META;
+use nisshi_sans_io::{
+    Body, DescribeConfigsRequest, Frame, Header, MESSAGE_META, Result,
+    describe_configs_request::DescribeConfigsResource,
+};
 use std::collections::BTreeMap;
+
+// Regression test for a decoder bug found by `fuzz_describe_configs_storage`:
+// a non-empty, non-null `ConfigurationKeys` (a nullable `[]string`) failed to
+// decode because the decoder mistook the nullability of the array itself for
+// the nullability of its individual string elements, and so skipped reading
+// their length prefix.
+fn request_round_trips(api_version: i16) -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let header = Header::Request {
+        api_key: 32,
+        api_version,
+        correlation_id: 0,
+        client_id: Some("test".into()),
+    };
+
+    let mut request = DescribeConfigsRequest::default().resources(Some(
+        [DescribeConfigsResource::default()
+            .resource_type(2)
+            .resource_name("test".into())
+            .configuration_keys(Some(["retention.ms".into(), "".into()].into()))]
+        .into(),
+    ));
+
+    if api_version >= 1 {
+        request = request.include_synonyms(Some(false));
+    }
+
+    if api_version >= 3 {
+        request = request.include_documentation(Some(false));
+    }
+
+    let body: Body = request.into();
+
+    let decoded = Frame::request(header, body.clone()).and_then(Frame::request_from_bytes)?;
+
+    assert_eq!(body, decoded.body);
+
+    Ok(())
+}
+
+#[test]
+fn request_non_empty_configuration_keys_v0() -> Result<()> {
+    request_round_trips(0)
+}
+
+#[test]
+fn request_non_empty_configuration_keys_v4() -> Result<()> {
+    request_round_trips(4)
+}
 
 #[test]
 fn response() {

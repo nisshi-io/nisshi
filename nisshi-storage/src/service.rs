@@ -48,7 +48,13 @@ pub use alter_user_scram_credentials::AlterUserScramCredentialsService;
 use async_trait::async_trait;
 pub use consumer_group_describe::ConsumerGroupDescribeService;
 pub use create_acls::CreateAclsService;
-pub use create_topics::CreateTopicsService;
+pub use create_topics::{
+    CreateTopicsService,
+    validation::{
+        CreateTopicsValidationLayer, CreateTopicsValidationService, MalformedCreateTopicsRequest,
+        ValidatedCreateTopicsRequest,
+    },
+};
 pub use delete_groups::DeleteGroupsService;
 pub use delete_records::DeleteRecordsService;
 pub use delete_topics::DeleteTopicsService;
@@ -58,7 +64,12 @@ pub use describe_configs::DescribeConfigsService;
 pub use describe_groups::DescribeGroupsService;
 pub use describe_topic_partitions::DescribeTopicPartitionsService;
 pub use describe_user_scram_credentials::DescribeUserScramCredentialsService;
-pub use fetch::FetchService;
+pub use fetch::{
+    FetchService,
+    validation::{
+        FetchValidationLayer, FetchValidationService, MalformedFetchRequest, ValidatedFetchRequest,
+    },
+};
 pub use find_coordinator::FindCoordinatorService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
 pub use init_producer_id::InitProducerIdService;

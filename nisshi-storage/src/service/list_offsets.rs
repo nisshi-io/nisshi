@@ -213,88 +213,162 @@ where
         let input = input.into();
         let throttle_time_ms = Some(0);
 
-        let isolation_level = input
-            .request
-            .isolation_level
-            .map_or(Ok(IsolationLevel::ReadUncommitted), |isolation_level| {
-                IsolationLevel::try_from(isolation_level)
-            })?;
+        // `isolation_level` applies to the whole request, and the wire response has no
+        // top-level error code (only per-partition ones), so an out of range value is
+        // reported by marking every requested partition `INVALID_REQUEST`.
+        //
+        // This deliberately differs from Kafka, whose `IsolationLevel.forId` throws
+        // `IllegalArgumentException` for an unknown id, so the client only sees
+        // `UNKNOWN_SERVER_ERROR`. `INVALID_REQUEST` tells it what it got wrong.
+        let isolation_level = match input.request.isolation_level.map_or(
+            Ok(IsolationLevel::ReadUncommitted),
+            IsolationLevel::try_from,
+        ) {
+            Ok(isolation_level) => isolation_level,
+
+            Err(error) => {
+                warn!(?error, isolation_level = ?input.request.isolation_level, "invalid isolation level, answering INVALID_REQUEST");
+
+                return Ok(ListOffsetsResponse::default()
+                    .throttle_time_ms(throttle_time_ms)
+                    .topics(input.request.topics.map(|topics| {
+                        topics
+                            .into_iter()
+                            .map(|topic| {
+                                ListOffsetsTopicResponse::default()
+                                    .name(topic.name)
+                                    .partitions(topic.partitions.map(|partitions| {
+                                        partitions
+                                            .into_iter()
+                                            .map(|partition| {
+                                                ListOffsetsPartitionResponse::default()
+                                                    .partition_index(partition.partition_index)
+                                                    .error_code(ErrorCode::InvalidRequest.into())
+                                                    .old_style_offsets(None)
+                                                    .timestamp(Some(-1))
+                                                    .offset(Some(0))
+                                                    .leader_epoch(Some(0))
+                                            })
+                                            .collect()
+                                    }))
+                            })
+                            .collect()
+                    })));
+            }
+        };
 
         let topics = if let Some(topics) = input.request.topics {
             let mut offsets = vec![];
+
+            // An out of range `timestamp` is scoped to its own partition (unlike
+            // `isolation_level` above), so only that partition is marked
+            // `INVALID_TIMESTAMP`; every other requested partition still resolves
+            // normally through storage.
+            let mut invalid_timestamps = vec![];
 
             for topic in topics {
                 if let Some(ref partitions) = topic.partitions {
                     for partition in partitions {
                         let tp = Topition::new(topic.name.clone(), partition.partition_index);
-                        let offset = ListOffset::try_from(partition.timestamp)?;
 
-                        offsets.push((tp, offset));
+                        match ListOffset::try_from(partition.timestamp) {
+                            Ok(offset) => offsets.push((tp, offset)),
+
+                            Err(error) => {
+                                debug!(
+                                    ?error,
+                                    ?tp,
+                                    timestamp = partition.timestamp,
+                                    "invalid timestamp, answering INVALID_TIMESTAMP"
+                                );
+
+                                invalid_timestamps.push((
+                                    tp,
+                                    ListOffsetResponse {
+                                        error_code: ErrorCode::InvalidTimestamp,
+                                        ..Default::default()
+                                    },
+                                ));
+                            }
+                        }
                     }
                 }
             }
 
-            self.list_offsets(isolation_level, &offsets)
+            // One line per request, not per partition, so a large request of bad timestamps
+            // can't flood the log; each entry is at `debug!` above.
+            if let Some((tp, _)) = invalid_timestamps.first() {
+                warn!(
+                    count = invalid_timestamps.len(),
+                    first = ?tp,
+                    "invalid timestamps, answering INVALID_TIMESTAMP"
+                );
+            }
+
+            let mut offsets = self
+                .list_offsets(isolation_level, &offsets)
                 .await
                 .inspect(|r| debug!(?r, ?offsets))
-                .inspect_err(|err| error!(?err, ?offsets))
-                .map(|offsets| {
-                    offsets
-                        .iter()
-                        .fold(BTreeSet::new(), |mut topics, (topition, _)| {
-                            _ = topics.insert(topition.topic());
-                            topics
-                        })
-                        .iter()
-                        .map(|topic_name| {
-                            ListOffsetsTopicResponse::default()
-                                .name((*topic_name).into())
-                                .partitions(Some(
-                                    offsets
-                                        .iter()
-                                        .filter_map(|(topition, offset)| {
-                                            if topition.topic() == *topic_name {
-                                                Some(
-                                                    ListOffsetsPartitionResponse::default()
-                                                        .partition_index(topition.partition())
-                                                        .error_code(offset.error_code().into())
-                                                        // Only present on the wire for a v0
-                                                        // request (`OldStyleOffsets` is
-                                                        // `"versions": "0"` in
-                                                        // `ListOffsetsResponse.json`); the
-                                                        // encoder drops this field for any
-                                                        // later version based on the request's
-                                                        // own negotiated version, so populating
-                                                        // it unconditionally is safe for v1+.
-                                                        .old_style_offsets(Some(
-                                                            offset.offset().into_iter().collect(),
-                                                        ))
-                                                        .timestamp(
-                                                            offset
-                                                                .timestamp()
-                                                                .unwrap_or(Some(-1))
-                                                                .or(Some(-1)),
-                                                        )
-                                                        // `None` is sent as -1, as Kafka does:
-                                                        // [KafkaApis.scala#L1171-L1177].
-                                                        //
-                                                        // [KafkaApis.scala#L1171-L1177]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1171-L1177
-                                                        .offset(offset.offset().or(Some(-1)))
-                                                        // Kafka sends -1 (the schema default) when
-                                                        // the offset is unknown; nisshi always sends
-                                                        // 0. Clients ignore the epoch for offset -1.
-                                                        .leader_epoch(Some(0)),
-                                                )
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect(),
-                                ))
-                        })
-                        .collect()
-                })
-                .map(Some)?
+                .inspect_err(|err| error!(?err, ?offsets))?;
+
+            offsets.extend(invalid_timestamps);
+
+            Some(
+                offsets
+                    .iter()
+                    .fold(BTreeSet::new(), |mut topics, (topition, _)| {
+                        _ = topics.insert(topition.topic());
+                        topics
+                    })
+                    .iter()
+                    .map(|topic_name| {
+                        ListOffsetsTopicResponse::default()
+                            .name((*topic_name).into())
+                            .partitions(Some(
+                                offsets
+                                    .iter()
+                                    .filter_map(|(topition, offset)| {
+                                        if topition.topic() == *topic_name {
+                                            Some(
+                                                ListOffsetsPartitionResponse::default()
+                                                    .partition_index(topition.partition())
+                                                    .error_code(offset.error_code().into())
+                                                    // Only present on the wire for a v0
+                                                    // request (`OldStyleOffsets` is
+                                                    // `"versions": "0"` in
+                                                    // `ListOffsetsResponse.json`); the
+                                                    // encoder drops this field for any
+                                                    // later version based on the request's
+                                                    // own negotiated version, so populating
+                                                    // it unconditionally is safe for v1+.
+                                                    .old_style_offsets(Some(
+                                                        offset.offset().into_iter().collect(),
+                                                    ))
+                                                    .timestamp(
+                                                        offset
+                                                            .timestamp()
+                                                            .unwrap_or(Some(-1))
+                                                            .or(Some(-1)),
+                                                    )
+                                                    // `None` is sent as -1, as Kafka does:
+                                                    // [KafkaApis.scala#L1171-L1177].
+                                                    //
+                                                    // [KafkaApis.scala#L1171-L1177]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1171-L1177
+                                                    .offset(offset.offset().or(Some(-1)))
+                                                    // Kafka sends -1 (the schema default) when
+                                                    // the offset is unknown; nisshi always sends
+                                                    // 0. Clients ignore the epoch for offset -1.
+                                                    .leader_epoch(Some(0)),
+                                            )
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect(),
+                            ))
+                    })
+                    .collect(),
+            )
         } else {
             None
         };

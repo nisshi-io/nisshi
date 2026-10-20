@@ -14,8 +14,44 @@
 
 use crate::common::init_tracing;
 use nisshi_model::MessageKind;
-use nisshi_sans_io::MESSAGE_META;
+use nisshi_sans_io::{
+    Body, DescribeTopicPartitionsRequest, Frame, Header, MESSAGE_META, Result,
+    describe_topic_partitions_request::{Cursor, TopicRequest},
+};
 use std::collections::BTreeMap;
+
+// Regression test for an encoder bug found by `fuzz_describe_topic_partitions_storage`:
+// a populated (non-null) nullable struct field encoded no presence marker
+// at all, even though `serialize_none` already wrote one for the null
+// case, desyncing every field written after it (KIP-893 requires one for
+// both: https://cwiki.apache.org/confluence/display/KAFKA/KIP-893).
+#[test]
+fn request_non_null_cursor_round_trips() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let header = Header::Request {
+        api_key: 75,
+        api_version: 0,
+        correlation_id: 0,
+        client_id: Some("test".into()),
+    };
+
+    let body: Body = DescribeTopicPartitionsRequest::default()
+        .topics(Some([TopicRequest::default().name("test".into())].into()))
+        .response_partition_limit(2000)
+        .cursor(Some(
+            Cursor::default()
+                .topic_name("test".into())
+                .partition_index(3),
+        ))
+        .into();
+
+    let decoded = Frame::request(header, body.clone()).and_then(Frame::request_from_bytes)?;
+
+    assert_eq!(body, decoded.body);
+
+    Ok(())
+}
 
 #[test]
 fn request() {

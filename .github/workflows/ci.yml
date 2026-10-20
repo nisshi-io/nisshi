@@ -226,18 +226,40 @@ jobs:
           # under the same key and never save it.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-shared-key: dev
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
-      # Set on the step, not the job: rust-cache hashes every variable that
-      # starts with RUST into its key, and the jobs that restore this entry
-      # don't set these, so a job-level value would give every job a key of
-      # its own.
-      - run: just test
+      # The two halves of `just test` run as separate steps, because doctests
+      # write no JUnit report, so only a step of its own shows a doctest
+      # failure. The doctests also run after a nextest failure, so that one
+      # failure does not hide the other. `--timings` writes the build's
+      # cargo-timing.html.
+      #
+      # RUST_BACKTRACE and RUST_LOG are set on each step, not the job:
+      # rust-cache hashes every variable that starts with RUST into its key,
+      # and the jobs that restore this entry don't set these, so a job-level
+      # value would give every job a key of its own.
+      - id: nextest
+        run: just test-workspace --timings
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
+      - if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        run: just test-doc
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug,nisshi_sans_io=warn,nisshi_model=warn
+      # The reports also cover a run whose tests fail. The step continues on
+      # error and has a timeout, so a report never changes the job's result.
+      # tier-c.yml's `test` job runs the same action.
+      - if: ${{ !cancelled() && steps.nextest.outcome != 'skipped' }}
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: ./.github/actions/test-reports
+        with:
+          title: Rust tests (${{ matrix.pg }})
+          artifact-name: test-reports-${{ env.PG_IMAGE_DASH }}
       - run: df -h
         if: always()
       - run: ls -l
@@ -576,7 +598,7 @@ jobs:
           just-version: 1.58.0
       # We install a pinned version instead of using the runner image's copy,
       # so that a runner image update cannot fail this check on unchanged code.
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
@@ -592,7 +614,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-about@0.8.4
       - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
@@ -664,7 +686,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -747,7 +769,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -872,7 +894,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
       # Embeds the crate list so scanners can read the binary's dependencies.
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
@@ -948,7 +970,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
@@ -1000,6 +1022,9 @@ jobs:
       - macos
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The timings step lists the run's jobs.
+    permissions:
+      actions: read
     env:
       NEEDS: ${{ toJSON(needs) }}
     steps:
@@ -1048,3 +1073,49 @@ jobs:
         run: |
           skipped=$(jq -r --arg may_skip "$MAY_SKIP" '($may_skip | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::skipped on a push to main, only the trimmed jobs may skip here: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }
+      # The timings are a report, so a failure or a timeout while fetching them
+      # leaves the gate's result as it is. The job's own timeout-minutes would
+      # fail the gate, so each reporting step has a shorter one. The tables
+      # list only the jobs that have completed: the `*-report` jobs are not in
+      # this job's `needs`, so they can still be running.
+      - name: Job and step timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '.jobs[]' \
+            | jq -s --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" '
+                def secs(from; to): if from and to then (to | fromdate) - (from | fromdate) else null end;
+                {run_id: $run, run_attempt: $attempt, jobs: [
+                  .[] | select(.status == "completed") | {
+                    name, conclusion,
+                    queued_s: secs(.created_at; .started_at),
+                    duration_s: secs(.started_at; .completed_at),
+                    steps: [(.steps // [])[] | {name, conclusion, duration_s: secs(.started_at; .completed_at)}]
+                  }
+                ]}' >timings.json
+          jq -r '
+            def fmt: if . == null then "" elif . >= 60 then "\(. / 60 | floor)m \(. % 60)s" else "\(.)s" end;
+            def cell: gsub("\\|"; "\\|");
+            "### Job Timings\n",
+            "| Job | Result | Queued | Ran |",
+            "| --- | --- | --- | --- |",
+            (.jobs | sort_by(.duration_s // 0) | reverse[] | "| \(.name | cell) | \(.conclusion) | \(.queued_s | fmt) | \(.duration_s | fmt) |"),
+            "\n### Slowest Steps\n",
+            "| Job | Step | Took |",
+            "| --- | --- | --- |",
+            ([.jobs[] | .name as $job | .steps[] | select(.duration_s != null) | {job: $job, name, duration_s}]
+              | sort_by(.duration_s) | reverse | .[:10][]
+              | "| \(.job | cell) | \(.name | cell) | \(.duration_s | fmt) |")
+          ' timings.json >>"$GITHUB_STEP_SUMMARY"
+      - if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: timings
+          path: timings.json
+          if-no-files-found: warn
+          retention-days: 14

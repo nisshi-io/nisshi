@@ -5,6 +5,11 @@
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# CI reads this report, at target/nextest/ci/junit.xml, for the test summary
+# and the test-reports artifact.
+[profile.ci.junit]
+path = "junit.xml"
+
 # The durability tests are the heaviest tests, and the most sensitive to
 # timing, so a run starts them one at a time. The rebalance tests run one at a
 # time too, beside the other tests, because each starts up to five JVMs, and

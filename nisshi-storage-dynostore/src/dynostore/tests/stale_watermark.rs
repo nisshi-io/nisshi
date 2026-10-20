@@ -21,9 +21,9 @@ use nisshi_sans_io::{
     fetch_request::{FetchPartition, FetchTopic},
     record::{Record, inflated},
 };
-use nisshi_storage::{Error, FetchService, Storage as _, Topition};
+use nisshi_storage::{Error, FetchService, FetchValidationLayer, Storage as _, Topition};
 use object_store::memory::InMemory;
-use rama::{Service as _, extensions::Extensions};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 
 use crate::dynostore::{DynoStore, tests::init_tracing};
 
@@ -72,7 +72,8 @@ async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
     assert_eq!(stale, b.offset_stage(&topition).await?.high_watermark());
     assert!(stale < high_watermark, "{stale} < {high_watermark}");
 
-    let response = FetchService { storage: b }
+    let response = FetchValidationLayer::new()
+        .layer(FetchService { storage: b })
         .serve(RequestInput {
             request: FetchRequest::default()
                 .max_wait_ms(100)

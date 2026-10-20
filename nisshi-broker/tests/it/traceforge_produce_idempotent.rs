@@ -92,13 +92,13 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, CreateTopicsService, Error, GroupDetail,
-    InitProducerIdService, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProduceService, ProducerIdResponse, Result as StorageResult,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    ArcDynStorage, BrokerRegistrationRequest, CreateTopicsService, CreateTopicsValidationLayer,
+    Error, GroupDetail, InitProducerIdService, ListOffsetResponse, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceService, ProducerIdResponse,
+    Result as StorageResult, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
-use rama::{Service as _, extensions::Extensions};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
@@ -144,9 +144,9 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
         let extensions = Extensions::default();
         let index = 0;
 
-        let create_topics = CreateTopicsService {
+        let create_topics = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
             storage: storage.clone(),
-        };
+        });
         let response = future::block_on(
             create_topics.serve(RequestInput {
                 request: CreateTopicsRequest::default()

@@ -25,10 +25,10 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
 };
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, DescribeConfigsService, IncrementalAlterConfigsService,
-    Storage,
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, DescribeConfigsService,
+    IncrementalAlterConfigsService, Storage,
 };
-use rama::{Service, extensions::Extensions};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use std::collections::BTreeSet;
 use tokio::task::JoinSet;
@@ -38,9 +38,9 @@ use uuid::Uuid;
 async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let resource_name = &alphanumeric_string(15)[..];
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let extensions = Extensions::default();
 
@@ -148,7 +148,8 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
 const CLEANUP_POLICY: &str = "cleanup.policy";
 
 async fn create_topic(storage: impl Storage + Clone, name: &str) -> Result<()> {
-    let response = CreateTopicsService { storage }
+    let response = CreateTopicsValidationLayer::new()
+        .layer(CreateTopicsService { storage })
         .serve(RequestInput {
             request: CreateTopicsRequest::default().topics(Some(
                 [CreatableTopic::default()

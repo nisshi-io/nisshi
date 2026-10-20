@@ -30,9 +30,10 @@ use nisshi_sans_io::{
     record::{Record, inflated},
 };
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, DeleteTopicsService, OffsetCommitRequest, Storage, Topition,
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, DeleteTopicsService,
+    OffsetCommitRequest, Storage, Topition,
 };
-use rama::{Service as _, extensions::Extensions};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use std::assert_matches;
 use uuid::Uuid;
@@ -98,9 +99,9 @@ async fn delete_unknown_by_uuid(storage: impl Storage + Clone) -> Result<(), Err
 }
 
 async fn create_delete_create_by_name(storage: impl Storage + Clone) -> Result<(), Error> {
-    let create_topics = CreateTopicsService {
+    let create_topics = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let name = alphanumeric_string(15);
     let num_partitions = 5;

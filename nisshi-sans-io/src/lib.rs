@@ -120,6 +120,8 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod acl;
+#[cfg(feature = "arbitrary")]
+mod arbitrary_support;
 pub mod consumer;
 pub mod de;
 mod input;

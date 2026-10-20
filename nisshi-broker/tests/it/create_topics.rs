@@ -19,11 +19,13 @@ use nisshi_sans_io::{
     create_topics_request::{CreatableReplicaAssignment, CreatableTopic},
     describe_topic_partitions_request::TopicRequest,
 };
-use nisshi_storage::{CreateTopicsService, DescribeTopicPartitionsService, Storage};
-use rama::{Service as _, extensions::Extensions};
+use nisshi_storage::{
+    CreateTopicsService, CreateTopicsValidationLayer, DescribeTopicPartitionsService, Storage,
+};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 
 async fn create(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = CreateTopicsService { storage };
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
 
     let name = alphanumeric_string(15);
     let num_partitions = 5;
@@ -60,9 +62,9 @@ async fn create(storage: impl Storage + Clone) -> Result<(), Error> {
 }
 
 async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = CreateTopicsService {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let name = alphanumeric_string(15);
     let num_partitions = -1;
@@ -147,9 +149,9 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
 }
 
 async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = CreateTopicsService {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let name = alphanumeric_string(15);
     let num_partitions = 5;
@@ -220,9 +222,9 @@ async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
 /// `UnknownTopicOrPartition` there, `CreateTopics` genuinely never called
 /// `Storage::create_topic` for it.
 async fn invalid_name_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
-    let create = CreateTopicsService {
+    let create = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
     let describe = DescribeTopicPartitionsService {
         storage: storage.clone(),
     };
@@ -310,9 +312,9 @@ async fn invalid_name_rejected(storage: impl Storage + Clone) -> Result<(), Erro
 /// `InvalidPartitions`; `-1` (the "use the default" sentinel) must still
 /// succeed.
 async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = CreateTopicsService {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let replication_factor = 1;
     let assignments = Some([].into());
@@ -382,9 +384,9 @@ async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<()
 /// `validate_only`, so the check has to run before storage either way).
 /// `-1` (the "use the default" sentinel) and 64 must still succeed.
 async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = CreateTopicsService {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
     let describe = DescribeTopicPartitionsService {
         storage: storage.clone(),
     };
@@ -534,9 +536,9 @@ async fn invalid_replication_factor_rejected(storage: impl Storage + Clone) -> R
 /// One invalid topic in a batch must not affect the others: the invalid
 /// entry is rejected, the valid one is still created.
 async fn mixed_batch_partial_success(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = CreateTopicsService {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let valid_name = alphanumeric_string(15);
     let num_partitions = 3;
@@ -595,9 +597,9 @@ async fn mixed_batch_partial_success(storage: impl Storage + Clone) -> Result<()
 /// is a deliberate difference from Kafka 3.9.1; see
 /// `in_memory::total_partitions_cap_creates_at_the_boundary`.
 async fn total_partitions_cap_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
-    let service = CreateTopicsService {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let replication_factor = 1;
     let assignments = Some([].into());
@@ -770,9 +772,9 @@ async fn total_partitions_cap_rejected(storage: impl Storage + Clone) -> Result<
 async fn mixed_batch_partial_success_replication_factor(
     storage: impl Storage + Clone,
 ) -> Result<(), Error> {
-    let service = CreateTopicsService {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let invalid_name = alphanumeric_string(15);
     let valid_name = alphanumeric_string(15);
@@ -954,9 +956,9 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         let storage = storage_container(cluster_id, broker_id).await?;
-        let service = CreateTopicsService {
+        let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
             storage: storage.clone(),
-        };
+        });
 
         let replication_factor = 1;
         let assignments = Some([].into());

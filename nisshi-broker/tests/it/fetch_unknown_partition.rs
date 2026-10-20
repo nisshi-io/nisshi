@@ -23,8 +23,8 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     fetch_request::{FetchPartition, FetchTopic},
 };
-use nisshi_storage::{FetchService, Storage};
-use rama::{Service, extensions::Extensions};
+use nisshi_storage::{FetchService, FetchValidationLayer, Storage};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
 use url::Url;
@@ -82,7 +82,7 @@ where
         )
         .await?;
 
-    let service = FetchService { storage: sc };
+    let service = FetchValidationLayer::new().layer(FetchService { storage: sc });
 
     let requested = [0, PARTITIONS, -1, i32::MAX];
 

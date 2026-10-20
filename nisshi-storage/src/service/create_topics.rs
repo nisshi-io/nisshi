@@ -13,86 +13,28 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, NULL_TOPIC_ID, RequestInput,
-    create_topics_response::CreatableTopicResult, topic::is_valid_topic_name,
+    ApiKey, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, NULL_TOPIC_ID,
+    create_topics_response::CreatableTopicResult,
 };
 use rama::Service;
 use tracing::{debug, instrument};
 
-use crate::{Error, MAX_REPLICATION_FACTOR, Result, Storage};
+use validation::{ValidatedCreateTopicsRequest, ValidatedTopic, error_result};
 
-/// Build the [`CreatableTopicResult`] for a topic that was rejected, either
-/// by storage or by validation performed before storage is ever consulted.
-fn error_result(
-    name: String,
-    num_partitions: Option<i32>,
-    replication_factor: Option<i16>,
-    error_code: ErrorCode,
-) -> CreatableTopicResult {
-    CreatableTopicResult::default()
-        .name(name)
-        .topic_id(Some(NULL_TOPIC_ID))
-        .error_code(error_code.into())
-        .error_message(Some(error_code.to_string()))
-        .topic_config_error_code(None)
-        .num_partitions(num_partitions)
-        .replication_factor(replication_factor)
-        .configs(Some([].into()))
-}
+use crate::{Error, Result, Storage};
 
-/// Kafka 3.9.1 rejects a whole `CreateTopics` request whose topics add up
-/// to more than `MAX_PARTITIONS_PER_BATCH` (10,000) partitions, before any
-/// per-topic validation runs, including the name check
-/// ([ReplicationControlManager.java#L1152-L1169]).
+pub(crate) mod validation;
+
+/// A [`Service`] using its [`Storage`] taking [`ValidatedCreateTopicsRequest`] returning [`CreateTopicsResponse`].
 ///
-/// nisshi counts partitions only. Kafka 3.9.1 also caps the metadata
-/// records a request produces at 10,000 (one `TopicRecord` per topic, one
-/// per config, one per partition), so a request for exactly 10,000
-/// partitions fails there with `POLICY_VIOLATION`. nisshi has no metadata
-/// records, so it deliberately allows exactly 10,000 partitions.
+/// Wrap it in a [`CreateTopicsValidationLayer`](validation::CreateTopicsValidationLayer) to serve a
+/// [`CreateTopicsRequest`].
 ///
-/// [ReplicationControlManager.java#L1152-L1169]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L1152-L1169
-const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
-
-/// Partitions created for a topic whose `num_partitions` is `-1` (the
-/// "use the broker default" sentinel). Shared between the per-topic
-/// substitution in [`CreateTopicsService::serve`] and
-/// [`total_requested_partitions`], which must count a `-1` topic the same
-/// way the substitution below will.
-const BROKER_DEFAULT_NUM_PARTITIONS: i32 = 3;
-
-/// Sum of partitions this request would create, computed before any
-/// per-topic validation runs, counted as Kafka 3.9.1 does: a topic with
-/// manual `assignments` counts one partition per assignment, a topic
-/// requesting the broker default (`-1`) counts as
-/// [`BROKER_DEFAULT_NUM_PARTITIONS`]. A topic whose `num_partitions` is
-/// otherwise invalid (`0`, or another negative value) counts as zero, so it
-/// can't pull the total under the cap; the per-topic check in `serve`
-/// rejects it on its own merits.
-fn total_requested_partitions(
-    topics: &[nisshi_sans_io::create_topics_request::CreatableTopic],
-) -> i64 {
-    topics
-        .iter()
-        .map(
-            |topic| match (topic.assignments.as_deref(), topic.num_partitions) {
-                (Some(assignments), _) if !assignments.is_empty() => {
-                    i64::try_from(assignments.len()).unwrap_or(i64::MAX)
-                }
-                (_, -1) => i64::from(BROKER_DEFAULT_NUM_PARTITIONS),
-                (_, n) if n > 0 => i64::from(n),
-                _ => 0,
-            },
-        )
-        .fold(0i64, i64::saturating_add)
-}
-
-/// A [`Service`] using its [`Storage`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
 /// ```no_run
-/// use rama::Service as _;
+/// use rama::{Layer as _, Service as _};
 /// use nisshi_sans_io::{NULL_TOPIC_ID, CreateTopicsRequest,
 ///     create_topics_request::CreatableTopic, ErrorCode};
-/// use nisshi_storage::{CreateTopicsService, Error, StorageContainer};
+/// use nisshi_storage::{CreateTopicsService, CreateTopicsValidationLayer, Error, StorageContainer};
 /// use url::Url;
 ///
 /// # #[tokio::main]
@@ -105,7 +47,7 @@ fn total_requested_partitions(
 ///     .build()
 ///     .await?;
 ///
-/// let service = CreateTopicsService { storage };
+/// let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
 ///
 /// let name = "abcba";
 ///
@@ -144,146 +86,37 @@ impl<G> ApiKey for CreateTopicsService<G> {
     const KEY: i16 = CreateTopicsRequest::KEY;
 }
 
-impl<G, I> Service<I> for CreateTopicsService<G>
+impl<G> Service<ValidatedCreateTopicsRequest> for CreateTopicsService<G>
 where
     G: Storage,
-    I: Into<RequestInput<CreateTopicsRequest>> + Send + 'static,
 {
     type Output = CreateTopicsResponse;
     type Error = Error;
 
-    #[instrument(skip(self, input))]
-    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
-        let input = input.into();
-
-        let requested = input.request.topics.as_deref().unwrap_or(&[]);
-
-        // Reject the whole request, before any per-topic validation or
-        // storage call, when the partitions requested across every topic
-        // exceed the cap. Kafka also runs this before the name check.
-        let total = total_requested_partitions(requested);
-        if total > MAX_PARTITIONS_PER_REQUEST {
-            debug!(
-                total,
-                limit = MAX_PARTITIONS_PER_REQUEST,
-                "rejecting CreateTopics: too many partitions in one request"
-            );
-
-            let message = format!(
-                "Excessively large number of partitions per request: \
-                 {total} requested, limit {MAX_PARTITIONS_PER_REQUEST}."
-            );
-
-            let topics = requested
-                .iter()
-                .map(|topic| {
-                    error_result(
-                        topic.name.clone(),
-                        Some(topic.num_partitions),
-                        Some(topic.replication_factor),
-                        ErrorCode::PolicyViolation,
-                    )
-                    .error_message(Some(message.clone()))
-                })
-                .collect();
-
-            return Ok(CreateTopicsResponse::default()
-                .topics(Some(topics))
-                .throttle_time_ms(Some(0)));
-        }
-
+    #[instrument(skip(self, request))]
+    async fn serve(
+        &self,
+        request: ValidatedCreateTopicsRequest,
+    ) -> Result<Self::Output, Self::Error> {
         let mut topics = vec![];
 
-        for mut topic in input.request.topics.unwrap_or_default() {
+        for topic in request.topics {
+            let topic = match topic {
+                ValidatedTopic::Valid(topic) => topic,
+
+                ValidatedTopic::Rejected(result) => {
+                    topics.push(result);
+                    continue;
+                }
+            };
+
             let name = topic.name.clone();
-
-            let num_partitions = Some(match topic.num_partitions {
-                -1 => {
-                    topic.num_partitions = BROKER_DEFAULT_NUM_PARTITIONS;
-                    topic.num_partitions
-                }
-                otherwise => otherwise,
-            });
-
-            let replication_factor = Some(match topic.replication_factor {
-                -1 => {
-                    topic.replication_factor = 1;
-                    topic.replication_factor
-                }
-                otherwise => otherwise,
-            });
-
-            // Validate before storage is ever consulted, so invalid topics
-            // are rejected regardless of `validate_only`, and so a bad name
-            // (e.g. "", ".", "..", or one containing "/") can never reach a
-            // backend whose delete/list operations are prefix based.
-            if !is_valid_topic_name(&name) {
-                topics.push(error_result(
-                    name,
-                    num_partitions,
-                    replication_factor,
-                    ErrorCode::InvalidTopicException,
-                ));
-                continue;
-            }
-
-            // Replication factor is checked before partition count, matching
-            // Kafka's KRaft controller (ReplicationControlManager), the only
-            // mode from Kafka 4.0. -1 (broker default) was already replaced
-            // above, so anything below 1 is invalid, as is anything above
-            // `MAX_REPLICATION_FACTOR`.
-            if let Some(factor) =
-                replication_factor.filter(|factor| !(1..=MAX_REPLICATION_FACTOR).contains(factor))
-            {
-                debug!(
-                    topic = %name,
-                    replication_factor = factor,
-                    limit = MAX_REPLICATION_FACTOR,
-                    "rejecting CreateTopics: invalid replication factor"
-                );
-
-                // The generic text for this error code blames the number of
-                // available brokers, which is wrong here, because the factor
-                // can exceed the broker count. The message below 1 is
-                // Kafka's own.
-                let message = if factor < 1 {
-                    String::from(
-                        "Replication factor must be larger than 0, or -1 to use the default value.",
-                    )
-                } else {
-                    format!(
-                        "Replication factor {factor} is above the maximum of \
-                         {MAX_REPLICATION_FACTOR}."
-                    )
-                };
-
-                topics.push(
-                    error_result(
-                        name,
-                        num_partitions,
-                        replication_factor,
-                        ErrorCode::InvalidReplicationFactor,
-                    )
-                    .error_message(Some(message)),
-                );
-                continue;
-            }
-
-            // -1 (broker default) was already replaced above, so anything
-            // below 1 is invalid.
-            if num_partitions.is_some_and(|partitions| partitions < 1) {
-                topics.push(error_result(
-                    name,
-                    num_partitions,
-                    replication_factor,
-                    ErrorCode::InvalidPartitions,
-                ));
-                continue;
-            }
+            let num_partitions = Some(topic.num_partitions);
+            let replication_factor = Some(topic.replication_factor);
 
             match self
                 .storage
-                .create_topic(topic, input.request.validate_only.unwrap_or_default())
+                .create_topic(topic, request.validate_only)
                 .await
             {
                 Ok(topic_id) => {

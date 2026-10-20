@@ -44,6 +44,7 @@ expect "fuzz.yml" true .github/workflows/fuzz.yml
 expect "fuzz target config" true fuzz/ci-targets.json
 expect "compat report sql" true .github/workflows/scripts/pivot-integration-report.sql
 expect "ci scripts" true .github/scripts/ci-changes.sh
+expect "local actions" true .github/actions/test-reports/action.yml
 expect "rust source" true nisshi-broker/src/lib.rs
 expect "nested markdown in a crate" true nisshi-broker/README.md
 expect "cargo files" true Cargo.toml

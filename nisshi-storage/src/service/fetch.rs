@@ -15,7 +15,7 @@
 use std::{cmp::min, future::Future, sync::LazyLock};
 
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput,
+    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId},
     metadata_response::MetadataResponseTopic,
@@ -30,6 +30,7 @@ use crate::{
     Error, METER, OffsetStage, Result, Storage, Topition,
     service::deadline::{self, Missed},
 };
+use validation::ValidatedFetchRequest;
 
 /// Partition reads whose fetch offset falls outside the partition, by
 /// `topic` and by `bound`: `below_log_start` (answered with
@@ -49,6 +50,8 @@ static FETCH_OFFSET_OUT_OF_BOUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         )
         .build()
 });
+
+pub(super) mod validation;
 
 /// Partitions that a Fetch answers with `UNKNOWN_TOPIC_OR_PARTITION` although
 /// their topic exists, by `topic` and by `source`: `request` for an index
@@ -225,15 +228,20 @@ impl Deadlines {
     }
 }
 
-/// A [`Service`] using its [`Storage`] taking [`FetchRequest`] returning [`FetchResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ValidatedFetchRequest`] returning [`FetchResponse`].
+///
+/// Wrap it in a [`FetchValidationLayer`](validation::FetchValidationLayer) to serve a
+/// [`FetchRequest`].
 /// ```no_run
-/// use rama::Service as _;
+/// use rama::{Layer as _, Service as _};
 /// use nisshi_sans_io::{
 ///     CreateTopicsRequest, ErrorCode, FetchRequest,
 ///     create_topics_request::CreatableTopic,
 ///     fetch_request::{FetchPartition, FetchTopic},
 /// };
-/// use nisshi_storage::{CreateTopicsService, Error, FetchService, StorageContainer};
+/// use nisshi_storage::{
+///     CreateTopicsService, CreateTopicsValidationLayer, Error, FetchService, FetchValidationLayer, StorageContainer,
+/// };
 /// use url::Url;
 ///
 /// # #[tokio::main]
@@ -251,9 +259,9 @@ impl Deadlines {
 ///     .build()
 ///     .await?;
 ///
-/// let create_topic = CreateTopicsService {
+/// let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
 ///     storage: storage.clone(),
-/// };
+/// });
 ///
 /// let name = "abcba";
 ///
@@ -276,9 +284,9 @@ impl Deadlines {
 /// assert_eq!(1, topics.len());
 /// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 ///
-/// let fetch = FetchService {
+/// let fetch = FetchValidationLayer::new().layer(FetchService {
 ///     storage: storage.clone(),
-/// };
+/// });
 ///
 /// let partition = 0;
 ///
@@ -909,61 +917,68 @@ where
     }
 }
 
-impl<G, I> Service<I> for FetchService<G>
+/// Builds a [`FetchableTopicResponse`] reporting `error_code` on every partition `fetch` requested.
+pub(super) fn topic_error_response(
+    fetch: &FetchTopic,
+    error_code: ErrorCode,
+) -> Result<FetchableTopicResponse> {
+    Ok(FetchableTopicResponse::default()
+        .topic(fetch.topic.clone())
+        // From v13 the client matches a response topic by id and drops
+        // one it cannot match, so the requested id is echoed: the client
+        // then sees the error and refreshes its metadata.
+        .topic_id(fetch.topic_id)
+        .partitions(fetch.partitions.as_ref().map(|partitions| {
+            partitions
+                .iter()
+                .map(|partition| {
+                    PartitionData::default()
+                        .partition_index(partition.partition)
+                        .error_code(error_code.into())
+                        .high_watermark(0)
+                        .last_stable_offset(Some(0))
+                        .log_start_offset(Some(-1))
+                        .diverging_epoch(Some(EpochEndOffset::default().epoch(-1).end_offset(-1)))
+                        // Kafka sends a leader hint only with a leadership
+                        // error; librdkafka acts on one here, and its
+                        // consumer close then hangs on a deleted topic
+                        .current_leader(None)
+                        .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
+                        .aborted_transactions(Some([].into()))
+                        .preferred_read_replica(Some(-1))
+                        .records(None)
+                })
+                .collect()
+        })))
+}
+
+impl<G> Service<ValidatedFetchRequest> for FetchService<G>
 where
     G: Storage,
-    I: Into<RequestInput<FetchRequest>> + Send + 'static,
 {
     type Output = FetchResponse;
     type Error = Error;
 
-    #[instrument(skip(self, input))]
-    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
+    #[instrument(skip(self, request))]
+    async fn serve(&self, mut request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
         let started_at = Instant::now();
 
-        let input = input.into();
-
-        let responses = Some(if let Some(topics) = input.request.topics {
-            let isolation_level = input
-                .request
-                .isolation_level
-                .map_or(Ok(IsolationLevel::ReadUncommitted), |isolation| {
-                    IsolationLevel::try_from(isolation)
-                })?;
-
-            let max_wait_ms =
-                u64::try_from(input.request.max_wait_ms).map(Duration::from_millis)?;
-
-            let min_bytes = u32::try_from(input.request.min_bytes)?;
-
-            const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
-
-            let mut max_bytes =
-                input
-                    .request
-                    .max_bytes
-                    .map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
-                        u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
-                    })?;
-
-            self.fetch(
-                max_wait_ms,
-                min_bytes,
-                &mut max_bytes,
-                isolation_level,
-                topics.as_ref(),
-            )
-            .await?
-        } else {
-            vec![]
-        });
-
-        Ok(FetchResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(Some(ErrorCode::None.into()))
-            .session_id(Some(0))
-            .node_endpoints(Some([].into()))
-            .responses(responses))
+        self.fetch(
+            request.max_wait,
+            request.min_bytes,
+            &mut request.max_bytes,
+            request.isolation_level,
+            &request.topics,
+        )
+        .await
+        .map(|responses| {
+            FetchResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(Some(ErrorCode::None.into()))
+                .session_id(Some(0))
+                .node_endpoints(Some([].into()))
+                .responses(Some(responses))
+        })
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 }
@@ -1084,7 +1099,7 @@ mod tests {
         record::{Record, deflated, inflated},
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
-    use rama::Service as _;
+    use rama::{Layer as _, Service as _};
     use tokio::time::{Duration, Instant, advance};
     use url::Url;
     use uuid::Uuid;
@@ -1093,9 +1108,9 @@ mod tests {
         Deadlines, FetchService, MIN_BUDGET_MARGIN, Missed, READ_DEADLINE_OVERHEAD, before,
     };
     use crate::{
-        BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
-        NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-        ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+        BrokerRegistrationRequest, Error, FetchValidationLayer, GroupDetail, ListOffsetResponse,
+        MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+        Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
         TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
     };
 
@@ -2185,7 +2200,8 @@ mod tests {
     ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
         let started_at = Instant::now();
 
-        let response = FetchService { storage }
+        let response = FetchValidationLayer::new()
+            .layer(FetchService { storage })
             .serve(
                 FetchRequest::default()
                     .max_wait_ms(i32::try_from(max_wait.as_millis())?)

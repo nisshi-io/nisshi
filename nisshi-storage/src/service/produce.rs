@@ -749,14 +749,14 @@ mod rewrite_create_time_tests {
 /// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
 /// use bytes::Bytes;
-/// use rama::Service as _;
+/// use rama::{Layer as _, Service as _};
 /// use nisshi_sans_io::{
 ///     CreateTopicsRequest, ErrorCode, ProduceRequest,
 ///     create_topics_request::CreatableTopic,
 ///     produce_request::{PartitionProduceData, TopicProduceData},
 ///     record::{Record, deflated::Frame, inflated},
 /// };
-/// use nisshi_storage::{CreateTopicsService, Error, ProduceService, StorageContainer};
+/// use nisshi_storage::{CreateTopicsService, CreateTopicsValidationLayer, Error, ProduceService, StorageContainer};
 /// use url::Url;
 ///
 /// # #[tokio::main]
@@ -774,9 +774,9 @@ mod rewrite_create_time_tests {
 ///     .build()
 ///     .await?;
 ///
-/// let create_topic = CreateTopicsService {
+/// let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
 ///     storage: storage.clone(),
-/// };
+/// });
 ///
 /// let name = "abcba";
 ///

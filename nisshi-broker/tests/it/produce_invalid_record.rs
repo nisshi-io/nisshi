@@ -42,10 +42,10 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::Registry;
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, InitProducerIdService, ListOffsetsService, ProduceService,
-    Storage,
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, InitProducerIdService,
+    ListOffsetsService, ProduceService, Storage,
 };
-use rama::{Service as _, extensions::Extensions};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use url::Url;
 use uuid::Uuid;
@@ -85,24 +85,25 @@ async fn storage(storage_type: StorageType, with_registry: bool) -> Result<ArcDy
 }
 
 async fn create_topic(storage: &(impl Storage + Clone), name: &str) -> Result<()> {
-    let response = CreateTopicsService {
-        storage: storage.clone(),
-    }
-    .serve(RequestInput {
-        request: CreateTopicsRequest::default()
-            .validate_only(Some(false))
-            .topics(Some(
-                [CreatableTopic::default()
-                    .name(name.into())
-                    .num_partitions(1)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into()))]
-                .into(),
-            )),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let response = CreateTopicsValidationLayer::new()
+        .layer(CreateTopicsService {
+            storage: storage.clone(),
+        })
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(name.into())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into()))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
