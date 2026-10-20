@@ -385,7 +385,7 @@ jobs:
       # `version` is read back as a FOSSA revision, so it must be the string the
       # FOSSA jobs above stamp - a branch name resolves to nothing.
       #
-      # `image_tag` is the moving `main` tag nisshi's ci.yml `package` job
+      # `image_tag` is the moving `main` tag nisshi's ci.yml `publish` job
       # pushes on every push to main, so it names an image that exists.
       # Guardian takes only the tag from this row. It builds the rest of the
       # image path from the `nisshi` product's own config, as

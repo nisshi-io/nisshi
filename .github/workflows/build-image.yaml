@@ -11,8 +11,8 @@ name: Build Scan Image
 # The Dockerfile packages a prebuilt static binary, so this repeats the
 # linux/amd64 leg of ci.yml's `release` job first. That build runs every
 # dependency's build script, which is why this job holds no secrets and no
-# write scope. The released multi-arch image is still built and pushed by
-# ci.yml's `package` job.
+# write scope. The released multi-arch image is built and pushed by ci.yml's
+# `publish` job (main) and release.yml's `publish-image` job (tags).
 
 on:
   workflow_call:
