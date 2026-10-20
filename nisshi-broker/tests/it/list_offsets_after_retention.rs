@@ -22,9 +22,11 @@ use nisshi_sans_io::{
     ListOffsetsRequest, ProduceRequest, RequestInput,
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
+    delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
+    to_timestamp,
 };
 use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
@@ -66,6 +68,11 @@ const TEN_MINUTE_RETENTION: &str = "600000";
 
 /// How far after producing the records a test runs maintenance, past their `retention.ms`.
 const AN_HOUR: Duration = Duration::from_secs(3_600);
+
+/// How far ahead of now a test sets a record's `CreateTime`, so that the record is still within
+/// its `retention.ms` when maintenance runs [`AN_HOUR`] later. Produce rejects a `CreateTime`
+/// more than an hour ahead, the default `message.timestamp.after.max.ms`.
+const FIFTY_FIVE_MINUTES: Duration = Duration::from_secs(3_300);
 
 async fn create_topic(
     broker: &Broker,
@@ -112,7 +119,23 @@ async fn produce(
     name: &str,
     value: Bytes,
 ) -> Result<i64> {
+    produce_with_create_time(broker, extensions, name, value, SystemTime::now()).await
+}
+
+/// Produces one record with `create_time` as its `CreateTime`, which retention compares with
+/// `retention.ms`, and returns its offset.
+async fn produce_with_create_time(
+    broker: &Broker,
+    extensions: &Extensions,
+    name: &str,
+    value: Bytes,
+    create_time: SystemTime,
+) -> Result<i64> {
+    let timestamp = to_timestamp(&create_time)?;
+
     let frame = inflated::Batch::builder()
+        .base_timestamp(timestamp)
+        .max_timestamp(timestamp)
         .record(Record::builder().value(Some(value)))
         .build()
         .map(|batch| inflated::Frame {
@@ -260,34 +283,12 @@ where
     Ok(())
 }
 
-/// An open transaction pins `read_committed` Latest at the transaction's first offset, even after
-/// retention deletes the record at that offset. A latest offset above it would let a
-/// `read_committed` consumer read past records that the transaction may still abort.
-pub async fn open_transaction_pins_read_committed_latest_after_retention<G>(sc: G) -> Result<()>
+/// Opens a transaction on partition 0 of `topic`, produces one record in it, and returns the
+/// record's offset. The transaction stays open.
+async fn produce_in_open_transaction<G>(sc: &G, topic: &str) -> Result<i64>
 where
-    G: Storage + Clone,
+    G: Storage,
 {
-    let broker = broker(sc.clone())?;
-    let extensions = Extensions::default();
-    let topic = &alphanumeric_string(15)[..];
-    let topition = Topition::new(topic, 0);
-
-    create_topic(
-        &broker,
-        &extensions,
-        topic,
-        &[
-            ("cleanup.policy", "delete"),
-            ("retention.ms", TEN_MINUTE_RETENTION),
-        ],
-    )
-    .await?;
-
-    assert_eq!(
-        0,
-        produce(&broker, &extensions, topic, Bytes::from_static(b"before")).await?
-    );
-
     let transaction_id = alphanumeric_string(10);
     let producer = sc
         .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
@@ -306,7 +307,6 @@ where
         })
         .await?;
 
-    let transaction_start = 1;
     let batch = inflated::Batch::builder()
         .record(Record::builder().value(Some(Bytes::from_static(b"uncommitted"))))
         .attributes(BatchAttribute::default().transaction(true).into())
@@ -315,19 +315,92 @@ where
         .base_sequence(0)
         .build()
         .and_then(TryInto::try_into)?;
+
+    sc.produce(
+        Some(transaction_id.as_str()),
+        &Topition::new(topic, 0),
+        batch,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+/// Creates a topic with a ten minute `retention.ms`, and produces three records to it: `first`
+/// at `first_create_time`, one in a transaction that stays open, and one more at the current
+/// time. Returns the offset of the transaction's record.
+async fn create_topic_with_open_transaction<G>(
+    sc: &G,
+    broker: &Broker,
+    extensions: &Extensions,
+    topic: &str,
+    first_create_time: SystemTime,
+) -> Result<i64>
+where
+    G: Storage,
+{
+    create_topic(
+        broker,
+        extensions,
+        topic,
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.ms", TEN_MINUTE_RETENTION),
+        ],
+    )
+    .await?;
+
+    let first = Bytes::from_static(b"first");
     assert_eq!(
-        transaction_start,
-        sc.produce(Some(transaction_id.as_str()), &topition, batch)
-            .await?
+        0,
+        produce_with_create_time(broker, extensions, topic, first, first_create_time).await?
     );
+
+    let transaction_start = produce_in_open_transaction(sc, topic).await?;
+    assert_eq!(1, transaction_start);
 
     assert_eq!(
         2,
-        produce(&broker, &extensions, topic, Bytes::from_static(b"after")).await?
+        produce(broker, extensions, topic, Bytes::from_static(b"after")).await?
     );
+
+    Ok(transaction_start)
+}
+
+/// An open transaction pins `read_committed` Latest at the transaction's first offset, even after
+/// retention deletes the record at that offset. A latest offset above it would let a
+/// `read_committed` consumer read past records that the transaction may still abort.
+pub async fn open_transaction_pins_read_committed_latest_after_retention<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    // The first record is newer than the others, so retention keeps it, and the transaction's
+    // first offset stays above the earliest offset.
+    let transaction_start = create_topic_with_open_transaction(
+        &sc,
+        &broker,
+        &extensions,
+        topic,
+        SystemTime::now() + FIFTY_FIVE_MINUTES,
+    )
+    .await?;
 
     sc.maintain(SystemTime::now() + AN_HOUR).await?;
 
+    assert_eq!(
+        Some(0),
+        list_offset(
+            &broker,
+            &extensions,
+            topic,
+            IsolationLevel::ReadCommitted,
+            ListOffset::Earliest
+        )
+        .await?
+    );
     assert_eq!(
         Some(transaction_start),
         list_offset(
@@ -350,6 +423,92 @@ where
         )
         .await?
     );
+
+    Ok(())
+}
+
+/// When retention deletes every record of a partition with an open transaction, `read_committed`
+/// Latest answers the earliest offset. Kafka never answers a last stable offset below the log
+/// start, so a consumer that resets to Latest gets an offset that it can fetch from.
+pub async fn read_committed_latest_is_earliest_when_retention_deletes_open_transaction<G>(
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    _ = create_topic_with_open_transaction(&sc, &broker, &extensions, topic, SystemTime::now())
+        .await?;
+
+    sc.maintain(SystemTime::now() + AN_HOUR).await?;
+
+    for which in [ListOffset::Earliest, ListOffset::Latest] {
+        assert_eq!(
+            Some(3),
+            list_offset(
+                &broker,
+                &extensions,
+                topic,
+                IsolationLevel::ReadCommitted,
+                which
+            )
+            .await?,
+            "{which:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// When DeleteRecords moves the log start past an open transaction's first offset,
+/// `read_committed` Latest answers the new log start, as in Kafka.
+pub async fn read_committed_latest_is_log_start_after_delete_records_past_open_transaction<G>(
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    let transaction_start =
+        create_topic_with_open_transaction(&sc, &broker, &extensions, topic, SystemTime::now())
+            .await?;
+
+    let log_start = transaction_start + 1;
+
+    let results = sc
+        .delete_records(&[DeleteRecordsTopic::default()
+            .name(topic.into())
+            .partitions(Some(
+                [DeleteRecordsPartition::default()
+                    .partition_index(0)
+                    .offset(log_start)]
+                .into(),
+            ))])
+        .await?;
+    let partition = &results[0].partitions.as_deref().unwrap_or_default()[0];
+    assert_eq!(i16::from(ErrorCode::None), partition.error_code);
+    assert_eq!(log_start, partition.low_watermark);
+
+    for which in [ListOffset::Earliest, ListOffset::Latest] {
+        assert_eq!(
+            Some(log_start),
+            list_offset(
+                &broker,
+                &extensions,
+                topic,
+                IsolationLevel::ReadCommitted,
+                which
+            )
+            .await?,
+            "{which:?}"
+        );
+    }
 
     Ok(())
 }
@@ -389,6 +548,26 @@ macro_rules! backend {
             async fn open_transaction_pins_read_committed_latest_after_retention() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::open_transaction_pins_read_committed_latest_after_retention(
+                    storage_container().await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn read_committed_latest_is_earliest_when_retention_deletes_open_transaction(
+            ) -> Result<()> {
+                let _guard = init_tracing()?;
+                super::read_committed_latest_is_earliest_when_retention_deletes_open_transaction(
+                    storage_container().await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn read_committed_latest_is_log_start_after_delete_records_past_open_transaction(
+            ) -> Result<()> {
+                let _guard = init_tracing()?;
+                super::read_committed_latest_is_log_start_after_delete_records_past_open_transaction(
                     storage_container().await?,
                 )
                 .await
