@@ -329,9 +329,9 @@ async fn invalid_isolation_level(storage: impl Storage + Clone, broker_id: i32) 
 async fn unknown_partition(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let topic = &alphanumeric_string(15)[..];
     let num_partitions = 3;
