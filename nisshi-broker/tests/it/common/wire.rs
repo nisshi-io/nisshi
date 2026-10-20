@@ -34,6 +34,8 @@ use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
+use super::lite_url;
+
 /// Largest response the test client will read; anything bigger is not a
 /// Kafka frame (a TLS alert read as a length prefix decodes to ~350 MiB).
 const MAXIMUM_RESPONSE: usize = 16 * 1024 * 1024;
@@ -62,6 +64,10 @@ pub(crate) async fn spawn_broker(tls: Option<ServerConfig>) -> Result<RunningBro
 
 /// Like [`spawn_broker`], with `--authentication` on or off. With it on, the
 /// broker has no credentials, so no client can log in.
+///
+/// With authentication on, the broker runs on a SQLite database of the test's
+/// own, because the in-memory engine can't store the SCRAM users that
+/// authentication needs and the broker refuses to start on it.
 pub(crate) async fn spawn_broker_with_authentication(
     tls: Option<ServerConfig>,
     authentication: bool,
@@ -70,12 +76,18 @@ pub(crate) async fn spawn_broker_with_authentication(
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = Url::parse(&format!("tcp://{addr}"))?;
 
+    let storage = if authentication {
+        lite_url().await?
+    } else {
+        Url::parse("memory://")?
+    };
+
     let mut broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
         .node_id(NODE_ID)
         .cluster_id(format!("wire-{}", Uuid::now_v7()))
         .incarnation_id(Uuid::now_v7())
         .advertised_listener(listener.clone())
-        .storage(Url::parse("memory://")?)
+        .storage(storage)
         .listener(listener)
         .tls_server_config(tls)
         .authentication(authentication)
