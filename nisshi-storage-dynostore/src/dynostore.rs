@@ -3049,21 +3049,33 @@ impl Storage for DynoStore {
                         results.push(NamedGroupDetail::found(group_id.into(), group_detail));
                     }
 
-                    Err(Error::ObjectStore(error)) => match error.as_ref() {
-                        object_store::Error::NotFound { .. } => {
-                            results.push(NamedGroupDetail::found(
-                                group_id.into(),
-                                GroupDetail::default(),
-                            ));
-                        }
+                    // A group that commits offsets and never joins has no state object. The
+                    // group exists while any of its committed offsets remains.
+                    Err(Error::ObjectStore(error))
+                        if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+                    {
+                        let offsets_prefix = self.group_offsets_prefix(group_id)?;
 
-                        _otherwise => {
-                            results.push(NamedGroupDetail::found(
+                        match self.object_store.list(Some(&offsets_prefix)).next().await {
+                            Some(Ok(_)) => results.push(NamedGroupDetail::found(
                                 group_id.into(),
                                 GroupDetail::default(),
-                            ));
+                            )),
+
+                            None => results.push(NamedGroupDetail::error_code(
+                                group_id.into(),
+                                ErrorCode::GroupIdNotFound,
+                            )),
+
+                            Some(Err(err)) => {
+                                error!(?err, group_id);
+                                results.push(NamedGroupDetail::error_code(
+                                    group_id.into(),
+                                    ErrorCode::UnknownServerError,
+                                ));
+                            }
                         }
-                    },
+                    }
 
                     Err(_) => {
                         results.push(NamedGroupDetail::error_code(

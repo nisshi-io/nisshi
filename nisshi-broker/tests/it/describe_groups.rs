@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::assert_matches;
+use std::{assert_matches, slice};
 
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
@@ -20,9 +20,12 @@ use crate::common::{
 };
 use nisshi_broker::{Error, Result};
 use nisshi_sans_io::{
-    DescribeGroupsRequest, ErrorCode, RequestInput, describe_groups_response::DescribedGroup,
+    DescribeGroupsRequest, ErrorCode, RequestInput, create_topics_request::CreatableTopic,
+    describe_groups_response::DescribedGroup,
 };
-use nisshi_storage::{ArcDynStorage, DescribeGroupsService, GroupDetail, Storage};
+use nisshi_storage::{
+    ArcDynStorage, DescribeGroupsService, GroupDetail, OffsetCommitRequest, Storage, Topition,
+};
 use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
@@ -119,7 +122,7 @@ async fn unknown_group_answers_operations_only_on_a_row_without_error(
 }
 
 /// Requires an engine that answers an unknown group with `GROUP_ID_NOT_FOUND`.
-#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
 async fn error_row_omits_authorized_operations(storage: impl Storage + Clone) -> Result<()> {
     for include_authorized_operations in [false, true] {
         let groups = describe(
@@ -135,6 +138,46 @@ async fn error_row_omits_authorized_operations(storage: impl Storage + Clone) ->
         );
         assert_eq!(Some(i32::MIN), groups[0].authorized_operations);
     }
+
+    Ok(())
+}
+
+/// A group that only committed offsets, and never joined, exists: the broker must answer it as
+/// an empty group, not with `GROUP_ID_NOT_FOUND`.
+#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
+async fn group_with_only_committed_offsets_is_empty(storage: impl Storage + Clone) -> Result<()> {
+    let topic_name = alphanumeric_string(15);
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let group_id = alphanumeric_string(15);
+    let topition = Topition::new(topic_name, 0);
+    let committed = storage
+        .offset_commit(
+            &group_id,
+            None,
+            &[(
+                topition.clone(),
+                OffsetCommitRequest::default().offset(rng().random_range(0..i64::MAX)),
+            )],
+        )
+        .await?;
+    assert_eq!(vec![(topition, ErrorCode::None)], committed);
+
+    let groups = describe(storage, slice::from_ref(&group_id), false).await?;
+    assert_eq!(1, groups.len());
+    assert_eq!(group_id, groups[0].group_id);
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+    assert_eq!("Empty", groups[0].group_state);
 
     Ok(())
 }
@@ -214,6 +257,18 @@ mod in_memory {
         let _guard = init_tracing()?;
         super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
     }
+
+    #[tokio::test]
+    async fn error_row_omits_authorized_operations() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::error_row_omits_authorized_operations(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::group_with_only_committed_offsets_is_empty(storage().await?).await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -266,6 +321,12 @@ mod lite {
     async fn error_row_omits_authorized_operations() -> Result<()> {
         let _guard = init_tracing()?;
         super::error_row_omits_authorized_operations(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::group_with_only_committed_offsets_is_empty(storage().await?).await
     }
 }
 
@@ -345,5 +406,11 @@ mod pg {
     async fn error_row_omits_authorized_operations() -> Result<()> {
         let _guard = init_tracing()?;
         super::error_row_omits_authorized_operations(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::group_with_only_committed_offsets_is_empty(storage().await?).await
     }
 }

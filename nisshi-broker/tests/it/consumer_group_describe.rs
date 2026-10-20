@@ -112,7 +112,7 @@ async fn unknown_group_answers_operations_only_on_a_row_without_error(
 }
 
 /// Requires an engine that answers an unknown group with `GROUP_ID_NOT_FOUND`.
-#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
 async fn error_row_omits_authorized_operations(storage: impl Storage + Clone) -> Result<()> {
     for include_authorized_operations in [false, true] {
         let groups = describe(
@@ -161,9 +161,11 @@ where
 
     let groups = response.groups.unwrap_or_default();
     assert_eq!(1, groups.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+    assert_eq!(
+        ErrorCode::GroupIdNotFound,
+        ErrorCode::try_from(groups[0].error_code)?
+    );
     assert_eq!(group_id, groups[0].group_id.as_str());
-    assert_eq!("Empty", groups[0].group_state.as_str());
 
     Ok(())
 }
@@ -230,6 +232,12 @@ mod in_memory {
     async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn error_row_omits_authorized_operations() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::error_row_omits_authorized_operations(storage().await?).await
     }
 }
 

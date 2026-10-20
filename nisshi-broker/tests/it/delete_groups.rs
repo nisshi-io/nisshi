@@ -153,10 +153,8 @@ async fn delete_evicts_coordinator_cache(
     assert_eq!(1, results.len());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
 
-    // On dynostore and SlateDB a missing group fails open to
-    // `Found(GroupDetail::default())` (pre-existing, accepted elsewhere in
-    // this file): only Postgres and libSQL actually report `GroupIdNotFound`
-    // here, so this check only applies to them.
+    // SlateDB answers a missing group as `Found(GroupDetail::default())`, so
+    // this check applies only to the engines that report `GroupIdNotFound`.
     if let Some(expected) = after_delete_not_found {
         let described = storage
             .describe_groups(Some(slice::from_ref(&group)), false)
@@ -1342,7 +1340,7 @@ mod in_memory {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::delete_evicts_coordinator_cache(storage, None).await?;
+        super::delete_evicts_coordinator_cache(storage, Some(ErrorCode::GroupIdNotFound)).await?;
 
         Ok(())
     }
