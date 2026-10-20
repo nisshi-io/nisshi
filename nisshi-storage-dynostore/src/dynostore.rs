@@ -3071,12 +3071,22 @@ impl Storage for DynoStore {
                                 error!(?err, group_id);
                                 results.push(NamedGroupDetail::error_code(
                                     group_id.into(),
-                                    ErrorCode::UnknownServerError,
+                                    ErrorCode::CoordinatorNotAvailable,
                                 ));
                             }
                         }
                     }
 
+                    // An object store error is usually transient. Kafka clients retry
+                    // `COORDINATOR_NOT_AVAILABLE`, and fail on `UNKNOWN_SERVER_ERROR`.
+                    Err(Error::ObjectStore(_)) => {
+                        results.push(NamedGroupDetail::error_code(
+                            group_id.into(),
+                            ErrorCode::CoordinatorNotAvailable,
+                        ));
+                    }
+
+                    // A retry does not fix a stored group that can't be decoded.
                     Err(_) => {
                         results.push(NamedGroupDetail::error_code(
                             group_id.into(),

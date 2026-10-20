@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
 mod delete_records;
+mod describe_groups;
 mod init_producer;
 mod latency;
 mod list_offsets;
