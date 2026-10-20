@@ -32,3 +32,8 @@ tmp
 .ua/diff-overlay.json
 .ua/.trash-*/
 fuzz/artifacts/fuzz_alter_user_scram_credentials_storage/
+/benchmark/openmessaging/.omb/
+/benchmark/openmessaging/results/
+/benchmark/openmessaging/broker.*
+/benchmark/openmessaging/.pg/
+/benchmark/openmessaging/run-*.log

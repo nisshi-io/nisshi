@@ -1,0 +1,12 @@
+# Short sanity workload: 1 topic, 4 partitions, 1 KiB messages, 1 minute.
+name: nisshi smoke, 1 producer / 1 consumer on 1 topic
+topics: 1
+partitionsPerTopic: 4
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+producerRate: 10000
+consumerBacklogSizeGB: 0
+testDurationMinutes: 1
