@@ -2220,23 +2220,20 @@ impl Storage for Engine {
             .inspect(|result| debug!(?result))?
             .map_or_else(
                 || {
-                    // No record row: Earliest/Latest answer 0, a Timestamp
-                    // lookup answers no offset (see `ListOffsetResponse::offset`).
-                    let (offset, timestamp) = match offset_type {
-                        ListOffsetRequest::Earliest | ListOffsetRequest::Latest => (Some(0), None),
-                        ListOffsetRequest::Timestamp(_) => (None, None),
+                    // Earliest and Latest find no row only when the partition does not exist,
+                    // because creating a partition also creates its watermark row. A Timestamp
+                    // lookup finds no row when no record matches, and also when the partition
+                    // does not exist. Both answer no offset (see `ListOffsetResponse::offset`).
+                    let error_code = match offset_type {
+                        ListOffsetRequest::Earliest | ListOffsetRequest::Latest => {
+                            ErrorCode::UnknownTopicOrPartition
+                        }
+                        ListOffsetRequest::Timestamp(_) => ErrorCode::None,
                     };
-                    debug!(
-                        cluster = self.cluster,
-                        ?topition,
-                        ?offset_type,
-                        offset,
-                        ?timestamp
-                    );
+                    debug!(cluster = self.cluster, ?topition, ?offset_type, ?error_code);
 
                     Ok(ListOffsetResponse {
-                        timestamp,
-                        offset,
+                        error_code,
                         ..Default::default()
                     })
                 },

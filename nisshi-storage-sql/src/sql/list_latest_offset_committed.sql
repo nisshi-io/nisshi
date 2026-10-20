@@ -13,62 +13,48 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- Last Stable Offset Tracking: To do this, the broker must maintain in
--- memory the set of active transactions along with their initial
--- offsets. The last stable offset is always equal to the minimum
--- of the initial offsets across all active transactions.
---
-
 -- prepare list_latest_offset (text, text, integer) as
 
+-- Kafka answers read_committed Latest with the last stable offset: the first
+-- offset of the oldest transaction still open on the partition, or the high
+-- watermark when no transaction is open.
 
-select offset_id, timestamp
+with
 
-from
+requested_topition as (
+    select tp.id, w.high
+    from cluster c
+    join topic t on t.cluster = c.id
+    join topition tp on tp.topic = t.id
+    join watermark w on w.topition = tp.id
+    where c.name = $1
+    and t.name = $2
+    and tp.partition = $3
+),
 
-(select
-
-1 as o, r.offset_id, r.timestamp
-
-from
-
-cluster c
-
-join topic t on t.cluster = c.id
-join topition tp on tp.topic = t.id
-
-join txn on txn.cluster = c.id
-join txn_detail txn_d on txn_d."transaction" = txn.id
-join txn_topition txn_tp on txn_tp.txn_detail = txn_d.id and txn_tp.topition = tp.id
-join txn_produce_offset txn_po on txn_po.txn_topition = txn_tp.id
-join record r on r.topition = tp.id and r.offset_id = txn_po.offset_start
-
-where
-
-c.name = $1
-and t.name = $2
-and tp.partition = $3
-and (txn_d.status = 'PREPARE_COMMIT' or txn_d.status = 'PREPARE_ABORT' or txn_d.status = 'BEGIN')
-
-union
+-- The aggregate gives one row, with a null offset_start when no transaction is open.
+oldest_open_transaction as (
+    select min(txn_po.offset_start) as offset_start
+    from requested_topition
+    join txn_topition txn_tp on txn_tp.topition = requested_topition.id
+    join txn_detail txn_d on txn_d.id = txn_tp.txn_detail
+    join txn_produce_offset txn_po on txn_po.txn_topition = txn_tp.id
+    where txn_d.status in ('BEGIN', 'PREPARE_COMMIT', 'PREPARE_ABORT')
+)
 
 select
 
-2 as o, r.offset_id + 1, r.timestamp
+coalesce(oldest_open_transaction.offset_start, requested_topition.high, 0),
+r.timestamp
 
 from
 
-cluster c
-join topic t on t.cluster = c.id
-join topition tp on tp.topic = t.id
-join watermark w on w.topition = tp.id
-join record r on r.topition = tp.id and r.offset_id = w.high - 1
-
-where
-
-c.name = $1
-and t.name = $2
-and tp.partition = $3
-
-order by o, offset_id asc
-limit 1);
+requested_topition
+cross join oldest_open_transaction
+-- The query also answers the timestamp of a record: the oldest open
+-- transaction's first record, or the newest record. Retention can delete that
+-- record, so the left join keeps the row, and the timestamp is then null.
+left join record r on r.topition = requested_topition.id
+    and r.offset_id = coalesce(
+        oldest_open_transaction.offset_start,
+        requested_topition.high - 1);
