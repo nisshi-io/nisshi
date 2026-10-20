@@ -2379,7 +2379,7 @@ impl Builder<String, i32, Url, Url> {
 
         if let Some(relative) = self.storage.path().strip_prefix("/") {
             path.push(relative);
-        } else {
+        } else if !self.storage.path().is_empty() {
             path.push(self.storage.path());
         }
 
