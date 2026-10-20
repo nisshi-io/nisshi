@@ -335,8 +335,11 @@ pub enum Error {
     UnknownServiceBody(Box<Body>),
     /// No route handles `api_key`. The error names the request, not its
     /// decoded body: the body comes from the client, and this error is logged.
+    /// `api_name` is the API's fixed name, so the line identifies the API
+    /// without growing with the request.
     UnknownServiceFrame {
         api_key: i16,
+        api_name: &'static str,
         api_version: i16,
         correlation_id: i32,
         size: i32,

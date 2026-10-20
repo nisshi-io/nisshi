@@ -97,23 +97,40 @@ impl Capture {
     }
 }
 
-/// Whether `logs` holds a line from each of the two error sites.
-fn both_sites(logs: &str) -> bool {
-    [
-        "nisshi-service/src/stream.rs",
-        "nisshi-broker/src/broker.rs",
-    ]
-    .iter()
-    .all(|site| logs.lines().any(|line| line.contains(site)))
+/// The two places that log a failed request.
+const SITES: [&str; 2] = [
+    "nisshi-service/src/stream.rs",
+    "nisshi-broker/src/broker.rs",
+];
+
+/// What the error of each case prints, so a request that fails earlier with a
+/// different error doesn't pass for the case it was built to reach.
+const FROM_UTF8: &str = "FromUtf8 {";
+const UNKNOWN_SERVICE_FRAME: &str = "UnknownServiceFrame {";
+
+/// Whether `logs` holds a line from each of the two error sites that reports
+/// `variant`.
+fn both_sites(logs: &str, variant: &str) -> bool {
+    SITES.iter().all(|site| {
+        logs.lines()
+            .any(|line| line.contains(site) && line.contains(variant))
+    })
+}
+
+/// The lines of `logs` that report `variant`.
+fn variant_lines<'a>(logs: &'a str, variant: &str) -> impl Iterator<Item = &'a str> {
+    let variant = variant.to_owned();
+    logs.lines().filter(move |line| line.contains(&variant))
 }
 
 /// Sends `frame` to a new broker, waits for the broker to close the
-/// connection and log the failure at both sites, and returns what it logged.
+/// connection and log the failure at both sites as `variant`, and returns
+/// what it logged.
 ///
 /// The subscriber is the thread's default, at ERROR, as with `RUST_LOG`
 /// unset. The test runs on a current-thread runtime, so the broker's
 /// connection task logs on this thread.
-async fn logs_for(frame: Bytes) -> Result<String> {
+async fn logs_for(frame: Bytes, variant: &str) -> Result<String> {
     let capture = Capture::default();
     let writer = capture.clone();
 
@@ -137,9 +154,12 @@ async fn logs_for(frame: Bytes) -> Result<String> {
 
     let deadline = Instant::now() + DEADLINE;
 
-    while !both_sites(&capture.text()) {
+    while !both_sites(&capture.text(), variant) {
         if Instant::now() > deadline {
-            return Err(anyhow!("no error logged at both sites: {}", capture.text()));
+            return Err(anyhow!(
+                "no {variant} error logged at both sites: {}",
+                capture.text()
+            ));
         }
 
         sleep(Duration::from_millis(10)).await;
@@ -150,11 +170,14 @@ async fn logs_for(frame: Bytes) -> Result<String> {
     Ok(capture.text())
 }
 
-/// Asserts that the logs of the small and large request are about the same
-/// size, that no line is longer than [`MAXIMUM_LINE`], and that no line holds
-/// the request's bytes, even as a short prefix. A failure names sizes and
-/// forms only, so it doesn't print the bytes it found.
-fn assert_bounded(small: &str, large: &str) {
+/// Asserts that the `variant` lines of the small and large request are about
+/// the same size, that no line is longer than [`MAXIMUM_LINE`], and that no
+/// line holds the request's bytes, even as a short prefix. A failure names
+/// sizes and forms only, so it doesn't print the bytes it found.
+///
+/// Only the `variant` lines are compared in size, so an unrelated ERROR line
+/// that one run writes and the other doesn't can't fail the comparison.
+fn assert_bounded(small: &str, large: &str, variant: &str) {
     for (name, logs) in [("small", small), ("large", large)] {
         for line in logs.lines() {
             assert!(
@@ -172,11 +195,13 @@ fn assert_bounded(small: &str, large: &str) {
         }
     }
 
+    let small_size: usize = variant_lines(small, variant).map(str::len).sum();
+    let large_size: usize = variant_lines(large, variant).map(str::len).sum();
+
     assert!(
-        large.len().abs_diff(small.len()) <= SLACK,
-        "a {SMALL} byte field logged {} bytes, a {LARGE} byte field {}",
-        small.len(),
-        large.len()
+        large_size.abs_diff(small_size) <= SLACK,
+        "a {SMALL} byte field logged {small_size} bytes of {variant} lines, \
+         a {LARGE} byte field {large_size}"
     );
 }
 
@@ -234,18 +259,24 @@ fn unrouted(len: usize) -> Result<Bytes> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn invalid_utf8() -> Result<()> {
-    let small = logs_for(invalid_topic_name(SMALL)?).await?;
-    let large = logs_for(invalid_topic_name(LARGE)?).await?;
+    let small = logs_for(invalid_topic_name(SMALL)?, FROM_UTF8).await?;
+    let large = logs_for(invalid_topic_name(LARGE)?, FROM_UTF8).await?;
 
-    assert_bounded(&small, &large);
+    assert_bounded(&small, &large, FROM_UTF8);
     Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn unrouted_request() -> Result<()> {
-    let small = logs_for(unrouted(SMALL)?).await?;
-    let large = logs_for(unrouted(LARGE)?).await?;
+    let small = logs_for(unrouted(SMALL)?, UNKNOWN_SERVICE_FRAME).await?;
+    let large = logs_for(unrouted(LARGE)?, UNKNOWN_SERVICE_FRAME).await?;
 
-    assert_bounded(&small, &large);
+    assert_bounded(&small, &large, UNKNOWN_SERVICE_FRAME);
+
+    // The line names the API, so an operator can tell what was refused.
+    assert!(
+        large.contains("api_name: \"PushTelemetryRequest\""),
+        "the unrouted request's log doesn't name its API"
+    );
     Ok(())
 }

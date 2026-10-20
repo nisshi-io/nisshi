@@ -698,7 +698,7 @@ impl Frame {
     }
 
     /// API name
-    pub fn api_name(&self) -> &str {
+    pub fn api_name(&self) -> &'static str {
         self.body.api_name()
     }
 

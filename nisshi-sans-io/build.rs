@@ -1579,7 +1579,7 @@ fn process(messages: &[Message], include_tag: bool) -> TokenStream {
                     }
                 }
 
-                pub fn api_name(&self) -> &str {
+                pub fn api_name(&self) -> &'static str {
                     match self {
                         #(#api_names)*
                     }
