@@ -506,6 +506,33 @@ where
     Ok(())
 }
 
+/// Kafka accepts a `retention.ms` with a `+` or white space around the number. Maintenance must
+/// apply it as the number, and not keep every record as it does for a value it can't read.
+pub async fn retention_ms_with_a_plus_sign_expires_records<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[DELETE_POLICY, ("retention.ms", "+600000\n")],
+    )
+    .await?;
+    produce_records_before_maintenance(&broker, &extensions, topic).await?;
+
+    maintain_an_hour_later(&sc).await?;
+
+    assert_eq!(
+        Some(RECORDS_BEFORE_MAINTENANCE),
+        earliest_offset_after_maintenance(&broker, &extensions, topic).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -594,6 +621,12 @@ macro_rules! backend {
                 .await
             }
 
+            #[tokio::test]
+            async fn retention_ms_with_a_plus_sign_expires_records() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_ms_with_a_plus_sign_expires_records(storage_container().await?)
+                    .await
+            }
         }
     };
 }

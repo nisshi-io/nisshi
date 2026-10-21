@@ -556,31 +556,30 @@ async fn validate_only(storage: impl Storage + Clone) -> Result<()> {
     Ok(())
 }
 
-/// A `retention.ms` that Kafka rejects must not be stored: maintenance reads the value, and a
-/// value below -1 or one that isn't a number makes it delete every record or fail for every topic.
-/// Kafka checks the value before it checks that the topic exists, so a missing topic gets the same
-/// error.
-async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<()> {
+/// A `retention.ms` or `retention.bytes` that Kafka rejects must not be stored: maintenance reads
+/// the value, and a `retention.ms` below -1 or a value that isn't a long makes it delete every
+/// record or fail for every topic. Kafka checks the value before it checks that the topic exists,
+/// so a missing topic gets the same error.
+async fn invalid_retention_config_rejected(storage: impl Storage + Clone) -> Result<()> {
     let name = &alphanumeric_string(15)[..];
     create_topic(storage.clone(), name).await?;
     let missing = &alphanumeric_string(15)[..];
 
-    for (value, reason) in [
-        ("-2", "Value must be at least -1"),
-        ("abc", "Not a number of type LONG"),
+    for (key, value, reason) in [
+        ("retention.ms", "-2", "Value must be at least -1"),
+        ("retention.ms", "abc", "Not a number of type LONG"),
+        (
+            "retention.bytes",
+            "99999999999999999999",
+            "Not a number of type LONG",
+        ),
     ] {
         for validate_only in [false, true] {
             let response = alter(
                 storage.clone(),
                 [
-                    topic(
-                        name,
-                        [config(OpType::Set.into(), "retention.ms", Some(value))],
-                    ),
-                    topic(
-                        missing,
-                        [config(OpType::Set.into(), "retention.ms", Some(value))],
-                    ),
+                    topic(name, [config(OpType::Set.into(), key, Some(value))]),
+                    topic(missing, [config(OpType::Set.into(), key, Some(value))]),
                 ],
                 validate_only,
             )
@@ -589,21 +588,48 @@ async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<
             assert_eq!(
                 vec![ErrorCode::InvalidConfig, ErrorCode::InvalidConfig],
                 error_codes(&response)?,
-                "{value}, validate_only = {validate_only}"
+                "{key}={value}, validate_only = {validate_only}"
             );
             assert_eq!(
-                Some(
-                    format!("Invalid value {value} for configuration retention.ms: {reason}")
-                        .as_str()
-                ),
+                Some(format!("Invalid value {value} for configuration {key}: {reason}").as_str()),
                 response.responses.as_deref().unwrap_or_default()[0]
                     .error_message
                     .as_deref()
             );
         }
+
+        assert_eq!(None, config_value(storage.clone(), name, key).await?);
     }
 
-    assert_eq!(None, config_value(storage, name, "retention.ms").await?);
+    Ok(())
+}
+
+/// Kafka accepts a `retention.ms` with white space or a `+` around the number, but maintenance
+/// reads only a plain number, and reads anything else as no limit. The broker must store the plain
+/// number, or the topic keeps every record.
+async fn retention_ms_is_stored_as_a_plain_number(storage: impl Storage + Clone) -> Result<()> {
+    let name = &alphanumeric_string(15)[..];
+    create_topic(storage.clone(), name).await?;
+
+    let response = alter(
+        storage.clone(),
+        [topic(
+            name,
+            [config(
+                OpType::Set.into(),
+                "retention.ms",
+                Some("+600000\n"),
+            )],
+        )],
+        false,
+    )
+    .await?;
+
+    assert_eq!(vec![ErrorCode::None], error_codes(&response)?);
+    assert_eq!(
+        Some("600000".to_owned()),
+        config_value(storage, name, "retention.ms").await?
+    );
 
     Ok(())
 }
@@ -647,7 +673,8 @@ mod in_memory {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
-        invalid_retention_ms_rejected,
+        invalid_retention_config_rejected,
+        retention_ms_is_stored_as_a_plain_number,
     );
 }
 
@@ -672,7 +699,8 @@ mod lite {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
-        invalid_retention_ms_rejected,
+        invalid_retention_config_rejected,
+        retention_ms_is_stored_as_a_plain_number,
     );
 }
 
@@ -697,7 +725,8 @@ mod slatedb {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
-        invalid_retention_ms_rejected,
+        invalid_retention_config_rejected,
+        retention_ms_is_stored_as_a_plain_number,
     );
 }
 
@@ -722,6 +751,7 @@ mod pg {
         multiple_changes,
         storage_rolls_back_failed_resource,
         concurrent_appends,
-        invalid_retention_ms_rejected,
+        invalid_retention_config_rejected,
+        retention_ms_is_stored_as_a_plain_number,
     );
 }

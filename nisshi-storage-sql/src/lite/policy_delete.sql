@@ -28,9 +28,9 @@ deletion as (
     -- A topic without a cleanup.policy has Kafka's default policy, delete.
     and coalesce(cp.value, 'delete') like '%delete%'
     -- A negative retention.ms keeps every record, because Kafka reads any negative value as no
-    -- limit. The broker rejects a value below -1, but a topic created before the broker checked the
-    -- value can hold one. The broker also rejects a retention.ms that isn't a whole number, and a
-    -- stored one keeps every record, instead of being cast to 0 and deleting every record.
+    -- limit. The broker rejects a value below -1, and stores any other as a plain number, but a
+    -- topic created before the broker checked the value can hold any text. A value that isn't a
+    -- plain number keeps every record, instead of being cast to 0 and deleting every record.
     and case
         when rt.value is null then 1
         when (trim(rt.value) glob '[0-9]*' or trim(rt.value) glob '-[0-9]*')

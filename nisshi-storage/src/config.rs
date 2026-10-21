@@ -22,28 +22,36 @@ use nisshi_sans_io::{ConfigResource, ErrorCode, OpType};
 
 use crate::{Error, Result};
 
-/// Checks `value` against Kafka's rules for the topic configuration `key`, and returns why Kafka
-/// rejects it, in the message that Kafka sends with [`ErrorCode::InvalidConfig`].
+/// Checks `value` against Kafka's rules for the topic configuration `key`, and returns the value
+/// to store, or why Kafka rejects it, in the message that Kafka sends with
+/// [`ErrorCode::InvalidConfig`].
 ///
 /// The broker checks only the configurations below, with the rules that Kafka defines for them in
 /// [`LogConfig`], and stores the value of any other configuration without a check. The storage
 /// engines read these values in their maintenance queries, so a value that doesn't parse can stop
 /// maintenance for every topic.
 ///
-/// [`LogConfig`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L279
-pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<(), String> {
-    let minimum: i64 = match key {
-        "retention.ms" => -1,
-        _ => return Ok(()),
+/// The value to store for a checked configuration is the number that Kafka parsed, written without
+/// the white space or the `+` that Kafka accepts around it, so that the maintenance queries read
+/// exactly the values that the broker accepts.
+///
+/// [`LogConfig`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L277-L279
+pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    let minimum: Option<i64> = match key {
+        "retention.bytes" => None,
+        "retention.ms" => Some(-1),
+        _ => return Ok(value.map(ToOwned::to_owned)),
     };
     let Some(value) = value else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Kafka trims the value before it parses it, in `ConfigDef.parseType`.
     let reason = match value.trim().parse::<i64>() {
-        Ok(number) if number >= minimum => return Ok(()),
-        Ok(_) => format!("Value must be at least {minimum}"),
+        Ok(number) => match minimum {
+            Some(minimum) if number < minimum => format!("Value must be at least {minimum}"),
+            _ => return Ok(Some(number.to_string())),
+        },
         Err(_) => "Not a number of type LONG".to_owned(),
     };
 
@@ -260,8 +268,24 @@ mod tests {
 
     #[test]
     fn retention_ms_accepts_minus_1_and_above() {
-        for value in ["-1", "0", "2592000000", " 600000 "] {
-            assert_eq!(Ok(()), validate_topic_config("retention.ms", Some(value)));
+        for value in ["-1", "0", "2592000000"] {
+            assert_eq!(
+                Ok(Some(value.to_owned())),
+                validate_topic_config("retention.ms", Some(value))
+            );
+        }
+    }
+
+    /// The maintenance queries read only a plain number, so a value that Kafka accepts with white
+    /// space or a `+` around it must be stored as that plain number. Stored as sent, the queries
+    /// read it as no limit, and the topic keeps every record.
+    #[test]
+    fn retention_ms_is_stored_as_the_number_that_kafka_parses() {
+        for value in [" 600000 ", "+600000", "600000\n", "\t600000"] {
+            assert_eq!(
+                Ok(Some("600000".to_owned())),
+                validate_topic_config("retention.ms", Some(value))
+            );
         }
     }
 
@@ -286,6 +310,39 @@ mod tests {
                 validate_topic_config("retention.ms", Some(value))
             );
         }
+    }
+
+    /// Kafka sets no minimum for `retention.bytes`, and reads any negative value as no limit.
+    #[test]
+    fn retention_bytes_accepts_any_long() {
+        for value in ["-2", "-1", "0", "1073741824", "9223372036854775807"] {
+            assert_eq!(
+                Ok(Some(value.to_owned())),
+                validate_topic_config("retention.bytes", Some(value))
+            );
+        }
+    }
+
+    /// A `retention.bytes` that doesn't fit in a long fails the PostgreSQL maintenance statement,
+    /// which stops maintenance for every topic, so the broker must reject it as Kafka does.
+    #[test]
+    fn retention_bytes_rejects_a_value_that_is_not_a_long() {
+        for value in ["abc", "1.5", "99999999999999999999"] {
+            assert_eq!(
+                Err(format!(
+                    "Invalid value {value} for configuration retention.bytes: Not a number of type LONG"
+                )),
+                validate_topic_config("retention.bytes", Some(value))
+            );
+        }
+    }
+
+    #[test]
+    fn other_configs_are_stored_as_sent() {
+        assert_eq!(
+            Ok(Some(" compact ".to_owned())),
+            validate_topic_config("cleanup.policy", Some(" compact "))
+        );
     }
 
     #[test]

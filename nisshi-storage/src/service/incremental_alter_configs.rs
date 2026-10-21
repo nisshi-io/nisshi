@@ -191,7 +191,7 @@ where
 
         let mut responses = vec![];
 
-        for resource in resources {
+        for mut resource in resources {
             let rejection =
                 if duplicates.contains(&(resource.resource_type, resource.resource_name.clone())) {
                     Some((
@@ -199,7 +199,7 @@ where
                         "Each resource must appear at most once.".into(),
                     ))
                 } else {
-                    validate(&resource)
+                    validate(&mut resource)
                 };
 
             let response = match rejection {
@@ -281,12 +281,13 @@ where
 /// Returns the error for a `resource` that Kafka rejects before it reads or changes any
 /// configuration, checked in the order of Kafka's [`ConfigAdminManager.preprocess`] and
 /// [`incrementalAlterConfigResource`], then the value of each topic configuration, which Kafka
-/// checks in [`validateAlterConfig`] before it checks that the topic exists.
+/// checks in [`validateAlterConfig`] before it checks that the topic exists. Each checked value
+/// that `SET` stores is replaced with the number that Kafka parses.
 ///
 /// [`ConfigAdminManager.preprocess`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigAdminManager.scala#L105-L165
 /// [`incrementalAlterConfigResource`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L237
 /// [`validateAlterConfig`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L298-L301
-fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
+fn validate(resource: &mut AlterConfigsResource) -> Option<(ErrorCode, String)> {
     let configs = resource.configs.as_deref().unwrap_or_default();
     let is_topic = ConfigResource::from(resource.resource_type) == ConfigResource::Topic;
 
@@ -316,7 +317,7 @@ fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
         ));
     }
 
-    for config in configs {
+    for config in resource.configs.iter_mut().flatten() {
         // Kafka rejects an unknown operation with INVALID_REQUEST only on a
         // broker resource ([ConfigAdminManager.scala#L176-L179]). On a
         // topic resource its controller looks the operation up as null
@@ -360,11 +361,11 @@ fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
             return Some((ErrorCode::InvalidConfig, reason));
         }
 
-        if is_topic
-            && op == OpType::Set
-            && let Err(message) = validate_topic_config(&config.name, config.value.as_deref())
-        {
-            return Some((ErrorCode::InvalidConfig, message));
+        if is_topic && op == OpType::Set {
+            match validate_topic_config(&config.name, config.value.as_deref()) {
+                Ok(value) => config.value = value,
+                Err(message) => return Some((ErrorCode::InvalidConfig, message)),
+            }
         }
     }
 
