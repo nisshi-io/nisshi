@@ -2963,6 +2963,9 @@ impl Storage for DynoStore {
 
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
         let location = self.group_consumers_prefix();
+
+        // `list_with_delimiter` returns a group's committed offsets as a common prefix and its
+        // state as a `.json` object. A group with no committed offset has only the state object.
         let list_result = self
             .object_store
             .list_with_delimiter(Some(&location))
@@ -2970,27 +2973,32 @@ impl Storage for DynoStore {
             .inspect(|list_result| debug!(?list_result))
             .inspect_err(|error| error!(?error, cluster = self.cluster))?;
 
-        let mut listed_groups = vec![];
+        let offsets_segments = list_result
+            .common_prefixes
+            .iter()
+            .filter_map(Path::filename);
+        let state_segments = list_result
+            .objects
+            .iter()
+            .filter_map(|object| object.location.filename()?.strip_suffix(".json"));
 
-        for prefix in list_result.common_prefixes {
-            let Some(segment) = prefix.parts().next_back() else {
-                continue;
-            };
+        // The set holds each group that either list names. A group that has committed has both a
+        // common prefix and a state object, and the set keeps one entry for its id.
+        let group_ids = offsets_segments
+            .chain(state_segments)
+            .filter_map(decode_group_segment)
+            .collect::<BTreeSet<_>>();
 
-            let Some(group_id) = decode_group_segment(segment.as_ref()) else {
-                continue;
-            };
-
-            listed_groups.push(
+        Ok(group_ids
+            .into_iter()
+            .map(|group_id| {
                 ListedGroup::default()
                     .group_id(group_id)
                     .protocol_type("consumer".into())
                     .group_state(Some("Unknown".into()))
-                    .group_type(Some("classic".into())),
-            );
-        }
-
-        Ok(listed_groups)
+                    .group_type(Some("classic".into()))
+            })
+            .collect())
     }
 
     async fn delete_groups(

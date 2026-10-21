@@ -261,10 +261,6 @@ fn delete_removes_an_empty_group() {
 /// offsets of consumers that are running. The broker must answer `DeleteGroups` for such a group
 /// with `NON_EMPTY_GROUP`, and keep the group.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "ListGroups leaves out a group without committed offsets (#961)"
-)]
 fn delete_refuses_a_group_with_members() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);
