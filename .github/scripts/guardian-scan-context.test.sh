@@ -117,6 +117,28 @@ expect "bypass" mode trunk
 expect "bypass" enforce false
 expect "bypass" fossa_mode REPORT
 
+# --- Case 5a: FOSSA_LICENSING_BLOCK turns off only the licensing block ---------
+# Exactly "false" makes licensing REPORT on trunk while enforce (the Guardian
+# gate) stays on; any other value fails closed.
+run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
+    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED="" FOSSA_LICENSING_BLOCK=false
+expect "licensing-off" mode trunk
+expect "licensing-off" enforce true
+expect "licensing-off" fossa_mode REPORT
+case "$STDOUT" in
+  *"::warning::FOSSA licensing guard is REPORT-only"*) pass "licensing-off: warns" ;;
+  *) fail "licensing-off: warns" "stdout=[$STDOUT]" ;;
+esac
+for value in true no FALSE; do
+  run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
+      GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED="" FOSSA_LICENSING_BLOCK="$value"
+  expect "licensing-$value" fossa_mode BLOCK
+done
+run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+    GITHUB_REF=refs/pull/7/merge IS_FORK=false FAIL_ON_BLOCKED="" FOSSA_LICENSING_BLOCK=false
+expect "licensing-off-pr" enforce false
+expect "licensing-off-pr" fossa_mode REPORT
+
 # --- Case 6: ref precedence - explicit input wins, else github.ref -------------
 run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main \
     GIT_REF_INPUT=refs/tags/v9.9.9 IS_FORK=false FAIL_ON_BLOCKED=""

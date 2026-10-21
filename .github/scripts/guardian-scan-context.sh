@@ -19,6 +19,9 @@
 #   GIT_REF_INPUT       workflow_dispatch / workflow_call `git_ref` input
 #   FULL_VERSION_INPUT  workflow_call `product_full_version` input
 #   FAIL_ON_BLOCKED     workflow_call `fail_on_blocked` input ("false" bypasses)
+#   FOSSA_LICENSING_BLOCK  repository variable; "false" makes the FOSSA
+#                       licensing guard report-only on trunk, leaving the
+#                       Guardian gate enforced. Any other value, or unset, blocks.
 #   IS_FORK             "true" for a PR from a fork
 #   GITHUB_OUTPUT       file the outputs are appended to
 #
@@ -86,12 +89,20 @@ fi
 # Enforce (block) only on trunk and only when not bypassed.
 ENFORCE="false"
 if [ "$IS_TRUNK" = "true" ] && [ "${FAIL_ON_BLOCKED:-}" != "false" ]; then ENFORCE="true"; fi
-# FOSSA licensing guard: BLOCK when enforcing, else REPORT.
-if [ "$ENFORCE" = "true" ]; then FOSSA_MODE="BLOCK"; else FOSSA_MODE="REPORT"; fi
+# FOSSA licensing guard: BLOCK when enforcing, else REPORT. Only an exact
+# "false" turns the block off, so a typo in the variable fails closed.
+FOSSA_MODE="REPORT"
+if [ "$ENFORCE" = "true" ]; then
+  if [ "${FOSSA_LICENSING_BLOCK:-}" = "false" ]; then
+    echo "::warning::FOSSA licensing guard is REPORT-only: repository variable FOSSA_LICENSING_BLOCK=false"
+  else
+    FOSSA_MODE="BLOCK"
+  fi
+fi
 
 # The line an operator needs when asking "which mode did this run take?" -
 # $GITHUB_OUTPUT is never displayed in the run log.
-echo "Resolved: mode=$MODE event=${EVENT_NAME:-} is_fork=${IS_FORK:-false} enforce=$ENFORCE fossa_branch=$FOSSA_BRANCH"
+echo "Resolved: mode=$MODE event=${EVENT_NAME:-} is_fork=${IS_FORK:-false} enforce=$ENFORCE fossa_mode=$FOSSA_MODE fossa_licensing_block=${FOSSA_LICENSING_BLOCK:-} fossa_branch=$FOSSA_BRANCH"
 
 # A newline in any value would let it inject extra keys into $GITHUB_OUTPUT.
 emit() {

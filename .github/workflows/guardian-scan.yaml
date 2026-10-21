@@ -106,6 +106,7 @@ jobs:
           GIT_REF_INPUT: ${{ inputs.git_ref }}
           FULL_VERSION_INPUT: ${{ inputs.product_full_version }}
           FAIL_ON_BLOCKED: ${{ inputs.fail_on_blocked }}
+          FOSSA_LICENSING_BLOCK: ${{ vars.FOSSA_LICENSING_BLOCK }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: .github/scripts/guardian-scan-context.sh
 
@@ -196,6 +197,10 @@ jobs:
           # Upload only on trunk (env flag), never on a PR.
           guardian_url: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_URL || '' }}
           guardian_token: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_API_TOKEN || '' }}
+      # Blocks on trunk only. To make it report-only while a license issue is
+      # waived in FOSSA (the Guardian gate stays on):
+      #   gh variable set FOSSA_LICENSING_BLOCK --body false
+      # and `gh variable delete FOSSA_LICENSING_BLOCK` to block again.
       - name: FOSSA licensing guard
         uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
         with:
