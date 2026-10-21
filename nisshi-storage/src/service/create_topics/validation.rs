@@ -220,14 +220,19 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
     }
 
     // Check configs before the assignments, the replication factor and the partition count, like
-    // Kafka.
-    if let Some(message) = topic
-        .configs
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .find_map(|config| validate_topic_config(&config.name, config.value.as_deref()).err())
-    {
+    // Kafka, and store each checked value as the number that it parses.
+    let mut rejection = None;
+    for config in topic.configs.iter_mut().flatten() {
+        match validate_topic_config(&config.name, config.value.as_deref()) {
+            Ok(value) => config.value = value,
+            Err(message) => {
+                rejection = Some(message);
+                break;
+            }
+        }
+    }
+
+    if let Some(message) = rejection {
         return ValidatedTopic::Rejected(
             error_result(
                 name,

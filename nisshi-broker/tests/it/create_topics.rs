@@ -821,10 +821,10 @@ async fn mixed_batch_partial_success_replication_factor(
     Ok(())
 }
 
-/// A topic must not be created with a `retention.ms` that Kafka rejects: maintenance reads the
-/// value, and a value below -1 or one that isn't a number makes it delete every record or fail for
-/// every topic.
-async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+/// A topic must not be created with a `retention.ms` or `retention.bytes` that Kafka rejects:
+/// maintenance reads the value, and a `retention.ms` below -1 or a value that isn't a long makes it
+/// delete every record or fail for every topic.
+async fn invalid_retention_config_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
     });
@@ -833,9 +833,14 @@ async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<
     };
 
     for validate_only in [false, true] {
-        for (value, reason) in [
-            ("-2", "Value must be at least -1"),
-            ("abc", "Not a number of type LONG"),
+        for (key, value, reason) in [
+            ("retention.ms", "-2", "Value must be at least -1"),
+            ("retention.ms", "abc", "Not a number of type LONG"),
+            (
+                "retention.bytes",
+                "99999999999999999999",
+                "Not a number of type LONG",
+            ),
         ] {
             let name = alphanumeric_string(15);
 
@@ -850,7 +855,7 @@ async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<
                                 .assignments(Some([].into()))
                                 .configs(Some(vec![
                                     CreatableTopicConfig::default()
-                                        .name("retention.ms".into())
+                                        .name(key.into())
                                         .value(Some(value.into())),
                                 ])),
                         ]))
@@ -864,13 +869,10 @@ async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<
             assert_eq!(
                 ErrorCode::InvalidConfig,
                 ErrorCode::try_from(topics[0].error_code)?,
-                "{value}, validate_only = {validate_only}"
+                "{key}={value}, validate_only = {validate_only}"
             );
             assert_eq!(
-                Some(
-                    format!("Invalid value {value} for configuration retention.ms: {reason}")
-                        .as_str()
-                ),
+                Some(format!("Invalid value {value} for configuration {key}: {reason}").as_str()),
                 topics[0].error_message.as_deref()
             );
 
@@ -886,7 +888,7 @@ async fn invalid_retention_ms_rejected(storage: impl Storage + Clone) -> Result<
             assert_eq!(
                 ErrorCode::UnknownTopicOrPartition,
                 ErrorCode::try_from(describe_topics[0].error_code)?,
-                "{value}, validate_only = {validate_only} must never have reached storage"
+                "{key}={value}, validate_only = {validate_only} must never have reached storage"
             );
         }
     }
@@ -1106,7 +1108,7 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn invalid_retention_ms_rejected() -> Result<()> {
+    async fn invalid_retention_config_rejected() -> Result<()> {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
@@ -1114,7 +1116,7 @@ mod in_memory {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::invalid_retention_ms_rejected(storage).await?;
+        super::invalid_retention_config_rejected(storage).await?;
 
         Ok(())
     }
@@ -1264,7 +1266,7 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn invalid_retention_ms_rejected() -> Result<()> {
+    async fn invalid_retention_config_rejected() -> Result<()> {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
@@ -1272,7 +1274,7 @@ mod lite {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::invalid_retention_ms_rejected(storage).await?;
+        super::invalid_retention_config_rejected(storage).await?;
 
         Ok(())
     }
@@ -1422,7 +1424,7 @@ mod slatedb {
     }
 
     #[tokio::test]
-    async fn invalid_retention_ms_rejected() -> Result<()> {
+    async fn invalid_retention_config_rejected() -> Result<()> {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
@@ -1430,7 +1432,7 @@ mod slatedb {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::invalid_retention_ms_rejected(storage).await?;
+        super::invalid_retention_config_rejected(storage).await?;
 
         Ok(())
     }
@@ -1580,7 +1582,7 @@ mod pg {
     }
 
     #[tokio::test]
-    async fn invalid_retention_ms_rejected() -> Result<()> {
+    async fn invalid_retention_config_rejected() -> Result<()> {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
@@ -1588,7 +1590,7 @@ mod pg {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::invalid_retention_ms_rejected(storage).await?;
+        super::invalid_retention_config_rejected(storage).await?;
 
         Ok(())
     }

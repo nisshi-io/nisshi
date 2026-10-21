@@ -103,6 +103,40 @@ async fn create_topic(
     Ok(())
 }
 
+/// Creates a topic through [`Storage::create_topic`], which stores `configs` without the checks
+/// that the broker makes, as a topic created before the broker checked its configuration holds
+/// them.
+async fn create_topic_without_validation<G>(
+    sc: &G,
+    name: &str,
+    configs: &[(&str, &str)],
+) -> Result<()>
+where
+    G: Storage,
+{
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(name.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some(
+                    configs
+                        .iter()
+                        .map(|(name, value)| {
+                            CreatableTopicConfig::default()
+                                .name((*name).into())
+                                .value(Some((*value).into()))
+                        })
+                        .collect(),
+                )),
+            false,
+        )
+        .await?;
+    Ok(())
+}
+
 async fn produce(
     broker: &Broker,
     extensions: &Extensions,
@@ -355,6 +389,60 @@ where
     Ok(())
 }
 
+/// A `retention.bytes` that doesn't fit in a long must not stop maintenance trimming another
+/// topic, and must not trim its own topic. The broker rejects such a value, so only a topic created
+/// before the broker checked the value holds it. A broker that fails on it stops maintenance for
+/// every topic, so storage grows until it is full.
+pub async fn retention_bytes_stored_value_that_is_not_a_long_does_not_stop_retention<G>(
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let not_a_long_topic = &alphanumeric_string(15)[..];
+    create_topic_without_validation(
+        &sc,
+        not_a_long_topic,
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.bytes", "99999999999999999999"),
+        ],
+    )
+    .await?;
+    let capped_topic = &alphanumeric_string(15)[..];
+    create_topic(
+        &broker,
+        &extensions,
+        capped_topic,
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.bytes", &RETENTION_BYTES.to_string()),
+        ],
+    )
+    .await?;
+
+    for topic in [not_a_long_topic, capped_topic] {
+        for n in 0..PRODUCED {
+            let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+            _ = produce(&broker, &extensions, topic, value).await?;
+        }
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(PRODUCED - KEPT),
+        list_offset(&broker, &extensions, capped_topic, ListOffset::Earliest).await?
+    );
+    assert_eq!(
+        Some(0),
+        list_offset(&broker, &extensions, not_a_long_topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -410,6 +498,15 @@ macro_rules! backend {
                 let _guard = init_tracing()?;
                 super::retention_bytes_compacted_topic_keeps_everything(storage_container().await?)
                     .await
+            }
+
+            #[tokio::test]
+            async fn stored_value_that_is_not_a_long_does_not_stop_retention() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_stored_value_that_is_not_a_long_does_not_stop_retention(
+                    storage_container().await?,
+                )
+                .await
             }
         }
     };
