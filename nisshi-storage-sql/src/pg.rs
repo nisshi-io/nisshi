@@ -3109,7 +3109,7 @@ impl Postgres {
 
     #[instrument(skip(self), ret)]
     async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
-        let retention_secs = i32::try_from(Duration::from_hours(7 * 24).as_secs())?;
+        let retention_secs = i64::try_from(Duration::from_hours(7 * 24).as_secs())?;
 
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;

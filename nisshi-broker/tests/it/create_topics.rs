@@ -16,7 +16,7 @@ use crate::common::{alphanumeric_string, init_tracing};
 use nisshi_broker::Error;
 use nisshi_sans_io::{
     CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID, RequestInput,
-    create_topics_request::{CreatableReplicaAssignment, CreatableTopic},
+    create_topics_request::{CreatableReplicaAssignment, CreatableTopic, CreatableTopicConfig},
     describe_topic_partitions_request::TopicRequest,
 };
 use nisshi_storage::{
@@ -821,6 +821,125 @@ async fn mixed_batch_partial_success_replication_factor(
     Ok(())
 }
 
+/// A topic must not be created with a `retention.ms` or `retention.bytes` that Kafka rejects:
+/// maintenance reads the value, and a `retention.ms` below -1 or a value that isn't a long makes it
+/// delete every record or fail for every topic.
+async fn invalid_retention_config_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+        storage: storage.clone(),
+    });
+    let describe = DescribeTopicPartitionsService {
+        storage: storage.clone(),
+    };
+
+    for validate_only in [false, true] {
+        for (key, value, reason) in [
+            ("retention.ms", "-2", "Value must be at least -1"),
+            ("retention.ms", "abc", "Not a number of type LONG"),
+            (
+                "retention.bytes",
+                "99999999999999999999",
+                "Not a number of type LONG",
+            ),
+        ] {
+            let name = alphanumeric_string(15);
+
+            let response = service
+                .serve(RequestInput {
+                    request: CreateTopicsRequest::default()
+                        .topics(Some(vec![
+                            CreatableTopic::default()
+                                .name(name.clone())
+                                .num_partitions(1)
+                                .replication_factor(1)
+                                .assignments(Some([].into()))
+                                .configs(Some(vec![
+                                    CreatableTopicConfig::default()
+                                        .name(key.into())
+                                        .value(Some(value.into())),
+                                ])),
+                        ]))
+                        .validate_only(Some(validate_only)),
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            let topics = response.topics.unwrap_or_default();
+            assert_eq!(1, topics.len());
+            assert_eq!(
+                ErrorCode::InvalidConfig,
+                ErrorCode::try_from(topics[0].error_code)?,
+                "{key}={value}, validate_only = {validate_only}"
+            );
+            assert_eq!(
+                Some(format!("Invalid value {value} for configuration {key}: {reason}").as_str()),
+                topics[0].error_message.as_deref()
+            );
+
+            let describe_response = describe
+                .serve(RequestInput {
+                    request: DescribeTopicPartitionsRequest::default()
+                        .topics(Some([TopicRequest::default().name(name.clone())].into())),
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            let describe_topics = describe_response.topics.unwrap_or_default();
+            assert_eq!(
+                ErrorCode::UnknownTopicOrPartition,
+                ErrorCode::try_from(describe_topics[0].error_code)?,
+                "{key}={value}, validate_only = {validate_only} must never have reached storage"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Kafka answers `TOPIC_ALREADY_EXISTS` for an existing topic before it checks the topic's
+/// configs. A client that treats that answer as success, and repeats a create whose configs the
+/// broker rejects, must not fail.
+async fn existing_topic_with_invalid_config_already_exists(
+    storage: impl Storage + Clone,
+) -> Result<(), Error> {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
+    let name = alphanumeric_string(15);
+
+    for (configs, expected) in [
+        (vec![], ErrorCode::None),
+        (
+            vec![
+                CreatableTopicConfig::default()
+                    .name("retention.ms".into())
+                    .value(Some("-2".into())),
+            ],
+            ErrorCode::TopicAlreadyExists,
+        ),
+    ] {
+        let response = service
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .topics(Some(vec![
+                        CreatableTopic::default()
+                            .name(name.clone())
+                            .num_partitions(1)
+                            .replication_factor(1)
+                            .assignments(Some([].into()))
+                            .configs(Some(configs)),
+                    ]))
+                    .validate_only(Some(false)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(expected, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use nisshi_broker::Result;
@@ -1031,6 +1150,34 @@ mod in_memory {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -1172,6 +1319,34 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success_replication_factor(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
 
         Ok(())
     }
@@ -1319,6 +1494,34 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -1460,6 +1663,34 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success_replication_factor(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
 
         Ok(())
     }
