@@ -22,9 +22,8 @@ use nisshi_sans_io::{ConfigResource, ErrorCode, OpType};
 
 use crate::{Error, Result};
 
-/// Checks `value` against Kafka's rules for the topic configuration `key`, and returns the value
-/// to store, or why Kafka rejects it, in the message that Kafka sends with
-/// [`ErrorCode::InvalidConfig`].
+/// Checks `value` against Kafka's rules for the topic configuration `key`. Returns the value to
+/// store, or Kafka's [`ErrorCode::InvalidConfig`] message when Kafka rejects it.
 ///
 /// The broker checks only the configurations below, with the rules that Kafka defines for them in
 /// [`LogConfig`], and stores the value of any other configuration without a check. The storage
