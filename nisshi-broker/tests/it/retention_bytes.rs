@@ -103,9 +103,9 @@ async fn create_topic(
     Ok(())
 }
 
-/// Creates a topic through [`Storage::create_topic`], which stores `configs` without the checks
-/// that the broker makes, as a topic created before the broker checked its configuration holds
-/// them.
+/// Creates a topic with `configs` through [`Storage::create_topic`], which stores them without the
+/// broker's checks. A test uses it to set up a topic that an earlier version of the broker created,
+/// with a config value that the broker now rejects.
 async fn create_topic_without_validation<G>(
     sc: &G,
     name: &str,
