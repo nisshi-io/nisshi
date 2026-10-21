@@ -19,8 +19,8 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    Ack, ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
-    SuppressResponseExtension, TimestampType,
+    Ack, ApiKey, BatchAttribute, ConfigResource, ErrorCode, ProduceRequest, ProduceResponse,
+    RequestInput, SuppressResponseExtension, TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse, TopicProduceResponse},
     record::{deflated, inflated},
@@ -116,6 +116,12 @@ const TIMESTAMP_AFTER_MAX_MS: i64 = 3_600_000;
 /// Kafka's own `log.message.timestamp.before.max.ms` default
 /// (`Long.MAX_VALUE`): no lower bound.
 const TIMESTAMP_BEFORE_MAX_MS: i64 = i64::MAX;
+
+/// The topic configuration that selects the clock of each record's
+/// timestamp: `CreateTime` keeps the producer's timestamp, and
+/// `LogAppendTime` replaces it with the broker's clock when the broker stores
+/// the batch.
+const MESSAGE_TIMESTAMP_TYPE: &str = "message.timestamp.type";
 
 /// The message sent with `CORRUPT_MESSAGE` for a batch whose CRC does not
 /// match its contents.
@@ -493,11 +499,61 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
         actual_max = actual_max.max(timestamp);
     }
 
-    if actual_max == batch.max_timestamp {
+    // The topic's `CreateTime` overrides a `LogAppendTime` bit that the
+    // producer set, as in Kafka.
+    if actual_max == batch.max_timestamp
+        && TimestampType::from(batch.attributes) == TimestampType::CreateTime
+    {
         return Ok(None);
     }
 
-    match batch.set_timestamps(batch.base_timestamp, actual_max) {
+    set_timestamps(
+        batch,
+        TimestampType::CreateTime,
+        batch.base_timestamp,
+        actual_max,
+    )
+}
+
+/// Stamps a batch for a `LogAppendTime` topic with the broker's clock: sets
+/// the batch's timestamp type to `LogAppendTime` and its `max_timestamp` to
+/// `now`. A consumer reads `max_timestamp` as the timestamp of each record of
+/// such a batch. Kafka's `LogValidator` keeps `base_timestamp`, and so does
+/// this function ([LogValidator.java#L278-L282]).
+///
+/// The record timestamps are not checked against the window that
+/// [`TIMESTAMP_BEFORE_MAX_MS`] and [`TIMESTAMP_AFTER_MAX_MS`] set, because a
+/// consumer does not read them. The batch still decodes through
+/// [`inflate_produced`], so that a batch that does not decode is rejected as
+/// on a `CreateTime` topic.
+///
+/// Returns `Ok(Some(_))` for a batch that does not decode, or whose CRC does
+/// not match its contents. `Err` is a broker-side failure.
+///
+/// [LogValidator.java#L278-L282]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L278-L282
+fn stamp_log_append_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<Rejection>> {
+    if let Err(error) = inflate_produced(&*batch) {
+        return Ok(Some(undecodable_batch(&error)));
+    }
+
+    set_timestamps(
+        batch,
+        TimestampType::LogAppendTime,
+        batch.base_timestamp,
+        now,
+    )
+}
+
+/// Sets the timestamp type and the timestamps of `batch` with
+/// [`deflated::Batch::set_timestamps`], and maps a CRC mismatch to the
+/// rejection that [`rejection`] gives it.
+fn set_timestamps(
+    batch: &mut deflated::Batch,
+    timestamp_type: TimestampType,
+    base_timestamp: i64,
+    max_timestamp: i64,
+) -> Result<Option<Rejection>> {
+    match batch.set_timestamps(timestamp_type, base_timestamp, max_timestamp) {
         Ok(()) => Ok(None),
         Err(nisshi_sans_io::Error::ApiError(ErrorCode::CorruptMessage)) => {
             Ok(Some(corrupt_batch()))
@@ -506,19 +562,25 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
     }
 }
 
-/// Runs [`rewrite_create_time`] on Tokio's blocking thread pool, through
-/// [`offload`], and hands the batch back with the outcome.
+/// Validates the timestamps of a client batch for a topic whose
+/// `message.timestamp.type` is `timestamp_type`, with [`rewrite_create_time`]
+/// or [`stamp_log_append_time`], and hands the batch back with the outcome.
 ///
-/// The batch moves into the closure and back out, because `offload` needs a
-/// `'static` closure. A clone would only add a handle to the same record
-/// bytes, so moving the batch keeps one owner.
-async fn rewrite_create_time_offloaded(
+/// Both functions decode the batch, so the work runs on Tokio's blocking
+/// thread pool, through [`offload`]. The batch moves into the closure and back
+/// out, because `offload` needs a `'static` closure. A clone would only add a
+/// handle to the same record bytes, so moving the batch keeps one owner.
+async fn validate_timestamps_offloaded(
     batch: deflated::Batch,
+    timestamp_type: TimestampType,
     now: i64,
 ) -> Result<(deflated::Batch, Option<Rejection>)> {
     offload(move || {
         let mut batch = batch;
-        let rejection = rewrite_create_time(&mut batch, now)?;
+        let rejection = match timestamp_type {
+            TimestampType::CreateTime => rewrite_create_time(&mut batch, now)?,
+            TimestampType::LogAppendTime => stamp_log_append_time(&mut batch, now)?,
+        };
         Ok((batch, rejection))
     })
     .await
@@ -791,7 +853,11 @@ mod rewrite_create_time_tests {
 
         let batch: deflated::Batch = builder.build().and_then(TryInto::try_into)?;
 
-        let rewrite = tokio::spawn(rewrite_create_time_offloaded(batch, FIXED_NOW));
+        let rewrite = tokio::spawn(validate_timestamps_offloaded(
+            batch,
+            TimestampType::CreateTime,
+            FIXED_NOW,
+        ));
 
         yield_now().await;
 
@@ -970,6 +1036,7 @@ where
         &self,
         transaction_id: Option<&str>,
         name: &str,
+        timestamp_type: TimestampType,
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         // The decoder turns a zero-length records field into `None`, so it
@@ -1013,38 +1080,22 @@ where
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
 
-        // The batch's own timestamp-type bit selects `LogAppendTime`
-        // here. Kafka takes the type from the topic's
-        // `message.timestamp.type` instead: on a `CreateTime` topic it
-        // validates such a batch like any `CreateTime` batch and
-        // clears the bit. A client that sets the bit here skips the
-        // timestamp window.
-        if BatchAttribute::try_from(batch.attributes)
-            .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
-            .unwrap_or_default()
-        {
-            match batch.set_timestamps(now, now) {
-                Ok(()) => {}
-                Err(nisshi_sans_io::Error::ApiError(ErrorCode::CorruptMessage)) => {
-                    return self.reject(name, partition.index, &batch, corrupt_batch());
-                }
-                Err(err) => {
-                    error!(?err);
-                    return self.error(partition.index, ErrorCode::UnknownServerError);
-                }
+        match validate_timestamps_offloaded(batch, timestamp_type, now).await {
+            Ok((validated, None)) => batch = validated,
+            Ok((validated, Some(rejection))) => {
+                return self.reject(name, partition.index, &validated, rejection);
             }
-        } else {
-            match rewrite_create_time_offloaded(batch, now).await {
-                Ok((rewritten, None)) => batch = rewritten,
-                Ok((rewritten, Some(rejection))) => {
-                    return self.reject(name, partition.index, &rewritten, rejection);
-                }
-                Err(err) => {
-                    error!(?err);
-                    return self.error(partition.index, ErrorCode::UnknownServerError);
-                }
+            Err(err) => {
+                error!(?err);
+                return self.error(partition.index, ErrorCode::UnknownServerError);
             }
         }
+
+        // Kafka answers -1 for a `CreateTime` topic.
+        let log_append_time_ms = match timestamp_type {
+            TimestampType::CreateTime => NO_TIMESTAMP,
+            TimestampType::LogAppendTime => now,
+        };
 
         let tp = Topition::new(name, partition.index);
         let producer_id = batch.producer_id;
@@ -1054,7 +1105,7 @@ where
                 .index(partition.index)
                 .error_code(ErrorCode::None.into())
                 .base_offset(base_offset)
-                .log_append_time_ms(Some(-1))
+                .log_append_time_ms(Some(log_append_time_ms))
                 .log_start_offset(Some(0))
                 .record_errors(Some([].into()))
                 .error_message(None)
@@ -1090,17 +1141,69 @@ where
         }
     }
 
+    /// Returns the `message.timestamp.type` of the topic `name`, or
+    /// `CreateTime`, Kafka's default, when the topic does not set it.
+    ///
+    /// A topic that does not exist also gets `CreateTime`, so that
+    /// `storage.produce()` answers each of its partitions with the error code
+    /// that it gives an unknown topic.
+    async fn timestamp_type(&self, name: &str) -> Result<TimestampType> {
+        let result = self
+            .storage
+            .describe_config(
+                name,
+                ConfigResource::Topic,
+                Some(&[MESSAGE_TIMESTAMP_TYPE.to_owned()]),
+            )
+            .await?;
+
+        let log_append_time = result
+            .configs
+            .unwrap_or_default()
+            .into_iter()
+            .any(|config| {
+                config.name == MESSAGE_TIMESTAMP_TYPE
+                    && config.value.as_deref() == Some("LogAppendTime")
+            });
+
+        Ok(if log_append_time {
+            TimestampType::LogAppendTime
+        } else {
+            TimestampType::CreateTime
+        })
+    }
+
     #[instrument(skip_all)]
     async fn topic(
         &self,
         transaction_id: Option<&str>,
         topic: TopicProduceData,
     ) -> TopicProduceResponse {
-        let mut partitions = vec![];
+        let partition_data = topic.partition_data.unwrap_or_default();
+        let mut partitions = Vec::with_capacity(partition_data.len());
 
-        if let Some(partition_data) = topic.partition_data {
-            for partition in partition_data {
-                partitions.push(self.partition(transaction_id, &topic.name, partition).await)
+        match self.timestamp_type(&topic.name).await {
+            Ok(timestamp_type) => {
+                for partition in partition_data {
+                    partitions.push(
+                        self.partition(transaction_id, &topic.name, timestamp_type, partition)
+                            .await,
+                    )
+                }
+            }
+
+            Err(error) => {
+                error!(
+                    topic = topic.name,
+                    ?error,
+                    "message.timestamp.type lookup failed"
+                );
+
+                partitions.extend(
+                    partition_data.iter().map(|partition| {
+                        self.error(partition.index, ErrorCode::UnknownServerError)
+                    }),
+                );
             }
         }
 

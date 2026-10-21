@@ -210,6 +210,20 @@ impl Batch {
         self.base_offset + i64::from(self.last_offset_delta)
     }
 
+    /// Returns the timestamp that a consumer reads for `record` of this
+    /// batch: `max_timestamp` for a [`TimestampType::LogAppendTime`] batch,
+    /// and `base_timestamp` plus the record's `timestamp_delta` for a
+    /// [`TimestampType::CreateTime`] batch. Kafka defines the two types in
+    /// [`DefaultRecordBatch`].
+    ///
+    /// [`DefaultRecordBatch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L90-L93
+    pub fn record_timestamp(&self, record: &Record) -> i64 {
+        match TimestampType::from(self.attributes) {
+            TimestampType::LogAppendTime => self.max_timestamp,
+            TimestampType::CreateTime => self.base_timestamp + record.timestamp_delta,
+        }
+    }
+
     pub fn keys(&self) -> BTreeSet<Bytes> {
         self.records
             .iter()
@@ -424,6 +438,31 @@ impl Builder {
     pub fn record(mut self, record: super::Builder) -> Self {
         self.records.extend(vec![record]);
         self
+    }
+
+    /// Sets `max_timestamp` to the largest record timestamp: `base_timestamp`
+    /// plus the largest `timestamp_delta` of the records. A builder without
+    /// records keeps its `max_timestamp`.
+    ///
+    /// A storage engine that rebuilds a batch from stored records needs this,
+    /// because a consumer reads `max_timestamp` as the timestamp of each record
+    /// of a `LogAppendTime` batch.
+    #[must_use]
+    pub fn max_timestamp_of_records(self) -> Self {
+        let Some(max_delta) = self
+            .records
+            .0
+            .iter()
+            .map(|record| record.timestamp_delta.0)
+            .max()
+        else {
+            return self;
+        };
+
+        Self {
+            max_timestamp: self.base_timestamp + max_delta,
+            ..self
+        }
     }
 
     fn crc(&self) -> Result<u32> {
