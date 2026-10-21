@@ -26,12 +26,12 @@ use crate::{
 use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    BatchAttribute, Compression, ErrorCode, TimestampType,
+    BatchAttribute, Compression, ErrorCode, IsolationLevel, ListOffset, TimestampType,
     record::{Record, deflated, inflated},
 };
-use nisshi_storage::{ArcDynStorage, Storage};
+use nisshi_storage::{ArcDynStorage, Storage, Topition};
 use rand::{RngExt as _, rng};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use url::Url;
 use uuid::Uuid;
 
@@ -251,6 +251,46 @@ async fn create_time_topic_validates_a_batch_marked_log_append_time(
     Ok(())
 }
 
+/// A lookup by timestamp finds a record by the broker's clock at its produce,
+/// the timestamp that a consumer reads, not by the producer's timestamp.
+async fn timestamp_lookup_uses_the_broker_clock(storage: impl Storage + Clone) -> Result<()> {
+    let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
+    let a_day_ago = now_ms()? - 24 * 60 * 60 * 1000;
+
+    let response = produce_batches(
+        storage.clone(),
+        &topic,
+        PARTITION,
+        vec![create_time_batch(Compression::None, a_day_ago, -1, &[0])?],
+    )
+    .await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+
+    let log_append_time = response
+        .log_append_time_ms
+        .expect("a produce response carries log_append_time_ms");
+
+    let target = UNIX_EPOCH + Duration::from_millis(u64::try_from(log_append_time)?);
+
+    let responses = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(
+                Topition::new(topic.as_str(), PARTITION),
+                ListOffset::Timestamp(target),
+            )],
+        )
+        .await?;
+
+    assert_eq!(1, responses.len());
+    let (_, found) = &responses[0];
+    assert_eq!(ErrorCode::None, found.error_code);
+    assert_eq!(Some(0), found.offset);
+    assert_eq!(Some(target), found.timestamp);
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -282,6 +322,12 @@ mod in_memory {
             storage(StorageType::InMemory).await?,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn timestamp_lookup_uses_the_broker_clock() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::InMemory).await?).await
     }
 }
 
@@ -315,6 +361,12 @@ mod lite {
             storage(StorageType::Lite).await?,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn timestamp_lookup_uses_the_broker_clock() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::Lite).await?).await
     }
 }
 
@@ -350,6 +402,12 @@ mod pg {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn timestamp_lookup_uses_the_broker_clock() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::Postgres).await?).await
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -382,5 +440,49 @@ mod slate {
             storage(StorageType::SlateDb).await?,
         )
         .await
+    }
+}
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn stamps_each_record_with_the_broker_clock() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::stamps_each_record_with_the_broker_clock(storage(StorageType::Turso).await?).await
+    }
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn each_batch_keeps_its_own_broker_timestamp() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::each_batch_keeps_its_own_broker_timestamp(storage(StorageType::Turso).await?).await
+    }
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn accepts_a_record_outside_the_timestamp_window() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::accepts_a_record_outside_the_timestamp_window(storage(StorageType::Turso).await?)
+            .await
+    }
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn create_time_topic_validates_a_batch_marked_log_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::create_time_topic_validates_a_batch_marked_log_append_time(
+            storage(StorageType::Turso).await?,
+        )
+        .await
+    }
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn timestamp_lookup_uses_the_broker_clock() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::Turso).await?).await
     }
 }

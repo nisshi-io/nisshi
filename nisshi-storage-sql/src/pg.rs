@@ -4173,26 +4173,54 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let prepared = c
-            .prepare_cached(self.sql_lookup("topic_select.sql")?)
-            .await
-            .inspect_err(|err| error!(?err))?;
-
-        if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
-            .await
-            .inspect_err(|err| error!(?err))?
-            .is_some()
-        {
+        // `None` for a topic that does not exist.
+        let rows = if let Some(keys) = keys.filter(|keys| !keys.is_empty()) {
+            // One query, because a produce reads `message.timestamp.type`
+            // through here for each topic of each request.
             let prepared = c
-                .prepare_cached(self.sql_lookup("topic_configuration_select.sql")?)
+                .prepare_cached(self.sql_lookup("pg/topic_configuration_select_keys.sql")?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let rows = c
-                .query(&prepared, &[&self.cluster.as_str(), &name])
+                .query(&prepared, &[&self.cluster.as_str(), &name, &keys])
                 .await
                 .inspect_err(|err| error!(?err))?;
 
+            // A row whose name is null is an existing topic that sets none of
+            // `keys`.
+            (!rows.is_empty()).then(|| {
+                rows.into_iter()
+                    .filter(|row| matches!(row.try_get::<_, Option<&str>>(0), Ok(Some(_))))
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            let prepared = c
+                .prepare_cached(self.sql_lookup("topic_select.sql")?)
+                .await
+                .inspect_err(|err| error!(?err))?;
+
+            if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
+                .await
+                .inspect_err(|err| error!(?err))?
+                .is_some()
+            {
+                let prepared = c
+                    .prepare_cached(self.sql_lookup("topic_configuration_select.sql")?)
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+
+                Some(
+                    c.query(&prepared, &[&self.cluster.as_str(), &name])
+                        .await
+                        .inspect_err(|err| error!(?err))?,
+                )
+            } else {
+                None
+            }
+        };
+
+        if let Some(rows) = rows {
             let mut configs = vec![];
 
             for row in rows {

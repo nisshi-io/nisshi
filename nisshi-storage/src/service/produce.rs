@@ -1147,6 +1147,13 @@ where
     /// A topic that does not exist also gets `CreateTime`, so that
     /// `storage.produce()` answers each of its partitions with the error code
     /// that it gives an unknown topic.
+    ///
+    /// The lookup and `storage.produce()` do not run in one transaction. A
+    /// change to `message.timestamp.type` that lands between them leaves the
+    /// batch with the type that was read. That batch carries its type in its
+    /// attributes, so a consumer still reads its timestamps correctly. Kafka
+    /// also applies a config change asynchronously, so an append that is in
+    /// progress can use the old type.
     async fn timestamp_type(&self, name: &str) -> Result<TimestampType> {
         let result = self
             .storage
