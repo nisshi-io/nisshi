@@ -31,9 +31,8 @@ use crate::{Error, Result};
 /// engines read these values in their maintenance queries, so a value that doesn't parse can stop
 /// maintenance for every topic.
 ///
-/// The value to store for a checked configuration is the number that Kafka parsed, written without
-/// the white space or the `+` that Kafka accepts around it, so that the maintenance queries read
-/// exactly the values that the broker accepts.
+/// For a checked configuration, it returns the plain number that it parses, without white space or
+/// a `+`, because the maintenance queries read anything else as no limit.
 ///
 /// [`LogConfig`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L277-L279
 pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<Option<String>, String> {
