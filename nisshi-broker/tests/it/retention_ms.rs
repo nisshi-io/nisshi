@@ -69,6 +69,11 @@ const KEEP_FOREVER_RETENTION: (&str, &str) = ("retention.ms", "-1");
 
 const DELETE_POLICY: (&str, &str) = ("cleanup.policy", "delete");
 
+const COMPACT_POLICY: (&str, &str) = ("cleanup.policy", "compact");
+
+/// The `cleanup.policy` that `SUBTRACT` leaves when it removes the last policy.
+const EMPTY_POLICY: (&str, &str) = ("cleanup.policy", "");
+
 /// How many records a test produces before maintenance, at offsets 0, 1 and 2.
 const RECORDS_BEFORE_MAINTENANCE: i64 = 3;
 
@@ -445,6 +450,62 @@ where
     Ok(())
 }
 
+/// A topic whose `cleanup.policy` is `compact` keeps every record that compaction keeps, however
+/// old. A broker that applies `retention.ms` to it deletes the only copy of each key's latest value,
+/// such as a changelog that a Kafka Streams application restores its state from.
+pub async fn compacted_topic_keeps_expired_records<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[COMPACT_POLICY, TEN_MINUTE_RETENTION],
+    )
+    .await?;
+    produce_records_before_maintenance(&broker, &extensions, topic).await?;
+
+    maintain_an_hour_later(&sc).await?;
+
+    assert_eq!(
+        Some(0),
+        earliest_offset_after_maintenance(&broker, &extensions, topic).await?
+    );
+    Ok(())
+}
+
+/// A topic whose `cleanup.policy` is empty has neither policy, so Kafka deletes none of its
+/// records. `SUBTRACT` leaves an empty policy when it removes the last one. A broker that reads the
+/// empty policy as the default, `delete`, deletes records that the topic was set to keep.
+pub async fn topic_with_empty_cleanup_policy_keeps_expired_records<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[EMPTY_POLICY, TEN_MINUTE_RETENTION],
+    )
+    .await?;
+    produce_records_before_maintenance(&broker, &extensions, topic).await?;
+
+    maintain_an_hour_later(&sc).await?;
+
+    assert_eq!(
+        Some(0),
+        earliest_offset_after_maintenance(&broker, &extensions, topic).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -518,6 +579,21 @@ macro_rules! backend {
                 )
                 .await
             }
+            #[tokio::test]
+            async fn compacted_topic_keeps_expired_records() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::compacted_topic_keeps_expired_records(storage_container().await?).await
+            }
+
+            #[tokio::test]
+            async fn topic_with_empty_cleanup_policy_keeps_expired_records() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::topic_with_empty_cleanup_policy_keeps_expired_records(
+                    storage_container().await?,
+                )
+                .await
+            }
+
         }
     };
 }

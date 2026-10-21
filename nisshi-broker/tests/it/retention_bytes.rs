@@ -319,6 +319,42 @@ where
     Ok(())
 }
 
+/// A topic whose `cleanup.policy` is `compact` keeps every record that compaction keeps, whatever
+/// their size. A broker that applies `retention.bytes` to it deletes the only copy of each key's
+/// latest value.
+pub async fn retention_bytes_compacted_topic_keeps_everything<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[
+            ("cleanup.policy", "compact"),
+            ("retention.bytes", &RETENTION_BYTES.to_string()),
+        ],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(0),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -368,6 +404,12 @@ macro_rules! backend {
             async fn keeps_newest_record() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::retention_bytes_keeps_newest_record(storage_container().await?).await
+            }
+            #[tokio::test]
+            async fn compacted_topic_keeps_everything() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_compacted_topic_keeps_everything(storage_container().await?)
+                    .await
             }
         }
     };
