@@ -34,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       git_ref:
-        description: "Git ref to scan (branch, tag, or SHA). Empty = current ref."
+        description: "Git ref to scan (branch, refs/tags/<tag>, or SHA). Empty = current ref. A tag must be spelled refs/tags/<tag> to be scanned as a release."
         required: false
         type: string
   workflow_call:
@@ -48,11 +48,16 @@ on:
         type: string
         default: ""
 
-# Same group as ci.yml rather than plain `sha`: the queue fast-forwards main to
-# the commit it just tested, so the merge_group run and the post-merge push run
-# share a sha, and sharing a group would cancel one of them.
+# Same grouping idea as ci.yml rather than plain `sha`: the queue fast-forwards
+# main to the commit it just tested, so the merge_group run and the post-merge
+# push run share a sha, and sharing a group would cancel one of them.
+#
+# Pushes group on the ref alone with cancel-in-progress off: GitHub keeps one run
+# going and one pending, and the pending one is always the newest push, so main's
+# tip still gets scanned while a burst of merges starts one cold release build
+# instead of one per commit. Only the tip's run writes the manifest row anyway.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}@{1}', github.ref, github.sha) }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || format('{0}@{1}', github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -88,26 +93,43 @@ jobs:
       fossa_mode: ${{ steps.ctx.outputs.fossa_mode }}
       scan_tag: scan-${{ github.run_id }}
     steps:
-      # The event's commit, not the branch: with a branch ref, checkout takes
-      # that branch's tip when the job starts. The context script emits the
-      # commit it finds here as `sha`, and every later job checks that out.
+      # The scripts come from the workflow's own commit, never from the ref being
+      # scanned. A workflow_dispatch from main can set `git_ref` to any branch,
+      # and a branch's copy of the context script could print is_trunk=true and
+      # any other output, which would run that branch in `guardian-trunk`.
+      - name: Checkout workflow scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          path: trusted
+          persist-credentials: false
+      # The tree to scan: the event's commit, not the branch (with a branch ref,
+      # checkout takes that branch's tip when the job starts). The context script
+      # emits the commit it finds here as `sha`, and every later job checks that
+      # out. Nothing in this tree is executed by this job.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ inputs.git_ref || github.sha }}
+          path: scan
           persist-credentials: false
       # The classification lives in a script with a self-test because it decides
       # whether a run uploads to Guardian, runs the DB sync + Jira report, and
       # blocks on Guardian's verdict. The self-test runs first, and is not
       # decoration: the regressions it pins are a queue entry or a feature-branch
       # dispatch silently classified as trunk, and a value the PR author chose
-      # reaching the shared actions' bash unfiltered.
-      - name: Self-test the scan context resolution
-        run: .github/scripts/guardian-scan-context.test.sh
+      # reaching the shared actions' bash unfiltered. The gate's verdict is
+      # tested the same way, since the manifest row only moves when it passes.
+      - name: Self-test the scan context resolution and gate verdict
+        run: |
+          trusted/.github/scripts/guardian-scan-context.test.sh
+          trusted/.github/scripts/guardian-scan-gate.test.sh
       - name: Resolve
         id: ctx
         shell: bash
+        working-directory: scan
         env:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -117,7 +139,7 @@ jobs:
           ACTOR: ${{ github.actor }}
           FOSSA_LICENSING_BLOCK: ${{ vars.FOSSA_LICENSING_BLOCK }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: .github/scripts/guardian-scan-context.sh
+        run: ${{ github.workspace }}/trusted/.github/scripts/guardian-scan-context.sh
 
   # Every scan job skips unless `scan` is true: not a fork PR, a Dependabot PR
   # or a merge queue entry. Off trunk the guards are all REPORT-only, so a
@@ -155,6 +177,10 @@ jobs:
     # A trunk run uploads to Guardian, so it needs guardian-trunk, which only
     # main and v* tags can enter. Anything else gets only the FOSSA key.
     environment: ${{ fromJSON(needs.setup.outputs.is_trunk) && 'guardian-trunk' || 'guardian' }}
+    # `analyze` is the upload's outcome, which guardian-gate reads: a licensing
+    # BLOCK still leaves a fresh upload to sync, a failed analyze does not.
+    outputs:
+      analyze: ${{ steps.analyze.outcome }}
     permissions:
       contents: read
       packages: read        # fossa-guard pulls the private maas-build-actions container
@@ -299,9 +325,15 @@ jobs:
   guardian-gate:
     name: Guardian gate
     needs: [setup, fossa, prisma]
-    if: ${{ !cancelled() && needs.setup.result == 'success' && fromJSON(needs.setup.outputs.scan) && fromJSON(needs.setup.outputs.is_trunk) }}
+    # Only with both scanners' results in: the sync reconciles `fossa,prisma` for
+    # this version, and a listed scanner with nothing uploaded for this commit
+    # could be read as zero findings. A licensing BLOCK alone still syncs, because
+    # the analyze upload happened. `gate` fails the run in every other case.
+    if: ${{ !cancelled() && needs.setup.result == 'success' && fromJSON(needs.setup.outputs.scan) && fromJSON(needs.setup.outputs.is_trunk) && needs.prisma.result == 'success' && needs.fossa.outputs.analyze == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Covers the 10-minute dependency graph step plus the sync's poll-timeout
+    # below, with room for the gate, so the action reports its own timeout.
+    timeout-minutes: 45
     environment: guardian-trunk
     permissions:
       contents: read
@@ -356,6 +388,7 @@ jobs:
           unifiers: "fossa,prisma"
           # A missing file (Trivy failed above) is a warning in the action.
           dependency-graph: ${{ runner.temp }}/trivy_repo.json
+          poll-timeout: "1200"
           upload-logs: "true"
       - name: Guardian vulnerability gate
         uses: SolaceDev/solace-public-workflows/guardian-vulnerability-gate@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
@@ -376,6 +409,15 @@ jobs:
     permissions:
       contents: read
     steps:
+      # The verdict is a script with a table test (guardian-scan-gate.test.sh),
+      # run by `setup`: manifest-tip and update-manifest run only when it passes.
+      - name: Checkout workflow scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          path: trusted
+          persist-credentials: false
       - name: Aggregate verdict
         env:
           R_SETUP: ${{ needs.setup.result }}
@@ -388,46 +430,11 @@ jobs:
           R_PRISMA: ${{ needs.prisma.result }}
           R_GATE: ${{ needs.guardian-gate.result }}
         run: |
-          set -euo pipefail
-          # A failed setup leaves every output empty, which would otherwise read
-          # as "not a fork, not a queue entry" and report the skips below.
-          if [ "$R_SETUP" != "success" ]; then
-            echo "::error::setup = $R_SETUP"; exit 1
-          fi
-          if [ "$IS_FORK" = "true" ]; then
-            echo "::notice::Fork PR - scans skipped (no Environment secrets)."
-            exit 0
-          fi
-          if [ "$IS_QUEUE" = "true" ]; then
-            echo "::notice::Merge queue entry - scans skipped (PR run already reported; trunk run enforces after merge)."
-            exit 0
-          fi
-          if [ "$IS_DEPENDABOT" = "true" ]; then
-            echo "::notice::Dependabot PR - scans skipped (its run holds Dependabot secrets, not the Environment's; trunk run scans the bump after merge)."
-            exit 0
-          fi
-          # Off trunk every guard is REPORT-only, so a failed FOSSA job can only
-          # be the scanner, its key or the network. That is a warning, not a
-          # red check: a required check that fails on an outage would stop
-          # every PR from entering the queue. The trunk run after the merge
-          # still enforces.
-          if [ "$IS_TRUNK" != "true" ]; then
-            if [ "$R_FOSSA" != "success" ]; then
-              echo "::warning::fossa = $R_FOSSA - report-only off trunk, so not blocking; see the FOSSA job log."
-            fi
-            echo "Guardian scan passed (report only)."
-            exit 0
-          fi
-          fail=0
-          for pair in "build:$R_BUILD" "fossa:$R_FOSSA" "prisma:$R_PRISMA" "guardian-gate:$R_GATE"; do
-            name="${pair%%:*}"; res="${pair#*:}"
-            if [ "$res" != "success" ]; then echo "::error::$name = $res"; fail=1; fi
-          done
-          [ "$fail" -eq 0 ] && echo "Guardian scan passed." || exit 1
+          trusted/.github/scripts/guardian-scan-gate.sh
 
-  # Push runs are grouped per SHA, so two merges in a row scan in parallel and
-  # the older one can finish last. Like tier-c.yml's edge-gate, write the row
-  # only while this commit is still main's tip, so the row only moves forward.
+  # Push runs share one concurrency group, but a run still in progress can finish
+  # after a newer push has landed. Like tier-c.yml's edge-gate, write the row only
+  # while this commit is still main's tip, so the row only moves forward.
   manifest-tip:
     name: Manifest tip check
     needs: [setup, gate]

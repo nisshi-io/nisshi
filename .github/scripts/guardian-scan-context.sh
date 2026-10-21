@@ -25,8 +25,10 @@
 #   IS_FORK             "true" for a PR from a fork
 #   GITHUB_OUTPUT       file the outputs are appended to
 #
-# Run from the checkout the scan jobs will use: the commit it is at becomes the
-# `sha` output, which every later job checks out.
+# Run with the working directory set to the checkout the scan jobs will use: the
+# commit it is at becomes the `sha` output, which every later job checks out. The
+# script itself must come from the workflow's own commit, not from that checkout
+# (see `setup` in the workflow), or a scanned branch could classify itself as trunk.
 #
 set -euo pipefail
 
@@ -51,9 +53,11 @@ fi
 # own FOSSA revision instead of overwriting the last one, and a SHA is hex, so
 # nothing the PR author chose reaches the shared actions' bash.
 SHA_RE='^[0-9a-f]{40}$'
-# main, or a release tag such as v0.7.0 / v0.7.0-pre.2, with or without the
-# refs/ prefix (a `git_ref` input may be either).
-TRUNK_REF_RE='^(refs/heads/main|main|(refs/tags/)?v[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?)$'
+# main, or a release tag such as refs/tags/v0.7.0 / refs/tags/v0.7.0-pre.2. A
+# tag must be spelled with `refs/tags/`: actions/checkout resolves an unqualified
+# name to a branch before a tag, so a bare `v0.7.0` could scan a branch of that
+# name in trunk. A bare `main` is safe, since checkout tries branches first.
+TRUNK_REF_RE='^(refs/heads/main|main|refs/tags/v[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?)$'
 
 REF="${GIT_REF_INPUT:-${GITHUB_REF:-}}"
 if ! [[ "$REF" =~ $SAFE_REF_RE ]]; then

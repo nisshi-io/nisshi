@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 #
 # Self-test for guardian-scan-context.sh. Runs the real script under each event
-# shape and asserts the full output tuple, so the pr/queue/trunk classification
-# is verified on every run rather than trusted. The dangerous regressions this
-# pins: a queue entry, or a dispatch from a feature branch, falling through to
-# trunk, which would upload scan results, run the Guardian DB sync + Jira
-# report, and block on Guardian's verdict for a ref that isn't main; and a
-# value the PR author chose reaching the shared actions' bash unfiltered.
+# shape and asserts all 14 output keys, so the pr/queue/trunk/branch
+# classification is verified on every run rather than trusted. The dangerous
+# regressions this pins: a queue entry, or a dispatch from a feature branch,
+# falling through to trunk, which would upload scan results, run the Guardian DB
+# sync + Jira report, and block on Guardian's verdict for a ref that isn't main;
+# and a value the PR author chose reaching the shared actions' bash unfiltered.
+#
+# The script runs inside a throwaway git repo built under $WORK, so the cases
+# don't depend on the checkout's HEAD or tags.
 #
 # Run manually:  .github/scripts/guardian-scan-context.test.sh
 # Runs in CI as a step of the `setup` job in .github/workflows/guardian-scan.yaml.
@@ -19,20 +22,35 @@ RESOLVE="${SCRIPT_DIR}/guardian-scan-context.sh"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# Two commits: v1.0.0 on the first, then a nearer tag that is not a `v*` tag
+# (the real repo carries `tansu-*` and bare `0.x` tags) on the second. Only
+# `git describe --match 'v*'` yields v1.0.0-1-g<sha>; without --match it would
+# pick the nearer tag.
+REPO="$WORK/repo"
+git init -q "$REPO"
+g() { git -C "$REPO" -c user.name=test -c user.email=test@example.com -c commit.gpgsign=false -c tag.gpgsign=false "$@"; }
+g commit -q --allow-empty -m first
+g tag v1.0.0
+g commit -q --allow-empty -m second
+g tag tansu-9
+g tag 0.5.0
+SHA=$(g rev-parse HEAD)
+DESCRIBED="v1.0.0-1-g${SHA:0:7}"
+
 pass_count=0
 fail_count=0
 pass() { pass_count=$((pass_count + 1)); printf 'ok   - %s\n' "$1"; }
 fail() { fail_count=$((fail_count + 1)); printf 'FAIL - %s\n' "$1"; [ -n "${2:-}" ] && printf '       %s\n' "$2"; return 0; }
 
-# run - execute the script with the env given as KEY=VALUE args; set globals
-# STDOUT and OUT (path to the captured $GITHUB_OUTPUT file). The script must
-# exit 0 on every shape tested here; a crash is a failure in its own right,
+# run - execute the script in $REPO with the env given as KEY=VALUE args; set
+# globals STDOUT and OUT (path to the captured $GITHUB_OUTPUT file). The script
+# must exit 0 on every shape tested here; a crash is a failure in its own right,
 # not just empty outputs downstream.
 run() {
   OUT="$WORK/output.$RANDOM"
   : > "$OUT"
   local rc=0
-  STDOUT=$(env -i PATH="$PATH" HOME="${HOME:-}" GITHUB_OUTPUT="$OUT" "$@" bash "$RESOLVE" 2>&1) || rc=$?
+  STDOUT=$(cd "$REPO" && env -i PATH="$PATH" HOME="${HOME:-}" GITHUB_OUTPUT="$OUT" "$@" bash "$RESOLVE" 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then fail "script exited $rc" "env: $* / stdout=[$STDOUT]"; fi
   return 0
 }
@@ -40,36 +58,35 @@ run() {
 # get <key> - value of <key> from the captured output file.
 get() { sed -n "s/^$1=//p" "$OUT" | tail -n 1; }
 
-# expect <case> <key> <want> - assert one key of the tuple.
-expect() {
-  local case="$1" key="$2" want="$3" got
-  got=$(get "$key")
-  if [ "$got" = "$want" ]; then pass "$case: $key=$want"; else fail "$case: $key" "want [$want] got [$got]"; fi
+# check <case> <mode> <ref> <fossa_branch> <fossa_revision> <full_version> <is_fork> <is_pr>
+#       <is_trunk> <is_queue> <is_dependabot> <scan> <enforce> <fossa_mode>
+# Asserts the whole tuple (sha is always the fixture repo's HEAD), so a change to
+# any one output fails every case that sets it, not just the ones that looked.
+check() {
+  local case="$1" key want got
+  shift
+  local keys=(mode ref fossa_branch fossa_revision full_version is_fork is_pr is_trunk is_queue is_dependabot scan enforce fossa_mode)
+  local wants=("$@")
+  keys+=(sha)
+  wants+=("$SHA")
+  local i
+  for i in "${!keys[@]}"; do
+    key="${keys[$i]}"; want="${wants[$i]}"; got=$(get "$key")
+    if [ "$got" = "$want" ]; then pass "$case: $key=$want"; else fail "$case: $key" "want [$want] got [$got]"; fi
+  done
 }
 
+PR_SHA=0123456789abcdef0123456789abcdef01234567
+
 # --- Case 1: pull_request -> pr mode, nothing enforced ------------------------
-run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1.2.3 \
+run EVENT_NAME=pull_request HEAD_SHA=$PR_SHA FULL_VERSION_INPUT=v1.2.3 \
     GITHUB_REF=refs/pull/7/merge IS_FORK=false
-expect "pr" mode pr
-expect "pr" is_pr true
-expect "pr" is_trunk false
-expect "pr" is_queue false
-expect "pr" enforce false
-expect "pr" fossa_mode REPORT
-expect "pr" fossa_branch PR
-expect "pr" fossa_revision 0123456789abcdef0123456789abcdef01234567
+check "pr" pr refs/pull/7/merge PR $PR_SHA v1.2.3 false true false false false true false REPORT
 
 # --- Case 2: merge_group -> queue mode, NOT trunk ------------------------------
 run EVENT_NAME=merge_group FULL_VERSION_INPUT=v1.2.3-4-gabc \
     GITHUB_REF=refs/heads/gh-readonly-queue/main/pr-9 IS_FORK=false
-expect "queue" mode queue
-expect "queue" is_pr false
-expect "queue" is_trunk false
-expect "queue" is_queue true
-expect "queue" enforce false
-expect "queue" fossa_mode REPORT
-expect "queue" fossa_branch merge-queue
-expect "queue" fossa_revision v1.2.3-4-gabc
+check "queue" queue refs/heads/gh-readonly-queue/main/pr-9 merge-queue v1.2.3-4-gabc v1.2.3-4-gabc false false false true false false false REPORT
 if grep -q 'Resolved: mode=queue' <<<"$STDOUT"; then
   pass "queue: resolved mode is logged to stdout"
 else
@@ -77,66 +94,46 @@ else
 fi
 
 # --- Case 3: push -> trunk mode, enforcing -------------------------------------
-run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main IS_FORK=false
-expect "push" mode trunk
-expect "push" is_trunk true
-expect "push" is_queue false
-expect "push" enforce true
-expect "push" fossa_mode BLOCK
-expect "push" fossa_branch main
+run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 GITHUB_REF=refs/heads/main IS_FORK=false
+check "push" trunk refs/heads/main main v1.2.3 v1.2.3 false false true false false true true BLOCK
 
 # --- Case 4: workflow_dispatch is trunk only when it scans main or a tag ------
+run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3 GITHUB_REF=refs/heads/main IS_FORK=false
+check "dispatch-main" trunk refs/heads/main main v1.2.3 v1.2.3 false false true false false true true BLOCK
 run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main IS_FORK=false
-expect "dispatch-main" mode trunk
-expect "dispatch-main" enforce true
-run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main GIT_REF_INPUT=v0.7.0-pre.2 IS_FORK=false
-expect "dispatch-tag" mode trunk
-expect "dispatch-tag" fossa_branch main
+    GITHUB_REF=refs/heads/main GIT_REF_INPUT=refs/tags/v0.7.0-pre.2 IS_FORK=false
+check "dispatch-tag" trunk refs/tags/v0.7.0-pre.2 main v1.2.3 v1.2.3 false false true false false true true BLOCK
 # Dispatched from a feature branch, or from main with `git_ref` set to one.
 run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3-4-gabc \
     GITHUB_REF=refs/heads/feature/x IS_FORK=false
-expect "dispatch-branch" mode branch
-expect "dispatch-branch" is_trunk false
-expect "dispatch-branch" enforce false
-expect "dispatch-branch" fossa_mode REPORT
-expect "dispatch-branch" fossa_branch feature/x
-expect "dispatch-branch" fossa_revision v1.2.3-4-gabc
+check "dispatch-branch" branch refs/heads/feature/x feature/x v1.2.3-4-gabc v1.2.3-4-gabc false false false false false true false REPORT
 run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3 \
     GITHUB_REF=refs/heads/main GIT_REF_INPUT=maintenance IS_FORK=false
-expect "dispatch-input-branch" mode branch
-expect "dispatch-input-branch" fossa_branch maintenance
+check "dispatch-input-branch" branch maintenance maintenance v1.2.3 v1.2.3 false false false false false true false REPORT
 
 # --- Case 5: a Dependabot PR skips the scans; other runs scan ------------------
 # Its run holds Dependabot's secrets, not the Environment's. Only a PR run
 # skips: a push by the same actor would be trunk and must scan.
-run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+run EVENT_NAME=pull_request HEAD_SHA=$PR_SHA FULL_VERSION_INPUT=v1 \
     GITHUB_REF=refs/pull/7/merge IS_FORK=false ACTOR='dependabot[bot]'
-expect "dependabot" mode pr
-expect "dependabot" is_dependabot true
-expect "dependabot" scan false
+check "dependabot" pr refs/pull/7/merge PR $PR_SHA v1 false true false false true false false REPORT
 run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main IS_FORK=false ACTOR='dependabot[bot]'
-expect "dependabot-push" is_dependabot false
-expect "dependabot-push" scan true
-run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+check "dependabot-push" trunk refs/heads/main main v1 v1 false false true false false true true BLOCK
+run EVENT_NAME=pull_request HEAD_SHA=$PR_SHA FULL_VERSION_INPUT=v1 \
     GITHUB_REF=refs/pull/7/merge IS_FORK=false ACTOR=someone
-expect "pr-human" scan true
-run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+check "pr-human" pr refs/pull/7/merge PR $PR_SHA v1 false true false false false true false REPORT
+run EVENT_NAME=pull_request HEAD_SHA=$PR_SHA FULL_VERSION_INPUT=v1 \
     GITHUB_REF=refs/pull/7/merge IS_FORK=true
-expect "pr-fork" scan false
+check "pr-fork" pr refs/pull/7/merge PR $PR_SHA v1 true true false false false false false REPORT
 run EVENT_NAME=merge_group FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/gh-readonly-queue/main/pr-9 IS_FORK=false
-expect "queue-scan" scan false
+check "queue-scan" queue refs/heads/gh-readonly-queue/main/pr-9 merge-queue v1 v1 false false false true false false false REPORT
 
 # --- Case 5a: FOSSA_LICENSING_BLOCK turns off only the licensing block ---------
 # Exactly "false" makes licensing REPORT on trunk while enforce (the Guardian
 # gate) stays on; any other value fails closed.
 run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
     GITHUB_REF=refs/heads/main IS_FORK=false FOSSA_LICENSING_BLOCK=false
-expect "licensing-off" mode trunk
-expect "licensing-off" enforce true
-expect "licensing-off" fossa_mode REPORT
+check "licensing-off" trunk refs/heads/main main v1.2.3 v1.2.3 false false true false false true true REPORT
 case "$STDOUT" in
   *"::warning::FOSSA licensing guard is REPORT-only"*) pass "licensing-off: warns" ;;
   *) fail "licensing-off: warns" "stdout=[$STDOUT]" ;;
@@ -144,74 +141,55 @@ esac
 for value in true no FALSE; do
   run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
       GITHUB_REF=refs/heads/main IS_FORK=false FOSSA_LICENSING_BLOCK="$value"
-  expect "licensing-$value" fossa_mode BLOCK
+  check "licensing-$value" trunk refs/heads/main main v1.2.3 v1.2.3 false false true false false true true BLOCK
 done
-run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+run EVENT_NAME=pull_request HEAD_SHA=$PR_SHA FULL_VERSION_INPUT=v1 \
     GITHUB_REF=refs/pull/7/merge IS_FORK=false FOSSA_LICENSING_BLOCK=false
-expect "licensing-off-pr" enforce false
-expect "licensing-off-pr" fossa_mode REPORT
+check "licensing-off-pr" pr refs/pull/7/merge PR $PR_SHA v1 false true false false false true false REPORT
 
 # --- Case 6: ref precedence - explicit input wins, else github.ref -------------
 run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main \
     GIT_REF_INPUT=refs/tags/v9.9.9 IS_FORK=false
-expect "ref-input" ref refs/tags/v9.9.9
-expect "ref-input" mode trunk
-expect "ref-input" enforce true
+check "ref-input" trunk refs/tags/v9.9.9 main v1 v1 false false true false false true true BLOCK
 run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main \
     GIT_REF_INPUT="" IS_FORK=false
-expect "ref-fallback" ref refs/heads/main
+check "ref-fallback" trunk refs/heads/main main v1 v1 false false true false false true true BLOCK
 
 # --- Case 6a: the edges of the trunk regex ---------------------------------------
 # A qualified tag is trunk; a branch that merely contains `main` or a version
-# is not. These pin the anchors and the optional `refs/tags/` prefix.
-for ref in refs/tags/v1.2.3 v1.2.3 refs/tags/v0.7.0-pre.2 main refs/heads/main; do
+# is not, and neither is a bare `v1.2.3`, which checkout would resolve to a
+# branch of that name before a tag. These pin the anchors and the required
+# `refs/tags/` prefix.
+for ref in refs/tags/v1.2.3 refs/tags/v0.7.0-pre.2 main refs/heads/main; do
   run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main GIT_REF_INPUT="$ref" IS_FORK=false
-  expect "trunk-ref $ref" mode trunk
-  expect "trunk-ref $ref" enforce true
+  check "trunk-ref $ref" trunk "$ref" main v1 v1 false false true false false true true BLOCK
 done
 for ref in refs/heads/feature/main refs/heads/release/v1.2.3 refs/heads/v1.2.3 refs/heads/main2 \
-           refs/tags/v1.2 refs/tags/release-v1.2.3 xmain refs/heads/mainline; do
+           refs/tags/v1.2 refs/tags/release-v1.2.3 xmain refs/heads/mainline v1.2.3 v0.7.0-pre.2; do
   run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main GIT_REF_INPUT="$ref" IS_FORK=false
-  expect "branch-ref $ref" mode branch
-  expect "branch-ref $ref" enforce false
+  check "branch-ref $ref" branch "$ref" "${ref#refs/heads/}" v1 v1 false false false false false true false REPORT
 done
 
-# --- Case 6b: sha is the checked-out commit -----------------------------------
-run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main IS_FORK=false
-expect "sha" sha "$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
-
 # --- Case 7: FULL_VERSION_INPUT is used verbatim; empty falls back to describe -
-run EVENT_NAME=push FULL_VERSION_INPUT=7.7.7-custom \
-    GITHUB_REF=refs/heads/main IS_FORK=false
-expect "version-input" full_version 7.7.7-custom
-expect "version-input" fossa_revision 7.7.7-custom
-# Runs `git describe` for real, so this case needs the repo checkout (CI uses
-# fetch-depth: 0). Assert non-empty rather than a value that moves per commit.
-run EVENT_NAME=push FULL_VERSION_INPUT="" \
-    GITHUB_REF=refs/heads/main IS_FORK=false
-# `v*` only: the repo also carries `tansu-*` and bare `0.x` tags.
-case "$(get full_version)" in
-  v*) pass "version-describe: git describe fallback picks a v* tag" ;;
-  *) fail "version-describe: git describe fallback picks a v* tag" "got [$(get full_version)] stdout=[$STDOUT]" ;;
-esac
+run EVENT_NAME=push FULL_VERSION_INPUT=7.7.7-custom GITHUB_REF=refs/heads/main IS_FORK=false
+check "version-input" trunk refs/heads/main main 7.7.7-custom 7.7.7-custom false false true false false true true BLOCK
+# Runs `git describe` for real against the fixture repo, where the nearest tag
+# is not a `v*` tag: only `--match 'v*'` gives v1.0.0-1-g<sha>.
+run EVENT_NAME=push FULL_VERSION_INPUT="" GITHUB_REF=refs/heads/main IS_FORK=false
+check "version-describe" trunk refs/heads/main main "$DESCRIBED" "$DESCRIBED" false false true false false true true BLOCK
 
-# --- Case 8: is_fork passes through untouched -----------------------------------
-run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
-    GITHUB_REF=refs/pull/7/merge IS_FORK=true
-expect "fork" is_fork true
-
-# --- Case 9: the PR revision is the head SHA, never the branch name ---------
+# --- Case 8: the PR revision is the head SHA, never the branch name ---------
 # shellcheck disable=SC2016 # the literal `$(id)` is the point
-run EVENT_NAME=pull_request HEAD_REF='x";$(id)' HEAD_SHA=0123456789abcdef0123456789abcdef01234567 \
+run EVENT_NAME=pull_request HEAD_REF='x";$(id)' HEAD_SHA=$PR_SHA \
     FULL_VERSION_INPUT=v1 GITHUB_REF=refs/pull/7/merge IS_FORK=false
-expect "hostile-ref" fossa_revision 0123456789abcdef0123456789abcdef01234567
+check "hostile-ref" pr refs/pull/7/merge PR $PR_SHA v1 false true false false false true false REPORT
 
-# --- Case 10: hostile or malformed inputs are rejected, not passed through ----
+# --- Case 9: hostile or malformed inputs are rejected, not passed through ----
 # run_fails - like run, but the script must exit non-zero.
 run_fails() {
   OUT="$WORK/output.$RANDOM"
   : > "$OUT"
-  if STDOUT=$(env -i PATH="$PATH" HOME="${HOME:-}" GITHUB_OUTPUT="$OUT" "$@" bash "$RESOLVE" 2>&1); then
+  if STDOUT=$(cd "$REPO" && env -i PATH="$PATH" HOME="${HOME:-}" GITHUB_OUTPUT="$OUT" "$@" bash "$RESOLVE" 2>&1); then
     fail "script accepted a hostile input" "env: $* / stdout=[$STDOUT]"
   else
     pass "hostile input rejected: $*"
