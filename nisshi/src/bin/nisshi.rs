@@ -15,7 +15,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use dotenv::dotenv;
 use nisshi_broker::{TracingFormat, otel};
-use nisshi_cli::{Cli, Result};
+use nisshi_cli::{Cli, Outcome, Result};
 use nisshi_sans_io::ErrorCode;
 use tracing::{debug, error};
 
@@ -50,12 +50,17 @@ async fn main() -> Result<ErrorCode> {
 
     let _guard = otel::init(TracingFormat::Text)?;
 
-    Cli::main()
+    Cli::run()
         .await
-        .inspect(|error_code| match error_code {
-            ErrorCode::None => debug!("{}", error_code),
-            _ => error!("{}", error_code),
+        .inspect(|outcome| match outcome {
+            Outcome {
+                error_code: ErrorCode::None,
+                ..
+            }
+            | Outcome { reported: true, .. } => debug!("{}", outcome.error_code),
+            _ => error!("{}", outcome.error_code),
         })
+        .map(|outcome| outcome.error_code)
         .inspect_err(|err| match err {
             nisshi_cli::Error::Cat(error) => match &**error {
                 nisshi_cat::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),

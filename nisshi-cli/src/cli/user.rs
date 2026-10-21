@@ -27,7 +27,7 @@ use std::io::{self, Write};
 use tracing::debug;
 use url::Url;
 
-use super::DEFAULT_BROKER;
+use super::{DEFAULT_BROKER, Outcome};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -162,7 +162,7 @@ impl Command {
         }
     }
 
-    pub(super) async fn main(self) -> Result<ErrorCode> {
+    pub(super) async fn main(self) -> Result<Outcome> {
         let client = ConnectionManager::builder(self.broker())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
@@ -179,7 +179,10 @@ impl Command {
             .await
             .inspect(|response| debug!(?response))?;
 
-        Ok(report(&response, &mut io::stderr()))
+        Ok(Outcome {
+            error_code: report(&response, &mut io::stderr()),
+            reported: true,
+        })
     }
 }
 

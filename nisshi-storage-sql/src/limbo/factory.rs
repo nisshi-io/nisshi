@@ -26,12 +26,15 @@ use regex::Regex;
 
 use super::Engine;
 
+/// The engine's name, as the broker reports it to an operator.
+pub(super) const NAME: &str = "Turso (turso://)";
+
 #[derive(Clone, Copy, Debug)]
 pub struct LimboFactory;
 
 impl Display for LimboFactory {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str("Turso (turso://)")
+        f.write_str(NAME)
     }
 }
 
@@ -41,8 +44,8 @@ impl StorageFactory for LimboFactory {
         Regex::new(r"turso").map_err(Into::into)
     }
 
-    /// No SCRAM credentials yet: the Turso engine's SCRAM credential methods are
-    /// unimplemented.
+    /// No SCRAM credentials yet: the Turso engine refuses to store them, with
+    /// [`nisshi_storage::Error::UserCredentialsUnsupported`].
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities::default()
     }

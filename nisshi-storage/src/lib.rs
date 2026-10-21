@@ -2704,7 +2704,8 @@ pub fn authentication_unsupported_message(engine: &str, supported: &[impl AsRef<
             return format!(
                 "the {engine} storage engine can't store SCRAM users, which --authentication \
                 needs, and this build has no storage engine that can: rebuild with the libsql or \
-                postgres feature, or start without --authentication"
+                postgres feature, or start without --authentication, which lets any client \
+                connect without logging in"
             );
         }
         Some((last, [])) => last.as_ref().to_owned(),
@@ -2720,7 +2721,8 @@ pub fn authentication_unsupported_message(engine: &str, supported: &[impl AsRef<
 
     format!(
         "the {engine} storage engine can't store SCRAM users, which --authentication needs: use \
-        {choices}, or start without --authentication"
+        {choices}, or start without --authentication, which lets any client connect without \
+        logging in"
     )
 }
 
@@ -2769,7 +2771,7 @@ impl Debug for ScramCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::File, sync::Arc, thread};
+    use std::{assert_matches, fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -2778,7 +2780,7 @@ mod tests {
         assert_eq!(
             "the in-memory (memory://) storage engine can't store SCRAM users, which \
             --authentication needs: use SQLite (sqlite://) or PostgreSQL (postgres://), or start \
-            without --authentication",
+            without --authentication, which lets any client connect without logging in",
             authentication_unsupported_message(
                 "in-memory (memory://)",
                 &["SQLite (sqlite://)", "PostgreSQL (postgres://)"]
@@ -2787,7 +2789,8 @@ mod tests {
 
         assert_eq!(
             "the S3 (s3://) storage engine can't store SCRAM users, which --authentication needs: \
-            use A, B or C, or start without --authentication",
+            use A, B or C, or start without --authentication, which lets any client connect \
+            without logging in",
             authentication_unsupported_message("S3 (s3://)", &["A", "B", "C"])
         );
     }
@@ -2797,7 +2800,8 @@ mod tests {
         assert_eq!(
             "the in-memory (memory://) storage engine can't store SCRAM users, which \
             --authentication needs, and this build has no storage engine that can: rebuild with \
-            the libsql or postgres feature, or start without --authentication",
+            the libsql or postgres feature, or start without --authentication, which lets any \
+            client connect without logging in",
             authentication_unsupported_message("in-memory (memory://)", &[] as &[&str])
         );
     }
@@ -3018,6 +3022,59 @@ mod tests {
         let message = err.to_string();
         assert!(!message.contains("secret"));
         assert!(message.contains("user@host"));
+
+        Ok(())
+    }
+
+    /// An engine that keeps no credentials, and panics if the builder asks it to build.
+    #[derive(Debug)]
+    struct PanicsOnBuild;
+
+    impl Display for PanicsOnBuild {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("stub (stub://)")
+        }
+    }
+
+    #[async_trait]
+    impl StorageFactory for PanicsOnBuild {
+        fn scheme(&self) -> Result<Regex> {
+            Regex::new("stub").map_err(Into::into)
+        }
+
+        fn capabilities(&self) -> StorageCapabilities {
+            StorageCapabilities::default()
+        }
+
+        async fn build(&self, _: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+            panic!("the engine was built before the capability check");
+        }
+    }
+
+    /// The check that refuses an engine without user credentials runs before the factory
+    /// connects, so a refused engine is never built: a check moved after `build` panics here
+    /// on every machine, with or without a reachable storage service.
+    #[tokio::test]
+    async fn credentials_check_runs_before_the_engine_is_built() -> Result<()> {
+        let mut builder = StorageContainer::builder();
+        builder.with_factory(Arc::new(PanicsOnBuild));
+
+        let refused = builder
+            .node_id(1)
+            .cluster_id("test")
+            .advertised_listener(Url::parse("tcp://localhost:9092")?)
+            .storage(Url::parse("stub://bucket")?)
+            .user_credentials_required(true)
+            .silent(true)
+            .build()
+            .await;
+
+        assert_matches!(
+            &refused,
+            Err(Error::AuthenticationUnsupported { engine, supported })
+                if engine == "stub (stub://)" && supported.is_empty(),
+            "{refused:?}"
+        );
 
         Ok(())
     }

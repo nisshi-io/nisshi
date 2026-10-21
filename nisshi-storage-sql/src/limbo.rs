@@ -3817,29 +3817,36 @@ impl Storage for Engine {
         Ok(self.advertised_listener.clone())
     }
 
+    /// Turso keeps no SCRAM credentials, so it refuses the change instead of panicking.
     async fn delete_user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<()> {
-        todo!()
+        Err(Error::UserCredentialsUnsupported {
+            engine: factory::NAME.into(),
+        })
     }
 
+    /// See [`Self::delete_user_scram_credential`].
     async fn upsert_user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
         _credential: ScramCredential,
     ) -> Result<()> {
-        todo!()
+        Err(Error::UserCredentialsUnsupported {
+            engine: factory::NAME.into(),
+        })
     }
 
+    /// No user has a credential here: [`Self::upsert_user_scram_credential`] stores none.
     async fn user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<Option<ScramCredential>> {
-        todo!()
+        Ok(None)
     }
 
     async fn ping(&self) -> Result<()> {

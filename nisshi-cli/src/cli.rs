@@ -124,8 +124,31 @@ enum Command {
     },
 }
 
+/// How a subcommand finished.
+#[derive(Clone, Copy, Debug)]
+pub struct Outcome {
+    pub error_code: ErrorCode,
+
+    /// The subcommand already told the user what went wrong, so the caller does not log the
+    /// code again as an error.
+    pub reported: bool,
+}
+
+impl From<ErrorCode> for Outcome {
+    fn from(error_code: ErrorCode) -> Self {
+        Self {
+            error_code,
+            reported: false,
+        }
+    }
+}
+
 impl Cli {
     pub async fn main() -> Result<ErrorCode> {
+        Self::run().await.map(|outcome| outcome.error_code)
+    }
+
+    pub async fn run() -> Result<Outcome> {
         debug!(
             pid = process::id(),
             storage = ?storage_engines(),
@@ -135,10 +158,10 @@ impl Cli {
         let cli = Cli::parse();
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
-            Command::Broker(arg) => arg.main().await,
-            Command::Cat { command } => command.main().await,
-            Command::Generator(arg) => arg.main().await,
-            Command::Perf(arg) => arg.main().await,
+            Command::Broker(arg) => arg.main().await.map(Outcome::from),
+            Command::Cat { command } => command.main().await.map(Outcome::from),
+            Command::Generator(arg) => arg.main().await.map(Outcome::from),
+            Command::Perf(arg) => arg.main().await.map(Outcome::from),
             Command::Proxy(arg) => nisshi_proxy::Proxy::main(
                 arg.listener_url.into_inner(),
                 arg.advertised_listener_url.into_inner(),
@@ -147,8 +170,9 @@ impl Cli {
                     .map(|otlp_endpoint_url| otlp_endpoint_url.into_inner()),
             )
             .await
+            .map(Outcome::from)
             .map_err(Into::into),
-            Command::Topic { command } => command.main().await,
+            Command::Topic { command } => command.main().await.map(Outcome::from),
             Command::User { command } => command.main().await,
         }
     }
