@@ -451,8 +451,7 @@ where
 }
 
 /// A topic whose `cleanup.policy` is `compact` keeps every record that compaction keeps, however
-/// old. A broker that applies `retention.ms` to it deletes the only copy of each key's latest value,
-/// such as a changelog that a Kafka Streams application restores its state from.
+/// old. A broker that applies `retention.ms` to it deletes the only copy of each key's latest value.
 pub async fn compacted_topic_keeps_expired_records<G>(sc: G) -> Result<()>
 where
     G: Storage + Clone,
