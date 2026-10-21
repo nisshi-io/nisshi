@@ -25,8 +25,8 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the restarted consumer has to consume a record after it joins.
 const CONSUME_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The session timeout of the consumers, so that the broker removes a member within seconds after
-/// it stops sending heartbeats.
+/// The session timeout of the consumers, so that the broker removes a member that stops without
+/// sending `LeaveGroup` within seconds, and the member doesn't hold up a rebalance.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// How many records a second the producer writes. The producer keeps writing during the whole test,
@@ -41,8 +41,8 @@ const CLIENT_DEFAULT_ASSIGNORS: [PartitionAssignor; 2] = [
     PartitionAssignor::CooperativeSticky,
 ];
 
-/// Starts a consumer in `group` that lists the protocols of `assignors`, and waits until it has its
-/// partitions.
+/// Starts a consumer in `group` that lists the protocols of `assignors`, and waits until it joins
+/// the group.
 #[track_caller]
 fn join_with_assignors(
     cli: &KafkaCli,
@@ -50,13 +50,10 @@ fn join_with_assignors(
     group: &str,
     assignors: &[PartitionAssignor],
 ) -> BackgroundTool<VerifiableConsume> {
-    let mut member = cli.verifiable_consumer().start_with_assignors(
-        topic,
-        group,
-        SESSION_TIMEOUT,
-        None,
-        assignors,
-    );
+    let mut member =
+        cli.verifiable_consumer()
+            .assignors(assignors)
+            .start(topic, group, SESSION_TIMEOUT, None);
 
     if let Err(reason) = member.wait_for_partitions_assigned(0, JOIN_TIMEOUT) {
         panic!("the consumer with the assignors {assignors:?} didn't join {group}: {reason}");
@@ -70,7 +67,8 @@ fn join_with_assignors(
 /// each consumer's list. A user whose first restarted consumer fails to join can't finish the
 /// restart. The broker must choose the group's protocol again at each rebalance, from the
 /// protocols that every member lists. A consumer that lists only `cooperative-sticky` must then
-/// join a group whose other member lists the client's default, and consume a record.
+/// join a group whose other member lists the client's default. Both members must finish the
+/// rebalance, and the restarted consumer must consume a record.
 ///
 /// [Kafka documents]: https://kafka.apache.org/39/documentation.html#consumerconfigs_partition.assignment.strategy
 #[test]
@@ -108,12 +106,22 @@ fn restarted_consumer_with_only_cooperative_sticky_joins_a_group_on_the_default_
         );
     }
 
+    let staying_lines_before_restart = staying.line_count();
     let mut restarted = join_with_assignors(
         &cli,
         &topic,
         &group,
         &[PartitionAssignor::CooperativeSticky],
     );
+
+    if let Err(reason) =
+        staying.wait_for_partitions_assigned(staying_lines_before_restart, JOIN_TIMEOUT)
+    {
+        panic!(
+            "the member on the default assignors didn't finish the rebalance after the restarted \
+             member joined: {reason}"
+        );
+    }
 
     if let Err(reason) = restarted.wait_for_records_consumed(0, CONSUME_TIMEOUT) {
         panic!("the restarted member with only cooperative-sticky didn't consume: {reason}");
