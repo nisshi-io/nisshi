@@ -98,10 +98,11 @@ where
             .await
             .inspect_err(|error| debug!(topic = name, ?error))
             .is_ok_and(|metadata| {
-                metadata
-                    .topics()
-                    .first()
-                    .is_some_and(|topic| topic.error_code == i16::from(ErrorCode::None))
+                // A backend can return topics other than the one that the lookup names.
+                metadata.topics().iter().any(|topic| {
+                    topic.name.as_deref() == Some(name)
+                        && topic.error_code == i16::from(ErrorCode::None)
+                })
             })
     }
 }
