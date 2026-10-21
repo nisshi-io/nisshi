@@ -49,7 +49,7 @@ expect() {
 
 # --- Case 1: pull_request -> pr mode, nothing enforced ------------------------
 run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/pull/7/merge IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/pull/7/merge IS_FORK=false
 expect "pr" mode pr
 expect "pr" is_pr true
 expect "pr" is_trunk false
@@ -61,7 +61,7 @@ expect "pr" fossa_revision 0123456789abcdef0123456789abcdef01234567
 
 # --- Case 2: merge_group -> queue mode, NOT trunk ------------------------------
 run EVENT_NAME=merge_group FULL_VERSION_INPUT=v1.2.3-4-gabc \
-    GITHUB_REF=refs/heads/gh-readonly-queue/main/pr-9 IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/gh-readonly-queue/main/pr-9 IS_FORK=false
 expect "queue" mode queue
 expect "queue" is_pr false
 expect "queue" is_trunk false
@@ -78,7 +78,7 @@ fi
 
 # --- Case 3: push -> trunk mode, enforcing -------------------------------------
 run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main IS_FORK=false
 expect "push" mode trunk
 expect "push" is_trunk true
 expect "push" is_queue false
@@ -88,16 +88,16 @@ expect "push" fossa_branch main
 
 # --- Case 4: workflow_dispatch is trunk only when it scans main or a tag ------
 run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main IS_FORK=false
 expect "dispatch-main" mode trunk
 expect "dispatch-main" enforce true
 run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main GIT_REF_INPUT=v0.7.0-pre.2 IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main GIT_REF_INPUT=v0.7.0-pre.2 IS_FORK=false
 expect "dispatch-tag" mode trunk
 expect "dispatch-tag" fossa_branch main
 # Dispatched from a feature branch, or from main with `git_ref` set to one.
 run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3-4-gabc \
-    GITHUB_REF=refs/heads/feature/x IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/feature/x IS_FORK=false
 expect "dispatch-branch" mode branch
 expect "dispatch-branch" is_trunk false
 expect "dispatch-branch" enforce false
@@ -105,23 +105,35 @@ expect "dispatch-branch" fossa_mode REPORT
 expect "dispatch-branch" fossa_branch feature/x
 expect "dispatch-branch" fossa_revision v1.2.3-4-gabc
 run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main GIT_REF_INPUT=maintenance IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main GIT_REF_INPUT=maintenance IS_FORK=false
 expect "dispatch-input-branch" mode branch
 expect "dispatch-input-branch" fossa_branch maintenance
 
-# --- Case 5: FAIL_ON_BLOCKED=false bypasses enforcement on trunk ---------------
-# The release-readiness path: workflow_call runs under the caller's event.
-run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED=false
-expect "bypass" mode trunk
-expect "bypass" enforce false
-expect "bypass" fossa_mode REPORT
+# --- Case 5: a Dependabot PR skips the scans; other runs scan ------------------
+# Its run holds Dependabot's secrets, not the Environment's. Only a PR run
+# skips: a push by the same actor would be trunk and must scan.
+run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+    GITHUB_REF=refs/pull/7/merge IS_FORK=false ACTOR='dependabot[bot]'
+expect "dependabot" mode pr
+expect "dependabot" is_dependabot true
+expect "dependabot" scan false
+run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main IS_FORK=false ACTOR='dependabot[bot]'
+expect "dependabot-push" is_dependabot false
+expect "dependabot-push" scan true
+run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+    GITHUB_REF=refs/pull/7/merge IS_FORK=false ACTOR=someone
+expect "pr-human" scan true
+run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
+    GITHUB_REF=refs/pull/7/merge IS_FORK=true
+expect "pr-fork" scan false
+run EVENT_NAME=merge_group FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/gh-readonly-queue/main/pr-9 IS_FORK=false
+expect "queue-scan" scan false
 
 # --- Case 5a: FOSSA_LICENSING_BLOCK turns off only the licensing block ---------
 # Exactly "false" makes licensing REPORT on trunk while enforce (the Guardian
 # gate) stays on; any other value fails closed.
 run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
-    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED="" FOSSA_LICENSING_BLOCK=false
+    GITHUB_REF=refs/heads/main IS_FORK=false FOSSA_LICENSING_BLOCK=false
 expect "licensing-off" mode trunk
 expect "licensing-off" enforce true
 expect "licensing-off" fossa_mode REPORT
@@ -131,31 +143,52 @@ case "$STDOUT" in
 esac
 for value in true no FALSE; do
   run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
-      GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED="" FOSSA_LICENSING_BLOCK="$value"
+      GITHUB_REF=refs/heads/main IS_FORK=false FOSSA_LICENSING_BLOCK="$value"
   expect "licensing-$value" fossa_mode BLOCK
 done
 run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
-    GITHUB_REF=refs/pull/7/merge IS_FORK=false FAIL_ON_BLOCKED="" FOSSA_LICENSING_BLOCK=false
+    GITHUB_REF=refs/pull/7/merge IS_FORK=false FOSSA_LICENSING_BLOCK=false
 expect "licensing-off-pr" enforce false
 expect "licensing-off-pr" fossa_mode REPORT
 
 # --- Case 6: ref precedence - explicit input wins, else github.ref -------------
 run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main \
-    GIT_REF_INPUT=refs/tags/v9.9.9 IS_FORK=false FAIL_ON_BLOCKED=""
+    GIT_REF_INPUT=refs/tags/v9.9.9 IS_FORK=false
 expect "ref-input" ref refs/tags/v9.9.9
+expect "ref-input" mode trunk
+expect "ref-input" enforce true
 run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main \
-    GIT_REF_INPUT="" IS_FORK=false FAIL_ON_BLOCKED=""
+    GIT_REF_INPUT="" IS_FORK=false
 expect "ref-fallback" ref refs/heads/main
+
+# --- Case 6a: the edges of the trunk regex ---------------------------------------
+# A qualified tag is trunk; a branch that merely contains `main` or a version
+# is not. These pin the anchors and the optional `refs/tags/` prefix.
+for ref in refs/tags/v1.2.3 v1.2.3 refs/tags/v0.7.0-pre.2 main refs/heads/main; do
+  run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main GIT_REF_INPUT="$ref" IS_FORK=false
+  expect "trunk-ref $ref" mode trunk
+  expect "trunk-ref $ref" enforce true
+done
+for ref in refs/heads/feature/main refs/heads/release/v1.2.3 refs/heads/v1.2.3 refs/heads/main2 \
+           refs/tags/v1.2 refs/tags/release-v1.2.3 xmain refs/heads/mainline; do
+  run EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main GIT_REF_INPUT="$ref" IS_FORK=false
+  expect "branch-ref $ref" mode branch
+  expect "branch-ref $ref" enforce false
+done
+
+# --- Case 6b: sha is the checked-out commit -----------------------------------
+run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main IS_FORK=false
+expect "sha" sha "$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
 
 # --- Case 7: FULL_VERSION_INPUT is used verbatim; empty falls back to describe -
 run EVENT_NAME=push FULL_VERSION_INPUT=7.7.7-custom \
-    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main IS_FORK=false
 expect "version-input" full_version 7.7.7-custom
 expect "version-input" fossa_revision 7.7.7-custom
 # Runs `git describe` for real, so this case needs the repo checkout (CI uses
 # fetch-depth: 0). Assert non-empty rather than a value that moves per commit.
 run EVENT_NAME=push FULL_VERSION_INPUT="" \
-    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main IS_FORK=false
 # `v*` only: the repo also carries `tansu-*` and bare `0.x` tags.
 case "$(get full_version)" in
   v*) pass "version-describe: git describe fallback picks a v* tag" ;;
@@ -164,13 +197,13 @@ esac
 
 # --- Case 8: is_fork passes through untouched -----------------------------------
 run EVENT_NAME=pull_request HEAD_SHA=0123456789abcdef0123456789abcdef01234567 FULL_VERSION_INPUT=v1 \
-    GITHUB_REF=refs/pull/7/merge IS_FORK=true FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/pull/7/merge IS_FORK=true
 expect "fork" is_fork true
 
 # --- Case 9: the PR revision is the head SHA, never the branch name ---------
 # shellcheck disable=SC2016 # the literal `$(id)` is the point
 run EVENT_NAME=pull_request HEAD_REF='x";$(id)' HEAD_SHA=0123456789abcdef0123456789abcdef01234567 \
-    FULL_VERSION_INPUT=v1 GITHUB_REF=refs/pull/7/merge IS_FORK=false FAIL_ON_BLOCKED=""
+    FULL_VERSION_INPUT=v1 GITHUB_REF=refs/pull/7/merge IS_FORK=false
 expect "hostile-ref" fossa_revision 0123456789abcdef0123456789abcdef01234567
 
 # --- Case 10: hostile or malformed inputs are rejected, not passed through ----
@@ -186,14 +219,14 @@ run_fails() {
 }
 # shellcheck disable=SC2016 # the literal `$(id)` is the point
 run_fails EVENT_NAME=push FULL_VERSION_INPUT='v1";$(id)' \
-    GITHUB_REF=refs/heads/main IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main IS_FORK=false
 run_fails EVENT_NAME=push FULL_VERSION_INPUT=v1 \
-    GITHUB_REF=refs/heads/main GIT_REF_INPUT=$'main\nenforce=false' IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main GIT_REF_INPUT=$'main\nenforce=false' IS_FORK=false
 # shellcheck disable=SC2016 # the literal `$(id)` is the point
 run_fails EVENT_NAME=workflow_dispatch FULL_VERSION_INPUT=v1 \
-    GITHUB_REF=refs/heads/main GIT_REF_INPUT='x";$(id)' IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/heads/main GIT_REF_INPUT='x";$(id)' IS_FORK=false
 run_fails EVENT_NAME=pull_request HEAD_SHA=abc FULL_VERSION_INPUT=v1 \
-    GITHUB_REF=refs/pull/7/merge IS_FORK=false FAIL_ON_BLOCKED=""
+    GITHUB_REF=refs/pull/7/merge IS_FORK=false
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

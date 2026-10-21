@@ -9,7 +9,7 @@
 # Modes:
 #   pr      pull_request event                 report/diff only, no upload
 #   queue   merge_group event                  scan jobs skip entirely (see the workflow)
-#   trunk   any other event on main or a v* tag  upload + enforce (unless FAIL_ON_BLOCKED=false)
+#   trunk   any other event on main or a v* tag  upload + enforce
 #   branch  any other event on any other ref   report only, no upload, filed under its own branch
 #
 # Env (the workflow maps event context in, never interpolated into a script):
@@ -18,12 +18,15 @@
 #   GITHUB_REF          github.ref
 #   GIT_REF_INPUT       workflow_dispatch / workflow_call `git_ref` input
 #   FULL_VERSION_INPUT  workflow_call `product_full_version` input
-#   FAIL_ON_BLOCKED     workflow_call `fail_on_blocked` input ("false" bypasses)
+#   ACTOR               github.actor
 #   FOSSA_LICENSING_BLOCK  repository variable; "false" makes the FOSSA
 #                       licensing guard report-only on trunk, leaving the
 #                       Guardian gate enforced. Any other value, or unset, blocks.
 #   IS_FORK             "true" for a PR from a fork
 #   GITHUB_OUTPUT       file the outputs are appended to
+#
+# Run from the checkout the scan jobs will use: the commit it is at becomes the
+# `sha` output, which every later job checks out.
 #
 set -euo pipefail
 
@@ -86,9 +89,25 @@ else
   FOSSA_BRANCH="${REF#refs/heads/}"; FOSSA_REVISION="$FULL_VERSION"
 fi
 
-# Enforce (block) only on trunk and only when not bypassed.
-ENFORCE="false"
-if [ "$IS_TRUNK" = "true" ] && [ "${FAIL_ON_BLOCKED:-}" != "false" ]; then ENFORCE="true"; fi
+# The commit setup checked out. Later jobs check out this SHA rather than the
+# ref, so a branch that moves mid-run can't swap in another commit's tree.
+SHA="$(git rev-parse HEAD)"
+if ! [[ "$SHA" =~ $SHA_RE ]]; then
+  echo "::error::checked-out commit '$SHA' is not a 40-character SHA" >&2
+  exit 1
+fi
+
+# A Dependabot-triggered PR run gets Dependabot's secrets, not the `guardian`
+# Environment's, so its scans would fail on empty keys. It skips them like a
+# fork PR; the trunk run after the merge scans the bump.
+IS_DEPENDABOT="false"
+if [ "$MODE" = "pr" ] && [ "${ACTOR:-}" = "dependabot[bot]" ]; then IS_DEPENDABOT="true"; fi
+SCAN="true"
+if [ "${IS_FORK:-false}" = "true" ] || [ "$IS_QUEUE" = "true" ] || [ "$IS_DEPENDABOT" = "true" ]; then SCAN="false"; fi
+
+# Enforce (block) only on trunk. A release that must ship over a block does
+# so through release.yml's override job, not by turning this off.
+ENFORCE="$IS_TRUNK"
 # FOSSA licensing guard: BLOCK when enforcing, else REPORT. Only an exact
 # "false" turns the block off, so a typo in the variable fails closed.
 FOSSA_MODE="REPORT"
@@ -102,7 +121,7 @@ fi
 
 # The line an operator needs when asking "which mode did this run take?" -
 # $GITHUB_OUTPUT is never displayed in the run log.
-echo "Resolved: mode=$MODE event=${EVENT_NAME:-} is_fork=${IS_FORK:-false} enforce=$ENFORCE fossa_mode=$FOSSA_MODE fossa_licensing_block=${FOSSA_LICENSING_BLOCK:-} fossa_branch=$FOSSA_BRANCH"
+echo "Resolved: mode=$MODE event=${EVENT_NAME:-} sha=$SHA is_fork=${IS_FORK:-false} is_dependabot=$IS_DEPENDABOT scan=$SCAN enforce=$ENFORCE fossa_mode=$FOSSA_MODE fossa_licensing_block=${FOSSA_LICENSING_BLOCK:-} fossa_branch=$FOSSA_BRANCH"
 
 # A newline in any value would let it inject extra keys into $GITHUB_OUTPUT.
 emit() {
@@ -114,6 +133,7 @@ emit() {
 
 emit mode "$MODE"
 emit ref "$REF"
+emit sha "$SHA"
 emit fossa_branch "$FOSSA_BRANCH"
 emit fossa_revision "$FOSSA_REVISION"
 emit full_version "$FULL_VERSION"
@@ -121,5 +141,7 @@ emit is_fork "${IS_FORK:-false}"
 emit is_pr "$IS_PR"
 emit is_trunk "$IS_TRUNK"
 emit is_queue "$IS_QUEUE"
+emit is_dependabot "$IS_DEPENDABOT"
+emit scan "$SCAN"
 emit enforce "$ENFORCE"
 emit fossa_mode "$FOSSA_MODE"
