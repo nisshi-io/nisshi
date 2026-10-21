@@ -54,9 +54,9 @@ deletion as (
         when rt.value is null then true
         -- A negative retention.ms keeps every record, because Kafka reads any negative value as no
         -- limit. The broker rejects a value below -1, but a topic created before the broker checked
-        -- the value can hold one. The pattern allows at most 18 digits, so the cast to bigint never
-        -- overflows and fails this statement for every topic.
-        when trim(rt.value) ~ '^-?[0-9]{1,18}$' then cast(rt.value as bigint) >= 0
+        -- the value can hold one. The pattern allows a sign, as Kafka does, and at most 18 digits,
+        -- so the cast to bigint never overflows and fails this statement for every topic.
+        when trim(rt.value) ~ '^[-+]?[0-9]{1,18}$' then cast(rt.value as bigint) >= 0
         -- A retention.ms stored before the broker validated it can be any text. The topic keeps
         -- every record, because casting that text fails this statement for every topic.
         else false

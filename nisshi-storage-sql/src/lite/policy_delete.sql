@@ -30,10 +30,11 @@ deletion as (
     -- A negative retention.ms keeps every record, because Kafka reads any negative value as no
     -- limit. The broker rejects a value below -1, and stores any other as a plain number, but a
     -- topic created before the broker checked the value can hold any text. A value that isn't a
-    -- plain number keeps every record, instead of being cast to 0 and deleting every record.
+    -- number, with an optional sign as Kafka allows, keeps every record, instead of being cast to 0
+    -- and deleting every record.
     and case
         when rt.value is null then 1
-        when (trim(rt.value) glob '[0-9]*' or trim(rt.value) glob '-[0-9]*')
+        when (trim(rt.value) glob '[0-9]*' or trim(rt.value) glob '[-+][0-9]*')
             and substr(trim(rt.value), 2) not glob '*[^0-9]*'
             then cast(trim(rt.value) as integer) >= 0
         else 0
