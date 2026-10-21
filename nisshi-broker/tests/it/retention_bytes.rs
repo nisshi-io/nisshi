@@ -389,10 +389,9 @@ where
     Ok(())
 }
 
-/// A `retention.bytes` that doesn't fit in a long must not stop maintenance trimming another
-/// topic, and must not trim its own topic. The broker rejects such a value, so only a topic created
-/// before the broker checked the value holds it. A broker that fails on it stops maintenance for
-/// every topic, so storage grows until it is full.
+/// A topic whose stored `retention.bytes` doesn't fit in a long keeps every record, and maintenance
+/// still trims the other topics. Maintenance must not fail on the value, because one failure stops
+/// it for every topic.
 pub async fn retention_bytes_stored_value_that_is_not_a_long_does_not_stop_retention<G>(
     sc: G,
 ) -> Result<()>
