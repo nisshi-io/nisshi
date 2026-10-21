@@ -532,6 +532,28 @@ where
     Ok(())
 }
 
+/// A stored `retention.ms` with a `+`, which an earlier broker stored as sent, expires records as
+/// the number. A broker that reads it as no limit keeps every record of a topic that set a limit.
+pub async fn stored_retention_ms_with_a_plus_sign_expires_records<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+    create_topic_without_validation(&sc, topic, &[DELETE_POLICY, ("retention.ms", "+600000")])
+        .await?;
+    produce_records_before_maintenance(&broker, &extensions, topic).await?;
+
+    maintain_an_hour_later(&sc).await?;
+
+    assert_eq!(
+        Some(RECORDS_BEFORE_MAINTENANCE),
+        earliest_offset_after_maintenance(&broker, &extensions, topic).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -625,6 +647,14 @@ macro_rules! backend {
                 let _guard = init_tracing()?;
                 super::retention_ms_with_a_plus_sign_expires_records(storage_container().await?)
                     .await
+            }
+            #[tokio::test]
+            async fn stored_retention_ms_with_a_plus_sign_expires_records() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::stored_retention_ms_with_a_plus_sign_expires_records(
+                    storage_container().await?,
+                )
+                .await
             }
         }
     };
