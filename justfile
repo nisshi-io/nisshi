@@ -603,9 +603,10 @@ compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build
 smoke engine *nextest_args:
     nisshi-smoke-test/run.sh "$@"
 
-compat-franz-go-test tests timeout="600s" count="1":
+# run franz-go tests from the clone in work_dir; an older version's clone is in its own work_dir (see compat/franz-go/README.md)
+compat-franz-go-test tests timeout="600s" count="1" work_dir="target/compat":
     #!/usr/bin/env bash
-    cd target/compat/franz-go/pkg/kgo
+    cd {{ work_dir }}/franz-go/pkg/kgo
     export KGO_TEST_RF=1
     export KGO_LOG_LEVEL=debug
     go test -count={{ count }} -timeout {{ timeout }} -v -run {{ tests }} .

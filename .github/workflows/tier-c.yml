@@ -149,6 +149,9 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # the old version's leg does not open the nightly-failure issue until it
+    # has a record in CI
+    continue-on-error: ${{ matrix.client.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -157,7 +160,7 @@ jobs:
           - suffix: ""
           - suffix: -v2.3.0
             version: v2.3.0
-            tests_allow: compat/librdkafka/tests-v2.3.0.allow
+            experimental: true
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -168,7 +171,6 @@ jobs:
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
       LIBRDKAFKA_VERSION: ${{matrix.client.version}}
-      TESTS_ALLOW: ${{matrix.client.tests_allow}}
       RESULTS_FILE: results-s3${{matrix.client.suffix}}.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn
@@ -232,6 +234,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # as for compat-librdkafka
+    continue-on-error: ${{ matrix.client.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -240,7 +244,7 @@ jobs:
           - suffix: ""
           - suffix: -v1.16.1
             version: v1.16.1
-            tests_allow: compat/franz-go/tests-v1.16.1.allow
+            experimental: true
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -251,7 +255,6 @@ jobs:
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
       FRANZ_GO_VERSION: ${{matrix.client.version}}
-      TESTS_ALLOW: ${{matrix.client.tests_allow}}
       RESULTS_FILE: results-s3${{matrix.client.suffix}}.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn

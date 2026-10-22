@@ -388,9 +388,11 @@ jobs:
     needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.storage.experimental }}
+    continue-on-error: ${{ matrix.storage.experimental || matrix.client.experimental == true }}
     strategy:
-      fail-fast: true
+      # A failed leg must not cancel the others: the report compares each
+      # engine's legs to tell a broker regression from an old-client one.
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -405,12 +407,13 @@ jobs:
         # The version pinned in run.sh, and the newest release on or before
         # Kafka 3.7.0: the oldest Kafka CLI tools that CI tests are 3.7, so
         # every client is tested back to the same date. Tier A runs only the
-        # pinned version, as smoke-oldest-client runs only in Tier B.
+        # pinned version, as smoke-oldest-client runs only in Tier B. The old
+        # version is experimental until its legs have a record in CI.
         client: >-
           ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"suffix": ""}]'
           || '[{"suffix": ""},
-          {"suffix": "-v2.3.0", "version": "v2.3.0", "tests_allow": "compat/librdkafka/tests-v2.3.0.allow"}]') }}
+          {"suffix": "-v2.3.0", "version": "v2.3.0", "experimental": true}]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -420,10 +423,9 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
-      # run.sh falls back to its pinned version and tests.allow when these
-      # are empty
+      # run.sh falls back to its pinned version when this is empty, and picks
+      # the allowlist from the version
       LIBRDKAFKA_VERSION: ${{matrix.client.version}}
-      TESTS_ALLOW: ${{matrix.client.tests_allow}}
       RESULTS_FILE: results-${{matrix.storage.name}}${{matrix.client.suffix}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
       NISSHI_IMAGE: hello-world
@@ -482,7 +484,11 @@ jobs:
           mkdir -p "${DUCKDB_CLI}"
           gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
           chmod +x "${DUCKDB_CLI}/duckdb"
-      - run: echo "## librdkafka compatibility report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          {
+            echo "## librdkafka compatibility report card"
+            echo "A column named \`<engine>-<version>\` ran that librdkafka version; the others ran the version that \`compat/librdkafka/run.sh\` pins. A blank cell is a test that the column's allowlist does not name."
+          } >> "${GITHUB_STEP_SUMMARY}"
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   compat-franz-go:
@@ -490,20 +496,22 @@ jobs:
     needs: [changes]
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.storage.experimental }}
+    continue-on-error: ${{ matrix.storage.experimental || matrix.client.experimental == true }}
     strategy:
-      fail-fast: true
+      # as for compat-librdkafka
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
         storage: *compat_storage
         # The version pinned in run.sh, and the newest release on or before
-        # Kafka 3.7.0, in the same tiers as compat-librdkafka.
+        # Kafka 3.7.0, in the same tiers and with the same experimental
+        # setting as compat-librdkafka.
         client: >-
           ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"suffix": ""}]'
           || '[{"suffix": ""},
-          {"suffix": "-v1.16.1", "version": "v1.16.1", "tests_allow": "compat/franz-go/tests-v1.16.1.allow"}]') }}
+          {"suffix": "-v1.16.1", "version": "v1.16.1", "experimental": true}]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -513,10 +521,9 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
-      # run.sh falls back to its pinned version and tests.allow when these
-      # are empty
+      # run.sh falls back to its pinned version when this is empty, and picks
+      # the allowlist from the version
       FRANZ_GO_VERSION: ${{matrix.client.version}}
-      TESTS_ALLOW: ${{matrix.client.tests_allow}}
       RESULTS_FILE: results-${{matrix.storage.name}}${{matrix.client.suffix}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
       NISSHI_IMAGE: hello-world
@@ -575,7 +582,11 @@ jobs:
           mkdir -p "${DUCKDB_CLI}"
           gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
           chmod +x "${DUCKDB_CLI}/duckdb"
-      - run: echo "## franz-go compatibility report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          {
+            echo "## franz-go compatibility report card"
+            echo "A column named \`<engine>-<version>\` ran that franz-go version; the others ran the version that \`compat/franz-go/run.sh\` pins. A blank cell is a test that the column's allowlist does not name."
+          } >> "${GITHUB_STEP_SUMMARY}"
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   cargo-publish-dry-run:
@@ -692,8 +703,8 @@ jobs:
       STORAGE: ${{matrix.storage}}
     steps:
       # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
+      # a later setup step fails. The report names the leg's column with the
+      # part of the results file name between `results-` and `.csv`.
       - run: |
           kafka=${KAFKA_IMAGE#*:}
           echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
@@ -775,8 +786,8 @@ jobs:
       STORAGE: ${{matrix.storage}}
     steps:
       # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
+      # a later setup step fails. The report names the leg's column with the
+      # part of the results file name between `results-` and `.csv`.
       - run: |
           kafka=${KAFKA_IMAGE#*:}
           echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
