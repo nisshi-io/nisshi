@@ -243,6 +243,27 @@ pub(crate) struct ConnectionManager {
 
 pub(crate) struct PoolConnection {
     connection: Connection,
+
+    /// The statements that this connection has prepared, by query key.
+    statements: Mutex<BTreeMap<String, Arc<Statement>>>,
+}
+
+/// Resets a cached statement when dropped, so that a statement that stopped before its last
+/// row does not keep a read transaction open on the connection.
+struct CachedStatement(Arc<Statement>);
+
+impl Deref for CachedStatement {
+    type Target = Statement;
+
+    fn deref(&self) -> &Statement {
+        &self.0
+    }
+}
+
+impl Drop for CachedStatement {
+    fn drop(&mut self) {
+        self.0.reset();
+    }
 }
 
 impl Debug for PoolConnection {
@@ -319,7 +340,10 @@ impl PoolConnection {
     async fn new(connection: Connection) -> Result<Self> {
         Self::init(&connection).await?;
 
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            statements: Mutex::default(),
+        })
     }
 
     #[instrument(skip(self))]
@@ -330,6 +354,40 @@ impl PoolConnection {
             .ok_or(libsql::Error::Misuse(format!("Unknown cache key: {}", key)))?;
 
         self.connection.prepare(sql).await
+    }
+
+    /// Returns the connection's statement for the query key, preparing it on first use.
+    ///
+    /// libsql's `Connection::prepare` parses and plans the SQL on every call and keeps no
+    /// cache. The statement is reset when the returned guard drops, and a `Row` or `Rows`
+    /// reads its values from the statement, so only a caller that returns no row may use this
+    /// method. A caller that returns a row uses [`Self::prepared_statement`].
+    async fn cached_statement(&self, key: &str) -> Result<CachedStatement, libsql::Error> {
+        let cached = self
+            .statements
+            .lock()
+            .map_err(|_| libsql::Error::Misuse("statement cache lock poisoned".into()))?
+            .get(key)
+            .cloned();
+
+        let statement = match cached {
+            Some(statement) => statement,
+            None => {
+                let statement = Arc::new(self.prepared_statement(key).await?);
+
+                _ = self
+                    .statements
+                    .lock()
+                    .map_err(|_| libsql::Error::Misuse("statement cache lock poisoned".into()))?
+                    .insert(key.to_owned(), statement.clone());
+
+                statement
+            }
+        };
+
+        statement.reset();
+
+        Ok(CachedStatement(statement))
     }
 
     fn attributes_for_error(&self, key: Option<&str>, error: &libsql::Error) -> Vec<KeyValue> {
@@ -419,7 +477,7 @@ impl PoolConnection {
         debug!(sql);
         let start = SystemTime::now();
 
-        let statement = self.prepared_statement(sql).await?;
+        let statement = self.cached_statement(sql).await?;
 
         statement
             .execute(params)
@@ -6386,6 +6444,41 @@ mod tests {
 
         assert_eq!((ErrorCode::None, record_count), delete_up_to(-1).await?);
         assert_eq!((0, None), stored_rows().await?);
+
+        Ok(())
+    }
+
+    /// A connection prepares the SQL of a query key once. A second use of the key gets the same
+    /// statement, with its cursor reset.
+    #[tokio::test]
+    async fn cached_statement_is_prepared_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let key = "maintain-vacuum.sql";
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let db = libsql::Builder::new_local(temp_dir.path().join("nisshi.db"))
+            .build()
+            .await?;
+
+        let pool = Pool::builder(ConnectionManager {
+            db: Arc::new(Mutex::new(db)),
+            busy_timeout: Duration::from_millis(100),
+        })
+        .build()?;
+
+        let connection = pool.get().await?;
+
+        let first = connection.cached_statement(key).await?;
+        let first_statement = first.0.clone();
+        assert!(first.query(()).await?.next().await?.is_some());
+        drop(first);
+
+        let second = connection.cached_statement(key).await?;
+        assert!(Arc::ptr_eq(&first_statement, &second.0));
+        assert!(second.query(()).await?.next().await?.is_some());
+
+        assert_eq!(1, connection.statements.lock().unwrap().len());
 
         Ok(())
     }
