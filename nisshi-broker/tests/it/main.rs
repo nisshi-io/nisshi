@@ -83,6 +83,7 @@ pub mod storage_list_offsets;
 pub mod storage_metadata;
 pub mod storage_offset_commit_timestamp;
 pub mod storage_options;
+pub mod storage_produce_concurrent;
 pub mod tls;
 pub mod topic;
 pub mod topic_lifecycle;
