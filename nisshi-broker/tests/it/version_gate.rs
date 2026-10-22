@@ -141,17 +141,17 @@ async fn full_route_table_has_the_expected_route_count() -> Result<()> {
     let with_storage_routes = storage::services(FrameRouteService::<Error>::builder(), storage)?;
     // The broker does not register a route for GetTelemetrySubscriptions, so it does not
     // advertise the client telemetry APIs.
-    assert_eq!(26, with_storage_routes.len());
+    assert_eq!(24, with_storage_routes.len());
 
     let with_coordinator_routes = coordinator::services(with_storage_routes, coordinator)?;
-    assert_eq!(26 + 7, with_coordinator_routes.len());
+    assert_eq!(24 + 9, with_coordinator_routes.len());
 
     let with_auth_routes = auth::services(with_coordinator_routes)?;
-    assert_eq!(26 + 7 + 2, with_auth_routes.len());
+    assert_eq!(24 + 9 + 2, with_auth_routes.len());
 
     let route_table = with_auth_routes.build().map_err(Error::from)?;
     // `build` adds the `ApiVersions` route itself.
-    assert_eq!(26 + 7 + 2 + 1, route_table.len());
+    assert_eq!(24 + 9 + 2 + 1, route_table.len());
 
     Ok(())
 }
