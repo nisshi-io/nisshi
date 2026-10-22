@@ -53,6 +53,20 @@ DYLD_LIBRARY_PATH=../src:../src-cpp TESTS=0019 TEST_DEBUG=broker,protocol \
 
 `tests.allow` lists tests known to pass. When broker compatibility
 improves, re-sweep the excluded tests and grow the allowlist.
+
+CI also tests librdkafka v2.3.0, the newest release on or before Kafka
+3.7.0, because applications upgrade librdkafka slowly and many link the
+version their distribution packages. Its test numbers and passing tests
+differ, so it has its own allowlist, `tests-v2.3.0.allow`. To run it
+locally:
+
+```shell
+LIBRDKAFKA_VERSION=v2.3.0 TESTS_ALLOW=compat/librdkafka/tests-v2.3.0.allow \
+    WORK_DIR="${PWD}/target/compat-v2.3.0" just compat-librdkafka
+```
+
+`run.sh` stops if the clone in `WORK_DIR` is at another version, so give
+each version its own `WORK_DIR`.
 `FINDINGS.md` records the gaps behind the tests that are still excluded,
 and the ones already fixed (automatic topic creation on MetadataRequest,
 which most of the suite assumes, was implemented 2026-06-11).

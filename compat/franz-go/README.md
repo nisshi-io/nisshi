@@ -40,6 +40,20 @@ KGO_TEST_RF=1 KGO_LOG_LEVEL=debug \
 improves, re-sweep the excluded tests and grow the allowlist.
 `FINDINGS.md` records the gaps behind the tests that are excluded.
 
+CI also tests franz-go v1.16.1, the newest release on or before Kafka
+3.7.0, because applications upgrade franz-go slowly. Its test names and
+passing tests differ, so it has its own allowlist,
+`tests-v1.16.1.allow`. To run it locally:
+
+```shell
+FRANZ_GO_VERSION=v1.16.1 TESTS_ALLOW=compat/franz-go/tests-v1.16.1.allow \
+    WORK_DIR="${PWD}/target/compat-v1.16.1" just compat-franz-go
+```
+
+`run.sh` stops if the clone in `WORK_DIR` is at another version, so give
+each version its own `WORK_DIR`. `WORK_DIR` must be an absolute path,
+because `run.sh` writes its log there after it changes directory.
+
 Some allowlisted tests self-skip against nisshi: the SCRAM tests
 (no `KGO_TEST_SCRAM` configured) and the share-group / KIP-848 tests
 (nisshi does not advertise ShareFetch v2 or ConsumerGroupHeartbeat v1).

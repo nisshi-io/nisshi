@@ -24,6 +24,9 @@ BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-127.0.0.1:9092}"
 # started for this run: the readiness wait fails immediately if it exits
 BROKER_PID="${BROKER_PID:-}"
 COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# an older franz-go has its own allowlist, because its test names and the
+# tests that pass differ
+TESTS_ALLOW="${TESTS_ALLOW:-${COMPAT_DIR}/tests.allow}"
 WORK_DIR="${WORK_DIR:-${COMPAT_DIR}/../../target/compat}"
 SRC_DIR="${WORK_DIR}/franz-go"
 
@@ -43,6 +46,14 @@ mkdir -p "${WORK_DIR}"
 if [[ ! -d "${SRC_DIR}" ]]; then
     git clone --depth 1 --branch "${FRANZ_GO_VERSION}" \
         https://github.com/twmb/franz-go.git "${SRC_DIR}"
+fi
+
+# a clone that an earlier run left at another version would be reused silently
+cloned_tags="$(git -C "${SRC_DIR}" tag --points-at HEAD)"
+if ! grep -qxF "${FRANZ_GO_VERSION}" <<< "${cloned_tags}"; then
+    echo "${SRC_DIR} is not at ${FRANZ_GO_VERSION}:" \
+         "remove it, or set WORK_DIR" >&2
+    exit 1
 fi
 
 # wait for the broker to listen, failing fast if it never does: falling
@@ -77,10 +88,10 @@ if [[ -z "${ready}" ]]; then
                      "after $((SECONDS - started))s"
 fi
 
-tests=$(grep -Ev '^[[:space:]]*(#|$)' "${COMPAT_DIR}/tests.allow" |
+tests=$(grep -Ev '^[[:space:]]*(#|$)' "${TESTS_ALLOW}" |
             awk '{print $1}' | paste -s -d '|' -)
 
-count=$(grep -cEv '^[[:space:]]*(#|$)' "${COMPAT_DIR}/tests.allow")
+count=$(grep -cEv '^[[:space:]]*(#|$)' "${TESTS_ALLOW}")
 echo "running ${count// /} franz-go test(s) against ${BOOTSTRAP_SERVERS}"
 
 cd "${SRC_DIR}/pkg/kgo"
