@@ -338,13 +338,20 @@ impl Engine {
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
         debug!(sql, ?error);
 
-        let _attributes = [
+        vec![
             KeyValue::new("sql", sql.to_owned()),
             KeyValue::new("cluster_id", self.cluster.clone()),
-        ];
+        ]
+    }
 
-        debug!(?error);
-        todo!();
+    /// Counts a failed statement, except for a unique constraint violation, which a caller
+    /// answers with an error code and is not a fault of the engine.
+    fn record_error(&self, sql: &str, error: &turso::Error) {
+        if is_unique_constraint(error) {
+            debug!(?error);
+        } else {
+            SQL_ERROR.add(1, &self.attributes_for_error(sql, error)[..]);
+        }
     }
 
     async fn prepare_execute<P>(
@@ -388,7 +395,7 @@ impl Engine {
                 );
             })
             .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
+                self.record_error(sql, err);
             })
     }
 
@@ -409,11 +416,11 @@ impl Engine {
         let execute_start = SystemTime::now();
 
         let mut rows = statement.query(params).await.inspect_err(|err| {
-            SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
+            self.record_error(sql, err);
         })?;
 
         let row = rows.next().await.inspect_err(|err| {
-            SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
+            self.record_error(sql, err);
         })?;
 
         let attributes = [
@@ -454,7 +461,7 @@ impl Engine {
 
         let mut rows = statement.query(params).await.inspect_err(|err| {
             error!(?err, sql);
-            SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
+            self.record_error(sql, err);
         })?;
 
         if let Some(row) = rows
@@ -463,7 +470,7 @@ impl Engine {
             .inspect(|row| debug!(?row))
             .inspect_err(|err| {
                 error!(?err, sql);
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
+                self.record_error(sql, err);
             })?
         {
             let attributes = [
@@ -1267,22 +1274,18 @@ fn epoch_value(row: &Row, index: usize) -> Result<i16> {
     integer_value(row, index).and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
 }
 
-fn unique_constraint(error_code: ErrorCode) -> impl Fn(turso::Error) -> Error {
-    let _ = error_code;
-    move |err| {
-        let _ = err;
-        todo!()
-        // if let turso::Error::SqliteFailure(code, ref reason) = err {
-        //     debug!(code, reason);
+fn is_unique_constraint(error: &turso::Error) -> bool {
+    matches!(error, turso::Error::Constraint(reason) if reason.contains("UNIQUE constraint failed"))
+}
 
-        //     if code == 2067 {
-        //         Error::Api(error_code)
-        //     } else {
-        //         err.into()
-        //     }
-        // } else {
-        //     err.into()
-        // }
+fn unique_constraint(error_code: ErrorCode) -> impl Fn(turso::Error) -> Error {
+    move |err| {
+        if is_unique_constraint(&err) {
+            debug!(?err);
+            Error::Api(error_code)
+        } else {
+            err.into()
+        }
     }
 }
 
