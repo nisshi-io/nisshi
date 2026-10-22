@@ -1535,10 +1535,12 @@ where
         let described = self
             .storage
             .describe_groups(group_ids, include_authorized_operations)
-            .await?;
+            .await
+            .map(|groups| settled_groups(&self.storage, groups, SystemTime::now()));
 
         Ok(Body::DescribeGroupsResponse(describe_groups_response(
-            &settled_groups(&self.storage, described, SystemTime::now()),
+            described,
+            group_ids,
             include_authorized_operations,
         )))
     }

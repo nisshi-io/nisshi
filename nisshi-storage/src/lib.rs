@@ -428,6 +428,23 @@ pub enum Error {
     OneshotRecv,
 }
 
+impl Error {
+    /// Returns the error code that a group request, such as `ListGroups` or `DescribeGroups`,
+    /// reports when storage fails with this error.
+    ///
+    /// A storage error that carries a code keeps that code. Any other storage error is treated as
+    /// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
+    /// [retry].
+    ///
+    /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
+    pub fn group_request_error_code(&self) -> ErrorCode {
+        match self {
+            Self::Api(error_code) => *error_code,
+            _ => ErrorCode::CoordinatorNotAvailable,
+        }
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
@@ -3028,6 +3045,22 @@ mod tests {
                 ConsumerGroupState::Empty.matches(None),
                 ConsumerGroupState::Empty.matches(Some(&[]))
             )
+        );
+    }
+
+    #[test]
+    fn storage_error_with_a_code_keeps_that_code() {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            Error::Api(ErrorCode::UnknownServerError).group_request_error_code()
+        );
+    }
+
+    #[test]
+    fn other_storage_error_answers_coordinator_not_available() {
+        assert_eq!(
+            ErrorCode::CoordinatorNotAvailable,
+            Error::Message("connection refused".into()).group_request_error_code()
         );
     }
 

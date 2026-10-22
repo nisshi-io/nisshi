@@ -111,42 +111,8 @@ pub fn list_groups_response(
 
             ListGroupsResponse::default()
                 .throttle_time_ms(Some(0))
-                .error_code(list_groups_error_code(&err).into())
+                .error_code(err.group_request_error_code().into())
                 .groups(Some([].into()))
         }
-    }
-}
-
-/// Returns the error code that a `ListGroups` response reports when storage fails with `error`.
-///
-/// A storage error that carries a code keeps that code. Any other storage error is treated as
-/// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients [retry].
-///
-/// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
-fn list_groups_error_code(error: &Error) -> ErrorCode {
-    match error {
-        Error::Api(error_code) => *error_code,
-        _ => ErrorCode::CoordinatorNotAvailable,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn storage_error_with_a_code_keeps_that_code() {
-        assert_eq!(
-            ErrorCode::UnknownServerError,
-            list_groups_error_code(&Error::Api(ErrorCode::UnknownServerError))
-        );
-    }
-
-    #[test]
-    fn other_storage_error_answers_coordinator_not_available() {
-        assert_eq!(
-            ErrorCode::CoordinatorNotAvailable,
-            list_groups_error_code(&Error::Message("connection refused".into()))
-        );
     }
 }
