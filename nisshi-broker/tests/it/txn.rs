@@ -2054,7 +2054,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn simple_txn_commit_offset_abort() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2070,7 +2069,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn simple_txn_commit_offset_commit() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2086,7 +2084,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn simple_txn_produce_commit() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2102,7 +2099,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn simple_txn_produce_abort() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2118,7 +2114,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn with_overlap() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2134,7 +2129,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn init_producer_twice() -> Result<()> {
         let _guard = init_tracing()?;
