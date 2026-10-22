@@ -14,7 +14,7 @@
 
 #[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
 pub(crate) mod consumer_group_select;
-#[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
+#[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
