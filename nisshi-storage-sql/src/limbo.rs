@@ -4131,7 +4131,7 @@ impl From<LiteTimestamp> for SystemTime {
 
 impl From<LiteTimestamp> for Value {
     fn from(value: LiteTimestamp) -> Self {
-        todo!("{value:?}")
+        Value::Integer(to_timestamp(&value.0).unwrap_or_default())
     }
 }
 

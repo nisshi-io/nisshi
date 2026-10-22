@@ -1184,7 +1184,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine cannot bind a timestamp parameter yet"]
     #[tokio::test]
     async fn multiple_record() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1199,7 +1198,6 @@ mod turso {
         super::multiple_record(broker).await
     }
 
-    #[ignore = "the Turso engine cannot bind a timestamp parameter yet"]
     #[tokio::test]
     async fn multi_record_batch() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1230,7 +1228,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine cannot bind a timestamp parameter yet"]
     #[tokio::test]
     async fn single_record() -> Result<()> {
         let _guard = init_tracing()?;
