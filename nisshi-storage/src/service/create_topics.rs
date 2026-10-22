@@ -173,16 +173,14 @@ impl<G> CreateTopicsService<G>
 where
     G: Storage,
 {
-    /// Answers a `validate_only` request for the topic `name` without creating it, as Kafka
-    /// does in [`ReplicationControlManager`]. An existing topic fails with
-    /// `TOPIC_ALREADY_EXISTS` ([`createTopics`][exists]). A new topic succeeds with a random
-    /// topic id ([`createTopic`][topic-id]), and Kafka discards the records that would
-    /// create it ([`createTopics`][discard]).
+    /// Answers a dry run of creating the topic `name`, for a `validate_only` request. The
+    /// dry run checks the topic and does not create it.
     ///
-    /// [`ReplicationControlManager`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java
-    /// [exists]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L601-L604
-    /// [topic-id]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L778
-    /// [discard]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L664-L666
+    /// An existing topic fails with [`ErrorCode::TopicAlreadyExists`]. A new topic succeeds
+    /// with a random topic id instead of the null topic id, because Kafka 3.9.1 answers a
+    /// `validate_only` request with a random id ([`createTopic`]). No stored topic has that id.
+    ///
+    /// [`createTopic`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L778
     async fn dry_run(&self, name: &str) -> Result<Uuid> {
         let metadata = self
             .storage
