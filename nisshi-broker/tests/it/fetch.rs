@@ -2190,7 +2190,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no keyed fetch yet"]
     #[tokio::test]
     async fn compacted_header() -> Result<()> {
         let _guard = init_tracing()?;
