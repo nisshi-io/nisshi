@@ -27,6 +27,7 @@ use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_pa
 
 mod delete_records;
 mod describe_groups;
+mod failing_object_store;
 mod init_producer;
 mod latency;
 mod list_offsets;
