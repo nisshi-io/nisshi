@@ -25,6 +25,7 @@ use crate::common::{lite_storage, postgres_storage, slate_storage};
 use bytes::{BufMut, Bytes, BytesMut};
 use nisshi_broker::{
     Error, Result,
+    otel::capped_env_filter,
     service::{auth, storage},
 };
 use nisshi_sans_io::{
@@ -50,7 +51,7 @@ use rsasl::{
 };
 use sha2::Sha256;
 use tracing::Level;
-use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 use uuid::Uuid;
 
 type Broker = BytesFrameService<FrameRouteService<Error>>;
@@ -106,7 +107,8 @@ impl Capture {
 }
 
 /// Returns the buffer that the process-wide subscriber writes every event and
-/// span to, at TRACE.
+/// span to, at TRACE, with the caps that the broker's own env filter puts on
+/// its dependencies.
 ///
 /// The subscriber is global, not a thread-local default, because the broker
 /// decodes frames on blocking threads, and a thread-local default would miss
@@ -120,7 +122,10 @@ fn capture() -> &'static Capture {
 
         tracing::subscriber::set_global_default(
             tracing_subscriber::fmt()
-                .with_max_level(Level::TRACE)
+                .with_env_filter(
+                    capped_env_filter(EnvFilter::new(Level::TRACE.as_str()))
+                        .expect("the caps of the broker's env filter are valid directives"),
+                )
                 .with_span_events(FmtSpan::FULL)
                 .with_ansi(false)
                 .with_writer(move || writer.clone())
@@ -488,7 +493,6 @@ mod lite {
 mod turso {
     use super::*;
 
-    #[ignore = "the Turso engine logs record keys"]
     #[tokio::test]
     async fn secrets_stay_out_of_logs() -> Result<()> {
         let storage =

@@ -33,15 +33,29 @@ impl Drop for Guard {
     }
 }
 
-/// The default env filter, with `reqsign_core` capped at `info` regardless
-/// of the ambient level. reqsign-core 3.3.2 logs each credential provider it
-/// tries at `debug`, and reqsign-aws-core 3.2.0's `StaticCredentialProvider`
-/// derives `Debug` over `secret_access_key` and `session_token` without
-/// redaction, so `RUST_LOG=debug` (routine when troubleshooting, and what
-/// CI's test job uses) prints AWS secrets in cleartext through this
-/// subscriber's `log` compatibility layer.
+/// The default env filter, with `reqsign_core` and `turso_core` capped at
+/// `info` regardless of the ambient level.
+///
+/// reqsign-core 3.3.2 logs each credential provider it tries at `debug`, and
+/// reqsign-aws-core 3.2.0's `StaticCredentialProvider` derives `Debug` over
+/// `secret_access_key` and `session_token` without redaction, so
+/// `RUST_LOG=debug` (routine when troubleshooting, and what CI's test job
+/// uses) prints AWS secrets in cleartext through this subscriber's `log`
+/// compatibility layer.
+///
+/// turso_core 0.8.3 logs the B-tree cell that it deletes or balances at
+/// `debug`, with the cell's payload, which is the stored record's key and
+/// value, so `RUST_LOG=debug` on a `turso://` broker writes every record that
+/// the broker deletes to the log.
 fn env_filter() -> Result<EnvFilter> {
-    Ok(EnvFilter::from_default_env().add_directive("reqsign_core=info".parse()?))
+    capped_env_filter(EnvFilter::from_default_env())
+}
+
+/// Adds the caps of the default env filter to `filter`.
+pub fn capped_env_filter(filter: EnvFilter) -> Result<EnvFilter> {
+    Ok(filter
+        .add_directive("reqsign_core=info".parse()?)
+        .add_directive("turso_core=info".parse()?))
 }
 
 pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<Guard> {

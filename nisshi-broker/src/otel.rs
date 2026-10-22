@@ -19,6 +19,8 @@ use crate::{Result, TracingFormat};
 
 mod tracing;
 
+pub use tracing::capped_env_filter;
+
 #[derive(Debug)]
 pub struct Guard {
     #[allow(dead_code)]
