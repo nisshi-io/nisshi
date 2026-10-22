@@ -17,6 +17,7 @@ mod consumer_group_describe;
 mod create_acls;
 mod create_topics;
 pub mod deadline;
+mod delete_acls;
 mod delete_groups;
 mod delete_records;
 mod delete_topics;
@@ -55,6 +56,7 @@ pub use create_topics::{
         ValidatedCreateTopicsRequest,
     },
 };
+pub use delete_acls::DeleteAclsService;
 pub use delete_groups::DeleteGroupsService;
 pub use delete_records::DeleteRecordsService;
 pub use delete_topics::DeleteTopicsService;

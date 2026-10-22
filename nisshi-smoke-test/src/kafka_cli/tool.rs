@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 /// A Kafka command-line tool in `/opt/kafka/bin` that the suite runs.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Tool {
+    Acls,
     BrokerApiVersions,
     Cluster,
     Configs,
@@ -36,6 +37,7 @@ impl Tool {
     /// `.sh`.
     pub(super) fn name(self) -> &'static str {
         match self {
+            Self::Acls => "kafka-acls",
             Self::BrokerApiVersions => "kafka-broker-api-versions",
             Self::Cluster => "kafka-cluster",
             Self::Configs => "kafka-configs",
@@ -58,7 +60,8 @@ impl Tool {
             Self::ConsoleProducer | Self::VerifiableProducer => "--producer.config",
             Self::ConsoleConsumer | Self::VerifiableConsumer => "--consumer.config",
             Self::Cluster => "--config",
-            Self::BrokerApiVersions
+            Self::Acls
+            | Self::BrokerApiVersions
             | Self::Configs
             | Self::ConsumerGroups
             | Self::DeleteRecords

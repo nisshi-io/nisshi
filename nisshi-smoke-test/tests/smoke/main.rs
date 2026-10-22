@@ -16,6 +16,7 @@
 
 use std::{fs, path::Path};
 
+pub mod acls;
 pub mod broker_lifecycle;
 pub mod groups;
 pub mod log_cleanup;

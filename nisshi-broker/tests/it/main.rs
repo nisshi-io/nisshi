@@ -74,6 +74,8 @@ pub mod startup_failure;
 pub mod storage_alter_user_scram_credentials;
 pub mod storage_capabilities;
 pub mod storage_create_acls;
+pub mod storage_delete_acls;
+pub mod storage_describe_acls;
 pub mod storage_describe_cluster;
 pub mod storage_describe_configs;
 pub mod storage_fetch;

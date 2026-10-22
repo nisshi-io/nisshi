@@ -49,6 +49,7 @@ use crate::{
     settings,
 };
 
+mod acls;
 mod background_tool;
 mod broker_api_versions;
 mod cluster;
@@ -69,6 +70,8 @@ mod verifiable_producer;
 
 /// The name the tools print for the broker's `TOPIC_ALREADY_EXISTS` error.
 pub const TOPIC_EXISTS_EXCEPTION: &str = "TopicExistsException";
+/// The name the tools print for the broker's `SECURITY_DISABLED` error.
+pub const SECURITY_DISABLED_EXCEPTION: &str = "SecurityDisabledException";
 /// The name the tools print for the broker's `MESSAGE_TOO_LARGE` error.
 pub const RECORD_TOO_LARGE_EXCEPTION: &str = "RecordTooLargeException";
 /// The name the tools print when the broker doesn't list a version of an API that a tool needs.
@@ -83,6 +86,7 @@ pub const GROUP_ID_NOT_FOUND_EXCEPTION: &str = "GroupIdNotFoundException";
 /// The name the tools print for the broker's `NON_EMPTY_GROUP` error.
 pub const GROUP_NOT_EMPTY_EXCEPTION: &str = "GroupNotEmptyException";
 
+pub use acls::KafkaAcls;
 pub use background_tool::{BackgroundTool, PrintedLine, StdoutLines};
 pub use broker_api_versions::{ApiVersions, KafkaBrokerApiVersions};
 pub use cluster::{ClusterId, KafkaCluster};
@@ -181,6 +185,11 @@ impl KafkaCli {
              sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
              username=\"{user}\" password=\"{password}\";\n"
         ))
+    }
+
+    /// Returns `kafka-acls`, run against this broker.
+    pub fn acls(&self) -> KafkaAcls<'_> {
+        KafkaAcls::new(self)
     }
 
     /// Returns `kafka-broker-api-versions`, run against this broker.
