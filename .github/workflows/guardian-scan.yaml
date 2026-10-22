@@ -56,8 +56,12 @@ on:
 # going and one pending, and the pending one is always the newest push, so main's
 # tip still gets scanned while a burst of merges starts one cold release build
 # instead of one per commit. Only the tip's run writes the manifest row anyway.
+#
+# The prefix is a literal, not `github.workflow`: in a called workflow that is the
+# caller's name, so a call from release.yml would land in release.yml's own group
+# and GitHub would cancel it as a deadlock.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || format('{0}@{1}', github.ref, github.sha) }}
+  group: guardian-scan-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || format('{0}@{1}', inputs.git_ref || github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
