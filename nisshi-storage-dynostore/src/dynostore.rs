@@ -49,7 +49,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated, inflated},
     to_system_time, to_timestamp,
@@ -2949,7 +2948,7 @@ impl Storage for DynoStore {
         Ok(responses)
     }
 
-    async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let location = self.group_consumers_prefix();
 
         // `list_with_delimiter` returns a group's committed offsets as a common prefix and its
@@ -2961,32 +2960,56 @@ impl Storage for DynoStore {
             .inspect(|list_result| debug!(?list_result))
             .inspect_err(|error| error!(?error, cluster = self.cluster))?;
 
-        let offsets_segments = list_result
-            .common_prefixes
-            .iter()
-            .filter_map(Path::filename);
-        let state_segments = list_result
+        // A group has a state object once a member joins it, and an offsets folder once it
+        // commits an offset. A group can have either one without the other.
+        let groups_with_state = list_result
             .objects
             .iter()
-            .filter_map(|object| object.location.filename()?.strip_suffix(".json"));
-
-        // The set holds each group that either list names. A group that has committed has both a
-        // common prefix and a state object, and the set keeps one entry for its id.
-        let group_ids = offsets_segments
-            .chain(state_segments)
-            .filter_map(decode_group_segment)
+            .filter_map(|object| {
+                object
+                    .location
+                    .filename()
+                    .and_then(|filename| filename.strip_suffix(".json"))
+                    .and_then(decode_group_segment)
+            })
             .collect::<BTreeSet<_>>();
 
-        Ok(group_ids
-            .into_iter()
-            .map(|group_id| {
-                ListedGroup::default()
-                    .group_id(group_id)
-                    .protocol_type("consumer".into())
-                    .group_state(Some("Unknown".into()))
-                    .group_type(Some("classic".into()))
+        let groups_with_offsets_only = list_result
+            .common_prefixes
+            .iter()
+            .filter_map(|prefix| {
+                prefix
+                    .parts()
+                    .next_back()
+                    .and_then(|segment| decode_group_segment(segment.as_ref()))
             })
-            .collect())
+            .filter(|group_id| !groups_with_state.contains(group_id))
+            .collect::<BTreeSet<_>>();
+
+        let mut listed_groups = groups_with_offsets_only
+            .into_iter()
+            .map(|group_id| NamedGroupDetail::found(group_id, GroupDetail::default()))
+            .collect::<Vec<_>>();
+
+        for group_id in groups_with_state {
+            let stored = match self.group_with_version(&group_id).await {
+                Ok(Some((detail, _))) => Ok(detail),
+
+                // The group was deleted after the listing, so it is left out.
+                Ok(None) => continue,
+
+                // An object store error fails the whole listing instead of listing the group in
+                // the `Unknown` state, because the error is usually transient, and the client
+                // retries the listing.
+                Err(err @ Error::ObjectStore(_)) => return Err(err),
+
+                Err(err) => Err(err),
+            };
+
+            listed_groups.push(NamedGroupDetail::decoded(group_id, Some(stored)));
+        }
+
+        Ok(listed_groups)
     }
 
     async fn delete_groups(

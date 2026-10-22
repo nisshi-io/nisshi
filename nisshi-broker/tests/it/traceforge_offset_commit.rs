@@ -71,8 +71,7 @@ use nisshi_sans_io::{
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated,
+    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
@@ -401,11 +400,8 @@ impl Storage for FaultInjectingStorage {
         self.inner.describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(
-        &self,
-        states_filter: Option<&[String]>,
-    ) -> StorageResult<Vec<ListedGroup>> {
-        self.inner.list_groups(states_filter).await
+    async fn list_groups(&self) -> StorageResult<Vec<NamedGroupDetail>> {
+        self.inner.list_groups().await
     }
 
     async fn delete_groups(

@@ -34,7 +34,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     record::{Record, deflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
@@ -566,8 +565,8 @@ where
         self.storage.describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.storage.list_groups(states_filter).await
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+        self.storage.list_groups().await
     }
 
     async fn delete_groups(
@@ -939,7 +938,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+        async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
             unimplemented!()
         }
 

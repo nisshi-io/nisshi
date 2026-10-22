@@ -40,7 +40,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated::Batch, inflated::Batch as InflatedBatch},
     ser::RecordBatchEncoder,
@@ -1763,11 +1762,7 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        // TODO: Implement states_filter - should filter groups by their state
-        if states_filter.is_some() {
-            tracing::warn!("list_groups state filtering is not implemented, returning all groups");
-        }
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let prefix = postcard::to_stdvec(&GroupKeyPrefix::new())?;
         let mut groups = vec![];
 
@@ -1779,13 +1774,9 @@ impl Storage for Engine {
             }
 
             if let Ok(key) = postcard::from_bytes::<GroupKey>(&kv.key) {
-                groups.push(
-                    ListedGroup::default()
-                        .group_id(key.group_id)
-                        .protocol_type("consumer".into())
-                        .group_state(Some("Unknown".into()))
-                        .group_type(Some("classic".into())),
-                );
+                let stored = GroupDetailVersion::decode(&kv.value).map(|gdv| gdv.detail);
+
+                groups.push(NamedGroupDetail::decoded(key.group_id, Some(stored)));
             }
         }
 

@@ -26,7 +26,10 @@ use std::{
 
 use crate::{
     database_file,
-    sql::{Cache, default_hash, idempotent_sequence_check, remove_comments},
+    sql::{
+        Cache, consumer_group_select, default_hash, idempotent_sequence_check, remove_comments,
+        result_columns::ResultColumns,
+    },
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,7 +52,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
     to_system_time, to_timestamp,
@@ -2947,34 +2949,44 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        debug!(?states_filter);
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
         let mut listed_groups = vec![];
 
         let mut rows = c
             .query(
-                &sql_lookup("consumer_group_select.sql")?,
+                &sql_lookup(consumer_group_select::QUERY)?,
                 &[self.cluster.as_str()],
             )
             .await?;
 
+        let columns = ResultColumns::new(consumer_group_select::QUERY, rows.column_names());
+        let name = columns.index(consumer_group_select::NAME)?;
+        let detail = columns.index(consumer_group_select::DETAIL)?;
+
         while let Some(row) = rows.next().await? {
-            let group_id = row.get_value(0).map_err(Into::into).and_then(|value| {
+            let group_id = row.get_value(name).map_err(Into::into).and_then(|value| {
                 value
                     .as_text()
                     .cloned()
                     .ok_or(Error::UnexpectedValue(value.clone()))
             })?;
 
-            listed_groups.push(
-                ListedGroup::default()
-                    .group_id(group_id)
-                    .protocol_type("consumer".into())
-                    .group_state(Some("unknown".into()))
-                    .group_type(Some("classic".into())),
-            );
+            let detail = row.get_value(detail).map_err(Error::from)?;
+
+            let stored = if detail.is_null() {
+                None
+            } else {
+                Some(
+                    detail
+                        .as_text()
+                        .ok_or(Error::UnexpectedValue(detail.clone()))
+                        .and_then(|text| serde_json::from_str(text).map_err(Error::from)),
+                )
+            };
+
+            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
         }
 
         Ok(listed_groups)

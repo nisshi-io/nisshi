@@ -16,12 +16,20 @@ use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
 };
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, SystemTime},
+};
+
+use bytes::Bytes;
 use nisshi_broker::{Error, Result};
 use nisshi_sans_io::{
     ErrorCode, ListGroupsRequest, RequestInput, create_topics_request::CreatableTopic,
+    join_group_response::JoinGroupResponseMember,
 };
 use nisshi_storage::{
-    ArcDynStorage, GroupDetail, ListGroupsService, OffsetCommitRequest, Storage, Topition,
+    ArcDynStorage, GroupDetail, GroupMember, GroupRebalance, GroupState, JoinPhase,
+    ListGroupsService, OffsetCommitRequest, Storage, Topition,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
@@ -56,14 +64,11 @@ async fn group_without_committed_offsets_is_listed_once(
         .await
         .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
 
-    let groups = storage.list_groups(None).await?;
+    let groups = storage.list_groups().await?;
 
     assert_eq!(
         1,
-        groups
-            .iter()
-            .filter(|group| group.group_id == group_id)
-            .count(),
+        groups.iter().filter(|group| group.name == group_id).count(),
         "expected {group_id:?} exactly once in {groups:?}"
     );
 
@@ -106,15 +111,239 @@ async fn group_with_committed_offsets_is_listed_once(storage: impl Storage + Clo
     assert_eq!(1, commit.len());
     assert_eq!(ErrorCode::None, commit[0].1);
 
-    let groups = storage.list_groups(None).await?;
+    let groups = storage.list_groups().await?;
 
     assert_eq!(
         1,
-        groups
-            .iter()
-            .filter(|group| group.group_id == group_id)
-            .count(),
+        groups.iter().filter(|group| group.name == group_id).count(),
         "expected {group_id:?} exactly once in {groups:?}"
+    );
+
+    Ok(())
+}
+
+/// Returns a detail with one member, in the given group state and join phase.
+fn detail_with_one_member(
+    member_id: &str,
+    state: GroupState,
+    join_phase: Option<JoinPhase>,
+) -> GroupDetail {
+    GroupDetail {
+        members: [(
+            member_id.into(),
+            GroupMember {
+                join_response: JoinGroupResponseMember::default().member_id(member_id.into()),
+                last_contact: Some(SystemTime::now()),
+            },
+        )]
+        .into(),
+        generation_id: 1,
+        state,
+        rebalance: Box::new(GroupRebalance {
+            join_phase,
+            ..GroupRebalance::default()
+        }),
+        ..GroupDetail::default()
+    }
+}
+
+/// Returns a forming group state with the `consumer` protocol type and `range` protocol.
+fn forming_group_state(leader: Option<String>) -> GroupState {
+    GroupState::Forming {
+        protocol_type: Some("consumer".into()),
+        protocol_name: Some("range".into()),
+        leader,
+    }
+}
+
+/// Commits offset 1 on partition 0 of `topic_name` for `group_id`.
+async fn commit_offset(
+    storage: &impl Storage,
+    topic_name: &str,
+    group_id: &str,
+) -> nisshi_storage::Result<Vec<(Topition, ErrorCode)>> {
+    storage
+        .offset_commit(
+            group_id,
+            None,
+            &[(
+                Topition::new(topic_name.to_owned(), 0),
+                OffsetCommitRequest::default().offset(1),
+            )],
+        )
+        .await
+}
+
+/// The ids of the groups that [`store_group_in_each_state`] stores, one for each state that
+/// `ListGroups` reports.
+struct StoredGroupIds {
+    /// A group with a formed state and committed offsets.
+    stable: String,
+    /// A group with the default detail.
+    empty: String,
+    /// A forming group without a leader, in a join phase.
+    preparing_rebalance: String,
+    /// A forming group with a leader, after its join phase.
+    completing_rebalance: String,
+    /// A group with committed offsets and no stored detail.
+    offsets_only: String,
+}
+
+/// Stores `detail` under a new group id, and returns that id.
+async fn store_group(storage: &impl Storage, detail: GroupDetail) -> Result<String> {
+    let group_id = alphanumeric_string(15);
+
+    _ = storage
+        .update_group(&group_id, detail, None)
+        .await
+        .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
+
+    Ok(group_id)
+}
+
+/// Stores a group in each state that `ListGroups` reports, and returns their ids.
+async fn store_group_in_each_state(storage: &impl Storage) -> Result<StoredGroupIds> {
+    let member_id = alphanumeric_string(15);
+
+    let topic_name = alphanumeric_string(15);
+
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let stable = store_group(
+        storage,
+        detail_with_one_member(
+            &member_id,
+            GroupState::Formed {
+                protocol_type: "consumer".into(),
+                protocol_name: "range".into(),
+                leader: member_id.clone(),
+                assignments: [(member_id.clone(), Bytes::new())].into(),
+            },
+            None,
+        ),
+    )
+    .await?;
+
+    // The stable group also has committed offsets. A storage engine can store a group's detail
+    // and its offsets apart, and `ListGroups` must still list the group once.
+    _ = commit_offset(storage, &topic_name, &stable).await?;
+
+    let empty = store_group(storage, GroupDetail::default()).await?;
+
+    let preparing_rebalance = store_group(
+        storage,
+        detail_with_one_member(
+            &member_id,
+            forming_group_state(None),
+            Some(JoinPhase {
+                deadline: SystemTime::now() + Duration::from_secs(60),
+                joined: BTreeSet::new(),
+                initial_delay: None,
+            }),
+        ),
+    )
+    .await?;
+
+    let completing_rebalance = store_group(
+        storage,
+        detail_with_one_member(
+            &member_id,
+            forming_group_state(Some(member_id.clone())),
+            None,
+        ),
+    )
+    .await?;
+
+    let offsets_only = alphanumeric_string(15);
+    _ = commit_offset(storage, &topic_name, &offsets_only).await?;
+
+    Ok(StoredGroupIds {
+        stable,
+        empty,
+        preparing_rebalance,
+        completing_rebalance,
+        offsets_only,
+    })
+}
+
+/// Returns the state of each group that `ListGroups` lists for `states_filter`.
+async fn listed_state_by_group(
+    storage: impl Storage + Clone,
+    states_filter: Option<Vec<String>>,
+) -> Result<BTreeMap<String, String>> {
+    let response = ListGroupsService { storage }
+        .serve(RequestInput {
+            request: ListGroupsRequest::default().states_filter(states_filter),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+
+    let listed_groups = response.groups.unwrap_or_default();
+
+    let state_by_group = listed_groups
+        .iter()
+        .map(|group| {
+            (
+                group.group_id.clone(),
+                group.group_state.clone().unwrap_or_default(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(
+        listed_groups.len(),
+        state_by_group.len(),
+        "a group is listed more than once: {listed_groups:?}"
+    );
+
+    Ok(state_by_group)
+}
+
+/// Listing the groups must show each group's state, so an operator can see which groups are
+/// running, idle or rebalancing. The broker must answer `ListGroups` with the state of each
+/// group, from the group's stored detail.
+async fn lists_each_group_with_its_state(storage: impl Storage + Clone) -> Result<()> {
+    let groups = store_group_in_each_state(&storage).await?;
+
+    // `ListGroups` reports a group that has committed offsets and no stored detail as `Empty`.
+    let expected = BTreeMap::from([
+        (groups.stable, "Stable".into()),
+        (groups.empty, "Empty".into()),
+        (groups.preparing_rebalance, "PreparingRebalance".into()),
+        (groups.completing_rebalance, "CompletingRebalance".into()),
+        (groups.offsets_only, "Empty".into()),
+    ]);
+
+    assert_eq!(expected, listed_state_by_group(storage, None).await?);
+
+    Ok(())
+}
+
+/// Listing the groups in a state must show only the groups in that state, so an operator can find
+/// the groups that are running. The broker must leave out of `ListGroups` each group whose state
+/// is not in the request's state filter.
+async fn states_filter_lists_only_groups_in_that_state(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let groups = store_group_in_each_state(&storage).await?;
+
+    let expected = BTreeMap::from([(groups.stable, "Stable".into())]);
+
+    assert_eq!(
+        expected,
+        listed_state_by_group(storage, Some(vec!["Stable".into()])).await?
     );
 
     Ok(())
@@ -169,16 +398,16 @@ async fn empty_group_id_is_not_surfaced_as_phantom_group(
     assert_eq!(1, commit.len());
     assert_eq!(ErrorCode::None, commit[0].1);
 
-    let groups = storage.list_groups(None).await?;
+    let groups = storage.list_groups().await?;
 
     assert!(
-        groups.iter().any(|group| group.group_id.is_empty()),
+        groups.iter().any(|group| group.name.is_empty()),
         "expected a group with id \"\" in {groups:?}"
     );
 
     for phantom in ["consumers", "offsets", "%empty"] {
         assert!(
-            !groups.iter().any(|group| group.group_id == phantom),
+            !groups.iter().any(|group| group.name == phantom),
             "list_groups surfaced a phantom group named {phantom:?}: {groups:?}"
         );
     }
@@ -198,20 +427,17 @@ async fn empty_group_id_without_committed_offsets_is_listed(
         .await
         .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
 
-    let groups = storage.list_groups(None).await?;
+    let groups = storage.list_groups().await?;
 
     assert_eq!(
         1,
-        groups
-            .iter()
-            .filter(|group| group.group_id.is_empty())
-            .count(),
+        groups.iter().filter(|group| group.name.is_empty()).count(),
         "expected a group with id \"\" exactly once in {groups:?}"
     );
 
     for phantom in ["%empty", "%empty.json"] {
         assert!(
-            !groups.iter().any(|group| group.group_id == phantom),
+            !groups.iter().any(|group| group.name == phantom),
             "list_groups surfaced a phantom group named {phantom:?}: {groups:?}"
         );
     }
@@ -235,14 +461,14 @@ async fn state_only_group_ids_are_decoded(storage: impl Storage + Clone) -> Resu
             .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
     }
 
-    let groups = storage.list_groups(None).await?;
+    let groups = storage.list_groups().await?;
 
     for group_id in &group_ids {
         assert_eq!(
             1,
             groups
                 .iter()
-                .filter(|group| &group.group_id == group_id)
+                .filter(|group| &group.name == group_id)
                 .count(),
             "expected {group_id:?} exactly once in {groups:?}"
         );
@@ -300,6 +526,34 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::group_with_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_each_group_with_its_state() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::lists_each_group_with_its_state(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn states_filter_lists_only_groups_in_that_state() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::states_filter_lists_only_groups_in_that_state(storage).await?;
 
         Ok(())
     }
@@ -396,6 +650,34 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::group_with_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_each_group_with_its_state() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::lists_each_group_with_its_state(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn states_filter_lists_only_groups_in_that_state() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::states_filter_lists_only_groups_in_that_state(storage).await?;
 
         Ok(())
     }
@@ -504,6 +786,34 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::group_with_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_each_group_with_its_state() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::lists_each_group_with_its_state(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn states_filter_lists_only_groups_in_that_state() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::states_filter_lists_only_groups_in_that_state(storage).await?;
 
         Ok(())
     }

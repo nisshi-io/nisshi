@@ -81,9 +81,9 @@ where
     assert!(co_tps.contains_key(&topition));
     assert_eq!(Some(&offset), co_tps.get(&topition));
 
-    let groups = sc.list_groups(None).await?;
+    let groups = sc.list_groups().await?;
     assert_eq!(1, groups.len());
-    assert_eq!(group_id, groups[0].group_id);
+    assert_eq!(group_id, groups[0].name);
 
     Ok(())
 }
@@ -294,7 +294,7 @@ where
     assert!(offset_fetch.contains_key(&topition));
     assert_eq!(Some(&-1), offset_fetch.get(&topition));
 
-    let groups = sc.list_groups(None).await?;
+    let groups = sc.list_groups().await?;
     assert_eq!(0, groups.len());
 
     Ok(())
@@ -326,7 +326,7 @@ where
     assert!(offset_fetch.contains_key(&topition));
     assert_eq!(Some(&-1), offset_fetch.get(&topition));
 
-    let groups = sc.list_groups(None).await?;
+    let groups = sc.list_groups().await?;
     assert_eq!(0, groups.len());
 
     Ok(())
@@ -338,7 +338,7 @@ where
 {
     register_broker(cluster_id, broker_id, &sc).await?;
 
-    let groups = sc.list_groups(None).await?;
+    let groups = sc.list_groups().await?;
     assert_eq!(0, groups.len());
 
     Ok(())

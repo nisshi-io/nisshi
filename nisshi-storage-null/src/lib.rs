@@ -35,7 +35,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::deflated::Batch,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
@@ -341,7 +340,7 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         Ok([].into())
     }
 

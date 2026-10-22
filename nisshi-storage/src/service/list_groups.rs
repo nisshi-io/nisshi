@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse, RequestInput};
+use nisshi_sans_io::{
+    ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse, RequestInput,
+    list_groups_response::ListedGroup,
+};
 use rama::Service;
-use tracing::instrument;
+use tracing::{error, instrument};
 
-use crate::{Error, Result, Storage};
+use crate::{ConsumerGroupState, Error, Result, Storage};
 
 /// A [`Service`] using its [`Storage`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
 /// ```no_run
@@ -72,16 +75,66 @@ where
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
+        let states_filter = input.request.states_filter.as_deref();
 
-        self.storage
-            .list_groups(input.request.states_filter.as_deref())
-            .await
-            .map(Some)
-            .map(|groups| {
-                ListGroupsResponse::default()
+        match self.storage.list_groups().await {
+            Ok(groups) => {
+                let groups = groups
+                    .iter()
+                    .filter(|group| ConsumerGroupState::from(*group).matches(states_filter))
+                    .map(ListedGroup::from)
+                    .collect::<Vec<_>>();
+
+                Ok(ListGroupsResponse::default()
                     .throttle_time_ms(Some(0))
                     .error_code(ErrorCode::None.into())
-                    .groups(groups)
-            })
+                    .groups(Some(groups)))
+            }
+
+            // The service answers a storage error with an error code instead of returning it,
+            // because the connection closes on a returned error, and the client gets no answer.
+            Err(err) => {
+                error!(?err);
+
+                Ok(ListGroupsResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(list_groups_error_code(&err).into())
+                    .groups(Some([].into())))
+            }
+        }
+    }
+}
+
+/// Returns the error code that a `ListGroups` response reports when storage fails with `error`.
+///
+/// A storage error that carries a code keeps that code. Any other storage error is treated as
+/// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients [retry].
+///
+/// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
+fn list_groups_error_code(error: &Error) -> ErrorCode {
+    match error {
+        Error::Api(error_code) => *error_code,
+        _ => ErrorCode::CoordinatorNotAvailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_error_with_a_code_keeps_that_code() {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            list_groups_error_code(&Error::Api(ErrorCode::UnknownServerError))
+        );
+    }
+
+    #[test]
+    fn other_storage_error_answers_coordinator_not_available() {
+        assert_eq!(
+            ErrorCode::CoordinatorNotAvailable,
+            list_groups_error_code(&Error::Message("connection refused".into()))
+        );
     }
 }

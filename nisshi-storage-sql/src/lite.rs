@@ -15,7 +15,10 @@
 use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
-    sql::{Cache, default_hash, idempotent_sequence_check, remove_comments},
+    sql::{
+        Cache, consumer_group_select, default_hash, idempotent_sequence_check, remove_comments,
+        result_columns::ResultColumns,
+    },
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -43,7 +46,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
     to_system_time, to_timestamp,
@@ -2023,9 +2025,9 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let start = SystemTime::now();
-        self.inner.list_groups(states_filter).await.inspect(|_| {
+        self.inner.list_groups().await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
                 &[KeyValue::new("operation", "list_groups")],
@@ -4196,29 +4198,35 @@ impl Storage for Delegate {
         })
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let start = SystemTime::now();
-
-        debug!(?states_filter);
 
         let c = self.connection().await?;
 
         let mut listed_groups = vec![];
 
         let mut rows = c
-            .query("consumer_group_select.sql", &[self.cluster.as_str()])
+            .query(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        while let Some(row) = rows.next().await? {
-            let group_id = row.get_str(0)?;
+        let columns = ResultColumns::new(
+            consumer_group_select::QUERY,
+            (0..rows.column_count())
+                .map(|index| rows.column_name(index).unwrap_or_default().to_owned())
+                .collect(),
+        );
+        let name = columns.index(consumer_group_select::NAME)? as i32;
+        let detail = columns.index(consumer_group_select::DETAIL)? as i32;
 
-            listed_groups.push(
-                ListedGroup::default()
-                    .group_id(group_id.to_owned())
-                    .protocol_type("consumer".into())
-                    .group_state(Some("unknown".into()))
-                    .group_type(Some("classic".into())),
-            );
+        while let Some(row) = rows.next().await? {
+            let group_id = row.get_str(name)?.to_owned();
+
+            let stored = row
+                .get::<Option<String>>(detail)
+                .map_err(Error::from)?
+                .map(|detail| serde_json::from_str::<GroupDetail>(&detail));
+
+            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
         }
 
         Ok(listed_groups).inspect(|_| {

@@ -670,8 +670,8 @@ async fn empty_group_id_mixed_list(
         .await?;
     assert_eq!(Some(&offset_a), offset_fetch.get(&topition));
 
-    let groups = storage.list_groups(None).await?;
-    assert!(groups.iter().any(|group| group.group_id == group_a));
+    let groups = storage.list_groups().await?;
+    assert!(groups.iter().any(|group| group.name == group_a));
 
     let described = storage
         .describe_groups(Some(slice::from_ref(&group_a)), false)
@@ -991,8 +991,7 @@ mod unreadable_groups {
         describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
         fetch_response::AbortedTransaction,
         incremental_alter_configs_request::AlterConfigsResource,
-        incremental_alter_configs_response::AlterConfigsResourceResponse,
-        list_groups_response::ListedGroup, record::deflated,
+        incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
     use nisshi_storage::{
@@ -1156,8 +1155,8 @@ mod unreadable_groups {
             self.storage.describe_config(name, resource, keys).await
         }
 
-        async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-            self.storage.list_groups(states_filter).await
+        async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+            self.storage.list_groups().await
         }
 
         async fn delete_groups(

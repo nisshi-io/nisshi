@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
+pub(crate) mod consumer_group_select;
+#[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
+pub(crate) mod result_columns;
+
 use nisshi_sans_io::{ErrorCode, record::deflated};
 use nisshi_storage::{Error, Result};
 use std::{

@@ -54,7 +54,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated::Batch},
     to_system_time, to_timestamp,
@@ -102,7 +101,7 @@ use uuid::Uuid;
 
 use crate::{
     schema::{RecordedSchema, should_create_schema},
-    sql::{default_hash, idempotent_sequence_check},
+    sql::{consumer_group_select, default_hash, idempotent_sequence_check},
 };
 
 pub mod factory;
@@ -4424,27 +4423,23 @@ impl Storage for Postgres {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        debug!(?states_filter);
-
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
         let mut listed_groups = vec![];
 
         for row in self
-            .prepare_query(&c, "consumer_group_select.sql", &[&self.cluster])
+            .prepare_query(&c, consumer_group_select::QUERY, &[&self.cluster])
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let group_id = row.try_get::<_, String>(0)?;
+            let group_id = row.try_get::<_, String>(consumer_group_select::NAME)?;
 
-            listed_groups.push(
-                ListedGroup::default()
-                    .group_id(group_id)
-                    .protocol_type("consumer".into())
-                    .group_state(Some("unknown".into()))
-                    .group_type(Some("classic".into())),
-            );
+            let stored = row
+                .try_get::<_, Option<Value>>(consumer_group_select::DETAIL)?
+                .map(serde_json::from_value::<GroupDetail>);
+
+            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
         }
 
         Ok(listed_groups)

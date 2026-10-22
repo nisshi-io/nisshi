@@ -63,7 +63,6 @@ fn list_includes_a_group_that_consumed() {
 /// operator can find the groups that are running, or the ones that are idle. The broker must
 /// answer `ListGroups` with each group's state, and apply the state filter.
 #[test]
-#[ignore = "ListGroups answers every group's state as Unknown, and ignores the state filter (#960)"]
 fn list_by_state_shows_only_groups_in_that_state() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);

@@ -28,8 +28,7 @@ use nisshi_sans_io::{
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated,
+    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use rand::{prelude::*, rngs::SmallRng};
@@ -267,10 +266,10 @@ where
         self.storage.describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         self.introduce_latency().await?;
 
-        self.storage.list_groups(states_filter).await
+        self.storage.list_groups().await
     }
 
     async fn delete_groups(

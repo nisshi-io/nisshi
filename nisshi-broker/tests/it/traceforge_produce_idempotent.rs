@@ -82,7 +82,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{
         Record,
@@ -516,11 +515,8 @@ impl Storage for FaultInjectingProduceStorage {
         self.inner.describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(
-        &self,
-        states_filter: Option<&[String]>,
-    ) -> StorageResult<Vec<ListedGroup>> {
-        self.inner.list_groups(states_filter).await
+    async fn list_groups(&self) -> StorageResult<Vec<NamedGroupDetail>> {
+        self.inner.list_groups().await
     }
 
     async fn delete_groups(

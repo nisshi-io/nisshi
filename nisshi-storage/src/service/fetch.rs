@@ -1094,7 +1094,6 @@ mod tests {
         fetch_response::{AbortedTransaction, PartitionData},
         incremental_alter_configs_request::AlterConfigsResource,
         incremental_alter_configs_response::AlterConfigsResourceResponse,
-        list_groups_response::ListedGroup,
         metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         record::{Record, deflated, inflated},
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
@@ -1236,7 +1235,7 @@ mod tests {
                     unimplemented!()
                 }
 
-                async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+                async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
                     unimplemented!()
                 }
 
