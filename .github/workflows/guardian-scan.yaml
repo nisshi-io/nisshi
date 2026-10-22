@@ -57,9 +57,12 @@ on:
 # tip still gets scanned while a burst of merges starts one cold release build
 # instead of one per commit. Only the tip's run writes the manifest row anyway.
 #
-# The prefix is a literal, not `github.workflow`: in a called workflow that is the
-# caller's name, so a call from release.yml would land in release.yml's own group
-# and GitHub would cancel it as a deadlock.
+# The prefix is a literal because in a called run `github.workflow` is the
+# caller's name, so the group is named after this workflow whoever calls it.
+# The fallback key uses the scanned ref (`git_ref`) when there is one: a dispatch
+# of release-readiness-check.yaml from main that scans a tag must not share a
+# group with main's push scan of the same commit, because GitHub cancels a
+# pending run in a group when a newer one arrives.
 concurrency:
   group: guardian-scan-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || format('{0}@{1}', inputs.git_ref || github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
