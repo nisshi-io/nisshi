@@ -22,14 +22,17 @@ use std::{
 };
 
 use bytes::Bytes;
-use nisshi_broker::{Error, Result};
+use nisshi_broker::{
+    Error, Result,
+    coordinator::group::{Coordinator, administrator::Controller},
+};
 use nisshi_sans_io::{
-    ErrorCode, ListGroupsRequest, RequestInput, create_topics_request::CreatableTopic,
-    join_group_response::JoinGroupResponseMember,
+    ErrorCode, ListGroupsRequest, ListGroupsResponse, RequestInput,
+    create_topics_request::CreatableTopic, join_group_response::JoinGroupResponseMember,
 };
 use nisshi_storage::{
     ArcDynStorage, GroupDetail, GroupMember, GroupRebalance, GroupState, JoinPhase,
-    ListGroupsService, OffsetCommitRequest, Storage, Topition,
+    ListGroupsService, OffsetCommitRequest, PendingSync, Storage, Topition,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
@@ -122,11 +125,11 @@ async fn group_with_committed_offsets_is_listed_once(storage: impl Storage + Clo
     Ok(())
 }
 
-/// Returns a detail with one member, in the given group state and join phase.
+/// Returns a detail with one member, in the given group state and rebalance.
 fn detail_with_one_member(
     member_id: &str,
     state: GroupState,
-    join_phase: Option<JoinPhase>,
+    rebalance: GroupRebalance,
 ) -> GroupDetail {
     GroupDetail {
         members: [(
@@ -139,10 +142,7 @@ fn detail_with_one_member(
         .into(),
         generation_id: 1,
         state,
-        rebalance: Box::new(GroupRebalance {
-            join_phase,
-            ..GroupRebalance::default()
-        }),
+        rebalance: Box::new(rebalance),
         ..GroupDetail::default()
     }
 }
@@ -183,7 +183,7 @@ struct StoredGroupIds {
     empty: String,
     /// A forming group without a leader, in a join phase.
     preparing_rebalance: String,
-    /// A forming group with a leader, after its join phase.
+    /// A forming group with a leader, waiting for its members to sync.
     completing_rebalance: String,
     /// A group with committed offsets and no stored detail.
     offsets_only: String,
@@ -229,7 +229,7 @@ async fn store_group_in_each_state(storage: &impl Storage) -> Result<StoredGroup
                 leader: member_id.clone(),
                 assignments: [(member_id.clone(), Bytes::new())].into(),
             },
-            None,
+            GroupRebalance::default(),
         ),
     )
     .await?;
@@ -245,11 +245,14 @@ async fn store_group_in_each_state(storage: &impl Storage) -> Result<StoredGroup
         detail_with_one_member(
             &member_id,
             forming_group_state(None),
-            Some(JoinPhase {
-                deadline: SystemTime::now() + Duration::from_secs(60),
-                joined: BTreeSet::new(),
-                initial_delay: None,
-            }),
+            GroupRebalance {
+                join_phase: Some(JoinPhase {
+                    deadline: SystemTime::now() + Duration::from_secs(60),
+                    joined: BTreeSet::new(),
+                    initial_delay: None,
+                }),
+                ..GroupRebalance::default()
+            },
         ),
     )
     .await?;
@@ -259,7 +262,13 @@ async fn store_group_in_each_state(storage: &impl Storage) -> Result<StoredGroup
         detail_with_one_member(
             &member_id,
             forming_group_state(Some(member_id.clone())),
-            None,
+            GroupRebalance {
+                pending_sync: Some(PendingSync {
+                    deadline: SystemTime::now() + Duration::from_secs(60),
+                    members: [member_id.clone()].into(),
+                }),
+                ..GroupRebalance::default()
+            },
         ),
     )
     .await?;
@@ -276,17 +285,15 @@ async fn store_group_in_each_state(storage: &impl Storage) -> Result<StoredGroup
     })
 }
 
-/// Returns the state of each group that `ListGroups` lists for `states_filter`.
+/// Returns the state of each group that the group coordinator lists for `states_filter`.
 async fn listed_state_by_group(
     storage: impl Storage + Clone,
     states_filter: Option<Vec<String>>,
 ) -> Result<BTreeMap<String, String>> {
-    let response = ListGroupsService { storage }
-        .serve(RequestInput {
-            request: ListGroupsRequest::default().states_filter(states_filter),
-            extensions: Extensions::default(),
-        })
-        .await?;
+    let response: ListGroupsResponse = Controller::with_storage(storage)?
+        .list_groups(states_filter.as_deref())
+        .await
+        .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
 
     assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
 
@@ -345,6 +352,72 @@ async fn states_filter_lists_only_groups_in_that_state(
         expected,
         listed_state_by_group(storage, Some(vec!["Stable".into()])).await?
     );
+
+    Ok(())
+}
+
+/// A group whose consumers stopped without sending `LeaveGroup` must be listed as `Empty` once
+/// their sessions expire, as Kafka lists it, so an operator can find the abandoned group. The
+/// broker must remove each member whose session has expired before it reports the group's state,
+/// also when no member has sent a request since.
+async fn group_whose_sessions_expired_is_listed_as_empty(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let member_id = alphanumeric_string(15);
+
+    let mut detail = detail_with_one_member(
+        &member_id,
+        GroupState::Formed {
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            leader: member_id.clone(),
+            assignments: [(member_id.clone(), Bytes::new())].into(),
+        },
+        GroupRebalance::default(),
+    );
+
+    let session_timeout = Duration::from_millis(u64::try_from(detail.session_timeout_ms)?);
+
+    for member in detail.members.values_mut() {
+        member.last_contact = Some(SystemTime::now() - session_timeout - Duration::from_secs(1));
+    }
+
+    let group_id = store_group(&storage, detail).await?;
+
+    let listed = listed_state_by_group(storage, None).await?;
+
+    assert_eq!(Some(&"Empty".into()), listed.get(&group_id));
+
+    Ok(())
+}
+
+/// A group whose join phase has passed its deadline must not be listed as rebalancing, because
+/// Kafka ends the phase at its deadline. A group whose last member leaves during the initial
+/// rebalance delay keeps its join phase in storage until a request ends it. The broker must end
+/// the phase before it reports the group's state, so the group is listed as `Empty`.
+async fn group_past_its_join_deadline_is_listed_as_empty(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let group_id = store_group(
+        &storage,
+        GroupDetail {
+            state: forming_group_state(None),
+            rebalance: Box::new(GroupRebalance {
+                join_phase: Some(JoinPhase {
+                    deadline: SystemTime::now() - Duration::from_secs(1),
+                    joined: BTreeSet::new(),
+                    initial_delay: None,
+                }),
+                ..GroupRebalance::default()
+            }),
+            ..GroupDetail::default()
+        },
+    )
+    .await?;
+
+    let listed = listed_state_by_group(storage, None).await?;
+
+    assert_eq!(Some(&"Empty".into()), listed.get(&group_id));
 
     Ok(())
 }
@@ -559,6 +632,34 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn group_whose_sessions_expired_is_listed_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_whose_sessions_expired_is_listed_as_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_past_its_join_deadline_is_listed_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_past_its_join_deadline_is_listed_as_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn empty_group_id_is_not_surfaced_as_phantom_group() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -678,6 +779,34 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::states_filter_lists_only_groups_in_that_state(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_whose_sessions_expired_is_listed_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_whose_sessions_expired_is_listed_as_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_past_its_join_deadline_is_listed_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_past_its_join_deadline_is_listed_as_empty(storage).await?;
 
         Ok(())
     }
@@ -814,6 +943,34 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::states_filter_lists_only_groups_in_that_state(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_whose_sessions_expired_is_listed_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_whose_sessions_expired_is_listed_as_empty(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_past_its_join_deadline_is_listed_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_past_its_join_deadline_is_listed_as_empty(storage).await?;
 
         Ok(())
     }

@@ -19,7 +19,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::instrument;
 
-use crate::{Error, Result, Storage, authorized_operations};
+use crate::{Error, NamedGroupDetail, Result, Storage, authorized_operations};
 
 /// A [`Service`] using its [`Storage`] taking [`DescribeGroupsRequest`] returning [`DescribeGroupsResponse`].
 /// ```no_run
@@ -86,24 +86,27 @@ where
                 include_authorized_operations,
             )
             .await
-            .map(|described| {
-                described
-                    .iter()
-                    .map(DescribedGroup::from)
-                    .map(|group| {
-                        let operations = authorized_operations::group(
-                            include_authorized_operations,
-                            group.error_code,
-                        );
-                        group.authorized_operations(Some(operations))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .map(Some)
-            .map(|groups| {
-                DescribeGroupsResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .groups(groups)
-            })
+            .map(|described| describe_groups_response(&described, include_authorized_operations))
     }
+}
+
+/// Returns the `DescribeGroups` response that describes each group in `described`, with its
+/// authorized operations when `include_authorized_operations` asks for them.
+pub fn describe_groups_response(
+    described: &[NamedGroupDetail],
+    include_authorized_operations: bool,
+) -> DescribeGroupsResponse {
+    let groups = described
+        .iter()
+        .map(DescribedGroup::from)
+        .map(|group| {
+            let operations =
+                authorized_operations::group(include_authorized_operations, group.error_code);
+            group.authorized_operations(Some(operations))
+        })
+        .collect::<Vec<_>>();
+
+    DescribeGroupsResponse::default()
+        .throttle_time_ms(Some(0))
+        .groups(Some(groups))
 }

@@ -12,19 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{assert_matches, slice};
+use std::{
+    assert_matches, slice,
+    time::{Duration, SystemTime},
+};
 
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
 };
-use nisshi_broker::{Error, Result};
+use bytes::Bytes;
+use nisshi_broker::{
+    Error, Result,
+    coordinator::group::{Coordinator, administrator::Controller},
+};
 use nisshi_sans_io::{
-    DescribeGroupsRequest, ErrorCode, RequestInput, create_topics_request::CreatableTopic,
-    describe_groups_response::DescribedGroup,
+    DescribeGroupsRequest, DescribeGroupsResponse, ErrorCode, RequestInput,
+    create_topics_request::CreatableTopic, describe_groups_response::DescribedGroup,
+    join_group_response::JoinGroupResponseMember,
 };
 use nisshi_storage::{
-    ArcDynStorage, DescribeGroupsService, GroupDetail, OffsetCommitRequest, Storage, Topition,
+    ArcDynStorage, DescribeGroupsService, GroupDetail, GroupMember, GroupState,
+    OffsetCommitRequest, Storage, Topition,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -47,19 +56,16 @@ async fn create_group(storage: &impl Storage, group_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns each group in `group_ids` as the group coordinator describes it.
 async fn describe(
-    storage: impl Storage,
+    storage: impl Storage + Clone,
     group_ids: &[String],
     include_authorized_operations: bool,
 ) -> Result<Vec<DescribedGroup>> {
-    let response = DescribeGroupsService { storage }
-        .serve(RequestInput {
-            request: DescribeGroupsRequest::default()
-                .groups(Some(group_ids.into()))
-                .include_authorized_operations(Some(include_authorized_operations)),
-            extensions: Extensions::default(),
-        })
-        .await?;
+    let response: DescribeGroupsResponse = Controller::with_storage(storage)?
+        .describe_groups(Some(group_ids), include_authorized_operations)
+        .await
+        .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
 
     Ok(response.groups.unwrap_or_default())
 }
@@ -182,6 +188,51 @@ async fn group_with_only_committed_offsets_is_empty(storage: impl Storage + Clon
     Ok(())
 }
 
+/// A group whose consumers stopped without sending `LeaveGroup` must be described as `Empty` once
+/// their sessions expire, as Kafka describes it, so that tools that need an empty group, such as
+/// an offset reset, accept it. The broker must remove each member whose session has expired before
+/// it describes the group, also when no member has sent a request since.
+async fn group_whose_sessions_expired_is_described_as_empty(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let group_id = alphanumeric_string(15);
+    let member_id = alphanumeric_string(15);
+
+    let session_timeout =
+        Duration::from_millis(u64::try_from(GroupDetail::default().session_timeout_ms)?);
+
+    let detail = GroupDetail {
+        members: [(
+            member_id.clone(),
+            GroupMember {
+                join_response: JoinGroupResponseMember::default().member_id(member_id.clone()),
+                last_contact: Some(SystemTime::now() - session_timeout - Duration::from_secs(1)),
+            },
+        )]
+        .into(),
+        generation_id: 1,
+        state: GroupState::Formed {
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            leader: member_id.clone(),
+            assignments: [(member_id, Bytes::new())].into(),
+        },
+        ..GroupDetail::default()
+    };
+
+    _ = storage
+        .update_group(&group_id, detail, None)
+        .await
+        .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
+
+    let groups = describe(storage, &[group_id], false).await?;
+    assert_eq!(1, groups.len());
+    assert_eq!("Empty", groups[0].group_state);
+    assert_eq!(Some(vec![]), groups[0].members);
+
+    Ok(())
+}
+
 async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let service = DescribeGroupsService {
         storage: storage.clone(),
@@ -269,6 +320,12 @@ mod in_memory {
         let _guard = init_tracing()?;
         super::group_with_only_committed_offsets_is_empty(storage().await?).await
     }
+
+    #[tokio::test]
+    async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -327,6 +384,12 @@ mod lite {
     async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
         let _guard = init_tracing()?;
         super::group_with_only_committed_offsets_is_empty(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
     }
 }
 
@@ -412,5 +475,11 @@ mod pg {
     async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
         let _guard = init_tracing()?;
         super::group_with_only_committed_offsets_is_empty(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
     }
 }

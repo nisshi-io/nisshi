@@ -13,9 +13,11 @@
 // limitations under the License.
 
 pub mod delete;
+pub mod describe;
 pub mod heartbeat;
 pub mod join;
 pub mod leave;
+pub mod list;
 pub mod offset_commit;
 pub mod offset_fetch;
 pub mod sync;

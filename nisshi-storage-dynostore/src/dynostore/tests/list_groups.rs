@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `ListGroups` response when the object store can't read a group's state. An object store
-//! error answers `COORDINATOR_NOT_AVAILABLE` for the whole request, so a Kafka client retries the
-//! listing. A group whose state can't be decoded is listed in the `Unknown` state, because a retry
-//! does not fix it.
+//! The `ListGroups` response when a group's state can't be read or decoded. The group is listed in
+//! the `Unknown` state, and the request still lists every other group.
 
 use nisshi_sans_io::{ErrorCode, ListGroupsRequest};
 use nisshi_storage::{Error, GroupDetail, ListGroupsService, Result};
@@ -30,7 +28,7 @@ use crate::dynostore::{
 const GROUP_ID: &str = "abc";
 
 #[tokio::test]
-async fn failed_state_read_answers_coordinator_not_available() -> Result<(), Error> {
+async fn unreadable_state_is_listed_as_unknown() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let object_store = InMemory::new();
@@ -51,10 +49,12 @@ async fn failed_state_read_answers_coordinator_not_available() -> Result<(), Err
         .serve(ListGroupsRequest::default())
         .await?;
 
-    assert_eq!(
-        ErrorCode::CoordinatorNotAvailable,
-        ErrorCode::try_from(response.error_code)?
-    );
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+
+    let groups = response.groups.unwrap_or_default();
+    assert_eq!(1, groups.len());
+    assert_eq!(GROUP_ID, groups[0].group_id);
+    assert_eq!(Some("Unknown".into()), groups[0].group_state);
 
     Ok(())
 }

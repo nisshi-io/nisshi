@@ -19,7 +19,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::{error, instrument};
 
-use crate::{ConsumerGroupState, Error, Result, Storage};
+use crate::{ConsumerGroupState, Error, NamedGroupDetail, Result, Storage};
 
 /// A [`Service`] using its [`Storage`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
 /// ```no_run
@@ -75,32 +75,44 @@ where
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
-        let states_filter = input.request.states_filter.as_deref();
 
-        match self.storage.list_groups().await {
-            Ok(groups) => {
-                let groups = groups
-                    .iter()
-                    .filter(|group| ConsumerGroupState::from(*group).matches(states_filter))
-                    .map(ListedGroup::from)
-                    .collect::<Vec<_>>();
+        Ok(list_groups_response(
+            self.storage.list_groups().await,
+            input.request.states_filter.as_deref(),
+        ))
+    }
+}
 
-                Ok(ListGroupsResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-                    .groups(Some(groups)))
-            }
+/// Returns the `ListGroups` response that lists each group in `listed` whose state matches
+/// `states_filter`.
+///
+/// A storage error is answered with an error code instead of being returned, because the
+/// connection closes on a returned error, and the client gets no answer.
+pub fn list_groups_response(
+    listed: Result<Vec<NamedGroupDetail>>,
+    states_filter: Option<&[String]>,
+) -> ListGroupsResponse {
+    match listed {
+        Ok(groups) => {
+            let groups = groups
+                .iter()
+                .filter(|group| ConsumerGroupState::from(*group).matches(states_filter))
+                .map(ListedGroup::from)
+                .collect::<Vec<_>>();
 
-            // The service answers a storage error with an error code instead of returning it,
-            // because the connection closes on a returned error, and the client gets no answer.
-            Err(err) => {
-                error!(?err);
+            ListGroupsResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::None.into())
+                .groups(Some(groups))
+        }
 
-                Ok(ListGroupsResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(list_groups_error_code(&err).into())
-                    .groups(Some([].into())))
-            }
+        Err(err) => {
+            error!(?err, "the groups could not be listed");
+
+            ListGroupsResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(list_groups_error_code(&err).into())
+                .groups(Some([].into()))
         }
     }
 }

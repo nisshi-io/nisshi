@@ -63,7 +63,7 @@ pub use delete_topics::DeleteTopicsService;
 pub use describe_acls::DescribeAclsService;
 pub use describe_cluster::DescribeClusterService;
 pub use describe_configs::DescribeConfigsService;
-pub use describe_groups::DescribeGroupsService;
+pub use describe_groups::{DescribeGroupsService, describe_groups_response};
 pub use describe_topic_partitions::DescribeTopicPartitionsService;
 pub use describe_user_scram_credentials::DescribeUserScramCredentialsService;
 pub use fetch::{
@@ -75,7 +75,7 @@ pub use fetch::{
 pub use find_coordinator::FindCoordinatorService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
 pub use init_producer_id::InitProducerIdService;
-pub use list_groups::ListGroupsService;
+pub use list_groups::{ListGroupsService, list_groups_response};
 pub use list_offsets::ListOffsetsService;
 pub use list_partition_reassignments::ListPartitionReassignmentsService;
 pub use metadata::MetadataService;

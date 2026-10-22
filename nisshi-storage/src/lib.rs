@@ -221,7 +221,8 @@ pub use service::{
     MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
     RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
     TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, bounded_channel, inflate_produced,
+    ValidatedFetchRequest, bounded_channel, describe_groups_response, inflate_produced,
+    list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -1216,8 +1217,17 @@ impl From<&GroupDetail> for ConsumerGroupState {
 
             GroupDetail {
                 state: GroupState::Forming { .. },
+                rebalance,
                 ..
-            } => Self::CompletingRebalance,
+            } if rebalance.pending_sync.is_some() => Self::CompletingRebalance,
+
+            // A broker that stored the group without its rebalance state held each request for a
+            // fixed time. The group coordinator gives such a group a join phase, so it is in
+            // PreparingRebalance.
+            GroupDetail {
+                state: GroupState::Forming { .. },
+                ..
+            } => Self::PreparingRebalance,
         }
     }
 }
@@ -1275,10 +1285,10 @@ impl NamedGroupDetail {
         }
     }
 
-    /// Returns a group from its stored detail, as the storage decoded it. A group without a
-    /// stored detail has only committed offsets, so it is empty. A group whose detail can't be
-    /// decoded has an error instead of a detail, so that a list of groups still includes the
-    /// other groups.
+    /// Returns a group from its stored detail, as the storage read and decoded it. A group
+    /// without a stored detail has only committed offsets, so it is empty. A group whose detail
+    /// can't be read or decoded has an error instead of a detail, so that a list of groups still
+    /// includes the other groups.
     pub fn decoded<E>(name: String, stored: Option<Result<GroupDetail, E>>) -> Self
     where
         E: Debug,
@@ -1286,7 +1296,7 @@ impl NamedGroupDetail {
         match stored {
             Some(Ok(detail)) => Self::found(name, detail),
             Some(Err(err)) => {
-                error!(?err, name, "the stored group can't be decoded");
+                error!(?err, name, "the stored group can't be read or decoded");
                 Self::error_code(name, ErrorCode::UnknownServerError)
             }
             None => Self::found(name, GroupDetail::default()),
@@ -2910,8 +2920,8 @@ mod tests {
         assert!(debug.contains("iterations: 4096"), "{debug}");
     }
 
-    /// Returns a detail with one member, in the given group state and join phase.
-    fn detail_with_one_member(state: GroupState, join_phase: Option<JoinPhase>) -> GroupDetail {
+    /// Returns a detail with one member, in the given group state and rebalance.
+    fn detail_with_one_member(state: GroupState, rebalance: GroupRebalance) -> GroupDetail {
         GroupDetail {
             members: [(
                 "member".into(),
@@ -2922,10 +2932,7 @@ mod tests {
             )]
             .into(),
             state,
-            rebalance: Box::new(GroupRebalance {
-                join_phase,
-                ..GroupRebalance::default()
-            }),
+            rebalance: Box::new(rebalance),
             ..GroupDetail::default()
         }
     }
@@ -2954,12 +2961,22 @@ mod tests {
             assignments: BTreeMap::new(),
         };
 
+        let in_join_phase = GroupRebalance {
+            join_phase: Some(join_phase),
+            ..GroupRebalance::default()
+        };
+
+        let pending_sync = GroupRebalance {
+            pending_sync: Some(PendingSync {
+                deadline: SystemTime::now(),
+                members: ["member".into()].into(),
+            }),
+            ..GroupRebalance::default()
+        };
+
         let without_members_in_join_phase = GroupDetail {
             state: forming_group_state(None),
-            rebalance: Box::new(GroupRebalance {
-                join_phase: Some(join_phase.clone()),
-                ..GroupRebalance::default()
-            }),
+            rebalance: Box::new(in_join_phase.clone()),
             ..GroupDetail::default()
         };
 
@@ -2969,14 +2986,19 @@ mod tests {
                 ConsumerGroupState::PreparingRebalance,
                 ConsumerGroupState::PreparingRebalance,
                 ConsumerGroupState::CompletingRebalance,
+                ConsumerGroupState::PreparingRebalance,
                 ConsumerGroupState::Stable,
             ],
             [
                 GroupDetail::default(),
                 without_members_in_join_phase,
-                detail_with_one_member(forming_group_state(None), Some(join_phase)),
-                detail_with_one_member(forming_group_state(Some("member")), None),
-                detail_with_one_member(formed, None),
+                detail_with_one_member(forming_group_state(None), in_join_phase),
+                detail_with_one_member(forming_group_state(Some("member")), pending_sync),
+                detail_with_one_member(
+                    forming_group_state(Some("member")),
+                    GroupRebalance::default()
+                ),
+                detail_with_one_member(formed, GroupRebalance::default()),
             ]
             .each_ref()
             .map(ConsumerGroupState::from)

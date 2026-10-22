@@ -97,4 +97,14 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
     /// (`NON_EMPTY_GROUP`), and forgetting the in-memory state that this
     /// coordinator held for each group it deletes.
     async fn delete_groups(&self, group_ids: &[String]) -> Result<Body>;
+
+    /// Lists every group whose state matches `states_filter`, with its state at the current time.
+    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Body>;
+
+    /// Describes each group in `group_ids` as it is at the current time.
+    async fn describe_groups(
+        &self,
+        group_ids: Option<&[String]>,
+        include_authorized_operations: bool,
+    ) -> Result<Body>;
 }
