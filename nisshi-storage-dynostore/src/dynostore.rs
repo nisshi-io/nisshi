@@ -480,8 +480,8 @@ struct TopicMetadata {
 }
 
 impl TopicMetadata {
-    /// Returns the `DescribeConfigs` result for this topic. The result holds
-    /// each config that the topic sets, and gives `name` as the resource name.
+    /// Returns the `DescribeConfigs` result for this topic. The result holds each config that the
+    /// topic sets, and gives `name` as the resource name.
     fn describe_configs_result(&self, name: &str) -> DescribeConfigsResult {
         let error_code = ErrorCode::None;
 
@@ -677,20 +677,20 @@ impl DynoStore {
     /// Ensures that `topition` names an existing partition: its topic
     /// exists, and its index is below the topic's partition count.
     ///
-    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for
-    /// an unknown topic or an index outside the topic.
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic or
+    /// an index outside the topic.
     async fn ensure_partition_exists(&self, topition: &Topition) -> Result<()> {
         self.existing_partition_topic_metadata(topition)
             .await
             .map(|_| ())
     }
 
-    /// Returns the metadata of `topition`'s topic, and checks that the topic
-    /// has the partition. The function reads the metadata once, so a caller
-    /// that needs both the check and the metadata does not read it twice.
+    /// Returns the metadata of `topition`'s topic, and checks that the topic has the partition. The
+    /// function reads the metadata once, so a caller that needs both the check and the metadata
+    /// does not read it twice.
     ///
-    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for
-    /// an unknown topic or an index outside the topic.
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic or
+    /// an index outside the topic.
     async fn existing_partition_topic_metadata(
         &self,
         topition: &Topition,

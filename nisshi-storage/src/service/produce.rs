@@ -117,11 +117,10 @@ const TIMESTAMP_AFTER_MAX_MS: i64 = 3_600_000;
 /// (`Long.MAX_VALUE`): no lower bound.
 const TIMESTAMP_BEFORE_MAX_MS: i64 = i64::MAX;
 
-/// The name of the topic configuration that selects the timestamp type of the
-/// topic's records.
+/// The name of the topic configuration that selects the timestamp type of the topic's records.
 ///
-/// `CreateTime` keeps the producer's timestamp. `LogAppendTime` replaces it
-/// with the broker's time when the broker stores the batch.
+/// `CreateTime` keeps the producer's timestamp. `LogAppendTime` replaces it with the broker's time
+/// when the broker stores the batch.
 const MESSAGE_TIMESTAMP_TYPE: &str = "message.timestamp.type";
 
 /// The message sent with `CORRUPT_MESSAGE` for a batch whose CRC does not
@@ -500,9 +499,8 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
         actual_max = actual_max.max(timestamp);
     }
 
-    // The function also rewrites a batch with a correct `max_timestamp` when
-    // the producer marks it `LogAppendTime`, because the topic's `CreateTime`
-    // overrides that mark. Kafka does the same.
+    // The function also rewrites a batch with a correct `max_timestamp` when the producer marks it
+    // `LogAppendTime`, because the topic's `CreateTime` overrides that mark. Kafka does the same.
     if actual_max == batch.max_timestamp
         && TimestampType::from(batch.attributes) == TimestampType::CreateTime
     {
@@ -519,19 +517,17 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
 
 /// Stamps `batch` with the broker's time, `now`, for a `LogAppendTime` topic.
 ///
-/// The function sets the batch's timestamp type to `LogAppendTime` and its
-/// `max_timestamp` to `now`. A consumer reads `max_timestamp` as the timestamp
-/// of each record of a `LogAppendTime` batch. The function keeps
-/// `base_timestamp`, as Kafka's [`LogValidator`] does.
+/// The function sets the batch's timestamp type to `LogAppendTime` and its `max_timestamp` to
+/// `now`. A consumer reads `max_timestamp` as the timestamp of each record of a `LogAppendTime`
+/// batch. The function keeps `base_timestamp`, as Kafka's [`LogValidator`] does.
 ///
 /// The function does not check the record timestamps against the window of
-/// [`TIMESTAMP_BEFORE_MAX_MS`] and [`TIMESTAMP_AFTER_MAX_MS`], because a
-/// consumer does not read them. It still decodes the batch through
-/// [`inflate_produced`], and rejects a batch that does not decode, as on a
-/// `CreateTime` topic.
+/// [`TIMESTAMP_BEFORE_MAX_MS`] and [`TIMESTAMP_AFTER_MAX_MS`], because a consumer does not read
+/// them. It still decodes the batch through [`inflate_produced`], and rejects a batch that does not
+/// decode, as on a `CreateTime` topic.
 ///
-/// Returns `Ok(Some(_))` for a batch that does not decode, or whose CRC does
-/// not match its contents. Returns `Err` for a broker-side failure.
+/// Returns `Ok(Some(_))` for a batch that does not decode, or whose CRC does not match its
+/// contents. Returns `Err` for a broker-side failure.
 ///
 /// [`LogValidator`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L278-L282
 fn stamp_log_append_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<Rejection>> {
@@ -547,9 +543,8 @@ fn stamp_log_append_time(batch: &mut deflated::Batch, now: i64) -> Result<Option
     )
 }
 
-/// Sets the timestamp type and the timestamps of `batch` with
-/// [`deflated::Batch::set_timestamps`]. Returns [`corrupt_batch`] for a batch
-/// whose CRC does not match its contents.
+/// Sets the timestamp type and the timestamps of `batch` with [`deflated::Batch::set_timestamps`].
+/// Returns [`corrupt_batch`] for a batch whose CRC does not match its contents.
 fn set_timestamps(
     batch: &mut deflated::Batch,
     timestamp_type: TimestampType,
@@ -565,14 +560,13 @@ fn set_timestamps(
     }
 }
 
-/// Validates the timestamps of a client batch for a topic whose
-/// `message.timestamp.type` is `timestamp_type`, and hands the batch back with
-/// the outcome.
+/// Validates the timestamps of a client batch for a topic whose `message.timestamp.type` is
+/// `timestamp_type`, and hands the batch back with the outcome.
 ///
-/// Validation decodes the batch, so the work runs on Tokio's blocking thread
-/// pool, through [`offload`]. The batch moves into the closure and back
-/// out, because `offload` needs a `'static` closure. A clone would only add a
-/// handle to the same record bytes, so moving the batch keeps one owner.
+/// Validation decodes the batch, so the work runs on Tokio's blocking thread pool, through
+/// [`offload`]. The batch moves into the closure and back out, because `offload` needs a `'static`
+/// closure. A clone would only add a handle to the same record bytes, so moving the batch keeps one
+/// owner.
 async fn validate_timestamps_offloaded(
     batch: deflated::Batch,
     timestamp_type: TimestampType,
@@ -1144,18 +1138,16 @@ where
         }
     }
 
-    /// Returns the `message.timestamp.type` of the topic `name`. Returns
-    /// `CreateTime`, Kafka's default, when the topic does not set it.
+    /// Returns the `message.timestamp.type` of the topic `name`. Returns `CreateTime`, Kafka's
+    /// default, when the topic does not set it.
     ///
-    /// Also returns `CreateTime` for a topic that does not exist.
-    /// `storage.produce()` then answers each partition of the topic with its
-    /// error code for an unknown topic.
+    /// Also returns `CreateTime` for a topic that does not exist. `storage.produce()` then answers
+    /// each partition of the topic with its error code for an unknown topic.
     ///
-    /// The lookup and `storage.produce()` run in separate transactions. If the
-    /// topic's `message.timestamp.type` changes between them, the batch keeps
-    /// the type that this function read. The batch stores its type in its
-    /// attributes, so a consumer still reads its timestamps correctly. Kafka
-    /// also applies a config change asynchronously, and an append that is in
+    /// The lookup and `storage.produce()` run in separate transactions. If the topic's
+    /// `message.timestamp.type` changes between them, the batch keeps the type that this function
+    /// read. The batch stores its type in its attributes, so a consumer still reads its timestamps
+    /// correctly. Kafka also applies a config change asynchronously, and an append that is in
     /// progress can use the old type.
     async fn timestamp_type(&self, name: &str) -> Result<TimestampType> {
         let result = self

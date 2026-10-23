@@ -3176,10 +3176,9 @@ impl Storage for Delegate {
                     .inspect(|timestamp| debug!(?timestamp))
                     .inspect_err(|err| error!(?err))?;
 
-                // A `LogAppendTime` record whose timestamp differs from the
-                // batch's starts a new batch. A consumer reads one timestamp,
-                // `max_timestamp`, for every record of a `LogAppendTime`
-                // batch. Each stored record holds the broker's time of its own
+                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
                 // produce request, so one batch cannot hold two such times.
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id

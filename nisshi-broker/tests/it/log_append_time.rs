@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The topic's `message.timestamp.type` selects the timestamp of each stored
-//! record. On a `LogAppendTime` topic the broker stamps each batch with its own
-//! clock. On a `CreateTime` topic it keeps the producer's timestamps, also for
-//! a batch that the producer marks `LogAppendTime`.
+//! The topic's `message.timestamp.type` selects the timestamp of each stored record. On a
+//! `LogAppendTime` topic the broker stamps each batch with its own clock. On a `CreateTime` topic
+//! it keeps the producer's timestamps, also for a batch that the producer marks `LogAppendTime`.
 
 use crate::{
     common::{StorageType, init_tracing},
@@ -52,8 +51,8 @@ async fn storage(storage_type: StorageType) -> Result<ArcDynStorage> {
     .await
 }
 
-/// Returns a batch that the producer marks `LogAppendTime`, with one record
-/// `timestamp_delta` milliseconds after `base_timestamp`.
+/// Returns a batch that the producer marks `LogAppendTime`, with one record `timestamp_delta`
+/// milliseconds after `base_timestamp`.
 fn marked_log_append_time(base_timestamp: i64, timestamp_delta: i64) -> Result<deflated::Batch> {
     inflated::Batch::builder()
         .attributes(
@@ -73,8 +72,8 @@ fn marked_log_append_time(base_timestamp: i64, timestamp_delta: i64) -> Result<d
         .map_err(Into::into)
 }
 
-/// The produce response and every fetched record carry the broker's time of
-/// the produce. The stored batch is marked `LogAppendTime`.
+/// The produce response and every fetched record carry the broker's time of the produce. The stored
+/// batch is marked `LogAppendTime`.
 async fn stamps_each_record_with_the_broker_clock(storage: impl Storage + Clone) -> Result<()> {
     let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
     let a_day_ago = now_ms()? - 24 * 60 * 60 * 1000;
@@ -122,8 +121,8 @@ async fn stamps_each_record_with_the_broker_clock(storage: impl Storage + Clone)
     Ok(())
 }
 
-/// Each fetched record carries the broker's time of its own produce request,
-/// also when one fetch returns the batches of two produce requests.
+/// Each fetched record carries the broker's time of its own produce request, also when one fetch
+/// returns the batches of two produce requests.
 async fn each_batch_keeps_its_own_broker_timestamp(storage: impl Storage + Clone) -> Result<()> {
     let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
 
@@ -177,8 +176,8 @@ async fn each_batch_keeps_its_own_broker_timestamp(storage: impl Storage + Clone
     Ok(())
 }
 
-/// On a `LogAppendTime` topic, the broker does not check the record timestamps
-/// against the `CreateTime` timestamp window, because it replaces them.
+/// On a `LogAppendTime` topic, the broker does not check the record timestamps against the
+/// `CreateTime` timestamp window, because it replaces them.
 async fn accepts_a_record_outside_the_timestamp_window(
     storage: impl Storage + Clone,
 ) -> Result<()> {
@@ -203,9 +202,8 @@ async fn accepts_a_record_outside_the_timestamp_window(
     Ok(())
 }
 
-/// On a `CreateTime` topic, the broker validates a batch that the producer
-/// marks `LogAppendTime` like any other batch, and stores it as `CreateTime`,
-/// as Kafka does.
+/// On a `CreateTime` topic, the broker validates a batch that the producer marks `LogAppendTime`
+/// like any other batch, and stores it as `CreateTime`, as Kafka does.
 async fn create_time_topic_validates_a_batch_marked_log_append_time(
     storage: impl Storage + Clone,
 ) -> Result<()> {
@@ -249,8 +247,8 @@ async fn create_time_topic_validates_a_batch_marked_log_append_time(
     Ok(())
 }
 
-/// A lookup by timestamp finds a record by the timestamp that a consumer
-/// reads: the broker's time of the record's produce request.
+/// A lookup by timestamp finds a record by the timestamp that a consumer reads: the broker's time
+/// of the record's produce request.
 async fn timestamp_lookup_uses_the_broker_clock(storage: impl Storage + Clone) -> Result<()> {
     let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
     let a_day_ago = now_ms()? - 24 * 60 * 60 * 1000;

@@ -13,9 +13,9 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- Returns one row for each key in $3 that the topic sets. For a topic that
--- sets none of these keys, it returns one row with a null name. So the query
--- returns zero rows only when the topic does not exist.
+-- Returns one row for each key in $3 that the topic sets. For a topic that sets none of these keys,
+-- it returns one row with a null name. So the query returns zero rows only when the topic does not
+-- exist.
 select tc.name, tc.value
 
 from

@@ -1181,10 +1181,9 @@ impl Postgres {
                     .inspect(|timestamp| debug!(?timestamp))
                     .inspect_err(|err| error!(?err))?;
 
-                // A `LogAppendTime` record whose timestamp differs from the
-                // batch's starts a new batch. A consumer reads one timestamp,
-                // `max_timestamp`, for every record of a `LogAppendTime`
-                // batch. Each stored record holds the broker's time of its own
+                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
                 // produce request, so one batch cannot hold two such times.
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id
@@ -4176,9 +4175,8 @@ impl Storage for Postgres {
 
         // `rows` is `None` when the topic does not exist.
         let rows = if let Some(keys) = keys.filter(|keys| !keys.is_empty()) {
-            // A lookup of named keys runs one query instead of two, because
-            // the broker reads `message.timestamp.type` through here for each
-            // topic of each produce request.
+            // A lookup of named keys runs one query instead of two, because the broker reads
+            // `message.timestamp.type` through here for each topic of each produce request.
             let prepared = c
                 .prepare_cached(self.sql_lookup("pg/topic_configuration_select_keys.sql")?)
                 .await
@@ -4189,9 +4187,8 @@ impl Storage for Postgres {
                 .await
                 .inspect_err(|err| error!(?err))?;
 
-            // The filter drops a row with a null name. The query returns that
-            // row for a topic that sets none of `keys`, and the row is not a
-            // config.
+            // The filter drops a row with a null name. The query returns that row for a topic that
+            // sets none of `keys`, and the row is not a config.
             (!rows.is_empty()).then(|| {
                 rows.into_iter()
                     .filter(|row| matches!(row.try_get::<_, Option<&str>>(0), Ok(Some(_))))
