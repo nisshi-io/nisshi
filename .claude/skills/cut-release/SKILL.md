@@ -12,7 +12,7 @@ A `v*` tag on a commit on `main` runs `.github/workflows/release.yml`. That work
 This skill gets the release commit onto `main` and tags it:
 
 - **Stable release (`X.Y.Z`):** the release PR bumps the version and adds the `## [X.Y.Z]` section to `CHANGELOG.md`. The section covers every commit since the previous stable tag, and it skips pre-release tags. After the tag, the skill drafts the GitHub release body from that section.
-- **Pre-release (`X.Y.Z-pre.N`):** the release PR only bumps the version. A pre-release has no changelog section, and its release body is one compare link.
+- **Pre-release (`X.Y.Z-pre.N`):** the release PR only bumps the version. A pre-release has no changelog section, and its release body is a fixed line saying what a pre-release is, then one compare link.
 
 The operator has three checkpoints: reviewing and merging the PR, confirming the tag, and approving the release body. Never merge the PR, add it to the merge queue, or push a tag without the operator's go-ahead.
 
@@ -170,7 +170,13 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 - Find the run: `gh run list --workflow release.yml --branch TAG --event push --json databaseId,status`. A queued run is normal. If no run shows up within two minutes of the push, stop and report it, because a tag ruleset or a disabled workflow stops the trigger.
 - Watch it in the background with `gh run watch <id> --exit-status`.
-- Pre-release: the body is one line, `**Full Changelog**: https://github.com/nisshi-io/nisshi/compare/<previous tag>...TAG`. The previous tag is the one just below `TAG` in phase 1's list, stable or pre-release. When `github-release` has succeeded, show the line to the operator and set it with `gh release edit TAG --notes-file <file>` after they approve.
+- Pre-release: the body is two paragraphs. The first is fixed, with `X.Y.Z` being `VERSION` without its `-pre.N`:
+
+  ```markdown
+  Pre-release of X.Y.Z, for trying changes before it ships: behaviour and storage formats can still change, so use the [latest release](https://github.com/nisshi-io/nisshi/releases/latest) for anything you keep. See [Which release to use](https://github.com/nisshi-io/nisshi#which-release-to-use).
+  ```
+
+  The second is `**Full Changelog**: https://github.com/nisshi-io/nisshi/compare/<previous tag>...TAG`. The previous tag is the one just below `TAG` in phase 1's list, stable or pre-release. When `github-release` has succeeded, show the body to the operator and set it with `gh release edit TAG --notes-file <file>` after they approve.
 - Stable: while the run builds, draft the body:
   - Use only the `[VERSION]` section of `CHANGELOG.md` at `MERGE_SHA`. Add no fact that the section doesn't state.
   - Follow the shape of the previous stable release's body (`gh release view VPREV --json body --jq .body`): an intro paragraph, `## Highlights` (the most important changes, one line each), `## Upgrade notes` (a link to `https://github.com/nisshi-io/nisshi/blob/TAG/CHANGELOG.md` and a short list), and `## Install` (the `cargo install` command, the image `ghcr.io/nisshi-io/nisshi:VERSION`, and the attached binaries). Keep a caveat from the previous body only if it is still true.
