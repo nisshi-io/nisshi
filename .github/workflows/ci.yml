@@ -558,7 +558,9 @@ jobs:
     if: &tier_b needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
     needs: [changes]
     runs-on: ${{matrix.os}}
-    timeout-minutes: 30
+    # The job takes 17 to 26 minutes. A slow Ubuntu mirror or cache download can add
+    # 15 minutes of setup, which made a 30-minute limit fail runs that would have passed.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
