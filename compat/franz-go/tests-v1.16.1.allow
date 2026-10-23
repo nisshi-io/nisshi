@@ -5,6 +5,10 @@
 # version of the oldest Kafka CLI tools that CI tests. This list holds the
 # tests of tests.allow that v1.16.1 has. TestGroupETL and TestTxnEtl stay
 # excluded, for the gaps that FINDINGS.md records.
+#
+# TestPauseIssue489 and TestPauseIssueOct2023 are excluded too. They failed
+# in 3 of 5 local runs at v1.16.1 and passed when run alone, and franz-go
+# v1.18.0 fixed pausing under PollRecords. tests.allow still runs them.
 # client
 TestMaxVersions
 TestParseBrokerAddr
@@ -24,11 +28,6 @@ TestIssue337
 TestDirectPartitionPurge
 TestIssue434
 TestAddRemovePartitions
-# These two failed in 3 of 5 local runs at v1.16.1 and passed when run
-# alone. The cause is not known: load, the client (franz-go v1.18.0 fixed
-# pausing under PollRecords), or the broker. tests.allow runs them too.
-TestPauseIssue489
-TestPauseIssueOct2023
 TestIssue523
 TestIssue648
 
