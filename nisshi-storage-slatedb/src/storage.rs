@@ -53,7 +53,7 @@ use nisshi_storage::{
     ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
-    producer_claim,
+    max_message_bytes, producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::sleep;
@@ -880,6 +880,19 @@ impl Storage for Engine {
         if topition.partition < 0 || topition.partition >= metadata.topic.num_partitions {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         }
+
+        let limit = max_message_bytes::limit(
+            topition.topic(),
+            metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|config| config.name == max_message_bytes::KEY)
+                .and_then(|config| config.value.as_deref()),
+        );
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
 
         // Schema validation (if schemas registry is configured)
         if let Some(ref schemas) = self.schemas

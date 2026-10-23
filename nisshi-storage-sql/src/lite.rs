@@ -17,7 +17,7 @@ use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
         Cache, consumer_group_select, default_hash, idempotent_sequence_check, remove_comments,
-        result_columns::ResultColumns,
+        result_columns::ResultColumns, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -63,7 +63,8 @@ use nisshi_storage::{
     RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy,
     StartupFailure, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
-    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, producer_claim,
+    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
+    producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -722,17 +723,20 @@ impl Delegate {
         }
     }
 
+    /// Returns what a write to the partition reads first: the partition's low and high watermarks,
+    /// and its topic's stored `max.message.bytes`. Fails with `UNKNOWN_TOPIC_OR_PARTITION` when the
+    /// partition does not exist.
     #[instrument(skip_all)]
-    async fn watermark_select_for_update(
+    async fn watermark_select_for_write(
         &self,
         topition: &Topition,
         connection: &PoolConnection,
-    ) -> Result<(Option<i64>, Option<i64>)> {
+    ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition);
 
         let mut rows = connection
             .query(
-                "watermark_select_no_update.sql",
+                watermark_select_for_write::LITE_QUERY,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -741,18 +745,30 @@ impl Delegate {
             )
             .await?;
 
-        if let Some(row) = rows
+        let columns = ResultColumns::new(
+            watermark_select_for_write::LITE_QUERY,
+            (0..rows.column_count())
+                .map(|index| rows.column_name(index).unwrap_or_default().to_owned())
+                .collect(),
+        );
+        let low = columns.index(watermark_select_for_write::LOW)? as i32;
+        let high = columns.index(watermark_select_for_write::HIGH)? as i32;
+        let max_message_bytes =
+            columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)? as i32;
+
+        let Some(row) = rows
             .next()
             .await
             .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        {
-            Ok((
-                row.get::<Option<i64>>(0).inspect_err(|err| error!(?err))?,
-                row.get::<Option<i64>>(1).inspect_err(|err| error!(?err))?,
-            ))
-        } else {
-            Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
-        }
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        Ok(watermark_select_for_write::Row {
+            low: row.get(low).inspect_err(|err| error!(?err))?,
+            high: row.get(high).inspect_err(|err| error!(?err))?,
+            max_message_bytes: row.get(max_message_bytes).inspect_err(|err| error!(?err))?,
+        })
     }
 
     #[instrument(skip_all)]
@@ -777,12 +793,17 @@ impl Delegate {
 
         debug!(after_idempotent_check = elapsed_millis(start));
 
-        let (low, high) = self
-            .watermark_select_for_update(topition, connection)
+        let watermarks = self
+            .watermark_select_for_write(topition, connection)
             .await
-            .inspect_err(|err| error!(?err))?;
+            .inspect_err(|err| debug!(?err))?;
 
-        debug!(after_watermark_select_for_update = elapsed_millis(start));
+        debug!(after_watermark_select_for_write = elapsed_millis(start));
+
+        let limit =
+            max_message_bytes::limit(topition.topic(), watermarks.max_message_bytes.as_deref());
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+        let watermark_select_for_write::Row { low, high, .. } = watermarks;
 
         debug!(?low, ?high);
 
@@ -2733,7 +2754,7 @@ impl Storage for Delegate {
                     let topition = Topition::new(topic.name.as_str(), partition.partition_index);
 
                     let (error_code, low_watermark) = match self
-                        .watermark_select_for_update(&topition, &pc)
+                        .watermark_select_for_write(&topition, &pc)
                         .await
                     {
                         Err(Error::Api(error_code)) => {
@@ -2741,7 +2762,7 @@ impl Storage for Delegate {
                         }
                         Err(err) => return Err(err),
 
-                        Ok((low, high)) => {
+                        Ok(watermark_select_for_write::Row { low, high, .. }) => {
                             let stage = OffsetStage {
                                 last_stable: high.unwrap_or_default(),
                                 high_watermark: high.unwrap_or_default(),
@@ -2959,7 +2980,9 @@ impl Storage for Delegate {
             .inspect_err(|err| match err {
                 // A rejection the client caused: ProduceService logs it once,
                 // at warn, with the topic and partition.
-                Error::Api(_) | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
+                Error::Api(_)
+                | Error::MessageTooLarge { .. }
+                | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
                     debug!(?err)
                 }
                 err => error!(?err),

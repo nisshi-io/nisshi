@@ -1,9 +1,8 @@
 # franz-go pkg/kgo tests known to pass against tansu (run by run.sh).
 #
 # FINDINGS.md records the compatibility gaps behind the tests that are
-# excluded: TestClient_ProduceLargeMessages (max.message.bytes not
-# enforced), TestGroupETL (UNKNOWN_MEMBER_ID under concurrent
-# rebalances), TestTxnEtl (aborted records visible to read_committed).
+# excluded: TestGroupETL (UNKNOWN_MEMBER_ID under concurrent rebalances),
+# TestTxnEtl (aborted records visible to read_committed).
 #
 # TestSCRAMAuth/TestSCRAMAuthBadCredentials self-skip without
 # KGO_TEST_SCRAM; TestShareGroup*/Test*848* self-skip because tansu does
@@ -62,6 +61,7 @@ TestNewConsumerBalancerIssue493
 
 # producer
 TestClient_Produce
+TestClient_ProduceLargeMessages
 TestIssue769
 TestIssueProduceSyncManualPartitionNegativeDoesNotPanic
 TestIssue831

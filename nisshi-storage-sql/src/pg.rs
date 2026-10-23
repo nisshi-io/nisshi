@@ -69,7 +69,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
-    epoch_is_exhausted, inflate, producer_claim,
+    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -101,7 +101,9 @@ use uuid::Uuid;
 
 use crate::{
     schema::{RecordedSchema, should_create_schema},
-    sql::{consumer_group_select, default_hash, idempotent_sequence_check},
+    sql::{
+        consumer_group_select, default_hash, idempotent_sequence_check, watermark_select_for_write,
+    },
 };
 
 pub mod factory;
@@ -1649,29 +1651,37 @@ impl Postgres {
         }
     }
 
-    async fn watermark_select_for_update(
+    /// Locks the rows that a write to the partition changes, until `tx` ends. Returns the
+    /// partition's low and high watermarks and its topic's stored `max.message.bytes`. Fails with
+    /// `UNKNOWN_TOPIC_OR_PARTITION` when the partition does not exist.
+    async fn watermark_select_for_write(
         &self,
         topition: &Topition,
         tx: &Transaction<'_>,
-    ) -> Result<(Option<i64>, Option<i64>)> {
-        if let Some(row) = self
+    ) -> Result<watermark_select_for_write::Row> {
+        let Some(row) = self
             .tx_prepare_query_opt(
                 tx,
-                "watermark_select_for_update.sql",
+                watermark_select_for_write::QUERY,
                 &[&self.cluster, &topition.topic(), &topition.partition()],
             )
             .await
             .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        {
-            Ok((
-                row.try_get::<_, Option<i64>>(0)
-                    .inspect_err(|err| error!(?err))?,
-                row.try_get::<_, Option<i64>>(1)
-                    .inspect_err(|err| error!(?err))?,
-            ))
-        } else {
-            Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
-        }
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        Ok(watermark_select_for_write::Row {
+            low: row
+                .try_get(watermark_select_for_write::LOW)
+                .inspect_err(|err| error!(?err))?,
+            high: row
+                .try_get(watermark_select_for_write::HIGH)
+                .inspect_err(|err| error!(?err))?,
+            max_message_bytes: row
+                .try_get(watermark_select_for_write::MAX_MESSAGE_BYTES)
+                .inspect_err(|err| error!(?err))?,
+        })
     }
 
     /// Advances one partition's log start for DeleteRecords, answering the
@@ -1690,7 +1700,8 @@ impl Postgres {
     ) -> Result<(ErrorCode, i64)> {
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
-        let (low, high) = self.watermark_select_for_update(topition, &tx).await?;
+        let watermark_select_for_write::Row { low, high, .. } =
+            self.watermark_select_for_write(topition, &tx).await?;
 
         let stage = OffsetStage {
             last_stable: high.unwrap_or_default(),
@@ -2164,7 +2175,11 @@ impl Postgres {
                 .inspect_err(|err| error!(?err))?;
         }
 
-        let (low, high) = self.watermark_select_for_update(topition, tx).await?;
+        let watermarks = self.watermark_select_for_write(topition, tx).await?;
+        let limit =
+            max_message_bytes::limit(topition.topic(), watermarks.max_message_bytes.as_deref());
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+        let watermark_select_for_write::Row { low, high, .. } = watermarks;
 
         debug!(?low, ?high);
 

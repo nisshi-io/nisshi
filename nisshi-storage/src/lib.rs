@@ -196,6 +196,7 @@ mod batch;
 pub mod config;
 mod inflate;
 mod latency;
+pub mod max_message_bytes;
 mod producer;
 mod proxy;
 mod service;
@@ -325,6 +326,12 @@ pub enum Error {
     LessThanMinTime {
         time: i64,
         min_time: Option<i64>,
+    },
+    /// A produced batch of `size` bytes is larger than its topic's `max.message.bytes` of `limit`
+    /// bytes. Produce answers it with `MESSAGE_TOO_LARGE`.
+    MessageTooLarge {
+        size: usize,
+        limit: usize,
     },
     Message(String),
     NoSuchEntry {
@@ -1738,6 +1745,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// A backend that decodes the batch does so with [`inflate_produced`], so
     /// records that do not decode fail with `INVALID_RECORD`.
+    ///
+    /// A backend returns [`Error::MessageTooLarge`] when [`max_message_bytes::ensure_batch_fits`]
+    /// rejects the batch. The backend must return that error before it changes any state.
+    /// [`ProduceRequestBatcher`] then writes the same records again, one batch at a time.
     async fn produce(
         &self,
         transaction_id: Option<&str>,

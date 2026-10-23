@@ -28,7 +28,7 @@ use crate::{
     database_file,
     sql::{
         Cache, consumer_group_select, default_hash, idempotent_sequence_check, remove_comments,
-        result_columns::ResultColumns,
+        result_columns::ResultColumns, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -68,7 +68,7 @@ use nisshi_storage::{
     OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
     TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff,
-    epoch_is_exhausted, inflate, producer_claim,
+    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -526,16 +526,19 @@ impl Engine {
         }
     }
 
-    async fn watermark_select_for_update(
+    /// Returns what a write to the partition reads first: the partition's low and high watermarks,
+    /// and its topic's stored `max.message.bytes`. Fails with `UNKNOWN_TOPIC_OR_PARTITION` when the
+    /// partition does not exist.
+    async fn watermark_select_for_write(
         &self,
         topition: &Topition,
         tx: &Connection,
-    ) -> Result<(Option<i64>, Option<i64>)> {
+    ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition, ?tx);
 
         let mut rows = tx
             .query(
-                &sql_lookup("watermark_select_no_update.sql")?,
+                &sql_lookup(watermark_select_for_write::LITE_QUERY)?,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -544,22 +547,34 @@ impl Engine {
             )
             .await?;
 
-        if let Some(row) = rows
+        let columns =
+            ResultColumns::new(watermark_select_for_write::LITE_QUERY, rows.column_names());
+        let low = columns.index(watermark_select_for_write::LOW)?;
+        let high = columns.index(watermark_select_for_write::HIGH)?;
+        let max_message_bytes = columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)?;
+
+        let Some(row) = rows
             .next()
             .await
             .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        {
-            Ok((
-                row.get_value(0)
-                    .map(|value| value.as_integer().copied())
-                    .inspect_err(|err| error!(?err))?,
-                row.get_value(1)
-                    .map(|value| value.as_integer().copied())
-                    .inspect_err(|err| error!(?err))?,
-            ))
-        } else {
-            Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
-        }
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        Ok(watermark_select_for_write::Row {
+            low: row
+                .get_value(low)
+                .map(|value| value.as_integer().copied())
+                .inspect_err(|err| error!(?err))?,
+            high: row
+                .get_value(high)
+                .map(|value| value.as_integer().copied())
+                .inspect_err(|err| error!(?err))?,
+            max_message_bytes: row
+                .get_value(max_message_bytes)
+                .map(|value| value.as_text().cloned())
+                .inspect_err(|err| error!(?err))?,
+        })
     }
 
     async fn produce_in_tx<'conn>(
@@ -581,7 +596,11 @@ impl Engine {
                 .inspect_err(|err| error!(?err))?;
         }
 
-        let (low, high) = self.watermark_select_for_update(topition, tx).await?;
+        let watermarks = self.watermark_select_for_write(topition, tx).await?;
+        let limit =
+            max_message_bytes::limit(topition.topic(), watermarks.max_message_bytes.as_deref());
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+        let watermark_select_for_write::Row { low, high, .. } = watermarks;
 
         debug!(?low, ?high);
 
@@ -1383,7 +1402,7 @@ impl Storage for Engine {
                     let topition = Topition::new(topic.name.as_str(), partition.partition_index);
 
                     let (error_code, low_watermark) = match self
-                        .watermark_select_for_update(&topition, &tx)
+                        .watermark_select_for_write(&topition, &tx)
                         .await
                     {
                         Err(Error::Api(error_code)) => {
@@ -1391,7 +1410,7 @@ impl Storage for Engine {
                         }
                         Err(err) => return Err(err),
 
-                        Ok((low, high)) => {
+                        Ok(watermark_select_for_write::Row { low, high, .. }) => {
                             let stage = OffsetStage {
                                 last_stable: high.unwrap_or_default(),
                                 high_watermark: high.unwrap_or_default(),

@@ -34,6 +34,11 @@ changes.
   - libSQL and Turso read only by index. Build a `ResultColumns` from the result's column names
     once, before the first row, and look up each index with `columns.index(topic_select::NAME)?`.
     Then read every row by the looked-up index, so each row costs no more than before.
+- **Name the type for one row of a query's result `Row`, in the query's module. Write it
+  qualified, as `topic_select::Row`.** The module already names the query, so the type needs no
+  other name. Each engine file also imports its driver's own `Row`, and the qualified name shows
+  which of the two a line means. A query whose engines read the columns straight from the
+  driver's row needs no such type.
 - **Name every column that an engine reads with `as`, unless it is a plain column.** PostgreSQL
   names `count(*)` `count`, and a parameter `?column?`. SQLite names them by the expression's text.
   `cg.name` is `name` on all three drivers, but `count(*) as partitions` is the only way to give an

@@ -46,19 +46,24 @@ pub struct Frame {
 impl ByteSize for Frame {
     #[instrument(skip_all, ret)]
     fn size_in_bytes(&self) -> Result<usize> {
-        Ok(size_of::<i32>()
-            + self
-                .batches
-                .iter()
-                .map(|batch| {
-                    // base_offset
-                    size_of::<i64>()
-                // batch length
-                + size_of::<i32>()
-                + FIXED_BATCH_LENGTH
-                + batch.record_data.len()
-                })
-                .sum::<usize>())
+        self.batches
+            .iter()
+            .map(ByteSize::size_in_bytes)
+            .sum::<Result<usize>>()
+            .map(|batches| size_of::<i32>() + batches)
+    }
+}
+
+/// The encoded size of the batch, from `base_offset` to the end of `record_data`. Kafka's
+/// `RecordBatch.sizeInBytes` measures the same span.
+impl ByteSize for Batch {
+    fn size_in_bytes(&self) -> Result<usize> {
+        // base_offset
+        Ok(size_of::<i64>()
+            // batch_length
+            + size_of::<i32>()
+            + FIXED_BATCH_LENGTH
+            + self.record_data.len())
     }
 }
 

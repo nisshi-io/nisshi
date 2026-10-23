@@ -204,9 +204,8 @@ fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
 fn storage_error_code(error: &Error) -> ErrorCode {
     match error {
         Error::Api(error_code) => *error_code,
-        Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
-            ErrorCode::MessageTooLarge
-        }
+        Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_))
+        | Error::MessageTooLarge { .. } => ErrorCode::MessageTooLarge,
         _ => ErrorCode::UnknownServerError,
     }
 }
@@ -317,6 +316,17 @@ mod rejection_tests {
             storage_error_code(&Error::SansIo(
                 nisshi_sans_io::Error::MessageMaxSizeExceeded(1)
             ))
+        );
+    }
+
+    #[test]
+    fn a_batch_over_max_message_bytes_from_storage_is_message_too_large() {
+        assert_eq!(
+            ErrorCode::MessageTooLarge,
+            storage_error_code(&Error::MessageTooLarge {
+                size: 20_061,
+                limit: 10_000,
+            })
         );
     }
 
@@ -1074,6 +1084,15 @@ where
                         ?error,
                         "produce failed"
                     );
+                } else if let Error::MessageTooLarge { size, limit } = error {
+                    warn!(
+                        topic = name,
+                        partition = partition.index,
+                        producer_id,
+                        size,
+                        limit,
+                        "rejecting produce batch larger than max.message.bytes"
+                    );
                 } else {
                     warn!(
                         topic = name,
@@ -1085,7 +1104,19 @@ where
                     );
                 }
 
-                self.error(partition.index, error_code)
+                let response = self.error(partition.index, error_code);
+
+                // Kafka sends the same message, so that the producer's `RecordTooLargeException`
+                // names both sizes.
+                if let Error::MessageTooLarge { size, limit, .. } = error {
+                    response.error_message(Some(format!(
+                        "The record batch size in the append to {name}-{} is {size} bytes \
+                         which exceeds the maximum configured value of {limit}.",
+                        partition.index
+                    )))
+                } else {
+                    response
+                }
             }
         }
     }
