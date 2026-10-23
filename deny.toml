@@ -18,8 +18,6 @@ no-default-features = false
 # dependencies.yml) - being unmaintained isn't the same as being vulnerable,
 # and they stay visible in the job log rather than being silenced outright.
 ignore = [
-    { id = "RUSTSEC-2026-0118", reason = "hickory-resolver NSEC3 unbounded loop; pulled in transitively via rama-dns, fix needs hickory-proto 0.26.x" },
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto O(n^2) name compression; pulled in transitively via rama-dns, fix needs hickory-proto 0.26.x" },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic start-tag check; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
 ]
