@@ -677,10 +677,8 @@ impl DynoStore {
     /// Ensures that `topition` names an existing partition: its topic
     /// exists, and its index is below the topic's partition count.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`]
-    /// for an unknown topic or an index outside the topic.
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for
+    /// an unknown topic or an index outside the topic.
     async fn ensure_partition_exists(&self, topition: &Topition) -> Result<()> {
         self.existing_partition_topic_metadata(topition)
             .await
