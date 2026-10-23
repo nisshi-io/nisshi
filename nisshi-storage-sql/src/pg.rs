@@ -38,7 +38,7 @@ use deadpool_postgres::{
 use futures::pin_mut;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -1173,11 +1173,29 @@ impl Postgres {
                     .map(|producer_epoch| producer_epoch.unwrap_or(-1))
                     .inspect_err(|err| error!(?err))?;
 
+                let timestamp = record
+                    .try_get::<_, SystemTime>(2)
+                    .map_err(Error::from)
+                    .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?;
+
+                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
+                // produce request, so one batch cannot hold two such times.
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id
                     || batch_builder.producer_epoch != producer_epoch
+                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
+                        && timestamp != batch_builder.base_timestamp)
                 {
-                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+                    batches.push(
+                        batch_builder
+                            .max_timestamp_of_records()
+                            .build()
+                            .and_then(TryInto::try_into)?,
+                    );
 
                     batch_builder = Batch::builder()
                         .base_offset(
@@ -1186,15 +1204,7 @@ impl Postgres {
                                 .inspect(|base_offset| debug!(base_offset))
                                 .inspect_err(|err| error!(?err))?,
                         )
-                        .base_timestamp(
-                            record
-                                .try_get::<_, SystemTime>(2)
-                                .map_err(Error::from)
-                                .and_then(|system_time| {
-                                    to_timestamp(&system_time).map_err(Into::into)
-                                })
-                                .inspect_err(|err| error!(?err))?,
-                        )
+                        .base_timestamp(timestamp)
                         .attributes(attributes)
                         .producer_id(producer_id)
                         .producer_epoch(producer_epoch);
@@ -1207,16 +1217,7 @@ impl Postgres {
 
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
-                let timestamp_delta = record
-                    .try_get::<_, SystemTime>(2)
-                    .map_err(Error::from)
-                    .and_then(|system_time| {
-                        to_timestamp(&system_time)
-                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
-                            .map_err(Into::into)
-                    })
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
+                let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
                 let k = record
                     .try_get::<_, Option<&[u8]>>(3)
@@ -1279,7 +1280,12 @@ impl Postgres {
                 }
             }
 
-            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+            batches.push(
+                batch_builder
+                    .max_timestamp_of_records()
+                    .build()
+                    .and_then(TryInto::try_into)?,
+            );
         } else {
             batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
         }
@@ -2252,7 +2258,7 @@ impl Postgres {
 
                     let producer_id = transaction_id.and(Some(inflated.producer_id));
                     let producer_epoch = transaction_id.and(Some(inflated.producer_epoch));
-                    let ts = to_system_time(inflated.base_timestamp + record.timestamp_delta)?;
+                    let ts = to_system_time(inflated.record_timestamp(record))?;
 
                     let mut row: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(record_column_types.len());
@@ -4166,26 +4172,54 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let prepared = c
-            .prepare_cached(self.sql_lookup("topic_select.sql")?)
-            .await
-            .inspect_err(|err| error!(?err))?;
-
-        if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
-            .await
-            .inspect_err(|err| error!(?err))?
-            .is_some()
-        {
+        // `rows` is `None` when the topic does not exist.
+        let rows = if let Some(keys) = keys.filter(|keys| !keys.is_empty()) {
+            // A lookup of named keys runs one query instead of two, because the broker reads
+            // `message.timestamp.type` through here for each topic of each produce request.
             let prepared = c
-                .prepare_cached(self.sql_lookup("topic_configuration_select.sql")?)
+                .prepare_cached(self.sql_lookup("pg/topic_configuration_select_keys.sql")?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let rows = c
-                .query(&prepared, &[&self.cluster.as_str(), &name])
+                .query(&prepared, &[&self.cluster.as_str(), &name, &keys])
                 .await
                 .inspect_err(|err| error!(?err))?;
 
+            // The filter drops a row with a null name. The query returns that row for a topic that
+            // sets none of `keys`, and the row is not a config.
+            (!rows.is_empty()).then(|| {
+                rows.into_iter()
+                    .filter(|row| matches!(row.try_get::<_, Option<&str>>(0), Ok(Some(_))))
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            let prepared = c
+                .prepare_cached(self.sql_lookup("topic_select.sql")?)
+                .await
+                .inspect_err(|err| error!(?err))?;
+
+            if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
+                .await
+                .inspect_err(|err| error!(?err))?
+                .is_some()
+            {
+                let prepared = c
+                    .prepare_cached(self.sql_lookup("topic_configuration_select.sql")?)
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+
+                Some(
+                    c.query(&prepared, &[&self.cluster.as_str(), &name])
+                        .await
+                        .inspect_err(|err| error!(?err))?,
+                )
+            } else {
+                None
+            }
+        };
+
+        if let Some(rows) = rows {
             let mut configs = vec![];
 
             for row in rows {

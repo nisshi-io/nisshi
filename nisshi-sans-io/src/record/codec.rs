@@ -540,6 +540,10 @@ impl<T: Serialize> Sequence<T> {
 }
 
 impl<T> Sequence<T> {
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+
     pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<T>, D::Error>
     where
         D: Deserializer<'de>,

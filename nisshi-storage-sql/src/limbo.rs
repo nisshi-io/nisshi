@@ -36,7 +36,7 @@ use bytes::Bytes;
 use chrono::NaiveDateTime;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, NULL_TOPIC_ID, OpType, ScramMechanism,
+    ErrorCode, IsolationLevel, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -630,7 +630,7 @@ impl Engine {
                         } else {
                             Some(inflated.producer_epoch)
                         },
-                        inflated.base_timestamp + record.timestamp_delta,
+                        inflated.record_timestamp(record),
                         key,
                         value,
                     ),
@@ -1778,11 +1778,30 @@ impl Storage for Engine {
                         .inspect_err(|err| error!(?err))?,
                 )?;
 
+                let timestamp = row
+                    .get_value(2)
+                    .map_err(Error::from)
+                    .and_then(LiteTimestamp::try_from)
+                    .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?;
+
+                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
+                // produce request, so one batch cannot hold two such times.
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id
                     || batch_builder.producer_epoch != producer_epoch
+                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
+                        && timestamp != batch_builder.base_timestamp)
                 {
-                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+                    batches.push(
+                        batch_builder
+                            .max_timestamp_of_records()
+                            .build()
+                            .and_then(TryInto::try_into)?,
+                    );
 
                     batch_builder = inflated::Batch::builder()
                         .base_offset(
@@ -1797,15 +1816,7 @@ impl Storage for Engine {
                                 .inspect(|base_offset| debug!(base_offset))
                                 .inspect_err(|err| error!(?err))?,
                         )
-                        .base_timestamp(
-                            row.get_value(2)
-                                .map_err(Error::from)
-                                .and_then(LiteTimestamp::try_from)
-                                .and_then(|system_time| {
-                                    to_timestamp(&system_time.0).map_err(Into::into)
-                                })
-                                .inspect_err(|err| error!(?err))?,
-                        )
+                        .base_timestamp(timestamp)
                         .attributes(attributes)
                         .producer_id(producer_id)
                         .producer_epoch(producer_epoch);
@@ -1825,17 +1836,7 @@ impl Storage for Engine {
 
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
-                let timestamp_delta = row
-                    .get_value(2)
-                    .map_err(Error::from)
-                    .and_then(LiteTimestamp::try_from)
-                    .and_then(|system_time| {
-                        to_timestamp(&system_time.0)
-                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
-                            .map_err(Into::into)
-                    })
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
+                let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
                 let record_builder = {
                     let mut record_builder = Record::builder()
@@ -1900,7 +1901,12 @@ impl Storage for Engine {
                     .last_offset_delta(offset_delta);
             }
 
-            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+            batches.push(
+                batch_builder
+                    .max_timestamp_of_records()
+                    .build()
+                    .and_then(TryInto::try_into)?,
+            );
         } else {
             batches.push(
                 inflated::Batch::builder()

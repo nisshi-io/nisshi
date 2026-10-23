@@ -317,6 +317,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("pg/topic_select_uuid.sql"),
         ),
         (
+            "pg/topic_configuration_select_keys.sql",
+            include_sql!("pg/topic_configuration_select_keys.sql"),
+        ),
+        (
             "topition_delete_by_topic.sql",
             include_sql!("sql/topition_delete_by_topic.sql"),
         ),
