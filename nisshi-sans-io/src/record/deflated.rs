@@ -285,13 +285,14 @@ impl Batch {
         CrcData::from(self).crc()
     }
 
-    /// Sets the timestamp type in `attributes`, `base_timestamp` and
-    /// `max_timestamp`, and recomputes `crc` so that it covers the new values.
+    /// Sets the timestamp type, `base_timestamp` and `max_timestamp`, and
+    /// recomputes `crc` so that it covers the new values.
     ///
-    /// A consumer reads each record of a [`TimestampType::LogAppendTime`]
-    /// batch with the batch's `max_timestamp`, and each record of a
-    /// [`TimestampType::CreateTime`] batch with `base_timestamp` plus the
-    /// record's `timestamp_delta`.
+    /// The timestamp type is a bit of `attributes`. A consumer reads each
+    /// record's timestamp from these fields, by the rule of
+    /// [`inflated::Batch::record_timestamp`].
+    ///
+    /// [`inflated::Batch::record_timestamp`]: crate::record::inflated::Batch::record_timestamp
     ///
     /// The method verifies `crc` against the current contents first, because
     /// a new `crc` would make a batch that was damaged in transit look intact

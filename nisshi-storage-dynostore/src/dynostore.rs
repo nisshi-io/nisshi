@@ -480,8 +480,8 @@ struct TopicMetadata {
 }
 
 impl TopicMetadata {
-    /// Returns the `DescribeConfigs` result for this topic, whose name is
-    /// `name`: each config that the topic sets.
+    /// Returns the `DescribeConfigs` result for this topic. The result holds
+    /// each config that the topic sets, and gives `name` as the resource name.
     fn describe_configs_result(&self, name: &str) -> DescribeConfigsResult {
         let error_code = ErrorCode::None;
 
@@ -687,8 +687,9 @@ impl DynoStore {
             .map(|_| ())
     }
 
-    /// Returns the metadata of `topition`'s topic, after the checks of
-    /// [`Self::ensure_partition_exists`], from one read of the metadata.
+    /// Returns the metadata of `topition`'s topic, and checks that the topic
+    /// has the partition. The function reads the metadata once, so a caller
+    /// that needs both the check and the metadata does not read it twice.
     ///
     /// # Errors
     ///

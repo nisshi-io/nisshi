@@ -20,8 +20,9 @@
 //! records field. Every malformed batch here carries a valid CRC as sent, so
 //! the tests still exercise decoding if produce starts enforcing the CRC.
 //!
-//! `ProduceService` decodes every batch before a storage backend gets it, so
-//! each test checks the error code that a client gets from each backend.
+//! These tests check the error code that a client gets on each backend.
+//! `ProduceService` decodes every batch before a storage backend gets it, so a
+//! batch that does not decode never reaches a backend.
 
 use crate::common::{StorageType, alphanumeric_string, init_tracing};
 use bytes::Bytes;

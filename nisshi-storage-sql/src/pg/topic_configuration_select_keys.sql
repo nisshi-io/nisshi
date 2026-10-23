@@ -13,9 +13,9 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- One row for each of the keys in $3 that the topic sets. A topic that sets
--- none of them gives one row whose name is null, so that zero rows means that
--- the topic does not exist.
+-- Returns one row for each key in $3 that the topic sets. For a topic that
+-- sets none of these keys, it returns one row with a null name. So the query
+-- returns zero rows only when the topic does not exist.
 select tc.name, tc.value
 
 from

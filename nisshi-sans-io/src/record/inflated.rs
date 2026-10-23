@@ -210,11 +210,13 @@ impl Batch {
         self.base_offset + i64::from(self.last_offset_delta)
     }
 
-    /// Returns the timestamp that a consumer reads for `record` of this
-    /// batch: `max_timestamp` for a [`TimestampType::LogAppendTime`] batch,
-    /// and `base_timestamp` plus the record's `timestamp_delta` for a
-    /// [`TimestampType::CreateTime`] batch. Kafka defines the two types in
-    /// [`DefaultRecordBatch`].
+    /// Returns the timestamp that a consumer reads for `record`.
+    ///
+    /// For each record of a [`TimestampType::LogAppendTime`] batch, a consumer
+    /// reads the batch's `max_timestamp`. For each record of a
+    /// [`TimestampType::CreateTime`] batch, it reads `base_timestamp` plus the
+    /// record's `timestamp_delta`. Kafka defines `max_timestamp` for each type
+    /// in [`DefaultRecordBatch`].
     ///
     /// [`DefaultRecordBatch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L90-L93
     pub fn record_timestamp(&self, record: &Record) -> i64 {
@@ -440,13 +442,15 @@ impl Builder {
         self
     }
 
-    /// Sets `max_timestamp` to the largest record timestamp: `base_timestamp`
-    /// plus the largest `timestamp_delta` of the records. A builder without
-    /// records keeps its `max_timestamp`.
+    /// Sets `max_timestamp` to the largest timestamp of the records. The
+    /// largest timestamp is `base_timestamp` plus the largest
+    /// `timestamp_delta`. If the builder has no records, `max_timestamp` does
+    /// not change.
     ///
-    /// A storage engine that rebuilds a batch from stored records needs this,
-    /// because a consumer reads `max_timestamp` as the timestamp of each record
-    /// of a `LogAppendTime` batch.
+    /// Call this after you add the records of a batch that you rebuild from
+    /// stored records. A consumer reads `max_timestamp` as the timestamp of
+    /// each record of a `LogAppendTime` batch, so a wrong value gives every
+    /// record of that batch a wrong timestamp.
     #[must_use]
     pub fn max_timestamp_of_records(self) -> Self {
         let Some(max_delta) = self

@@ -52,8 +52,8 @@ async fn storage(storage_type: StorageType) -> Result<ArcDynStorage> {
     .await
 }
 
-/// A batch with one record `timestamp_delta` after `base_timestamp`, marked
-/// `LogAppendTime` by the producer.
+/// Returns a batch that the producer marks `LogAppendTime`, with one record
+/// `timestamp_delta` milliseconds after `base_timestamp`.
 fn marked_log_append_time(base_timestamp: i64, timestamp_delta: i64) -> Result<deflated::Batch> {
     inflated::Batch::builder()
         .attributes(
@@ -73,9 +73,8 @@ fn marked_log_append_time(base_timestamp: i64, timestamp_delta: i64) -> Result<d
         .map_err(Into::into)
 }
 
-/// The produce response and every fetched record carry the broker's clock at
-/// the time of the produce, not the producer's timestamps, and the stored
-/// batch is marked `LogAppendTime`.
+/// The produce response and every fetched record carry the broker's time of
+/// the produce. The stored batch is marked `LogAppendTime`.
 async fn stamps_each_record_with_the_broker_clock(storage: impl Storage + Clone) -> Result<()> {
     let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
     let a_day_ago = now_ms()? - 24 * 60 * 60 * 1000;
@@ -123,9 +122,8 @@ async fn stamps_each_record_with_the_broker_clock(storage: impl Storage + Clone)
     Ok(())
 }
 
-/// Each record of a fetch carries the broker's clock at the produce of its own
-/// batch, also when two batches from different produce requests come back in
-/// one fetch.
+/// Each fetched record carries the broker's time of its own produce request,
+/// also when one fetch returns the batches of two produce requests.
 async fn each_batch_keeps_its_own_broker_timestamp(storage: impl Storage + Clone) -> Result<()> {
     let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
 
@@ -152,7 +150,7 @@ async fn each_batch_keeps_its_own_broker_timestamp(storage: impl Storage + Clone
                 .expect("a produce response carries log_append_time_ms"),
         );
 
-        // The two batches must get different times.
+        // The sleep makes the broker give the next batch a later time.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
@@ -179,8 +177,8 @@ async fn each_batch_keeps_its_own_broker_timestamp(storage: impl Storage + Clone
     Ok(())
 }
 
-/// The broker replaces each record timestamp on a `LogAppendTime` topic, so it
-/// does not check them against the `CreateTime` timestamp window.
+/// On a `LogAppendTime` topic, the broker does not check the record timestamps
+/// against the `CreateTime` timestamp window, because it replaces them.
 async fn accepts_a_record_outside_the_timestamp_window(
     storage: impl Storage + Clone,
 ) -> Result<()> {
@@ -251,8 +249,8 @@ async fn create_time_topic_validates_a_batch_marked_log_append_time(
     Ok(())
 }
 
-/// A lookup by timestamp finds a record by the broker's clock at its produce,
-/// the timestamp that a consumer reads, not by the producer's timestamp.
+/// A lookup by timestamp finds a record by the timestamp that a consumer
+/// reads: the broker's time of the record's produce request.
 async fn timestamp_lookup_uses_the_broker_clock(storage: impl Storage + Clone) -> Result<()> {
     let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
     let a_day_ago = now_ms()? - 24 * 60 * 60 * 1000;
