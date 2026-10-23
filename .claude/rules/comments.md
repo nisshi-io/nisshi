@@ -141,7 +141,7 @@ A doc comment (a language's own doc-comment convention — Rust's `///`, a Pytho
   - No: `/// Returns a pool that closes a connection after it has been unused for a while.` above `fn with_idle_timeout(&self, timeout: Duration)`. The summary never says "idle timeout", and it doesn't say how long "a while" is.
   - Yes: `/// Returns a pool with the given idle timeout: how long the pool keeps an unused connection open before closing it.`
 - Longer form only when there is a real invariant, unit, or failure mode to state — see "Function-Header Scope vs. Inline Detail" above for where the line falls.
-- **No boilerplate that restates the signature with no new information.** "Returns a `Result`" adds nothing the signature doesn't already show. Rust's `# Errors` and `# Panics` sections are the right place for the load-bearing facts a signature can't carry — *which* condition produces *which* error variant, or under what non-obvious condition the function panics — but only when they say that, not just that errors or panics are possible (Rust API Guidelines [C-FAILURE](https://rust-lang.github.io/api-guidelines/documentation.html#c-failure)).
+- **No boilerplate that restates the signature with no new information.** "Returns a `Result`" adds nothing the signature doesn't already show. Say which condition gives which error, or when the function panics, only when the signature can't show it, and then in a plain sentence after the summary: "Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic." Don't use a `# Errors` or `# Panics` header. A header and its blank lines take three lines before the one sentence that matters.
 
 ## Rust
 
