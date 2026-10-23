@@ -55,9 +55,18 @@ tests self-skip).
    kafka-python, snappy-java) and nisshi's own inflator accept.
    Regression test:
    `compression_preserved` in `nisshi-broker/tests/it/fetch.rs`, run
-   against every engine. Not covered: `s3://` with request batching
-   enabled re-deflates combined batches as uncompressed
-   (`ProduceRequestBatcher::combine`); CI runs it without batching.
+   against every engine.
+
+4. **`max.message.bytes` was not enforced on Produce**
+   *(fixed 2026-10-21)* — a 10 MiB record produced to a topic created
+   with `max.message.bytes=50KiB` was accepted; Kafka rejects the batch
+   with `MESSAGE_TOO_LARGE`
+   (`TestClient_ProduceLargeMessages/LargeMessage_FailureBroker`). Every
+   engine now rejects a batch larger than the topic's limit, or than
+   Kafka's default of 1048588 bytes when the topic doesn't set one.
+   With request batching enabled, `ProduceRequestBatcher` merges only
+   batches that share a codec and keeps that codec, so a merged batch is
+   measured close to the batches as sent.
 
 ## Open gaps, most impactful first
 
@@ -79,12 +88,6 @@ tests self-skip).
    failed to parse ("response did not contain enough data to be
    valid"), suggesting an empty/truncated assignment payload under
    rebalance.
-
-3. **`max.message.bytes` is not enforced on Produce** — a 10 MiB record
-   produced to a topic created with `max.message.bytes=50KiB` is
-   accepted; Kafka rejects the batch with `MESSAGE_TOO_LARGE`
-   (`TestClient_ProduceLargeMessages/LargeMessage_FailureBroker`; the
-   client-side subtest passes).
 
 ## Feature gaps observed via self-skips (not failures)
 

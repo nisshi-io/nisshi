@@ -201,7 +201,6 @@ fn record_under_max_message_bytes_reads_back() {
 /// A record over the limit must be refused with `RecordTooLargeException`, which tells the producer
 /// that retrying won't help.
 #[test]
-#[ignore = "the broker stores a record larger than the topic's max.message.bytes (#906)"]
 fn record_over_max_message_bytes_is_rejected() {
     let cli = KafkaCli::shared();
     let topic = cli

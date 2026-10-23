@@ -64,7 +64,7 @@ use nisshi_storage::{
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
-    inflate_produced, offload, producer_claim,
+    inflate_produced, max_message_bytes, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -659,14 +659,14 @@ impl DynoStore {
             .await
     }
 
-    /// Ensures that `topition` names an existing partition: its topic
-    /// exists, and its index is below the topic's partition count.
+    /// Ensures that `topition` names an existing partition: its topic exists, and its index is
+    /// below the topic's partition count. Returns the topic's metadata.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`]
     /// for an unknown topic or an index outside the topic.
-    async fn ensure_partition_exists(&self, topition: &Topition) -> Result<()> {
+    async fn ensure_partition_exists(&self, topition: &Topition) -> Result<TopicMetadata> {
         let Some(metadata) = self
             .topic_metadata(&TopicId::Name(topition.topic.clone()))
             .await?
@@ -678,7 +678,7 @@ impl DynoStore {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         }
 
-        Ok(())
+        Ok(metadata)
     }
 
     fn encode(&self, deflated: deflated::Batch) -> Result<PutPayload> {
@@ -907,7 +907,7 @@ impl DynoStore {
             return Ok(watermark.to_owned());
         }
 
-        self.ensure_partition_exists(topition).await?;
+        _ = self.ensure_partition_exists(topition).await?;
 
         self.watermark_for(topition)
     }
@@ -1843,7 +1843,20 @@ impl Storage for DynoStore {
     ) -> Result<i64> {
         // Checked before any key is built, so a produce to a topic or
         // partition that does not exist writes nothing, as in Kafka.
-        self.ensure_partition_exists(topition).await?;
+        let metadata = self.ensure_partition_exists(topition).await?;
+
+        let limit = max_message_bytes::limit(
+            topition.topic(),
+            metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|config| config.name == max_message_bytes::KEY)
+                .and_then(|config| config.value.as_deref()),
+        );
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
 
         let config = self
             .describe_config(topition.topic(), ConfigResource::Topic, None)
@@ -2417,7 +2430,7 @@ impl Storage for DynoStore {
 
                     continue;
                 }
-                checked => checked?,
+                checked => _ = checked?,
             }
 
             // A store failure answers `KAFKA_STORAGE_ERROR` in its own

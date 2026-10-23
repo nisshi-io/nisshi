@@ -23,7 +23,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::{debug, instrument, warn};
 
-use crate::{Error, Result, Storage, TopicId, config::is_list_config};
+use crate::{Error, Result, Storage, TopicId, config::is_list_config, max_message_bytes};
 
 /// A [`Service`] using its [`Storage`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
 /// ```no_run
@@ -343,6 +343,14 @@ fn validate(resource: &AlterConfigsResource) -> Option<(ErrorCode, String)> {
                     config.name
                 ),
             ));
+        }
+
+        if ConfigResource::from(resource.resource_type) == ConfigResource::Topic
+            && op == OpType::Set
+            && config.name == max_message_bytes::KEY
+            && let Some(Err(reason)) = config.value.as_deref().map(max_message_bytes::parse)
+        {
+            return Some((ErrorCode::InvalidConfig, reason));
         }
     }
 

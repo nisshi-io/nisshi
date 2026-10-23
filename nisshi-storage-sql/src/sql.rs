@@ -15,6 +15,7 @@
 pub(crate) mod consumer_group_select;
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
+pub(crate) mod watermark_select_for_write;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
 use nisshi_storage::{Error, Result};
@@ -466,12 +467,12 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/watermark_insert.sql"),
         ),
         (
-            "watermark_select_for_update.sql",
-            include_sql!("sql/watermark_select_for_update.sql"),
+            watermark_select_for_write::QUERY,
+            include_sql!("sql/watermark_select_for_write.sql"),
         ),
         (
-            "watermark_select_no_update.sql",
-            include_sql!("sql/watermark_select_no_update.sql"),
+            watermark_select_for_write::LITE_QUERY,
+            include_sql!("lite/watermark_select_for_write.sql"),
         ),
         (
             "watermark_select_stable.sql",

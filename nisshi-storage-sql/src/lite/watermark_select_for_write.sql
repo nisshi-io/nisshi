@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -13,9 +13,13 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+-- SQLite has no row locks, so this query locks nothing. A write transaction
+-- holds the database's write lock instead.
+-- sql/watermark_select_for_write.sql must select the same columns.
+
 select
 
-w.low, w.high
+w.low, w.high, tc.value as max_message_bytes
 
 from
 
@@ -23,11 +27,11 @@ cluster c
 join topic t on t.cluster = c.id
 join topition tp on tp.topic = t.id
 join watermark w on w.topition = tp.id
+left join topic_configuration tc
+on tc.topic = t.id and tc.name = 'max.message.bytes'
 
 where
 
 c.name = $1
 and t.name = $2
-and tp.partition = $3
-
-for no key update;
+and tp.partition = $3;

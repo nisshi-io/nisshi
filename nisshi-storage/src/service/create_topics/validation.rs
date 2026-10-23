@@ -22,7 +22,7 @@ use nisshi_sans_io::{
 use rama::{Layer, Service, extensions::Extensions};
 use tracing::{debug, instrument, warn};
 
-use crate::{Error, MAX_REPLICATION_FACTOR, Result};
+use crate::{Error, MAX_REPLICATION_FACTOR, Result, max_message_bytes};
 
 /// Build the [`CreatableTopicResult`] for a topic that was rejected, either
 /// by storage or by validation performed before storage is ever consulted.
@@ -290,6 +290,29 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
 
     if num_partitions.is_some_and(|partitions| partitions < 1) {
         return reject(ErrorCode::InvalidPartitions);
+    }
+
+    let max_message_bytes_rejection = topic
+        .configs
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|config| config.name == max_message_bytes::KEY)
+        .filter_map(|config| config.value.as_deref())
+        .find_map(|configured| max_message_bytes::parse(configured).err());
+
+    if let Some(reason) = max_message_bytes_rejection {
+        debug!(topic = %name, reason, "rejecting CreateTopics: invalid max.message.bytes");
+
+        return ValidatedTopic::Rejected(
+            error_result(
+                name,
+                num_partitions,
+                replication_factor,
+                ErrorCode::InvalidConfig,
+            )
+            .error_message(Some(reason)),
+        );
     }
 
     ValidatedTopic::Valid(topic)
