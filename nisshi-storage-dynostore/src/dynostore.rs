@@ -691,10 +691,8 @@ impl DynoStore {
     /// has the partition. The function reads the metadata once, so a caller
     /// that needs both the check and the metadata does not read it twice.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`]
-    /// for an unknown topic or an index outside the topic.
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for
+    /// an unknown topic or an index outside the topic.
     async fn existing_partition_topic_metadata(
         &self,
         topition: &Topition,
