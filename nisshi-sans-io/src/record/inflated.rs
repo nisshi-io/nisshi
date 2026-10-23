@@ -455,9 +455,8 @@ impl Builder {
     pub fn max_timestamp_of_records(self) -> Self {
         let Some(max_delta) = self
             .records
-            .0
             .iter()
-            .map(|record| record.timestamp_delta.0)
+            .map(|record| i64::from(record.timestamp_delta))
             .max()
         else {
             return self;
