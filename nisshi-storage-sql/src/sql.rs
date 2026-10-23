@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
 pub(crate) mod consumer_group_select;
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
@@ -43,7 +42,6 @@ impl Cache {
         Self(inner)
     }
 
-    #[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
     pub(crate) fn get(&self, key: &str) -> Result<&str> {
         self.0
             .get(key)
@@ -89,7 +87,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/consumer_group_select_by_name.sql"),
         ),
         (
-            "consumer_group_select.sql",
+            consumer_group_select::QUERY,
             include_sql!("sql/consumer_group_select.sql"),
         ),
         (

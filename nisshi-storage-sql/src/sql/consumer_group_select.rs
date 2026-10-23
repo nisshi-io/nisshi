@@ -14,6 +14,12 @@
 
 //! The `consumer_group_select.sql` query and the names of the columns that the engines read from
 //! its result. A change to the query's `select` list must keep these names.
+//!
+//! The query takes one parameter, `$1`: the cluster's name.
+//!
+//! An engine that needs its own version of the query gets another key here, such as
+//! `lite/consumer_group_select.sql`, and its version returns the same columns, so every engine
+//! reads them by the names below. A query that returns other columns gets a module of its own.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "consumer_group_select.sql";
