@@ -32,7 +32,11 @@ if [[ -z "${TESTS_ALLOW:-}" ]]; then
     fi
 fi
 echo "librdkafka ${LIBRDKAFKA_VERSION}, allowlist ${TESTS_ALLOW}"
+# resolved to an absolute path, because the test suite runs in another
+# working directory and loads librdkafka from here
 WORK_DIR="${WORK_DIR:-${COMPAT_DIR}/../../target/compat}"
+mkdir -p "${WORK_DIR}"
+WORK_DIR="$(cd "${WORK_DIR}" && pwd)"
 SRC_DIR="${WORK_DIR}/librdkafka"
 JOBS="$(getconf _NPROCESSORS_ONLN)"
 
@@ -43,8 +47,6 @@ if [[ -n "${RESULTS_FILE}" ]]; then
     mkdir -p "$(dirname "${RESULTS_FILE}")"
     : > "${RESULTS_FILE}"
 fi
-
-mkdir -p "${WORK_DIR}"
 
 if [[ ! -d "${SRC_DIR}" ]]; then
     git clone --depth 1 --branch "${LIBRDKAFKA_VERSION}" \
