@@ -9628,7 +9628,7 @@ mod tests {
 
     /// A storage on a new cluster holding one empty single-partition topic, or `None` when
     /// there is no postgres to connect to.
-    async fn storage_with_topic() -> Result<Option<(Postgres, Topition)>> {
+    async fn storage_with_empty_topic() -> Result<Option<(Postgres, Topition)>> {
         let cluster = alphanumeric_string(15);
 
         let storage = Postgres::builder(CONNECTION)?
@@ -9691,7 +9691,7 @@ mod tests {
     async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
         const RECORDS: i64 = ROWS_PER_FETCH + 50;
 
-        let Some((storage, topition)) = storage_with_topic().await? else {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
             return Ok(());
         };
 
@@ -9892,7 +9892,7 @@ mod tests {
         const EXPIRED: i64 = 1_200;
         const RECORDS: i64 = 2_000;
 
-        let Some((storage, topition)) = storage_with_topic().await? else {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
             return Ok(());
         };
 
@@ -9932,7 +9932,7 @@ mod tests {
         const RECORDS: i64 = 1_000;
         const AHEAD: [i64; 2] = [100, 500];
 
-        let Some((storage, topition)) = storage_with_topic().await? else {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
             return Ok(());
         };
 
@@ -9974,7 +9974,7 @@ mod tests {
     /// records that have expired since.
     #[tokio::test]
     async fn retention_sweeps_again_after_more_records_arrive() -> Result<()> {
-        let Some((storage, topition)) = storage_with_topic().await? else {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
             return Ok(());
         };
 
@@ -10024,7 +10024,7 @@ mod tests {
         const EXPIRED: i64 = 800;
         const RECORDS: i64 = 1_000;
 
-        let Some((storage, topition)) = storage_with_topic().await? else {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
             return Ok(());
         };
 
@@ -10060,7 +10060,7 @@ mod tests {
     /// records returned, not of the records in between.
     #[tokio::test]
     async fn keyed_fetch_attaches_headers_of_the_records_it_returns() -> Result<()> {
-        let Some((storage, topition)) = storage_with_topic().await? else {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
             return Ok(());
         };
 
@@ -10144,7 +10144,7 @@ mod tests {
     /// the range get theirs, and a record keeps its headers in produce order.
     #[tokio::test]
     async fn fetch_attaches_each_header_to_its_own_record() -> Result<()> {
-        let Some((storage, topition)) = storage_with_topic().await? else {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
             return Ok(());
         };
 
