@@ -117,6 +117,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/header_delete_by_topic.sql"),
         ),
         ("header_fetch.sql", include_sql!("sql/header_fetch.sql")),
+        (
+            "header_fetch_range.sql",
+            include_sql!("sql/header_fetch_range.sql"),
+        ),
         ("header_insert.sql", include_sql!("sql/header_insert.sql")),
         (
             "list_earliest_offset.sql",
