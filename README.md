@@ -51,6 +51,10 @@ Choose the engine with `--storage-engine` (or `STORAGE_ENGINE`) using the URL sc
 | In-memory | `memory://` | Suitable for development and testing. Data is lost when the broker stops. |
 | Turso | `turso://` | Experimental. |
 
+The engines differ in what they support. For example, only PostgreSQL and SQLite apply
+retention and compaction. [Compatibility and feature status](docs/compatibility.md) lists what
+each engine supports, which Kafka APIs the broker answers, and which Kafka clients CI tests.
+
 PostgreSQL can stream transaction logs to an archive with
 [continuous archiving][continuous-archiving].
 

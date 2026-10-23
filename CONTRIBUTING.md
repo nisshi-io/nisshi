@@ -109,6 +109,33 @@ stable tag that has no `CHANGELOG.md` section. A pre-release
 (`/cut-release X.Y.Z-pre.N`) only bumps the version and has no changelog
 section of its own. The next stable section covers its changes.
 
+## What CI tests on each storage engine
+
+CI runs its checks in three tiers:
+
+- **Tier A, every PR**: on each push to a pull request.
+- **Tier B, merge queue**: once more, after the pull request enters the merge queue. These jobs
+  show as skipped on the pull request itself.
+- **Tier C, twice a day**: on `main`, in the scheduled `tier-c` workflow.
+
+A check marked "not required" runs, but the merge goes ahead even if it fails. In the merge queue,
+the failure shows only in the job's report. In Tier C, a failure opens a "Nightly Tier C run
+failed" issue, which closes when a later run passes. A dash means that CI does not run the check
+on that engine.
+
+| Check | PostgreSQL | SQLite | In-memory | S3 | Turso |
+| --- | --- | --- | --- | --- | --- |
+| Broker tests | Every PR, on PostgreSQL 16. Twice a day on PostgreSQL 17 and 18, not required. | Every PR | Every PR | – | Every PR, with most tests skipped ([#866]) |
+| Build with only this engine | Merge queue | Merge queue | Merge queue | Merge queue | Merge queue |
+| Kafka CLI smoke suite, with Kafka 3.7.2, 3.9.2 and 4.3.1 | Merge queue | Merge queue | Merge queue | Merge queue, topic create, list, describe and delete tests only | – |
+| librdkafka v2.14.2 and franz-go v1.21.3 suites | Merge queue, not required | Merge queue, not required | Every PR | Twice a day, not required | – |
+| librdkafka v2.3.0 suite | Merge queue, not required | Merge queue, not required | Merge queue, not required | Twice a day, not required | – |
+
+The in-memory and S3 engines share one implementation, so the broker tests for the in-memory
+engine also test the code that the S3 engine runs.
+
+[#866]: https://github.com/nisshi-io/nisshi/issues/866
+
 ## Sign off your commits (DCO)
 
 This project's contributor-agreement position is the Developer Certificate
