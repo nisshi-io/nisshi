@@ -24,15 +24,6 @@ BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-127.0.0.1:9092}"
 # started for this run: the readiness wait fails immediately if it exits
 BROKER_PID="${BROKER_PID:-}"
 COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# an older franz-go has its own allowlist, tests-<version>.allow, because its
-# test names and the tests that pass differ
-if [[ -z "${TESTS_ALLOW:-}" ]]; then
-    TESTS_ALLOW="${COMPAT_DIR}/tests-${FRANZ_GO_VERSION}.allow"
-    if [[ ! -f "${TESTS_ALLOW}" ]]; then
-        TESTS_ALLOW="${COMPAT_DIR}/tests.allow"
-    fi
-fi
-echo "franz-go ${FRANZ_GO_VERSION}, allowlist ${TESTS_ALLOW}"
 # resolved to an absolute path, because the test suite runs in another
 # working directory and writes its log here
 WORK_DIR="${WORK_DIR:-${COMPAT_DIR}/../../target/compat}"
@@ -97,10 +88,10 @@ if [[ -z "${ready}" ]]; then
                      "after $((SECONDS - started))s"
 fi
 
-tests=$(grep -Ev '^[[:space:]]*(#|$)' "${TESTS_ALLOW}" |
+tests=$(grep -Ev '^[[:space:]]*(#|$)' "${COMPAT_DIR}/tests.allow" |
             awk '{print $1}' | paste -s -d '|' -)
 
-count=$(grep -cEv '^[[:space:]]*(#|$)' "${TESTS_ALLOW}")
+count=$(grep -cEv '^[[:space:]]*(#|$)' "${COMPAT_DIR}/tests.allow")
 echo "running ${count// /} franz-go test(s) against ${BOOTSTRAP_SERVERS}"
 
 cd "${SRC_DIR}/pkg/kgo"

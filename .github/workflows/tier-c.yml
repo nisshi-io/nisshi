@@ -234,17 +234,6 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # as for compat-librdkafka
-    continue-on-error: ${{ matrix.client.experimental == true }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # The same client versions as compat-franz-go in ci.yml.
-        client:
-          - suffix: ""
-          - suffix: -v1.16.1
-            version: v1.16.1
-            experimental: true
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -254,8 +243,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
-      FRANZ_GO_VERSION: ${{matrix.client.version}}
-      RESULTS_FILE: results-s3${{matrix.client.suffix}}.csv
+      RESULTS_FILE: results-s3.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn
       STORAGE_ENGINE: s3://nisshi/
@@ -282,7 +270,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: compat-franz-go-results-s3${{matrix.client.suffix}}
+          name: compat-franz-go-results-s3
           path: ${{env.RESULTS_FILE}}
           if-no-files-found: warn
   compat-franz-go-report:

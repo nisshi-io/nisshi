@@ -29,33 +29,16 @@ To run against an already-running broker, call `./run.sh` directly.
 To investigate a single test:
 
 ```shell
-just compat-franz-go-test '^TestAddRemovePartitions$' 120s
+cd target/compat/franz-go/pkg/kgo
+KGO_TEST_RF=1 KGO_LOG_LEVEL=debug \
+    go test -count=1 -timeout 120s -v -run '^TestAddRemovePartitions$' .
 ```
-
-For an older version, pass its `WORK_DIR` (see below) as the fourth
-argument, e.g. `just compat-franz-go-test '^TestIssue325$' 120s 1
-target/compat-v1.16.1`.
 
 ## The allowlist
 
 `tests.allow` lists tests known to pass. When broker compatibility
 improves, re-sweep the excluded tests and grow the allowlist.
 `FINDINGS.md` records the gaps behind the tests that are excluded.
-
-CI also tests franz-go v1.16.1, the newest release on or before Kafka
-3.7.0, because applications upgrade franz-go slowly. Its test names and
-passing tests differ, so it has its own allowlist,
-`tests-v1.16.1.allow`, which `run.sh` picks from `FRANZ_GO_VERSION`. To
-run it locally:
-
-```shell
-FRANZ_GO_VERSION=v1.16.1 WORK_DIR=target/compat-v1.16.1 just compat-franz-go
-```
-
-`run.sh` stops if the clone in `WORK_DIR` is at another version, so give
-each version its own `WORK_DIR`. It also fails a test that the allowlist
-names but the version does not run, because `go test` passes when `-run`
-matches nothing.
 
 Some allowlisted tests self-skip against nisshi: the SCRAM tests
 (no `KGO_TEST_SCRAM` configured) and the share-group / KIP-848 tests
@@ -64,3 +47,7 @@ They are kept in the allowlist so they light up automatically when the
 broker grows support. Others never contact the broker at all: they are
 unit tests of the client, such as address parsing, compression and the
 group balancers.
+
+`run.sh` fails an allowlisted test that `go test` reports no result for,
+because `go test` passes when `-run` matches nothing. It also stops if
+the clone in `WORK_DIR` is at another version than `FRANZ_GO_VERSION`.
