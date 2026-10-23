@@ -19,7 +19,7 @@ use crate::{Result, TracingFormat};
 
 mod tracing;
 
-pub use tracing::capped_env_filter;
+pub use tracing::capped_filter;
 
 #[derive(Debug)]
 pub struct Guard {

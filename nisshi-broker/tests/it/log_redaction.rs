@@ -25,7 +25,7 @@ use crate::common::{lite_storage, postgres_storage, slate_storage};
 use bytes::{BufMut, Bytes, BytesMut};
 use nisshi_broker::{
     Error, Result,
-    otel::capped_env_filter,
+    otel::capped_filter,
     service::{auth, storage},
 };
 use nisshi_sans_io::{
@@ -51,7 +51,7 @@ use rsasl::{
 };
 use sha2::Sha256;
 use tracing::Level;
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+use tracing_subscriber::{EnvFilter, Layer as _, fmt::format::FmtSpan, layer::SubscriberExt as _};
 use uuid::Uuid;
 
 type Broker = BytesFrameService<FrameRouteService<Error>>;
@@ -121,15 +121,16 @@ fn capture() -> &'static Capture {
         let writer = capture.clone();
 
         tracing::subscriber::set_global_default(
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    capped_env_filter(EnvFilter::new(Level::TRACE.as_str()))
-                        .expect("the caps of the broker's env filter are valid directives"),
-                )
-                .with_span_events(FmtSpan::FULL)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish(),
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_span_events(FmtSpan::FULL)
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .with_filter(
+                        capped_filter(EnvFilter::new(Level::TRACE.as_str()))
+                            .expect("the caps of the broker's env filter are valid directives"),
+                    ),
+            ),
         )
         .expect("no other global subscriber in this test process");
 
