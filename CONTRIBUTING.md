@@ -125,7 +125,7 @@ on that engine.
 
 | Check | PostgreSQL | SQLite | In-memory | S3 | Turso |
 | --- | --- | --- | --- | --- | --- |
-| Broker tests | Every PR, on PostgreSQL 16. Twice a day on PostgreSQL 17 and 18, not required. | Every PR | Every PR | – | Every PR, with most tests skipped ([#866]) |
+| Broker tests | Every PR, on PostgreSQL 16. Twice a day on PostgreSQL 17, 18 and the current 19 beta, not required. | Every PR | Every PR | – | Every PR, with most tests skipped ([#866]) |
 | Build with only this engine | Merge queue | Merge queue | Merge queue | Merge queue | Merge queue |
 | Kafka CLI smoke suite, with Kafka 3.7.2, 3.9.2 and 4.3.1 | Merge queue | Merge queue | Merge queue | Merge queue, topic create, list, describe and delete tests only | – |
 | librdkafka v2.14.2 and franz-go v1.21.3 suites | Merge queue, not required | Merge queue, not required | Every PR | Twice a day, not required | – |

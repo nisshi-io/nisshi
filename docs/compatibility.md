@@ -47,7 +47,7 @@ client that reads the ApiVersions response first does not send such a request.
 
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker always creates a missing topic automatically, with 4 partitions. To set a different number of partitions, create the topic with CreateTopics first. |
+| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with 4 partitions, if the client allows automatic topic creation. The broker has no setting to turn this off. To set a different number of partitions, create the topic with CreateTopics first. |
 | CreateTopics | 19 | 0-7 | Yes | Yes | Yes | Yes | |
 | DeleteTopics | 20 | 0-6 | Yes | Yes | Yes | Yes | |
 | DescribeConfigs | 32 | 0-4 | Partial | Partial | Partial | Partial | Lists only the configs set on a topic, not the defaults. Describing a broker, for example with `kafka-configs --describe --entity-type brokers`, returns an empty list. |
