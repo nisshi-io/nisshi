@@ -284,6 +284,130 @@ where
     Ok(())
 }
 
+/// A topic with `retention.bytes` and no `cleanup.policy` keeps every record: nisshi cleans up a
+/// topic only when its `cleanup.policy` is set and contains `delete`.
+pub async fn retention_bytes_without_cleanup_policy_keeps_everything<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[("retention.bytes", &RETENTION_BYTES.to_string())],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(0),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
+/// A topic whose `cleanup.policy` is only compact keeps every record, whatever `retention.bytes`
+/// says.
+pub async fn retention_bytes_ignores_a_compact_only_topic<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[
+            ("cleanup.policy", "compact"),
+            ("retention.bytes", &RETENTION_BYTES.to_string()),
+        ],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(0),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
+/// A second sweep after more records arrive deletes exactly the records that the new ones push
+/// out, and a sweep that finds the partition within its limit deletes nothing.
+pub async fn retention_bytes_second_sweep_deletes_the_new_excess<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.bytes", &RETENTION_BYTES.to_string()),
+        ],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        Some(15),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+
+    // within the limit: nothing to delete
+    sc.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        Some(15),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+
+    // three more records push out the three oldest of the five that remain
+    for n in PRODUCED..PRODUCED + 3 {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        Some(18),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    assert_eq!(
+        Some(PRODUCED + 3),
+        list_offset(&broker, &extensions, topic, ListOffset::Latest).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -324,6 +448,31 @@ macro_rules! backend {
             async fn keeps_newest_record() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::retention_bytes_keeps_newest_record(storage_container().await?).await
+            }
+
+            #[tokio::test]
+            async fn without_cleanup_policy_keeps_everything() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_without_cleanup_policy_keeps_everything(
+                    storage_container().await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn ignores_a_compact_only_topic() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_ignores_a_compact_only_topic(storage_container().await?)
+                    .await
+            }
+
+            #[tokio::test]
+            async fn second_sweep_deletes_the_new_excess() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_second_sweep_deletes_the_new_excess(
+                    storage_container().await?,
+                )
+                .await
             }
         }
     };
