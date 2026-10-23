@@ -2281,6 +2281,68 @@ fn describe_groups_response_v1_000() -> Result<()> {
 }
 
 #[test]
+fn describe_groups_response_v2_drops_authorized_operations() -> Result<()> {
+    use nisshi_sans_io::describe_groups_response::DescribedGroup;
+
+    let _guard = init_tracing()?;
+    let header = Header::Response { correlation_id: 0 };
+    let body = DescribeGroupsResponse::default()
+        .throttle_time_ms(Some(0))
+        .groups(Some(
+            [DescribedGroup::default()
+                .error_code(0)
+                .group_id("abc".into())
+                .group_state("".into())
+                .protocol_type("".into())
+                .protocol_data("".into())
+                .members(Some([].into()))
+                .authorized_operations(Some(i32::MIN))]
+            .into(),
+        ))
+        .into();
+
+    assert_eq!(
+        vec![
+            0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 3, 97, 98, 99, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ],
+        Frame::response(header, body, DescribeGroupsResponse::KEY, 2)?,
+    );
+    Ok(())
+}
+
+#[test]
+fn describe_groups_response_v5_writes_authorized_operations() -> Result<()> {
+    use nisshi_sans_io::describe_groups_response::DescribedGroup;
+
+    let _guard = init_tracing()?;
+    let header = Header::Response { correlation_id: 0 };
+    let body = DescribeGroupsResponse::default()
+        .throttle_time_ms(Some(0))
+        .groups(Some(
+            [DescribedGroup::default()
+                .error_code(0)
+                .group_id("abc".into())
+                .group_state("".into())
+                .protocol_type("".into())
+                .protocol_data("".into())
+                .members(Some([].into()))
+                .authorized_operations(Some(328))]
+            .into(),
+        ))
+        .into();
+
+    assert_eq!(
+        vec![
+            0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 4, 97, 98, 99, 1, 1, 1, 1, 0, 0, 1,
+            72, 0, 0,
+        ],
+        Frame::response(header, body, DescribeGroupsResponse::KEY, 5)?,
+    );
+    Ok(())
+}
+
+#[test]
 fn fetch_request_v6_000() -> Result<()> {
     use nisshi_sans_io::fetch_request::{FetchPartition, FetchTopic};
 

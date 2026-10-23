@@ -14,8 +14,14 @@ include.workspace = true
 default = ["libsql", "postgres", "turso"]
 libsql = ["dep:libsql", "dep:deadpool"]
 postgres = ["dep:tokio-postgres", "dep:deadpool", "dep:deadpool-postgres", "dep:tokio-postgres-rustls"]
-turso = ["dep:turso"]
+turso = ["dep:turso", "nisshi-storage/turso"]
 
+# docs.rs builds with nightly, where `branches` 0.4 (a dependency of turso) no longer
+# compiles. Remove this table once turso depends on `branches` 0.5.
+# https://github.com/nisshi-io/nisshi/issues/1045
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["libsql", "postgres"]
 
 [dependencies]
 async-trait.workspace = true
@@ -29,7 +35,7 @@ human-units.workspace = true
 libsql = { workspace = true, optional = true }
 nisshi-sans-io.workspace = true
 nisshi-schema.workspace = true
-nisshi-storage = {workspace = true, features = ["libsql", "postgres", "turso"]}
+nisshi-storage = {workspace = true, features = ["libsql", "postgres"]}
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 rama.workspace = true

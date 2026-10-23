@@ -44,7 +44,22 @@ fuzz_target!(|request: ProduceRequest| {
         check_request(request.clone()).expect("encode/decode request");
 
         // Serve what a client could actually have sent: the request as decoded off the wire.
-        let request = normalize_request(request).expect("normalized request");
+        let mut request = normalize_request(request).expect("normalized request");
+
+        // A fuzzed CRC almost never matches its batch, and `ProduceService` rejects such a
+        // batch before any other check. Give every batch a matching CRC, so that the later
+        // checks and the timestamp rewrite are fuzzed too. When the otherwise unused
+        // `timeout_ms` is odd, keep the fuzzed CRC, so that the rejection is fuzzed as well.
+        if request.timeout_ms % 2 == 0 {
+            request
+                .topic_data
+                .iter_mut()
+                .flatten()
+                .flat_map(|topic| topic.partition_data.iter_mut().flatten())
+                .flat_map(|partition| partition.records.iter_mut())
+                .flat_map(|frame| frame.batches.iter_mut())
+                .for_each(|batch| batch.crc = batch.computed_crc());
+        }
 
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")

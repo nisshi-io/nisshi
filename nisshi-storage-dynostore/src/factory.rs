@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{num::NonZeroU32, str::FromStr as _, sync::Arc, time::Duration};
+use std::{
+    fmt::{self, Display, Formatter},
+    num::NonZeroU32,
+    str::FromStr as _,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use nisshi_schema::redact_url;
 use nisshi_storage::{
-    ArcDynStorage, ProduceRequestBatcher, Result, StorageFactory, StorageFactoryConfiguration,
-    reject_unrecognized_options,
+    ArcDynStorage, ProduceRequestBatcher, Result, StorageCapabilities, StorageFactory,
+    StorageFactoryConfiguration, reject_unrecognized_options,
 };
 use object_store::{
     aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
@@ -30,13 +36,28 @@ use tracing::{debug, warn};
 
 use crate::{dynostore::DynoStore, gcs::limit::PutRateLimiter};
 
+const MEMORY: &str = "in-memory (memory://)";
+const S3: &str = "S3 (s3://)";
+const GCS: &str = "Google Cloud Storage (gs://)";
+
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryEngineFactory;
+
+impl Display for MemoryEngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(MEMORY)
+    }
+}
 
 #[async_trait]
 impl StorageFactory for MemoryEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"memory").map_err(Into::into)
+    }
+
+    /// No SCRAM credentials yet: DynoStore keeps none.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
@@ -48,6 +69,7 @@ impl StorageFactory for MemoryEngineFactory {
                 configuration.node_id,
                 InMemory::new(),
             )?
+            .engine(MEMORY)
             .advertised_listener(configuration.advertised_listener.clone())
             .schemas(configuration.schema_registry)
             .lake(configuration.lake_house.clone()),
@@ -58,10 +80,21 @@ impl StorageFactory for MemoryEngineFactory {
 #[derive(Clone, Copy, Debug)]
 pub struct S3OptimisticConcurrencyEngineFactory;
 
+impl Display for S3OptimisticConcurrencyEngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(S3)
+    }
+}
+
 #[async_trait]
 impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"s3").map_err(Into::into)
+    }
+
+    /// No SCRAM credentials yet: DynoStore keeps none.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
@@ -132,6 +165,7 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             configuration.node_id,
             object_store,
         )?
+        .engine(S3)
         .advertised_listener(configuration.advertised_listener.clone())
         .schemas(configuration.schema_registry)
         .lake(configuration.lake_house.clone());
@@ -162,10 +196,21 @@ fn skip_signature(value: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct GoogleCloudStorageEngineFactory;
 
+impl Display for GoogleCloudStorageEngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(GCS)
+    }
+}
+
 #[async_trait]
 impl StorageFactory for GoogleCloudStorageEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"gs").map_err(Into::into)
+    }
+
+    /// No SCRAM credentials yet: DynoStore keeps none.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
@@ -222,6 +267,7 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
                 )
                 .map(|storage| {
                     storage
+                        .engine(GCS)
                         .advertised_listener(configuration.advertised_listener.clone())
                         .schemas(configuration.schema_registry)
                         .lake(configuration.lake_house.clone())

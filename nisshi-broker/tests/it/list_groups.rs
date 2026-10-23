@@ -16,11 +16,13 @@ use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
     slate_storage,
 };
-use nisshi_broker::Result;
+use nisshi_broker::{Error, Result};
 use nisshi_sans_io::{
     ErrorCode, ListGroupsRequest, RequestInput, create_topics_request::CreatableTopic,
 };
-use nisshi_storage::{ArcDynStorage, ListGroupsService, OffsetCommitRequest, Storage, Topition};
+use nisshi_storage::{
+    ArcDynStorage, GroupDetail, ListGroupsService, OffsetCommitRequest, Storage, Topition,
+};
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
@@ -37,6 +39,83 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
 
     assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
     assert_eq!(Some([].into()), response.groups);
+
+    Ok(())
+}
+
+/// A group that the coordinator has stored, but that has not committed an offset, must be listed
+/// exactly once, because Kafka lists every group the coordinator knows. A group has no committed
+/// offset until its first commit, and an operator must be able to find it before then.
+async fn group_without_committed_offsets_is_listed_once(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let group_id = alphanumeric_string(15);
+
+    _ = storage
+        .update_group(&group_id, GroupDetail::default(), None)
+        .await
+        .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
+
+    let groups = storage.list_groups(None).await?;
+
+    assert_eq!(
+        1,
+        groups
+            .iter()
+            .filter(|group| group.group_id == group_id)
+            .count(),
+        "expected {group_id:?} exactly once in {groups:?}"
+    );
+
+    Ok(())
+}
+
+/// A group that the coordinator has stored, and that has committed an offset, must be listed
+/// once, not once for its state and once for its offsets.
+async fn group_with_committed_offsets_is_listed_once(storage: impl Storage + Clone) -> Result<()> {
+    let topic_name = alphanumeric_string(15);
+    let group_id = alphanumeric_string(15);
+
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    _ = storage
+        .update_group(&group_id, GroupDetail::default(), None)
+        .await
+        .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
+
+    let commit = storage
+        .offset_commit(
+            &group_id,
+            None,
+            &[(
+                Topition::new(topic_name, 0),
+                OffsetCommitRequest::default().offset(rng().random_range(0..i64::MAX)),
+            )],
+        )
+        .await?;
+    assert_eq!(1, commit.len());
+    assert_eq!(ErrorCode::None, commit[0].1);
+
+    let groups = storage.list_groups(None).await?;
+
+    assert_eq!(
+        1,
+        groups
+            .iter()
+            .filter(|group| group.group_id == group_id)
+            .count(),
+        "expected {group_id:?} exactly once in {groups:?}"
+    );
 
     Ok(())
 }
@@ -107,6 +186,71 @@ async fn empty_group_id_is_not_surfaced_as_phantom_group(
     Ok(())
 }
 
+/// A group with the empty id and only a state object must be listed once, as `""`. On dynostore
+/// that state object is `%empty.json`, because the empty id is stored as the sentinel `%empty`,
+/// and `list_groups` must decode the sentinel instead of listing a group named `%empty`.
+#[cfg(feature = "dynostore")]
+async fn empty_group_id_without_committed_offsets_is_listed(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    _ = storage
+        .update_group("", GroupDetail::default(), None)
+        .await
+        .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
+
+    let groups = storage.list_groups(None).await?;
+
+    assert_eq!(
+        1,
+        groups
+            .iter()
+            .filter(|group| group.group_id.is_empty())
+            .count(),
+        "expected a group with id \"\" exactly once in {groups:?}"
+    );
+
+    for phantom in ["%empty", "%empty.json"] {
+        assert!(
+            !groups.iter().any(|group| group.group_id == phantom),
+            "list_groups surfaced a phantom group named {phantom:?}: {groups:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// On dynostore, a group's state object is its encoded id followed by `.json`, so `list_groups`
+/// must remove the `.json` before it decodes the id. A group named `foo.json` must stay distinct
+/// from the state object of a group named `foo`, and an id with reserved characters must be
+/// listed as it was stored.
+#[cfg(feature = "dynostore")]
+async fn state_only_group_ids_are_decoded(storage: impl Storage + Clone) -> Result<()> {
+    let base = alphanumeric_string(15);
+    let group_ids = [base.clone(), format!("{base}.json"), format!("{base}/a%b")];
+
+    for group_id in &group_ids {
+        _ = storage
+            .update_group(group_id, GroupDetail::default(), None)
+            .await
+            .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
+    }
+
+    let groups = storage.list_groups(None).await?;
+
+    for group_id in &group_ids {
+        assert_eq!(
+            1,
+            groups
+                .iter()
+                .filter(|group| &group.group_id == group_id)
+                .count(),
+            "expected {group_id:?} exactly once in {groups:?}"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -133,6 +277,34 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_without_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_with_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn empty_group_id_is_not_surfaced_as_phantom_group() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -142,6 +314,34 @@ mod in_memory {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::empty_group_id_is_not_surfaced_as_phantom_group(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_group_id_without_committed_offsets_is_listed() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::empty_group_id_without_committed_offsets_is_listed(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_only_group_ids_are_decoded() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::state_only_group_ids_are_decoded(storage).await?;
 
         Ok(())
     }
@@ -171,6 +371,34 @@ mod lite {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_without_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_with_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -197,6 +425,34 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_without_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_with_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -220,6 +476,34 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::simple(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_without_committed_offsets_is_listed_once(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::group_with_committed_offsets_is_listed_once(storage).await?;
 
         Ok(())
     }

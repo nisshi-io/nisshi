@@ -1852,15 +1852,8 @@ impl Storage for Engine {
     async fn describe_groups(
         &self,
         group_ids: Option<&[String]>,
-        include_authorized_operations: bool,
+        _include_authorized_operations: bool,
     ) -> Result<Vec<NamedGroupDetail>> {
-        // TODO: Implement include_authorized_operations
-        // Should return ACL-based authorized operations for each group
-        if include_authorized_operations {
-            tracing::warn!(
-                "describe_groups authorized_operations is not implemented, returning empty"
-            );
-        }
         let mut results = vec![];
 
         if let Some(group_ids) = group_ids {

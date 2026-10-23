@@ -18,10 +18,11 @@ use nisshi_sans_io::{
 };
 use rama::Service;
 use tracing::{debug, instrument};
+use uuid::Uuid;
 
 use validation::{ValidatedCreateTopicsRequest, ValidatedTopic, error_result};
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, TopicId};
 
 pub(crate) mod validation;
 
@@ -114,11 +115,13 @@ where
             let num_partitions = Some(topic.num_partitions);
             let replication_factor = Some(topic.replication_factor);
 
-            match self
-                .storage
-                .create_topic(topic, request.validate_only)
-                .await
-            {
+            let created = if request.validate_only {
+                self.dry_run(&name).await
+            } else {
+                self.storage.create_topic(topic, false).await
+            };
+
+            match created {
                 Ok(topic_id) => {
                     debug!(?topic_id);
 
@@ -163,5 +166,44 @@ where
         Ok(CreateTopicsResponse::default()
             .topics(Some(topics))
             .throttle_time_ms(Some(0)))
+    }
+}
+
+impl<G> CreateTopicsService<G>
+where
+    G: Storage,
+{
+    /// Answers a `validate_only` request for the topic `name` without creating it, as Kafka
+    /// does in [`ReplicationControlManager`]. An existing topic fails with
+    /// `TOPIC_ALREADY_EXISTS` ([`createTopics`][exists]). A new topic succeeds with a random
+    /// topic id ([`createTopic`][topic-id]), and Kafka discards the records that would
+    /// create it ([`createTopics`][discard]).
+    ///
+    /// [`ReplicationControlManager`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java
+    /// [exists]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L601-L604
+    /// [topic-id]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L778
+    /// [discard]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L664-L666
+    async fn dry_run(&self, name: &str) -> Result<Uuid> {
+        let metadata = self
+            .storage
+            .metadata(Some(&[TopicId::Name(name.into())]))
+            .await?;
+
+        // `Storage::metadata` includes every requested topic that exists, and may leave out
+        // one that does not, so a name that is missing from the response is a topic that
+        // does not exist.
+        let Some(topic) = metadata
+            .topics()
+            .iter()
+            .find(|topic| topic.name.as_deref() == Some(name))
+        else {
+            return Ok(Uuid::new_v4());
+        };
+
+        match ErrorCode::try_from(topic.error_code) {
+            Ok(ErrorCode::None) => Err(Error::Api(ErrorCode::TopicAlreadyExists)),
+            Ok(ErrorCode::UnknownTopicOrPartition) => Ok(Uuid::new_v4()),
+            _ => Err(Error::Api(ErrorCode::UnknownServerError)),
+        }
     }
 }

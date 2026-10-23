@@ -20,8 +20,9 @@ use rsasl::{
     callback::{Context, Request, SessionCallback, SessionData},
     config::SASLConfig,
     mechanisms::scram::properties::ScramStoredPassword,
-    prelude::{SASLError, SASLServer, Session, SessionError, Validation},
-    property::{AuthId, AuthzId, Password},
+    mechanisms::scram::{SCRAM_SHA256, SCRAM_SHA512},
+    prelude::{Mechanism, Registry, SASLError, SASLServer, Session, SessionError, Validation},
+    property::{AuthId, AuthzId},
     validate::{Validate, ValidationError},
 };
 use std::{
@@ -123,6 +124,17 @@ impl AuthenticationExtension {
     pub fn fresh_server(&self) -> Stage {
         Stage::Server(SASLServer::<Justification>::new(self.config.clone()))
     }
+
+    /// The names of the mechanisms that the stored config enables, which a
+    /// SaslHandshake response lists whether it accepts the requested one or
+    /// not.
+    pub fn enabled_mechanisms(&self) -> Vec<String> {
+        SASLServer::<Justification>::new(self.config.clone())
+            .get_available()
+            .into_iter()
+            .map(|mechanism| mechanism.mechanism.to_string())
+            .collect()
+    }
 }
 
 impl Debug for AuthenticationExtension {
@@ -182,27 +194,7 @@ where
     ) -> Result<Result<Success, AuthError>, Error> {
         debug!(mechanism = %session_data.mechanism().mechanism);
 
-        if session_data.mechanism().mechanism == "PLAIN" {
-            Ok(context
-                .get_ref::<Password>()
-                .ok_or(AuthError::MissingProperty {
-                    mechanism: session_data.mechanism().mechanism.to_string(),
-                    property: "Password".into(),
-                })
-                .and(
-                    context
-                        .get_ref::<AuthId>()
-                        .inspect(|auth_id| {
-                            debug!(mechanism = %session_data.mechanism().mechanism, auth_id)
-                        })
-                        .ok_or(AuthError::MissingProperty {
-                            mechanism: session_data.mechanism().mechanism.to_string(),
-                            property: "AuthId".into(),
-                        }).map(ToString::to_string).map(|auth_id| {
-                            Success { auth_id }
-                        })
-                ))
-        } else if session_data.mechanism().mechanism.starts_with("SCRAM-") {
+        if session_data.mechanism().mechanism.starts_with("SCRAM-") {
             Ok(context
                 .get_ref::<AuthId>()
                 .inspect(|auth_id| debug!(mechanism = %session_data.mechanism().mechanism, auth_id))
@@ -303,12 +295,21 @@ where
     }
 }
 
+/// The mechanisms that the broker enables: the SCRAM mechanisms that
+/// [`Callback`] can look up a credential for and validate.
+///
+/// The config names them, not rsasl's defaults, because the defaults follow
+/// rsasl's enabled features and so can include a mechanism (such as
+/// OAUTHBEARER) that the broker would accept at handshake and then fail at
+/// every authentication.
+static MECHANISMS: &[Mechanism] = &[SCRAM_SHA512, SCRAM_SHA256];
+
 pub fn configuration<S>(storage: S) -> Result<Arc<SASLConfig>, Error>
 where
     S: Storage,
 {
     SASLConfig::builder()
-        .with_defaults()
+        .with_registry(Registry::with_mechanisms(MECHANISMS))
         .with_callback(Callback::new(storage))
         .map_err(Into::into)
 }
@@ -324,5 +325,22 @@ mod tests {
     fn authentication() {
         is_send::<AuthenticationExtension>();
         is_sync::<AuthenticationExtension>();
+    }
+
+    /// The broker enables exactly the SCRAM mechanisms that it can look up a
+    /// credential for.
+    #[test]
+    fn mechanisms_are_the_scram_mechanisms() {
+        let mut enabled = MECHANISMS
+            .iter()
+            .map(|mechanism| ScramMechanism::from_str(mechanism.mechanism.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every enabled mechanism is a SCRAM mechanism");
+        enabled.sort_unstable();
+
+        assert_eq!(
+            vec![ScramMechanism::Scram256, ScramMechanism::Scram512],
+            enabled
+        );
     }
 }

@@ -150,13 +150,9 @@ async fn scram_rejects_unverified_client(engine: impl Storage + Clone) -> Result
         ErrorCode::try_from(handshake.error_code)?,
         "SCRAM-SHA-256 must be negotiable for this test to be meaningful",
     );
-    let offered = handshake
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
+    // A Kafka client logs in with the mechanism that it requested, not one that
+    // it picks from the list.
+    let offered = [Mechname::parse(b"SCRAM-SHA-256").expect("mechanism name")];
 
     // 2. Run the SCRAM exchange with junk credentials: a user with no
     //    stored credential and an arbitrary password, so no proof can

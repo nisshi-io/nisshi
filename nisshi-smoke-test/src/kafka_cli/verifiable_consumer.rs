@@ -88,15 +88,43 @@ pub enum ConsumerEvent {
     Other,
 }
 
+/// A partition assignor of the Java client. A member of a classic group lists the names of its
+/// assignors as its protocols in `JoinGroup`, and the group's leader runs the assignor of the
+/// protocol that the broker chooses for the group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionAssignor {
+    /// `range`, which supports only the eager rebalance protocol, where each member gives up all
+    /// of its partitions at each rebalance. The client's default list of assignors prefers it.
+    Range,
+    /// `cooperative-sticky`, which supports the cooperative rebalance protocol, where a member
+    /// gives up only the partitions that move to another member.
+    CooperativeSticky,
+}
+
+impl PartitionAssignor {
+    /// The assignor's class, as the client's `partition.assignment.strategy` setting names it.
+    fn class_name(self) -> &'static str {
+        match self {
+            Self::Range => "org.apache.kafka.clients.consumer.RangeAssignor",
+            Self::CooperativeSticky => {
+                "org.apache.kafka.clients.consumer.CooperativeStickyAssignor"
+            }
+        }
+    }
+}
+
 /// Returns the arguments of `kafka-verifiable-consumer`. The consumer starts each partition at the
 /// group's committed offset, or at the beginning when the group has none, and commits after each
-/// poll. Without `max_messages`, it reads until it is stopped.
+/// poll. Without `max_messages`, it reads until it is stopped. The consumer lists the protocols of
+/// `assignors` in that order. With an empty `assignors`, it lists only `range`, which is the tool's
+/// own default, and not the client's default list of `range` and `cooperative-sticky`.
 fn verifiable_consumer_args(
     topic: &str,
     group: &str,
     session_timeout: Duration,
     group_instance_id: Option<&str>,
     max_messages: Option<usize>,
+    assignors: &[PartitionAssignor],
 ) -> Vec<String> {
     let mut args = [
         "--topic",
@@ -123,6 +151,15 @@ fn verifiable_consumer_args(
         args.extend(["--max-messages".to_owned(), max_messages.to_string()]);
     }
 
+    if !assignors.is_empty() {
+        let class_names = assignors
+            .iter()
+            .map(|assignor| assignor.class_name())
+            .collect::<Vec<_>>();
+
+        args.extend(["--assignment-strategy".to_owned(), class_names.join(",")]);
+    }
+
     args
 }
 
@@ -130,12 +167,25 @@ fn verifiable_consumer_args(
 #[derive(Clone, Copy, Debug)]
 pub struct KafkaVerifiableConsumer<'cli> {
     cli: &'cli KafkaCli,
+    /// The assignors whose protocols the consumer lists in `JoinGroup`, in that order. An empty
+    /// list gives only `range`, the tool's own default.
+    assignors: &'cli [PartitionAssignor],
 }
 
 impl<'cli> KafkaVerifiableConsumer<'cli> {
     pub(super) fn new(cli: &'cli KafkaCli) -> Self {
-        Self { cli }
+        Self {
+            cli,
+            assignors: &[],
+        }
     }
+
+    /// Returns this consumer with `assignors`: the consumer lists their protocols in `JoinGroup`,
+    /// in that order, instead of only `range`, the tool's own default.
+    pub fn assignors(self, assignors: &'cli [PartitionAssignor]) -> Self {
+        Self { assignors, ..self }
+    }
+
     /// Reads `max_messages` records of `topic` with `kafka-verifiable-consumer`, as a member of
     /// `group`.
     ///
@@ -158,6 +208,7 @@ impl<'cli> KafkaVerifiableConsumer<'cli> {
             VERIFIABLE_CONSUME_SESSION_TIMEOUT,
             None,
             Some(max_messages),
+            self.assignors,
         );
 
         self.cli.exec_until_timeout(
@@ -185,7 +236,14 @@ impl<'cli> KafkaVerifiableConsumer<'cli> {
         session_timeout: Duration,
         group_instance_id: Option<&str>,
     ) -> BackgroundTool<VerifiableConsume> {
-        let args = verifiable_consumer_args(topic, group, session_timeout, group_instance_id, None);
+        let args = verifiable_consumer_args(
+            topic,
+            group,
+            session_timeout,
+            group_instance_id,
+            None,
+            self.assignors,
+        );
 
         BackgroundTool::start(
             self.cli,
@@ -219,8 +277,8 @@ impl<'cli> KafkaVerifiableConsumer<'cli> {
 
 impl BackgroundTool<VerifiableConsume> {
     /// Waits until the consumer prints a `partitions_assigned` event on a stdout line at or after
-    /// `from_line`, and returns the assigned partitions. The consumer prints
-    /// the event when it has joined its group and has its partitions. Returns an error with what
+    /// `from_line`, and returns the assigned partitions. The consumer prints the event each time it
+    /// finishes a rebalance, also when the group gives it no partitions. Returns an error with what
     /// the consumer printed if the consumer does not print the event within `timeout`, or exits
     /// before it does.
     pub fn wait_for_partitions_assigned(

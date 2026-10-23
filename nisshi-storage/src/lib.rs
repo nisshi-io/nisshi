@@ -191,6 +191,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod assignment;
+mod authorized_operations;
 mod batch;
 pub mod config;
 mod inflate;
@@ -203,7 +204,7 @@ pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replic
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
-pub use producer::{check_claim, producer_claim};
+pub use producer::{check_claim, epoch_is_exhausted, producer_claim};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
 
@@ -241,6 +242,20 @@ pub enum Error {
     Acquire(Arc<AcquireError>),
 
     Api(ErrorCode),
+
+    /// The broker was asked for `--authentication` on the `engine` storage engine, which can't
+    /// store SCRAM credentials. `supported` names the storage engines of this build that can,
+    /// and is empty when there are none. See [`authentication_unsupported_message`].
+    AuthenticationUnsupported {
+        engine: String,
+        supported: Vec<String>,
+    },
+
+    /// The `engine` storage engine can't store SCRAM credentials, so a credential upsert or
+    /// deletion changed nothing. See [`user_credentials_unsupported_message`].
+    UserCredentialsUnsupported {
+        engine: String,
+    },
 
     /// An `acks=0` Produce request had at least one non-`None` error code
     /// among its partition responses. The client reads no response either
@@ -704,6 +719,10 @@ pub type ListOffsetRequest = ListOffset;
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ListOffsetResponse {
     pub error_code: ErrorCode,
+    /// The timestamp of the record that a [`ListOffset::Timestamp`] lookup
+    /// matched. `ListOffsetsService` sends -1 for [`ListOffset::Earliest`]
+    /// and [`ListOffset::Latest`] whatever this holds, as Kafka does, so a
+    /// storage engine need not set it for them.
     pub timestamp: Option<SystemTime>,
     /// `None` when a [`ListOffset::Timestamp`] lookup matches no record, or
     /// when `error_code` is not [`ErrorCode::None`]; `ListOffsetsService`
@@ -1201,7 +1220,7 @@ impl From<&GroupDetail> for consumer_group_describe_response::DescribedGroup {
             .assignment_epoch(-1)
             .assignor_name(assignor_name)
             .members(Some([].into()))
-            .authorized_operations(-1)
+            .authorized_operations(authorized_operations::OMITTED)
     }
 }
 
@@ -1260,7 +1279,7 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
                     .assignment_epoch(-1)
                     .assignor_name(assignor_name)
                     .members(Some([].into()))
-                    .authorized_operations(-1)
+                    .authorized_operations(authorized_operations::OMITTED)
             }
 
             NamedGroupDetail {
@@ -1275,7 +1294,7 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
                 .assignment_epoch(-1)
                 .assignor_name("".into())
                 .members(Some([].into()))
-                .authorized_operations(-1),
+                .authorized_operations(authorized_operations::OMITTED),
         }
     }
 }
@@ -1310,7 +1329,7 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                     .protocol_type(group_detail.state.protocol_type().unwrap_or_default())
                     .protocol_data("".into())
                     .members(Some(members))
-                    .authorized_operations(Some(-1))
+                    .authorized_operations(Some(authorized_operations::OMITTED))
             }
 
             NamedGroupDetail {
@@ -1323,7 +1342,7 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                 .protocol_type("".into())
                 .protocol_data("".into())
                 .members(Some(vec![]))
-                .authorized_operations(Some(-1)),
+                .authorized_operations(Some(authorized_operations::OMITTED)),
         }
     }
 }
@@ -1483,6 +1502,12 @@ impl TxnState {
             _otherwise => false,
         }
     }
+
+    /// Whether the transaction has finished: it committed or aborted, and its
+    /// markers are written.
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Committed | Self::Aborted)
+    }
 }
 
 impl FromStr for TxnState {
@@ -1531,9 +1556,32 @@ pub struct StorageFactoryConfiguration {
     pub cancellation: CancellationToken,
 }
 
+/// What a storage engine can do beyond the core [`Storage`] methods, so that the broker can
+/// refuse a configuration the engine can't serve before it starts, instead of failing request
+/// by request.
+///
+/// A new capability is a new field. An engine with no capability returns [`Default`]. An
+/// engine with any lists its capabilities in full, so adding a field makes the compiler name
+/// each engine that has to decide about it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageCapabilities {
+    /// Whether the engine stores SCRAM credentials, so that a broker on it can require
+    /// authentication. An engine that can't must fail
+    /// [`Storage::upsert_user_scram_credential`] and [`Storage::delete_user_scram_credential`]
+    /// instead of reporting success.
+    pub user_credentials: bool,
+}
+
+/// A storage engine's factory.
+///
+/// [`Display`] is the engine's name for people, with its URL scheme, e.g.
+/// `PostgreSQL (postgres://)`.
 #[async_trait]
-pub trait StorageFactory: Debug + Send + Sync + 'static {
+pub trait StorageFactory: Debug + Display + Send + Sync + 'static {
     fn scheme(&self) -> Result<Regex>;
+
+    /// What the engine can do. See [`StorageCapabilities`].
+    fn capabilities(&self) -> StorageCapabilities;
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage>;
 }
@@ -1554,6 +1602,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()>;
 
     /// Create a topic on this storage.
+    ///
+    /// An implementation creates the topic whatever `validate_only` says.
+    /// [`CreateTopicsService`] answers a `validate_only` request itself and
+    /// calls this method with `false`.
     async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid>;
 
     /// Incrementally alter a resource on this storage.
@@ -2438,6 +2490,7 @@ pub struct Builder<N, C, A, S> {
     schema_registry: Option<Registry>,
     lake_house: Option<House>,
     silent: bool,
+    user_credentials_required: bool,
 
     cancellation: CancellationToken,
 
@@ -2474,6 +2527,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2488,6 +2542,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2502,6 +2557,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2518,6 +2574,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
             silent: self.silent,
+            user_credentials_required: self.user_credentials_required,
             cancellation: self.cancellation,
             factories: self.factories,
         }
@@ -2551,6 +2608,16 @@ impl<N, C, A, S> Builder<N, C, A, S> {
 
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    /// When `true`, [`build`](Builder::build) fails with [`Error::AuthenticationUnsupported`]
+    /// if the storage engine can't store SCRAM credentials, before it connects to the storage.
+    /// A broker that requires authentication sets it.
+    pub fn user_credentials_required(self, user_credentials_required: bool) -> Self {
+        Self {
+            user_credentials_required,
+            ..self
+        }
     }
 
     pub fn with_factory(&mut self, factory: ArcDynStorageFactory) {
@@ -2590,6 +2657,18 @@ impl Builder<i32, String, Url, Url> {
             });
         };
 
+        if self.user_credentials_required && !factory.capabilities().user_credentials {
+            return Err(Error::AuthenticationUnsupported {
+                engine: factory.to_string(),
+                supported: self
+                    .factories
+                    .iter()
+                    .filter(|factory| factory.capabilities().user_credentials)
+                    .map(|factory| factory.to_string())
+                    .collect(),
+            });
+        }
+
         let silent = self.silent;
         let redacted = redact_url(&self.storage);
 
@@ -2625,6 +2704,45 @@ impl Builder<i32, String, Url, Url> {
 
         Ok(storage)
     }
+}
+
+/// The message for [`Error::AuthenticationUnsupported`]: `engine` can't store SCRAM users,
+/// and `supported` names the engines of this build that can.
+pub fn authentication_unsupported_message(engine: &str, supported: &[impl AsRef<str>]) -> String {
+    let choices = match supported.split_last() {
+        None => {
+            return format!(
+                "the {engine} storage engine can't store SCRAM users, which --authentication \
+                needs, and this build has no storage engine that can: rebuild with the libsql or \
+                postgres feature, or start without --authentication, which lets any client \
+                connect without logging in"
+            );
+        }
+        Some((last, [])) => last.as_ref().to_owned(),
+        Some((last, rest)) => format!(
+            "{} or {}",
+            rest.iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", "),
+            last.as_ref()
+        ),
+    };
+
+    format!(
+        "the {engine} storage engine can't store SCRAM users, which --authentication needs: use \
+        {choices}, or start without --authentication, which lets any client connect without \
+        logging in"
+    )
+}
+
+/// The per-user message that AlterUserScramCredentials answers for
+/// [`Error::UserCredentialsUnsupported`].
+pub fn user_credentials_unsupported_message(engine: &str) -> String {
+    format!(
+        "The {engine} storage engine can't store SCRAM credentials, so nothing was changed. \
+        SCRAM users need PostgreSQL or SQLite storage."
+    )
 }
 
 pub static METER: LazyLock<Meter> = LazyLock::new(|| {
@@ -2663,9 +2781,40 @@ impl Debug for ScramCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::File, sync::Arc, thread};
+    use std::{assert_matches, fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn authentication_unsupported_message_names_the_engines_that_can() {
+        assert_eq!(
+            "the in-memory (memory://) storage engine can't store SCRAM users, which \
+            --authentication needs: use SQLite (sqlite://) or PostgreSQL (postgres://), or start \
+            without --authentication, which lets any client connect without logging in",
+            authentication_unsupported_message(
+                "in-memory (memory://)",
+                &["SQLite (sqlite://)", "PostgreSQL (postgres://)"]
+            )
+        );
+
+        assert_eq!(
+            "the S3 (s3://) storage engine can't store SCRAM users, which --authentication needs: \
+            use A, B or C, or start without --authentication, which lets any client connect \
+            without logging in",
+            authentication_unsupported_message("S3 (s3://)", &["A", "B", "C"])
+        );
+    }
+
+    #[test]
+    fn authentication_unsupported_message_without_an_engine_that_can() {
+        assert_eq!(
+            "the in-memory (memory://) storage engine can't store SCRAM users, which \
+            --authentication needs, and this build has no storage engine that can: rebuild with \
+            the libsql or postgres feature, or start without --authentication, which lets any \
+            client connect without logging in",
+            authentication_unsupported_message("in-memory (memory://)", &[] as &[&str])
+        );
+    }
 
     #[test]
     fn topition_from_str() -> Result<()> {
@@ -2883,6 +3032,59 @@ mod tests {
         let message = err.to_string();
         assert!(!message.contains("secret"));
         assert!(message.contains("user@host"));
+
+        Ok(())
+    }
+
+    /// An engine that keeps no credentials, and panics if the builder asks it to build.
+    #[derive(Debug)]
+    struct PanicsOnBuild;
+
+    impl Display for PanicsOnBuild {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("stub (stub://)")
+        }
+    }
+
+    #[async_trait]
+    impl StorageFactory for PanicsOnBuild {
+        fn scheme(&self) -> Result<Regex> {
+            Regex::new("stub").map_err(Into::into)
+        }
+
+        fn capabilities(&self) -> StorageCapabilities {
+            StorageCapabilities::default()
+        }
+
+        async fn build(&self, _: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
+            panic!("the engine was built before the capability check");
+        }
+    }
+
+    /// The check that refuses an engine without user credentials runs before the factory
+    /// connects, so a refused engine is never built: a check moved after `build` panics here
+    /// on every machine, with or without a reachable storage service.
+    #[tokio::test]
+    async fn credentials_check_runs_before_the_engine_is_built() -> Result<()> {
+        let mut builder = StorageContainer::builder();
+        builder.with_factory(Arc::new(PanicsOnBuild));
+
+        let refused = builder
+            .node_id(1)
+            .cluster_id("test")
+            .advertised_listener(Url::parse("tcp://localhost:9092")?)
+            .storage(Url::parse("stub://bucket")?)
+            .user_credentials_required(true)
+            .silent(true)
+            .build()
+            .await;
+
+        assert_matches!(
+            &refused,
+            Err(Error::AuthenticationUnsupported { engine, supported })
+                if engine == "stub (stub://)" && supported.is_empty(),
+            "{refused:?}"
+        );
 
         Ok(())
     }

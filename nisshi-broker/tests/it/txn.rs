@@ -1568,6 +1568,95 @@ where
     Ok(())
 }
 
+/// Under READ_COMMITTED, `ListOffsets(Latest)` answers the last stable
+/// offset: the first offset of the earliest open transaction. Under
+/// READ_UNCOMMITTED it answers the high watermark.
+pub async fn read_committed_latest_stops_at_an_open_transaction<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let partition_index = 0;
+    let topition = Topition::new(topic_name.clone(), partition_index);
+
+    for _ in 0..2 {
+        let batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from_static(b"plain"))))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = sc.produce(None, &topition, batch).await?;
+    }
+
+    let transaction = alphanumeric_string(10);
+
+    let producer = sc
+        .init_producer(Some(transaction.as_str()), 10_000, Some(-1), Some(-1))
+        .await?;
+
+    _ = sc
+        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: transaction.clone(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            topics: [AddPartitionsToTxnTopic::default()
+                .name(topic_name.clone())
+                .partitions(Some([partition_index].into()))]
+            .into(),
+        })
+        .await?;
+
+    let batch = inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from_static(b"open"))))
+        .attributes(BatchAttribute::default().transaction(true).into())
+        .producer_id(producer.id)
+        .producer_epoch(producer.epoch)
+        .base_sequence(0)
+        .build()
+        .and_then(TryInto::try_into)?;
+
+    assert_eq!(
+        2,
+        sc.produce(Some(transaction.as_str()), &topition, batch)
+            .await?
+    );
+
+    for (isolation_level, expected) in [
+        (IsolationLevel::ReadCommitted, 2),
+        (IsolationLevel::ReadUncommitted, 3),
+    ] {
+        let responses = sc
+            .list_offsets(isolation_level, &[(topition.clone(), ListOffset::Latest)])
+            .await?;
+
+        assert_eq!(1, responses.len());
+        assert_eq!(ErrorCode::None, responses[0].1.error_code);
+        assert_eq!(Some(expected), responses[0].1.offset, "{isolation_level:?}");
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use super::*;
@@ -1670,6 +1759,21 @@ mod pg {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::init_producer_twice(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn read_committed_latest_stops_at_an_open_transaction() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::read_committed_latest_stops_at_an_open_transaction(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1787,6 +1891,21 @@ mod in_memory {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn read_committed_latest_stops_at_an_open_transaction() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::read_committed_latest_stops_at_an_open_transaction(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -1898,6 +2017,21 @@ mod lite {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn read_committed_latest_stops_at_an_open_transaction() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::read_committed_latest_stops_at_an_open_transaction(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "slatedb")]
@@ -2003,6 +2137,21 @@ mod slatedb {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::init_producer_twice(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn read_committed_latest_stops_at_an_open_transaction() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::read_committed_latest_stops_at_an_open_transaction(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,

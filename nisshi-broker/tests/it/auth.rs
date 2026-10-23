@@ -69,6 +69,15 @@ where
         })
 }
 
+/// Asserts that a SaslHandshake response lists the mechanisms that the broker
+/// enables, whichever one the client requested.
+fn assert_enabled_mechanisms(response: &SaslHandshakeResponse) {
+    let mut mechanisms = response.mechanisms.clone().unwrap_or_default();
+    mechanisms.sort_unstable();
+
+    assert_eq!(vec!["SCRAM-SHA-256", "SCRAM-SHA-512"], mechanisms);
+}
+
 #[tokio::test]
 async fn auth_handshake_scram_256_v1() -> Result<()> {
     let _guard = init_tracing()?;
@@ -128,13 +137,11 @@ async fn auth_handshake_scram_256_v1() -> Result<()> {
         .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
     debug!(?response);
 
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
+    assert_enabled_mechanisms(&response);
+
+    // A Kafka client logs in with the mechanism that it requested, not one
+    // that it picks from the list.
+    let offered = [Mechname::parse(b"SCRAM-SHA-256").expect("mechanism name")];
 
     let sasl = SASLClient::new(
         SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
@@ -268,13 +275,11 @@ async fn auth_handshake_scram_256_v1_reauth() -> Result<()> {
              UnsupportedSaslMechanism because Stage was already Finished",
         );
 
-        let offered = response
-            .mechanisms
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-            .collect::<Vec<_>>();
+        assert_enabled_mechanisms(&response);
+
+        // A Kafka client logs in with the mechanism that it requested, not one
+        // that it picks from the list.
+        let offered = [Mechname::parse(b"SCRAM-SHA-256").expect("mechanism name")];
 
         let sasl = SASLClient::new(
             SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
@@ -391,13 +396,11 @@ async fn auth_handshake_scram_512_v1() -> Result<()> {
         .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
     debug!(?response);
 
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
+    assert_enabled_mechanisms(&response);
+
+    // A Kafka client logs in with the mechanism that it requested, not one
+    // that it picks from the list.
+    let offered = [Mechname::parse(b"SCRAM-SHA-512").expect("mechanism name")];
 
     let sasl = SASLClient::new(
         SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
@@ -518,13 +521,11 @@ async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
         .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
     debug!(?response);
 
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
+    assert_enabled_mechanisms(&response);
+
+    // A Kafka client logs in with the mechanism that it requested, not one
+    // that it picks from the list.
+    let offered = [Mechname::parse(b"SCRAM-SHA-512").expect("mechanism name")];
 
     let sasl = SASLClient::new(
         SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
@@ -766,13 +767,11 @@ async fn auth_handshake_scram_256_v0() -> Result<()> {
     debug!(?response);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
 
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
+    assert_enabled_mechanisms(&response);
+
+    // A Kafka client logs in with the mechanism that it requested, not one
+    // that it picks from the list.
+    let offered = [Mechname::parse(b"SCRAM-SHA-256").expect("mechanism name")];
 
     let sasl = SASLClient::new(
         SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())

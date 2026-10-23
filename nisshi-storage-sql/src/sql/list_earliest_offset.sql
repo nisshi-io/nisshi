@@ -15,54 +15,16 @@
 
 -- prepare list_earliest_offset (text, text, integer) as
 
--- Kafka answers Earliest with the log start offset, which is watermark.low.
--- DeleteRecords advances watermark.low and keeps the record at
--- watermark.high - 1, so a record below watermark.low can remain. The query
--- answers with the first record at or above watermark.low, or with
--- watermark.low and no timestamp when none remains.
+-- Kafka answers Earliest with the log start offset. The query answers the
+-- offset of the first record at or above watermark.low. When no such record
+-- exists, it answers watermark.high, the offset of the next produced record.
 --
--- The first branch takes its own limit 1 so it stays one probe of the
--- record primary key. With only the outer limit, the constant o hides the
--- index order and the engine can read every record at or above
--- watermark.low before choosing one.
-
-select offset_id, timestamp
-
-from
-
-(select
-
-1 as o, offset_id, timestamp
-
-from
-
-(select
-
-r.offset_id, r.timestamp
-
-from
-
-cluster c
-join topic t on t.cluster = c.id
-join topition tp on tp.topic = t.id
-left join watermark w on w.topition = tp.id
-join record r on r.topition = tp.id
-
-where
-
-c.name = $1
-and t.name = $2
-and tp.partition = $3
-and r.offset_id >= coalesce(w.low, 0)
-
-order by r.offset_id asc
-limit 1) first_record
-
-union all
+-- The query cannot answer watermark.low alone, because retention deletes
+-- records and leaves watermark.low as it is.
 
 select
 
-2 as o, w.low, null
+coalesce(r.offset_id, w.high, 0), r.timestamp
 
 from
 
@@ -70,13 +32,18 @@ cluster c
 join topic t on t.cluster = c.id
 join topition tp on tp.topic = t.id
 join watermark w on w.topition = tp.id
+-- A record below watermark.low is deleted, but it can still be stored. On
+-- PostgreSQL, DeleteRecords advances watermark.low before it removes the
+-- records, and when that removal fails, maintenance removes them later.
+left join record r on r.topition = tp.id
+    and r.offset_id = (
+        select min(first_record.offset_id)
+        from record first_record
+        where first_record.topition = tp.id
+        and first_record.offset_id >= coalesce(w.low, 0))
 
 where
 
 c.name = $1
 and t.name = $2
-and tp.partition = $3
-and w.low is not null
-
-order by o, offset_id asc
-limit 1) earliest;
+and tp.partition = $3;

@@ -17,6 +17,9 @@
 
 use super::{KafkaCli, Output, Tool};
 
+/// What `kafka-reassign-partitions --list` prints when no reassignment is in progress.
+pub const NO_REASSIGNMENTS: &str = "No partition reassignments found.";
+
 /// Runs `kafka-reassign-partitions` against the broker of a [`KafkaCli`].
 #[derive(Clone, Copy, Debug)]
 pub struct KafkaReassignPartitions<'cli> {

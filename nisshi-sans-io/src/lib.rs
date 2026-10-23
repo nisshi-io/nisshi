@@ -155,7 +155,10 @@ use std::{
 use tracing::{debug, error, instrument, warn};
 use tracing_subscriber::filter::ParseError;
 
-pub use input::{BodyInput, BytesInput, FrameInput, RequestInput, SuppressResponseExtension};
+pub use input::{
+    BodyInput, BytesInput, CloseAfterResponseExtension, FrameInput, RequestInput,
+    SuppressResponseExtension,
+};
 
 /// The null topic identifier.
 pub const NULL_TOPIC_ID: [u8; 16] = [0; 16];
@@ -338,7 +341,15 @@ pub trait IntoVersion {
 pub enum Error {
     ApiError(ErrorCode),
     EnvVar(VarError),
-    FromUtf8(string::FromUtf8Error),
+    /// A string field of `len` bytes is not valid UTF-8.
+    ///
+    /// The error keeps the field's length and the position of the invalid
+    /// sequence, not its bytes: the field comes from the client and can be as
+    /// large as a frame, and this error is logged.
+    FromUtf8 {
+        len: usize,
+        error: str::Utf8Error,
+    },
     InvalidAckValue(i16),
     InvalidConsumerProtocolSubscriptionVersion(i16),
     InvalidCoordinatorType(i8),
@@ -383,6 +394,9 @@ impl Display for Error {
             Error::Message(e) => f.write_str(e),
             Error::MessageMaxSizeExceeded(size) => {
                 write!(f, "message of {size} bytes exceeds the maximum size")
+            }
+            Error::FromUtf8 { len, error } => {
+                write!(f, "string of {len} bytes is not valid UTF-8: {error}")
             }
             e => write!(f, "{e:?}"),
         }
@@ -444,7 +458,10 @@ impl From<str::Utf8Error> for Error {
 
 impl From<string::FromUtf8Error> for Error {
     fn from(value: string::FromUtf8Error) -> Self {
-        Self::FromUtf8(value)
+        Self::FromUtf8 {
+            len: value.as_bytes().len(),
+            error: value.utf8_error(),
+        }
     }
 }
 
@@ -660,8 +677,13 @@ impl Frame {
     pub fn response_from_bytes(bytes: impl Buf, api_key: i16, api_version: i16) -> Result<Frame> {
         let start = SystemTime::now();
 
+        // As for a request: no length-prefixed field can claim more than the
+        // frame holds, so bound the decoder to the frame's own length.
+        let message_max_size = bytes.remaining();
+
         let mut reader = bytes.reader();
-        let mut deserializer = Decoder::response(&mut reader, api_key, api_version);
+        let mut deserializer =
+            Decoder::response(&mut reader, api_key, api_version, Some(message_max_size));
         Frame::deserialize(&mut deserializer)
             .inspect(|encoded| debug!(elapsed_millis = Self::elapsed_millis(start)))
     }
@@ -676,7 +698,7 @@ impl Frame {
     }
 
     /// API name
-    pub fn api_name(&self) -> &str {
+    pub fn api_name(&self) -> &'static str {
         self.body.api_name()
     }
 

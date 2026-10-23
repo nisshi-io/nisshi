@@ -18,6 +18,13 @@ postgres = ["dep:nisshi-storage-sql", "nisshi-storage-sql/postgres"]
 slatedb = ["dep:nisshi-storage-slatedb"]
 turso = ["dep:nisshi-storage-sql", "nisshi-storage-sql/turso"]
 
+# docs.rs builds with nightly, where `branches` 0.4 (a dependency of turso) no longer
+# compiles. Remove this table once turso depends on `branches` 0.5.
+# https://github.com/nisshi-io/nisshi/issues/1045
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["dynostore", "libsql", "postgres", "slatedb"]
+
 [lints]
 workspace = true
 

@@ -38,7 +38,7 @@ use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
-use crate::common::init_tracing;
+use crate::common::{init_tracing, lite_url};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -64,8 +64,10 @@ async fn free_port() -> Result<u16> {
     Ok(port)
 }
 
-/// A plaintext, memory-backed broker with `--authentication` enabled and no
-/// credentials configured: every client is unauthenticated.
+/// A plaintext broker with `--authentication` enabled and no credentials
+/// configured: every client is unauthenticated. The broker refuses
+/// `--authentication` on storage that can't store SCRAM users, so it runs on
+/// SQLite.
 async fn spawn_authenticating_broker() -> Result<RunningBroker> {
     let port = free_port().await?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -76,7 +78,7 @@ async fn spawn_authenticating_broker() -> Result<RunningBroker> {
         .cluster_id(format!("unauthenticated-{}", Uuid::now_v7()))
         .incarnation_id(Uuid::now_v7())
         .advertised_listener(listener.clone())
-        .storage(Url::parse("memory://")?)
+        .storage(lite_url().await?)
         .listener(listener)
         .authentication(true)
         .silent(true)

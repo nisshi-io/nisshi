@@ -132,8 +132,12 @@ impl TryFrom<Bytes> for MemberMetadata {
     type Error = Error;
 
     fn try_from(value: Bytes) -> Result<Self, Self::Error> {
+        // The consumer codec reads byte by byte and never reaches the
+        // decoder's length-prefixed reads, so this bound changes nothing
+        // today; it keeps those reads bounded if the codec starts using them.
+        let message_max_size = value.len();
         let mut reader = value.reader();
-        let mut decoder = Decoder::new(&mut reader);
+        let mut decoder = Decoder::new(&mut reader).with_message_max_size(message_max_size);
         Self::deserialize(&mut decoder)
     }
 }
@@ -290,8 +294,10 @@ impl TryFrom<Bytes> for MemberAssignment {
     type Error = Error;
 
     fn try_from(value: Bytes) -> Result<Self, Self::Error> {
+        // Bounded for the same reason as `MemberMetadata` above.
+        let message_max_size = value.len();
         let mut reader = value.reader();
-        let mut codec = Decoder::new(&mut reader);
+        let mut codec = Decoder::new(&mut reader).with_message_max_size(message_max_size);
         Self::deserialize(&mut codec)
     }
 }

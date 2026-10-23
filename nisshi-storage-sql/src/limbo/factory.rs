@@ -12,23 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use nisshi_storage::{
-    ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration, reject_unrecognized_options,
+    ArcDynStorage, Result, StorageCapabilities, StorageFactory, StorageFactoryConfiguration,
+    reject_unrecognized_options,
 };
 use regex::Regex;
 
 use super::Engine;
 
+/// The engine's name, as the broker reports it to an operator.
+pub(super) const NAME: &str = "Turso (turso://)";
+
 #[derive(Clone, Copy, Debug)]
 pub struct LimboFactory;
+
+impl Display for LimboFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(NAME)
+    }
+}
 
 #[async_trait]
 impl StorageFactory for LimboFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"turso").map_err(Into::into)
+    }
+
+    /// No SCRAM credentials yet: the Turso engine refuses to store them, with
+    /// [`nisshi_storage::Error::UserCredentialsUnsupported`].
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {

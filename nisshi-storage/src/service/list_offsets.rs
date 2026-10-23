@@ -156,8 +156,30 @@ where
         let mut responses = vec![Vec::new(); offsets.len()];
         let mut timed_out = Vec::new();
 
-        while let Some((index, (topition, _), answer)) = answers.next().await {
+        while let Some((index, (topition, list_offset), answer)) = answers.next().await {
             responses[index] = match answer {
+                // Kafka answers `Earliest` and `Latest` without a timestamp
+                // ([Partition.scala#L1617-L1619], [UnifiedLog.scala#L1325-L1336]),
+                // so the timestamp that a storage engine returns for them is
+                // dropped here, for every engine.
+                //
+                // [Partition.scala#L1617-L1619]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1617-L1619
+                // [UnifiedLog.scala#L1325-L1336]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1325-L1336
+                Ok(answer) if matches!(list_offset, ListOffset::Earliest | ListOffset::Latest) => {
+                    answer?
+                        .into_iter()
+                        .map(|(topition, response)| {
+                            (
+                                topition,
+                                ListOffsetResponse {
+                                    timestamp: None,
+                                    ..response
+                                },
+                            )
+                        })
+                        .collect()
+                }
+
                 Ok(answer) => answer?,
 
                 Err(missed) => {
@@ -406,6 +428,7 @@ mod tests {
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         list_offsets_response::ListOffsetsPartitionResponse,
         record::deflated,
+        to_system_time,
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
     use rama::Service as _;
@@ -434,6 +457,8 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Answer {
         Offset(i64),
+        /// An offset and the timestamp, in milliseconds, of its record.
+        OffsetAt(i64, i64),
         Stall,
         Fail,
     }
@@ -521,6 +546,15 @@ mod tests {
                     ListOffsetResponse {
                         error_code: ErrorCode::None,
                         timestamp: None,
+                        offset: Some(*offset),
+                    },
+                )]),
+
+                Some(Answer::OffsetAt(offset, timestamp)) => Ok(vec![(
+                    topition.clone(),
+                    ListOffsetResponse {
+                        error_code: ErrorCode::None,
+                        timestamp: Some(to_system_time(*timestamp)?),
                         offset: Some(*offset),
                     },
                 )]),
@@ -879,6 +913,66 @@ mod tests {
             storage.calls()
         );
         assert_eq!(storage.calls(), storage.dropped());
+
+        Ok(())
+    }
+
+    /// `Earliest` and `Latest` answer timestamp -1, as Kafka does, whatever
+    /// timestamp storage returns. A `Timestamp` lookup answers the timestamp
+    /// of the record it matched.
+    #[tokio::test]
+    async fn earliest_and_latest_answer_no_timestamp() -> Result<()> {
+        let timestamp = 1_577_836_800_000;
+        let storage = Stub::new(&[Answer::OffsetAt(7, timestamp); 3]);
+
+        let request = ListOffsetsRequest::default()
+            .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+            .replica_id(-1)
+            .topics(Some(vec![
+                ListOffsetsTopic::default()
+                    .name(TOPIC.into())
+                    .partitions(Some(
+                        (0..)
+                            .zip([
+                                ListOffset::Earliest,
+                                ListOffset::Latest,
+                                ListOffset::Timestamp(to_system_time(timestamp)?),
+                            ])
+                            .map(|(partition, list_offset)| {
+                                list_offset.try_into().map(|timestamp| {
+                                    ListOffsetsPartition::default()
+                                        .partition_index(partition)
+                                        .current_leader_epoch(Some(-1))
+                                        .timestamp(timestamp)
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )),
+            ]));
+
+        let response = ListOffsetsService { storage }.serve(request).await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        assert_eq!(
+            vec![
+                (0, Some(7), Some(-1)),
+                (1, Some(7), Some(-1)),
+                (2, Some(7), Some(timestamp)),
+            ],
+            topics[0]
+                .partitions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|partition| (
+                    partition.partition_index,
+                    partition.offset,
+                    partition.timestamp
+                ))
+                .collect::<Vec<_>>()
+        );
 
         Ok(())
     }

@@ -21,7 +21,6 @@ use std::{
     num::TryFromIntError,
     result,
     str::{FromStr, Utf8Error},
-    string::FromUtf8Error,
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTimeError},
 };
@@ -109,7 +108,6 @@ pub enum Error {
     SchemaRegistry(Arc<nisshi_schema::Error>),
     Service(#[from] nisshi_service::Error),
     Storage(#[from] nisshi_storage::Error),
-    StringUtf8(#[from] FromUtf8Error),
     SystemTime(#[from] SystemTimeError),
 
     TryFromInt(#[from] TryFromIntError),

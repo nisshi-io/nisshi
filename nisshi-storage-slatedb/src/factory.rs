@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use nisshi_storage::{
-    ArcDynStorage, Error, Result, StorageFactory, StorageFactoryConfiguration,
+    ArcDynStorage, Error, Result, StorageCapabilities, StorageFactory, StorageFactoryConfiguration,
     reject_unrecognized_options,
 };
 use regex::Regex;
@@ -44,10 +47,22 @@ fn db_settings() -> Settings {
 #[derive(Clone, Copy, Debug)]
 pub struct EngineFactory;
 
+impl Display for EngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("SlateDB (slatedb://)")
+    }
+}
+
 #[async_trait]
 impl StorageFactory for EngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"slatedb").map_err(Into::into)
+    }
+
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities {
+            user_credentials: true,
+        }
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {

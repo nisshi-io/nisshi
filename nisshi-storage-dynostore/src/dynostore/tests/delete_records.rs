@@ -17,7 +17,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use nisshi_sans_io::{
-    ErrorCode,
+    ErrorCode, IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::{Record, inflated},
@@ -80,9 +80,9 @@ async fn delete_records_partition(
 }
 
 /// A DeleteRecords cut removes the batch objects that lie wholly below it,
-/// and keeps the object of a batch that straddles the cut and the last
-/// object, which holds `high_watermark - 1`. The watermark alone does not
-/// show this, so the test lists the bucket.
+/// and keeps the object of a batch that straddles the cut. A cut at the
+/// high watermark removes every object. The watermark alone does not show
+/// this, so the test lists the bucket.
 #[tokio::test]
 async fn delete_records_removes_batch_objects_below_the_cut() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -156,14 +156,118 @@ async fn delete_records_removes_batch_objects_below_the_cut() -> Result<(), Erro
     assert_eq!(vec![3, 5], stored_base_offsets(&bucket, &topition).await?);
     assert_eq!(4, storage.offset_stage(&topition).await?.log_start());
 
-    // A cut to the high watermark removes the straddling batch and keeps the
-    // last object.
+    // A cut to the high watermark removes every batch object, the last one
+    // too. Earliest and Latest still answer the high watermark.
     assert_eq!(
         (ErrorCode::None, 6),
         delete_records_partition(&storage, name, -1).await?
     );
-    assert_eq!(vec![5], stored_base_offsets(&bucket, &topition).await?);
+    assert_eq!(
+        Vec::<i64>::new(),
+        stored_base_offsets(&bucket, &topition).await?
+    );
     assert_eq!(6, storage.offset_stage(&topition).await?.log_start());
+
+    for list_offset in [ListOffset::Earliest, ListOffset::Latest] {
+        let responses = storage
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), list_offset)],
+            )
+            .await?;
+
+        assert_eq!(1, responses.len());
+        assert_eq!(ErrorCode::None, responses[0].1.error_code);
+        assert_eq!(Some(6), responses[0].1.offset, "{list_offset:?}");
+    }
+
+    Ok(())
+}
+
+/// Creates the topic `name` with one partition in `storage`.
+async fn create_topic(storage: &DynoStore, name: &str) -> Result<(), Error> {
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(name.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Produces one batch of `records` records to `topition`.
+async fn produce_batch(
+    storage: &DynoStore,
+    topition: &Topition,
+    records: i32,
+) -> Result<i64, Error> {
+    let mut builder = inflated::Batch::builder().last_offset_delta(records - 1);
+
+    for offset_delta in 0..records {
+        builder = builder.record(
+            Record::builder()
+                .offset_delta(offset_delta)
+                .value(Some(Bytes::from_static(b"abc"))),
+        );
+    }
+
+    let batch = builder.build().and_then(TryInto::try_into)?;
+
+    storage.produce(None, topition, batch).await
+}
+
+/// A cut below the high watermark keeps the last object, because that
+/// batch can hold records at and above the cut.
+#[tokio::test]
+async fn delete_records_keeps_a_last_batch_that_straddles_the_cut() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = Arc::new(InMemory::new());
+    let storage = DynoStore::new("nisshi", 1, bucket.clone())?;
+
+    let name = "straddle";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    assert_eq!(0, produce_batch(&storage, &topition, 4).await?);
+
+    assert_eq!(
+        (ErrorCode::None, 2),
+        delete_records_partition(&storage, name, 2).await?
+    );
+    assert_eq!(vec![0], stored_base_offsets(&bucket, &topition).await?);
+
+    Ok(())
+}
+
+/// A produce that races a cut at the high watermark writes its batch at
+/// the cut. The cleanup keeps that batch, although it is the last object
+/// and the cut equals the high watermark that the delete read.
+#[tokio::test]
+async fn delete_records_keeps_a_batch_written_at_the_cut() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = Arc::new(InMemory::new());
+    let storage = DynoStore::new("nisshi", 1, bucket.clone())?;
+
+    let name = "race";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    assert_eq!(0, produce_batch(&storage, &topition, 6).await?);
+    assert_eq!(6, produce_batch(&storage, &topition, 2).await?);
+
+    // The delete read a high watermark of 6, and the batch at 6 was written
+    // after that.
+    storage.delete_records_batches(&topition, 6, 6).await;
+
+    assert_eq!(vec![6], stored_base_offsets(&bucket, &topition).await?);
 
     Ok(())
 }

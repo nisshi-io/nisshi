@@ -1,0 +1,23 @@
+# OpenMessaging Benchmark driver for nisshi (single node, so replicationFactor 1).
+name: Nisshi
+driverClass: io.openmessaging.benchmark.driver.kafka.KafkaBenchmarkDriver
+
+replicationFactor: 1
+
+# Required by the upstream driver even when empty
+topicConfig: |
+
+commonConfig: |
+  bootstrap.servers=localhost:9092
+  default.api.timeout.ms=1200000
+  request.timeout.ms=1200000
+
+producerConfig: |
+  acks=all
+  linger.ms=1
+  batch.size=1048576
+
+consumerConfig: |
+  auto.offset.reset=earliest
+  enable.auto.commit=false
+  max.partition.fetch.bytes=10485760

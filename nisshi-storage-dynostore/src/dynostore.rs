@@ -64,8 +64,8 @@ use nisshi_storage::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate_produced,
-    offload, producer_claim,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
+    inflate_produced, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -220,6 +220,8 @@ fn decode_group_segment(segment: &str) -> Option<String> {
 
 #[derive(Clone, Debug)]
 pub struct DynoStore {
+    /// The storage engine's name for people, in errors.
+    engine: &'static str,
     cluster: String,
     node: i32,
     advertised_listener: Url,
@@ -396,6 +398,26 @@ struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
 }
 
+/// Allocates a new producer ID, one more than the newest, and gives it epoch 0.
+///
+/// Returns `None` when the newest producer ID is `i64::MAX`.
+fn allocate_producer_id(
+    producers: &mut BTreeMap<ProducerId, ProducerDetail>,
+) -> Option<ProducerId> {
+    let id = producers
+        .last_key_value()
+        .map_or(Some(1), |(newest, _)| newest.checked_add(1))?;
+
+    _ = producers.insert(
+        id,
+        ProducerDetail {
+            sequences: BTreeMap::from([(0, BTreeMap::new())]),
+        },
+    );
+
+    Some(id)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct TxnId {
     transaction: String,
@@ -553,6 +575,7 @@ impl DynoStore {
 
     fn new_with(cluster: &str, node: i32, object_store: impl ObjectStore) -> Result<Self> {
         Ok(Self {
+            engine: "object storage",
             cluster: cluster.into(),
             node,
             advertised_listener: Url::parse("tcp://127.0.0.1/")?,
@@ -568,6 +591,11 @@ impl DynoStore {
                 Duration::from_millis(5_000),
             )?),
         })
+    }
+
+    /// Names the storage engine, e.g. `S3 (s3://)`, in the errors that it returns.
+    pub(crate) fn engine(self, engine: &'static str) -> Self {
+        Self { engine, ..self }
     }
 
     #[cfg(feature = "test-support")]
@@ -709,12 +737,15 @@ impl DynoStore {
     /// not hold the end offset. A batch ends before the base offset of the
     /// next batch, so this deletes an object when the next object's base
     /// offset is at or below `cutoff`, without reading either object. The
-    /// last object has no successor, so this never deletes it. That object
-    /// holds `high_watermark - 1`, which `ListOffsets(Latest)` reads.
+    /// last object has no successor, so this deletes it only when `cutoff`
+    /// is the `high_watermark` that the cut was checked against. Every batch
+    /// that begins below that high watermark also ends at or below it. Below
+    /// the high watermark, the last object can hold records at or above the
+    /// cut, so it stays.
     ///
     /// The listing covers this partition's `records/` prefix only, so that a
     /// mistake here cannot remove the objects of another partition.
-    async fn delete_records_batches(&self, topition: &Topition, cutoff: i64) {
+    async fn delete_records_batches(&self, topition: &Topition, cutoff: i64, high_watermark: i64) {
         if cutoff <= 0 {
             return;
         }
@@ -745,11 +776,21 @@ impl DynoStore {
 
         objects.sort_by_key(|(_, base_offset)| *base_offset);
 
-        let expired = objects
+        let mut expired = objects
             .windows(2)
             .filter(|window| window[1].1 <= cutoff)
             .map(|window| Ok::<_, object_store::Error>(window[0].0.clone()))
             .collect::<Vec<_>>();
+
+        // A produce that raced this delete can write a batch at `cutoff`
+        // after the listing began, so the last object is deleted only when
+        // it begins below the cut.
+        if cutoff >= high_watermark
+            && let Some((last, base_offset)) = objects.last()
+            && *base_offset < cutoff
+        {
+            expired.push(Ok(last.clone()));
+        }
 
         let mut deleted = self
             .object_store
@@ -770,6 +811,89 @@ impl DynoStore {
     /// the partition (see [`Self::ensure_partition_exists`]). A later read
     /// skips that check, because it would read the metadata again on each
     /// Fetch of the partition.
+    /// Returns the open transaction starts: for each partition with an open
+    /// transaction, the first offset of the earliest one.
+    async fn open_transaction_starts(&self) -> Result<BTreeMap<Topition, Offset>> {
+        let starts = self
+            .meta
+            .with(&self.object_store, |meta| {
+                Ok(meta
+                    .transactions
+                    .values()
+                    .flat_map(|txn| {
+                        debug!(?txn);
+
+                        txn.epochs
+                            .values()
+                            .filter(|detail| {
+                                detail.state.is_some_and(|state| {
+                                    state != TxnState::Committed && state != TxnState::Aborted
+                                })
+                            })
+                            .map(BTreeMap::<Topition, Offset>::from)
+                            .collect::<Vec<_>>()
+                    })
+                    .reduce(|mut acc, e| {
+                        debug!(?acc, ?e);
+
+                        for (topition, offset_start) in e.iter() {
+                            _ = acc
+                                .entry(topition.to_owned())
+                                .and_modify(|existing_offset_start| {
+                                    if *existing_offset_start > *offset_start {
+                                        *existing_offset_start = *offset_start
+                                    }
+                                })
+                                .or_insert(*offset_start);
+                        }
+
+                        acc
+                    })
+                    .unwrap_or(BTreeMap::new()))
+            })
+            .await?;
+
+        debug!(?starts);
+
+        Ok(starts)
+    }
+
+    /// Returns the [`OffsetStage`] of `topition`, with its last stable offset
+    /// taken from `open_transaction_starts`, which a caller that reads many
+    /// partitions reads once (see [`Self::open_transaction_starts`]).
+    async fn offset_stage_with(
+        &self,
+        topition: &Topition,
+        open_transaction_starts: &BTreeMap<Topition, Offset>,
+    ) -> Result<OffsetStage> {
+        self.checked_watermark_for(topition)
+            .await?
+            .with(&self.object_store, |watermark| {
+                debug!(?watermark);
+                let high_watermark = watermark.high.unwrap_or(0);
+                let log_start = watermark.low.unwrap_or(0);
+
+                // DeleteRecords can move the log start past the first offset of
+                // an open transaction. Kafka then raises the last stable offset
+                // to the log start ([UnifiedLog.scala#L964-L978]), so that it
+                // never names an offset below the log.
+                //
+                // [UnifiedLog.scala#L964-L978]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L964-L978
+                let last_stable = open_transaction_starts
+                    .get(topition)
+                    .copied()
+                    .unwrap_or(high_watermark)
+                    .max(log_start);
+
+                Ok(OffsetStage {
+                    last_stable,
+                    high_watermark,
+                    log_start,
+                })
+            })
+            .await
+    }
+
     async fn checked_watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
         if let Some(watermark) = self.watermarks.lock()?.get(topition) {
             return Ok(watermark.to_owned());
@@ -778,16 +902,6 @@ impl DynoStore {
         self.ensure_partition_exists(topition).await?;
 
         self.watermark_for(topition)
-    }
-
-    /// Returns the low watermark of one partition: its log start offset.
-    async fn log_start(&self, topition: &Topition) -> Result<i64> {
-        self.checked_watermark_for(topition)
-            .await?
-            .with(&self.object_store, |watermark| {
-                Ok(watermark.low.unwrap_or(0))
-            })
-            .await
     }
 
     /// Returns the (cached, shared) `OptiCon` handle for `topition`'s
@@ -1188,8 +1302,7 @@ impl DynoStore {
 
     /// Answers `ListOffsets(Timestamp)` for one partition: the first record
     /// at or after `target`, below `last_stable` when the lookup is under
-    /// `READ_COMMITTED` and the partition has an open transaction, or no
-    /// match. Runs the time index backfill first when the index is
+    /// `READ_COMMITTED`, or no match. Runs the time index backfill first when the index is
     /// incomplete (see [`DynoStore::time_index_for_lookup`]).
     async fn timestamp_lookup(
         &self,
@@ -1484,7 +1597,7 @@ impl Storage for DynoStore {
                             // concurrent-write conflict (e.g. a produce racing this
                             // delete), so the cutoff is always computed from the value
                             // actually being persisted.
-                            let (error_code, cutoff) = watermark
+                            let (error_code, cutoff, high_watermark) = watermark
                                 .with_mut(&self.object_store, |w| {
                                     let stage = OffsetStage {
                                         last_stable: w.high.unwrap_or(0),
@@ -1493,13 +1606,15 @@ impl Storage for DynoStore {
                                     };
 
                                     match delete_records_cutoff(partition.offset, &stage) {
-                                        Err(error_code) => {
-                                            Ok((error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK))
-                                        }
+                                        Err(error_code) => Ok((
+                                            error_code,
+                                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                                            stage.high_watermark,
+                                        )),
 
                                         Ok(cutoff) => {
                                             w.low = Some(cutoff);
-                                            Ok((ErrorCode::None, cutoff))
+                                            Ok((ErrorCode::None, cutoff, stage.high_watermark))
                                         }
                                     }
                                 })
@@ -1512,7 +1627,8 @@ impl Storage for DynoStore {
                                 // above: the logical delete has already taken effect,
                                 // same as Kafka's own segment reclaim lagging behind
                                 // a logStartOffset bump.
-                                self.delete_records_batches(&topition, cutoff).await;
+                                self.delete_records_batches(&topition, cutoff, high_watermark)
+                                    .await;
                             }
 
                             (error_code, cutoff)
@@ -2253,61 +2369,8 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        let stable = self
-            .meta
-            .with(&self.object_store, |meta| {
-                Ok(meta
-                    .transactions
-                    .values()
-                    .flat_map(|txn| {
-                        debug!(?txn);
-
-                        txn.epochs
-                            .values()
-                            .filter(|detail| {
-                                detail.state.is_some_and(|state| {
-                                    state != TxnState::Committed && state != TxnState::Aborted
-                                })
-                            })
-                            .map(BTreeMap::<Topition, Offset>::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .reduce(|mut acc, e| {
-                        debug!(?acc, ?e);
-
-                        for (topition, offset_start) in e.iter() {
-                            _ = acc
-                                .entry(topition.to_owned())
-                                .and_modify(|existing_offset_start| {
-                                    if *existing_offset_start > *offset_start {
-                                        *existing_offset_start = *offset_start
-                                    }
-                                })
-                                .or_insert(*offset_start);
-                        }
-
-                        acc
-                    })
-                    .unwrap_or(BTreeMap::new()))
-            })
-            .await?;
-
-        debug!(?stable);
-
-        self.checked_watermark_for(topition)
-            .await?
-            .with(&self.object_store, |watermark| {
-                debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
-                let log_start = watermark.low.unwrap_or(0);
-                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                })
-            })
+        let open_transaction_starts = self.open_transaction_starts().await?;
+        self.offset_stage_with(topition, &open_transaction_starts)
             .await
     }
 
@@ -2316,41 +2379,10 @@ impl Storage for DynoStore {
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        let stable = if isolation_level == IsolationLevel::ReadCommitted {
-            self.meta
-                .with(&self.object_store, |meta| {
-                    Ok(meta
-                        .transactions
-                        .values()
-                        .flat_map(|txn| {
-                            txn.epochs
-                                .values()
-                                .filter(|detail| {
-                                    detail.state.is_some_and(|state| {
-                                        state != TxnState::Committed && state != TxnState::Aborted
-                                    })
-                                })
-                                .map(BTreeMap::<Topition, Offset>::from)
-                                .collect::<Vec<_>>()
-                        })
-                        .reduce(|mut acc, e| {
-                            debug!(?acc, ?e);
-                            for (topition, offset_start) in e.iter() {
-                                _ = acc
-                                    .entry(topition.to_owned())
-                                    .and_modify(|existing_offset_start| {
-                                        if *existing_offset_start > *offset_start {
-                                            *existing_offset_start = *offset_start
-                                        }
-                                    })
-                                    .or_insert(*offset_start);
-                            }
-
-                            acc
-                        })
-                        .unwrap_or(BTreeMap::new()))
-                })
-                .await?
+        // Only READ_COMMITTED reads a last stable offset, so only it reads the
+        // open transactions, once for the whole request.
+        let open_transaction_starts = if isolation_level == IsolationLevel::ReadCommitted {
+            self.open_transaction_starts().await?
         } else {
             BTreeMap::new()
         };
@@ -2380,140 +2412,96 @@ impl Storage for DynoStore {
                 checked => checked?,
             }
 
-            if let ListOffset::Timestamp(system_time) = offset_request {
-                let target = to_timestamp(system_time)?;
-
-                // A lookup that fails answers the error in its own
-                // partition, as Kafka does, so the other partitions of the
-                // request still get their answers.
-                let response = self
-                    .timestamp_lookup(topition, target, stable.get(topition).copied())
-                    .await
-                    .unwrap_or_else(|error| {
-                        error!(?error, ?topition, target, "list offsets by timestamp");
-
-                        ListOffsetResponse {
-                            error_code: match error {
-                                Error::Api(error_code) => error_code,
-                                _ => ErrorCode::UnknownServerError,
-                            },
-                            offset: None,
-                            ..Default::default()
-                        }
-                    });
-
-                responses.push((topition.to_owned(), response));
-                continue;
-            }
-
-            let location = records_prefix(&self.cluster, topition);
-
-            let mut list_stream = self.object_store.list(Some(&location));
-
-            let mut candidate: Option<ObjectMeta> = None;
-
-            while let Some(meta) = list_stream
-                .next()
+            // A store failure answers `KAFKA_STORAGE_ERROR` in its own
+            // partition, which a client retries, so the other partitions of
+            // the request still get their answers.
+            let stage = match self
+                .offset_stage_with(topition, &open_transaction_starts)
                 .await
-                .inspect(|meta| debug!(?meta))
-                .transpose()
-                .inspect_err(|error| error!(?error))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             {
-                let Some(meta_offset) = batch_base_offset(&location, &meta.location) else {
-                    continue;
-                };
+                Ok(stage) => stage,
 
-                if let Some(last) = stable.get(topition)
-                    && offset_request == &ListOffset::Latest
-                {
-                    let Some(found_offset) = candidate
-                        .as_ref()
-                        .and_then(|found| batch_base_offset(&location, &found.location))
-                    else {
-                        continue;
-                    };
+                Err(error) => {
+                    error!(?error, ?topition, "list offsets");
 
-                    if meta_offset >= *last && found_offset > meta_offset {
-                        _ = candidate.replace(meta);
-                    }
-                } else {
-                    match offset_request {
-                        ListOffset::Earliest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| found.last_modified > meta.last_modified) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        ListOffset::Latest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| meta.last_modified > found.last_modified) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        _ => continue,
-                    }
-                }
-            }
-
-            debug!(?candidate);
-
-            if offset_request == &ListOffset::Earliest {
-                let log_start = self.log_start(topition).await?;
-
-                // Kafka answers `Earliest` with the log start offset. An object
-                // that begins below the log start can remain after
-                // `DeleteRecords`, so the base offset of the oldest object can
-                // be below the log start.
-                let base_offset = candidate
-                    .as_ref()
-                    .and_then(|found| batch_base_offset(&location, &found.location));
-
-                if base_offset.is_none_or(|base_offset| base_offset < log_start) {
                     responses.push((
                         topition.to_owned(),
                         ListOffsetResponse {
-                            error_code: ErrorCode::None,
-                            offset: Some(log_start),
-                            ..Default::default()
+                            error_code: match error {
+                                Error::Api(error_code) => error_code,
+                                _ => ErrorCode::KafkaStorageError,
+                            },
+                            offset: None,
+                            timestamp: None,
                         },
                     ));
 
                     continue;
                 }
-            }
+            };
 
-            if let Some(ref found) = candidate {
-                let Some(offset) = batch_base_offset(&location, &found.location) else {
+            // Kafka answers `Earliest` with the log start offset, and
+            // `Latest` with the last stable offset under READ_COMMITTED and
+            // the high watermark otherwise. It reads no record for either
+            // ([Partition.scala#L1589-L1593], [Partition.scala#L1617-L1619],
+            // [UnifiedLog.scala#L1325-L1336]).
+            //
+            // [Partition.scala#L1589-L1593]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1589-L1593
+            // [Partition.scala#L1617-L1619]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1617-L1619
+            // [UnifiedLog.scala#L1325-L1336]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1325-L1336
+            let offset = match offset_request {
+                ListOffset::Earliest => stage.log_start,
+
+                ListOffset::Latest if isolation_level == IsolationLevel::ReadCommitted => {
+                    stage.last_stable
+                }
+
+                // A produce raises `watermark.high` before it writes its
+                // batch object, so this can count a batch that is not
+                // readable yet, unlike Kafka's high watermark. Fetch reads
+                // the same `watermark.high`, so the two answers agree.
+                ListOffset::Latest => stage.high_watermark,
+
+                ListOffset::Timestamp(system_time) => {
+                    let target = to_timestamp(system_time)?;
+
+                    // A lookup that fails answers the error in its own
+                    // partition, as Kafka does, so the other partitions of
+                    // the request still get their answers.
+                    let response = self
+                        .timestamp_lookup(
+                            topition,
+                            target,
+                            (isolation_level == IsolationLevel::ReadCommitted)
+                                .then_some(stage.last_stable),
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            error!(?error, ?topition, target, "list offsets by timestamp");
+
+                            ListOffsetResponse {
+                                error_code: match error {
+                                    Error::Api(error_code) => error_code,
+                                    _ => ErrorCode::UnknownServerError,
+                                },
+                                offset: None,
+                                ..Default::default()
+                            }
+                        });
+
+                    responses.push((topition.to_owned(), response));
                     continue;
-                };
-                debug!(offset);
+                }
+            };
 
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: Some(match offset_request {
-                            ListOffset::Latest => offset + 1,
-                            _ => offset,
-                        }),
-                        timestamp: Some(found.last_modified.into()),
-                    },
-                ))
-            } else {
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: Some(0),
-                        ..Default::default()
-                    },
-                ))
-            }
+            responses.push((
+                topition.to_owned(),
+                ListOffsetResponse {
+                    error_code: ErrorCode::None,
+                    offset: Some(offset),
+                    timestamp: None,
+                },
+            ));
         }
 
         Ok(responses)
@@ -2963,6 +2951,9 @@ impl Storage for DynoStore {
 
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
         let location = self.group_consumers_prefix();
+
+        // `list_with_delimiter` returns a group's committed offsets as a common prefix and its
+        // state as a `.json` object. A group with no committed offset has only the state object.
         let list_result = self
             .object_store
             .list_with_delimiter(Some(&location))
@@ -2970,27 +2961,32 @@ impl Storage for DynoStore {
             .inspect(|list_result| debug!(?list_result))
             .inspect_err(|error| error!(?error, cluster = self.cluster))?;
 
-        let mut listed_groups = vec![];
+        let offsets_segments = list_result
+            .common_prefixes
+            .iter()
+            .filter_map(Path::filename);
+        let state_segments = list_result
+            .objects
+            .iter()
+            .filter_map(|object| object.location.filename()?.strip_suffix(".json"));
 
-        for prefix in list_result.common_prefixes {
-            let Some(segment) = prefix.parts().next_back() else {
-                continue;
-            };
+        // The set holds each group that either list names. A group that has committed has both a
+        // common prefix and a state object, and the set keeps one entry for its id.
+        let group_ids = offsets_segments
+            .chain(state_segments)
+            .filter_map(decode_group_segment)
+            .collect::<BTreeSet<_>>();
 
-            let Some(group_id) = decode_group_segment(segment.as_ref()) else {
-                continue;
-            };
-
-            listed_groups.push(
+        Ok(group_ids
+            .into_iter()
+            .map(|group_id| {
                 ListedGroup::default()
                     .group_id(group_id)
                     .protocol_type("consumer".into())
                     .group_state(Some("Unknown".into()))
-                    .group_type(Some("classic".into())),
-            );
-        }
-
-        Ok(listed_groups)
+                    .group_type(Some("classic".into()))
+            })
+            .collect())
     }
 
     async fn delete_groups(
@@ -3069,22 +3065,44 @@ impl Storage for DynoStore {
                         results.push(NamedGroupDetail::found(group_id.into(), group_detail));
                     }
 
-                    Err(Error::ObjectStore(error)) => match error.as_ref() {
-                        object_store::Error::NotFound { .. } => {
-                            results.push(NamedGroupDetail::found(
+                    // A group that commits offsets and never joins has no state object. The
+                    // group exists while any of its committed offsets remains.
+                    Err(Error::ObjectStore(error))
+                        if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+                    {
+                        let offsets_prefix = self.group_offsets_prefix(group_id)?;
+
+                        match self.object_store.list(Some(&offsets_prefix)).next().await {
+                            Some(Ok(_)) => results.push(NamedGroupDetail::found(
                                 group_id.into(),
                                 GroupDetail::default(),
-                            ));
-                        }
+                            )),
 
-                        _otherwise => {
-                            results.push(NamedGroupDetail::found(
+                            None => results.push(NamedGroupDetail::error_code(
                                 group_id.into(),
-                                GroupDetail::default(),
-                            ));
-                        }
-                    },
+                                ErrorCode::GroupIdNotFound,
+                            )),
 
+                            Some(Err(err)) => {
+                                error!(?err, group_id);
+                                results.push(NamedGroupDetail::error_code(
+                                    group_id.into(),
+                                    ErrorCode::CoordinatorNotAvailable,
+                                ));
+                            }
+                        }
+                    }
+
+                    // An object store error is usually transient. Kafka clients retry
+                    // `COORDINATOR_NOT_AVAILABLE`, and fail on `UNKNOWN_SERVER_ERROR`.
+                    Err(Error::ObjectStore(_)) => {
+                        results.push(NamedGroupDetail::error_code(
+                            group_id.into(),
+                            ErrorCode::CoordinatorNotAvailable,
+                        ));
+                    }
+
+                    // A retry does not fix a stored group that can't be decoded.
                     Err(_) => {
                         results.push(NamedGroupDetail::error_code(
                             group_id.into(),
@@ -3160,30 +3178,23 @@ impl Storage for DynoStore {
                     debug!(?meta, ?claim);
                     match meta.transactions.entry(transaction_id.to_string()) {
                         Entry::Vacant(vacant) => {
-                            let id = meta
-                                .producers
-                                .last_key_value()
-                                .map_or(1.into(), |(k, _v)| k + 1);
+                            let Some(id) = allocate_producer_id(&mut meta.producers) else {
+                                error!(transaction_id, "no producer ID left");
 
-                            let mut pd = ProducerDetail::default();
-                            assert_eq!(None, pd.sequences.insert(0, BTreeMap::new()));
-                            assert_eq!(None, meta.producers.insert(id, pd));
+                                return Ok(InitProducer::Completed(ProducerIdResponse::failed(
+                                    ErrorCode::UnknownServerError,
+                                )));
+                            };
 
-                            let mut epochs = BTreeMap::new();
-                            assert_eq!(
-                                None,
-                                epochs.insert(
+                            _ = vacant.insert(Txn {
+                                producer: id,
+                                epochs: BTreeMap::from([(
                                     0,
                                     TxnDetail {
                                         transaction_timeout_ms,
                                         ..Default::default()
                                     },
-                                )
-                            );
-
-                            _ = vacant.insert(Txn {
-                                producer: id,
-                                epochs,
+                                )]),
                             });
 
                             Ok(InitProducer::Completed(ProducerIdResponse {
@@ -3194,64 +3205,132 @@ impl Storage for DynoStore {
                         }
 
                         Entry::Occupied(mut occupied) => {
-                            if let Some((current_epoch, txn_detail)) =
-                                occupied.get().epochs.last_key_value()
-                            {
-                                if let Some(claim) = claim {
-                                    let error = check_claim(
-                                        (occupied.get().producer, *current_epoch),
-                                        claim,
-                                    );
+                            let txn = occupied.get();
 
-                                    if error != ErrorCode::None {
-                                        return Ok(InitProducer::Completed(
-                                            ProducerIdResponse::failed(error),
-                                        ));
-                                    }
-                                }
-
-                                if txn_detail.state == Some(TxnState::Begin) {
-                                    Ok(InitProducer::NeedToRollback {
-                                        producer_id: occupied.get().producer,
-                                        producer_epoch: *current_epoch,
-                                    })
-                                } else {
-                                    let id = occupied.get().producer;
-                                    let epoch = current_epoch + 1;
-
-                                    _ = meta.producers.entry(id).and_modify(|pd| {
-                                        assert_eq!(
-                                            None,
-                                            pd.sequences.insert(epoch, BTreeMap::new())
-                                        );
-                                    });
-
-                                    assert_eq!(
-                                        None,
-                                        occupied.get_mut().epochs.insert(
-                                            epoch,
-                                            TxnDetail {
-                                                transaction_timeout_ms,
-                                                ..Default::default()
-                                            }
-                                        )
-                                    );
-
-                                    Ok(InitProducer::Completed(ProducerIdResponse {
-                                        id,
-                                        epoch,
-                                        error: ErrorCode::None,
-                                    }))
-                                }
-                            } else {
+                            let Some((&current_epoch, txn_detail)) = txn.epochs.last_key_value()
+                            else {
                                 // Unreachable: every transaction starts with epoch 0,
                                 // and no code removes an epoch.
                                 error!(transaction_id, "transaction has no epoch");
 
-                                Ok(InitProducer::Completed(ProducerIdResponse::failed(
+                                return Ok(InitProducer::Completed(ProducerIdResponse::failed(
                                     ErrorCode::UnknownServerError,
-                                )))
+                                )));
+                            };
+
+                            if let Some(claim) = claim {
+                                let error = check_claim((txn.producer, current_epoch), claim);
+
+                                if error != ErrorCode::None {
+                                    return Ok(InitProducer::Completed(
+                                        ProducerIdResponse::failed(error),
+                                    ));
+                                }
                             }
+
+                            if txn_detail.state == Some(TxnState::Begin) {
+                                return Ok(InitProducer::NeedToRollback {
+                                    producer_id: txn.producer,
+                                    producer_epoch: current_epoch,
+                                });
+                            }
+
+                            let previous_id = txn.producer;
+
+                            // The producer's newest epoch is the epoch of its newest
+                            // transaction, or i16::MAX once the rollback below fences it.
+                            let newest_epoch = meta
+                                .producers
+                                .get(&previous_id)
+                                .and_then(|producer| producer.sequences.last_key_value())
+                                .map_or(current_epoch, |(epoch, _)| current_epoch.max(*epoch));
+
+                            if epoch_is_exhausted(newest_epoch) {
+                                // As in Kafka, only the transaction of the current epoch holds
+                                // back the move: the client retries CONCURRENT_TRANSACTIONS
+                                // until it finishes.
+                                if txn_detail.state.is_some_and(|state| !state.is_finished()) {
+                                    return Ok(InitProducer::Completed(
+                                        ProducerIdResponse::failed(
+                                            ErrorCode::ConcurrentTransactions,
+                                        ),
+                                    ));
+                                }
+
+                                let Some(id) = allocate_producer_id(&mut meta.producers) else {
+                                    error!(transaction_id, "no producer ID left");
+
+                                    return Ok(InitProducer::Completed(
+                                        ProducerIdResponse::failed(ErrorCode::UnknownServerError),
+                                    ));
+                                };
+
+                                // A produce compares the batch's epoch with the producer's
+                                // newest, so epoch i16::MAX fences every batch of the
+                                // previous producer ID. Its older epochs and sequences are
+                                // never read again, so they go, instead of growing meta.json
+                                // by an entry for each epoch.
+                                if let Some(previous) = meta.producers.get_mut(&previous_id) {
+                                    previous.sequences =
+                                        BTreeMap::from([(i16::MAX, BTreeMap::new())]);
+                                }
+
+                                info!(
+                                    transaction_id,
+                                    previous_id,
+                                    id,
+                                    "producer epoch exhausted, moved to a new producer ID"
+                                );
+
+                                _ = occupied.insert(Txn {
+                                    producer: id,
+                                    epochs: BTreeMap::from([(
+                                        0,
+                                        TxnDetail {
+                                            transaction_timeout_ms,
+                                            ..Default::default()
+                                        },
+                                    )]),
+                                });
+
+                                return Ok(InitProducer::Completed(ProducerIdResponse {
+                                    id,
+                                    epoch: 0,
+                                    error: ErrorCode::None,
+                                }));
+                            }
+
+                            // with_mut stores each change that this closure makes, also
+                            // when it then answers an error, so every check runs first.
+                            let Some(epoch) = current_epoch.checked_add(1).filter(|epoch| {
+                                meta.producers
+                                    .get(&previous_id)
+                                    .is_none_or(|producer| !producer.sequences.contains_key(epoch))
+                            }) else {
+                                error!(transaction_id, previous_id, current_epoch, "epoch taken");
+
+                                return Ok(InitProducer::Completed(ProducerIdResponse::failed(
+                                    ErrorCode::UnknownServerError,
+                                )));
+                            };
+
+                            if let Some(producer) = meta.producers.get_mut(&previous_id) {
+                                _ = producer.sequences.insert(epoch, BTreeMap::new());
+                            }
+
+                            _ = occupied.get_mut().epochs.insert(
+                                epoch,
+                                TxnDetail {
+                                    transaction_timeout_ms,
+                                    ..Default::default()
+                                },
+                            );
+
+                            Ok(InitProducer::Completed(ProducerIdResponse {
+                                id: previous_id,
+                                epoch,
+                                error: ErrorCode::None,
+                            }))
                         }
                     }
                 })
@@ -3274,6 +3353,25 @@ impl Storage for DynoStore {
                     debug!(?rollback_producer_id, ?rollback_producer_epoch, ?error_code);
 
                     if error_code == ErrorCode::None {
+                        // The abort can stay prepared behind an older open transaction, and
+                        // the move to a new producer ID then waits for it. Kafka fences the
+                        // producer at that point, so that it cannot add to the aborted
+                        // transaction, and so does this: a produce compares the batch's
+                        // epoch with the producer's newest.
+                        if epoch_is_exhausted(rollback_producer_epoch) {
+                            self.meta
+                                .with_mut(&self.object_store, |meta| {
+                                    if let Some(producer) =
+                                        meta.producers.get_mut(&rollback_producer_id)
+                                    {
+                                        _ = producer.sequences.entry(i16::MAX).or_default();
+                                    }
+
+                                    Ok(())
+                                })
+                                .await?;
+                        }
+
                         return self
                             .init_producer(
                                 Some(transaction_id),
@@ -3295,20 +3393,15 @@ impl Storage for DynoStore {
             self.meta
                 .with_mut(&self.object_store, |meta| {
                     debug!(?meta);
-                    let producer = meta
-                        .producers
-                        .last_key_value()
-                        .map_or(1.into(), |(k, _v)| k + 1);
 
-                    let epoch = 0;
-                    let mut pd = ProducerDetail::default();
-                    assert_eq!(None, pd.sequences.insert(epoch, BTreeMap::new()));
-                    debug!(?producer, ?pd);
-                    assert_eq!(None, meta.producers.insert(producer, pd));
+                    let Some(producer) = allocate_producer_id(&mut meta.producers) else {
+                        error!("no producer ID left");
+                        return Ok(ProducerIdResponse::failed(ErrorCode::UnknownServerError));
+                    };
 
                     Ok(ProducerIdResponse {
                         id: producer,
-                        epoch,
+                        epoch: 0,
                         ..Default::default()
                     })
                 })
@@ -3885,24 +3978,33 @@ impl Storage for DynoStore {
         Ok(self.advertised_listener.clone())
     }
 
+    /// DynoStore keeps no SCRAM credentials, so it refuses the change instead of reporting
+    /// success for a credential that it would drop.
     #[instrument(skip_all)]
     async fn delete_user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<()> {
-        Ok(())
+        Err(Error::UserCredentialsUnsupported {
+            engine: self.engine.into(),
+        })
     }
 
+    /// See [`Self::delete_user_scram_credential`].
+    #[instrument(skip_all)]
     async fn upsert_user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
         _credential: ScramCredential,
     ) -> Result<()> {
-        Ok(())
+        Err(Error::UserCredentialsUnsupported {
+            engine: self.engine.into(),
+        })
     }
 
+    /// No user has a credential here: [`Self::upsert_user_scram_credential`] stores none.
     async fn user_scram_credential(
         &self,
         _user: &str,

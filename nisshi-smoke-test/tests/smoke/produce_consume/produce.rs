@@ -121,28 +121,16 @@ fn stores_every_record(acks: Acks) {
 }
 
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn acks_0_stores_every_record() {
     stores_every_record(Acks::None);
 }
 
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn acks_1_stores_every_record() {
     stores_every_record(Acks::Leader);
 }
 
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn acks_all_stores_every_record() {
     stores_every_record(Acks::FullIsr);
 }
@@ -234,10 +222,6 @@ fn record_over_max_message_bytes_is_rejected() {
 /// once, with no gaps. This test doesn't make the producer retry, so it doesn't check that a
 /// retried batch is dropped.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn idempotent_producer_stores_each_record_once() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);
@@ -266,10 +250,6 @@ fn idempotent_producer_stores_each_record_once() {
 /// Several producers writing to one partition at once must each get offsets of their own, with
 /// none skipped or given twice, or consumers would miss records or read them twice.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn concurrent_producers_get_unique_gapless_offsets() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);

@@ -48,14 +48,14 @@ use crate::common::{
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct CertifiedKey {
+pub(crate) struct CertifiedKey {
     _dir: TempDir,
-    cert: PathBuf,
-    key: PathBuf,
+    pub(crate) cert: PathBuf,
+    pub(crate) key: PathBuf,
 }
 
 /// A self-signed certificate for `localhost`, written as PEM into a temporary directory.
-fn certified_key() -> Result<CertifiedKey> {
+pub(crate) fn certified_key() -> Result<CertifiedKey> {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(["localhost".to_owned(), "127.0.0.1".to_owned()])?;
 
@@ -77,7 +77,7 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
-fn server_config_from_pem(cert: &Path, key: &Path) -> Result<ServerConfig> {
+pub(crate) fn server_config_from_pem(cert: &Path, key: &Path) -> Result<ServerConfig> {
     let certs = CertificateDer::pem_file_iter(cert)?.collect::<Result<Vec<_>, _>>()?;
     let key = PrivateKeyDer::from_pem_file(key)?;
 
@@ -88,7 +88,7 @@ fn server_config_from_pem(cert: &Path, key: &Path) -> Result<ServerConfig> {
         .map_err(Into::into)
 }
 
-fn client_config_trusting(cert: &Path) -> Result<ClientConfig> {
+pub(crate) fn client_config_trusting(cert: &Path) -> Result<ClientConfig> {
     let mut roots = RootCertStore::empty();
 
     for cert in CertificateDer::pem_file_iter(cert)? {

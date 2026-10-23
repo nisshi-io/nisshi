@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tests for the `time_index`-backed `ListOffsets(Timestamp)` implementation.
+//! Tests for `ListOffsets`: `Earliest` and `Latest` from the partition's
+//! watermark, and the `time_index`-backed `Timestamp` lookup.
 //! Calls `DynoStore`'s private helpers directly (this module is
 //! a descendant of `dynostore`, so it can see them) rather than only going
 //! through the `Storage` trait, because some of the scenarios below need to
@@ -37,8 +38,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use nisshi_sans_io::{
-    ErrorCode, IsolationLevel, ListOffset, create_topics_request::CreatableTopic, to_system_time,
-    to_timestamp,
+    ErrorCode, IsolationLevel, ListOffset,
+    create_topics_request::CreatableTopic,
+    delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
+    to_system_time, to_timestamp,
 };
 use nisshi_storage::{Error, ListOffsetResponse, Result, Storage, Topition, TxnState};
 use object_store::{
@@ -785,7 +788,7 @@ enum Fault {
 }
 
 /// An object store that fails the next GET of one armed path, counts the
-/// GETs of batch objects, once aged lists every object as written longer
+/// GETs of batch objects and the listings, once aged lists every object as written longer
 /// than [`BATCH_SETTLED_AFTER`] ago, and can report every write time from
 /// a clock behind the test's own. Every GET first yields to the runtime,
 /// so that concurrent requests in a test interleave.
@@ -794,6 +797,7 @@ struct Faulty {
     inner: Arc<InMemory>,
     armed: Arc<Mutex<Option<(Path, Fault)>>>,
     batch_gets: Arc<AtomicUsize>,
+    lists: Arc<AtomicUsize>,
     aged: Arc<AtomicBool>,
     /// How far the store's clock is behind the test's, in seconds, in every
     /// write time the store reports.
@@ -812,6 +816,10 @@ impl Faulty {
 
     fn batch_gets(&self) -> usize {
         self.batch_gets.load(Ordering::SeqCst)
+    }
+
+    fn lists(&self) -> usize {
+        self.lists.load(Ordering::SeqCst)
     }
 
     fn put_conflicts(&self) -> usize {
@@ -918,6 +926,8 @@ impl ObjectStore for Faulty {
         &self,
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        _ = self.lists.fetch_add(1, Ordering::SeqCst);
+
         let aged = self.aged.load(Ordering::SeqCst);
         let faulty = self.clone();
 
@@ -1426,6 +1436,326 @@ async fn backfill_is_left_incomplete_by_an_older_broker_write() -> Result<()> {
     assert_eq!(Some(3), offset);
     assert_eq!(Some(T0 + 200), timestamp);
     assert!(time_index_complete(&storage, &topition).await?);
+
+    Ok(())
+}
+
+/// The offset and timestamp that `storage` answers for `list_offset` of
+/// `topition`, after checking that it answered without an error.
+async fn list_offset_at(
+    storage: &DynoStore,
+    isolation_level: IsolationLevel,
+    topition: &Topition,
+    list_offset: ListOffset,
+) -> Result<(Option<i64>, Option<SystemTime>)> {
+    let responses = storage
+        .list_offsets(isolation_level, &[(topition.to_owned(), list_offset)])
+        .await?;
+
+    assert_eq!(1, responses.len());
+    assert_eq!(topition, &responses[0].0);
+    assert_eq!(ErrorCode::None, responses[0].1.error_code);
+
+    Ok((responses[0].1.offset, responses[0].1.timestamp))
+}
+
+/// Produces one batch of `records` records through `storage`, and returns
+/// its base offset.
+async fn produce_records(storage: &DynoStore, topition: &Topition, records: usize) -> Result<i64> {
+    storage
+        .produce(
+            None,
+            topition,
+            batch_with_timestamps(0, &vec![T0; records])?,
+        )
+        .await
+}
+
+/// `Earliest` answers the log start and `Latest` the high watermark, both
+/// read from the watermark alone: this partition has no batch object at
+/// all. Kafka answers both without a timestamp.
+#[tokio::test]
+async fn earliest_and_latest_answer_from_the_watermark() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "watermark";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+
+    seed_watermark(&storage, &topition, |watermark| {
+        watermark.low = Some(2);
+        watermark.high = Some(10);
+        Ok(())
+    })
+    .await?;
+
+    for isolation_level in [
+        IsolationLevel::ReadUncommitted,
+        IsolationLevel::ReadCommitted,
+    ] {
+        assert_eq!(
+            (Some(2), None),
+            list_offset_at(&storage, isolation_level, &topition, ListOffset::Earliest).await?
+        );
+        assert_eq!(
+            (Some(10), None),
+            list_offset_at(&storage, isolation_level, &topition, ListOffset::Latest).await?
+        );
+    }
+
+    Ok(())
+}
+
+/// Two brokers share one bucket and produce multi-record batches to one
+/// partition in turn. After each batch, the broker that produced it answers
+/// `Latest` with every record so far, from both brokers. A third broker,
+/// which has read nothing yet, answers the same. After `DeleteRecords`,
+/// `Earliest` answers the cut.
+#[tokio::test]
+async fn brokers_sharing_a_bucket_answer_the_shared_watermark() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = Arc::new(InMemory::new());
+    let a = DynoStore::new("nisshi", 1, bucket.clone())?;
+    let b = DynoStore::new("nisshi", 2, bucket.clone())?;
+
+    let topic = "shared";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&a, topic, 1).await?;
+
+    let mut high_watermark = 0;
+
+    for (broker, records) in [(&a, 3), (&b, 2), (&a, 4), (&b, 1)] {
+        assert_eq!(
+            high_watermark,
+            produce_records(broker, &topition, records).await?
+        );
+        high_watermark += i64::try_from(records)?;
+
+        assert_eq!(
+            (Some(high_watermark), None),
+            list_offset_at(
+                broker,
+                IsolationLevel::ReadUncommitted,
+                &topition,
+                ListOffset::Latest
+            )
+            .await?
+        );
+    }
+
+    let c = DynoStore::new("nisshi", 3, bucket.clone())?;
+    assert_eq!(
+        (Some(high_watermark), None),
+        list_offset_at(
+            &c,
+            IsolationLevel::ReadUncommitted,
+            &topition,
+            ListOffset::Latest
+        )
+        .await?
+    );
+
+    let cut = 4;
+    let results = a
+        .delete_records(&[DeleteRecordsTopic::default()
+            .name(topic.into())
+            .partitions(Some(
+                [DeleteRecordsPartition::default()
+                    .partition_index(0)
+                    .offset(cut)]
+                .into(),
+            ))])
+        .await?;
+    let partitions = results[0].partitions.as_deref().unwrap_or_default();
+    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
+    assert_eq!(cut, partitions[0].low_watermark);
+
+    let d = DynoStore::new("nisshi", 4, bucket)?;
+
+    for broker in [&a, &d] {
+        assert_eq!(
+            (Some(cut), None),
+            list_offset_at(
+                broker,
+                IsolationLevel::ReadUncommitted,
+                &topition,
+                ListOffset::Earliest
+            )
+            .await?
+        );
+    }
+
+    Ok(())
+}
+
+/// `Earliest` and `Latest` read the watermark and never list the
+/// partition's batch objects, so their cost does not grow with the
+/// partition.
+#[tokio::test]
+async fn earliest_and_latest_do_not_list_batch_objects() -> Result<()> {
+    let _guard = init_tracing()?;
+    let faulty = Faulty::default();
+    let storage = DynoStore::new("nisshi", 111, faulty.clone())?;
+    let topic = "no-listing";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+
+    for records in [3, 2] {
+        _ = produce_records(&storage, &topition, records).await?;
+    }
+
+    let lists = faulty.lists();
+
+    for isolation_level in [
+        IsolationLevel::ReadUncommitted,
+        IsolationLevel::ReadCommitted,
+    ] {
+        assert_eq!(
+            (Some(0), None),
+            list_offset_at(&storage, isolation_level, &topition, ListOffset::Earliest).await?
+        );
+        assert_eq!(
+            (Some(5), None),
+            list_offset_at(&storage, isolation_level, &topition, ListOffset::Latest).await?
+        );
+    }
+
+    assert_eq!(lists, faulty.lists());
+
+    Ok(())
+}
+
+/// A store failure while `Earliest` or `Latest` reads one partition's
+/// watermark answers `KAFKA_STORAGE_ERROR`, which a client retries, in that
+/// partition only. The other partitions of the request still get their
+/// offsets.
+#[tokio::test]
+async fn watermark_read_failure_answers_an_error_for_the_partition() -> Result<()> {
+    let _guard = init_tracing()?;
+    let faulty = Faulty::default();
+    let writer = DynoStore::new("nisshi", 1, faulty.clone())?;
+    let topic = "watermark-failure";
+
+    create_topic(&writer, topic, 2).await?;
+
+    for partition in 0..2 {
+        _ = produce_records(&writer, &Topition::new(topic, partition), 3).await?;
+    }
+
+    // A broker that has read nothing yet sends its watermark GETs to the
+    // store, past the cache of conditional GETs.
+    let reader = DynoStore::new("nisshi", 2, faulty.clone())?;
+    let failing = Topition::new(topic, 1);
+
+    faulty.arm(
+        reader.watermark_for(&failing)?.location().clone(),
+        Fault::Unavailable,
+    )?;
+
+    for list_offset in [ListOffset::Earliest, ListOffset::Latest] {
+        let responses = reader
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[
+                    (Topition::new(topic, 0), list_offset),
+                    (failing.clone(), list_offset),
+                ],
+            )
+            .await?;
+
+        assert_eq!(2, responses.len());
+
+        assert_eq!(
+            ErrorCode::None,
+            responses[0].1.error_code,
+            "{list_offset:?}"
+        );
+        assert!(responses[0].1.offset.is_some(), "{list_offset:?}");
+
+        assert_eq!(
+            ErrorCode::KafkaStorageError,
+            responses[1].1.error_code,
+            "{list_offset:?}"
+        );
+        assert_eq!(None, responses[1].1.offset, "{list_offset:?}");
+
+        faulty.arm(
+            reader.watermark_for(&failing)?.location().clone(),
+            Fault::Unavailable,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Under READ_COMMITTED, `Latest` answers the last stable offset: the
+/// first offset of the earliest open transaction on the partition. Under
+/// READ_UNCOMMITTED it answers the high watermark.
+#[tokio::test]
+async fn read_committed_latest_answers_the_last_stable_offset() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "latest-open-transaction";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    assert_eq!(0, produce_records(&storage, &topition, 2).await?);
+    assert_eq!(2, produce_records(&storage, &topition, 3).await?);
+
+    storage
+        .meta
+        .with_mut(&storage.object_store, |meta| {
+            _ = meta.transactions.insert(
+                "txn".into(),
+                Txn {
+                    producer: 1,
+                    epochs: BTreeMap::from([(
+                        0,
+                        TxnDetail {
+                            state: Some(TxnState::Begin),
+                            produces: BTreeMap::from([(
+                                topic.into(),
+                                BTreeMap::from([(
+                                    0,
+                                    Some(TxnProduceOffset {
+                                        offset_start: 2,
+                                        offset_end: 4,
+                                    }),
+                                )]),
+                            )]),
+                            ..Default::default()
+                        },
+                    )]),
+                },
+            );
+            Ok(())
+        })
+        .await?;
+
+    assert_eq!(
+        (Some(2), None),
+        list_offset_at(
+            &storage,
+            IsolationLevel::ReadCommitted,
+            &topition,
+            ListOffset::Latest
+        )
+        .await?
+    );
+    assert_eq!(
+        (Some(5), None),
+        list_offset_at(
+            &storage,
+            IsolationLevel::ReadUncommitted,
+            &topition,
+            ListOffset::Latest
+        )
+        .await?
+    );
 
     Ok(())
 }

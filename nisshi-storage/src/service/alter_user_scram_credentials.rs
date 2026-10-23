@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, ScramCredential, Storage};
+use crate::{Error, Result, ScramCredential, Storage, user_credentials_unsupported_message};
 use bytes::Bytes;
 use nisshi_sans_io::{
     AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse, ApiKey, ErrorCode,
@@ -23,6 +23,32 @@ use rama::Service;
 use rsasl::mechanisms::scram::tools::derive_keys;
 use sha2::{Digest, Sha256, Sha512};
 use tracing::{debug, instrument, warn};
+
+/// The answer for `user` once storage has upserted or deleted its credential.
+///
+/// An engine that can't store credentials is answered `UNSUPPORTED_VERSION` with a message
+/// that names the engine, as Kafka answers each user when its cluster can't store SCRAM
+/// credentials. Kafka's clients show that message to the user.
+fn result(user: String, outcome: Result<()>) -> AlterUserScramCredentialsResult {
+    let (error_code, error_message) = match outcome {
+        Ok(()) => (ErrorCode::None, String::new()),
+
+        Err(Error::UserCredentialsUnsupported { engine }) => (
+            ErrorCode::UnsupportedVersion,
+            user_credentials_unsupported_message(&engine),
+        ),
+
+        Err(error) => {
+            warn!(?error, user, "storage failed to alter a SCRAM credential");
+            (ErrorCode::UnsupportedSaslMechanism, String::new())
+        }
+    };
+
+    AlterUserScramCredentialsResult::default()
+        .user(user)
+        .error_code(error_code.into())
+        .error_message(Some(error_message))
+}
 
 #[derive(Clone, Debug)]
 pub struct AlterUserScramCredentialsService<G> {
@@ -69,23 +95,12 @@ where
                     }
                 };
 
-                results.push(
+                results.push(result(
+                    deletion.name.clone(),
                     self.storage
                         .delete_user_scram_credential(&deletion.name, mechanism)
-                        .await
-                        .map_or(
-                            AlterUserScramCredentialsResult::default()
-                                .user(deletion.name.clone())
-                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
-                            |()| {
-                                AlterUserScramCredentialsResult::default()
-                                    .user(deletion.name.clone())
-                                    .error_code(ErrorCode::None.into())
-                                    .error_message(Some("".into()))
-                            },
-                        ),
-                );
+                        .await,
+                ));
             }
         }
 
@@ -138,32 +153,71 @@ where
                     server_key,
                 };
 
-                results.push(
+                results.push(result(
+                    upsertion.name.clone(),
                     self.storage
                         .upsert_user_scram_credential(
                             upsertion.name.as_str(),
                             mechanism,
                             credential,
                         )
-                        .await
-                        .map_or(
-                            AlterUserScramCredentialsResult::default()
-                                .user(upsertion.name.clone())
-                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
-                            |()| {
-                                AlterUserScramCredentialsResult::default()
-                                    .user(upsertion.name.clone())
-                                    .error_code(ErrorCode::None.into())
-                                    .error_message(Some("".into()))
-                            },
-                        ),
-                );
+                        .await,
+                ));
             }
         }
 
         Ok(AlterUserScramCredentialsResponse::default()
             .throttle_time_ms(0)
             .results(Some(results)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_is_none() -> Result<()> {
+        let answered = result("alice".into(), Ok(()));
+
+        assert_eq!("alice", answered.user);
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(answered.error_code)?);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_engine_is_unsupported_version_naming_the_engine() -> Result<()> {
+        let answered = result(
+            "alice".into(),
+            Err(Error::UserCredentialsUnsupported {
+                engine: "in-memory (memory://)".into(),
+            }),
+        );
+
+        assert_eq!(
+            ErrorCode::UnsupportedVersion,
+            ErrorCode::try_from(answered.error_code)?
+        );
+        assert_eq!(
+            Some(
+                "The in-memory (memory://) storage engine can't store SCRAM credentials, so \
+                nothing was changed. SCRAM users need PostgreSQL or SQLite storage."
+            ),
+            answered.error_message.as_deref()
+        );
+        Ok(())
+    }
+
+    /// Any other storage failure is answered as before this engine check existed.
+    #[test]
+    fn other_failure_is_unchanged() -> Result<()> {
+        let answered = result("alice".into(), Err(Error::Message("broken".into())));
+
+        assert_eq!(
+            ErrorCode::UnsupportedSaslMechanism,
+            ErrorCode::try_from(answered.error_code)?
+        );
+        assert_eq!(Some(""), answered.error_message.as_deref());
+        Ok(())
     }
 }

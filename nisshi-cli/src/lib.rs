@@ -17,7 +17,7 @@ use std::{collections::HashMap, env::vars, fmt, path::PathBuf, result, str::From
 
 mod cli;
 
-pub use cli::Cli;
+pub use cli::{Cli, Outcome};
 use regex::{Regex, Replacer};
 
 #[derive(thiserror::Error, Debug)]

@@ -104,10 +104,6 @@ fn list_by_state_shows_only_groups_in_that_state() {
 /// broker must answer `OffsetFetch` with the group's committed offset and `ListOffsets` with the
 /// partition's end.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
-)]
 fn describe_shows_committed_and_end_offsets() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);
@@ -204,10 +200,6 @@ fn state_is_stable_while_consuming_and_empty_after() {
 /// instead hides a mistyped group name. The broker must answer `DescribeGroups` for an unknown
 /// group with `GROUP_ID_NOT_FOUND`.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "DescribeGroups answers an empty group for a group that doesn't exist (#963)"
-)]
 fn describe_of_unknown_group_says_it_does_not_exist() {
     let cli = KafkaCli::shared();
 
@@ -261,10 +253,6 @@ fn delete_removes_an_empty_group() {
 /// offsets of consumers that are running. The broker must answer `DeleteGroups` for such a group
 /// with `NON_EMPTY_GROUP`, and keep the group.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "ListGroups leaves out a group without committed offsets (#961)"
-)]
 fn delete_refuses_a_group_with_members() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);

@@ -15,14 +15,10 @@
 //! Fuzzes [`ListPartitionReassignmentsService`] end-to-end against the in-memory storage backend,
 //! bypassing the wire protocol entirely: fuzzed bytes are turned directly
 //! into a [`ListPartitionReassignmentsRequest`] via `nisshi-sans-io`'s `arbitrary` feature, then run
-//! through the same service the broker routes `ListPartitionReassignments` requests to. This
-//! targets bugs in the storage/business logic (panics, mismatched
-//! invariants) rather than the wire decoder, which `fuzz_request_decode`
-//! already covers.
+//! through the same service the broker routes `ListPartitionReassignments` requests to.
 //!
-//! Storage starts empty for every execution (no topics/groups/ACLs are
-//! pre-seeded), so this mainly exercises not-found/empty-state handling;
-//! seeding realistic state first is a possible follow-up.
+//! The service answers that no reassignment is in progress without reading storage, so this
+//! mainly checks that the answer encodes and decodes for any request.
 
 #![no_main]
 

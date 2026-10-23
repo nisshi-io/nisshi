@@ -474,9 +474,15 @@ where
             //  corresponding to the mechanism are sent as opaque packets without wrapping the
             //  messages with Kafka protocol headers.
             //
-            // Following messages will be opaque:
+            // Following messages will be opaque, but only after a handshake that
+            // the broker accepted: a rejected one leaves the connection framed.
             if let Some(af) = self.af.as_ref()
                 && (api_key == SaslHandshakeRequest::KEY && api_version == 0)
+                && matches!(
+                    &body,
+                    Body::SaslHandshakeResponse(response)
+                        if response.error_code == i16::from(ErrorCode::None)
+                )
                 && let Ok(mut v0) = af.v0.lock()
             {
                 *v0 = Some(true)

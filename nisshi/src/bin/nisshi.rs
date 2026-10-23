@@ -15,7 +15,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use dotenv::dotenv;
 use nisshi_broker::{TracingFormat, otel};
-use nisshi_cli::{Cli, Result};
+use nisshi_cli::{Cli, Outcome, Result};
 use nisshi_sans_io::ErrorCode;
 use tracing::{debug, error};
 
@@ -50,12 +50,17 @@ async fn main() -> Result<ErrorCode> {
 
     let _guard = otel::init(TracingFormat::Text)?;
 
-    Cli::main()
+    Cli::run()
         .await
-        .inspect(|error_code| match error_code {
-            ErrorCode::None => debug!("{}", error_code),
-            _ => error!("{}", error_code),
+        .inspect(|outcome| match outcome {
+            Outcome {
+                error_code: ErrorCode::None,
+                ..
+            }
+            | Outcome { reported: true, .. } => debug!("{}", outcome.error_code),
+            _ => error!("{}", outcome.error_code),
         })
+        .map(|outcome| outcome.error_code)
         .inspect_err(|err| match err {
             nisshi_cli::Error::Cat(error) => match &**error {
                 nisshi_cat::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
@@ -132,6 +137,12 @@ async fn main() -> Result<ErrorCode> {
                         _ => error!("storage {storage} failed its schema setup: {source}"),
                     },
                 },
+                nisshi_broker::Error::Storage(
+                    nisshi_storage::Error::AuthenticationUnsupported { engine, supported },
+                ) => error!(
+                    "{}",
+                    nisshi_storage::authentication_unsupported_message(engine, supported)
+                ),
                 nisshi_broker::Error::InvalidStorageOptionValue { option, value } => error!(
                     "storage option {option}={value} is not a valid interval: give a non-zero \
                     duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"

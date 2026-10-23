@@ -117,10 +117,22 @@ const TIMESTAMP_AFTER_MAX_MS: i64 = 3_600_000;
 /// (`Long.MAX_VALUE`): no lower bound.
 const TIMESTAMP_BEFORE_MAX_MS: i64 = i64::MAX;
 
+/// The message sent with `CORRUPT_MESSAGE` for a batch whose CRC does not
+/// match its contents.
+const CRC_MISMATCH: &str = "batch crc does not match its contents";
+
 /// Why a client batch must be rejected before anything is written, with the
-/// error code to send, or `None` if it may be stored. Kafka's `LogValidator`
-/// rejects the same batches.
+/// error code to send, or `None` if it may be stored. Kafka's `UnifiedLog` and
+/// `LogValidator` reject the same batches.
 ///
+/// - The CRC must match the batch's contents, from `attributes` through the
+///   end of the records, as Kafka computes it ([DefaultRecordBatch.java#L393-L398]).
+///   Kafka checks it before the batch's header fields
+///   ([UnifiedLog.scala#L1189-L1193]): when the CRC is wrong, the attributes,
+///   the record count and the control bit are suspect too, so this check runs
+///   first. The memory and object store backends store the bytes as sent, so
+///   a consumer that checks CRCs would fail on every fetch of the batch.
+///   `CORRUPT_MESSAGE`.
 /// - Only the broker writes control batches (transaction commit/abort
 ///   markers), and those go directly to storage rather than through
 ///   [`ProduceService`]. Every backend skips schema validation and lake
@@ -142,7 +154,14 @@ const TIMESTAMP_BEFORE_MAX_MS: i64 = i64::MAX;
 ///   decode as well; checking here rejects the batch before `storage.produce()`
 ///   and before any decompression is paid for. `MESSAGE_TOO_LARGE`, the same
 ///   code the decode-time rejection maps to (see [`storage_error_code`]).
+///
+/// [DefaultRecordBatch.java#L393-L398]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L393-L398
+/// [UnifiedLog.scala#L1189-L1193]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1189-L1193
 fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
+    if batch.computed_crc() != batch.crc {
+        return Some((ErrorCode::CorruptMessage, CRC_MISMATCH));
+    }
+
     if batch.is_control() {
         return Some((
             ErrorCode::InvalidRecord,
@@ -198,13 +217,61 @@ mod rejection_tests {
 
     use super::*;
 
+    /// `batch` with a CRC that matches its contents, so that [`rejection`]
+    /// gets past its CRC check to the check under test.
+    fn with_valid_crc(mut batch: deflated::Batch) -> deflated::Batch {
+        batch.crc = batch.computed_crc();
+        batch
+    }
+
+    #[test]
+    fn a_batch_whose_crc_does_not_match_is_a_corrupt_message() {
+        let mut batch = with_valid_crc(deflated::Batch {
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        });
+        assert_eq!(None, rejection(&batch));
+
+        batch.crc ^= 1;
+        assert_eq!(
+            Some((ErrorCode::CorruptMessage, CRC_MISMATCH)),
+            rejection(&batch)
+        );
+    }
+
+    /// Kafka checks the CRC before the control bit, so a control batch with
+    /// a bad CRC is corrupt, not an invalid record.
+    #[test]
+    fn the_crc_is_checked_before_the_control_bit() {
+        let mut batch = with_valid_crc(deflated::Batch {
+            attributes: BatchAttribute::default().control(true).into(),
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            Some((
+                ErrorCode::InvalidRecord,
+                "clients may not write control batches"
+            )),
+            rejection(&batch)
+        );
+
+        batch.crc ^= 1;
+        assert_eq!(
+            Some((ErrorCode::CorruptMessage, CRC_MISMATCH)),
+            rejection(&batch)
+        );
+    }
+
     #[test]
     fn oversized_record_count_is_rejected_before_storage_is_called() {
-        let batch = deflated::Batch {
+        let batch = with_valid_crc(deflated::Batch {
             record_count: 1_000_000,
             last_offset_delta: 999_999,
             ..Default::default()
-        };
+        });
 
         assert_eq!(
             Some((
@@ -217,22 +284,22 @@ mod rejection_tests {
 
     #[test]
     fn a_record_count_within_the_limit_is_not_rejected_for_this_reason() {
-        let batch = deflated::Batch {
+        let batch = with_valid_crc(deflated::Batch {
             record_count: 1,
             last_offset_delta: 0,
             ..Default::default()
-        };
+        });
 
         assert_eq!(None, rejection(&batch));
     }
 
     #[test]
     fn an_inconsistent_header_is_an_invalid_record() {
-        let batch = deflated::Batch {
+        let batch = with_valid_crc(deflated::Batch {
             record_count: 2,
             last_offset_delta: 0,
             ..Default::default()
-        };
+        });
 
         assert_eq!(
             Some((
@@ -473,13 +540,10 @@ fn undecodable_batch(error: &Error) -> Rejection {
     Rejection::new(error_code, message)
 }
 
-/// The rejection for a batch whose CRC does not match its contents. Kafka
-/// rejects such a batch before it validates timestamps.
+/// The rejection for a batch whose CRC does not match its contents, as
+/// [`rejection`] answers it.
 fn corrupt_batch() -> Rejection {
-    Rejection::new(
-        ErrorCode::CorruptMessage,
-        "batch crc does not match its contents",
-    )
+    Rejection::new(ErrorCode::CorruptMessage, CRC_MISMATCH)
 }
 
 #[cfg(test)]
