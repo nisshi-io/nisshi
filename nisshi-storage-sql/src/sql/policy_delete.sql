@@ -28,8 +28,11 @@
 -- The delete still tests the timestamp of each record below that offset, so it never removes a
 -- record that has not expired, and a record with a timestamp ahead of its neighbours only keeps
 -- itself. A record with an old timestamp that was appended recently is deleted once its append time
--- has expired, which can be later than its timestamp alone would allow. Appends that overlap in time
--- can leave a record just below the boundary out of order, and it is deleted by a later sweep.
+-- has expired, which can be later than its timestamp alone would allow. created_at defaults to the
+-- start time of the appending transaction, so appends that overlap in time can give a record a
+-- smaller created_at than the record before it. The search can then stop just below an expired
+-- record, and a later sweep deletes that record. A record just below the boundary is deleted at
+-- once when its timestamp has expired, even if its own append time has not.
 --
 -- created_at is a timestamp without a time zone, in the time zone of the session that appended
 -- the record, so it is converted with the TimeZone setting before it is compared with now.
