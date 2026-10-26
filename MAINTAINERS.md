@@ -35,7 +35,8 @@ discussion.
 2. A maintainer other than the nominator approves the pull request. That is
    the bar branch protection enforces for any change. A maintainer who objects
    requests changes on the pull request, which blocks the merge until they
-   approve or dismiss their review.
+   approve or the review is dismissed. The pull request's history records a
+   dismissal.
 3. The nomination merges.
 
 If you think you are ready, ask a maintainer to nominate you.
