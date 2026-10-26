@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and usage help
+    url: https://community.solace.com/
+    about: Ask general questions in Solace Community. Answers are best-effort.

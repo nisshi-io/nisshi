@@ -1,3 +1,5 @@
+<!-- Features need an approved issue first. See CONTRIBUTING.md. Small fixes, typos and docs changes can go straight to a PR. -->
+
 ## What changes, and why?
 
 <!-- What a user or operator sees differently, and why. Link an issue if one exists. -->

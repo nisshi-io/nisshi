@@ -3,22 +3,38 @@
 Thanks for considering a contribution. This document covers how to file issues,
 submit changes, and get them merged.
 
-## Before you start
+## Propose first
 
-For anything beyond a small fix, open an issue first. It saves everyone time
-if a design direction gets agreed before code is written. Bug reports and
-typo fixes can go straight to a pull request.
+Nisshi's direction is set by the Solace Nisshi team (see
+[GOVERNANCE.md](GOVERNANCE.md)), so please propose a change before you write
+it:
 
-## What we accept
+1. Open an issue describing the problem and your idea.
+2. Wait for approval from the Solace Nisshi team. An idea is approved when
+   a maintainer listed in [`.github/CODEOWNERS`](.github/CODEOWNERS)
+   comments on the issue to say so. For these purposes the maintainers are
+   the members of the Solace Nisshi team.
+3. Open a pull request that links the approved issue.
 
-Most contributions — bug fixes, new features, documentation, and tests — are
-welcome through the normal pull request flow described below. Changes with
-broader impact, as defined in [GOVERNANCE.md](GOVERNANCE.md#decision-making)
-(for example a breaking API or wire-protocol change, a new storage backend,
-or a change to the governance model itself), need discussion and agreement
-from a majority of maintainers before they merge, not just one reviewer's
-approval. If you're unsure which category a change falls into, ask in an
-issue before opening the PR.
+This respects your time. Pull requests without prior approval are generally
+closed with a pointer to this process, however good the code is.
+
+Small changes can go straight to a pull request without an issue:
+
+- bug fixes with a small, local change
+- typo fixes
+- documentation improvements
+- editorial changes
+
+If you're unsure whether a change counts as small, open an issue and ask.
+
+Approved pull requests are reviewed and either merged or given a clear
+reason why not.
+
+## Questions
+
+For questions and usage help, please ask in
+[Solace Community](https://community.solace.com/). Answers are best-effort.
 
 ## Development setup
 
@@ -44,6 +60,8 @@ architecture overview.
 4. Open a pull request against `main`. Fill in the PR template — it's short
    on purpose. Merging requires an approval from a code owner and all
    required checks passing; see `.github/CODEOWNERS` for who that is.
+   Link the approved issue unless the change is one of the small changes
+   listed under [Propose first](#propose-first).
 
 Keep pull requests focused on one change. A large, mixed-purpose PR is
 harder to review and harder to revert if something goes wrong.

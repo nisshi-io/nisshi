@@ -1,40 +1,54 @@
 # Governance
 
-Nisshi is maintained by the group listed in [`.github/CODEOWNERS`](.github/CODEOWNERS).
-There is no single project lead; decisions are made by the maintainer group
-as a whole.
+Nisshi is an open source project under the Apache 2.0 license. Solace
+stewards it. The Solace Nisshi team runs the project day to day. For these
+purposes the team's members are the maintainers listed in
+[`.github/CODEOWNERS`](.github/CODEOWNERS). The project's creator, Peter
+Morgan ([@shortishly](https://github.com/shortishly)), is a maintainer.
 
-## Decision-making
+## Who decides
+
+- **Day-to-day decisions** (what to build, what to merge, what to release)
+  are made by the Solace Nisshi team.
+- **Product direction** is set by Solace product management, who also decide
+  what the open source project includes.
+- **Maintainers** are the code owners who review and approve changes.
 
 Every change merges through the same mechanism, enforced by the repository's
 branch protection: at least one code owner's approval and all required
-checks passing. That's a floor, not the whole story of how decisions get
-made above it.
+checks passing.
 
-For most changes — bug fixes, features, dependency updates, documentation —
-that one approval is effectively **lazy consensus**: whoever reviews first
-and is satisfied merges it, and anyone who disagrees can say so during that
-same review.
+Decisions about contributions are recorded in public issues and pull
+requests, so the reasoning is visible to everyone.
 
-Changes with broader impact — a breaking API or wire-protocol change, a new
-storage backend, a change to this governance model — need approval on the
-PR from a majority of active maintainers before merging, not just one
-reviewer.
+## How contributions are decided
 
-Disagreements that don't resolve through discussion are decided by a vote of
-active maintainers, simple majority.
+Contributors propose first. Open an issue describing the idea, get approval
+from the Solace Nisshi team, then open a pull request. An idea is approved
+when a maintainer listed in `.github/CODEOWNERS` comments on the issue to
+say so. Small fixes, typos, documentation and editorial changes can go
+straight to a pull request. [CONTRIBUTING.md](CONTRIBUTING.md) has the
+details.
+
+Approved pull requests are reviewed and either merged or given a clear
+reason why not.
 
 ## Becoming a maintainer
 
 Maintainer status is offered to contributors who have made sustained,
 substantive contributions and shown good judgment in reviews and design
-discussion. An existing maintainer nominates the candidate; the nomination
-passes by lazy consensus among current maintainers. New maintainers are
-added to `CODEOWNERS` and given write access.
+discussion. An existing maintainer nominates the candidate, and the
+nomination needs approval from the Solace Nisshi team. New maintainers are
+added to `CODEOWNERS`.
 
 Maintainers who are no longer active are welcome to step back at any time,
-and may be moved to an emeritus/inactive state after a sustained period of
-inactivity, decided by the same lazy-consensus process.
+and may be moved to an emeritus state after a sustained period of
+inactivity.
+
+## Changing this document
+
+Changes to this document go through a pull request like any other change,
+and need approval from the Solace Nisshi team.
 
 ## Code of Conduct
 
