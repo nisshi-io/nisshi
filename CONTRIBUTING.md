@@ -136,9 +136,9 @@ sign off each of them.
 
 A `DCO` check reports on every pull request. It fails if a commit in the
 pull request has no `Signed-off-by` line, or has one that doesn't match the
-name and email of the commit's author or committer. It is not a required
-status check, but a reviewer will ask you to fix a failure: run the
-`git rebase --signoff main` command above, then force-push. Commits already
+name and email of the commit's author or committer. It is a required status
+check, so a pull request can't merge while it fails. To fix a failure, run
+the `git rebase --signoff main` command above, then force-push. Commits already
 on `main` predate this expectation and aren't checked.
 
 ## Code of conduct
