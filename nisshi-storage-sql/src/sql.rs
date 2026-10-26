@@ -15,6 +15,9 @@
 pub(crate) mod consumer_group_select;
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
+pub(crate) mod topic_configuration_select;
+pub(crate) mod topic_configuration_select_keys;
+pub(crate) mod topic_select;
 pub(crate) mod watermark_select_for_write;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
@@ -288,7 +291,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/topic_configuration_delete.sql"),
         ),
         (
-            "topic_configuration_select.sql",
+            topic_configuration_select::QUERY,
             include_sql!("sql/topic_configuration_select.sql"),
         ),
         (
@@ -304,7 +307,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/topic_delete_by.sql"),
         ),
         ("topic_insert.sql", include_sql!("sql/topic_insert.sql")),
-        ("topic_select.sql", include_sql!("sql/topic_select.sql")),
+        (topic_select::QUERY, include_sql!("sql/topic_select.sql")),
         (
             "topic_select_name_for_update.sql",
             include_sql!("sql/topic_select_name_for_update.sql"),
@@ -320,6 +323,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         (
             "pg/topic_select_uuid.sql",
             include_sql!("pg/topic_select_uuid.sql"),
+        ),
+        (
+            topic_configuration_select_keys::QUERY,
+            include_sql!("pg/topic_configuration_select_keys.sql"),
         ),
         (
             "topition_delete_by_topic.sql",

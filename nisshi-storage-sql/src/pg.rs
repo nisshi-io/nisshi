@@ -103,7 +103,8 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        consumer_group_select, default_hash, idempotent_sequence_check, watermark_select_for_write,
+        consumer_group_select, default_hash, idempotent_sequence_check, topic_configuration_select,
+        topic_configuration_select_keys, topic_select, watermark_select_for_write,
     },
 };
 
@@ -929,6 +930,21 @@ impl TryFrom<Row> for Txn {
             status,
         })
     }
+}
+
+/// Returns the `DescribeConfigs` entry for a config that a topic sets: a dynamic topic config of
+/// type `STRING`. A null stored value is described as an empty string.
+fn dynamic_topic_config(name: String, value: Option<String>) -> DescribeConfigsResourceResult {
+    DescribeConfigsResourceResult::default()
+        .name(name)
+        .value(Some(value.unwrap_or_default()))
+        .read_only(false)
+        .is_default(None)
+        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
+        .is_sensitive(false)
+        .synonyms(Some([].into()))
+        .config_type(Some(ConfigType::String.into()))
+        .documentation(Some("".into()))
 }
 
 impl Postgres {
@@ -1879,6 +1895,88 @@ impl Postgres {
                 SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
             })
             .map_err(Into::into)
+    }
+
+    /// Returns the configs among `keys` that the topic `name` sets, or `None` when the topic does
+    /// not exist.
+    async fn topic_configs_by_key(
+        &self,
+        c: &Object,
+        name: &str,
+        keys: &[String],
+    ) -> Result<Option<Vec<DescribeConfigsResourceResult>>> {
+        // This function runs one query instead of the two that `all_topic_configs` runs, because
+        // the broker reads `message.timestamp.type` through here for each topic of each produce
+        // request.
+        let rows = self
+            .prepare_query(
+                c,
+                topic_configuration_select_keys::QUERY,
+                &[&self.cluster.as_str(), &name, &keys],
+            )
+            .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let mut configs = vec![];
+
+        for row in rows {
+            // The query returns a row with a null name for a topic that sets none of `keys`, and
+            // that row is not a config.
+            let Some(name) = row
+                .try_get::<_, Option<String>>(topic_configuration_select_keys::NAME)
+                .inspect_err(|err| error!(?err))?
+            else {
+                continue;
+            };
+            let value = row
+                .try_get::<_, Option<String>>(topic_configuration_select_keys::VALUE)
+                .inspect_err(|err| error!(?err))?;
+
+            configs.push(dynamic_topic_config(name, value));
+        }
+
+        Ok(Some(configs))
+    }
+
+    /// Returns every config that the topic `name` sets, or `None` when the topic does not exist.
+    async fn all_topic_configs(
+        &self,
+        c: &Object,
+        name: &str,
+    ) -> Result<Option<Vec<DescribeConfigsResourceResult>>> {
+        if self
+            .prepare_query(c, topic_select::QUERY, &[&self.cluster.as_str(), &name])
+            .await?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let rows = self
+            .prepare_query(
+                c,
+                topic_configuration_select::QUERY,
+                &[&self.cluster.as_str(), &name],
+            )
+            .await?;
+
+        let mut configs = vec![];
+
+        for row in rows {
+            let name = row
+                .try_get::<_, String>(topic_configuration_select::NAME)
+                .inspect_err(|err| error!(?err))?;
+            let value = row
+                .try_get::<_, Option<String>>(topic_configuration_select::VALUE)
+                .inspect_err(|err| error!(?err))?;
+
+            configs.push(dynamic_topic_config(name, value));
+        }
+
+        Ok(Some(configs))
     }
 
     #[instrument(skip(self, c, params))]
@@ -4222,52 +4320,12 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let prepared = c
-            .prepare_cached(self.sql_lookup("topic_select.sql")?)
-            .await
-            .inspect_err(|err| error!(?err))?;
+        let configs = match keys.filter(|keys| !keys.is_empty()) {
+            Some(keys) => self.topic_configs_by_key(&c, name, keys).await?,
+            None => self.all_topic_configs(&c, name).await?,
+        };
 
-        if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
-            .await
-            .inspect_err(|err| error!(?err))?
-            .is_some()
-        {
-            let prepared = c
-                .prepare_cached(self.sql_lookup("topic_configuration_select.sql")?)
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            let rows = c
-                .query(&prepared, &[&self.cluster.as_str(), &name])
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            let mut configs = vec![];
-
-            for row in rows {
-                let name = row
-                    .try_get::<_, String>(0)
-                    .inspect_err(|err| error!(?err))?;
-                let value = row
-                    .try_get::<_, Option<String>>(1)
-                    .map(|value| value.unwrap_or_default())
-                    .map(Some)
-                    .inspect_err(|err| error!(?err))?;
-
-                configs.push(
-                    DescribeConfigsResourceResult::default()
-                        .name(name)
-                        .value(value)
-                        .read_only(false)
-                        .is_default(None)
-                        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
-                        .is_sensitive(false)
-                        .synonyms(Some([].into()))
-                        .config_type(Some(ConfigType::String.into()))
-                        .documentation(Some("".into())),
-                );
-            }
-
+        if let Some(configs) = configs {
             let error_code = ErrorCode::None;
 
             Ok(DescribeConfigsResult::default()

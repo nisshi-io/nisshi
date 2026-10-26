@@ -256,6 +256,71 @@ async fn broker_error_stays_with_its_resource(
     Ok(())
 }
 
+/// A describe that names keys returns only the configs among those keys that the topic sets, as
+/// Kafka does.
+#[cfg(feature = "postgres")]
+async fn named_keys_return_only_those_configs(storage: impl Storage + Clone) -> Result<()> {
+    let topic = alphanumeric_string(15);
+
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some(
+                    [
+                        CreatableTopicConfig::default()
+                            .name("cleanup.policy".into())
+                            .value(Some("compact".into())),
+                        CreatableTopicConfig::default()
+                            .name("message.timestamp.type".into())
+                            .value(Some("LogAppendTime".into())),
+                    ]
+                    .into(),
+                )),
+            false,
+        )
+        .await?;
+
+    let described = storage
+        .describe_config(
+            &topic,
+            ConfigResource::Topic,
+            Some(&["message.timestamp.type".into(), "retention.ms".into()]),
+        )
+        .await?;
+
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(described.error_code)?);
+    let described_configs = described
+        .configs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|config| (config.name, config.value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vec![(
+            String::from("message.timestamp.type"),
+            Some(String::from("LogAppendTime"))
+        )],
+        described_configs
+    );
+
+    let unset = storage
+        .describe_config(
+            &topic,
+            ConfigResource::Topic,
+            Some(&["retention.ms".into()]),
+        )
+        .await?;
+
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(unset.error_code)?);
+    assert_matches!(unset.configs.as_deref(), Some([]));
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -589,6 +654,18 @@ mod slatedb {
 #[cfg(feature = "postgres")]
 mod pg {
     use super::*;
+
+    #[tokio::test]
+    async fn named_keys_return_only_those_configs() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::named_keys_return_only_those_configs(storage).await
+    }
 
     async fn storage_container(
         cluster: impl Into<String> + Clone,
