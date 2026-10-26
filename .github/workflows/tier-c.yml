@@ -12,10 +12,10 @@ name: tier-c
 # `nightly-failure` label. The next green run closes that issue.
 #
 # The `edge-gate` and `edge-publish` jobs push the multi-arch image of main's
-# tip as `ghcr.io/nisshi-io/nisshi:edge`, and as `main`, which stays for
-# external consumers and goes in a follow-up. They push only when the merge
-# queue passed the tip, and they reuse the binaries that the push run of ci.yml
-# built, so they compile nothing. `edge` can trail the tip until the next run
+# tip as `edge`, and as `main`, which stays for external consumers and goes in
+# a follow-up, to each image path that publish-image pushes. They push only
+# when the merge queue passed the tip, and they reuse the binaries that the
+# push run of ci.yml built, so they compile nothing. `edge` can trail the tip until the next run
 # when a merge lands during the scheduled run, or shortly before it while that
 # merge's push run is still in progress: the gate then skips the publish.
 #
