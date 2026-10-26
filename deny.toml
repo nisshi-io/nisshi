@@ -10,9 +10,9 @@ all-features = true
 no-default-features = false
 
 [advisories]
-# Pre-existing debt found when this gate was introduced (2026-09-17), not
-# caused by any single PR. Tracked for follow-up; remove each entry once the
-# fix lands. New advisories are NOT covered by this list and will fail CI.
+# Each entry is an advisory whose fix we can't take yet, because a dependency
+# still requires the affected version. Remove each entry once the fix lands.
+# Every advisory not on this list fails CI.
 # `unmaintained` findings are downgraded to non-blocking separately, via
 # `--warn unmaintained` on the command line (see .github/workflows/
 # dependencies.yml) - being unmaintained isn't the same as being vulnerable,
@@ -20,6 +20,9 @@ no-default-features = false
 ignore = [
     { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic start-tag check; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 has no fixed release, and apache-avro, iceberg, datafusion and foyer require it; none of them calls the affected with_context constructors" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 (via zstd 0.13) has no fixed release; the affected code needs the seekable feature, which nothing enables" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7 (via zstd 0.13) has no fixed release, and apache-avro, iceberg, datafusion and foyer require zstd 0.13" },
 ]
 # RUSTSEC-2026-0258 (h2) and RUSTSEC-2026-0285 (rustls) were on this list too,
 # but both had semver-compatible fixed versions available (h2 0.4.15->0.4.19,
