@@ -16,7 +16,7 @@ use nisshi_sans_io::{
     ApiKey, ErrorCode, InitProducerIdRequest, InitProducerIdResponse, RequestInput,
 };
 use rama::Service;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::{Error, ProducerIdResponse, Result, Storage, producer_claim};
 
@@ -117,6 +117,10 @@ where
             // [KafkaApis.scala#L2310-L2312]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2310-L2312
             // [TransactionManager.java#L1325-L1329]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java#L1325-L1329
             // [rdkafka_idempotence.c#L162-L165]: https://github.com/confluentinc/librdkafka/blob/v2.3.0/src/rdkafka_idempotence.c#L162-L165
+            warn!(
+                transactional_id = ?input.request.transactional_id,
+                "refusing InitProducerId: transactions are not supported"
+            );
             ProducerIdResponse::failed(ErrorCode::TransactionalIdAuthorizationFailed)
         } else {
             match producer_claim(input.request.producer_id, input.request.producer_epoch) {

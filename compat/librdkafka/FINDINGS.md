@@ -69,6 +69,19 @@ Sweeps of the librdkafka integration test suite against
 6. **Transactions are refused** — nisshi answers InitProducerId with a
    `transactional.id` with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, so
    the transactional tests (0103, 0129) fail at `init_transactions`.
+   0061 and 0137 have transactional subtests that fail in a full run,
+   and 0055 fails outside CI. CI's `-Q` quick mode skips the first two.
+   Turning transactions back on needs these fixes first:
+   - Every storage engine returns an empty `aborted_transactions`, so a
+     `read_committed` consumer reads aborted records.
+   - InitProducerId accepts a `transaction.timeout.ms` above
+     `transaction.max.timeout.ms`; Kafka answers
+     `INVALID_TRANSACTION_TIMEOUT` (0103 `do_test_misuse_txn`).
+   - 0129's `abort_transaction` fails with `EndTxnRequest (KIP-98) not
+     supported`, so the advertised EndTxn versions may not cover what
+     librdkafka needs.
+   - The `old_versions_bump_a_transactional_producer` test is ignored;
+     CI never runs it.
 
 7. **Consumer group edge cases** — one extra rebalance versus Kafka in
    max-poll-exceeded scenarios (0091, 0093); commit-during-rebalance
