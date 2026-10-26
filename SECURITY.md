@@ -18,7 +18,9 @@ vulnerability.
 that only the maintainers can see until a fix is ready.
 
 **Fallback:** if you don't have a GitHub account, email
-[support@solace.com](mailto:support@solace.com).
+[support@solace.com](mailto:support@solace.com) with "Nisshi security" at the
+start of the subject line, so the support team can route it to the
+maintainers.
 
 ### What to include
 
