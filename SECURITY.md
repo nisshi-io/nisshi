@@ -18,8 +18,7 @@ vulnerability.
 that only the maintainers can see until a fix is ready.
 
 **Fallback:** if you don't have a GitHub account, email
-[support@solace.com](mailto:support@solace.com). Use this address for
-vulnerability reports only.
+[support@solace.com](mailto:support@solace.com).
 
 ### What to include
 
