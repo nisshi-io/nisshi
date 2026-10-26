@@ -57,9 +57,9 @@ of the Solace support team. The support team can read your report, and they
 will contact the maintainers about it.
 
 If your report concerns a maintainer or someone who handles that inbox,
-contact any other maintainer listed in
-[`.github/CODEOWNERS`](.github/CODEOWNERS) directly. All complaints will be
-reviewed and investigated promptly and fairly.
+contact the Solace community team through
+<https://community.solace.com/>. All complaints will be reviewed and
+investigated promptly and fairly.
 
 Maintainers are obligated to handle every report with discretion and to
 respect the privacy and security of the reporter of any incident, within
