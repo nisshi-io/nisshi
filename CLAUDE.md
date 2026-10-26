@@ -115,7 +115,7 @@ Selected at compile time via feature flags, dispatched at runtime through a `Sto
 - `null://` - stub backend, tracks topic metadata only, no message storage (`nisshi-storage-null`, always compiled in)
 - `postgres://` - PostgreSQL (`nisshi-storage-sql`, feature: `postgres`)
 - `sqlite://` - libSQL/SQLite (`nisshi-storage-sql`, feature: `libsql`)
-- `slatedb://` - SlateDB KV store (`nisshi-storage-slatedb`, feature: `slatedb`)
+- `slatedb://` - SlateDB KV store (`nisshi-storage-slatedb`, feature: `slatedb`). **Deprecated.** Only security fixes are accepted. When writing code, reviewing a PR or running a sweep, do not suggest or make bug fixes, refactors or feature changes for it, and do not flag non-security issues in it. Leave its tests and backend coverage as they are.
 
 `RequestChannelService`'s `Storage` trait impl (`nisshi-storage/src/service.rs`) sends a `Request` over a channel and extracts the matching `Response` variant; every method does this via the `serve_and_extract!(self, request_expr, ResponseVariant)` macro rather than repeating the match/unwrap boilerplate - add new methods the same way.
 
