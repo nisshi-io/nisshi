@@ -61,6 +61,10 @@ shows only this is a known limitation, not a vulnerability. A client that
 does any of this without completing authentication on a broker started with
 `--authentication` is still in scope.
 
+`nisshi proxy` does not authenticate clients either. Its origin broker must
+not require authentication, so front only a broker you would expose without
+`--authentication`. Access through the proxy is the same known limitation.
+
 For vulnerabilities in a third-party dependency, report them to that
 project. If Nisshi's use of the dependency makes the issue exploitable, tell
 us too.
