@@ -18,7 +18,7 @@ no-default-features = false
 # dependencies.yml) - being unmaintained isn't the same as being vulnerable,
 # and they stay visible in the job log rather than being silenced outright.
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 quadratic start-tag check; fixed in quick-xml 0.41. Two paths pull in 0.39.4: object_store 0.13.2 (datafusion, parquet and deltalake) and opendal 0.57 (iceberg-storage-opendal). Blocked until datafusion, deltalake and iceberg have releases on arrow and parquet 60 (the first to use object_store 0.14), and iceberg-storage-opendal moves to opendal 0.58 or later" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 quadratic start-tag check; fixed in quick-xml 0.41. Two paths pull in 0.39.4: object_store 0.13.2 (datafusion, parquet and deltalake) and opendal 0.57 (iceberg-storage-opendal). Blocked until datafusion, deltalake and iceberg have releases on arrow and parquet 60 (the first to use object_store 0.14) and the workspace's own `arrow` and `parquet` requirements move to 60 with them, and iceberg-storage-opendal moves to opendal 0.58 or later" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 unbounded namespace-declaration allocation; same paths and blocker as RUSTSEC-2026-0194" },
     { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 has no fixed release, and apache-avro, iceberg, datafusion and foyer require it; none of them calls the affected with_context constructors" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 (via zstd 0.13) has no fixed release; the affected code needs the seekable feature, which nothing enables" },
