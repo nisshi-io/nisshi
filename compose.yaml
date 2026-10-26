@@ -4,7 +4,7 @@
 # and the other services use well-known passwords or anonymous access.
 services:
   grafana:
-    image: grafana/grafana:11.5.1@sha256:5781759b3d27734d4d548fcbaf60b1180dbf4290e708f01f292faa6ae764c5e6
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
     ports:
       - 127.0.0.1:3000:3000
     environment:
