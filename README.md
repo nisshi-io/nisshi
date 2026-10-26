@@ -194,6 +194,52 @@ Results in the following output:
 ```
 
 
+### Docker Compose
+
+Run the broker with [Docker Compose](https://docs.docker.com/compose/) from a
+clone of this repository. You don't need a `.env`: by default,
+[compose.yaml](compose.yaml) runs the latest release on PostgreSQL.
+
+```shell
+docker compose up -d nisshi
+```
+
+This starts PostgreSQL and the broker, which listens on `localhost:9092`.
+Compose publishes their ports on 127.0.0.1 only, so other computers can't connect.
+
+If PostgreSQL already runs on your computer, port 5432 is taken and the command
+fails with "port is already allocated". Publish the `db` service on another port:
+
+```shell
+NISSHI_DB_PORTS=127.0.0.1:15432:5432 docker compose up -d nisshi
+```
+
+Create a topic, produce a message to it, and consume it:
+
+```shell
+docker compose exec nisshi /nisshi topic create hello
+echo '{"value":"hello world"}' | docker compose exec -T nisshi /nisshi cat produce hello
+docker compose exec nisshi /nisshi cat consume hello
+```
+
+The consume command prints the message:
+
+```json
+[{"key":null,"value":"hello world"}]
+```
+
+If a command fails, `docker compose ps` shows whether the broker is running,
+and `docker compose logs nisshi` shows why it stopped.
+
+Stop the broker and PostgreSQL with `docker compose down`. Add `--volumes` to
+also delete the stored messages.
+
+Next steps:
+
+- Connect any Kafka client to `localhost:9092`, such as the Kafka CLI tools in [s3](#s3).
+- Use another storage engine: set `STORAGE_ENGINE` in a `.env` file, for example `STORAGE_ENGINE=memory://nisshi/`. [example.env](example.env) lists the other settings, and it selects `s3://nisshi/`, which needs the bucket that [s3](#s3) creates.
+- Read the documentation at [docs.nisshi.io](https://docs.nisshi.io/).
+
 ### s3
 
 The following will configure a S3 storage engine

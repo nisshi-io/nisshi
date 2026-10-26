@@ -178,6 +178,25 @@ fmt-fix:
 shellcheck:
     git ls-files -z '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
 
+# check that compose.yaml loads with no .env and no variables set, as on a fresh clone
+compose-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # dotenv-load puts .env in this recipe's environment, and compose reads that
+    # environment before the defaults, so compose runs with an empty environment.
+    status=0
+    stderr=$(env -i PATH="$PATH" HOME="$HOME" docker compose --env-file /dev/null config --quiet 2>&1 >/dev/null) || status=$?
+    if [[ -n "$stderr" ]]; then
+        printf '%s\n' "$stderr" >&2
+    fi
+    # The check fails only on a load error or an unset variable, and prints
+    # other warnings, because the runner's Compose version is not pinned and a
+    # newer one can add a warning for an unchanged file.
+    if [[ $status -ne 0 ]] || grep -q 'variable is not set' <<<"$stderr"; then
+        echo "compose-check: compose.yaml must load with no .env and give each variable a default" >&2
+        exit 1
+    fi
+
 miri:
     cargo +nightly miri test --no-fail-fast --all-features
 

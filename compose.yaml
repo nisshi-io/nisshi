@@ -1,9 +1,12 @@
 ---
+# Each service publishes its ports on 127.0.0.1 only, so that only this
+# computer can connect. The broker does not authenticate clients by default,
+# and the other services use well-known passwords or anonymous access.
 services:
   grafana:
     image: grafana/grafana:11.5.1@sha256:5781759b3d27734d4d548fcbaf60b1180dbf4290e708f01f292faa6ae764c5e6
     ports:
-      - 3000:3000
+      - 127.0.0.1:3000:3000
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: true
       GF_AUTH_ANONYMOUS_HIDE_VERSION: true
@@ -27,11 +30,13 @@ services:
       POSTGRES_PASSWORD: postgres
     # nisshi-smoke-test/run.sh sets NISSHI_DB_PORTS, so that Docker picks the host port.
     ports:
-      - ${NISSHI_DB_PORTS:-5432:5432}
+      - ${NISSHI_DB_PORTS:-127.0.0.1:5432:5432}
     volumes:
       - db:/var/lib/postgresql
     healthcheck:
-      test: /usr/bin/pg_isready
+      # pg_isready checks TCP, not the socket: on a new volume, the server
+      # listens only on the socket while its init scripts run.
+      test: /usr/bin/pg_isready --host=localhost
       interval: 5s
       timeout: 10s
       retries: 5
@@ -46,8 +51,8 @@ services:
       - minio:/data
     # nisshi-smoke-test/run.sh sets these variables, so that Docker picks the host ports.
     ports:
-      - ${NISSHI_MINIO_PORTS:-9000:9000}
-      - ${NISSHI_MINIO_CONSOLE_PORTS:-9001:9001}
+      - ${NISSHI_MINIO_PORTS:-127.0.0.1:9000:9000}
+      - ${NISSHI_MINIO_CONSOLE_PORTS:-127.0.0.1:9001:9001}
     environment:
       MINIO_PROMETHEUS_AUTH_TYPE: public
     healthcheck:
@@ -57,49 +62,62 @@ services:
       start_period: 5s
       timeout: 5s
     pull_policy: missing
+  # Each variable has a default, so that `docker compose up -d nisshi` works
+  # without a .env. The defaults run the latest release on PostgreSQL. A .env
+  # (see example.env) overrides any of them.
   nisshi:
-    image: ${NISSHI_IMAGE}
+    # :latest is the latest release. Set NISSHI_IMAGE to
+    # ghcr.io/nisshi-io/nisshi:edge for a build of main.
+    image: ${NISSHI_IMAGE:-ghcr.io/nisshi-io/nisshi:latest}
     restart: unless-stopped
     environment:
-      RUST_BACKTRACE: ${RUST_BACKTRACE}
-      RUST_LOG: ${RUST_LOG}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_ENDPOINT: ${AWS_ENDPOINT}
-      AWS_ALLOW_HTTP: ${AWS_ALLOW_HTTP}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-0}
+      RUST_LOG: ${RUST_LOG:-warn}
+      # The local credentials of the minio service above. They are not AWS
+      # credentials, and the s3:// storage engine needs no AWS account.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      AWS_ENDPOINT: ${AWS_ENDPOINT:-http://minio:9000}
+      AWS_ALLOW_HTTP: ${AWS_ALLOW_HTTP:-true}
     volumes:
       - ./etc/schema/:/schema/
       - ./data:/data/
     command: |
-      --kafka-cluster-id ${CLUSTER_ID}
+      --kafka-cluster-id ${CLUSTER_ID:-nisshi}
       --kafka-listener-url tcp://0.0.0.0:9092/
-      --kafka-advertised-listener-url ${ADVERTISED_LISTENER_URL}
-      --storage-engine ${STORAGE_ENGINE}
+      --kafka-advertised-listener-url ${ADVERTISED_LISTENER_URL:-tcp://localhost:9092}
+      --storage-engine ${STORAGE_ENGINE:-postgres://postgres:postgres@db}
       --schema-registry file:///schema
+    # The broker exits when its storage engine is unreachable at startup, so
+    # it waits for the default engine, PostgreSQL. With another engine,
+    # `docker compose up nisshi` still starts db.
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
-      - 9092:9092
-      - 9100:9100
+      - 127.0.0.1:9092:9092
+      - 127.0.0.1:9100:9100
   jaeger:
     # Jaeger v1 (jaegertracing/all-in-one) is end of life. Jaeger v2 ships
     # under a different image name, jaegertracing/jaeger, so a move to v2
     # needs more than a tag bump.
     image: jaegertracing/all-in-one:1.76.0@sha256:ab6f1a1f0fb49ea08bcd19f6b84f6081d0d44b364b6de148e1798eb5816bacac
     ports:
-      - 16686:16686
-      - 4317:4317
-      - 4318:4318
-      - 5778:5778
-      - 9411:9411
+      - 127.0.0.1:16686:16686
+      - 127.0.0.1:4317:4317
+      - 127.0.0.1:4318:4318
+      - 127.0.0.1:5778:5778
+      - 127.0.0.1:9411:9411
   prometheus:
     image: prom/prometheus:v3.1.0@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
     ports:
-      - 9090:9090
+      - 127.0.0.1:9090:9090
     command: --web.enable-otlp-receiver
     configs:
       - source: prometheus_yaml
         target: /prometheus/prometheus.yml
   lakehouse-catalog:
-    image: ${LAKEKEEPER_IMAGE}
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4}
     environment:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
@@ -120,9 +138,9 @@ services:
       minio:
         condition: service_healthy
     ports:
-      - "8181:8181"
+      - 127.0.0.1:8181:8181
   lakehouse-migrate:
-    image: ${LAKEKEEPER_IMAGE}
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4}
     environment:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres

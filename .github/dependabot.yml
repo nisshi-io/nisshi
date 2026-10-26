@@ -170,10 +170,8 @@ updates:
   # compose.yaml pins each image by tag and digest. The `docker` ecosystem
   # reads Dockerfiles only, so compose files need their own entry. Dependabot
   # reads the default of a `${VAR:-default}` image, so this entry refreshes the
-  # `POSTGRES_IMAGE` digest. It cannot read an image that a variable supplies
-  # without a default, so the maintainer bumps these digests by hand: the images
-  # in the justfile recipes, and `LAKEKEEPER_IMAGE`. The `LAKEKEEPER_IMAGE`
-  # value appears in example.env, ci.yml and tier-c.yml, and the three must match.
+  # `POSTGRES_IMAGE` and `LAKEKEEPER_IMAGE` defaults. It does not read the
+  # justfile recipes, so the maintainer bumps the images there by hand.
   # The `POSTGRES_IMAGE: postgres:18` values in ci.yml (four jobs) and tier-c.yml
   # (two jobs) and the fallback in nisshi-smoke-test/run.sh must keep the major
   # version of the compose default. The mirror action rejects `@sha256`, so they

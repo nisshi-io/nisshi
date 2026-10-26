@@ -196,7 +196,6 @@ jobs:
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
-      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4
       NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
@@ -625,6 +624,7 @@ jobs:
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
+      - run: just compose-check
   third-party-license:
     if: needs.changes.outputs.rust == 'true'
     needs: [changes]
