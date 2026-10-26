@@ -160,12 +160,22 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Writes a failed command's final message to stderr, whatever `RUST_LOG` is set to. A script
-/// that captures stdout (`topics=$(nisshi topic list)`) then gets no message in its output.
+/// Writes a failed command's final message to stderr after the prefix `error: `, whatever
+/// `RUST_LOG` is set to. A script that captures stdout (`topics=$(nisshi topic list)`) then gets
+/// no message in its output.
+///
+/// The prefix is the one that `rustc` and `clap` print, so a reader or a script finds the failure
+/// line by it. The smoke tests' `error_lines` rule relies on it, because the broker's startup
+/// output also names the storage URL, so a test can't search the whole log for a bad value.
 macro_rules! report_failure {
     ($($argument:tt)*) => {
-        eprintln!($($argument)*)
+        eprintln!("{}", failure_line(format_args!($($argument)*)))
     };
+}
+
+/// Returns the line that `report_failure!` writes for the message: the message after `error: `.
+fn failure_line(message: std::fmt::Arguments<'_>) -> String {
+    format!("error: {message}")
 }
 
 /// Writes the message for an error that a command returned: what went wrong and how to fix it
@@ -334,9 +344,21 @@ fn report_error(err: &nisshi_cli::Error) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BROKER_OPTION, TOPIC_BROKER_OPTION, cat_error_message, client_error_message,
+        BROKER_OPTION, TOPIC_BROKER_OPTION, cat_error_message, client_error_message, failure_line,
         feature_not_enabled_message, listener_in_use_message,
     };
+
+    /// The smoke tests find a failed start by the `error: ` prefix.
+    #[test]
+    fn failure_line_starts_with_the_error_prefix() {
+        assert_eq!(
+            "error: storage option a=b is not a valid interval",
+            failure_line(format_args!(
+                "storage option {}=b is not a valid interval",
+                "a"
+            ))
+        );
+    }
     use std::{
         io,
         net::{Ipv4Addr, SocketAddr},
