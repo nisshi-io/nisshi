@@ -211,17 +211,22 @@ broker now flushes pending metrics before exiting.
 The `nisshi topic` command has the following subcommands:
 
 ```shell
-Create or delete topics managed by the broker
+nisshi topic --help
+Create, list or delete topics managed by the broker
 
-Usage: nisshi topic <COMMAND>
+Usage: nisshi topic [OPTIONS] <COMMAND>
 
 Commands:
   create  Create a topic
   delete  Delete an existing topic
+  list    List existing topics
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+      --schema-registry <SCHEMA_REGISTRY>
+          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
+  -h, --help
+          Print help
 ```
 
 To create a topic use:
@@ -229,6 +234,17 @@ To create a topic use:
 ```shell
 nisshi topic create taxi
 ```
+
+The command prints the topic and its number of partitions:
+
+```shell
+Created topic taxi with 3 partitions.
+```
+
+`nisshi topic create` and `nisshi cat produce` exit with status 0 on success,
+and with a non-zero status on failure. A script that only checks the exit
+status can pass `--silent`, so that the command prints no confirmation line.
+Warnings and errors still print.
 
 ## cat
 
@@ -258,6 +274,13 @@ Using [trips.json](etc/data/trips.json) containing a JSON array of objects,
 
 ```
 nisshi cat produce taxi etc/data/trips.json
+```
+
+The command prints the number of messages and the offsets that the broker
+gave them:
+
+```shell
+Produced 4 messages to taxi partition 0, offsets 0 to 3.
 ```
 
 Using [duckdb](https://duckdb.org) we can read the

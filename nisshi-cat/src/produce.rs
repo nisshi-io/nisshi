@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::marker::PhantomData;
+use std::{
+    fmt::{self, Display},
+    io::Write,
+    marker::PhantomData,
+};
 
 use crate::{Error, Result};
 
@@ -43,6 +47,7 @@ pub struct Builder<B, T, P, S, F> {
     partition: P,
     schema_registry: S,
     file_name: F,
+    silent: bool,
 }
 
 pub(crate) type PhantomBuilder = Builder<
@@ -61,6 +66,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
+            silent: self.silent,
         }
     }
 
@@ -71,6 +77,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
+            silent: self.silent,
         }
     }
 
@@ -81,6 +88,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
+            silent: self.silent,
         }
     }
 
@@ -91,6 +99,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry,
             file_name: self.file_name,
+            silent: self.silent,
         }
     }
 
@@ -101,7 +110,12 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name,
+            silent: self.silent,
         }
+    }
+
+    pub fn silent(self, silent: bool) -> Builder<B, T, P, S, F> {
+        Self { silent, ..self }
     }
 }
 
@@ -113,6 +127,7 @@ impl Builder<Url, String, i32, Option<Url>, String> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
+            silent: self.silent,
         }))
     }
 }
@@ -124,6 +139,7 @@ pub struct Configuration {
     pub partition: i32,
     pub schema_registry: Option<Url>,
     pub file_name: String,
+    pub silent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -203,9 +219,10 @@ impl Produce {
             None
         };
 
+        let mut offset_delta = 0;
+
         let frame = {
             let mut batch = inflated::Batch::builder();
-            let mut offset_delta = 0;
 
             if self.configuration.file_name == "-" {
                 let stdin = io::stdin();
@@ -287,7 +304,7 @@ impl Produce {
             .timeout_ms(1_500)
             .topic_data(Some(
                 [TopicProduceData::default()
-                    .name(self.configuration.topic)
+                    .name(self.configuration.topic.clone())
                     .partition_data(Some(
                         [PartitionProduceData::default()
                             .index(self.configuration.partition)
@@ -310,13 +327,104 @@ impl Produce {
         let partition_responses = partition_responses.as_deref().unwrap_or_default();
         assert_eq!(1, partition_responses.len());
 
-        let PartitionProduceResponse { error_code, .. } =
-            partition_responses.first().ok_or_else(|| {
-                Error::Message(format!(
-                    "expected exactly one partition response: {partition_responses:?}"
-                ))
-            })?;
+        let PartitionProduceResponse {
+            error_code,
+            base_offset,
+            ..
+        } = partition_responses.first().ok_or_else(|| {
+            Error::Message(format!(
+                "expected exactly one partition response: {partition_responses:?}"
+            ))
+        })?;
 
-        ErrorCode::try_from(*error_code).map_err(Into::into)
+        let error_code = ErrorCode::try_from(*error_code)?;
+
+        if error_code == ErrorCode::None && !self.configuration.silent {
+            let produced = Produced {
+                topic: self.configuration.topic,
+                partition: self.configuration.partition,
+                base_offset: *base_offset,
+                count: offset_delta,
+            };
+
+            // The broker has already written the messages. A failure to print the line, such as
+            // a closed pipe, is ignored instead of panicking in `println!`, because a non-zero
+            // exit would make a caller that retries write the messages again.
+            _ = writeln!(std::io::stdout(), "{produced}").inspect_err(|error| debug!(?error));
+        }
+
+        Ok(error_code)
+    }
+}
+
+/// The line `cat produce` prints when the broker has written the messages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Produced {
+    topic: String,
+    partition: i32,
+    /// The offset of the first message written.
+    base_offset: i64,
+    /// The number of messages written.
+    count: i32,
+}
+
+impl Display for Produced {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            topic,
+            partition,
+            base_offset,
+            count,
+        } = self;
+
+        match count {
+            0 => write!(f, "Produced 0 messages to {topic} partition {partition}."),
+            1 => write!(
+                f,
+                "Produced 1 message to {topic} partition {partition}, offset {base_offset}."
+            ),
+            _ => write!(
+                f,
+                "Produced {count} messages to {topic} partition {partition}, offsets \
+                {base_offset} to {}.",
+                base_offset + i64::from(count - 1)
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Produced;
+
+    fn produced(base_offset: i64, count: i32) -> String {
+        Produced {
+            topic: "taxi".into(),
+            partition: 0,
+            base_offset,
+            count,
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn produced_gives_the_range_of_offsets() {
+        assert_eq!(
+            "Produced 4 messages to taxi partition 0, offsets 0 to 3.",
+            produced(0, 4)
+        );
+    }
+
+    #[test]
+    fn produced_one_message_gives_its_offset() {
+        assert_eq!(
+            "Produced 1 message to taxi partition 0, offset 4.",
+            produced(4, 1)
+        );
+    }
+
+    #[test]
+    fn produced_no_messages_gives_no_offset() {
+        assert_eq!("Produced 0 messages to taxi partition 0.", produced(-1, 0));
     }
 }

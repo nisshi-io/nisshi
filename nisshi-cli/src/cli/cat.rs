@@ -42,6 +42,10 @@ pub(super) enum Command {
         /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
         #[arg(long, env = "SCHEMA_REGISTRY")]
         schema_registry: Option<Url>,
+
+        /// Print no confirmation on success (warnings and errors still print)
+        #[arg(long)]
+        silent: bool,
     },
 
     /// Consume Avro/JSON/Protobuf messages from a topic
@@ -93,12 +97,14 @@ impl From<Command> for Cat {
                 file,
                 partition,
                 schema_registry,
+                silent,
             } => Cat::produce()
                 .broker(broker)
                 .topic(topic)
                 .partition(partition)
                 .schema_registry(schema_registry)
                 .file_name(file)
+                .silent(silent)
                 .build(),
 
             Command::Consume {
@@ -162,5 +168,22 @@ mod tests {
         for args in [["produce", "test"], ["consume", "test"]] {
             assert_eq!(Some("127.0.0.1"), broker_default(&args).host_str());
         }
+    }
+
+    fn produce_is_silent(args: &[&str]) -> bool {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("cat").chain(args.iter().copied()))
+                .expect("arguments parse");
+
+        match command {
+            Command::Produce { silent, .. } => silent,
+            Command::Consume { .. } => panic!("expected produce: {args:?}"),
+        }
+    }
+
+    #[test]
+    fn produce_prints_its_confirmation_unless_silent() {
+        assert!(!produce_is_silent(&["produce", "test"]));
+        assert!(produce_is_silent(&["produce", "test", "--silent"]));
     }
 }

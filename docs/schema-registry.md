@@ -163,16 +163,34 @@ Create the person topic:
 target/debug/nisshi topic create person
 ```
 
+The command prints:
+
+```shell
+Created topic person with 3 partitions.
+```
+
 Produce a message that is valid for the person schema:
 
 ```shell
 echo '{"key": "345-67-6543", "value": {"firstName": "John", "lastName": "Doe", "age": 21}}' | target/debug/nisshi cat produce person
 ```
 
+The command prints:
+
+```shell
+Produced 1 message to person partition 0, offset 0.
+```
+
 Produce a message that is invalid for the person schema (the `age` must be greater to equal to 0):
 
 ```shell
 echo '{"key": "567-89-8765", "value":	{"firstName": "John", "lastName": "Doe", "age": -1}}' | ./target/debug/nisshi cat produce person
+```
+
+The command prints no confirmation, exits with status 1, and prints the error that the broker returned:
+
+```shell
+2024-12-19T11:51:28.408011Z ERROR nisshi: 57: This record has failed the validation on broker and hence will be rejected.
 ```
 
 The server log contains the reason for the message being rejected:
