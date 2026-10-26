@@ -1131,45 +1131,41 @@ impl AsArrow for Schema {
                             schema,
                             r(
                                 schema,
-                                DateTime::from_timestamp_millis(
-                                    batch.base_timestamp + record.timestamp_delta,
-                                )
-                                .map_or(
-                                    [
-                                        ("partition", Value::Int(partition)),
-                                        (
-                                            "timestamp",
-                                            Value::Long(
-                                                (batch.base_timestamp + record.timestamp_delta)
-                                                    * 1_000,
-                                            ),
-                                        ),
-                                        ("year", Value::Int(0)),
-                                        ("month", Value::Int(0)),
-                                        ("day", Value::Int(0)),
-                                    ],
-                                    |date_time| {
+                                DateTime::from_timestamp_millis(batch.record_timestamp(record))
+                                    .map_or(
                                         [
                                             ("partition", Value::Int(partition)),
                                             (
                                                 "timestamp",
-                                                Value::Long(
-                                                    (batch.base_timestamp + record.timestamp_delta)
-                                                        * 1_000,
+                                                Value::Long(batch.record_timestamp(record) * 1_000),
+                                            ),
+                                            ("year", Value::Int(0)),
+                                            ("month", Value::Int(0)),
+                                            ("day", Value::Int(0)),
+                                        ],
+                                        |date_time| {
+                                            [
+                                                ("partition", Value::Int(partition)),
+                                                (
+                                                    "timestamp",
+                                                    Value::Long(
+                                                        batch.record_timestamp(record) * 1_000,
+                                                    ),
                                                 ),
-                                            ),
-                                            ("year", Value::Int(date_time.date_naive().year())),
-                                            (
-                                                "month",
-                                                Value::Int(date_time.date_naive().month() as i32),
-                                            ),
-                                            (
-                                                "day",
-                                                Value::Int(date_time.date_naive().day() as i32),
-                                            ),
-                                        ]
-                                    },
-                                ),
+                                                ("year", Value::Int(date_time.date_naive().year())),
+                                                (
+                                                    "month",
+                                                    Value::Int(
+                                                        date_time.date_naive().month() as i32
+                                                    ),
+                                                ),
+                                                (
+                                                    "day",
+                                                    Value::Int(date_time.date_naive().day() as i32),
+                                                ),
+                                            ]
+                                        },
+                                    ),
                             )?
                             .into(),
                         )
