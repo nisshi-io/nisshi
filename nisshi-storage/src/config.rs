@@ -25,10 +25,11 @@ use crate::{Error, Result};
 /// Checks `value` against Kafka's rules for the topic configuration `key`. Returns the value to
 /// store, or Kafka's [`ErrorCode::InvalidConfig`] message when Kafka rejects it.
 ///
-/// The broker checks only the configurations below, with the rules that Kafka defines for them in
-/// [`LogConfig`], and stores the value of any other configuration without a check. The storage
-/// engines read these values in their maintenance queries, so a value that doesn't parse can stop
-/// maintenance for every topic.
+/// This function checks `retention.ms` and `retention.bytes`, with the rules that Kafka defines for
+/// them in [`LogConfig`], and returns the value of any other configuration without a check.
+/// [`crate::max_message_bytes`] checks `max.message.bytes`. The storage engines read the retention
+/// values in their maintenance queries, so a value that doesn't parse can stop maintenance for every
+/// topic.
 ///
 /// For a checked configuration, it returns the plain number that it parses, without white space or
 /// a `+`, because the maintenance queries read anything else as no limit.
