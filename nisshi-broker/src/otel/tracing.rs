@@ -14,8 +14,12 @@
 
 use crate::{Result, TracingFormat};
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing::{Level, Subscriber};
 use tracing_subscriber::{
-    EnvFilter, Layer, Registry, filter::LevelFilter, fmt::format::FmtSpan, layer::SubscriberExt,
+    EnvFilter, Layer,
+    filter::{FilterExt, LevelFilter, filter_fn},
+    fmt::format::FmtSpan,
+    layer::{Filter, SubscriberExt},
     util::SubscriberInitExt,
 };
 
@@ -34,37 +38,41 @@ impl Drop for Guard {
     }
 }
 
-/// The env filter, built from the `RUST_LOG` environment variable.
-fn env_filter() -> Result<EnvFilter> {
-    env_filter_from(std::env::var("RUST_LOG").ok().as_deref())
+/// The log filter, built from the `RUST_LOG` environment variable.
+fn log_filter<S: Subscriber>() -> Result<impl Filter<S> + use<S>> {
+    log_filter_from(std::env::var("RUST_LOG").ok().as_deref())
 }
 
-/// The env filter for a `RUST_LOG` value, `None` when it is unset.
+/// The log filter for a `RUST_LOG` value, `None` when it is unset.
 ///
 /// The level is `warn` when `rust_log` is unset or empty, so warnings such
 /// as deprecation notices show on a default run; any directives in `rust_log`
 /// replace that default. Malformed directives are ignored, as they always
 /// have been.
 ///
-/// `reqsign_core` is capped at `info` when the filter enables anything more
-/// verbose than that. reqsign-core 3.3.2 logs each credential provider it
-/// tries at `debug`, and reqsign-aws-core 3.2.0's `StaticCredentialProvider`
-/// derives `Debug` over `secret_access_key` and `session_token` without
-/// redaction, so `RUST_LOG=debug` (routine when troubleshooting, and what
-/// CI's test job uses) prints AWS secrets in cleartext through this
-/// subscriber's `log` compatibility layer. The cap is left off when the filter
-/// is at `info` or quieter, because a directive sets a level rather than only
-/// capping one, and would otherwise raise `reqsign_core` to `info` under the
-/// default `warn` or under `RUST_LOG=error`.
-fn env_filter_from(rust_log: Option<&str>) -> Result<EnvFilter> {
-    let filter = EnvFilter::builder()
+/// `reqsign_core` events above `info` are dropped whatever `rust_log` says.
+/// reqsign-core 3.3.2 logs each credential provider it tries at `debug`, and
+/// reqsign-aws-core 3.2.0's `StaticCredentialProvider` derives `Debug` over
+/// `secret_access_key` and `session_token` without redaction, so
+/// `RUST_LOG=debug` (routine when troubleshooting, and what CI's test job
+/// uses) would print AWS secrets in cleartext through this subscriber's `log`
+/// compatibility layer. The cap is a second filter beside the `EnvFilter`
+/// instead of a directive in it, because a directive sets a level, and would
+/// raise `reqsign_core` to `info` under `warn,nisshi_broker=debug` or
+/// `error,foo=debug`.
+fn log_filter_from<S: Subscriber>(rust_log: Option<&str>) -> Result<impl Filter<S> + use<S>> {
+    let env = EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
         .parse_lossy(rust_log.unwrap_or_default());
 
-    match <EnvFilter as Layer<Registry>>::max_level_hint(&filter) {
-        Some(hint) if hint <= LevelFilter::INFO => Ok(filter),
-        _ => Ok(filter.add_directive("reqsign_core=info".parse()?)),
-    }
+    Ok(env.and(filter_fn(|metadata| {
+        !(is_reqsign_core(metadata.target()) && *metadata.level() > Level::INFO)
+    })))
+}
+
+/// Whether `target` is the `reqsign_core` crate or one of its modules.
+fn is_reqsign_core(target: &str) -> bool {
+    target == "reqsign_core" || target.starts_with("reqsign_core::")
 }
 
 pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<Guard> {
@@ -74,20 +82,23 @@ pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<G
 
     match tracing_format {
         TracingFormat::Text => tracing_subscriber::registry()
-            .with(env_filter()?)
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_level(true)
                     .with_line_number(true)
                     .with_thread_ids(false)
-                    .with_span_events(FmtSpan::FULL),
+                    .with_span_events(FmtSpan::FULL)
+                    .with_filter(log_filter()?),
             )
             // .with(OpenTelemetryLayer::new(tracer))
             .init(),
 
         TracingFormat::Json => tracing_subscriber::registry()
-            .with(env_filter()?)
-            .with(tracing_subscriber::fmt::layer().json())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_filter(log_filter()?),
+            )
             // .with(OpenTelemetryLayer::new(tracer))
             .init(),
     }
@@ -99,12 +110,16 @@ pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<G
 mod tests {
     use super::*;
     use std::assert_matches;
-    use tracing::{Level, enabled};
+    use tracing::enabled;
 
     /// Runs `check` under a thread-local subscriber filtered by `rust_log`, so
     /// the process environment is never read or changed.
     fn with_filter<T>(rust_log: Option<&str>, check: impl FnOnce() -> T) -> Result<T> {
-        let subscriber = tracing_subscriber::registry().with(env_filter_from(rust_log)?);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::sink)
+                .with_filter(log_filter_from(rust_log)?),
+        );
         Ok(tracing::subscriber::with_default(subscriber, check))
     }
 
@@ -153,6 +168,39 @@ mod tests {
             )
         })?;
         assert_matches!(levels, (true, false, true));
+        Ok(())
+    }
+
+    #[test]
+    fn reqsign_core_is_capped_at_info_under_mixed_filters() -> Result<()> {
+        for rust_log in [
+            "warn,nisshi_broker=debug",
+            "error,foo=debug",
+            "info,reqsign_core=debug",
+            "warn,reqsign_core=trace",
+            "trace",
+        ] {
+            let debug = with_filter(
+                Some(rust_log),
+                || enabled!(target: "reqsign_core", Level::DEBUG),
+            )?;
+            assert_matches!(debug, false, "{rust_log}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reqsign_core_keeps_the_level_the_filter_gives_it() -> Result<()> {
+        let levels = with_filter(Some("warn,nisshi_broker=debug"), || {
+            (
+                enabled!(target: "reqsign_core", Level::WARN),
+                enabled!(target: "reqsign_core", Level::INFO),
+                enabled!(target: "reqsign_core::sign", Level::DEBUG),
+                enabled!(target: "reqsign_core_other", Level::INFO),
+                enabled!(target: "nisshi_broker", Level::DEBUG),
+            )
+        })?;
+        assert_matches!(levels, (true, false, false, false, true));
         Ok(())
     }
 
