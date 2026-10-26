@@ -652,9 +652,9 @@ forward them to the origin. So a client configured for SASL fails to connect.
 
 ## Compatibility
 
-Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Kafka message
-descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). It is tested against
-the following in CI:
+Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Kafka 3.9.1
+message descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). Clients on
+Kafka 4.x negotiate down to those protocol versions. It is tested against the following in CI:
 
 | Suite | What runs | Version |
 | --- | --- | --- |
@@ -664,8 +664,9 @@ the following in CI:
 
 The client suites run against the memory storage engine on every pull request. When changes
 are queued for merge, they also run against PostgreSQL and SQLite, without blocking the merge.
-The smoke tests run against PostgreSQL, SQLite, memory and S3 (S3 runs the topic lifecycle test
-only).
+When changes are queued for merge, the smoke tests run against PostgreSQL, SQLite, memory
+and S3 (S3 runs the topic lifecycle test only). The nightly run also runs both client suites
+against S3.
 
 Each client suite runs only the tests listed in its allowlist file. Known client gaps are
 recorded in [librdkafka/FINDINGS.md](compat/librdkafka/FINDINGS.md) and
@@ -687,6 +688,9 @@ vulnerability, see [SECURITY][nisshi-security].
 ## License
 
 Nisshi is licensed under [Apache 2.0][apache-license].
+
+Apache, Apache Kafka, Kafka, Apache Iceberg and Apache Avro are trademarks of The Apache
+Software Foundation.
 
 [apache-license]: https://www.apache.org/licenses/LICENSE-2.0
 [apache-zookeeper]: https://en.wikipedia.org/wiki/Apache_ZooKeeper
