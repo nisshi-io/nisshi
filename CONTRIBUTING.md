@@ -11,9 +11,9 @@ it:
 
 1. Open an issue describing the problem and your idea.
 2. Wait for approval from the Solace Nisshi team. An idea is approved when
-   a maintainer listed in [`.github/CODEOWNERS`](.github/CODEOWNERS)
-   comments on the issue to say so. For these purposes the maintainers are
-   the members of the Solace Nisshi team.
+   a maintainer listed in [MAINTAINERS.md](MAINTAINERS.md) comments on the
+   issue to say so. For these purposes the maintainers are the members of
+   the Solace Nisshi team.
 3. Open a pull request that links the approved issue.
 
 This respects your time. Pull requests without prior approval are generally
@@ -30,6 +30,9 @@ If you're unsure whether a change counts as small, open an issue and ask.
 
 Approved pull requests are reviewed and either merged or given a clear
 reason why not.
+
+Sustained contribution can lead to becoming a maintainer. See
+[MAINTAINERS.md](MAINTAINERS.md) for who maintains Nisshi and how that works.
 
 ## Questions
 
