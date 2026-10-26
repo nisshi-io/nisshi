@@ -5805,6 +5805,7 @@ dependencies = [
  "nisshi-broker",
  "nisshi-cat",
  "nisshi-cli",
+ "nisshi-client",
  "nisshi-generator",
  "nisshi-perf",
  "nisshi-proxy",

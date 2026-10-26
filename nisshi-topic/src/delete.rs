@@ -20,7 +20,7 @@ use nisshi_sans_io::{
 use tracing::debug;
 use url::Url;
 
-use crate::{Error, Result, Topic};
+use crate::{CONNECT_TIMEOUT, Error, Result, Topic};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, N> {
@@ -75,6 +75,7 @@ impl TryFrom<Configuration> for Delete {
 impl Delete {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .connect_timeout(CONNECT_TIMEOUT)
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await

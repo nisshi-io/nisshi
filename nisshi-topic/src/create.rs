@@ -27,7 +27,7 @@ use nisshi_sans_io::{
 use tracing::debug;
 use url::Url;
 
-use crate::{Error, Result};
+use crate::{CONNECT_TIMEOUT, Error, Result};
 
 use super::Topic;
 
@@ -118,6 +118,7 @@ impl TryFrom<Configuration> for Create {
 impl Create {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .connect_timeout(CONNECT_TIMEOUT)
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await

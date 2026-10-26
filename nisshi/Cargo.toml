@@ -18,6 +18,7 @@ dotenv.workspace = true
 nisshi-broker = { workspace = true, default-features = false, optional = true }
 nisshi-cat.workspace = true
 nisshi-cli = { workspace = true, default-features = false, optional = true }
+nisshi-client.workspace = true
 nisshi-generator.workspace = true
 nisshi-perf.workspace = true
 nisshi-proxy.workspace = true

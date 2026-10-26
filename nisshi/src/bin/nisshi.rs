@@ -15,18 +15,74 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use dotenv::dotenv;
 use nisshi_broker::{TracingFormat, otel};
-use nisshi_cli::{Cli, Outcome, Result};
+use nisshi_cli::{Cli, Outcome};
 use nisshi_sans_io::ErrorCode;
+use std::{
+    net::SocketAddr,
+    process::{ExitCode, Termination},
+};
 use tracing::{debug, error};
 
-const CLIENT_ERROR_MESSAGE: &str = "A client error occurred. Possible causes:
-  • No network connection
-  • The server is down or unreachable
-  • Incorrect hostname or port
-  • Firewall or proxy blocking the connection
-  • TLS/SSL certificate issues (if applicable)
+/// The option and the environment variable that give `cat`, `generator` and `perf` their
+/// broker.
+const BROKER_OPTION: &str = "--broker (or ADVERTISED_LISTENER_URL)";
 
-Check your internet connection, verify the server address, and try again.";
+/// The option that gives `topic` its broker. `topic` reads no environment variable for it.
+const TOPIC_BROKER_OPTION: &str = "--broker";
+
+/// The option and the environment variable that give `proxy` its origin broker.
+const ORIGIN_OPTION: &str = "--origin-url (or ORIGIN_URL)";
+
+/// Returns the error message for a command whose Kafka client failed. `broker_option` names
+/// the option and the environment variable that give the command its broker.
+fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> String {
+    match error {
+        // The client gets each connection from its pool, and the pool opens it, so every
+        // failure to connect (refused, timed out, unknown host) is a pool error. Any other
+        // client error happens after the client connected.
+        nisshi_client::Error::Pool(cause) => format!(
+            "Could not connect to the broker: {cause}. Check that it is running (nisshi broker) \
+            and that {broker_option} points at it. This command connects in plaintext only, so \
+            it can't use a broker that serves only TLS (--cert and --key)."
+        ),
+        _ => format!("The request to the broker failed: {error}"),
+    }
+}
+
+/// Returns the error message for an error that `cat` returned.
+fn cat_error_message(error: &nisshi_cat::Error) -> String {
+    match error {
+        nisshi_cat::Error::Client(error) => client_error_message(error, BROKER_OPTION),
+        nisshi_cat::Error::InvalidJson { .. }
+        | nisshi_cat::Error::MessageWithoutKeyOrValue { .. }
+        | nisshi_cat::Error::NoMessages { .. }
+        | nisshi_cat::Error::NotAnArray { .. } => error.to_string(),
+        _ => format!("Unknown error occurred during command: {error}"),
+    }
+}
+
+/// Returns the error message for a storage URL whose engine this build doesn't have.
+/// `scheme` is the URL's scheme, and `storage` is the URL with its credentials redacted.
+fn feature_not_enabled_message(scheme: &str, storage: &str) -> String {
+    let feature = match scheme {
+        "memory" | "s3" | "gs" => "dynostore",
+        "postgres" | "postgresql" => "postgres",
+        "sqlite" => "libsql",
+        "slatedb" => "slatedb",
+        "turso" => "turso",
+        _ => {
+            return format!(
+                "storage {storage} uses the {scheme}:// scheme, which no storage engine in this \
+                build supports"
+            );
+        }
+    };
+
+    format!(
+        "storage {storage} needs the \"{feature}\" feature, which this build doesn't have. \
+        Install a release binary, or reinstall with cargo install nisshi --features {feature}"
+    )
+}
 
 /// Returns advice for a storage startup check failure, for the storage URL
 /// scheme.
@@ -44,45 +100,85 @@ fn startup_check_hint(scheme: &str) -> &'static str {
     }
 }
 
+/// Returns the error message for a broker that can't listen on `addr`, because another
+/// socket already listens on it.
+fn listener_in_use_message(addr: SocketAddr) -> String {
+    format!(
+        "{addr} is already in use, so the broker can't listen on it. Stop the process that uses \
+        it (perhaps another broker), or start this broker on another port, with --listener-url \
+        and --advertised-listener-url both set to tcp://<host>:<port>"
+    )
+}
+
+/// Runs the command, and exits with failure when it returns an error or a Kafka error code.
+///
+/// `main` logs an error and then returns [`ExitCode::FAILURE`], instead of returning the error,
+/// because Rust prints the `Debug` form of an error that `main` returns, after the message
+/// that this function has already logged.
 #[tokio::main]
-async fn main() -> Result<ErrorCode> {
+async fn main() -> ExitCode {
     _ = dotenv().ok();
 
-    let _guard = otel::init(TracingFormat::Text)?;
+    let _guard = match otel::init(TracingFormat::Text) {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    Cli::run()
-        .await
-        .inspect(|outcome| match outcome {
-            Outcome {
-                error_code: ErrorCode::None,
-                ..
+    match Cli::run().await {
+        Ok(outcome) => {
+            match outcome {
+                Outcome {
+                    error_code: ErrorCode::None,
+                    ..
+                }
+                | Outcome { reported: true, .. } => debug!("{}", outcome.error_code),
+                _ => error!("{}", outcome.error_code),
             }
-            | Outcome { reported: true, .. } => debug!("{}", outcome.error_code),
-            _ => error!("{}", outcome.error_code),
-        })
-        .map(|outcome| outcome.error_code)
-        .inspect_err(|err| match err {
-            nisshi_cli::Error::Cat(error) => match &**error {
-                nisshi_cat::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
-            nisshi_cli::Error::Generate(error) => match error {
-                nisshi_generator::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
-            nisshi_cli::Error::Perf(error) => match error {
-                nisshi_perf::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
-            nisshi_cli::Error::Proxy(error) => match error {
-                nisshi_proxy::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
-            nisshi_cli::Error::Topic(error) => match error {
-                nisshi_topic::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
-            nisshi_cli::Error::Server(error) => match &**error {
+
+            outcome.error_code.report()
+        }
+
+        Err(err) => {
+            log_error(&err);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Logs the message for an error that a command returned: what went wrong and how to fix it
+/// when the error is a known one, or the error itself otherwise.
+fn log_error(err: &nisshi_cli::Error) {
+    match err {
+        nisshi_cli::Error::Cat(error) => error!("{}", cat_error_message(error)),
+        nisshi_cli::Error::Generate(error) => match error {
+            nisshi_generator::Error::Client(error) => {
+                error!("{}", client_error_message(error, BROKER_OPTION))
+            }
+            _ => error!("Unknown error occurred during command: {}", error),
+        },
+        nisshi_cli::Error::Perf(error) => match error {
+            nisshi_perf::Error::Client(error) => {
+                error!("{}", client_error_message(error, BROKER_OPTION))
+            }
+            _ => error!("Unknown error occurred during command: {}", error),
+        },
+        nisshi_cli::Error::Proxy(error) => match error {
+            nisshi_proxy::Error::Client(error) => {
+                error!("{}", client_error_message(error, ORIGIN_OPTION))
+            }
+            _ => error!("Unknown error occurred during command: {}", error),
+        },
+        nisshi_cli::Error::Topic(error) => match error {
+            nisshi_topic::Error::Client(error) => {
+                error!("{}", client_error_message(error, TOPIC_BROKER_OPTION))
+            }
+            _ => error!("Unknown error occurred during command: {}", error),
+        },
+        nisshi_cli::Error::Server(error) => {
+            match &**error {
                 #[cfg(any(feature = "dynostore", feature = "slatedb"))]
                 nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
                     error!(
@@ -143,6 +239,13 @@ async fn main() -> Result<ErrorCode> {
                     "{}",
                     nisshi_storage::authentication_unsupported_message(engine, supported)
                 ),
+                nisshi_broker::Error::ListenerInUse { addr } => {
+                    error!("{}", listener_in_use_message(*addr))
+                }
+                nisshi_broker::Error::Storage(nisshi_storage::Error::FeatureNotEnabled {
+                    feature,
+                    message,
+                }) => error!("{}", feature_not_enabled_message(feature, message)),
                 nisshi_broker::Error::InvalidStorageOptionValue { option, value } => error!(
                     "storage option {option}={value} is not a valid interval: give a non-zero \
                     duration with a unit, up to 365d (e.g. 500ms, 90s, 10m, 1h30m)"
@@ -151,53 +254,172 @@ async fn main() -> Result<ErrorCode> {
                     nisshi_storage::Error::UnrecognizedStorageOption { scheme, option },
                 ) => error!("storage option {option} is not recognised by the {scheme} engine"),
                 _ => error!("Unknown error occurred during command: {}", err),
-            },
-            nisshi_cli::Error::TlsCertificate { path, source } => error!(
-                "TLS certificate {} could not be loaded: {source}. Expected one or more PEM \
+            }
+        }
+        nisshi_cli::Error::TlsCertificate { path, source } => error!(
+            "TLS certificate {} could not be loaded: {source}. Expected one or more PEM \
                 certificates (--cert).",
-                path.display()
-            ),
-            nisshi_cli::Error::TlsPrivateKey { path, source } => error!(
-                "TLS private key {} could not be loaded: {source}. Expected a PKCS#8, SEC1 or RSA \
+            path.display()
+        ),
+        nisshi_cli::Error::TlsPrivateKey { path, source } => error!(
+            "TLS private key {} could not be loaded: {source}. Expected a PKCS#8, SEC1 or RSA \
                 PEM key (--key).",
-                path.display()
-            ),
-            nisshi_cli::Error::TlsKeyPassphraseRequired { path } => error!(
-                "TLS private key {} is encrypted: pass --key-passphrase-file <file>.",
-                path.display()
-            ),
-            nisshi_cli::Error::TlsKeyDecrypt { path, source } => error!(
-                "TLS private key {} could not be decrypted: {source}. Check the passphrase in \
+            path.display()
+        ),
+        nisshi_cli::Error::TlsKeyPassphraseRequired { path } => error!(
+            "TLS private key {} is encrypted: pass --key-passphrase-file <file>.",
+            path.display()
+        ),
+        nisshi_cli::Error::TlsKeyDecrypt { path, source } => error!(
+            "TLS private key {} could not be decrypted: {source}. Check the passphrase in \
                 --key-passphrase-file.",
-                path.display()
-            ),
-            nisshi_cli::Error::TlsKeyUnsupportedEncryption { path, algorithm } => error!(
-                "TLS private key {} is encrypted with {algorithm}, which is not supported. \
+            path.display()
+        ),
+        nisshi_cli::Error::TlsKeyUnsupportedEncryption { path, algorithm } => error!(
+            "TLS private key {} is encrypted with {algorithm}, which is not supported. \
                 Supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES. \
                 Re-encrypt it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem -v2 aes-256-cbc \
                 -v2prf hmacWithSHA256",
-                path.display()
-            ),
-            nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => error!(
-                "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. \
+            path.display()
+        ),
+        nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => error!(
+            "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. \
                 Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
-                path.display()
-            ),
-            nisshi_cli::Error::TlsKeyPassphraseFile { path, source } => error!(
-                "TLS key passphrase file {} could not be read: {source}.",
-                path.display()
-            ),
-            nisshi_cli::Error::Tls(error) => error!(
-                "TLS configuration rejected: {error}. Check that --key is the private key for the \
+            path.display()
+        ),
+        nisshi_cli::Error::TlsKeyPassphraseFile { path, source } => error!(
+            "TLS key passphrase file {} could not be read: {source}.",
+            path.display()
+        ),
+        nisshi_cli::Error::Tls(error) => error!(
+            "TLS configuration rejected: {error}. Check that --key is the private key for the \
                 certificate in --cert and, for an encrypted key, that the passphrase is correct."
-            ),
-            nisshi_cli::Error::TlsRequiresCertAndKey => {
-                error!("TLS requires both --cert and --key.")
-            }
-            nisshi_cli::Error::LakeRequiresSchemaRegistry { lake } => error!(
-                "{lake} requires --schema-registry: a data lake writer validates every record \
+        ),
+        nisshi_cli::Error::TlsRequiresCertAndKey => {
+            error!("TLS requires both --cert and --key.")
+        }
+        nisshi_cli::Error::LakeRequiresSchemaRegistry { lake } => error!(
+            "{lake} requires --schema-registry: a data lake writer validates every record \
                 against a schema."
-            ),
-            _ => error!("Unknown error occurred during command: {}", err),
-        })
+        ),
+        _ => error!("Unknown error occurred during command: {}", err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BROKER_OPTION, TOPIC_BROKER_OPTION, cat_error_message, client_error_message,
+        feature_not_enabled_message, listener_in_use_message,
+    };
+    use std::{
+        io,
+        net::{Ipv4Addr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
+
+    #[test]
+    fn cat_input_errors_print_without_the_unknown_error_prefix() {
+        for error in [
+            nisshi_cat::Error::NoMessages {
+                location: nisshi_cat::Location::Stdin,
+            },
+            nisshi_cat::Error::NotAnArray {
+                location: nisshi_cat::Location::File("messages.json".into()),
+            },
+        ] {
+            assert_eq!(error.to_string(), cat_error_message(&error));
+        }
+    }
+
+    #[test]
+    fn other_cat_errors_keep_the_unknown_error_prefix() {
+        let error = nisshi_cat::Error::Message("boom".into());
+
+        assert_eq!(
+            "Unknown error occurred during command: Message(\"boom\")",
+            cat_error_message(&error)
+        );
+    }
+
+    #[test]
+    fn feature_not_enabled_message_names_the_storage_and_the_cargo_feature() {
+        assert_eq!(
+            "storage memory://nisshi/ needs the \"dynostore\" feature, which this build doesn't \
+            have. Install a release binary, or reinstall with cargo install nisshi --features \
+            dynostore",
+            feature_not_enabled_message("memory", "memory://nisshi/")
+        );
+
+        for (scheme, feature) in [
+            ("s3", "dynostore"),
+            ("gs", "dynostore"),
+            ("postgres", "postgres"),
+            ("postgresql", "postgres"),
+            ("sqlite", "libsql"),
+            ("slatedb", "slatedb"),
+            ("turso", "turso"),
+        ] {
+            assert!(
+                feature_not_enabled_message(scheme, "storage://")
+                    .contains(&format!("needs the \"{feature}\" feature")),
+                "{scheme}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_not_enabled_message_for_an_unknown_scheme_names_the_scheme() {
+        assert_eq!(
+            "storage foo://bar/ uses the foo:// scheme, which no storage engine in this build \
+            supports",
+            feature_not_enabled_message("foo", "foo://bar/")
+        );
+    }
+
+    #[test]
+    fn connect_failure_names_the_cause_and_the_option_that_gives_the_broker() {
+        let cause = io::Error::from(io::ErrorKind::ConnectionRefused);
+        let expected = format!(
+            "Could not connect to the broker: {cause}. Check that it is running (nisshi broker) \
+            and that --broker (or ADVERTISED_LISTENER_URL) points at it. This command connects \
+            in plaintext only, so it can't use a broker that serves only TLS (--cert and --key)."
+        );
+
+        let error = nisshi_client::Error::Pool(Arc::new(Box::new(cause)));
+
+        assert_eq!(expected, client_error_message(&error, BROKER_OPTION));
+    }
+
+    #[test]
+    fn request_failure_after_connecting_is_not_reported_as_a_connect_failure() {
+        let error = nisshi_client::Error::Timeout(Duration::from_secs(30));
+
+        assert_eq!(
+            "The request to the broker failed: Timeout(30s)",
+            client_error_message(&error, BROKER_OPTION)
+        );
+    }
+
+    #[test]
+    fn topic_connect_failure_names_only_the_option() {
+        let error = nisshi_client::Error::Pool(Arc::new(Box::new(io::Error::from(
+            io::ErrorKind::ConnectionRefused,
+        ))));
+
+        let message = client_error_message(&error, TOPIC_BROKER_OPTION);
+
+        assert!(message.contains("that --broker points at it"), "{message}");
+    }
+
+    #[test]
+    fn listener_in_use_message_names_the_address_and_the_fix() {
+        assert_eq!(
+            "127.0.0.1:9092 is already in use, so the broker can't listen on it. Stop the \
+            process that uses it (perhaps another broker), or start this broker on another port, \
+            with --listener-url and --advertised-listener-url both set to tcp://<host>:<port>",
+            listener_in_use_message(SocketAddr::from((Ipv4Addr::LOCALHOST, 9092)))
+        );
+    }
 }

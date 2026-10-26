@@ -179,6 +179,23 @@ fn bind_listener(addr: SocketAddr) -> io::Result<StdTcpListener> {
         .map(StdTcpListener::from)
 }
 
+/// Binds the broker's listener to `addr`, as [`bind_listener`] does.
+///
+/// # Errors
+///
+/// Returns [`Error::ListenerInUse`] when another socket already listens on `addr`.
+fn bind(addr: SocketAddr) -> Result<TcpListener> {
+    bind_listener(addr)
+        .and_then(TcpListener::from_std)
+        .map_err(|err| {
+            if err.kind() == ErrorKind::AddrInUse {
+                Error::ListenerInUse { addr }
+            } else {
+                err.into()
+            }
+        })
+}
+
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
     node_id: i32,
@@ -291,6 +308,12 @@ where
             v = set.join_next() => {
                 debug!(?v);
                 failure = match v {
+                    // The caller reports `ListenerInUse` with the fix, so it is logged
+                    // here only at debug, to avoid printing it twice.
+                    Some(Ok(Err(err @ Error::ListenerInUse { .. }))) => {
+                        debug!(?err);
+                        Some(err)
+                    }
                     Some(Ok(Err(err))) => {
                         error!(?err);
                         Some(err)
@@ -407,11 +430,10 @@ where
             },
         );
 
-        let listener = bind_listener(addr)
-            .and_then(TcpListener::from_std)
+        let listener = bind(addr)
             .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
-            .inspect_err(|err| {
-                if is_address_family_unsupported(err) {
+            .inspect_err(|err| match err {
+                Error::Io(err) if is_address_family_unsupported(err) => {
                     error!(
                         ?err,
                         %addr,
@@ -419,7 +441,9 @@ where
                          --kafka-listener-url (LISTENER_URL), set it to an address this host \
                          supports, such as tcp://0.0.0.0:9092"
                     );
-                } else {
+                }
+                Error::ListenerInUse { .. } => {}
+                _ => {
                     error!(?err, %addr, %self.advertised_listener, "failed to bind the listener");
                 }
             })?;
@@ -994,13 +1018,24 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{address_family_unsupported_os_error, arm, configure_listener, ipv4_fallback};
+    use super::{
+        address_family_unsupported_os_error, arm, bind, configure_listener, ipv4_fallback,
+    };
+    use crate::Error;
     use socket2::{Domain, Protocol, Socket, Type};
     use std::{
-        io,
+        assert_matches, io,
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     };
     use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn binding_an_address_in_use_names_the_address() {
+        let first = bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind a free port");
+        let addr = first.local_addr().expect("local_addr");
+
+        assert_matches!(bind(addr), Err(Error::ListenerInUse { addr: in_use }) if in_use == addr);
+    }
 
     /// The socket starts out IPv6-only, as on a host that defaults new IPv6 sockets to
     /// v6-only, so this test fails on any host if [`arm`] stops clearing `IPV6_V6ONLY`.

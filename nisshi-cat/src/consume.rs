@@ -14,7 +14,7 @@
 
 use std::marker::PhantomData;
 
-use crate::{Error, Result};
+use crate::{CONNECT_TIMEOUT, Error, Result};
 
 use bytes::Bytes;
 use futures::SinkExt;
@@ -209,6 +209,7 @@ impl Consume {
         };
 
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .connect_timeout(CONNECT_TIMEOUT)
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
