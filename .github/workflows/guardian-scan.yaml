@@ -47,6 +47,12 @@ on:
         required: false
         type: string
         default: ""
+    outputs:
+      # How `setup` classified the run: pr, queue, trunk or branch. A caller that
+      # needs the Guardian verdict to be enforced checks for `trunk`.
+      mode:
+        description: "Scan mode the run resolved to"
+        value: ${{ jobs.setup.outputs.mode }}
 
 # Same grouping idea as ci.yml rather than plain `sha`: the queue fast-forwards
 # main to the commit it just tested, so the merge_group run and the post-merge

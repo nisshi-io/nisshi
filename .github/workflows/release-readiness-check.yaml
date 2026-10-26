@@ -95,3 +95,24 @@ jobs:
     with:
       git_ref: ${{ needs.resolve.outputs.ref }}
       product_full_version: ${{ needs.resolve.outputs.full_version }}
+
+  # In any mode but trunk the Guardian gate passes as report-only, so the check
+  # would go green without asking Guardian. `resolve` limits the ref to main or
+  # a v* tag, but that pattern is a copy of the one in guardian-scan-context.sh.
+  # This job reads the mode the scan actually ran in, so the check fails closed
+  # whatever either pattern accepts.
+  trunk-mode:
+    name: Verify trunk mode
+    needs: guardian
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          MODE: ${{ needs.guardian.outputs.mode }}
+        run: |
+          if [ "$MODE" != "trunk" ]; then
+            echo "::error::the scan ran in mode '${MODE:-unknown}', not trunk, so the Guardian gate did not enforce a verdict"
+            exit 1
+          fi

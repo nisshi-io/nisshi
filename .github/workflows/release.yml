@@ -15,9 +15,10 @@ name: release
 # environment, whose required reviewers are repo admins. Approving it
 # publishes from this run, over a Guardian block or a scanner or Guardian
 # outage alike; rejecting it ends the run with nothing published. The
-# environment prevents self-review, so another admin has to approve: whoever
-# pushed the tag or started the re-run can't. GitHub asks for approval again on a
-# re-run, and the deployment log records who approved.
+# environment prevents self-review and admin bypass, so another admin has to
+# approve: whoever pushed the tag or started the re-run can't. The job refuses
+# to run if either setting is off. GitHub asks for approval again on a re-run,
+# and the deployment log records who approved.
 #
 # To skip only the FOSSA licensing block, set the FOSSA_LICENSING_BLOCK
 # repository variable to false (see guardian-scan.yaml) before pushing the
@@ -130,19 +131,26 @@ jobs:
     steps:
       # A missing environment is created on first use with no reviewers, and
       # this job then starts without waiting for anyone. Refuse to pass the
-      # publish jobs unless the environment still has its protection.
+      # publish jobs unless the environment still has its protection. Admin
+      # bypass is on by default and lets any admin start a waiting job without
+      # the reviewers, which looks the same as an approval once the job runs, so
+      # the setting itself is refused.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          rules=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-override" \
-            --jq '[.protection_rules[]? | select(.type == "required_reviewers")]')
+          env_json=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-override")
+          rules=$(jq '[.protection_rules[]? | select(.type == "required_reviewers")]' <<<"$env_json")
           if [ "$(jq length <<<"$rules")" -eq 0 ]; then
             echo "::error::release-override has no required reviewers; not publishing over a failed release-readiness check"
             exit 1
           fi
           if [ "$(jq '[.[] | select(.prevent_self_review == true)] | length' <<<"$rules")" -eq 0 ]; then
             echo "::error::release-override allows self-review; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          if [ "$(jq '.can_admins_bypass' <<<"$env_json")" != "false" ]; then
+            echo "::error::release-override lets admins bypass its reviewers; not publishing over a failed release-readiness check"
             exit 1
           fi
           echo "::warning::publishing ${GITHUB_REF_NAME} over a failed release-readiness check"
