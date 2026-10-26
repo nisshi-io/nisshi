@@ -109,7 +109,7 @@ services:
       - 127.0.0.1:5778:5778
       - 127.0.0.1:9411:9411
   prometheus:
-    image: prom/prometheus:v3.1.0@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     ports:
       - 127.0.0.1:9090:9090
     command: --web.enable-otlp-receiver
