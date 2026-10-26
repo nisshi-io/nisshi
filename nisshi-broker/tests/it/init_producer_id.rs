@@ -660,7 +660,7 @@ mod in_memory {
         super::transactional_id_is_refused(registered_storage().await?).await
     }
 
-    #[ignore = "transactions are not supported, so InitProducerId refuses a transactional ID"]
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
     #[tokio::test]
     async fn old_versions_bump_a_transactional_producer() -> Result<()> {
         let _guard = init_tracing()?;
@@ -774,7 +774,7 @@ mod lite {
         super::transactional_id_is_refused(registered_storage().await?).await
     }
 
-    #[ignore = "transactions are not supported, so InitProducerId refuses a transactional ID"]
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
     #[tokio::test]
     async fn old_versions_bump_a_transactional_producer() -> Result<()> {
         let _guard = init_tracing()?;
@@ -888,7 +888,7 @@ mod slatedb {
         super::transactional_id_is_refused(registered_storage().await?).await
     }
 
-    #[ignore = "transactions are not supported, so InitProducerId refuses a transactional ID"]
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
     #[tokio::test]
     async fn old_versions_bump_a_transactional_producer() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1002,7 +1002,7 @@ mod pg {
         super::transactional_id_is_refused(registered_storage().await?).await
     }
 
-    #[ignore = "transactions are not supported, so InitProducerId refuses a transactional ID"]
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
     #[tokio::test]
     async fn old_versions_bump_a_transactional_producer() -> Result<()> {
         let _guard = init_tracing()?;

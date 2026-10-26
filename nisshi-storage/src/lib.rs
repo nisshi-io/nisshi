@@ -1947,8 +1947,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()>;
 
     /// Aborted transactions overlapping `[offset, last_stable_offset)`, reporting which producer
-    /// ranges a `read_committed` Fetch client should discard. Postgres implements this; other
-    /// backends return `Ok(vec![])` or forward to an inner storage.
+    /// ranges a `read_committed` Fetch client should discard. No engine implements this yet:
+    /// every backend, Postgres included, returns `Ok(vec![])` (wrapper layers such as the proxy
+    /// forward to their inner storage), so a `read_committed` consumer would read aborted records.
     async fn aborted_transactions(
         &self,
         _topition: &Topition,
