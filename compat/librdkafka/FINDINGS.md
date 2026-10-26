@@ -66,22 +66,16 @@ Sweeps of the librdkafka integration test suite against
    ConfigEntry rows where Kafka reports every config with its default
    (0092 via AlterConfigs read-modify-write).
 
-6. **InitProducerId does not validate `transaction.timeout.ms`** — Kafka
-   rejects values above `transaction.max.timeout.ms` with fatal
-   `INVALID_TRANSACTION_TIMEOUT`; nisshi accepts them (0103
-   `do_test_misuse_txn`; the rest of 0103 passes).
+6. **Transactions are refused** — nisshi answers InitProducerId with a
+   `transactional.id` with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, so
+   the transactional tests (0103, 0129) fail at `init_transactions`.
 
-7. **EndTxn unsupported for abort from some clients** — 0129 fails with
-   `EndTxnRequest (KIP-98) not supported`, suggesting the advertised
-   ApiVersions range for EndTxn does not cover what librdkafka needs
-   for `abort_transaction`.
-
-8. **Consumer group edge cases** — one extra rebalance versus Kafka in
+7. **Consumer group edge cases** — one extra rebalance versus Kafka in
    max-poll-exceeded scenarios (0091, 0093); commit-during-rebalance
    error codes differ (0118); message expected after `offsets_store`
    of an unassigned partition (0130).
 
-9. **CreateTopics corner cases** — 0081 (admin) fails waiting for a
+8. **CreateTopics corner cases** — 0081 (admin) fails waiting for a
    metadata update after creating topics with mixed valid/invalid
    configs.
 

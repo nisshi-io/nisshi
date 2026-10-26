@@ -80,14 +80,13 @@ tests self-skip).
    static). Single-group rebalancing (`TestGroupSimple`,
    `TestConsumeRegex`, pause/resume tests) passes.
 
-2. **Aborted transactional records are visible to read_committed
-   consumers** — in `TestTxnEtl`, a `read_committed` consumer observed
-   more unique partition-offsets than committed records (aborted data
-   leaking through), tripping the test's "consumed too much" guard.
-   The same run also saw one SyncGroup response whose member assignment
-   failed to parse ("response did not contain enough data to be
-   valid"), suggesting an empty/truncated assignment payload under
-   rebalance.
+2. **Transactions are refused** — nisshi answers InitProducerId with a
+   `transactional.id` with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, so
+   `TestTxnEtl` fails when its producer initializes its transactions.
+   An earlier run, which got past that point, also saw one SyncGroup
+   response whose member assignment failed to parse ("response did not
+   contain enough data to be valid"), suggesting an empty/truncated
+   assignment payload under rebalance.
 
 ## Feature gaps observed via self-skips (not failures)
 
