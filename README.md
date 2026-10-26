@@ -25,8 +25,8 @@ stateless Kafka-compatible broker with pluggable storage (PostgreSQL, SQLite, S3
 
 # What is Nisshi?
 
-[Nisshi][github-com-nisshi-io] (née Tansu) is a drop-in replacement for
-Apache Kafka with PostgreSQL, libSQL (SQLite), S3 or memory storage engines.
+[Nisshi][github-com-nisshi-io] (née Tansu) is an Apache Kafka-compatible broker
+with PostgreSQL, libSQL (SQLite), S3 or memory storage engines.
 Schema backed topics (Avro, JSON or Protocol buffers) can
 be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables.
 
@@ -39,12 +39,22 @@ Features:
 
 See [examples using pyiceberg](https://github.com/nisshi-io/example-pyiceberg), [examples using Apache Spark](https://github.com/nisshi-io/example-spark) or 🆕 [examples using Delta Lake](https://github.com/nisshi-io/example-delta-lake).
 
-For data durability:
+Storage engines:
 
-- S3 is designed to exceed [99.999999999% (11 nines)][aws-s3-storage-classes]
-- PostgreSQL with [continuous archiving][continuous-archiving]
-  streaming transaction logs files to an archive
-- The memory storage engine is designed for ephemeral non-production environments
+Choose the engine with `--storage-engine` (or `STORAGE_ENGINE`) using the URL scheme below.
+
+| Engine | URL scheme | Status |
+| --- | --- | --- |
+| PostgreSQL | `postgres://` | Suitable for production. Tested, with bugs and security issues fixed. Help comes from the community. |
+| S3 and Google Cloud Storage | `s3://`, `gs://` | Experimental. Available for continuity. Not recommended for production. |
+| SQLite (libSQL) | `sqlite://` | Suitable for development. |
+| In-memory | `memory://` | Suitable for development and testing. Data is lost when the broker stops. |
+| Turso | `turso://` | Experimental. |
+
+PostgreSQL can stream transaction logs to an archive with
+[continuous archiving][continuous-archiving].
+
+Nisshi OSS is provided as-is, with community support only.
 
 Nisshi is a single statically linked binary containing the following:
 
@@ -529,7 +539,6 @@ Nisshi is licensed under [Apache 2.0][apache-license].
 [apache-zookeeper]: https://en.wikipedia.org/wiki/Apache_ZooKeeper
 [aws-s3-conditional-requests]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html
 [aws-s3-conditional-writes]: https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes/
-[aws-s3-storage-classes]: https://aws.amazon.com/s3/storage-classes/
 [cloudflare-r2]: https://developers.cloudflare.com/r2/
 [continuous-archiving]: https://www.postgresql.org/docs/current/continuous-archiving.html
 [crates-io-object-store]: https://crates.io/crates/object_store
