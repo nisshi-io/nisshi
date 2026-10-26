@@ -52,7 +52,7 @@ spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the maintainers at peter.james.morgan@gmail.com, or to any other
+reported to the maintainers at support@solace.com, or to any other
 maintainer listed in [`.github/CODEOWNERS`](.github/CODEOWNERS) if that
 report concerns the primary contact. All complaints will be reviewed and
 investigated promptly and fairly.
