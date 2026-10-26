@@ -30,9 +30,13 @@ use nisshi_smoke_test::{Broker, KafkaCli, PRINTED_NULL, polling};
 /// How long a test waits for a maintenance run to give the result it expects.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a record lives in a topic with [`SHORT_RETENTION`]. It is longer than a test takes to
-/// check a newer record after the older ones expire, so the newer record is still there.
+/// How long a record lives in a topic with [`SHORT_RETENTION`].
 const SHORT_RETENTION_PERIOD: Duration = Duration::from_secs(30);
+
+/// How far ahead of the clock a test stamps the records that retention must keep. Retention deletes
+/// a record only once its timestamp is older than `retention.ms`, so these records outlast the
+/// test, however long its checks take. The broker rejects a timestamp more than an hour ahead.
+const KEPT_RECORD_LEAD: Duration = Duration::from_secs(600);
 
 /// The `retention.ms` of [`SHORT_RETENTION_PERIOD`], which must change with it.
 const SHORT_RETENTION: &str = "retention.ms=30000";
@@ -167,17 +171,21 @@ fn compact_delete_policy_compacts_and_deletes_expired_records() {
     // The test waits for the records to expire instead of producing them with an old timestamp,
     // because the broker can also count a record's age from the time that it stored the record.
     thread::sleep(SHORT_RETENTION_PERIOD);
-    _ = cli
-        .console_producer()
-        .produce_keyed(&topic, &[("new", Some("v2")), ("new", Some("v3"))]);
+    // Both new records have the key `0`, so compaction deletes the first. They are stamped
+    // `KEPT_RECORD_LEAD` ahead, so retention keeps them.
+    let ahead = cli.now_in_millis() + KEPT_RECORD_LEAD.as_millis() as i64;
+    let produced = cli
+        .verifiable_producer()
+        .produce_created_at(&topic, 2, ahead, 0, Some(1));
+    assert_eq!(produced.acknowledged_record_count(), 2, "{produced}");
 
     wait_until_records_are(
         &cli,
         &topic,
         &[StoredRecord {
             offset: 3,
-            key: "new",
-            value: "v3",
+            key: "0",
+            value: "0.1",
         }],
     );
 }
