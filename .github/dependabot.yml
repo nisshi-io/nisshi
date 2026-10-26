@@ -174,6 +174,10 @@ updates:
   # without a default, so the maintainer bumps these digests by hand: the images
   # in the justfile recipes, and `LAKEKEEPER_IMAGE`. The `LAKEKEEPER_IMAGE`
   # value appears in example.env, ci.yml and tier-c.yml, and the three must match.
+  # The `POSTGRES_IMAGE: postgres:18` values in ci.yml (four jobs) and tier-c.yml
+  # (two jobs) and the fallback in nisshi-smoke-test/run.sh must keep the major
+  # version of the compose default. The mirror action rejects `@sha256`, so they
+  # stay unpinned.
   - package-ecosystem: "docker-compose"
     directory: "/"
     schedule:
