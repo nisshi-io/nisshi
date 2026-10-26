@@ -56,6 +56,16 @@ PostgreSQL can stream transaction logs to an archive with
 
 Nisshi OSS is provided as-is, with community support only.
 
+## Which release to use
+
+[![Latest release](https://img.shields.io/github/v/release/nisshi-io/nisshi?label=latest%20release)][nisshi-latest-release]
+
+Use the [latest release][nisshi-latest-release], the one marked **Latest** on the Releases page. `cargo install nisshi` and the `latest` container image both skip pre-releases.
+
+Releases marked **Pre-release**, with tags such as `v0.8.0-pre.1`, are builds of `main` published ahead of the next release so you can try changes early. They pass the same CI as a release. Until that release, their behaviour, upgrade notes and storage formats can still change, and a later version may not read the data they wrote: for example, 0.7.0 doesn't support a database that 0.7.0-pre.1 or pre.2 set up. Use them for testing, not for data you want to keep. To install one, name its exact version, for example `ghcr.io/nisshi-io/nisshi:0.8.0-pre.1`.
+
+This README describes `main`, which can be ahead of the latest release. To read the README of a release, open it at its tag, for example [v0.7.0](https://github.com/nisshi-io/nisshi/blob/v0.7.0/README.md).
+
 Nisshi is a single statically linked binary containing the following:
 
 - **broker** an Apache Kafka API compatible broker and schema registry
@@ -553,6 +563,7 @@ Nisshi is licensed under [Apache 2.0][apache-license].
 [raft-consensus]: https://raft.github.io
 [rust-lang-org]: https://www.rust-lang.org
 [nisshi-issues]: https://github.com/nisshi-io/nisshi/issues
+[nisshi-latest-release]: https://github.com/nisshi-io/nisshi/releases/latest
 [nisshi-contributing]: CONTRIBUTING.md
 [nisshi-code-of-conduct]: CODE_OF_CONDUCT.md
 [nisshi-security]: SECURITY.md
