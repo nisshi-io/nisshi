@@ -185,7 +185,7 @@ use std::{
 };
 use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
@@ -1676,6 +1676,15 @@ pub trait StorageFactory: Debug + Display + Send + Sync + 'static {
     /// What the engine can do. See [`StorageCapabilities`].
     fn capabilities(&self) -> StorageCapabilities;
 
+    /// Returns the notice that [`Builder::build`] logs as a warning when this factory is
+    /// selected, or `None` for an engine that is not deprecated.
+    ///
+    /// The notice is logged as it is written, so it must not hold a storage URL, which
+    /// can carry credentials.
+    fn deprecation(&self) -> Option<&'static str> {
+        None
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage>;
 }
 
@@ -2765,6 +2774,10 @@ impl Builder<i32, String, Url, Url> {
                     .map(|factory| factory.to_string())
                     .collect(),
             });
+        }
+
+        if let Some(notice) = factory.deprecation() {
+            warn!("{notice}");
         }
 
         let silent = self.silent;

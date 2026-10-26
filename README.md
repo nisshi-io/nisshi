@@ -50,6 +50,7 @@ Choose the engine with `--storage-engine` (or `STORAGE_ENGINE`) using the URL sc
 | SQLite (libSQL) | `sqlite://` | Suitable for development. |
 | In-memory | `memory://` | Suitable for development and testing. Data is lost when the broker stops. |
 | Turso | `turso://` | Experimental. |
+| SlateDB | `slatedb://` | Deprecated. Not recommended for new deployments, because it allows a single writer. Only security fixes are accepted. The engine may be removed in a future release. Use PostgreSQL for production, or SQLite or in-memory for development. The broker logs a warning at startup. |
 
 PostgreSQL can stream transaction logs to an archive with
 [continuous archiving][continuous-archiving].

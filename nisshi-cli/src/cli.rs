@@ -68,7 +68,19 @@ fn lakes() -> Vec<&'static str> {
 
 fn after_help() -> String {
     [
-        format!("Storage engines: {}", storage_engines().join(", ")),
+        format!(
+            "Storage engines: {}",
+            storage_engines()
+                .into_iter()
+                .map(|engine| match engine {
+                    // This list is built from feature names and does not read the factories, so a
+                    // deprecation is also marked here by hand.
+                    "slatedb" => "slatedb (deprecated)",
+                    engine => engine,
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         format!("Data lakes: {}", lakes().join(", ")),
     ]
     .join("\n")
