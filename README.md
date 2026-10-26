@@ -689,8 +689,8 @@ vulnerability, see [SECURITY][nisshi-security].
 
 Nisshi is licensed under [Apache 2.0][apache-license].
 
-Apache, Apache Kafka, Kafka, Apache Iceberg and Apache Avro are trademarks of The Apache
-Software Foundation.
+Apache, Apache Kafka, Kafka and the other Apache project names in this document are
+trademarks of The Apache Software Foundation.
 
 [apache-license]: https://www.apache.org/licenses/LICENSE-2.0
 [apache-zookeeper]: https://en.wikipedia.org/wiki/Apache_ZooKeeper
