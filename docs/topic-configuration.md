@@ -44,8 +44,9 @@ after the prefix: `tansu.lake.sink` is an alias of `nisshi.lake.sink`, and
   the broker or proxy starts. The warning names the key and the key that replaces it.
   It does not log the value, and it does not name a topic, because the broker or proxy
   logs it once for all topics. To list the topics that still use an alias, describe each
-  topic and search for the prefix:
-  `kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type topics | grep tansu.`
+  topic and search for the prefix. The command keeps the header lines, because only
+  the header names the topic:
+  `kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type topics | grep -E '^Dynamic configs for topic|^  tansu\.'`
 
 ### Move a topic to the `nisshi.` keys
 
