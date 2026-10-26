@@ -128,7 +128,7 @@ Selected at compile time via feature flags, dispatched at runtime through a `Sto
 
 ## Feature Flags
 
-Default: `dynostore`, `postgres`, `libsql`, `slatedb`. The `just build`/`release` feature lists below omit `turso`, which the broker and storage crates enable by default. Full build: `delta,dynostore,iceberg,libsql,parquet,postgres,slatedb`.
+Default: `dynostore`, `postgres`, `libsql`, `slatedb`. The `just build`/`release` feature lists below omit `turso`, which the broker and storage crates enable by default. Full build: `delta,dynostore,iceberg,libsql,parquet,postgres,slatedb`. The `nisshi` crate's own defaults, which `cargo install nisshi` builds, are `dynostore`, `libsql` and `postgres`; its tests check that they include the broker's default `memory://` engine.
 
 Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topics to data lake tables.
 

@@ -28,8 +28,11 @@ nisshi-topic.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [features]
-default = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage"]
+default = ["dynostore", "libsql", "postgres"]
 delta = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-cli/delta", "nisshi-schema/delta"]
 dynostore = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/dynostore", "nisshi-cli/dynostore", "nisshi-storage/dynostore"]
 iceberg = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-cli/iceberg", "nisshi-schema/iceberg"]

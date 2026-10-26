@@ -5812,6 +5812,7 @@ dependencies = [
  "nisshi-schema",
  "nisshi-storage",
  "nisshi-topic",
+ "serde_json",
  "tokio",
  "tracing",
 ]

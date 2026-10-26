@@ -73,6 +73,51 @@ Nisshi is a single statically linked binary containing the following:
 - **cat** a CLI to consume or produce Avro, JSON or Protobuf messages to a topic
 - **proxy** an Apache Kafka compatible proxy
 
+## Install
+
+To build and install Nisshi from [crates.io](https://crates.io/crates/nisshi), run:
+
+```shell
+cargo install nisshi --locked --features dynostore,libsql,postgres
+```
+
+The build takes several minutes. It compiles some C libraries as well as the Rust code,
+so it needs:
+
+- Rust, installed with [rustup](https://rustup.rs). The project builds and tests with
+  the Rust version in [rust-toolchain.toml](rust-toolchain.toml).
+- A C compiler. On macOS, install the Xcode Command Line Tools with
+  `xcode-select --install`. On Debian or Ubuntu, run
+  `sudo apt-get install build-essential`.
+
+`--locked` builds with the dependency versions in the release's `Cargo.lock`, instead of
+the newest compatible versions.
+
+A build contains only the storage engines and data lake formats whose features you
+enable:
+
+| Feature | Adds |
+| --- | --- |
+| `dynostore` | `memory://`, `s3://` and `gs://` storage (the broker's default is `memory://`) |
+| `libsql` | `sqlite://` storage |
+| `postgres` | `postgres://` storage |
+| `turso` | `turso://` storage |
+| `slatedb` | `slatedb://` storage |
+| `parquet`, `iceberg`, `delta` | Apache Parquet, Apache Iceberg and Delta Lake output for schema backed topics |
+
+`--all-features` builds the same set as the release binaries and the container image.
+
+To check the install, run `nisshi --help`. Its last lines list the storage engines in
+the build:
+
+```shell
+Storage engines: dynostore, libsql, postgres
+Data lakes:
+```
+
+Then run `nisshi` to start a broker on `memory://`, and continue with [topic](#topic)
+and [cat](#cat) to create a topic and send a message.
+
 ## broker
 
 The broker subcommand is default if no other command is supplied.
