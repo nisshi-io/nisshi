@@ -56,10 +56,10 @@ reported to the maintainers by emailing support@solace.com. This is the inbox
 of the Solace support team. The support team can read your report, and they
 will contact the maintainers about it.
 
-If your report concerns a maintainer or someone who handles that inbox,
-contact the Solace community team through
-<https://community.solace.com/>. All complaints will be reviewed and
-investigated promptly and fairly.
+If your report concerns a maintainer or someone who handles that inbox, say
+so in your email and ask the support team not to pass the report to the person
+concerned. All complaints will be reviewed and investigated promptly and
+fairly.
 
 Maintainers are obligated to handle every report with discretion and to
 respect the privacy and security of the reporter of any incident, within
