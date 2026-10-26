@@ -199,7 +199,7 @@ docker-dist arch=docker_arch:
     target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
     mkdir -p dist/linux/{{ arch }}
     cp "${target_dir}/${target}"/release/nisshi dist/linux/{{ arch }}/nisshi
-    cargo about generate --all-features about.hbs > dist/THIRD-PARTY-LICENSE.html
+    cargo about generate --all-features about.hbs > dist/linux/{{ arch }}/THIRD-PARTY-LICENSE.html
 
 docker-build: docker-dist
     docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --debug .
