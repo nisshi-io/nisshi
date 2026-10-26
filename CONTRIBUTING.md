@@ -116,9 +116,12 @@ Pull requests are squash-merged, so the commit on `main` doesn't carry the
 `Signed-off-by` lines. The commits in the pull request are the record, so
 sign off each of them.
 
-This is a new expectation for the project going forward — existing history
-predates it, and there's no automated check enforcing it yet. Please sign
-off new commits from here on; a reviewer will ask if it's missing.
+A `DCO` check reports on every pull request. It fails if a commit in the
+pull request has no `Signed-off-by` line, or has one that doesn't match the
+name and email of the commit's author or committer. It is not a required
+status check, but a reviewer will ask you to fix a failure: run the
+`git rebase --signoff main` command above, then force-push. Commits already
+on `main` predate this expectation and aren't checked.
 
 ## Code of conduct
 
