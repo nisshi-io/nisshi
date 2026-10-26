@@ -20,22 +20,29 @@ use std::collections::{HashMap, HashSet};
 
 use nisshi_sans_io::{ConfigResource, ErrorCode, OpType};
 
-use crate::{Error, Result};
+use crate::{Error, Result, message_timestamp_type};
 
 /// Checks `value` against Kafka's rules for the topic configuration `key`. Returns the value to
 /// store, or Kafka's [`ErrorCode::InvalidConfig`] message when Kafka rejects it.
 ///
 /// This function checks `retention.ms` and `retention.bytes`, with the rules that Kafka defines for
-/// them in [`LogConfig`], and returns the value of any other configuration without a check.
-/// [`crate::max_message_bytes`] checks `max.message.bytes`. The storage engines read the retention
-/// values in their maintenance queries, so a value that doesn't parse can stop maintenance for every
-/// topic.
+/// them in [`LogConfig`], and `message.timestamp.type` with [`message_timestamp_type::parse`]. It
+/// returns the value of any other configuration without a check. [`crate::max_message_bytes`]
+/// checks `max.message.bytes`. The storage engines read the retention values in their maintenance
+/// queries, so a value that doesn't parse can stop maintenance for every topic.
 ///
-/// For a checked configuration, it returns the plain number that it parses, without white space or
-/// a `+`, because the maintenance queries read anything else as no limit.
+/// For a retention configuration, it returns the plain number that it parses, without white space
+/// or a `+`, because the maintenance queries read anything else as no limit. For
+/// `message.timestamp.type`, it returns the value without surrounding white space.
 ///
 /// [`LogConfig`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L277-L279
 pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    if key == message_timestamp_type::KEY {
+        return value
+            .map(|value| message_timestamp_type::parse(value).map(|_| value.trim().to_owned()))
+            .transpose();
+    }
+
     let minimum: Option<i64> = match key {
         "retention.bytes" => None,
         "retention.ms" => Some(-1),
@@ -286,6 +293,27 @@ mod tests {
                 validate_topic_config("retention.ms", Some(value))
             );
         }
+    }
+
+    /// The produce path reads the stored `message.timestamp.type`, so a value that Kafka accepts
+    /// with white space around it is stored without that white space.
+    #[test]
+    fn message_timestamp_type_is_stored_without_surrounding_white_space() {
+        assert_eq!(
+            Ok(Some("LogAppendTime".to_owned())),
+            validate_topic_config("message.timestamp.type", Some(" LogAppendTime\n"))
+        );
+    }
+
+    #[test]
+    fn message_timestamp_type_rejects_a_value_that_kafka_rejects() {
+        assert_eq!(
+            Err(String::from(
+                "Invalid value logappendtime for configuration message.timestamp.type: String \
+                 must be one of: CreateTime, LogAppendTime"
+            )),
+            validate_topic_config("message.timestamp.type", Some("logappendtime"))
+        );
     }
 
     #[test]

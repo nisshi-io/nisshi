@@ -1702,7 +1702,9 @@ impl TryFrom<i16> for Ack {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
 /// The timestamp type.
 pub enum TimestampType {
     #[default]

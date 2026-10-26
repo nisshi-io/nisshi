@@ -490,6 +490,37 @@ struct TopicMetadata {
     topic: CreatableTopic,
 }
 
+impl TopicMetadata {
+    /// Returns the `DescribeConfigs` result for this topic. The result holds each config that the
+    /// topic sets, and gives `name` as the resource name.
+    fn describe_configs_result(&self, name: &str) -> DescribeConfigsResult {
+        let error_code = ErrorCode::None;
+
+        DescribeConfigsResult::default()
+            .error_code(error_code.into())
+            .error_message(Some(error_code.to_string()))
+            .resource_type(i8::from(ConfigResource::Topic))
+            .resource_name(name.into())
+            .configs(self.topic.configs.as_ref().map(|configs| {
+                configs
+                    .iter()
+                    .map(|config| {
+                        DescribeConfigsResourceResult::default()
+                            .name(config.name.clone())
+                            .value(config.value.clone())
+                            .read_only(false)
+                            .is_default(None)
+                            .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
+                            .is_sensitive(false)
+                            .synonyms(Some([].into()))
+                            .config_type(Some(ConfigType::String.into()))
+                            .documentation(Some("".into()))
+                    })
+                    .collect()
+            }))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Watermark {
     low: Option<i64>,
@@ -663,10 +694,8 @@ impl DynoStore {
     /// Ensures that `topition` names an existing partition: its topic exists, and its index is
     /// below the topic's partition count. Returns the topic's metadata.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`]
-    /// for an unknown topic or an index outside the topic.
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic or an
+    /// index outside the topic.
     async fn ensure_partition_exists(&self, topition: &Topition) -> Result<TopicMetadata> {
         let Some(metadata) = self
             .topic_metadata(&TopicId::Name(topition.topic.clone()))
@@ -1299,7 +1328,7 @@ impl DynoStore {
                     continue;
                 }
 
-                let timestamp = inflated.base_timestamp + record.timestamp_delta;
+                let timestamp = inflated.record_timestamp(record);
                 if timestamp >= target {
                     return Ok(Some((offset, timestamp)));
                 }
@@ -1859,10 +1888,7 @@ impl Storage for DynoStore {
         );
         max_message_bytes::ensure_batch_fits(&deflated, limit)?;
 
-        let config = self
-            .describe_config(topition.topic(), ConfigResource::Topic, None)
-            .await
-            .inspect_err(|err| debug!(?err))?;
+        let config = metadata.describe_configs_result(topition.topic());
 
         if self.lake.is_some()
             && config
@@ -2838,34 +2864,7 @@ impl Storage for DynoStore {
     ) -> Result<DescribeConfigsResult> {
         match resource {
             ConfigResource::Topic => match self.topic_metadata(&TopicId::Name(name.into())).await {
-                Ok(Some(topic_metadata)) => {
-                    let error_code = ErrorCode::None;
-
-                    Ok(DescribeConfigsResult::default()
-                        .error_code(error_code.into())
-                        .error_message(Some(error_code.to_string()))
-                        .resource_type(i8::from(resource))
-                        .resource_name(name.into())
-                        .configs(topic_metadata.topic.configs.map(|configs| {
-                            configs
-                                .iter()
-                                .map(|config| {
-                                    DescribeConfigsResourceResult::default()
-                                        .name(config.name.clone())
-                                        .value(config.value.clone())
-                                        .read_only(false)
-                                        .is_default(None)
-                                        .config_source(Some(
-                                            ConfigSource::DynamicTopicConfig.into(),
-                                        ))
-                                        .is_sensitive(false)
-                                        .synonyms(Some([].into()))
-                                        .config_type(Some(ConfigType::String.into()))
-                                        .documentation(Some("".into()))
-                                })
-                                .collect()
-                        })))
-                }
+                Ok(Some(topic_metadata)) => Ok(topic_metadata.describe_configs_result(name)),
 
                 Ok(None) => Ok(DescribeConfigsResult::default()
                     .error_code(ErrorCode::None.into())
@@ -2874,7 +2873,7 @@ impl Storage for DynoStore {
                     .resource_name(name.into())
                     .configs(Some(vec![]))),
 
-                Err(_) => todo!(),
+                Err(error) => Err(error),
             },
 
             _ => Ok(DescribeConfigsResult::default()

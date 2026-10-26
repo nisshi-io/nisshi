@@ -45,7 +45,7 @@ use uuid::Uuid;
 const MAX_MESSAGE_BYTES: usize = 10_000;
 
 /// Creates a topic named `topic` with `configs` through CreateTopics, and returns its result.
-async fn create_topic_result(
+pub(crate) async fn create_topic_result(
     storage: impl Storage + Clone,
     topic: &str,
     configs: &[(&str, &str)],

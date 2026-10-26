@@ -197,6 +197,7 @@ pub mod config;
 mod inflate;
 mod latency;
 pub mod max_message_bytes;
+pub mod message_timestamp_type;
 mod producer;
 mod proxy;
 mod service;

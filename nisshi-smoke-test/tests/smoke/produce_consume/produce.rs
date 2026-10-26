@@ -313,7 +313,6 @@ fn now_in_millis_on_this_machine() -> i64 {
 
 /// The broker sets each record's timestamp to when it stored it, and marks it `LogAppendTime`.
 #[test]
-#[ignore = "the broker keeps the producer's timestamp on a LogAppendTime topic (#907)"]
 fn log_append_time_gives_broker_timestamps() {
     let cli = KafkaCli::shared();
     let topic = cli

@@ -19,8 +19,8 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    Ack, ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
-    SuppressResponseExtension, TimestampType,
+    Ack, ApiKey, BatchAttribute, ConfigResource, ErrorCode, ProduceRequest, ProduceResponse,
+    RequestInput, SuppressResponseExtension, TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse, TopicProduceResponse},
     record::{deflated, inflated},
@@ -29,7 +29,7 @@ use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, METER, Result, Storage, Topition, offload};
+use crate::{Error, METER, Result, Storage, Topition, message_timestamp_type, offload};
 
 /// Counts the connections closed by a failed `acks=0` Produce, by the error
 /// code of the first failing partition.
@@ -443,20 +443,17 @@ impl From<(ErrorCode, &'static str)> for Rejection {
 /// takes the maximum record timestamp, and overwrites only the header. It
 /// exempts a record timestamped [`NO_TIMESTAMP`] from the bounds check.
 ///
-/// Returns `Ok(Some(_))` for a batch that the client must not store: a
-/// record timestamp outside the window that [`TIMESTAMP_BEFORE_MAX_MS`] and
-/// [`TIMESTAMP_AFTER_MAX_MS`] set around `now`, a timestamp that overflows,
-/// a batch that does not decode, or a header rewrite on a batch whose CRC
-/// does not match its contents. `Err` is a broker-side failure.
+/// `inflated` is `batch` decoded.
 ///
-/// The batch decodes through [`inflate_produced`], so a batch that does not
-/// decode gets the same error code here as on every other produce path.
-fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<Rejection>> {
-    let inflated = match inflate_produced(&*batch) {
-        Ok(inflated) => inflated,
-        Err(error) => return Ok(Some(undecodable_batch(&error))),
-    };
-
+/// Returns `Ok(Some(_))` for a batch that the client must not store: a record timestamp outside the
+/// window that [`TIMESTAMP_BEFORE_MAX_MS`] and [`TIMESTAMP_AFTER_MAX_MS`] set around `now`, a
+/// timestamp that overflows, or a header rewrite on a batch whose CRC does not match its contents.
+/// `Err` is a broker-side failure.
+fn rewrite_create_time(
+    batch: &mut deflated::Batch,
+    inflated: &inflated::Batch,
+    now: i64,
+) -> Result<Option<Rejection>> {
     let lower = now.saturating_sub(TIMESTAMP_BEFORE_MAX_MS);
     let upper = now.saturating_add(TIMESTAMP_AFTER_MAX_MS);
 
@@ -503,11 +500,51 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
         actual_max = actual_max.max(timestamp);
     }
 
-    if actual_max == batch.max_timestamp {
+    // A batch that the producer marks `LogAppendTime` is rewritten as `CreateTime`, even when its
+    // `max_timestamp` is correct. The topic's `message.timestamp.type` decides the type, not the
+    // batch's own bit, as in Kafka. Otherwise a client could skip the timestamp window by setting
+    // the bit.
+    if actual_max == batch.max_timestamp
+        && TimestampType::from(batch.attributes) == TimestampType::CreateTime
+    {
         return Ok(None);
     }
 
-    match batch.set_timestamps(batch.base_timestamp, actual_max) {
+    set_timestamps(
+        batch,
+        TimestampType::CreateTime,
+        batch.base_timestamp,
+        actual_max,
+    )
+}
+
+/// Stamps `batch` with the broker's time, `now`, for a `LogAppendTime` topic.
+///
+/// The function sets the batch's timestamp type to `LogAppendTime` and its `max_timestamp` to
+/// `now`. A consumer reads `max_timestamp` as the timestamp of each record of a `LogAppendTime`
+/// batch. The function keeps `base_timestamp`, as Kafka's [`LogValidator`] does.
+///
+/// Returns `Ok(Some(_))` for a batch whose CRC does not match its contents.
+///
+/// [`LogValidator`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L278-L282
+fn stamp_log_append_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<Rejection>> {
+    set_timestamps(
+        batch,
+        TimestampType::LogAppendTime,
+        batch.base_timestamp,
+        now,
+    )
+}
+
+/// Sets the timestamp type and the timestamps of `batch` with [`deflated::Batch::set_timestamps`].
+/// Returns [`corrupt_batch`] for a batch whose CRC does not match its contents.
+fn set_timestamps(
+    batch: &mut deflated::Batch,
+    timestamp_type: TimestampType,
+    base_timestamp: i64,
+    max_timestamp: i64,
+) -> Result<Option<Rejection>> {
+    match batch.set_timestamps(timestamp_type, base_timestamp, max_timestamp) {
         Ok(()) => Ok(None),
         Err(nisshi_sans_io::Error::ApiError(ErrorCode::CorruptMessage)) => {
             Ok(Some(corrupt_batch()))
@@ -516,19 +553,43 @@ fn rewrite_create_time(batch: &mut deflated::Batch, now: i64) -> Result<Option<R
     }
 }
 
-/// Runs [`rewrite_create_time`] on Tokio's blocking thread pool, through
-/// [`offload`], and hands the batch back with the outcome.
+/// Validates a client batch for a topic whose `message.timestamp.type` is `timestamp_type`, and
+/// sets its timestamps for that type: [`rewrite_create_time`] for `CreateTime`, and
+/// [`stamp_log_append_time`] for `LogAppendTime`.
 ///
-/// The batch moves into the closure and back out, because `offload` needs a
-/// `'static` closure. A clone would only add a handle to the same record
-/// bytes, so moving the batch keeps one owner.
-async fn rewrite_create_time_offloaded(
+/// The function decodes the batch for both types, so a batch that does not decode is rejected on
+/// every topic, with the error code that [`undecodable_batch`] gives it.
+///
+/// Returns `Ok(Some(_))` for a batch that the client must not store, and `Err` for a broker-side
+/// failure.
+fn validate_timestamps(
+    batch: &mut deflated::Batch,
+    timestamp_type: TimestampType,
+    now: i64,
+) -> Result<Option<Rejection>> {
+    let inflated = match inflate_produced(&*batch) {
+        Ok(inflated) => inflated,
+        Err(error) => return Ok(Some(undecodable_batch(&error))),
+    };
+
+    match timestamp_type {
+        TimestampType::CreateTime => rewrite_create_time(batch, &inflated, now),
+        TimestampType::LogAppendTime => stamp_log_append_time(batch, now),
+    }
+}
+
+/// Runs [`validate_timestamps`] on Tokio's blocking thread pool, because it decodes the batch, and
+/// hands the batch back with the outcome.
+async fn validate_timestamps_offloaded(
     batch: deflated::Batch,
+    timestamp_type: TimestampType,
     now: i64,
 ) -> Result<(deflated::Batch, Option<Rejection>)> {
+    // The batch moves into the closure and back out, because `offload` needs a `'static` closure. A
+    // clone would only add a handle to the same record bytes, so moving the batch keeps one owner.
     offload(move || {
         let mut batch = batch;
-        let rejection = rewrite_create_time(&mut batch, now)?;
+        let rejection = validate_timestamps(&mut batch, timestamp_type, now)?;
         Ok((batch, rejection))
     })
     .await
@@ -557,7 +618,7 @@ fn corrupt_batch() -> Rejection {
 }
 
 #[cfg(test)]
-mod rewrite_create_time_tests {
+mod validate_timestamps_tests {
     use bytes::{BufMut as _, BytesMut};
     use nisshi_sans_io::{Compression, record::Record};
     use tokio::task::yield_now;
@@ -600,7 +661,10 @@ mod rewrite_create_time_tests {
     fn max_timestamp_is_the_largest_record_not_the_last() -> Result<()> {
         let mut batch = batch(FIXED_NOW, -1, &[0, 300, 100])?;
 
-        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(
+            None,
+            validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
+        );
         assert_eq!(FIXED_NOW + 300, batch.max_timestamp);
         assert_eq!(batch.computed_crc(), batch.crc);
 
@@ -611,7 +675,10 @@ mod rewrite_create_time_tests {
     fn negative_delta_folds_into_the_maximum() -> Result<()> {
         let mut batch = batch(FIXED_NOW, FIXED_NOW, &[-5_000, -1_000])?;
 
-        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(
+            None,
+            validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
+        );
         assert_eq!(FIXED_NOW - 1_000, batch.max_timestamp);
 
         Ok(())
@@ -622,7 +689,10 @@ mod rewrite_create_time_tests {
         let mut batch = batch(FIXED_NOW, FIXED_NOW + 7, &[0, 7])?;
         let original = batch.clone();
 
-        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(
+            None,
+            validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
+        );
         assert_eq!(original, batch);
 
         Ok(())
@@ -632,7 +702,10 @@ mod rewrite_create_time_tests {
     fn exactly_the_upper_bound_is_accepted() -> Result<()> {
         let mut batch = batch(FIXED_NOW, -1, &[TIMESTAMP_AFTER_MAX_MS])?;
 
-        assert_eq!(None, rewrite_create_time(&mut batch, FIXED_NOW)?);
+        assert_eq!(
+            None,
+            validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
+        );
         assert_eq!(FIXED_NOW + TIMESTAMP_AFTER_MAX_MS, batch.max_timestamp);
 
         Ok(())
@@ -642,7 +715,7 @@ mod rewrite_create_time_tests {
     fn one_past_the_upper_bound_is_rejected() -> Result<()> {
         let mut batch = batch(FIXED_NOW, -1, &[TIMESTAMP_AFTER_MAX_MS + 1])?;
 
-        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+        let rejection = validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
             .expect("one millisecond past the upper bound must be rejected");
 
         assert_eq!(ErrorCode::InvalidTimestamp, rejection.error_code);
@@ -656,7 +729,7 @@ mod rewrite_create_time_tests {
         let mut batch = batch(FIXED_NOW, FIXED_NOW, &[0, 2 * TIMESTAMP_AFTER_MAX_MS, 0])?;
         let original = batch.clone();
 
-        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+        let rejection = validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
             .expect("a record two hours ahead must be rejected");
 
         assert_eq!(ErrorCode::InvalidTimestamp, rejection.error_code);
@@ -679,7 +752,7 @@ mod rewrite_create_time_tests {
     fn a_timestamp_that_overflows_is_rejected() -> Result<()> {
         let mut batch = batch(i64::MAX - 1, -1, &[10])?;
 
-        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+        let rejection = validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
             .expect("an overflowing timestamp must be rejected");
 
         assert_eq!(ErrorCode::InvalidRecord, rejection.error_code);
@@ -694,13 +767,16 @@ mod rewrite_create_time_tests {
 
         assert_eq!(
             None,
-            rewrite_create_time(&mut only_no_timestamp, FIXED_NOW)?
+            validate_timestamps(&mut only_no_timestamp, TimestampType::CreateTime, FIXED_NOW)?
         );
         assert_eq!(NO_TIMESTAMP, only_no_timestamp.max_timestamp);
 
         let mut mixed = batch(NO_TIMESTAMP, NO_TIMESTAMP, &[0, FIXED_NOW + 1])?;
 
-        assert_eq!(None, rewrite_create_time(&mut mixed, FIXED_NOW)?);
+        assert_eq!(
+            None,
+            validate_timestamps(&mut mixed, TimestampType::CreateTime, FIXED_NOW)?
+        );
         assert_eq!(FIXED_NOW, mixed.max_timestamp);
 
         Ok(())
@@ -711,7 +787,7 @@ mod rewrite_create_time_tests {
         let mut batch = batch(FIXED_NOW, -1, &[0])?;
         batch.record_data = bytes::Bytes::from_static(&[0xff, 0xff, 0xff]);
 
-        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+        let rejection = validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
             .expect("a batch that does not decode must be rejected");
 
         assert_eq!(ErrorCode::InvalidRecord, rejection.error_code);
@@ -737,7 +813,7 @@ mod rewrite_create_time_tests {
         record_data.put_u8(claimed as u8);
         batch.record_data = record_data.freeze();
 
-        let rejection = rewrite_create_time(&mut batch, FIXED_NOW)?
+        let rejection = validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
             .expect("a batch over the decoded size limit must be rejected");
 
         assert_eq!(ErrorCode::MessageTooLarge, rejection.error_code);
@@ -753,7 +829,55 @@ mod rewrite_create_time_tests {
 
         assert_eq!(
             Some(corrupt_batch()),
-            rewrite_create_time(&mut batch, FIXED_NOW)?
+            validate_timestamps(&mut batch, TimestampType::CreateTime, FIXED_NOW)?
+        );
+        assert_eq!(damaged, batch);
+
+        Ok(())
+    }
+
+    #[test]
+    fn log_append_time_stamps_the_broker_time_outside_the_window() -> Result<()> {
+        let producer_base_timestamp = FIXED_NOW + 10 * TIMESTAMP_AFTER_MAX_MS;
+        let mut batch = batch(producer_base_timestamp, -1, &[0, 7])?;
+
+        assert_eq!(
+            None,
+            validate_timestamps(&mut batch, TimestampType::LogAppendTime, FIXED_NOW)?
+        );
+        assert_eq!(
+            TimestampType::LogAppendTime,
+            TimestampType::from(batch.attributes)
+        );
+        assert_eq!(producer_base_timestamp, batch.base_timestamp);
+        assert_eq!(FIXED_NOW, batch.max_timestamp);
+        assert_eq!(batch.computed_crc(), batch.crc);
+
+        Ok(())
+    }
+
+    #[test]
+    fn log_append_time_rejects_a_batch_that_does_not_decode() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0])?;
+        batch.record_data = bytes::Bytes::from_static(&[0xff, 0xff, 0xff]);
+
+        let rejection = validate_timestamps(&mut batch, TimestampType::LogAppendTime, FIXED_NOW)?
+            .expect("a batch that does not decode must be rejected");
+
+        assert_eq!(ErrorCode::InvalidRecord, rejection.error_code);
+
+        Ok(())
+    }
+
+    #[test]
+    fn log_append_time_rejects_a_batch_with_a_bad_crc() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0])?;
+        batch.crc ^= 1;
+        let damaged = batch.clone();
+
+        assert_eq!(
+            Some(corrupt_batch()),
+            validate_timestamps(&mut batch, TimestampType::LogAppendTime, FIXED_NOW)?
         );
         assert_eq!(damaged, batch);
 
@@ -801,7 +925,11 @@ mod rewrite_create_time_tests {
 
         let batch: deflated::Batch = builder.build().and_then(TryInto::try_into)?;
 
-        let rewrite = tokio::spawn(rewrite_create_time_offloaded(batch, FIXED_NOW));
+        let rewrite = tokio::spawn(validate_timestamps_offloaded(
+            batch,
+            TimestampType::CreateTime,
+            FIXED_NOW,
+        ));
 
         yield_now().await;
 
@@ -980,6 +1108,7 @@ where
         &self,
         transaction_id: Option<&str>,
         name: &str,
+        timestamp_type: TimestampType,
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         // The decoder turns a zero-length records field into `None`, so it
@@ -1023,38 +1152,22 @@ where
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
 
-        // The batch's own timestamp-type bit selects `LogAppendTime`
-        // here. Kafka takes the type from the topic's
-        // `message.timestamp.type` instead: on a `CreateTime` topic it
-        // validates such a batch like any `CreateTime` batch and
-        // clears the bit. A client that sets the bit here skips the
-        // timestamp window.
-        if BatchAttribute::try_from(batch.attributes)
-            .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
-            .unwrap_or_default()
-        {
-            match batch.set_timestamps(now, now) {
-                Ok(()) => {}
-                Err(nisshi_sans_io::Error::ApiError(ErrorCode::CorruptMessage)) => {
-                    return self.reject(name, partition.index, &batch, corrupt_batch());
-                }
-                Err(err) => {
-                    error!(?err);
-                    return self.error(partition.index, ErrorCode::UnknownServerError);
-                }
+        match validate_timestamps_offloaded(batch, timestamp_type, now).await {
+            Ok((validated, None)) => batch = validated,
+            Ok((validated, Some(rejection))) => {
+                return self.reject(name, partition.index, &validated, rejection);
             }
-        } else {
-            match rewrite_create_time_offloaded(batch, now).await {
-                Ok((rewritten, None)) => batch = rewritten,
-                Ok((rewritten, Some(rejection))) => {
-                    return self.reject(name, partition.index, &rewritten, rejection);
-                }
-                Err(err) => {
-                    error!(?err);
-                    return self.error(partition.index, ErrorCode::UnknownServerError);
-                }
+            Err(err) => {
+                error!(?err);
+                return self.error(partition.index, ErrorCode::UnknownServerError);
             }
         }
+
+        // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic.
+        let log_append_time_ms = match timestamp_type {
+            TimestampType::CreateTime => NO_TIMESTAMP,
+            TimestampType::LogAppendTime => now,
+        };
 
         let tp = Topition::new(name, partition.index);
         let producer_id = batch.producer_id;
@@ -1064,7 +1177,7 @@ where
                 .index(partition.index)
                 .error_code(ErrorCode::None.into())
                 .base_offset(base_offset)
-                .log_append_time_ms(Some(-1))
+                .log_append_time_ms(Some(log_append_time_ms))
                 .log_start_offset(Some(0))
                 .record_errors(Some([].into()))
                 .error_message(None)
@@ -1121,17 +1234,58 @@ where
         }
     }
 
+    /// Returns the `message.timestamp.type` of the topic `name`, as
+    /// [`message_timestamp_type::described`] reads it from the topic's configs.
+    ///
+    /// The lookup and `storage.produce()` run in separate transactions. If the topic's
+    /// `message.timestamp.type` changes between them, the batch keeps the type that this function
+    /// read. The batch stores its type in its attributes, so a consumer still reads its timestamps
+    /// correctly. Kafka also applies a config change asynchronously, and an append that is in
+    /// progress can use the old type.
+    async fn timestamp_type(&self, name: &str) -> Result<TimestampType> {
+        let described = self
+            .storage
+            .describe_config(
+                name,
+                ConfigResource::Topic,
+                Some(&[message_timestamp_type::KEY.to_owned()]),
+            )
+            .await?;
+
+        message_timestamp_type::described(name, described)
+    }
+
     #[instrument(skip_all)]
     async fn topic(
         &self,
         transaction_id: Option<&str>,
         topic: TopicProduceData,
     ) -> TopicProduceResponse {
-        let mut partitions = vec![];
+        let partition_data = topic.partition_data.unwrap_or_default();
+        let mut partitions = Vec::with_capacity(partition_data.len());
 
-        if let Some(partition_data) = topic.partition_data {
-            for partition in partition_data {
-                partitions.push(self.partition(transaction_id, &topic.name, partition).await)
+        match self.timestamp_type(&topic.name).await {
+            Ok(timestamp_type) => {
+                for partition in partition_data {
+                    partitions.push(
+                        self.partition(transaction_id, &topic.name, timestamp_type, partition)
+                            .await,
+                    )
+                }
+            }
+
+            Err(error) => {
+                error!(
+                    topic = topic.name,
+                    ?error,
+                    "message.timestamp.type lookup failed"
+                );
+
+                partitions.extend(
+                    partition_data.iter().map(|partition| {
+                        self.error(partition.index, ErrorCode::UnknownServerError)
+                    }),
+                );
             }
         }
 

@@ -23,7 +23,7 @@ use nisshi_broker::Result;
 use nisshi_sans_io::{
     Ack, BatchAttribute, Compression, CreateTopicsRequest, DeleteTopicsRequest, ErrorCode,
     FetchRequest, InitProducerIdRequest, IsolationLevel, ListOffset, ListOffsetsRequest,
-    NULL_TOPIC_ID, ProduceRequest, ProduceResponse, RequestInput, TimestampType,
+    NULL_TOPIC_ID, ProduceRequest, ProduceResponse, RequestInput,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
@@ -73,7 +73,7 @@ fn topic_data(
 /// The batches stored for `topic`/`index` from offset 0, as the broker wrote
 /// them: letting a test inspect a stored header (`max_timestamp`, `crc`)
 /// rather than just the produce response's error code.
-async fn fetch_batches(
+pub(crate) async fn fetch_batches(
     storage: impl Storage + Clone,
     topic: &str,
     index: i32,
@@ -1386,7 +1386,7 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
 /// broker applies to every `CreateTime` record.
 const TIMESTAMP_AFTER_MAX_MS: i64 = 60 * 60 * 1000;
 
-fn now_ms() -> Result<i64> {
+pub(crate) fn now_ms() -> Result<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(Into::into)
@@ -1394,7 +1394,7 @@ fn now_ms() -> Result<i64> {
 }
 
 /// Creates a topic with one partition and `configs`, and returns its name.
-async fn create_topic_with_configs(
+pub(crate) async fn create_topic_with_configs(
     storage: impl Storage + Clone,
     configs: &[(&str, &str)],
 ) -> Result<String> {
@@ -1436,7 +1436,7 @@ async fn create_topic_with_configs(
 
 /// Sends `batches` to one partition with `acks=-1`, and returns that
 /// partition's response.
-async fn produce_batches(
+pub(crate) async fn produce_batches(
     storage: impl Storage + Clone,
     topic: &str,
     index: i32,
@@ -1467,7 +1467,7 @@ async fn produce_batches(
 }
 
 /// A `CreateTime` batch with one record for each of `timestamp_deltas`.
-fn create_time_batch(
+pub(crate) fn create_time_batch(
     compression: Compression,
     base_timestamp: i64,
     max_timestamp: i64,
@@ -1596,14 +1596,8 @@ async fn produce_rejects_future_timestamp(storage: impl Storage + Clone) -> Resu
 /// with the header at -1.
 ///
 /// Each case produces to its own topic, so a backend that combines batches
-/// on fetch does not change the result. `assert_stored_header` is true only
-/// for a backend whose fetch returns the stored bytes. A SQL backend builds
-/// a new batch from its records on fetch, so its header and `crc` say
-/// nothing about what [`ProduceService`] wrote.
-async fn produce_rewrites_header_max_timestamp(
-    storage: impl Storage + Clone,
-    assert_stored_header: bool,
-) -> Result<()> {
+/// on fetch does not change the result.
+async fn produce_rewrites_header_max_timestamp(storage: impl Storage + Clone) -> Result<()> {
     let index = 0;
     let now = now_ms()?;
     let ten_hours = 10 * TIMESTAMP_AFTER_MAX_MS;
@@ -1637,10 +1631,8 @@ async fn produce_rewrites_header_max_timestamp(
         let fetched = fetch_batches(storage.clone(), &topic, index).await?;
         assert_eq!(1, fetched.len());
 
-        if assert_stored_header {
-            assert_eq!(expected, fetched[0].max_timestamp);
-            assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
-        }
+        assert_eq!(expected, fetched[0].max_timestamp);
+        assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
     }
 
     Ok(())
@@ -1693,10 +1685,7 @@ async fn produce_header_below_records_is_found_by_timestamp_lookup(
 
 /// The header rewrite decodes the records, so it must accept each codec a
 /// client can send, including a snappy-java stream of several blocks.
-async fn produce_rewrites_header_for_every_codec(
-    storage: impl Storage + Clone,
-    assert_stored_header: bool,
-) -> Result<()> {
+async fn produce_rewrites_header_for_every_codec(storage: impl Storage + Clone) -> Result<()> {
     let index = 0;
     let now = now_ms()?;
 
@@ -1736,16 +1725,14 @@ async fn produce_rewrites_header_for_every_codec(
             "attributes: {attributes}"
         );
 
-        if assert_stored_header {
-            let fetched = fetch_batches(storage.clone(), &topic, index).await?;
-            assert_eq!(1, fetched.len());
-            assert_eq!(
-                now + 7,
-                fetched[0].max_timestamp,
-                "attributes: {attributes}"
-            );
-            assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
-        }
+        let fetched = fetch_batches(storage.clone(), &topic, index).await?;
+        assert_eq!(1, fetched.len());
+        assert_eq!(
+            now + 7,
+            fetched[0].max_timestamp,
+            "attributes: {attributes}"
+        );
+        assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
     }
 
     Ok(())
@@ -1862,50 +1849,6 @@ async fn produce_rewritten_header_keeps_a_new_batch_from_retention(
     let fetched = fetch_batches(storage, &topic, index).await?;
     assert_eq!(1, fetched.len());
     assert_eq!(now, fetched[0].max_timestamp);
-
-    Ok(())
-}
-
-/// The broker honours a client-set `LogAppendTime` bit, and that batch skips
-/// the `CreateTime` timestamp window. Kafka takes the timestamp type from the
-/// topic's `message.timestamp.type` instead: on a `CreateTime` topic it
-/// validates such a batch like any `CreateTime` batch and clears the bit, so
-/// Kafka rejects this batch.
-///
-/// The test also checks that the broker gives the rewritten batch a new
-/// `crc`. `assert_stored_header` gates that check as in
-/// [`produce_rewrites_header_max_timestamp`].
-async fn produce_log_append_time_ignores_bounds_check(
-    storage: impl Storage + Clone,
-    assert_stored_header: bool,
-) -> Result<()> {
-    let topic = create_topic_with_configs(storage.clone(), &[]).await?;
-    let index = 0;
-
-    const TEN_YEARS_MS: i64 = 10 * 365 * 24 * 60 * 60 * 1000;
-
-    let batch = inflated::Batch::builder()
-        .attributes(
-            BatchAttribute::default()
-                .timestamp(TimestampType::LogAppendTime)
-                .into(),
-        )
-        .record(
-            Record::builder()
-                .value(Bytes::from_static(b"far future, but log append time").into())
-                .timestamp_delta(TEN_YEARS_MS),
-        )
-        .build()
-        .and_then(deflated::Batch::try_from)?;
-
-    let response = produce_batches(storage.clone(), &topic, index, vec![batch]).await?;
-    assert_accepted_at(0, &response)?;
-
-    if assert_stored_header {
-        let fetched = fetch_batches(storage.clone(), &topic, index).await?;
-        assert_eq!(1, fetched.len());
-        assert_eq!(fetched[0].computed_crc(), fetched[0].crc);
-    }
 
     Ok(())
 }
@@ -2045,7 +1988,7 @@ mod in_memory {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_rewrites_header_max_timestamp(storage, true).await?;
+            super::produce_rewrites_header_max_timestamp(storage).await?;
 
             Ok(())
         }
@@ -2068,22 +2011,6 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn produce_log_append_time_ignores_bounds_check() -> Result<()> {
-        {
-            let _guard = init_tracing()?;
-
-            let cluster_id = Uuid::now_v7();
-            let broker_id = rng().random_range(0..i32::MAX);
-
-            let storage = storage_container(cluster_id, broker_id).await?;
-
-            super::produce_log_append_time_ignores_bounds_check(storage, true).await?;
-
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
     async fn produce_rewrites_header_for_every_codec() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -2092,7 +2019,7 @@ mod in_memory {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::produce_rewrites_header_for_every_codec(storage, true).await
+        super::produce_rewrites_header_for_every_codec(storage).await
     }
 
     #[tokio::test]
@@ -2255,7 +2182,7 @@ mod lite {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_rewrites_header_max_timestamp(storage, false).await?;
+            super::produce_rewrites_header_max_timestamp(storage).await?;
 
             Ok(())
         }
@@ -2278,22 +2205,6 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn produce_log_append_time_ignores_bounds_check() -> Result<()> {
-        {
-            let _guard = init_tracing()?;
-
-            let cluster_id = Uuid::now_v7();
-            let broker_id = rng().random_range(0..i32::MAX);
-
-            let storage = storage_container(cluster_id, broker_id).await?;
-
-            super::produce_log_append_time_ignores_bounds_check(storage, false).await?;
-
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
     async fn produce_rewrites_header_for_every_codec() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -2302,7 +2213,7 @@ mod lite {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::produce_rewrites_header_for_every_codec(storage, false).await
+        super::produce_rewrites_header_for_every_codec(storage).await
     }
 
     #[tokio::test]
@@ -2453,23 +2364,7 @@ mod slatedb {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_rewrites_header_max_timestamp(storage, true).await?;
-
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn produce_log_append_time_ignores_bounds_check() -> Result<()> {
-        {
-            let _guard = init_tracing()?;
-
-            let cluster_id = Uuid::now_v7();
-            let broker_id = rng().random_range(0..i32::MAX);
-
-            let storage = storage_container(cluster_id, broker_id).await?;
-
-            super::produce_log_append_time_ignores_bounds_check(storage, true).await?;
+            super::produce_rewrites_header_max_timestamp(storage).await?;
 
             Ok(())
         }
@@ -2484,7 +2379,7 @@ mod slatedb {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::produce_rewrites_header_for_every_codec(storage, true).await
+        super::produce_rewrites_header_for_every_codec(storage).await
     }
 
     #[tokio::test]
@@ -2647,23 +2542,7 @@ mod pg {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_rewrites_header_max_timestamp(storage, false).await?;
-
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn produce_log_append_time_ignores_bounds_check() -> Result<()> {
-        {
-            let _guard = init_tracing()?;
-
-            let cluster_id = Uuid::now_v7();
-            let broker_id = rng().random_range(0..i32::MAX);
-
-            let storage = storage_container(cluster_id, broker_id).await?;
-
-            super::produce_log_append_time_ignores_bounds_check(storage, false).await?;
+            super::produce_rewrites_header_max_timestamp(storage).await?;
 
             Ok(())
         }
@@ -2678,7 +2557,7 @@ mod pg {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::produce_rewrites_header_for_every_codec(storage, false).await
+        super::produce_rewrites_header_for_every_codec(storage).await
     }
 
     #[tokio::test]
