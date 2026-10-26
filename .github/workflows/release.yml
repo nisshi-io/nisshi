@@ -17,7 +17,8 @@ name: release
 # outage alike; rejecting it ends the run with nothing published. The
 # environment prevents self-review and admin bypass, so another admin has to
 # approve: whoever pushed the tag or started the re-run can't. The job refuses
-# to run if either setting is off. GitHub asks for approval again on a re-run,
+# to run if either setting is off, or if the run records no approval of
+# release-override from another user. GitHub asks for approval again on a re-run,
 # and the deployment log records who approved.
 #
 # To skip only the FOSSA licensing block, set the FOSSA_LICENSING_BLOCK
@@ -151,6 +152,19 @@ jobs:
           fi
           if [ "$(jq '.can_admins_bypass' <<<"$env_json")" != "false" ]; then
             echo "::error::release-override lets admins bypass its reviewers; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          # The settings checks read the environment as it is now, after GitHub
+          # released this job, so they can't prove that a second person
+          # approved it. This check reads the approvals that the run recorded,
+          # and requires one for release-override from someone other than
+          # whoever pushed the tag or started this attempt.
+          approvals=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals")
+          others=$(jq --arg actor "$GITHUB_ACTOR" --arg trigger "$GITHUB_TRIGGERING_ACTOR" '
+            [.[] | select(.state == "approved" and any(.environments[]; .name == "release-override"))
+              | .user.login | select(. != $actor and . != $trigger)] | length' <<<"$approvals")
+          if [ "$others" -eq 0 ]; then
+            echo "::error::release-override has no approval from anyone but ${GITHUB_ACTOR} or ${GITHUB_TRIGGERING_ACTOR}; not publishing over a failed release-readiness check"
             exit 1
           fi
           echo "::warning::publishing ${GITHUB_REF_NAME} over a failed release-readiness check"
