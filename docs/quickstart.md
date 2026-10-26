@@ -74,7 +74,7 @@ echo '{"value": "hello world"}' | ./bin/nisshi cat produce hello
 ./bin/nisshi cat consume hello
 ```
 
-The `nisshi cat` command sends and reads JSON messages from the terminal. The `cat produce` subcommand reads one JSON object per line. Each object has a `key`, a `value`, or both. When the broker accepts the message, the subcommand prints one line, for example `Produced 1 message to hello partition 0, offset 0.` (`topic create` prints a line too, such as `Created topic hello with 3 partitions.`). The `cat consume` subcommand reads the topic from the start of partition 0, prints the messages it gets, and exits. If the topic is empty, it waits up to 5 seconds first:
+The `nisshi cat` command sends and reads JSON messages from the terminal. The `cat produce` subcommand reads one JSON object per line. Each object has a `key`, a `value`, or both. When the broker accepts the message, the subcommand prints one line, for example `Produced 1 message to hello partition 0, offset 0.` (`topic create` prints a line too, such as `Created topic hello with 3 partitions.`). Releases before 0.8.0 print nothing on success for these two commands; a command that succeeds exits with status 0. The `cat consume` subcommand reads the topic from the start of partition 0, prints the messages it gets, and exits. If the topic is empty, it waits up to 5 seconds first:
 
 ```text
 [{"key":null,"value":"hello world"}]
@@ -104,6 +104,14 @@ Nisshi also has capabilities beyond this quickstart:
 
 ## Build from Source
 
-If there is no release for your operating system or architecture, for example Windows or an Intel-based Mac (`Darwin x86_64`), you can build Nisshi from source by following the steps in [Install](../README.md#install). After you install Rust, restart your shell so that `cargo` is on your `PATH`.
+If there is no release for your operating system or architecture, for example Windows or an Intel-based Mac (`Darwin x86_64`), you can build Nisshi from source. To build it, perform these steps:
+
+1. Install Rust with [rustup](https://rustup.rs).
+2. Restart your shell so that `cargo` is on your `PATH`.
+3. Run the following command:
+
+   ```shell
+   cargo install nisshi
+   ```
 
 The build installs the `nisshi` command on your `PATH`. In the other steps, run `nisshi` instead of `./bin/nisshi`.
