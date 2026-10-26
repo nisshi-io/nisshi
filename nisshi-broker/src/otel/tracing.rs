@@ -15,7 +15,7 @@
 use crate::{Result, TracingFormat};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::{
-    EnvFilter, filter::LevelFilter, fmt::format::FmtSpan, layer::SubscriberExt,
+    EnvFilter, Layer, Registry, filter::LevelFilter, fmt::format::FmtSpan, layer::SubscriberExt,
     util::SubscriberInitExt,
 };
 
@@ -46,18 +46,25 @@ fn env_filter() -> Result<EnvFilter> {
 /// replace that default. Malformed directives are ignored, as they always
 /// have been.
 ///
-/// `reqsign_core` is capped at `info` regardless of the ambient level.
-/// reqsign-core 3.3.2 logs each credential provider it tries at `debug`, and
-/// reqsign-aws-core 3.2.0's `StaticCredentialProvider` derives `Debug` over
-/// `secret_access_key` and `session_token` without redaction, so
-/// `RUST_LOG=debug` (routine when troubleshooting, and what CI's test job
-/// uses) prints AWS secrets in cleartext through this subscriber's `log`
-/// compatibility layer.
+/// `reqsign_core` is capped at `info` when the filter enables anything more
+/// verbose than that. reqsign-core 3.3.2 logs each credential provider it
+/// tries at `debug`, and reqsign-aws-core 3.2.0's `StaticCredentialProvider`
+/// derives `Debug` over `secret_access_key` and `session_token` without
+/// redaction, so `RUST_LOG=debug` (routine when troubleshooting, and what
+/// CI's test job uses) prints AWS secrets in cleartext through this
+/// subscriber's `log` compatibility layer. The cap is left off when the filter
+/// is at `info` or quieter, because a directive sets a level rather than only
+/// capping one, and would otherwise raise `reqsign_core` to `info` under the
+/// default `warn` or under `RUST_LOG=error`.
 fn env_filter_from(rust_log: Option<&str>) -> Result<EnvFilter> {
-    Ok(EnvFilter::builder()
+    let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
-        .parse_lossy(rust_log.unwrap_or_default())
-        .add_directive("reqsign_core=info".parse()?))
+        .parse_lossy(rust_log.unwrap_or_default());
+
+    match <EnvFilter as Layer<Registry>>::max_level_hint(&filter) {
+        Some(hint) if hint <= LevelFilter::INFO => Ok(filter),
+        _ => Ok(filter.add_directive("reqsign_core=info".parse()?)),
+    }
 }
 
 pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<Guard> {
@@ -146,6 +153,15 @@ mod tests {
             )
         })?;
         assert_matches!(levels, (true, false, true));
+        Ok(())
+    }
+
+    #[test]
+    fn reqsign_core_is_not_raised_to_info_by_a_quiet_filter() -> Result<()> {
+        for rust_log in [None, Some(""), Some("warn"), Some("error")] {
+            let info = with_filter(rust_log, || enabled!(target: "reqsign_core", Level::INFO))?;
+            assert_matches!(info, false);
+        }
         Ok(())
     }
 }
