@@ -24,6 +24,7 @@ use std::{
 use async_trait::async_trait;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
+    TimestampType,
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
@@ -290,7 +291,12 @@ where
 
         // We write a queue of mixed codecs one batch at a time. The merged batch takes the first
         // batch's codec, so a batch over `max.message.bytes` as sent could fit once merged.
-        if !shares_one_codec(&batches) {
+        //
+        // We also write a queue of mixed record timestamps one batch at a time. The merged batch
+        // takes the first batch's timestamp type and the largest `max_timestamp`. A consumer reads
+        // a `LogAppendTime` batch's `max_timestamp` as each record's timestamp, so a merge would
+        // give a record a broker time other than the one its produce response returned.
+        if !shares_one_codec(&batches) || !shares_one_log_append_time(&batches) {
             let responses_by_owner = self
                 .write_each_as_sent(transaction_id, topition, owners, batches, &attributes)
                 .await;
@@ -788,6 +794,22 @@ fn shares_one_codec(batches: &[deflated::Batch]) -> bool {
     codecs
         .next()
         .is_none_or(|first| codecs.all(|codec| codec == first))
+}
+
+/// Returns whether all of `batches` are `CreateTime`, or all are `LogAppendTime` with the same
+/// `max_timestamp`: the broker's time when it stamped the batch.
+fn shares_one_log_append_time(batches: &[deflated::Batch]) -> bool {
+    let mut log_append_times =
+        batches
+            .iter()
+            .map(|batch| match TimestampType::from(batch.attributes) {
+                TimestampType::CreateTime => None,
+                TimestampType::LogAppendTime => Some(batch.max_timestamp),
+            });
+
+    log_append_times
+        .next()
+        .is_none_or(|first| log_append_times.all(|log_append_time| log_append_time == first))
 }
 
 #[instrument(skip_all)]
@@ -1645,6 +1667,82 @@ mod tests {
         assert_eq!(
             Compression::Gzip,
             BatchAttribute::try_from(stored_batches[0].attributes)?.compression
+        );
+
+        Ok(())
+    }
+    /// Returns a `LogAppendTime` batch of one record from [`PRODUCER_ID`], stamped at
+    /// `log_append_time`.
+    fn log_append_time_batch(log_append_time: i64) -> Result<deflated::Batch> {
+        inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .timestamp(TimestampType::LogAppendTime)
+                    .into(),
+            )
+            .producer_id(PRODUCER_ID)
+            .base_timestamp(log_append_time)
+            .max_timestamp(log_append_time)
+            .record(
+                Record::builder()
+                    .value(Some(Bytes::from_static(b"abc")))
+                    .offset_delta(0),
+            )
+            .build()
+            .and_then(TryInto::try_into)
+            .map_err(Into::into)
+    }
+
+    /// Two `LogAppendTime` batches that the broker stamped at different times are written one at a
+    /// time, so each record keeps the broker time of its own produce request.
+    #[tokio::test(start_paused = true)]
+    async fn log_append_time_batches_of_different_times_are_written_as_sent() -> Result<()> {
+        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
+        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
+        const FIRST_LOG_APPEND_TIME: i64 = 1_000;
+        const SECOND_LOG_APPEND_TIME: i64 = 2_000;
+
+        let recorder = FlightRecorder::new();
+        let batcher =
+            ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(Some(MINIMUM_DELAY));
+        let topition = Topition::new("abc", 0);
+
+        let first_produce = spawn_produce(
+            &batcher,
+            &topition,
+            log_append_time_batch(FIRST_LOG_APPEND_TIME)?,
+        );
+        // Lets the first request join the queue before the second, so their order in it is fixed.
+        yield_now().await;
+        let second_produce = spawn_produce(
+            &batcher,
+            &topition,
+            log_append_time_batch(SECOND_LOG_APPEND_TIME)?,
+        );
+
+        // The clock is paused, so the batching timer fires only here. A request then flushes the
+        // queue that holds both batches.
+        advance(ADVANCE_DELAY).await;
+        yield_now().await;
+
+        assert_matches!(
+            tokio::time::timeout(Duration::from_secs(60), first_produce).await,
+            Ok(Ok(Ok(0)))
+        );
+        assert_matches!(
+            tokio::time::timeout(Duration::from_secs(60), second_produce).await,
+            Ok(Ok(Ok(1)))
+        );
+
+        let stored_log_append_times = recorder
+            .produced(&topition)?
+            .unwrap_or_default()
+            .iter()
+            .map(|batch| batch.max_timestamp)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![FIRST_LOG_APPEND_TIME, SECOND_LOG_APPEND_TIME],
+            stored_log_append_times
         );
 
         Ok(())
