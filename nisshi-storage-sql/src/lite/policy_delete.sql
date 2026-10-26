@@ -15,7 +15,11 @@
 
 with
 
-deletion as (
+-- materialized makes SQLite choose the partitions that retention applies to before it reads
+-- record. Without it, SQLite merges this query into ancient and joins each LEFT JOIN after the
+-- tables on its left, so it reads every record of a topic before it skips the topic for its
+-- cleanup.policy or retention.ms, and holds the write lock while it does.
+deletion as materialized (
     select
     tp.id as topition,
     coalesce(cast(trim(rt.value) as integer), $3) as retention_ms

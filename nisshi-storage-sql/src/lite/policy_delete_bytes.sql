@@ -17,7 +17,11 @@
 -- bytes of its keys and values are within it, and always keep the newest record.
 with
 
-capped as (
+-- materialized makes SQLite choose the partitions that retention.bytes applies to before it reads
+-- record. Without it, SQLite merges this query into sized and joins the LEFT JOIN after the tables
+-- on its left, so it reads every record of a topic before it skips the topic for its
+-- cleanup.policy, and holds the write lock while it does.
+capped as materialized (
     select tp.id as topition, cast(tc.value as bigint) as cap
     from topition tp
     join topic t on t.id = tp.topic
