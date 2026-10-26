@@ -638,7 +638,8 @@ jobs:
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-about@0.8.4
-      - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
+      # The release binary is built with --all-features, so the list is too.
+      - run: cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: third-party-license
@@ -914,14 +915,23 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      # Embeds the crate list so scanners can read the binary's dependencies.
+      # cargo-auditable embeds the crate list so scanners can read the binary's
+      # dependencies. cargo-about writes the licence list that the tarball and
+      # the image carry. This job generates it beside the build, instead of
+      # waiting on the third-party-license job, which takes minutes.
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
-          tool: cargo-auditable@0.7.6
+          tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
       - env:
           TARGET: ${{matrix.target}}
-        run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+        run: |
+          # The licence scan needs no build output, so it runs beside the build.
+          # wait returns the scan's exit status, so a failed scan fails the step.
+          cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html &
+          about=$!
+          cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+          wait "$about"
       - env:
           TARGET: ${{matrix.target}}
         run: |
@@ -934,7 +944,7 @@ jobs:
           dist=$(mktemp -d -p ${{runner.temp}})
           mkdir "$dist"/bin
           cp target/"${TARGET}"/release/nisshi "$dist"/bin
-          cp compose.yaml example.env LICENSE README.md "$dist"
+          cp compose.yaml example.env LICENSE NOTICE THIRD-PARTY-LICENSE.html README.md "$dist"
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       # release.yml attaches the tarballs to the GitHub release, on a tag.
@@ -943,14 +953,16 @@ jobs:
           name: nisshi-${{matrix.target}}
           path: nisshi-${{matrix.target}}.tar.gz
           if-no-files-found: error
-      # The Dockerfile copies dist/<platform>/nisshi into the image, in smoke
-      # and in the publish jobs of release.yml and tier-c.yml.
+      # The Dockerfile copies dist/<platform>/nisshi and the licence list into
+      # the image, in smoke and in the publish jobs of release.yml and
+      # tier-c.yml, which read only this artifact.
       - env:
           PLATFORM: ${{matrix.platform}}
           TARGET: ${{matrix.target}}
         run: |
           mkdir -p dist/"${PLATFORM}"
           cp target/"${TARGET}"/release/nisshi dist/"${PLATFORM}"/nisshi
+          cp THIRD-PARTY-LICENSE.html dist/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{matrix.target}}
@@ -993,16 +1005,18 @@ jobs:
       - if: ${{github.ref_type == 'tag'}}
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
-          tool: cargo-auditable@0.7.6
+          tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
       - if: ${{github.ref_type == 'tag'}}
         run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+      - if: ${{github.ref_type == 'tag'}}
+        run: cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html
       - if: ${{github.ref_type == 'tag'}}
         run: |
           dist=$(mktemp -d -p ${{runner.temp}})
           mkdir "$dist"/bin
           cp target/"${TARGET}"/release/nisshi "$dist"/bin
-          cp compose.yaml example.env LICENSE README.md "$dist"
+          cp compose.yaml example.env LICENSE NOTICE THIRD-PARTY-LICENSE.html README.md "$dist"
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       - if: ${{github.ref_type == 'tag'}}

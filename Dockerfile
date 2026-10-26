@@ -27,6 +27,8 @@ COPY --from=base /image /
 # --chmod: the binary arrives via an Actions artifact, which drops the exec bit.
 COPY --chmod=755 dist/${TARGETPLATFORM}/nisshi /nisshi
 COPY LICENSE /LICENSE
+COPY NOTICE /NOTICE
+COPY dist/THIRD-PARTY-LICENSE.html /THIRD-PARTY-LICENSE.html
 ENV TMP=/tmp
 ENTRYPOINT ["/nisshi"]
 CMD ["broker"]
