@@ -845,8 +845,13 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
                 .into_iter()
                 .map(|record| Record {
                     offset_delta: record.offset_delta + sink.last_offset_delta + 1,
-                    timestamp_delta: record.timestamp_delta
-                        + (batch.base_timestamp - sink.base_timestamp),
+                    // The difference of two bases can overflow, because nothing checks the
+                    // producer's `base_timestamp` on a `LogAppendTime` batch. Wrapping arithmetic
+                    // keeps each record's timestamp, the wrapping sum of the sink's base and the
+                    // new delta, equal to its timestamp before the merge.
+                    timestamp_delta: record
+                        .timestamp_delta
+                        .wrapping_add(batch.base_timestamp.wrapping_sub(sink.base_timestamp)),
                     ..record
                 })
                 .collect::<Vec<_>>(),
@@ -1671,9 +1676,10 @@ mod tests {
 
         Ok(())
     }
-    /// Returns a `LogAppendTime` batch of one record from [`PRODUCER_ID`], stamped at
-    /// `log_append_time`.
-    fn log_append_time_batch(log_append_time: i64) -> Result<deflated::Batch> {
+
+    /// Returns a `LogAppendTime` batch of one record from [`PRODUCER_ID`], with the producer's
+    /// `base_timestamp`, stamped at `log_append_time`.
+    fn log_append_time_batch(base_timestamp: i64, log_append_time: i64) -> Result<deflated::Batch> {
         inflated::Batch::builder()
             .attributes(
                 BatchAttribute::default()
@@ -1681,7 +1687,7 @@ mod tests {
                     .into(),
             )
             .producer_id(PRODUCER_ID)
-            .base_timestamp(log_append_time)
+            .base_timestamp(base_timestamp)
             .max_timestamp(log_append_time)
             .record(
                 Record::builder()
@@ -1691,6 +1697,24 @@ mod tests {
             .build()
             .and_then(TryInto::try_into)
             .map_err(Into::into)
+    }
+
+    /// Two `LogAppendTime` batches that the broker stamped at the same time merge into one, even
+    /// when the difference of their producers' base timestamps overflows an `i64`.
+    #[test]
+    fn log_append_time_batches_merge_at_the_extremes_of_base_timestamp() -> Result<()> {
+        const LOG_APPEND_TIME: i64 = 1_000;
+
+        let combined = combine(vec![
+            log_append_time_batch(i64::MAX, LOG_APPEND_TIME)?,
+            log_append_time_batch(i64::MIN, LOG_APPEND_TIME)?,
+        ])?
+        .expect("two batches merge into one");
+
+        assert_eq!(1, combined.last_offset_delta);
+        assert_eq!(LOG_APPEND_TIME, combined.max_timestamp);
+
+        Ok(())
     }
 
     /// Two `LogAppendTime` batches that the broker stamped at different times are written one at a
@@ -1710,14 +1734,14 @@ mod tests {
         let first_produce = spawn_produce(
             &batcher,
             &topition,
-            log_append_time_batch(FIRST_LOG_APPEND_TIME)?,
+            log_append_time_batch(FIRST_LOG_APPEND_TIME, FIRST_LOG_APPEND_TIME)?,
         );
         // Lets the first request join the queue before the second, so their order in it is fixed.
         yield_now().await;
         let second_produce = spawn_produce(
             &batcher,
             &topition,
-            log_append_time_batch(SECOND_LOG_APPEND_TIME)?,
+            log_append_time_batch(SECOND_LOG_APPEND_TIME, SECOND_LOG_APPEND_TIME)?,
         );
 
         // The clock is paused, so the batching timer fires only here. A request then flushes the
