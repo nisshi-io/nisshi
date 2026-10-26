@@ -168,7 +168,6 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
       LIBRDKAFKA_VERSION: ${{matrix.client.version}}
       POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-s3${{matrix.client.suffix}}.csv
@@ -176,7 +175,6 @@ jobs:
       RUST_LOG: warn
       STORAGE_ENGINE: s3://nisshi/
       STORAGE_FEATURES: dynostore
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -242,14 +240,12 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
       POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-s3.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn
       STORAGE_ENGINE: s3://nisshi/
       STORAGE_FEATURES: dynostore
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

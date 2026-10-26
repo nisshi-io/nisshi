@@ -421,14 +421,12 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
       # run.sh falls back to its pinned version when this is empty, and picks
       # the allowlist from the version
       LIBRDKAFKA_VERSION: ${{matrix.client.version}}
       POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-${{matrix.storage.name}}${{matrix.client.suffix}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -511,11 +509,9 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
       POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-${{matrix.storage.name}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -208,7 +208,8 @@ This starts PostgreSQL and the broker, which listens on `localhost:9092`.
 Compose publishes their ports on 127.0.0.1 only, so other computers can't connect.
 
 If PostgreSQL already runs on your computer, port 5432 is taken and the command
-fails with "port is already allocated". Publish the `db` service on another port:
+fails with "port is already allocated" or "address already in use". Publish the
+`db` service on another port:
 
 ```shell
 NISSHI_DB_PORTS=127.0.0.1:15432:5432 docker compose up -d nisshi
