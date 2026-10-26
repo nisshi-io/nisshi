@@ -1,4 +1,4 @@
-<!-- Features need an approved issue first. See CONTRIBUTING.md. Small fixes, typos and docs changes can go straight to a PR. -->
+<!-- Changes other than small fixes, typos and docs need an approved issue first. See CONTRIBUTING.md. -->
 
 ## What changes, and why?
 
