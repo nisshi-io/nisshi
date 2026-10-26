@@ -31,6 +31,15 @@ runs:
           ghcr.io/${{ github.repository }}
           ghcr.io/nisshi-io/nisshi
         tags: ${{ inputs.tags }}
+        # The labels that this step passes to build-push-action override the Dockerfile's, and
+        # metadata-action generates source, url, description and licenses from the GitHub
+        # repository. Set the Dockerfile's values here, and keep the two lists equal.
+        labels: |
+          org.opencontainers.image.source=https://github.com/nisshi-io/solace-nisshi
+          org.opencontainers.image.url=https://nisshi.io
+          org.opencontainers.image.documentation=https://docs.nisshi.io
+          org.opencontainers.image.description=A stateless Apache Kafka(R)-compatible broker with pluggable storage.
+          org.opencontainers.image.licenses=Apache-2.0
     - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       with:
         buildkitd-flags: --debug

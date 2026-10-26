@@ -23,6 +23,15 @@ RUN mkdir -p /image/schema /image/data /image/tmp /image/etc && cp -r /etc/ssl /
 
 FROM scratch
 ARG TARGETPLATFORM
+# docker/metadata-action generates title, description, url, source, version, created, revision
+# and licenses at publish time, and its labels override these. The labels input of
+# .github/actions/publish-image therefore sets source, url, documentation, description and
+# licenses again, and the two lists must stay equal.
+LABEL org.opencontainers.image.source="https://github.com/nisshi-io/solace-nisshi" \
+      org.opencontainers.image.url="https://nisshi.io" \
+      org.opencontainers.image.documentation="https://docs.nisshi.io" \
+      org.opencontainers.image.description="A stateless Apache Kafka(R)-compatible broker with pluggable storage." \
+      org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=base /image /
 # --chmod: the binary arrives via an Actions artifact, which drops the exec bit.
 COPY --chmod=755 dist/${TARGETPLATFORM}/nisshi /nisshi
