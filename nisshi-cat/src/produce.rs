@@ -18,7 +18,7 @@ use std::{
     marker::PhantomData,
 };
 
-use crate::{CONNECT_TIMEOUT, Error, Location, Result};
+use crate::{Error, Location, Result};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -335,7 +335,6 @@ impl Produce {
         debug!(?frame);
 
         let client = ConnectionManager::builder(self.configuration.broker.clone())
-            .connect_timeout(CONNECT_TIMEOUT)
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
@@ -459,13 +458,24 @@ impl Display for Produced {
     }
 }
 
+/// Returns `text` with each line break written as `\n` or `\r`. The text comes from the
+/// broker, and a line break in it would start a new line in the terminal, where it could pass
+/// for the confirmation line.
+fn escape_line_breaks(text: &str) -> String {
+    text.replace('\n', "\\n").replace('\r', "\\r")
+}
+
 /// Returns the broker's reason for rejecting the messages for `topic`, from the error
 /// message and the record errors in the partition's response. Returns `None` when the
 /// response has neither.
 fn rejection_reason(topic: &str, response: &PartitionProduceResponse) -> Option<String> {
     let record_errors = response.record_errors.iter().flatten().map(|record_error| {
         match record_error.batch_index_error_message.as_deref() {
-            Some(message) => format!("record {}: {message}", record_error.batch_index),
+            Some(message) => format!(
+                "record {}: {}",
+                record_error.batch_index,
+                escape_line_breaks(message)
+            ),
             None => format!("record {}", record_error.batch_index),
         }
     });
@@ -473,7 +483,7 @@ fn rejection_reason(topic: &str, response: &PartitionProduceResponse) -> Option<
     let reasons = response
         .error_message
         .iter()
-        .cloned()
+        .map(|message| escape_line_breaks(message))
         .chain(record_errors)
         .collect::<Vec<_>>();
 
@@ -789,6 +799,24 @@ mod tests {
             ),
             rejection_reason("greetings", &response)
         );
+    }
+
+    #[test]
+    fn rejection_reason_writes_line_breaks_from_the_broker_as_escapes() {
+        let response = rejected(
+            Some("bad\r\nProduced 1 message to taxi partition 0, offset 0."),
+            Some(vec![
+                BatchIndexAndErrorMessage::default()
+                    .batch_index(0)
+                    .batch_index_error_message(Some("a\nb".into())),
+            ]),
+        );
+
+        let reason = rejection_reason("greetings", &response).unwrap();
+
+        assert!(!reason.contains(['\n', '\r']), "{reason}");
+        assert!(reason.contains("bad\\r\\nProduced"), "{reason}");
+        assert!(reason.contains("record 0: a\\nb"), "{reason}");
     }
 
     #[test]

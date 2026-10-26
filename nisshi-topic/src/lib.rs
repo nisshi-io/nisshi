@@ -18,15 +18,8 @@ use std::{fmt, io, result};
 use create::Create;
 use delete::Delete;
 use nisshi_sans_io::ErrorCode;
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, sync::Arc};
 use url::Url;
-
-/// How long a command keeps trying to connect to the broker before it fails.
-///
-/// The client's default is 30 s, the default of Kafka's
-/// `socket.connection.setup.timeout.max.ms`. A command that a person runs uses a shorter limit,
-/// so that it reports a broker that isn't running within seconds.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::list::List;
 
@@ -90,60 +83,5 @@ impl Topic {
             Self::Delete(configuration) => Delete::try_from(configuration)?.main().await,
             Self::List(configuration) => List::try_from(configuration)?.main().await,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Error, Topic};
-    use std::{assert_matches, collections::HashMap, net::TcpListener, time::Duration};
-    use tokio::time::timeout;
-    use url::Url;
-
-    /// Returns the URL of a local port that nothing listens on.
-    fn closed_port() -> Url {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        Url::parse(&format!("tcp://127.0.0.1:{port}")).unwrap()
-    }
-
-    /// Asserts that `topic` fails to connect well within the client's default connect
-    /// timeout of 30 s, which shows that the command sets the shorter `CONNECT_TIMEOUT`.
-    async fn assert_stops_connecting_early(topic: Topic) {
-        assert_matches!(
-            timeout(Duration::from_secs(15), topic.main()).await,
-            Ok(Err(Error::Client(_)))
-        );
-    }
-
-    #[tokio::test]
-    async fn create_stops_connecting_after_the_connect_timeout() {
-        assert_stops_connecting_early(
-            Topic::create()
-                .broker(closed_port())
-                .name("greetings")
-                .partitions(1)
-                .config(HashMap::new())
-                .build(),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn delete_stops_connecting_after_the_connect_timeout() {
-        assert_stops_connecting_early(
-            Topic::delete()
-                .broker(closed_port())
-                .name("greetings")
-                .build(),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn list_stops_connecting_after_the_connect_timeout() {
-        assert_stops_connecting_early(Topic::list().broker(closed_port()).build()).await;
     }
 }

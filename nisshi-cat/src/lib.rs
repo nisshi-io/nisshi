@@ -17,7 +17,7 @@
 //!
 //! Fetch or Produce (with validation when backed by a schema) messages to a topic
 
-use std::{fmt, io, result, sync::Arc, time::Duration};
+use std::{fmt, io, result, sync::Arc};
 
 use consume::Consume;
 pub use location::Location;
@@ -30,13 +30,6 @@ mod location;
 mod produce;
 
 pub type Result<T, E = Error> = result::Result<T, E>;
-
-/// How long a command keeps trying to connect to the broker before it fails.
-///
-/// The client's default is 30 s, the default of Kafka's
-/// `socket.connection.setup.timeout.max.ms`. A command that a person runs uses a shorter limit,
-/// so that it reports a broker that isn't running within seconds.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -141,66 +134,5 @@ impl Builder {
 
     pub fn consume() -> consume::PhantomBuilder {
         consume::Builder::default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Cat, Error};
-    use std::{assert_matches, fs, net::TcpListener, process, time::Duration};
-    use tokio::time::timeout;
-    use url::Url;
-
-    /// Returns the URL of a local port that nothing listens on.
-    fn closed_port() -> Url {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        Url::parse(&format!("tcp://127.0.0.1:{port}")).unwrap()
-    }
-
-    /// Asserts that `cat` fails to connect well within the client's default connect timeout
-    /// of 30 s, which shows that the command sets the shorter `CONNECT_TIMEOUT`.
-    async fn assert_stops_connecting_early(cat: Cat) {
-        assert_matches!(
-            timeout(Duration::from_secs(15), cat.main()).await,
-            Ok(Err(Error::Client(_)))
-        );
-    }
-
-    #[tokio::test]
-    async fn produce_stops_connecting_after_the_connect_timeout() {
-        let file_name = std::env::temp_dir()
-            .join(format!("nisshi-cat-connect-timeout-{}.json", process::id()))
-            .to_string_lossy()
-            .into_owned();
-        fs::write(&file_name, r#"[{"value": "hello world"}]"#).unwrap();
-
-        assert_stops_connecting_early(
-            Cat::produce()
-                .broker(closed_port())
-                .topic("greetings")
-                .partition(0)
-                .schema_registry(None)
-                .file_name(file_name.clone())
-                .build(),
-        )
-        .await;
-
-        fs::remove_file(file_name).unwrap();
-    }
-
-    #[tokio::test]
-    async fn consume_stops_connecting_after_the_connect_timeout() {
-        assert_stops_connecting_early(
-            Cat::consume()
-                .broker(closed_port())
-                .topic("greetings")
-                .partition(0)
-                .schema_registry(None)
-                .build(),
-        )
-        .await;
     }
 }

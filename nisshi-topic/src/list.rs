@@ -17,7 +17,7 @@ use nisshi_sans_io::{ErrorCode, MetadataRequest, MetadataResponse};
 use tracing::debug;
 use url::Url;
 
-use crate::{CONNECT_TIMEOUT, Error, Result, Topic};
+use crate::{Error, Result, Topic};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B> {
@@ -59,7 +59,6 @@ impl TryFrom<Configuration> for List {
 impl List {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
         let client = ConnectionManager::builder(self.configuration.broker.clone())
-            .connect_timeout(CONNECT_TIMEOUT)
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await

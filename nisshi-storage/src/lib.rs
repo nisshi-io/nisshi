@@ -286,6 +286,14 @@ pub enum Error {
 
     Glob(Arc<GlobError>),
 
+    /// No storage factory registered with the builder accepts the `scheme` of the `storage` URL,
+    /// which has its credentials redacted. A build that leaves out the engine's feature has no
+    /// factory for it.
+    NoEngineForScheme {
+        scheme: String,
+        storage: String,
+    },
+
     /// The database records schema `recorded_version`, which a broker of `schema_version` can't
     /// use. Only a broker of `oldest_compatible_version` or later can use it.
     IncompatibleSchema {
@@ -2749,9 +2757,9 @@ impl Builder<i32, String, Url, Url> {
             })
             .cloned()
         else {
-            return Err(Error::FeatureNotEnabled {
-                feature: self.storage.scheme().into(),
-                message: redact_url(&self.storage).to_string(),
+            return Err(Error::NoEngineForScheme {
+                scheme: self.storage.scheme().into(),
+                storage: redact_url(&self.storage).to_string(),
             });
         };
 
@@ -3253,7 +3261,7 @@ mod tests {
         // No factories are registered on a bare `StorageContainer::builder()`
         // (those come from the storage backend crates, e.g.
         // `nisshi-storage-sql`), so this always falls into the
-        // `Error::FeatureNotEnabled` branch regardless of scheme, which used
+        // `Error::NoEngineForScheme` branch regardless of scheme, which used
         // to embed the raw, unredacted URL in its `message` field.
         let err = StorageContainer::builder()
             .node_id(1)
