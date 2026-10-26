@@ -665,7 +665,7 @@ Kafka 4.x negotiate down to those protocol versions. It is tested against the fo
 | [Kafka CLI smoke tests](nisshi-smoke-test) | the Apache Kafka command line tools | Kafka 3.7.2, 3.9.2 and 4.3.1 |
 
 The client suites run against the memory storage engine on every pull request. When changes
-are queued for merge, they also run against PostgreSQL and SQLite, without blocking the merge.
+are queued for merge, they also run against PostgreSQL and SQLite.
 When changes are queued for merge, the smoke tests run against PostgreSQL, SQLite, memory
 and S3 (S3 runs the topic lifecycle test only). The nightly run also runs both client suites
 against S3.

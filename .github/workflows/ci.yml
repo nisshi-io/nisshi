@@ -21,13 +21,12 @@ name: ci
 # cap; it keeps per-push runner time and queue time down. So:
 #
 # - Tier A runs on every pull_request push: fmt, clippy, typos, shellcheck,
-#   third-party-license, the single non-experimental leg of each compat
-#   suite, `test` on postgres:16 (the oldest version the project tests), and
-#   ci-gate.
+#   third-party-license, the memory leg of each compat suite, `test` on
+#   postgres:16 (the oldest version the project tests), and ci-gate.
 # - Tier B runs once per merge-queue entry (`merge_group`) and, trimmed, on
 #   push to main: the full build-storage/build-storage-lake matrix, `test` on
 #   postgres:16 again (Postgres 17, 18 and 19 run nightly in tier-c.yml), the
-#   experimental compat legs (postgres and sqlite; S3 compat runs nightly),
+#   postgres and sqlite compat legs (S3 compat runs nightly),
 #   cargo-publish-dry-run, src, release,
 #   macos, smoke, smoke-oldest-client, smoke-report.
 #
@@ -386,7 +385,9 @@ jobs:
     if: needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
     needs: [changes]
     runs-on: ${{matrix.os}}
-    timeout-minutes: 30
+    # The job takes 10 to 16 minutes. A slow Ubuntu mirror can add 13 minutes to the apt-get
+    # step, which brought blocking legs within 5 minutes of a 30-minute limit.
+    timeout-minutes: 45
     continue-on-error: ${{ matrix.storage.experimental || matrix.client.experimental == true }}
     strategy:
       # A failed leg must not cancel the others: the report compares each
@@ -395,14 +396,14 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        # Tier A runs the one non-experimental leg (memory); merge_group/push
+        # Tier A runs the memory leg; merge_group/push
         # run the three. compat-franz-go reuses this list as `*compat_storage`.
         storage: &compat_storage >-
           ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
-          {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": true},
-          {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": true}]') }}
+          {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": false},
+          {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": false}]') }}
         # The version pinned in run.sh, and the newest release on or before
         # Kafka 3.7.0: the oldest Kafka CLI tools that CI tests are 3.7, so
         # both are tested back to the same date. Tier A runs only the
@@ -496,7 +497,9 @@ jobs:
     timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
     strategy:
-      fail-fast: true
+      # A failed leg must not cancel the others: the report compares each
+      # engine's legs to tell which engines a regression affects.
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
