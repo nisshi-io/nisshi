@@ -1,6 +1,6 @@
 [package]
 name = "nisshi"
-description = "Apache Kafka compatible broker with S3, PostgreSQL, Apache Iceberg and Delta Lake"
+description = "Apache Kafka®-compatible broker with S3, PostgreSQL, Apache Iceberg and Delta Lake"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

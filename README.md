@@ -1,7 +1,7 @@
 <div align="center">
 
 # Nisshi (née Tansu) 🗃️
-stateless Kafka-compatible broker with pluggable storage (PostgreSQL, SQLite, S3, memory)
+stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, SQLite, S3, memory)
 
 <br>
 
@@ -25,14 +25,14 @@ stateless Kafka-compatible broker with pluggable storage (PostgreSQL, SQLite, S3
 
 # What is Nisshi?
 
-[Nisshi][github-com-nisshi-io] (née Tansu) is an Apache Kafka-compatible broker
+[Nisshi][github-com-nisshi-io] (née Tansu) is an Apache Kafka®-compatible broker
 with PostgreSQL, libSQL (SQLite), S3 or memory storage engines.
 Schema backed topics (Avro, JSON or Protocol buffers) can
 be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables.
 
 Features:
 
-- Apache Kafka API compatible
+- Apache Kafka®-compatible
 - Available with [PostgreSQL](https://www.postgresql.org), [libSQL](https://docs.turso.tech/libsql), [S3](https://en.wikipedia.org/wiki/Amazon_S3) or memory storage engines
 - Topics [validated](docs/schema-registry.md) by [JSON Schema][json-schema-org], [Apache Avro](https://avro.apache.org)
   or [Protocol buffers](protocol-buffers) can be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables
@@ -74,10 +74,10 @@ This README describes `main`, which can be ahead of the latest release. To read 
 
 Nisshi is a single statically linked binary containing the following:
 
-- **broker** an Apache Kafka API compatible broker and schema registry
+- **broker** an Apache Kafka®-compatible broker and schema registry
 - **topic** a CLI to create/delete Topics
 - **cat** a CLI to consume or produce Avro, JSON or Protobuf messages to a topic
-- **proxy** an Apache Kafka compatible proxy
+- **proxy** an Apache Kafka®-compatible proxy
 
 ## Install
 
@@ -133,10 +133,10 @@ Usage: nisshi [OPTIONS]
        nisshi <COMMAND>
 
 Commands:
-  broker  Apache Kafka compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
+  broker  Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
   cat     Easily consume or produce Avro, JSON or Protobuf messages to a topic
   topic   Create or delete topics managed by the broker
-  proxy   Apache Kafka compatible proxy
+  proxy   Apache Kafka®-compatible proxy
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -616,7 +616,7 @@ The `nisshi proxy` command runs a Kafka API proxy in front of an origin broker:
 
 ```shell
 nisshi proxy --help
-Apache Kafka compatible proxy
+Apache Kafka®-compatible proxy
 
 Usage: nisshi proxy [OPTIONS]
 
@@ -649,6 +649,29 @@ reach the proxy listener gets the proxy's access to the origin.
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not
 forward them to the origin. So a client configured for SASL fails to connect.
+
+## Compatibility
+
+Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Kafka message
+descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). It is tested against
+the following in CI:
+
+| Suite | What runs | Version |
+| --- | --- | --- |
+| [librdkafka](compat/librdkafka) | the librdkafka integration test suite | v2.14.2, and v2.3.0 when changes are queued for merge (not blocking) |
+| [franz-go](compat/franz-go) | the franz-go `kgo` integration test suite | v1.21.3 |
+| [Kafka CLI smoke tests](nisshi-smoke-test) | the Apache Kafka command line tools | Kafka 3.7.2, 3.9.2 and 4.3.1 |
+
+The client suites run against the memory storage engine on every pull request. When changes
+are queued for merge, they also run against PostgreSQL and SQLite, without blocking the merge.
+The smoke tests run against PostgreSQL, SQLite, memory and S3 (S3 runs the topic lifecycle test
+only).
+
+Each client suite runs only the tests listed in its allowlist file. Known client gaps are
+recorded in [librdkafka/FINDINGS.md](compat/librdkafka/FINDINGS.md) and
+[franz-go/FINDINGS.md](compat/franz-go/FINDINGS.md), which cover the memory engine only. A smoke
+test that fails because of an open bug is marked ignored in the suite. Please
+[raise an issue][nisshi-issues] if a client or Kafka version you rely on behaves differently.
 
 ## Feedback
 

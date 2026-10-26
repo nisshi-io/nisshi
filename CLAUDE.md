@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Nisshi is a stateless, Apache Kafka-compatible broker written in Rust. It is a drop-in replacement for Apache Kafka with pluggable storage backends: PostgreSQL, libSQL (SQLite), S3/object store, and memory. Schema-backed topics (Avro, JSON Schema, Protocol Buffers) can be written as Apache Iceberg or Delta Lake tables.
+Nisshi is a stateless, Apache Kafka®-compatible broker written in Rust, with pluggable storage backends: PostgreSQL, libSQL (SQLite), S3/object store, and memory. Schema-backed topics (Avro, JSON Schema, Protocol Buffers) can be written as Apache Iceberg or Delta Lake tables.
 
 - Rust edition 2024, toolchain pinned to 1.98 (`rust-toolchain.toml`)
 - License: Apache-2.0
@@ -81,7 +81,7 @@ Cargo workspace (members, including the `fuzz` harness, are listed in the root `
 | `nisshi-generator` | CLI: generate fake data for schema-backed topics |
 | `nisshi-otel` | OpenTelemetry common configuration |
 | `nisshi-perf` | CLI: performance producer/consumer |
-| `nisshi-proxy` | Kafka API-compatible proxy |
+| `nisshi-proxy` | Apache Kafka®-compatible proxy |
 | `nisshi-topic` | CLI: create, list, delete topics |
 
 ### Sans-I/O Code Generation (`nisshi-sans-io`)
