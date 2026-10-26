@@ -99,14 +99,6 @@ Options:
           Storage engine examples are: postgres://postgres:postgres@localhost, memory://nisshi/ or s3://nisshi/ [env: STORAGE_ENGINE=s3://nisshi/] [default: memory://nisshi/]
       --schema-registry <SCHEMA_REGISTRY>
           Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=file://./etc/schema]
-      --data-lake <DATA_LAKE>
-          Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/ [env: DATA_LAKE=s3://lake/]
-      --iceberg-catalog <ICEBERG_CATALOG>
-          Apache Iceberg Catalog, examples are: http://localhost:8181/ [env: ICEBERG_CATALOG=http://localhost:8181/]
-      --iceberg-namespace <ICEBERG_NAMESPACE>
-          Iceberg namespace [env: ICEBERG_NAMESPACE=] [default: nisshi]
-      --prometheus-listener-url <PROMETHEUS_LISTENER_URL>
-          Broker metrics can be scraped by Prometheus from this URL [env: PROMETHEUS_LISTENER_URL=tcp://0.0.0.0:9100] [default: tcp://[::]:9100]
   -h, --help
           Print help
   -V, --version
@@ -121,7 +113,7 @@ If an Apache Avro, Protobuf or JSON schema has been assigned to a topic, the
 broker will reject any messages that are invalid. Schema backed topics are written
 as Apache Parquet when the broker runs with the `parquet` subcommand, for example
 `nisshi broker --schema-registry file://./etc/schema parquet --location file://./lake`
-(or with `DATA_LAKE` set). A `file://` location must be an existing directory.
+(`--location` can also come from `DATA_LAKE`). A `file://` location must be an existing directory.
 The `iceberg` and `delta` subcommands write Apache Iceberg and Delta Lake tables;
 run `nisshi broker iceberg --help` or `nisshi broker delta --help` for their options.
 
