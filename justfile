@@ -541,13 +541,13 @@ taxi-topic-populate: (cat-produce "taxi" "etc/data/trips.json")
 taxi-topic-consume: (cat-consume "taxi")
 
 # create taxi topic with generated fields with schema etc/schema/taxi.proto
-taxi-topic-create: (topic-create "taxi" "--partitions=1" "--config=tansu.lake.normalize=true" "--config=tansu.lake.partition=meta.day" "--config=tansu.lake.z_order=vendor_id" "--config=tansu.lake.sink=true" "--config=tansu.batch=true" "--config=tansu.batch.max_records=200" "--config=tansu.batch.timeout_ms=1000")
+taxi-topic-create: (topic-create "taxi" "--partitions=1" "--config=nisshi.lake.normalize=true" "--config=nisshi.lake.partition=meta.day" "--config=nisshi.lake.z_order=vendor_id" "--config=nisshi.lake.sink=true" "--config=nisshi.batch=true" "--config=nisshi.batch.max_records=200" "--config=nisshi.batch.timeout_ms=1000")
 
 # create taxi topic with schema etc/schema/taxi.proto
-taxi-topic-create-plain: (topic-create "taxi" "--partitions" "1" "--config" "tansu.lake.sink=true")
+taxi-topic-create-plain: (topic-create "taxi" "--partitions" "1" "--config" "nisshi.lake.sink=true")
 
 # create taxi topic with a flattened schema etc/schema/taxi.proto
-taxi-topic-create-normalize: (topic-create "taxi" "--partitions" "1" "--config" "tansu.lake.sink=true" "--config" "tansu.lake.normalize=true" "--config" "tansu.lake.normalize.separator=_" "--config" "tansu.lake.z_order=value_vendor_id")
+taxi-topic-create-normalize: (topic-create "taxi" "--partitions" "1" "--config" "nisshi.lake.sink=true" "--config" "nisshi.lake.normalize=true" "--config" "nisshi.lake.normalize.separator=_" "--config" "nisshi.lake.z_order=value_vendor_id")
 
 taxi-topic-generator: (generator "taxi" "--broker=tcp://localhost:9092" "--per-second=10" "--producers=16" "--batch-size=1" "--duration-seconds=60")
 
@@ -570,7 +570,7 @@ employee-produce: (cat-produce "employee" "etc/data/employees.json")
 employee-duckdb-delta: (duckdb "\"select * from delta_scan('s3://lake/nisshi.employee');\"")
 
 # create customer topic with schema etc/schema/customer.proto
-customer-topic-create *args: (topic-create "customer" "--partitions=1" "--config=tansu.lake.normalize=true" "--config=tansu.lake.partition=meta.day" "--config=tansu.lake.sink=true" "--config=tansu.batch=true" "--config=tansu.batch.max_records=200" "--config=tansu.batch.timeout_ms=1000" args)
+customer-topic-create *args: (topic-create "customer" "--partitions=1" "--config=nisshi.lake.normalize=true" "--config=nisshi.lake.partition=meta.day" "--config=nisshi.lake.sink=true" "--config=nisshi.batch=true" "--config=nisshi.batch.max_records=200" "--config=nisshi.batch.timeout_ms=1000" args)
 
 customer-topic-generator *args: (generator "customer" args)
 
@@ -760,7 +760,7 @@ producer-perf-1000000: (producer-perf "1000000" "1024" "25000000")
 ps-nisshi-rss:
     ps -p $(pgrep nisshi) -o rss= | awk '{print $1/1024 " MB"}'
 
-telemetry-topic-create: (topic-create "telemetry" "--config" "tansu.virtual=true")
+telemetry-topic-create: (topic-create "telemetry" "--config" "nisshi.virtual=true")
 
 telemetry-produce-valid profile="dev":
     echo '{"key": "SK06 YPM", "value": {"latitude":52.930412156530465,"longitude":-4.894550244518114,"altitude":158.06766871179406}}' | target/{{ replace(profile, "dev", "debug") }}/nisshi cat produce telemetry

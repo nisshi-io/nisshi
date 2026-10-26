@@ -1,6 +1,6 @@
 [package]
 name = "nisshi-cli"
-description = "Tansu CLI"
+description = "Nisshi CLI"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

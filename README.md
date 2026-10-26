@@ -37,6 +37,8 @@ Features:
 - Topics [validated](docs/schema-registry.md) by [JSON Schema][json-schema-org], [Apache Avro](https://avro.apache.org)
   or [Protocol buffers](protocol-buffers) can be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables
 
+Nisshi settings for a topic are listed in [topic configuration](docs/topic-configuration.md).
+
 See [examples using pyiceberg](https://github.com/nisshi-io/example-pyiceberg), [examples using Apache Spark](https://github.com/nisshi-io/example-spark) or 🆕 [examples using Delta Lake](https://github.com/nisshi-io/example-delta-lake).
 
 Storage engines:

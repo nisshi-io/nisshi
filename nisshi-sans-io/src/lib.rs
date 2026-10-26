@@ -130,6 +130,7 @@ pub mod record;
 pub mod resource;
 pub mod ser;
 pub mod topic;
+pub mod topic_config;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 pub use de::Decoder;

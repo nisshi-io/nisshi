@@ -23,6 +23,7 @@ use std::{
     vec::IntoIter,
 };
 
+use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     Ack, ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -296,7 +297,7 @@ where
                 .iter()
                 .filter_map(|topic_name| {
                     self.resource_config
-                        .get(topic_name, "tansu.batch.timeout_ms")
+                        .get(topic_name, topic_config::BATCH_TIMEOUT_MS)
                         .and_then(|value| value.as_u64())
                 })
                 .min()
@@ -308,7 +309,7 @@ where
             .iter()
             .filter_map(|topic_name| {
                 self.resource_config
-                    .get(topic_name, "tansu.batch.max_records")
+                    .get(topic_name, topic_config::BATCH_MAX_RECORDS)
                     .and_then(|value| value.as_usize())
             })
             .min()
@@ -1121,6 +1122,46 @@ mod tests {
                 .into(),
             ))
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_timeout_key_and_its_alias_hold_a_batch_for_the_same_time() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        for timeout_key in ["tansu.batch.timeout_ms", "nisshi.batch.timeout_ms"] {
+            let mock = MockProduceService::default();
+
+            let configuration = ResourceConfig::default();
+            configuration.put("a", timeout_key, "5000")?;
+
+            let bp = (BatchProduceLayer::new(configuration)).into_layer(mock.clone());
+
+            let _batch = tokio::spawn({
+                let bp = bp.clone();
+
+                async move {
+                    bp.serve(produce_request("a", b"foo").map(Into::into)?)
+                        .await
+                }
+            });
+
+            yield_now().await;
+            advance(Duration::from_secs(1)).await;
+            yield_now().await;
+
+            let len = mock.reqs.lock().map(|guard| guard.len()).expect("poison");
+            assert_eq!(0, len, "{timeout_key} should hold the batch");
+
+            // The default batch timeout is 10 seconds, so a request sent after 6 seconds
+            // shows that the 5 second timeout applies.
+            advance(Duration::from_secs(5)).await;
+            yield_now().await;
+
+            let len = mock.reqs.lock().map(|guard| guard.len()).expect("poison");
+            assert_eq!(1, len, "{timeout_key} should release the batch");
+        }
+
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
