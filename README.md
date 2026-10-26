@@ -56,6 +56,10 @@ PostgreSQL can stream transaction logs to an archive with
 
 Nisshi OSS is provided as-is, with community support only.
 
+## Get Started
+
+To download a release, start the broker, and send your first message, see [Get Started with Nisshi](docs/quickstart.md).
+
 ## Which release to use
 
 [![Latest release](https://img.shields.io/github/v/release/nisshi-io/nisshi?label=latest%20release)][nisshi-latest-release]
