@@ -15,7 +15,8 @@ vulnerability.
 
 **Preferred:** use [GitHub private vulnerability reporting][private-vuln]
 (Security tab, then Report a vulnerability). It creates a private advisory
-that only the maintainers can see until a fix is ready.
+that only the maintainers and repository administrators can see until a
+fix is ready.
 
 **Fallback:** if you don't have a GitHub account, email
 [support@solace.com](mailto:support@solace.com). Use this address for
