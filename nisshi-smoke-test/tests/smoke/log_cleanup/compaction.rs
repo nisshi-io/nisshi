@@ -23,12 +23,19 @@
 
 #![cfg(any(feature = "postgres", feature = "sqlite"))]
 
-use std::time::Duration;
+use std::{thread, time::Duration};
 
 use nisshi_smoke_test::{Broker, KafkaCli, PRINTED_NULL, polling};
 
 /// How long a test waits for a maintenance run to give the result it expects.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a record lives in a topic with [`SHORT_RETENTION`]. It is longer than a test takes to
+/// check a newer record after the older ones expire, so the newer record is still there.
+const SHORT_RETENTION_PERIOD: Duration = Duration::from_secs(30);
+
+/// The `retention.ms` of [`SHORT_RETENTION_PERIOD`], which must change with it.
+const SHORT_RETENTION: &str = "retention.ms=30000";
 
 /// A record that a partition holds: its offset, and its key and value as the console consumer
 /// prints them.
@@ -153,14 +160,13 @@ fn compact_delete_policy_compacts_and_deletes_expired_records() {
     let cli = KafkaCli::new(broker.bootstrap());
     let topic = cli
         .topics()
-        .create_unique(1, &["cleanup.policy=compact,delete", "retention.ms=600000"]);
-    let an_hour_ago = cli.now_in_millis() - 3_600_000;
-    // Each record has a key of its own, `0` and `1`, because Kafka refuses a record without a key
-    // on a compacted topic.
-    let produced = cli
-        .verifiable_producer()
-        .produce_created_at(&topic, 2, an_hour_ago, 0, Some(2));
-    assert_eq!(produced.acknowledged_record_count(), 2, "{produced}");
+        .create_unique(1, &["cleanup.policy=compact,delete", SHORT_RETENTION]);
+    _ = cli
+        .console_producer()
+        .produce_keyed(&topic, &[("old-0", Some("v0")), ("old-1", Some("v1"))]);
+    // The test waits for the records to expire instead of producing them with an old timestamp,
+    // because the broker can also count a record's age from the time that it stored the record.
+    thread::sleep(SHORT_RETENTION_PERIOD);
     _ = cli
         .console_producer()
         .produce_keyed(&topic, &[("new", Some("v2")), ("new", Some("v3"))]);
