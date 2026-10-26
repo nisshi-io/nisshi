@@ -47,7 +47,7 @@ pub struct Builder<B, T, P, S, F> {
     partition: P,
     schema_registry: S,
     file_name: F,
-    silent: bool,
+    confirm: bool,
 }
 
 pub(crate) type PhantomBuilder = Builder<
@@ -66,7 +66,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
@@ -77,7 +77,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
@@ -88,7 +88,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
@@ -99,7 +99,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry,
             file_name: self.file_name,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
@@ -110,12 +110,13 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
-    pub fn silent(self, silent: bool) -> Builder<B, T, P, S, F> {
-        Self { silent, ..self }
+    /// Print a confirmation line to stdout on success. Off by default, so a library caller gets no output.
+    pub fn confirm(self, confirm: bool) -> Builder<B, T, P, S, F> {
+        Self { confirm, ..self }
     }
 }
 
@@ -127,7 +128,7 @@ impl Builder<Url, String, i32, Option<Url>, String> {
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
-            silent: self.silent,
+            confirm: self.confirm,
         }))
     }
 }
@@ -139,7 +140,7 @@ pub struct Configuration {
     pub partition: i32,
     pub schema_registry: Option<Url>,
     pub file_name: String,
-    pub silent: bool,
+    pub confirm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -339,7 +340,7 @@ impl Produce {
 
         let error_code = ErrorCode::try_from(*error_code)?;
 
-        if error_code == ErrorCode::None && !self.configuration.silent {
+        if error_code == ErrorCode::None && self.configuration.confirm {
             let produced = Produced {
                 topic: self.configuration.topic,
                 partition: self.configuration.partition,

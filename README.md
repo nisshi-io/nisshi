@@ -244,7 +244,7 @@ Created topic taxi with 3 partitions.
 `nisshi topic create` and `nisshi cat produce` exit with status 0 on success,
 and with a non-zero status on failure. A script that only checks the exit
 status can pass `--silent`, so that the command prints no confirmation line.
-Warnings and errors still print.
+Errors still print.
 
 ## cat
 

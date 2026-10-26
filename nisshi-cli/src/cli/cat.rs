@@ -43,7 +43,7 @@ pub(super) enum Command {
         #[arg(long, env = "SCHEMA_REGISTRY")]
         schema_registry: Option<Url>,
 
-        /// Print no confirmation on success (warnings and errors still print)
+        /// Print no confirmation on success (errors still print)
         #[arg(long)]
         silent: bool,
     },
@@ -104,7 +104,7 @@ impl From<Command> for Cat {
                 .partition(partition)
                 .schema_registry(schema_registry)
                 .file_name(file)
-                .silent(silent)
+                .confirm(!silent)
                 .build(),
 
             Command::Consume {

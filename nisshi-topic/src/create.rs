@@ -37,7 +37,7 @@ pub struct Builder<B, N, P> {
     name: N,
     partitions: P,
     configs: HashMap<String, String>,
-    silent: bool,
+    confirm: bool,
 }
 
 impl<B, N, P> Builder<B, N, P> {
@@ -47,7 +47,7 @@ impl<B, N, P> Builder<B, N, P> {
             name: self.name,
             partitions: self.partitions,
             configs: self.configs,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
@@ -57,7 +57,7 @@ impl<B, N, P> Builder<B, N, P> {
             name: name.into(),
             partitions: self.partitions,
             configs: self.configs,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
@@ -67,7 +67,7 @@ impl<B, N, P> Builder<B, N, P> {
             name: self.name,
             partitions,
             configs: self.configs,
-            silent: self.silent,
+            confirm: self.confirm,
         }
     }
 
@@ -75,8 +75,9 @@ impl<B, N, P> Builder<B, N, P> {
         Self { configs, ..self }
     }
 
-    pub fn silent(self, silent: bool) -> Builder<B, N, P> {
-        Self { silent, ..self }
+    /// Print a confirmation line to stdout on success. Off by default, so a library caller gets no output.
+    pub fn confirm(self, confirm: bool) -> Builder<B, N, P> {
+        Self { confirm, ..self }
     }
 }
 
@@ -87,7 +88,7 @@ impl Builder<Url, String, i32> {
             name: self.name,
             partitions: self.partitions,
             configs: self.configs,
-            silent: self.silent,
+            confirm: self.confirm,
         })
     }
 }
@@ -98,7 +99,7 @@ pub struct Configuration {
     name: String,
     partitions: i32,
     configs: HashMap<String, String>,
-    silent: bool,
+    confirm: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,7 +168,7 @@ impl Create {
 
         let error_code = ErrorCode::try_from(error_code)?;
 
-        if error_code == ErrorCode::None && !self.configuration.silent {
+        if error_code == ErrorCode::None && self.configuration.confirm {
             // A response before version 5 omits the partition count, and a request may leave the
             // count to the broker with -1, so the line names the count only when one is positive.
             let partitions = num_partitions

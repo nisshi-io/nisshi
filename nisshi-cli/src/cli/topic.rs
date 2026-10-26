@@ -41,7 +41,7 @@ pub(super) enum Command {
         #[arg(long, value_parser = parse_key_val::<String, String>)]
         config: Vec<(String, String)>,
 
-        /// Print no confirmation on success (warnings and errors still print)
+        /// Print no confirmation on success (errors still print)
         #[arg(long)]
         silent: bool,
     },
@@ -79,7 +79,7 @@ impl From<Command> for Topic {
                 .name(name)
                 .partitions(partitions)
                 .config(HashMap::from_iter(config))
-                .silent(silent)
+                .confirm(!silent)
                 .build(),
 
             Command::Delete { broker, name } => Topic::delete().broker(broker).name(name).build(),
