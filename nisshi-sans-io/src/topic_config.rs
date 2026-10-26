@@ -25,7 +25,10 @@
 use std::{
     borrow::Cow,
     collections::HashSet,
-    sync::{LazyLock, Mutex, PoisonError},
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use tracing::warn;
@@ -163,7 +166,7 @@ impl Key {
 /// sets those.
 #[derive(Debug, Default)]
 pub struct AliasWarnings {
-    warned: Mutex<HashSet<&'static str>>,
+    warned: [AtomicBool; KEYS.len()],
 }
 
 impl AliasWarnings {
@@ -247,11 +250,17 @@ impl AliasWarnings {
     }
 
     fn warn(&self, key: &Key) {
-        let first_use = self
-            .warned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key.canonical);
+        let Some(index) = KEYS
+            .iter()
+            .position(|registered| registered.canonical == key.canonical)
+        else {
+            return;
+        };
+
+        // The load keeps the steady state, where the alias has warned already, free of
+        // a write that every connection would contend for.
+        let first_use = !self.warned[index].load(Ordering::Relaxed)
+            && !self.warned[index].swap(true, Ordering::Relaxed);
 
         if first_use {
             let deprecated = if key.family {
