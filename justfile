@@ -279,7 +279,7 @@ docker-run-postgres:
         --publish 5432:5432 \
         --env PGUSER=postgres \
         --env POSTGRES_PASSWORD=postgres \
-        postgres:16.4
+        postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
 
 docker-prune:
     docker system prune --force
@@ -423,13 +423,13 @@ nisshi-server:
     target/debug/nisshi broker --schema-registry file://./etc/schema 2>&1 | tee broker.log
 
 kafka39:
-    docker run --d -p 9092:9092 apache/kafka:3.9.0
+    docker run --d -p 9092:9092 apache/kafka:3.9.0@sha256:fbc7d7c428e3755cf36518d4976596002477e4c052d1f80b5b9eafd06d0fff2f
 
 proxy-kafka39:
-    docker run --rm -p 19092:9092 apache/kafka:3.9.0
+    docker run --rm -p 19092:9092 apache/kafka:3.9.0@sha256:fbc7d7c428e3755cf36518d4976596002477e4c052d1f80b5b9eafd06d0fff2f
 
 proxy-kafka41:
-    docker run --rm -p 19092:9092 apache/kafka:4.1.0
+    docker run --rm -p 19092:9092 apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
 
 codespace-create:
     gh codespace create \

@@ -1,7 +1,7 @@
 ---
 services:
   grafana:
-    image: grafana/grafana:11.5.1
+    image: grafana/grafana:11.5.1@sha256:5781759b3d27734d4d548fcbaf60b1180dbf4290e708f01f292faa6ae764c5e6
     ports:
       - 3000:3000
     environment:
@@ -21,7 +21,7 @@ services:
       - grafana:/var/lib/grafana
     pull_policy: missing
   db:
-    image: ${POSTGRES_IMAGE:-postgres:18}
+    image: ${POSTGRES_IMAGE:-postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336}
     environment:
       PGUSER: postgres
       POSTGRES_PASSWORD: postgres
@@ -83,7 +83,7 @@ services:
     # Jaeger v1 (jaegertracing/all-in-one) is end of life. Jaeger v2 ships
     # under a different image name, jaegertracing/jaeger, so a move to v2
     # needs more than a tag bump.
-    image: jaegertracing/all-in-one:1.76.0
+    image: jaegertracing/all-in-one:1.76.0@sha256:ab6f1a1f0fb49ea08bcd19f6b84f6081d0d44b364b6de148e1798eb5816bacac
     ports:
       - 16686:16686
       - 4317:4317
@@ -91,7 +91,7 @@ services:
       - 5778:5778
       - 9411:9411
   prometheus:
-    image: prom/prometheus:v3.1.0
+    image: prom/prometheus:v3.1.0@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
     ports:
       - 9090:9090
     command: --web.enable-otlp-receiver

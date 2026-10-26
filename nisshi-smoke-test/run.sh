@@ -196,7 +196,7 @@ cargo nextest run -p nisshi-smoke-test --features "${engine}" --no-run
 
 # The image of a PostgreSQL server that a test starts for itself. It is the
 # image of the db service.
-export NISSHI_SMOKE_POSTGRES_IMAGE=${POSTGRES_IMAGE:-postgres:17}
+export NISSHI_SMOKE_POSTGRES_IMAGE=${POSTGRES_IMAGE:-postgres:18}
 
 # The directory of the files that reserve ports for brokers and PostgreSQL
 # servers. Every run of the same user shares it. Each user has their own,

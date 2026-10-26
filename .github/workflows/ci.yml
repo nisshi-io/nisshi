@@ -196,7 +196,7 @@ jobs:
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
-      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
+      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4
       NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
@@ -426,6 +426,7 @@ jobs:
       # run.sh falls back to its pinned version when this is empty, and picks
       # the allowlist from the version
       LIBRDKAFKA_VERSION: ${{matrix.client.version}}
+      POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-${{matrix.storage.name}}${{matrix.client.suffix}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
       NISSHI_IMAGE: hello-world
@@ -435,7 +436,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -512,6 +513,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
+      POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-${{matrix.storage.name}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
       NISSHI_IMAGE: hello-world
@@ -521,7 +523,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -684,6 +686,7 @@ jobs:
     timeout-minutes: 30
     env:
       KAFKA_IMAGE: ${{matrix.kafka}}
+      POSTGRES_IMAGE: postgres:18
       RUST_BACKTRACE: 1
       RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
       STORAGE: ${{matrix.storage}}
@@ -699,7 +702,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && env.POSTGRES_IMAGE || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -767,6 +770,7 @@ jobs:
     timeout-minutes: 30
     env:
       KAFKA_IMAGE: apache/kafka:3.7.2
+      POSTGRES_IMAGE: postgres:18
       RUST_BACKTRACE: 1
       RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
       STORAGE: ${{matrix.storage}}
@@ -782,7 +786,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && env.POSTGRES_IMAGE || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0

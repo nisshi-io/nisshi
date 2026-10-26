@@ -77,7 +77,7 @@ jobs:
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
-      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
+      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4
       NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
@@ -171,6 +171,7 @@ jobs:
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
       LIBRDKAFKA_VERSION: ${{matrix.client.version}}
+      POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-s3${{matrix.client.suffix}}.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn
@@ -183,7 +184,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -243,6 +244,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
       LAKEKEEPER_IMAGE: unused
+      POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-s3.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn
@@ -255,7 +257,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0

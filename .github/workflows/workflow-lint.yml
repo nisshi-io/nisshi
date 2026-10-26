@@ -39,10 +39,25 @@ jobs:
       # Installed directly (not via a reporting wrapper action) so the job's
       # own exit code is what gates the merge; a wrapper that posts to the
       # Checks API would need `checks: write`, which this workflow doesn't
-      # grant and shouldn't need to just run a linter.
-      - run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      # grant and shouldn't need to just run a linter. The release archive
+      # is pinned by version and by the SHA-256 recorded below (copied from
+      # the release's actionlint_<version>_checksums.txt), so a moved tag or
+      # a replaced asset fails the job instead of changing what runs. Update
+      # both values together.
+      - name: Install actionlint (pinned version, checksum-verified)
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
       - run: |
-          "$(go env GOPATH)/bin/actionlint"
+          "$RUNNER_TEMP/actionlint/actionlint"
       # The `changes` jobs run the base branch's copy of ci-changes.sh, so a
       # PR's edit to it is only tested here.
       - run: bash .github/scripts/ci-changes.test.sh
