@@ -65,9 +65,17 @@ fn log_filter_from<S: Subscriber>(rust_log: Option<&str>) -> Result<impl Filter<
         .with_default_directive(LevelFilter::WARN.into())
         .parse_lossy(rust_log.unwrap_or_default());
 
-    Ok(env.and(filter_fn(|metadata| {
+    // A `filter_fn` has no max level hint, and `And` takes the lesser of its
+    // two hints, so without one here the combined filter reports none. `init`
+    // passes that hint to `LogTracer` as the `log` crate's max level, and
+    // `log` records would then all reach the `EnvFilter`. TRACE tells `And`
+    // that this filter limits nothing by level, so the `EnvFilter`'s hint wins.
+    let reqsign_core_cap = filter_fn(|metadata| {
         !(is_reqsign_core(metadata.target()) && *metadata.level() > Level::INFO)
-    })))
+    })
+    .with_max_level_hint(LevelFilter::TRACE);
+
+    Ok(env.and(reqsign_core_cap))
 }
 
 /// Whether `target` is the `reqsign_core` crate or one of its modules.
@@ -209,6 +217,27 @@ mod tests {
         for rust_log in [None, Some(""), Some("warn"), Some("error")] {
             let info = with_filter(rust_log, || enabled!(target: "reqsign_core", Level::INFO))?;
             assert_matches!(info, false);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn max_level_hint_follows_the_env_filter() -> Result<()> {
+        for (rust_log, expected) in [
+            (None, LevelFilter::WARN),
+            (Some("debug"), LevelFilter::DEBUG),
+            (Some("warn,nisshi_broker=debug"), LevelFilter::DEBUG),
+        ] {
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(log_filter_from(rust_log)?),
+            );
+            assert_eq!(
+                Subscriber::max_level_hint(&subscriber),
+                Some(expected),
+                "{rust_log:?}"
+            );
         }
         Ok(())
     }
