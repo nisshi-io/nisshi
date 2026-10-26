@@ -547,8 +547,7 @@ impl Engine {
             )
             .await?;
 
-        let columns =
-            ResultColumns::new(watermark_select_for_write::LITE_QUERY, rows.column_names());
+        let columns = ResultColumns::turso(watermark_select_for_write::LITE_QUERY, &rows);
         let low = columns.index(watermark_select_for_write::LOW)?;
         let high = columns.index(watermark_select_for_write::HIGH)?;
         let max_message_bytes = columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)?;
@@ -2986,7 +2985,7 @@ impl Storage for Engine {
             )
             .await?;
 
-        let columns = ResultColumns::new(consumer_group_select::QUERY, rows.column_names());
+        let columns = ResultColumns::turso(consumer_group_select::QUERY, &rows);
         let name = columns.index(consumer_group_select::NAME)?;
         let detail = columns.index(consumer_group_select::DETAIL)?;
 

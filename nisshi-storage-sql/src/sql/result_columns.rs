@@ -24,8 +24,25 @@ pub(crate) struct ResultColumns {
 }
 
 impl ResultColumns {
-    pub(crate) fn new(query: &'static str, names: Vec<String>) -> Self {
+    fn new(query: &'static str, names: Vec<String>) -> Self {
         Self { query, names }
+    }
+
+    /// Returns the column names of `rows`, libSQL's result of `query`.
+    #[cfg(feature = "libsql")]
+    pub(crate) fn libsql(query: &'static str, rows: &libsql::Rows) -> Self {
+        Self::new(
+            query,
+            (0..rows.column_count())
+                .map(|index| rows.column_name(index).unwrap_or_default().to_owned())
+                .collect(),
+        )
+    }
+
+    /// Returns the column names of `rows`, Turso's result of `query`.
+    #[cfg(feature = "turso")]
+    pub(crate) fn turso(query: &'static str, rows: &turso::Rows) -> Self {
+        Self::new(query, rows.column_names())
     }
 
     /// Returns the index of the column `name`, or an error if the result has no such column.

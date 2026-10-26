@@ -746,12 +746,7 @@ impl Delegate {
             )
             .await?;
 
-        let columns = ResultColumns::new(
-            watermark_select_for_write::LITE_QUERY,
-            (0..rows.column_count())
-                .map(|index| rows.column_name(index).unwrap_or_default().to_owned())
-                .collect(),
-        );
+        let columns = ResultColumns::libsql(watermark_select_for_write::LITE_QUERY, &rows);
         let low = columns.index(watermark_select_for_write::LOW)? as i32;
         let high = columns.index(watermark_select_for_write::HIGH)? as i32;
         let max_message_bytes =
@@ -4240,12 +4235,7 @@ impl Storage for Delegate {
             .query(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let columns = ResultColumns::new(
-            consumer_group_select::QUERY,
-            (0..rows.column_count())
-                .map(|index| rows.column_name(index).unwrap_or_default().to_owned())
-                .collect(),
-        );
+        let columns = ResultColumns::libsql(consumer_group_select::QUERY, &rows);
         let name = columns.index(consumer_group_select::NAME)? as i32;
         let detail = columns.index(consumer_group_select::DETAIL)? as i32;
 
