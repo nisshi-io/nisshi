@@ -52,13 +52,9 @@ spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the maintainers in either of two ways:
-
-- **Preferred:** use GitHub's private reporting on this repository (the
-  Security tab). Only the repository's maintainers can see these reports.
-- **Fallback:** email support@solace.com. This is the inbox of the Solace
-  support team. The support team can read your report, and they will
-  contact the maintainers about it.
+reported to the maintainers by emailing support@solace.com. This is the inbox
+of the Solace support team. The support team can read your report, and they
+will contact the maintainers about it.
 
 If your report concerns a maintainer or someone who handles that inbox,
 contact any other maintainer listed in
