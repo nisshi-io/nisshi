@@ -16,8 +16,6 @@ stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, S
 &nbsp;
 <br>
 [![GitHub stars](https://img.shields.io/github/stars/nisshi-io/nisshi?style=social)](https://github.com/nisshi-io/nisshi)
-&nbsp;
-[![Bluesky](https://img.shields.io/bluesky/followers/nisshi.io)](https://bsky.app/profile/tansu.io)
 
 <br>
 
