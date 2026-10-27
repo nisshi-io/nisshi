@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::slice;
+
 use nisshi_broker::{Error, Result};
 use nisshi_sans_io::{
     ConsumerGroupDescribeRequest, ErrorCode, RequestInput,
@@ -58,28 +60,25 @@ async fn describe(
     Ok(response.groups.unwrap_or_default())
 }
 
-async fn operations_omitted_unless_requested(storage: impl Storage + Clone) -> Result<()> {
+/// Every Nisshi group is a classic group, so describing one must make an admin client fall back
+/// to `DescribeGroups`. A row without an error makes `kafka-consumer-groups --describe --members`
+/// show no members. The broker must answer `GROUP_ID_NOT_FOUND`, as Kafka does for a classic group.
+async fn stored_group_answers_group_id_not_found(storage: impl Storage + Clone) -> Result<()> {
     let group_id = alphanumeric_string(15);
     create_group(&storage, &group_id).await?;
 
-    let groups = describe(storage, &[group_id], false).await?;
+    let groups = describe(storage, slice::from_ref(&group_id), false).await?;
     assert_eq!(1, groups.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
-    assert_eq!(i32::MIN, groups[0].authorized_operations);
-
-    Ok(())
-}
-
-async fn found_group_answers_supported_operations_when_asked(
-    storage: impl Storage + Clone,
-) -> Result<()> {
-    let group_id = alphanumeric_string(15);
-    create_group(&storage, &group_id).await?;
-
-    let groups = describe(storage, &[group_id], true).await?;
-    assert_eq!(1, groups.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
-    assert_eq!(SUPPORTED_GROUP_OPERATIONS, groups[0].authorized_operations);
+    assert_eq!(
+        (
+            ErrorCode::GroupIdNotFound,
+            Some(format!("Group {group_id} is not a consumer group.")),
+        ),
+        (
+            ErrorCode::try_from(groups[0].error_code)?,
+            groups[0].error_message.clone(),
+        )
+    );
 
     Ok(())
 }
@@ -217,21 +216,15 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn operations_omitted_unless_requested() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::operations_omitted_unless_requested(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn found_group_answers_supported_operations_when_asked() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::found_group_answers_supported_operations_when_asked(storage().await?).await
-    }
-
-    #[tokio::test]
     async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn stored_group_answers_group_id_not_found() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::stored_group_answers_group_id_not_found(storage().await?).await
     }
 
     #[tokio::test]
@@ -256,21 +249,15 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn operations_omitted_unless_requested() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::operations_omitted_unless_requested(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn found_group_answers_supported_operations_when_asked() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::found_group_answers_supported_operations_when_asked(storage().await?).await
-    }
-
-    #[tokio::test]
     async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn stored_group_answers_group_id_not_found() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::stored_group_answers_group_id_not_found(storage().await?).await
     }
 
     #[tokio::test]
@@ -295,21 +282,15 @@ mod pg {
     }
 
     #[tokio::test]
-    async fn operations_omitted_unless_requested() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::operations_omitted_unless_requested(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn found_group_answers_supported_operations_when_asked() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::found_group_answers_supported_operations_when_asked(storage().await?).await
-    }
-
-    #[tokio::test]
     async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn stored_group_answers_group_id_not_found() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::stored_group_answers_group_id_not_found(storage().await?).await
     }
 
     #[tokio::test]

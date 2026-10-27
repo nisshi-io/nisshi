@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::{
-    assert_matches, slice,
+    assert_matches,
+    collections::BTreeMap,
+    slice,
     time::{Duration, SystemTime},
 };
 
@@ -28,12 +30,13 @@ use nisshi_broker::{
 };
 use nisshi_sans_io::{
     DescribeGroupsRequest, DescribeGroupsResponse, ErrorCode, RequestInput,
-    create_topics_request::CreatableTopic, describe_groups_response::DescribedGroup,
+    create_topics_request::CreatableTopic,
+    describe_groups_response::{DescribedGroup, DescribedGroupMember},
     join_group_response::JoinGroupResponseMember,
 };
 use nisshi_storage::{
-    ArcDynStorage, DescribeGroupsService, GroupDetail, GroupMember, GroupState,
-    OffsetCommitRequest, Storage, Topition,
+    ArcDynStorage, DescribeGroupsService, GroupDetail, GroupMember, GroupRebalance, GroupState,
+    OffsetCommitRequest, PendingSync, Storage, Topition,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -207,6 +210,7 @@ async fn group_whose_sessions_expired_is_described_as_empty(
             GroupMember {
                 join_response: JoinGroupResponseMember::default().member_id(member_id.clone()),
                 last_contact: Some(SystemTime::now() - session_timeout - Duration::from_secs(1)),
+                ..GroupMember::default()
             },
         )]
         .into(),
@@ -229,6 +233,190 @@ async fn group_whose_sessions_expired_is_described_as_empty(
     assert_eq!(1, groups.len());
     assert_eq!("Empty", groups[0].group_state);
     assert_eq!(Some(vec![]), groups[0].members);
+
+    Ok(())
+}
+
+/// A member of a test group, with the values that `DescribeGroups` reports for it.
+struct TestMember {
+    member_id: String,
+    client_id: &'static str,
+    client_host: &'static str,
+    metadata: Bytes,
+    assignment: Bytes,
+}
+
+impl TestMember {
+    fn new(client_id: &'static str, client_host: &'static str) -> Self {
+        Self {
+            member_id: alphanumeric_string(15),
+            client_id,
+            client_host,
+            metadata: Bytes::from(format!("{client_id} subscription")),
+            assignment: Bytes::from(format!("{client_id} assignment")),
+        }
+    }
+
+    /// Returns the member as the group coordinator stores it, with `last_contact` set to the
+    /// current time. Before it describes a group, the coordinator removes each member whose
+    /// session timeout has expired, so a member without a recent `last_contact` is not described.
+    fn stored(&self) -> (String, GroupMember) {
+        (
+            self.member_id.clone(),
+            GroupMember {
+                join_response: JoinGroupResponseMember::default()
+                    .member_id(self.member_id.clone())
+                    .metadata(self.metadata.clone()),
+                last_contact: Some(SystemTime::now()),
+                client_id: self.client_id.into(),
+                client_host: self.client_host.into(),
+            },
+        )
+    }
+
+    /// Returns the member as `DescribeGroups` reports it in a `Stable` group.
+    fn described(&self) -> DescribedGroupMember {
+        DescribedGroupMember::default()
+            .member_id(self.member_id.clone())
+            .group_instance_id(None)
+            .client_id(self.client_id.into())
+            .client_host(self.client_host.into())
+            .member_metadata(self.metadata.clone())
+            .member_assignment(self.assignment.clone())
+    }
+}
+
+/// The parts of a `DescribeGroups` answer that show who reads which partitions.
+#[derive(Debug, PartialEq)]
+struct GroupMembership {
+    group_state: String,
+    /// The protocol, which is the assignor, that the group selected.
+    protocol_data: String,
+    members_by_id: BTreeMap<String, DescribedGroupMember>,
+}
+
+impl From<DescribedGroup> for GroupMembership {
+    fn from(group: DescribedGroup) -> Self {
+        Self {
+            group_state: group.group_state,
+            protocol_data: group.protocol_data,
+            members_by_id: group
+                .members
+                .unwrap_or_default()
+                .into_iter()
+                .map(|member| (member.member_id.clone(), member))
+                .collect(),
+        }
+    }
+}
+
+/// Stores `detail` as the group `group_id`, and returns the group's membership as the coordinator
+/// describes it.
+async fn store_and_describe(
+    storage: impl Storage + Clone,
+    group_id: &str,
+    detail: GroupDetail,
+) -> Result<GroupMembership> {
+    _ = storage
+        .update_group(group_id, detail, None)
+        .await
+        .map_err(|err| Error::Message(format!("update_group: {err:?}")))?;
+
+    let mut groups = describe(storage, &[group_id.into()], false).await?;
+    assert_eq!(1, groups.len());
+    Ok(GroupMembership::from(groups.remove(0)))
+}
+
+/// Describing a running group must show who reads which partitions. The broker must answer
+/// `DescribeGroups` for a `Stable` group with each member's client id, host, subscription and
+/// assignment, and the group's assignor.
+async fn stable_group_reports_each_member_and_the_protocol(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let members = [
+        TestMember::new("first-client", "/192.0.2.1"),
+        TestMember::new("second-client", "/192.0.2.2"),
+    ];
+
+    let detail = GroupDetail {
+        members: members.iter().map(TestMember::stored).collect(),
+        generation_id: 1,
+        state: GroupState::Formed {
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            leader: members[0].member_id.clone(),
+            assignments: members
+                .iter()
+                .map(|member| (member.member_id.clone(), member.assignment.clone()))
+                .collect(),
+        },
+        ..GroupDetail::default()
+    };
+
+    assert_eq!(
+        GroupMembership {
+            group_state: "Stable".into(),
+            protocol_data: "range".into(),
+            members_by_id: members
+                .iter()
+                .map(|member| (member.member_id.clone(), member.described()))
+                .collect(),
+        },
+        store_and_describe(storage, &alphanumeric_string(15), detail).await?
+    );
+
+    Ok(())
+}
+
+/// During a rebalance, a member's stored subscription can be for a protocol that the group does
+/// not select. The broker must answer `DescribeGroups` for a rebalancing group with each member's
+/// client id and host, and without its subscription or the group's protocol, as Kafka does.
+async fn rebalancing_group_reports_members_without_metadata(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let members = [
+        TestMember::new("first-client", "/192.0.2.1"),
+        TestMember::new("second-client", "/192.0.2.2"),
+    ];
+
+    let detail = GroupDetail {
+        members: members.iter().map(TestMember::stored).collect(),
+        generation_id: 1,
+        state: GroupState::Forming {
+            protocol_type: Some("consumer".into()),
+            protocol_name: Some("range".into()),
+            leader: Some(members[0].member_id.clone()),
+        },
+        rebalance: Box::new(GroupRebalance {
+            pending_sync: Some(PendingSync {
+                deadline: SystemTime::now() + Duration::from_secs(300),
+                members: members
+                    .iter()
+                    .map(|member| member.member_id.clone())
+                    .collect(),
+            }),
+            ..GroupRebalance::default()
+        }),
+        ..GroupDetail::default()
+    };
+
+    assert_eq!(
+        GroupMembership {
+            group_state: "CompletingRebalance".into(),
+            protocol_data: "".into(),
+            members_by_id: members
+                .iter()
+                .map(|member| {
+                    let without_subscription_or_assignment = member
+                        .described()
+                        .member_metadata(Bytes::new())
+                        .member_assignment(Bytes::new());
+                    (member.member_id.clone(), without_subscription_or_assignment)
+                })
+                .collect(),
+        },
+        store_and_describe(storage, &alphanumeric_string(15), detail).await?
+    );
 
     Ok(())
 }
@@ -326,6 +514,18 @@ mod in_memory {
         let _guard = init_tracing()?;
         super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
     }
+
+    #[tokio::test]
+    async fn stable_group_reports_each_member_and_the_protocol() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::stable_group_reports_each_member_and_the_protocol(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn rebalancing_group_reports_members_without_metadata() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::rebalancing_group_reports_members_without_metadata(storage().await?).await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -390,6 +590,18 @@ mod lite {
     async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
         let _guard = init_tracing()?;
         super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn stable_group_reports_each_member_and_the_protocol() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::stable_group_reports_each_member_and_the_protocol(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn rebalancing_group_reports_members_without_metadata() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::rebalancing_group_reports_members_without_metadata(storage().await?).await
     }
 }
 
@@ -481,5 +693,17 @@ mod pg {
     async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
         let _guard = init_tracing()?;
         super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn stable_group_reports_each_member_and_the_protocol() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::stable_group_reports_each_member_and_the_protocol(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn rebalancing_group_reports_members_without_metadata() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::rebalancing_group_reports_members_without_metadata(storage().await?).await
     }
 }

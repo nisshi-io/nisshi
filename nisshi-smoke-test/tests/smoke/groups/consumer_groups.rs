@@ -18,7 +18,7 @@
 //! a group or its offsets to make its consumers start over. A wrong answer makes the operator look
 //! for a problem that does not exist, or hides a problem that does.
 
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use nisshi_smoke_test::{
     BackgroundTool, GROUP_ID_NOT_FOUND_EXCEPTION, GROUP_NOT_EMPTY_EXCEPTION, GroupOffsets,
@@ -128,11 +128,10 @@ fn describe_shows_committed_and_end_offsets() {
     );
 }
 
-/// Describing the members of a running group must show each member and how many partitions it
-/// reads, so an operator sees who reads what. The broker must answer `DescribeGroups` with each
-/// member and its assignment.
+/// Describing the members of a running group must show each member, the host it connects from,
+/// its client id and how many partitions it reads, so an operator sees who reads what. The broker
+/// must answer `DescribeGroups` with each member's host, client id and assignment.
 #[test]
-#[ignore = "DescribeGroups answers no members for a group that has them (#962)"]
 fn describe_members_shows_each_member_and_its_partitions() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(2, &[]);
@@ -164,10 +163,24 @@ fn describe_members_shows_each_member_and_its_partitions() {
     ]
     .map(|count| u32::try_from(count).expect("a partition count fits in a u32"));
     reported_counts.sort_unstable();
-    let mut described_counts = described.succeeded().member_partition_counts(&group);
+    let described_members = described.succeeded().members(&group);
+    let mut described_counts = described_members
+        .iter()
+        .map(|member| member.partition_count)
+        .collect::<Vec<_>>();
     described_counts.sort_unstable();
 
     assert_eq!(described_counts, reported_counts, "{described}");
+    assert!(
+        described_members.iter().all(|member| {
+            member
+                .host
+                .strip_prefix('/')
+                .is_some_and(|address| address.parse::<IpAddr>().is_ok())
+                && !member.client_id.is_empty()
+        }),
+        "a member has no host or no client id: {described}"
+    );
 }
 
 /// A group with a running consumer must be `Stable`, and `Empty` once the consumer has left, so

@@ -32,7 +32,7 @@ use nisshi_schema::{
     lake::{House, LakeHouseType},
     redact_url,
 };
-use nisshi_service::ProgressBarExtension;
+use nisshi_service::{PeerAddressExtension, ProgressBarExtension};
 use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
@@ -549,6 +549,7 @@ where
                     }
 
                     let extensions = Extensions::default();
+                    _ = extensions.insert(PeerAddressExtension::new(addr));
 
                     let pb = if self.silent {
                         None

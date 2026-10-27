@@ -1040,6 +1040,14 @@ pub fn delete_records_cutoff(requested: i64, stage: &OffsetStage) -> Result<i64,
 pub struct GroupMember {
     pub join_response: JoinGroupResponseMember,
     pub last_contact: Option<SystemTime>,
+    /// The client id in the header of the member's last `JoinGroup`. A member stored before this
+    /// field existed has an empty client id until it joins again.
+    #[serde(default)]
+    pub client_id: String,
+    /// The address the member's last `JoinGroup` came from, as Kafka writes it: `/` and the IP
+    /// address. A member stored before this field existed has an empty host until it joins again.
+    #[serde(default)]
+    pub client_host: String,
 }
 
 /// Group State
@@ -1265,26 +1273,46 @@ impl From<&GroupDetail> for ConsumerGroupState {
     }
 }
 
+/// Answers `ConsumerGroupDescribe` for a group that Nisshi stores, under an empty group id.
 impl From<&GroupDetail> for consumer_group_describe_response::DescribedGroup {
-    fn from(value: &GroupDetail) -> Self {
-        let assignor_name = match value.state {
-            GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-            GroupState::Formed { ref leader, .. } => leader.clone(),
-        };
-
-        let group_state = ConsumerGroupState::from(value).to_string();
-
-        Self::default()
-            .error_code(ErrorCode::None.into())
-            .error_message(Some(ErrorCode::None.to_string()))
-            .group_id(Default::default())
-            .group_state(group_state)
-            .group_epoch(-1)
-            .assignment_epoch(-1)
-            .assignor_name(assignor_name)
-            .members(Some([].into()))
-            .authorized_operations(authorized_operations::OMITTED)
+    fn from(_: &GroupDetail) -> Self {
+        classic_group_consumer_group_describe_row(String::new())
     }
+}
+
+/// Returns the `ConsumerGroupDescribe` row for the stored group `group_id`.
+///
+/// `ConsumerGroupDescribe` describes only a group of the KIP-848 consumer protocol, whose members
+/// send `ConsumerGroupHeartbeat`. Each Nisshi group forms through `JoinGroup` and `SyncGroup`, so
+/// each is a classic group, and the row answers `GROUP_ID_NOT_FOUND`, as Kafka's group
+/// coordinator does for a classic group ([`GroupMetadataManager.consumerGroup`]). An admin client
+/// then describes the group with `DescribeGroups`. A row with `NONE` and no members stops that
+/// fallback, and the client reports a group without members.
+///
+/// [`GroupMetadataManager.consumerGroup`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+fn classic_group_consumer_group_describe_row(
+    group_id: String,
+) -> consumer_group_describe_response::DescribedGroup {
+    let error_message = format!("Group {group_id} is not a consumer group.");
+    consumer_group_describe_error_row(group_id, ErrorCode::GroupIdNotFound, error_message)
+}
+
+/// Returns the `ConsumerGroupDescribe` row that answers `error_code` for the group `group_id`.
+fn consumer_group_describe_error_row(
+    group_id: String,
+    error_code: ErrorCode,
+    error_message: String,
+) -> consumer_group_describe_response::DescribedGroup {
+    consumer_group_describe_response::DescribedGroup::default()
+        .error_code(error_code.into())
+        .error_message(Some(error_message))
+        .group_id(group_id)
+        .group_state(ConsumerGroupState::Unknown.to_string())
+        .group_epoch(-1)
+        .assignment_epoch(-1)
+        .assignor_name("".into())
+        .members(Some([].into()))
+        .authorized_operations(authorized_operations::OMITTED)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1339,43 +1367,16 @@ impl NamedGroupDetail {
 
 impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGroup {
     fn from(value: &NamedGroupDetail) -> Self {
-        match value {
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::Found(group_detail),
-            } => {
-                let assignor_name = match group_detail.state {
-                    GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-                    GroupState::Formed { ref leader, .. } => leader.clone(),
-                };
-
-                let group_state = ConsumerGroupState::from(group_detail).to_string();
-
-                Self::default()
-                    .error_code(ErrorCode::None.into())
-                    .error_message(Some(ErrorCode::None.to_string()))
-                    .group_id(name.into())
-                    .group_state(group_state)
-                    .group_epoch(-1)
-                    .assignment_epoch(-1)
-                    .assignor_name(assignor_name)
-                    .members(Some([].into()))
-                    .authorized_operations(authorized_operations::OMITTED)
+        match &value.response {
+            GroupDetailResponse::Found(_) => {
+                classic_group_consumer_group_describe_row(value.name.clone())
             }
 
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::ErrorCode(error_code),
-            } => Self::default()
-                .error_code((*error_code).into())
-                .error_message(Some(error_code.to_string()))
-                .group_id(name.into())
-                .group_state(ConsumerGroupState::from(value).to_string())
-                .group_epoch(-1)
-                .assignment_epoch(-1)
-                .assignor_name("".into())
-                .members(Some([].into()))
-                .authorized_operations(authorized_operations::OMITTED),
+            GroupDetailResponse::ErrorCode(error_code) => consumer_group_describe_error_row(
+                value.name.clone(),
+                *error_code,
+                error_code.to_string(),
+            ),
         }
     }
 }
@@ -1387,28 +1388,51 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                 name,
                 response: GroupDetailResponse::Found(group_detail),
             } => {
-                let group_state = ConsumerGroupState::from(group_detail).to_string();
+                let group_state = ConsumerGroupState::from(group_detail);
+
+                // Kafka reports the group's protocol, and each member's metadata and assignment,
+                // only for a Stable group ([`GroupMetadata.summary`]). In another state, the
+                // members' metadata may be for a protocol the group has not selected yet.
+                //
+                // [`GroupMetadata.summary`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupMetadata.scala
+                let is_stable = group_state == ConsumerGroupState::Stable;
+                let assignments = group_detail.state.assignments();
 
                 let members = group_detail
                     .members
-                    .keys()
-                    .map(|member_id| {
+                    .iter()
+                    .map(|(member_id, member)| {
+                        let (member_metadata, member_assignment) = if is_stable {
+                            (
+                                member.join_response.metadata.clone(),
+                                assignments.get(member_id).cloned().unwrap_or_default(),
+                            )
+                        } else {
+                            (Bytes::new(), Bytes::new())
+                        };
+
                         describe_groups_response::DescribedGroupMember::default()
                             .member_id(member_id.into())
                             .group_instance_id(None)
-                            .client_id("".into())
-                            .client_host("".into())
-                            .member_metadata(Bytes::new())
-                            .member_assignment(Bytes::new())
+                            .client_id(member.client_id.clone())
+                            .client_host(member.client_host.clone())
+                            .member_metadata(member_metadata)
+                            .member_assignment(member_assignment)
                     })
                     .collect::<Vec<_>>();
+
+                let protocol_data = if is_stable {
+                    group_detail.state.protocol_name().unwrap_or_default()
+                } else {
+                    String::new()
+                };
 
                 Self::default()
                     .error_code(ErrorCode::None.into())
                     .group_id(name.clone())
-                    .group_state(group_state)
+                    .group_state(group_state.to_string())
                     .protocol_type(group_detail.state.protocol_type().unwrap_or_default())
-                    .protocol_data("".into())
+                    .protocol_data(protocol_data)
                     .members(Some(members))
                     .authorized_operations(Some(authorized_operations::OMITTED))
             }
@@ -2977,6 +3001,32 @@ mod tests {
         assert!(debug.contains("iterations: 4096"), "{debug}");
     }
 
+    /// Every engine stores a group as JSON. After an upgrade, the broker decodes groups that an
+    /// earlier version stored, whose members have no `client_id` or `client_host` field. Decoding
+    /// must succeed and give such a member an empty client id and host. A group that fails to
+    /// decode is described with `UNKNOWN_SERVER_ERROR`.
+    #[test]
+    fn member_stored_without_client_id_and_host_reads_with_empty_ones() -> serde_json::Result<()> {
+        let mut stored = serde_json::to_value(detail_with_one_member(
+            GroupState::default(),
+            GroupRebalance::default(),
+        ))?;
+        let member = stored["members"]["member"]
+            .as_object_mut()
+            .expect("a stored member is a JSON object");
+        assert!(member.remove("client_id").is_some());
+        assert!(member.remove("client_host").is_some());
+
+        let detail = serde_json::from_value::<GroupDetail>(stored)?;
+
+        let member = &detail.members["member"];
+        assert_eq!(
+            ("", ""),
+            (member.client_id.as_str(), member.client_host.as_str())
+        );
+        Ok(())
+    }
+
     /// Returns a detail with one member, in the given group state and rebalance.
     fn detail_with_one_member(state: GroupState, rebalance: GroupRebalance) -> GroupDetail {
         GroupDetail {
@@ -2985,6 +3035,7 @@ mod tests {
                 GroupMember {
                     join_response: JoinGroupResponseMember::default().member_id("member".into()),
                     last_contact: None,
+                    ..GroupMember::default()
                 },
             )]
             .into(),

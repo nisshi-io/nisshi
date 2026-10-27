@@ -101,8 +101,8 @@ pub use console_consumer::{
 };
 pub use console_producer::KafkaConsoleProducer;
 pub use consumer_groups::{
-    DescribeGroup, DescribeGroupMembers, DescribeGroupState, GroupOffsets, GroupState,
-    KafkaConsumerGroups, ListGroups, ListGroupsInState,
+    DescribeGroup, DescribeGroupMembers, DescribeGroupState, DescribedMember, GroupOffsets,
+    GroupState, KafkaConsumerGroups, ListGroups, ListGroupsInState,
 };
 pub use delete_records::{DeleteRecords, KafkaDeleteRecords};
 pub use get_offsets::{GetOffsets, KafkaGetOffsets};

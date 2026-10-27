@@ -329,6 +329,7 @@ where
         .join(
             JOIN_GROUP_VERSION,
             client_id,
+            None,
             group_id,
             session_timeout_ms,
             rebalance_timeout_ms,

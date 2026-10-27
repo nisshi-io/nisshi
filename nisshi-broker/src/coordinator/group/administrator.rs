@@ -137,6 +137,8 @@ impl Default for GroupCoordinatorConfig {
 pub struct JoinRequest<'a> {
     pub api_version: i16,
     pub client_id: Option<&'a str>,
+    /// The client's address, as `DescribeGroups` reports it.
+    pub client_host: Option<&'a str>,
     pub group_id: &'a str,
     pub session_timeout_ms: i32,
     /// The request's rebalance timeout, or its session timeout for version 0, which has no
@@ -948,6 +950,7 @@ where
     #[instrument(skip(
         self,
         client_id,
+        client_host,
         session_timeout_ms,
         rebalance_timeout_ms,
         group_instance_id,
@@ -959,6 +962,7 @@ where
         &self,
         api_version: i16,
         client_id: Option<&str>,
+        client_host: Option<&str>,
         group_id: &str,
         session_timeout_ms: i32,
         rebalance_timeout_ms: Option<i32>,
@@ -971,6 +975,7 @@ where
         debug!(
             api_version,
             ?client_id,
+            ?client_host,
             ?session_timeout_ms,
             ?rebalance_timeout_ms,
             ?group_instance_id,
@@ -1036,6 +1041,7 @@ where
             let request = JoinRequest {
                 api_version,
                 client_id,
+                client_host,
                 group_id,
                 session_timeout_ms,
                 rebalance_timeout_ms: rebalance_timeout_ms.unwrap_or(session_timeout_ms),
@@ -2205,11 +2211,13 @@ where
                 join_response: JoinGroupResponseMember::default()
                     .member_id(member_id.to_owned())
                     .group_instance_id(request.group_instance_id.map(ToOwned::to_owned)),
-                last_contact: None,
+                ..Member::default()
             });
 
         member.join_response.metadata = metadata.clone();
         member.last_contact = Some(now);
+        member.client_id = request.client_id.unwrap_or_default().to_owned();
+        member.client_host = request.client_host.unwrap_or_default().to_owned();
     }
 
     /// Forgets each pending member id whose session timeout has expired. Returns whether it forgot
@@ -3013,6 +3021,8 @@ where
 pub struct Member {
     join_response: JoinGroupResponseMember,
     last_contact: Option<SystemTime>,
+    client_id: String,
+    client_host: String,
 }
 
 impl From<&Member> for GroupMember {
@@ -3020,6 +3030,8 @@ impl From<&Member> for GroupMember {
         Self {
             join_response: member.join_response.clone(),
             last_contact: member.last_contact,
+            client_id: member.client_id.clone(),
+            client_host: member.client_host.clone(),
         }
     }
 }
@@ -3029,6 +3041,8 @@ impl From<&GroupMember> for Member {
         Self {
             join_response: member.join_response.clone(),
             last_contact: member.last_contact,
+            client_id: member.client_id.clone(),
+            client_host: member.client_host.clone(),
         }
     }
 }
@@ -3949,6 +3963,7 @@ mod tests {
             s.join(
                 9,
                 Some(CLIENT_ID),
+                None,
                 GROUP_ID,
                 session_timeout_ms,
                 rebalance_timeout_ms,

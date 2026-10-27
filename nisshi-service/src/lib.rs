@@ -254,6 +254,7 @@ mod channel;
 mod consumer;
 mod frame;
 mod input;
+mod peer_address;
 mod stream;
 mod version_gate;
 
@@ -271,6 +272,8 @@ pub use channel::{
 };
 
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
+
+pub use peer_address::PeerAddressExtension;
 
 pub use frame::{
     BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,

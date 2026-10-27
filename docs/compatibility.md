@@ -78,7 +78,7 @@ Nisshi does not implement them, because the storage engine holds all the state.
 | DeleteGroups | 42 | 0-2 | Yes | Yes | Yes | Yes | |
 | OffsetDelete | 47 | – | No | No | No | No | [#964] |
 | ConsumerGroupHeartbeat | 68 | – | No | No | No | No | Nisshi does not support the KIP-848 consumer group protocol. Consumers use the classic protocol. |
-| ConsumerGroupDescribe | 69 | 0 | Partial | Partial | Partial | Partial | Describes classic consumer groups, and answers an empty member list ([#962]). |
+| ConsumerGroupDescribe | 69 | 0 | Yes | Yes | Yes | Yes | Answers GROUP_ID_NOT_FOUND for each group, as Kafka does for a classic group, because every Nisshi group uses the classic protocol. Clients then describe the group with DescribeGroups. |
 
 ### Transactions
 
@@ -175,6 +175,5 @@ The `FINDINGS.md` file in each client suite's folder gives the test numbers and 
 each failure. The findings come from runs on the in-memory engine.
 
 [#922]: https://github.com/nisshi-io/solace-nisshi/issues/922
-[#962]: https://github.com/nisshi-io/solace-nisshi/issues/962
 [#964]: https://github.com/nisshi-io/solace-nisshi/issues/964
 [#1051]: https://github.com/nisshi-io/solace-nisshi/issues/1051
