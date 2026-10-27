@@ -259,7 +259,8 @@ impl TestMember {
 
     /// Returns the member as the group coordinator stores it, with `last_contact` set to the
     /// current time. Before it describes a group, the coordinator removes each member whose
-    /// session timeout has expired, so a member without a recent `last_contact` is not described.
+    /// session timeout has expired, so it describes only a member whose `last_contact` is within
+    /// its session timeout.
     fn stored(&self) -> (String, GroupMember) {
         (
             self.member_id.clone(),
@@ -290,7 +291,8 @@ impl TestMember {
 #[derive(Debug, PartialEq)]
 struct GroupMembership {
     group_state: String,
-    /// The protocol, which is the assignor, that the group selected.
+    /// The protocol that the group selected. For a consumer group, the protocol is the partition
+    /// assignor.
     protocol_data: String,
     members_by_id: BTreeMap<String, DescribedGroupMember>,
 }
@@ -368,9 +370,11 @@ async fn stable_group_reports_each_member_and_the_protocol(
     Ok(())
 }
 
-/// During a rebalance, a member's stored subscription can be for a protocol that the group does
-/// not select. The broker must answer `DescribeGroups` for a rebalancing group with each member's
-/// client id and host, and without its subscription or the group's protocol, as Kafka does.
+/// During a rebalance, a member's stored subscription can be for a protocol that the group has not
+/// selected yet, and an admin client that decodes it with the wrong assignor shows a wrong
+/// subscription. The broker must answer `DescribeGroups` for a rebalancing group with each
+/// member's client id and host, and with an empty subscription, assignment and protocol, as Kafka
+/// does.
 async fn rebalancing_group_reports_members_without_metadata(
     storage: impl Storage + Clone,
 ) -> Result<()> {

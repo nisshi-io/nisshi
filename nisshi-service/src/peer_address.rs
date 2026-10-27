@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use rama::extensions::Extension;
 
@@ -27,12 +27,25 @@ impl PeerAddressExtension {
     }
 
     /// Returns the client's host as Kafka reports it in `DescribeGroups`: `/` and the IP
-    /// address, which is how Java writes an `InetAddress` without a host name.
+    /// address, written as Java writes an `InetAddress` without a host name.
     ///
     /// A listener on an IPv6 address sees an IPv4 client at an IPv4-mapped IPv6 address. Java
-    /// reports such an address as the IPv4 address, and so does this method.
+    /// reports such an address as the IPv4 address, and so does this method. This method does not
+    /// write the zone of a link-local IPv6 address, which Java writes after a `%`.
     pub fn client_host(&self) -> String {
-        format!("/{}", self.0.ip().to_canonical())
+        match self.0.ip().to_canonical() {
+            IpAddr::V4(address) => format!("/{address}"),
+
+            // Java writes each of the eight groups of an IPv6 address in hexadecimal, and does not
+            // shorten a run of zero groups to `::` as Rust does.
+            IpAddr::V6(address) => format!(
+                "/{}",
+                address
+                    .segments()
+                    .map(|segment| format!("{segment:x}"))
+                    .join(":")
+            ),
+        }
     }
 }
 
@@ -43,14 +56,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_host_is_a_slash_and_the_ip_address() {
+    fn client_host_is_a_slash_and_the_ip_address_as_java_writes_it() {
         assert_eq!(
             "/192.0.2.7",
             PeerAddressExtension::new(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 7), 50_000)))
                 .client_host()
         );
         assert_eq!(
-            "/2001:db8::1",
+            "/2001:db8:0:0:0:0:0:1",
             PeerAddressExtension::new(SocketAddr::from((
                 Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
                 50_000

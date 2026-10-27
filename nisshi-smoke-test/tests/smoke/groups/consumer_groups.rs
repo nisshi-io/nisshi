@@ -179,7 +179,7 @@ fn describe_members_shows_each_member_and_its_partitions() {
                 .is_some_and(|address| address.parse::<IpAddr>().is_ok())
                 && !member.client_id.is_empty()
         }),
-        "a member has no host or no client id: {described}"
+        "a member's host is not `/` and an IP address, or its client id is empty: {described}"
     );
 }
 

@@ -1040,12 +1040,13 @@ pub fn delete_records_cutoff(requested: i64, stage: &OffsetStage) -> Result<i64,
 pub struct GroupMember {
     pub join_response: JoinGroupResponseMember,
     pub last_contact: Option<SystemTime>,
-    /// The client id in the header of the member's last `JoinGroup`. A member stored before this
-    /// field existed has an empty client id until it joins again.
+    /// The client id in the header of the member's last `JoinGroup`. It is empty for a member
+    /// whose stored group lacks the field, until the member joins again.
     #[serde(default)]
     pub client_id: String,
-    /// The address the member's last `JoinGroup` came from, as Kafka writes it: `/` and the IP
-    /// address. A member stored before this field existed has an empty host until it joins again.
+    /// The address that the member's last `JoinGroup` came from, as Kafka writes it: `/` and the
+    /// IP address. It is empty for a member whose stored group lacks the field, until the member
+    /// joins again.
     #[serde(default)]
     pub client_host: String,
 }
@@ -1273,21 +1274,15 @@ impl From<&GroupDetail> for ConsumerGroupState {
     }
 }
 
-/// Answers `ConsumerGroupDescribe` for a group that Nisshi stores, under an empty group id.
-impl From<&GroupDetail> for consumer_group_describe_response::DescribedGroup {
-    fn from(_: &GroupDetail) -> Self {
-        classic_group_consumer_group_describe_row(String::new())
-    }
-}
-
 /// Returns the `ConsumerGroupDescribe` row for the stored group `group_id`.
 ///
 /// `ConsumerGroupDescribe` describes only a group of the KIP-848 consumer protocol, whose members
-/// send `ConsumerGroupHeartbeat`. Each Nisshi group forms through `JoinGroup` and `SyncGroup`, so
-/// each is a classic group, and the row answers `GROUP_ID_NOT_FOUND`, as Kafka's group
-/// coordinator does for a classic group ([`GroupMetadataManager.consumerGroup`]). An admin client
-/// then describes the group with `DescribeGroups`. A row with `NONE` and no members stops that
-/// fallback, and the client reports a group without members.
+/// send `ConsumerGroupHeartbeat`. Nisshi forms each group through `JoinGroup` and `SyncGroup`, so
+/// each group is a classic group. This function answers `GROUP_ID_NOT_FOUND` for it, as Kafka's
+/// group coordinator does for a classic group ([`GroupMetadataManager.consumerGroup`]), and an
+/// admin client then describes the group with `DescribeGroups`. If the broker answered `NONE`
+/// with an empty member list, the admin client would not fall back to `DescribeGroups`, and it
+/// would report the group without members.
 ///
 /// [`GroupMetadataManager.consumerGroup`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
 fn classic_group_consumer_group_describe_row(
@@ -3001,10 +2996,11 @@ mod tests {
         assert!(debug.contains("iterations: 4096"), "{debug}");
     }
 
-    /// Every engine stores a group as JSON. After an upgrade, the broker decodes groups that an
-    /// earlier version stored, whose members have no `client_id` or `client_host` field. Decoding
-    /// must succeed and give such a member an empty client id and host. A group that fails to
-    /// decode is described with `UNKNOWN_SERVER_ERROR`.
+    /// Every engine except SlateDB stores a group as JSON. After an upgrade, the broker reads
+    /// groups that an earlier version stored, whose members do not have a `client_id` or
+    /// `client_host` field. If the broker fails to decode such a group, `DescribeGroups` answers
+    /// `UNKNOWN_SERVER_ERROR` for it. Decoding must give such a member an empty client id and
+    /// host.
     #[test]
     fn member_stored_without_client_id_and_host_reads_with_empty_ones() -> serde_json::Result<()> {
         let mut stored = serde_json::to_value(detail_with_one_member(

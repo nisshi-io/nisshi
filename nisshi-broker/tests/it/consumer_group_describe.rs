@@ -26,15 +26,6 @@ use url::Url;
 
 use crate::common::{self, alphanumeric_string, register_broker};
 
-/// The authorized operations that Kafka 3.9.1 answers for a group when the broker has no
-/// authorizer: the group's supported operations READ (3), DELETE (6) and DESCRIBE (8), as the
-/// bitfield `1 << 3 | 1 << 6 | 1 << 8` ([`AuthHelper.authorizedOperations`],
-/// [`AclEntry.supportedOperations`]).
-///
-/// [`AuthHelper.authorizedOperations`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AuthHelper.scala#L62-L76
-/// [`AclEntry.supportedOperations`]: https://github.com/apache/kafka/blob/3.9.1/server/src/main/java/org/apache/kafka/security/authorizer/AclEntry.java#L150-L167
-const SUPPORTED_GROUP_OPERATIONS: i32 = 328;
-
 async fn create_group(storage: &impl Storage, group_id: &str) -> Result<()> {
     _ = storage
         .update_group(group_id, GroupDetail::default(), None)
@@ -60,51 +51,32 @@ async fn describe(
     Ok(response.groups.unwrap_or_default())
 }
 
-/// Every Nisshi group is a classic group, so describing one must make an admin client fall back
-/// to `DescribeGroups`. A row without an error makes `kafka-consumer-groups --describe --members`
-/// show no members. The broker must answer `GROUP_ID_NOT_FOUND`, as Kafka does for a classic group.
+/// Every Nisshi group is a classic group. An admin client describes a group with `DescribeGroups`
+/// only if `ConsumerGroupDescribe` answers it with an error, so an answer without an error makes
+/// `kafka-consumer-groups --describe --members` show no members. The broker must answer
+/// `GROUP_ID_NOT_FOUND` for a stored group, as Kafka does for a classic group, and omit the
+/// group's authorized operations, as it does on every error row.
 async fn stored_group_answers_group_id_not_found(storage: impl Storage + Clone) -> Result<()> {
     let group_id = alphanumeric_string(15);
     create_group(&storage, &group_id).await?;
 
-    let groups = describe(storage, slice::from_ref(&group_id), false).await?;
-    assert_eq!(1, groups.len());
-    assert_eq!(
-        (
-            ErrorCode::GroupIdNotFound,
-            Some(format!("Group {group_id} is not a consumer group.")),
-        ),
-        (
-            ErrorCode::try_from(groups[0].error_code)?,
-            groups[0].error_message.clone(),
-        )
-    );
-
-    Ok(())
-}
-
-/// An engine answers an unknown group with an error row or with an empty group. Kafka reports
-/// the operations only on a row whose error is NONE.
-async fn unknown_group_answers_operations_only_on_a_row_without_error(
-    storage: impl Storage + Clone,
-) -> Result<()> {
     for include_authorized_operations in [false, true] {
         let groups = describe(
             storage.clone(),
-            &[alphanumeric_string(15)],
+            slice::from_ref(&group_id),
             include_authorized_operations,
         )
         .await?;
         assert_eq!(1, groups.len());
-
-        let expected = if include_authorized_operations
-            && ErrorCode::try_from(groups[0].error_code)? == ErrorCode::None
-        {
-            SUPPORTED_GROUP_OPERATIONS
-        } else {
-            i32::MIN
-        };
-        assert_eq!(expected, groups[0].authorized_operations);
+        assert_eq!(
+            ErrorCode::GroupIdNotFound,
+            ErrorCode::try_from(groups[0].error_code)?
+        );
+        assert_eq!(
+            Some(format!("Group {group_id} is not a consumer group.")),
+            groups[0].error_message
+        );
+        assert_eq!(i32::MIN, groups[0].authorized_operations);
     }
 
     Ok(())
@@ -216,12 +188,6 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
-
-    #[tokio::test]
     async fn stored_group_answers_group_id_not_found() -> Result<()> {
         let _guard = init_tracing()?;
         super::stored_group_answers_group_id_not_found(storage().await?).await
@@ -249,12 +215,6 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
-
-    #[tokio::test]
     async fn stored_group_answers_group_id_not_found() -> Result<()> {
         let _guard = init_tracing()?;
         super::stored_group_answers_group_id_not_found(storage().await?).await
@@ -279,12 +239,6 @@ mod pg {
 
     async fn storage() -> Result<ArcDynStorage> {
         common::postgres_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
-    }
-
-    #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
     }
 
     #[tokio::test]
