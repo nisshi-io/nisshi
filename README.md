@@ -37,6 +37,14 @@ Features:
 - Topics [validated](docs/schema-registry.md) by [JSON Schema][json-schema-org], [Apache Avro](https://avro.apache.org)
   or [Protocol buffers](protocol-buffers) can be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables
 
+## About
+
+Nisshi is now part of Solace. Peter Morgan is a key member of the Solace team that works on it.
+
+The license stays Apache 2.0, and what is open stays open.
+
+Nisshi OSS is provided as-is, with no warranty and no Solace Support commitment. Ask questions in the [Solace community][nisshi-community]. Report security issues through [SECURITY][nisshi-security].
+
 ## Get Started
 
 > [!NOTE]
