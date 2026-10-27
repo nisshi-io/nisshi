@@ -37,7 +37,7 @@ client that reads the ApiVersions response first does not send such a request.
 
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| Produce | 0 | 3-11 | Yes | Yes | Yes | Yes | Versions 0-2 use the message set format, which Nisshi does not decode. Some topic configs do not apply, see [Topic configuration](#topic-configuration). |
+| Produce | 0 | 3-11 | Yes | Yes | Yes | Yes | Versions 0-2 use the message set format, which Nisshi does not decode. Some topic configs do not apply, see [Topic configuration](#topic-configuration). The broker rejects a `CreateTime` record more than an hour ahead of its clock with INVALID_TIMESTAMP, as Kafka 4.0 does by default. Kafka 3.9.1 accepts any future timestamp, and Nisshi has no setting to change the limit. |
 | Fetch | 1 | 0-17 | Yes | Yes | Yes | Yes | Every fetch is a full fetch, because the broker does not keep incremental fetch sessions (KIP-227). |
 | ListOffsets | 2 | 0-6 | Yes | Yes | Yes | Yes | Nisshi does not support the `max-timestamp` lookup, because a client requests it with version 7. |
 | DeleteRecords | 21 | 0-2 | Yes | Yes | Yes | Yes | |
@@ -129,7 +129,8 @@ LeaderAndIsr, Vote and BrokerRegistration.
 
 The broker stores every topic config that a client sets, and returns it with DescribeConfigs.
 The broker applies only the configs that this table marks Yes. The broker applies
-`cleanup.policy`, `retention.ms` and `retention.bytes` in a maintenance run every 10 minutes.
+`cleanup.policy`, `retention.ms` and `retention.bytes` in a maintenance run, every 10 minutes by
+default. The `maintenance_interval` option on the storage engine URL changes the interval.
 
 | Config | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -159,7 +160,7 @@ consumer group behaviours, because the tests fail:
 - An offset commit during a rebalance. The broker answers different error codes than Kafka.
 
 The `FINDINGS.md` file in each client suite's folder gives the test numbers and the cause of
-each failure.
+each failure. The findings come from runs on the in-memory engine.
 
 [#922]: https://github.com/nisshi-io/nisshi/issues/922
 [#962]: https://github.com/nisshi-io/nisshi/issues/962

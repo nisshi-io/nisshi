@@ -199,6 +199,10 @@ A build contains only the storage engines whose features you enable. To add an e
 `--features dynostore,libsql,postgres,turso`. Apache Parquet, Apache Iceberg, and Delta Lake output for schema backed
 topics needs the `parquet`, `iceberg`, or `delta` feature.
 
+The engines differ in what they support. For example, only PostgreSQL and SQLite apply
+retention and compaction. [Compatibility and feature status](docs/compatibility.md) lists what
+each engine supports, which Kafka APIs the broker answers, and which Kafka clients CI tests.
+
 Switching storage engines does not move data: topics, messages, and consumer group offsets stay in the old engine, and the new one starts empty. The release binary starts on `memory://`, and Docker Compose runs on PostgreSQL unless you set `STORAGE_ENGINE`.
 
 PostgreSQL can stream transaction logs to an archive with
@@ -700,25 +704,11 @@ broker now flushes pending metrics before exiting.
 
 Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Kafka 3.9.1
 message descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). Clients on
-Kafka 4.x negotiate down to those protocol versions. It is tested against the following in CI:
-
-| Suite | What runs | Version |
-| --- | --- | --- |
-| [librdkafka](compat/librdkafka) | the librdkafka integration test suite | v2.14.2, and v2.3.0 when changes are queued for merge (not blocking) |
-| [franz-go](compat/franz-go) | the franz-go `kgo` integration test suite | v1.21.3 |
-| [Kafka CLI smoke tests](nisshi-smoke-test) | the Apache Kafka command line tools | Kafka 3.7.2, 3.9.2 and 4.3.1 |
-
-The client suites run against the memory storage engine on every pull request. When changes
-are queued for merge, they also run against PostgreSQL and SQLite.
-When changes are queued for merge, the smoke tests run against PostgreSQL, SQLite, memory
-and S3 (S3 runs the topic lifecycle test only). The nightly run also runs both client suites
-against S3.
-
-Each client suite runs only the tests listed in its allowlist file. Known client gaps are
-recorded in [librdkafka/FINDINGS.md](compat/librdkafka/FINDINGS.md) and
-[franz-go/FINDINGS.md](compat/franz-go/FINDINGS.md), which cover the memory engine only. A smoke
-test that fails because of an open bug is marked ignored in the suite. Please
-[raise an issue][nisshi-issues] if a client or Kafka version you rely on behaves differently.
+Kafka 4.x negotiate down to those protocol versions. CI tests the broker with the librdkafka and
+franz-go integration test suites and the Apache Kafka command line tools.
+[Kafka clients tested](docs/compatibility.md#kafka-clients-tested) lists the versions and the
+known client gaps. Please [raise an issue][nisshi-issues] if a client or Kafka version you rely on
+behaves differently.
 
 Transactions are not supported: a producer that calls `initTransactions()`, including Kafka Streams with `exactly_once_v2`, fails with `TransactionalIdAuthorizationException`. Idempotent producers work.
 
