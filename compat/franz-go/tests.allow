@@ -2,7 +2,8 @@
 #
 # FINDINGS.md records the compatibility gaps behind the tests that are
 # excluded: TestGroupETL (UNKNOWN_MEMBER_ID under concurrent rebalances),
-# TestTxnEtl (transactions refused).
+# TestTxnEtl (transactions refused), TestConsumeRegex (__consumer_offsets is
+# not in Metadata).
 #
 # TestSCRAMAuth/TestSCRAMAuthBadCredentials self-skip without
 # KGO_TEST_SCRAM; TestShareGroup*/Test*848* self-skip because tansu does
@@ -32,7 +33,6 @@ Test_xerialDecode
 TestIssue325
 TestConsumeTopicRetrieval
 TestConsumeTopicRetrieval_Many
-TestConsumeRegex
 TestIssue337
 TestDirectPartitionPurge
 TestIssue434

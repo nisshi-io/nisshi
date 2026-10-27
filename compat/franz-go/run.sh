@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-FRANZ_GO_VERSION="${FRANZ_GO_VERSION:-v1.21.3}"
+FRANZ_GO_VERSION="${FRANZ_GO_VERSION:-v1.22.2}"
 BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-127.0.0.1:9092}"
 # when set (the compat-franz-go justfile recipe does), the PID of the broker
 # started for this run: the readiness wait fails immediately if it exits

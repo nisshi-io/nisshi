@@ -489,15 +489,29 @@ where
             }
 
             // Kafka answers an `ApiVersions` request outside the protocol range with
-            // `UNSUPPORTED_VERSION`, encoded at v0, so that the client reads the `ApiVersions`
-            // entry and retries at a version in range ([ApiVersionsRequest.java#L112-L126]).
+            // `UNSUPPORTED_VERSION`, encoded at v0, and lists only its own `ApiVersions` range,
+            // so that the client retries at a version in range ([ApiVersionsRequest.java#L112-L129]).
             // `api_version` is already 0 for such a request.
             //
-            // [ApiVersionsRequest.java#L112-L126]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiVersionsRequest.java#L112-L126
+            // The reply lists only that entry because franz-go retries only on such a reply,
+            // and takes a longer list as the broker's supported versions.
+            //
+            // The entry is this build's protocol range, not the inner service's entry, because
+            // franz-go retries only at a version lower than the one it sent. Behind the proxy,
+            // the inner service is the origin, which can support a later version than this
+            // layer decodes.
+            //
+            // [ApiVersionsRequest.java#L112-L129]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiVersionsRequest.java#L112-L129
             let body = match body {
                 Body::ApiVersionsResponse(response) if unsupported_api_versions.is_some() => {
+                    let api_keys = crate::api::protocol_api_version(ApiVersionsRequest::KEY)
+                        .into_iter()
+                        .collect();
+
                     Body::ApiVersionsResponse(
-                        response.error_code(ErrorCode::UnsupportedVersion.into()),
+                        response
+                            .error_code(ErrorCode::UnsupportedVersion.into())
+                            .api_keys(Some(api_keys)),
                     )
                 }
                 body => body,

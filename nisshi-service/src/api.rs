@@ -203,6 +203,20 @@ pub(crate) fn is_within_protocol_range(api_key: i16, api_version: i16) -> bool {
         .is_some_and(|meta| meta.version.valid.within(api_version))
 }
 
+/// Returns the `ApiVersions` entry for `api_key` with its protocol range, the range that
+/// [`is_within_protocol_range`] checks.
+pub(crate) fn protocol_api_version(api_key: i16) -> Option<ApiVersion> {
+    RootMessageMeta::messages()
+        .requests()
+        .get(&api_key)
+        .map(|meta| {
+            ApiVersion::default()
+                .api_key(meta.api_key)
+                .min_version(meta.version.valid.start)
+                .max_version(meta.version.valid.end)
+        })
+}
+
 impl<E> Service<FrameInput> for FrameRouteService<E>
 where
     E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,

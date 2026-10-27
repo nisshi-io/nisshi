@@ -47,7 +47,7 @@ client that reads the ApiVersions response first does not send such a request.
 
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with 4 partitions, if the client allows automatic topic creation. The broker has no setting to turn this off. To set a different number of partitions, create the topic with CreateTopics first. |
+| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with 4 partitions, if the client allows automatic topic creation. The broker has no setting to turn this off. To set a different number of partitions, create the topic with CreateTopics first. Metadata does not list `__consumer_offsets`, because the broker keeps committed offsets in its storage engine, not in a topic. |
 | CreateTopics | 19 | 0-7 | Yes | Yes | Yes | Yes | |
 | DeleteTopics | 20 | 0-6 | Yes | Yes | Yes | Yes | |
 | DescribeConfigs | 32 | 0-4 | Partial | Partial | Partial | Partial | Lists only the configs set on a topic, not the defaults. Describing a broker, for example with `kafka-configs --describe --entity-type brokers`, returns an empty list. |
@@ -148,7 +148,7 @@ CI runs these suites against the broker.
 | Suite | What runs | Version | Tests that pass |
 | --- | --- | --- | --- |
 | [librdkafka](../compat/librdkafka) | The librdkafka integration test suite | v2.14.2 and v2.3.0 | [tests.allow](../compat/librdkafka/tests.allow) for v2.14.2, [tests-v2.3.0.allow](../compat/librdkafka/tests-v2.3.0.allow) for v2.3.0 |
-| [franz-go](../compat/franz-go) | The franz-go `kgo` integration test suite | v1.21.3 | [tests.allow](../compat/franz-go/tests.allow) |
+| [franz-go](../compat/franz-go) | The franz-go `kgo` integration test suite | v1.22.2 | [tests.allow](../compat/franz-go/tests.allow) |
 | [Kafka CLI smoke tests](../nisshi-smoke-test) | The Apache Kafka command line tools | Kafka 3.7.2, 3.9.2 and 4.3.1 | Every test that is not marked `#[ignore]` |
 
 The `tests.allow` lists of the librdkafka and franz-go suites leave out the tests of these

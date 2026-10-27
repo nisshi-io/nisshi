@@ -1,9 +1,13 @@
-# franz-go v1.21.3 sweep findings
+# franz-go sweep findings
 
 Sweep of the franz-go `pkg/kgo` integration test suite against
-`nisshi broker --storage-engine=memory://`, 2026-06-12. Passing tests are
-in `tests.allow`; 61 of 64 pass (the SCRAM, share-group and KIP-848
-tests self-skip).
+`nisshi broker --storage-engine=memory://`, 2026-06-12, at v1.21.3. Passing
+tests are in `tests.allow`; 61 of 64 pass (the SCRAM, share-group and
+KIP-848 tests self-skip).
+
+The suite runs at v1.22.2 since 2026-10-27. The allowlist was checked
+against that version, and `TestConsumeRegex` left it (gap 3 below). The
+tests that v1.22 adds have not been swept.
 
 ## Fixed
 
@@ -77,8 +81,8 @@ tests self-skip).
    for both dynamic and KIP-345 static (`group.instance.id`) members;
    one run also saw a duplicate offset delivered after a rebalance.
    Fails all `TestGroupETL` variants (range, cooperative-sticky,
-   static). Single-group rebalancing (`TestGroupSimple`,
-   `TestConsumeRegex`, pause/resume tests) passes.
+   static). Single-group rebalancing (`TestGroupSimple`, pause/resume
+   tests) passes.
 
 2. **Transactions are refused** — nisshi answers InitProducerId with a
    `transactional.id` with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, so
@@ -87,6 +91,18 @@ tests self-skip).
    response whose member assignment failed to parse ("response did not
    contain enough data to be valid"), suggesting an empty/truncated
    assignment payload under rebalance.
+
+3. **`__consumer_offsets` is not in Metadata** — Kafka creates
+   `__consumer_offsets` on the first FindCoordinator and lists it in
+   Metadata as an internal topic. nisshi keeps committed offsets in its
+   storage engine, not in a topic, so Metadata does not list it. From
+   v1.22, `TestConsumeRegex` checks that a regex subscription skips an
+   internal topic, and it falls back to `__consumer_offsets` because only
+   franz-go's fake broker honours the `kfake.is_internal` topic config.
+   The test reports `topic __consumer_offsets is not in metadata` from
+   its setup, after a 30s wait, then `skipped_internal [] is missing
+   __consumer_offsets`. Its include and exclude checks pass, so regex
+   subscriptions work.
 
 ## Feature gaps observed via self-skips (not failures)
 
