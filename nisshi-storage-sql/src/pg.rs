@@ -103,10 +103,10 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        self,
-        consumer_group_select, default_hash, idempotent_epoch_check, idempotent_sequence_check,
-        producer_epochs_select, result_columns::ResultColumns, topic_configuration_select,
-        topic_configuration_select_keys, topic_select, watermark_select_for_write,
+        self, consumer_group_select, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, result_columns::ResultColumns,
+        topic_configuration_select, topic_configuration_select_keys, topic_select,
+        watermark_select_for_write,
     },
 };
 
@@ -2922,11 +2922,7 @@ impl Postgres {
             }
 
             let (producer, epoch) = if let Some(row) = self
-                .prepare_query_opt(
-                    &tx,
-                    sql::TXN_SELECT_NAME,
-                    &[&self.cluster, &transaction_id],
-                )
+                .prepare_query_opt(&tx, sql::TXN_SELECT_NAME, &[&self.cluster, &transaction_id])
                 .await
                 .inspect_err(|err| error!(?err))?
             {
@@ -3019,11 +3015,7 @@ impl Postgres {
                 let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
 
                 let row = self
-                    .prepare_query_one(
-                        &tx,
-                        sql::PRODUCER_EPOCH_INSERT,
-                        &[&self.cluster, &producer],
-                    )
+                    .prepare_query_one(&tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &producer])
                     .await
                     .inspect_err(|err| error!(self.cluster, producer, ?err))?;
 
@@ -3104,11 +3096,7 @@ impl Postgres {
             let producer: i64 = row.try_get(0)?;
 
             let row = self
-                .prepare_query_one(
-                    &tx,
-                    sql::PRODUCER_EPOCH_INSERT,
-                    &[&self.cluster, &producer],
-                )
+                .prepare_query_one(&tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &producer])
                 .await
                 .inspect_err(|err| error!(self.cluster, producer, ?err))?;
 
@@ -3311,11 +3299,7 @@ impl Storage for Postgres {
         let c = self.connection().await?;
 
         _ = self
-            .prepare_execute(
-                &c,
-                sql::REGISTER_BROKER,
-                &[&broker_registration.cluster_id],
-            )
+            .prepare_execute(&c, sql::REGISTER_BROKER, &[&broker_registration.cluster_id])
             .await
             .inspect(|n| debug!(cluster = self.cluster, n))?;
 
@@ -4530,11 +4514,7 @@ impl Storage for Postgres {
         let tx = c.transaction().await?;
 
         _ = self
-            .prepare_execute(
-                &tx,
-                sql::CONSUMER_GROUP_INSERT,
-                &[&self.cluster, &group_id],
-            )
+            .prepare_execute(&tx, sql::CONSUMER_GROUP_INSERT, &[&self.cluster, &group_id])
             .await?;
 
         let existing_e_tag = version
@@ -4921,11 +4901,7 @@ impl Storage for Postgres {
         let c = self.connection().await?;
 
         let rows = self
-            .prepare_query(
-                &c,
-                sql::TXN_DETAIL_SELECT_TIMED_OUT,
-                &[&self.cluster, &now],
-            )
+            .prepare_query(&c, sql::TXN_DETAIL_SELECT_TIMED_OUT, &[&self.cluster, &now])
             .await?;
 
         // release the listing connection before aborting: each abort_timed_out below checks

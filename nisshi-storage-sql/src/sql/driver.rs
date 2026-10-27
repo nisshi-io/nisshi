@@ -15,20 +15,36 @@
 //! Reads a column's value from a row of each SQL driver: the only driver-specific code that a
 //! query module's `RowReader` uses.
 
+use bytes::Bytes;
 use nisshi_storage::{Error, Result};
 use serde_json::Value;
+use std::time::SystemTime;
+use uuid::Uuid;
 
 /// A row of one SQL driver's result, read by column index.
 ///
 /// Each method reads one kind of value that the queries store, and returns `None` for a null and
-/// an error for a value of another kind. Each method reads the value from the row once.
-/// [`FromColumn`] reads each Rust type that a query module declares through these methods.
+/// an error for a value of another kind. Each method reads the value from the row once, so that a
+/// large value, such as a record's key, is copied at most once. [`Column`] builds each Rust type
+/// that a query module declares on these methods.
 pub(crate) trait DriverRow {
     /// Returns the integer at `index`, widened to `i64`.
     fn integer(&self, index: usize) -> Result<Option<i64>>;
 
+    /// Returns the boolean at `index`. SQLite stores a boolean as the integer 0 or 1.
+    fn boolean(&self, index: usize) -> Result<Option<bool>>;
+
     /// Returns the text at `index`.
     fn text(&self, index: usize) -> Result<Option<String>>;
+
+    /// Returns the bytes at `index`.
+    fn bytes(&self, index: usize) -> Result<Option<Bytes>>;
+
+    /// Returns the UUID at `index`. SQLite stores a UUID as its text.
+    fn uuid(&self, index: usize) -> Result<Option<Uuid>>;
+
+    /// Returns the time at `index`. SQLite stores a time as milliseconds since the Unix epoch.
+    fn timestamp(&self, index: usize) -> Result<Option<SystemTime>>;
 
     /// Returns the JSON document at `index`, or the error from parsing it.
     ///
@@ -100,9 +116,33 @@ impl FromColumn for i16 {
     }
 }
 
+impl FromColumn for bool {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.boolean(index)
+    }
+}
+
 impl FromColumn for String {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.text(index)
+    }
+}
+
+impl FromColumn for Bytes {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.bytes(index)
+    }
+}
+
+impl FromColumn for Uuid {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.uuid(index)
+    }
+}
+
+impl FromColumn for SystemTime {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.timestamp(index)
     }
 }
 
@@ -115,13 +155,15 @@ impl FromColumn for serde_json::Result<Value> {
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::DriverRow;
+    use bytes::Bytes;
     use nisshi_storage::Result;
     use serde_json::Value;
-    use std::error::Error as StdError;
+    use std::{error::Error as StdError, time::SystemTime};
     use tokio_postgres::{
         Row,
         types::{FromSql, Type},
     };
+    use uuid::Uuid;
 
     /// A `smallint`, `integer` or `bigint`, widened to `i64`.
     ///
@@ -151,7 +193,25 @@ mod postgres {
                 .map_err(Into::into)
         }
 
+        fn boolean(&self, index: usize) -> Result<Option<bool>> {
+            self.try_get(index).map_err(Into::into)
+        }
+
         fn text(&self, index: usize) -> Result<Option<String>> {
+            self.try_get(index).map_err(Into::into)
+        }
+
+        fn bytes(&self, index: usize) -> Result<Option<Bytes>> {
+            self.try_get::<_, Option<&[u8]>>(index)
+                .map(|bytes| bytes.map(Bytes::copy_from_slice))
+                .map_err(Into::into)
+        }
+
+        fn uuid(&self, index: usize) -> Result<Option<Uuid>> {
+            self.try_get(index).map_err(Into::into)
+        }
+
+        fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
             self.try_get(index).map_err(Into::into)
         }
 
@@ -166,8 +226,12 @@ mod postgres {
 #[cfg(feature = "libsql")]
 mod libsql {
     use super::{DriverRow, DriverRowCursor};
+    use bytes::Bytes;
     use libsql::{Row, Rows, Value};
+    use nisshi_sans_io::to_system_time;
     use nisshi_storage::Result;
+    use std::time::SystemTime;
+    use uuid::Uuid;
 
     /// Returns the value at `index` of `row`, or `None` for a null.
     ///
@@ -175,6 +239,95 @@ mod libsql {
     /// typed `Row::get`, because libSQL 0.10's typed `get` panics on a value of another kind.
     fn nullable_value(row: &Row, index: usize) -> Result<Option<Value>> {
         match row.get_value(i32::try_from(index)?)? {
+            Value::Null => Ok(None),
+            value => Ok(Some(value)),
+        }
+    }
+
+    /// Returns the integer in `value`, or an error for a value of another kind.
+    fn integer_of(value: Value) -> Result<i64> {
+        match value {
+            Value::Integer(integer) => Ok(integer),
+            _ => Err(libsql::Error::InvalidColumnType.into()),
+        }
+    }
+
+    /// Returns the text in `value`, or an error for a value of another kind.
+    fn text_of(value: Value) -> Result<String> {
+        match value {
+            Value::Text(text) => Ok(text),
+            _ => Err(libsql::Error::InvalidColumnType.into()),
+        }
+    }
+
+    impl DriverRowCursor for Rows {
+        type Row = Row;
+
+        async fn next(&mut self) -> Result<Option<Row>> {
+            Rows::next(self).await.map_err(Into::into)
+        }
+    }
+
+    impl DriverRow for Row {
+        fn integer(&self, index: usize) -> Result<Option<i64>> {
+            nullable_value(self, index)?.map(integer_of).transpose()
+        }
+
+        fn boolean(&self, index: usize) -> Result<Option<bool>> {
+            self.integer(index)?
+                .map(|integer| match integer {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                })
+                .transpose()
+        }
+
+        fn text(&self, index: usize) -> Result<Option<String>> {
+            nullable_value(self, index)?.map(text_of).transpose()
+        }
+
+        fn bytes(&self, index: usize) -> Result<Option<Bytes>> {
+            nullable_value(self, index)?
+                .map(|value| match value {
+                    Value::Blob(blob) => Ok(Bytes::from(blob)),
+                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                })
+                .transpose()
+        }
+
+        fn uuid(&self, index: usize) -> Result<Option<Uuid>> {
+            self.text(index)?
+                .map(|text| Uuid::parse_str(&text).map_err(Into::into))
+                .transpose()
+        }
+
+        fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
+            self.integer(index)?
+                .map(|millis| to_system_time(millis).map_err(Into::into))
+                .transpose()
+        }
+
+        fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {
+            self.text(index)
+                .map(|text| text.map(|text| serde_json::from_str(&text)))
+        }
+    }
+}
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::{DriverRow, DriverRowCursor};
+    use bytes::Bytes;
+    use nisshi_sans_io::to_system_time;
+    use nisshi_storage::{Error, Result};
+    use std::time::SystemTime;
+    use turso::{Row, Rows, Value};
+    use uuid::Uuid;
+
+    /// Returns the value at `index` of `row`, or `None` for a null.
+    fn nullable_value(row: &Row, index: usize) -> Result<Option<Value>> {
+        match row.get_value(index)? {
             Value::Null => Ok(None),
             value => Ok(Some(value)),
         }
@@ -193,7 +346,17 @@ mod libsql {
             nullable_value(self, index)?
                 .map(|value| match value {
                     Value::Integer(integer) => Ok(integer),
-                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                    value => Err(Error::UnexpectedValue(value)),
+                })
+                .transpose()
+        }
+
+        fn boolean(&self, index: usize) -> Result<Option<bool>> {
+            nullable_value(self, index)?
+                .map(|value| match value {
+                    Value::Integer(0) => Ok(false),
+                    Value::Integer(1) => Ok(true),
+                    value => Err(Error::UnexpectedValue(value)),
                 })
                 .transpose()
         }
@@ -202,39 +365,30 @@ mod libsql {
             nullable_value(self, index)?
                 .map(|value| match value {
                     Value::Text(text) => Ok(text),
-                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                    value => Err(Error::UnexpectedValue(value)),
                 })
                 .transpose()
         }
 
-        fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {
-            self.text(index)
-                .map(|text| text.map(|text| serde_json::from_str(&text)))
-        }
-    }
-}
-
-#[cfg(feature = "turso")]
-mod turso {
-    use super::{DriverRow, DriverRowCursor};
-    use nisshi_storage::Result;
-    use turso::{Row, Rows};
-
-    impl DriverRowCursor for Rows {
-        type Row = Row;
-
-        async fn next(&mut self) -> Result<Option<Row>> {
-            Rows::next(self).await.map_err(Into::into)
-        }
-    }
-
-    impl DriverRow for Row {
-        fn integer(&self, index: usize) -> Result<Option<i64>> {
-            self.get(index).map_err(Into::into)
+        fn bytes(&self, index: usize) -> Result<Option<Bytes>> {
+            nullable_value(self, index)?
+                .map(|value| match value {
+                    Value::Blob(blob) => Ok(Bytes::from(blob)),
+                    value => Err(Error::UnexpectedValue(value)),
+                })
+                .transpose()
         }
 
-        fn text(&self, index: usize) -> Result<Option<String>> {
-            self.get(index).map_err(Into::into)
+        fn uuid(&self, index: usize) -> Result<Option<Uuid>> {
+            self.text(index)?
+                .map(|text| Uuid::parse_str(&text).map_err(Into::into))
+                .transpose()
+        }
+
+        fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
+            self.integer(index)?
+                .map(|millis| to_system_time(millis).map_err(Into::into))
+                .transpose()
         }
 
         fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {

@@ -27,8 +27,7 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        self,
-        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
+        self, Cache, consumer_group_select, default_hash, idempotent_epoch_check,
         idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
         watermark_select_for_write,
@@ -3665,10 +3664,7 @@ impl Storage for Engine {
                     .await?;
 
                 let mut rows = tx
-                    .query(
-                        &sql_lookup(sql::PRODUCER_INSERT)?,
-                        &[self.cluster.as_str()],
-                    )
+                    .query(&sql_lookup(sql::PRODUCER_INSERT)?, &[self.cluster.as_str()])
                     .await?;
 
                 if let Some(row) = rows.next().await? {
