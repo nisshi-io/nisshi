@@ -137,7 +137,7 @@ on that engine.
 The in-memory and S3 engines share one implementation, so the broker tests for the in-memory
 engine also test the code that the S3 engine runs.
 
-[#866]: https://github.com/nisshi-io/nisshi/issues/866
+[#866]: https://github.com/nisshi-io/solace-nisshi/issues/866
 
 ## Sign off your commits (DCO)
 

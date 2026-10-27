@@ -5,7 +5,7 @@ stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, S
 
 <br>
 
-[![License](https://img.shields.io/badge/License-Apache-165dfc.svg)](https://github.com/nisshi-io/nisshi/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache-165dfc.svg)](https://github.com/nisshi-io/solace-nisshi/blob/main/LICENSE)
 &nbsp;
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-165dfc.svg?logo=rust)](https://www.rust-lang.org/)
 &nbsp;
@@ -15,7 +15,7 @@ stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, S
 [![Blog](https://img.shields.io/badge/%F0%9F%93%98%20blog-blog.nisshi.io-165dfc.svg)](https://blog.nisshi.io/articles)
 &nbsp;
 <br>
-[![GitHub stars](https://img.shields.io/github/stars/nisshi-io/nisshi?style=social)](https://github.com/nisshi-io/nisshi)
+[![GitHub stars](https://img.shields.io/github/stars/nisshi-io/solace-nisshi?style=social)](https://github.com/nisshi-io/solace-nisshi)
 
 <br>
 
@@ -67,13 +67,13 @@ To learn more about Nisshi, see the full documentation at [docs.nisshi.io](https
 
 ## Which release to use
 
-[![Latest release](https://img.shields.io/github/v/release/nisshi-io/nisshi?label=latest%20release)][nisshi-latest-release]
+[![Latest release](https://img.shields.io/github/v/release/nisshi-io/solace-nisshi?label=latest%20release)][nisshi-latest-release]
 
 Use the [latest release][nisshi-latest-release], the one marked **Latest** on the Releases page. `cargo install nisshi` and the `latest` container image both skip pre-releases.
 
 Releases marked **Pre-release**, with tags such as `v0.8.0-pre.1`, are builds of `main` published ahead of the next release. Their behaviour and storage formats can still change, and a later version may not read the data they wrote (upgrading from 0.7.0-pre.1 or pre.2 to 0.7.0 needs the manual steps in the 0.7.0 upgrade notes). Use them for testing, not for data you want to keep. To install one, name its exact version, for example `ghcr.io/nisshi-io/nisshi:0.8.0-pre.1`.
 
-This README describes `main`, which can be ahead of the latest release. To read the README of a release, open it at its tag, for example [v0.7.0](https://github.com/nisshi-io/nisshi/blob/v0.7.0/README.md).
+This README describes `main`, which can be ahead of the latest release. To read the README of a release, open it at its tag, for example [v0.7.0](https://github.com/nisshi-io/solace-nisshi/blob/v0.7.0/README.md).
 
 ## Installing with crates.io
 
@@ -786,7 +786,7 @@ trademarks of The Apache Software Foundation.
 [cloudflare-r2]: https://developers.cloudflare.com/r2/
 [continuous-archiving]: https://www.postgresql.org/docs/current/continuous-archiving.html
 [crates-io-object-store]: https://crates.io/crates/object_store
-[github-com-nisshi-io]: https://github.com/nisshi-io/nisshi
+[github-com-nisshi-io]: https://github.com/nisshi-io/solace-nisshi
 [json-schema-org]: https://json-schema.org/
 [librdkafka]: https://github.com/confluentinc/librdkafka
 [min-io]: https://min.io
@@ -796,8 +796,8 @@ trademarks of The Apache Software Foundation.
 [protocol-buffers]: https://protobuf.dev
 [raft-consensus]: https://raft.github.io
 [rust-lang-org]: https://www.rust-lang.org
-[nisshi-issues]: https://github.com/nisshi-io/nisshi/issues
-[nisshi-latest-release]: https://github.com/nisshi-io/nisshi/releases/latest
+[nisshi-issues]: https://github.com/nisshi-io/solace-nisshi/issues
+[nisshi-latest-release]: https://github.com/nisshi-io/solace-nisshi/releases/latest
 [nisshi-contributing]: CONTRIBUTING.md
 [nisshi-code-of-conduct]: CODE_OF_CONDUCT.md
 [nisshi-security]: SECURITY.md

@@ -69,7 +69,7 @@ The range can be hundreds of commits (`v0.7.0` had 236), so give the cleaned com
 - **Changed or Fixed:** an entry goes under Fixed when the old behavior was a bug, such as a crash, a closed connection, a wrong answer or lost data. It goes under Changed when the old behavior worked as designed and a client could depend on it, even if the new behavior matches Apache Kafka more closely. A change that can break such a client also gets an upgrade note.
 - Leave out `ci`, `test`, `refactor`, `chore` and `build(deps)` commits unless a user can see the change. Keep a dependency bump that fixes an advisory (RUSTSEC or GHSA) under Security, with the advisory linked.
 - Merge commits that fix the same thing into one entry, and drop a fix for a bug that no release had.
-- Link each PR as `([#N](https://github.com/nisshi-io/nisshi/pull/N))` at the end of its entry. Don't hard-wrap lines: each paragraph and each list item is one line. Nested lists and fenced code blocks are fine.
+- Link each PR as `([#N](https://github.com/nisshi-io/solace-nisshi/pull/N))` at the end of its entry. Don't hard-wrap lines: each paragraph and each list item is one line. Nested lists and fenced code blocks are fine.
 - Name flags, environment variables, metrics, error codes and config keys exactly as the code spells them, in backticks.
 - Return the section and, separately, a list of the commits it left out, each with a one-line reason.
 
@@ -101,7 +101,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 ### `CHANGELOG.md` (stable only)
 
 - Insert the section above the first `## [` heading.
-- Add `[VERSION]: https://github.com/nisshi-io/nisshi/compare/VPREV...TAG` above the first link reference at the end of the file.
+- Add `[VERSION]: https://github.com/nisshi-io/solace-nisshi/compare/VPREV...TAG` above the first link reference at the end of the file.
 - If the file has a section for a stable version newer than `VPREV` (a version whose run published nothing, see phase 1), the new section covers its commits. Remove that section and its link reference, and say so in the PR.
 - Change nothing else in the file.
 
@@ -116,13 +116,13 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 - `bash .github/scripts/check-release-tag.sh TAG > <scratch>/section.md` passes. That is the check `release.yml` runs on the tag. For a stable tag, its output after the first line is the new section.
 - Stable only: `grep -n -i -E '<!--|- \[ \]|- \[x\]|signed-off-by|co-authored-by|generated with' <scratch>/section.md` prints nothing.
-- Stable only: list every URL in the section (`grep -o -E 'https?://[^ )>]+' <scratch>/section.md | sort -u`). Show the operator each one that isn't under `github.com/nisshi-io/nisshi`, `cwiki.apache.org`, `issues.apache.org`, `rustsec.org`, `github.com/advisories` or `www.rfc-editor.org`, because a link in a contributor's text can point anywhere.
+- Stable only: list every URL in the section (`grep -o -E 'https?://[^ )>]+' <scratch>/section.md | sort -u`). Show the operator each one that isn't under `github.com/nisshi-io/solace-nisshi`, `cwiki.apache.org`, `issues.apache.org`, `rustsec.org`, `github.com/advisories` or `www.rfc-editor.org`, because a link in a contributor's text can point anywhere.
 - Read the section once more as an operator who upgrades from `VPREV`, and check that every upgrade note says what to do.
 
 ## 5. Open the PR
 
 - Commit only `Cargo.toml`, `Cargo.lock` and (stable) `CHANGELOG.md`, as `chore(release): prepare TAG`, signed off (`git commit -s`), ending with the session's `Co-Authored-By` trailer.
-- Push with `git push -u origin release/TAG` and open the PR against `main` with the title `chore(release): prepare TAG` and the three sections of `.github/PULL_REQUEST_TEMPLATE.md`, as in [#1004](https://github.com/nisshi-io/nisshi/pull/1004):
+- Push with `git push -u origin release/TAG` and open the PR against `main` with the title `chore(release): prepare TAG` and the three sections of `.github/PULL_REQUEST_TEMPLATE.md`, as in [#1004](https://github.com/nisshi-io/solace-nisshi/pull/1004):
   - **What changes, and why?** The version bump from the old to the new version, and (stable) the section: which range it covers, and the upgrade notes that no commit body mentioned. Say that after the merge, `/cut-release` tags the squash commit on `main`, which publishes the image, the GitHub release and the crates. Stable only: end the section with the line `Drafted from <DRAFT_BASE>.`, using the full SHA.
   - **Upgrade impact:** none from the PR itself. For a stable release, the changelog describes the impact of upgrading.
   - **How was this tested?** `cargo metadata --locked`, the release-tag check, and how the entries were checked.
@@ -181,13 +181,13 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 - Pre-release: the body is two paragraphs. The first is fixed, with `X.Y.Z` being `VERSION` without its `-pre.N`:
 
   ```markdown
-  Pre-release of X.Y.Z, for trying changes before it ships: behaviour and storage formats can still change, so use the [latest release](https://github.com/nisshi-io/nisshi/releases/latest) for anything you keep. See [Which release to use](https://github.com/nisshi-io/nisshi#which-release-to-use).
+  Pre-release of X.Y.Z, for trying changes before it ships: behaviour and storage formats can still change, so use the [latest release](https://github.com/nisshi-io/solace-nisshi/releases/latest) for anything you keep. See [Which release to use](https://github.com/nisshi-io/solace-nisshi#which-release-to-use).
   ```
 
-  The second is `**Full Changelog**: https://github.com/nisshi-io/nisshi/compare/<previous tag>...TAG`. The previous tag is the one just below `TAG` in phase 1's list, stable or pre-release. When `github-release` has succeeded, show the body to the operator and set it with `gh release edit TAG --notes-file <file>` after they approve.
+  The second is `**Full Changelog**: https://github.com/nisshi-io/solace-nisshi/compare/<previous tag>...TAG`. The previous tag is the one just below `TAG` in phase 1's list, stable or pre-release. When `github-release` has succeeded, show the body to the operator and set it with `gh release edit TAG --notes-file <file>` after they approve.
 - Stable: while the run builds, draft the body:
   - Use only the `[VERSION]` section of `CHANGELOG.md` at `MERGE_SHA`. Add no fact that the section doesn't state.
-  - Follow the shape of the previous stable release's body (`gh release view VPREV --json body --jq .body`): an intro paragraph, `## Highlights` (the most important changes, one line each), `## Upgrade notes` (a link to `https://github.com/nisshi-io/nisshi/blob/TAG/CHANGELOG.md` and a short list), and `## Install` (the `cargo install` command, the image `ghcr.io/nisshi-io/nisshi:VERSION`, and the attached binaries). Keep a caveat from the previous body only if it is still true.
+  - Follow the shape of the previous stable release's body (`gh release view VPREV --json body --jq .body`): an intro paragraph, `## Highlights` (the most important changes, one line each), `## Upgrade notes` (a link to `https://github.com/nisshi-io/solace-nisshi/blob/TAG/CHANGELOG.md` and a short list), and `## Install` (the `cargo install` command, the image `ghcr.io/nisshi-io/nisshi:VERSION`, and the attached binaries). Keep a caveat from the previous body only if it is still true.
   - Write it to a file in the scratchpad and show the operator the full text.
 - When the `github-release` job has succeeded (`gh run view <id> --json jobs --jq '.jobs[] | select(.name == "github-release") | .conclusion'`) and the operator approves the body: `gh release edit TAG --notes-file <file>`.
 
@@ -204,7 +204,7 @@ Report the run URL and its conclusion, and whether the `FOSSA_LICENSING_BLOCK` v
 - **On success,** run these checks and report each result:
   - Every publishable crate is on crates.io at `VERSION`. List the crates with `cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish == null) | .name'`, and for each one check `curl -sf -A nisshi-cut-release "https://crates.io/api/v1/crates/<name>/VERSION"`. For a stable release, `https://crates.io/api/v1/crates/nisshi` has `VERSION` as `crate.default_version`.
   - `cargo install nisshi --locked --features dynostore,postgres,libsql,slatedb --root "$(mktemp -d)"` installs `VERSION`, and `<root>/bin/nisshi --version` prints it. A pre-release needs `--version VERSION`.
-  - The GitHub release has its tarballs (`gh release view TAG --json assets,isPrerelease`). Stable: `gh api repos/nisshi-io/nisshi/releases/latest --jq .tag_name` is `TAG`. Pre-release: `isPrerelease` is `true`.
+  - The GitHub release has its tarballs (`gh release view TAG --json assets,isPrerelease`). Stable: `gh api repos/nisshi-io/solace-nisshi/releases/latest --jq .tag_name` is `TAG`. Pre-release: `isPrerelease` is `true`.
   - The image: `docker buildx imagetools inspect ghcr.io/nisshi-io/nisshi:VERSION`. Stable: the `X.Y` and `latest` tags have the same digest. Pre-release: `latest` still points to the previous stable release.
 - Offer to delete the local `release/TAG` branch, if it remains after the merge.
 

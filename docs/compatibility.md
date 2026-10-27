@@ -167,7 +167,7 @@ consumer group behaviours, because the tests fail:
 The `FINDINGS.md` file in each client suite's folder gives the test numbers and the cause of
 each failure. The findings come from runs on the in-memory engine.
 
-[#922]: https://github.com/nisshi-io/nisshi/issues/922
-[#962]: https://github.com/nisshi-io/nisshi/issues/962
-[#964]: https://github.com/nisshi-io/nisshi/issues/964
-[#1051]: https://github.com/nisshi-io/nisshi/issues/1051
+[#922]: https://github.com/nisshi-io/solace-nisshi/issues/922
+[#962]: https://github.com/nisshi-io/solace-nisshi/issues/962
+[#964]: https://github.com/nisshi-io/solace-nisshi/issues/964
+[#1051]: https://github.com/nisshi-io/solace-nisshi/issues/1051
