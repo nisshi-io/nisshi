@@ -97,7 +97,7 @@ us too.
 ## Questions
 
 For questions about this policy, ask in the
-[Solace community](https://community.solace.com). Report vulnerabilities only
+[Solace community](https://community.solace.com/c/nisshi-diskless-streaming/19). Report vulnerabilities only
 through the channels under How to report. For non-security bugs and feature
 requests, open a [GitHub issue](https://github.com/nisshi-io/nisshi/issues).
 
