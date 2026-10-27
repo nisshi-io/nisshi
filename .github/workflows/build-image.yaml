@@ -52,11 +52,30 @@ jobs:
       # ring, libsql-ffi, zstd-sys, ...); see ci.yml's `release` job.
       CC_x86_64_unknown_linux_musl: musl-gcc
     steps:
+      # The workflow's own commit, with full history, so the next step can test
+      # `git_ref` against main before this job runs any code from it.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
           persist-credentials: false
+
+      # This job builds only a commit that is on main. A dispatch from main
+      # runs in main's cache scope, and the build runs every build script of
+      # the checked-out tree, so a commit off main could write main's Actions
+      # cache. Main's own commits gain nothing from that. A release tag passes
+      # because release.yml's `on-main` job requires the tagged commit to be
+      # on main.
+      - name: Check out the commit to build
+        env:
+          GIT_REF: ${{ inputs.git_ref }}
+        run: |
+          sha=$(git rev-parse --verify "${GIT_REF}^{commit}")
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::$GIT_REF ($sha) is not on main, so this job does not build it"
+            exit 1
+          fi
+          git checkout --detach "$sha"
 
       # No cache. This runs on trunk only, after the merge, where nobody
       # waits on it, and a cache of its own would be a second musl release
