@@ -5,7 +5,7 @@ and the Solace support team is the backup when the community cannot help.
 
 | You want to | Go to |
 | --- | --- |
-| Ask a question or discuss how to use Nisshi | The [Solace community](https://community.solace.com) |
+| Ask a question or discuss how to use Nisshi | The [Nisshi forum in the Solace community](https://community.solace.com/c/nisshi-diskless-streaming/19) |
 | Report a bug or request a feature | [GitHub issues](https://github.com/nisshi-io/solace-nisshi/issues) |
 | Report a security vulnerability | [SECURITY.md](SECURITY.md). Don't use the forum, an issue or a general help request. |
 | Reach the Solace support team when the community can't help | support@solace.com |

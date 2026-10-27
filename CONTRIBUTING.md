@@ -37,7 +37,7 @@ Sustained contribution can lead to becoming a maintainer. See
 ## Questions
 
 For questions and usage help, please ask in
-[Solace Community](https://community.solace.com/). Answers are best-effort.
+the [Nisshi forum in the Solace Community](https://community.solace.com/c/nisshi-diskless-streaming/19). Answers are best-effort.
 
 ## Development setup
 

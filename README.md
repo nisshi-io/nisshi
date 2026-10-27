@@ -14,6 +14,8 @@ stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, S
 &nbsp;
 [![Blog](https://img.shields.io/badge/%F0%9F%93%98%20blog-blog.nisshi.io-165dfc.svg)](https://blog.nisshi.io/articles)
 &nbsp;
+[![Community](https://img.shields.io/badge/%F0%9F%92%AC%20community-Solace%20forum-165dfc.svg)](https://community.solace.com/c/nisshi-diskless-streaming/19)
+&nbsp;
 <br>
 [![GitHub stars](https://img.shields.io/github/stars/nisshi-io/solace-nisshi?style=social)](https://github.com/nisshi-io/solace-nisshi)
 
@@ -206,7 +208,7 @@ Switching storage engines does not move data: topics, messages, and consumer gro
 PostgreSQL can stream transaction logs to an archive with
 [continuous archiving][continuous-archiving].
 
-Nisshi OSS is provided as-is, with community support only.
+Nisshi OSS is provided as-is, with [community support][nisshi-community] only.
 
 ### Running Docker Compose with S3 (MinIO)
 
@@ -797,6 +799,7 @@ trademarks of The Apache Software Foundation.
 [raft-consensus]: https://raft.github.io
 [rust-lang-org]: https://www.rust-lang.org
 [nisshi-issues]: https://github.com/nisshi-io/solace-nisshi/issues
+[nisshi-community]: https://community.solace.com/c/nisshi-diskless-streaming/19
 [nisshi-latest-release]: https://github.com/nisshi-io/solace-nisshi/releases/latest
 [nisshi-contributing]: CONTRIBUTING.md
 [nisshi-code-of-conduct]: CODE_OF_CONDUCT.md
