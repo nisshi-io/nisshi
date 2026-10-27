@@ -662,6 +662,57 @@ and `proxy` subcommands connect in plaintext and cannot yet talk to a TLS
 listener. `--key-passphrase-file` is unknown to earlier releases, so rolling
 the binary back means removing that flag from the command line as well.
 
+### Outbound TLS
+
+The broker opens connections to PostgreSQL, S3 and Google Cloud Storage,
+Iceberg catalogs and data files, Delta tables, an OTLP collector, and the
+remote `$ref`s of a JSON Schema. Each connection that uses TLS checks the
+server's certificate chain and host name, and a failed check fails the
+connection: the broker does not retry it in plaintext. A connection to an
+`http://` endpoint, such as an `http://` OTLP or Iceberg catalog URL, or an
+`AWS_ENDPOINT` with `AWS_ALLOW_HTTP=true`, uses no TLS.
+
+- **Linux and the container image.** The certificates are checked against the
+  system's CA certificates (`/etc/ssl/certs/ca-certificates.crt` in the image),
+  and rustls-webpki also rejects a chain through any CA on its built-in
+  distrust list. To trust a private CA, set `SSL_CERT_FILE` to a PEM bundle or
+  `SSL_CERT_DIR` to a directory of PEM files. Either one replaces the system's
+  CA certificates, so the bundle must also hold every public CA the broker
+  needs. If the file or directory doesn't exist or holds no PEM certificate,
+  the broker trusts no CA, and every TLS connection fails its certificate
+  check.
+- **macOS.** The trusted CAs come from the operating system. rustls-webpki
+  checks the PostgreSQL, Iceberg REST catalog and Delta S3 connections against
+  those CAs, with its built-in distrust list. macOS itself checks every other
+  connection, including the S3 and Google Cloud Storage storage engines, and
+  rustls-webpki's distrust list does not apply to them. Those connections
+  rely on the distrust updates that Apple pushes, so keep the Mac online and
+  up to date.
+
+A PostgreSQL connection uses TLS only when the server agrees to it. The
+default `sslmode` is `prefer`, which uses plaintext when the server, or
+anything on the network path, declines TLS. Add `sslmode=require` to the
+storage URL to refuse a plaintext connection:
+
+```shell
+nisshi broker --storage-engine "postgres://nisshi:secret@db.example.com/nisshi?sslmode=require"
+```
+
+`require` checks the server's certificate and host name, as libpq does with
+`verify-full`. The broker refuses to start with `sslmode=verify-ca` or
+`sslmode=verify-full`, so use `require` instead. If the server's certificate
+comes from a CA that the system doesn't trust, such as a cloud provider's
+database CA, set `SSL_CERT_FILE` to a bundle that holds that CA and the public
+CAs.
+
+The object store clients read `AWS_ALLOW_INVALID_CERTIFICATES`,
+`GOOGLE_ALLOW_INVALID_CERTIFICATES`, `AZURE_ALLOW_INVALID_CERTIFICATES` and
+`ALLOW_INVALID_CERTIFICATES` from the environment. When one of them is true,
+that client accepts any certificate, so anyone on the network path can read
+and change the data. These variables are for testing only and are not
+supported. The broker logs a warning at startup for each one that is set to
+true.
+
 ### Metrics
 
 Metrics are exported over OTLP/HTTP when `--otlp-endpoint-url` (or

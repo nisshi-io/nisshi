@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use crate::{EnvVarExp, Error, Result, cli::storage_engines};
+use crate::{EnvVarExp, Error, Result, cli::storage_engines, insecure_tls};
 
 use super::DEFAULT_BROKER;
 use clap::Parser;
@@ -419,6 +419,16 @@ impl Arg {
             // arguments are ever constructed another way.
             _ => return Err(Error::TlsRequiresCertAndKey),
         };
+
+        // The broker warns instead of refusing to start, so that a test setup
+        // that sets one of these variables keeps working after an upgrade.
+        for variable in insecure_tls::env_variables(env::vars_os()) {
+            warn!(
+                "{variable} turns off certificate checks on connections to object stores, \
+                 which is unsupported and lets anyone on the network path read and change \
+                 the data: https://github.com/nisshi-io/nisshi#outbound-tls"
+            );
+        }
 
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
