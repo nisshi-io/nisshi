@@ -1,7 +1,7 @@
 <div align="center">
 
-# Nisshi (née Tansu) 🗃️
-stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, SQLite, S3, memory)
+# Nisshi 🗃️
+A stateless server that implements the Apache Kafka® API, with pluggable storage (PostgreSQL, SQLite, S3, memory)
 
 <br>
 
@@ -25,7 +25,7 @@ stateless Apache Kafka®-compatible broker with pluggable storage (PostgreSQL, S
 
 # What is Nisshi?
 
-[Nisshi][github-com-nisshi-io] (née Tansu) is an Apache Kafka®-compatible broker
+[Nisshi][github-com-nisshi-io] implements the Apache Kafka® API
 with PostgreSQL, libSQL (SQLite), S3 or memory storage engines.
 Schema backed topics (Avro, JSON or Protocol buffers) can
 be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables.
@@ -191,7 +191,7 @@ Choose the engine with `--storage-engine` (or `STORAGE_ENGINE`) using the URL sc
 | PostgreSQL | `postgres://` | `postgres` | Suitable for production. Tested, with bugs and security issues fixed. Help comes from the community. |
 | S3 and Google Cloud Storage | `s3://`, `gs://` | `dynostore` | Experimental. Available for continuity. Not recommended for production. |
 | SQLite (libSQL) | `sqlite://` | `libsql` | Suitable for development. |
-| In-memory | `memory://` | `dynostore` | Suitable for development and testing. Data is lost when the broker stops. |
+| In-memory | `memory://` | `dynostore` | Suitable for development and testing. Data is lost when Nisshi stops. |
 | Turso | `turso://` | `turso` | Experimental. |
 | SlateDB | `slatedb://` | `slatedb` | Deprecated. Not recommended for new deployments, because it allows a single writer. Only security fixes are accepted. The engine may be removed in a future release. Use PostgreSQL for production, or SQLite or in-memory for development. The broker logs a warning at startup. |
 
