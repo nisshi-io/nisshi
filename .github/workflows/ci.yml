@@ -624,6 +624,27 @@ jobs:
           tool: shellcheck@0.11.0
       - run: just shellcheck
       - run: just compose-check
+  # Fails when the container image would trust a CA in distrusted-roots.txt.
+  # It builds only the Dockerfile's base stage, which needs no broker binary,
+  # so it runs on every pull request, and a Dependabot bump of the base image
+  # gets its own result.
+  image-ca-certificates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/docker-hub-mirror
+      # The final image copies the base stage's /image as its root, so
+      # /image/etc/ssl here is the image's /etc/ssl. The step checks every file
+      # there, not only the bundle, because the TLS stack also loads each
+      # certificate file in /etc/ssl/certs.
+      - name: Check the image's CA certificates
+        run: |
+          docker build --target base --output "type=local,dest=${RUNNER_TEMP}/base" .
+          find "${RUNNER_TEMP}/base/image/etc/ssl" -type f -exec cat {} + > "${RUNNER_TEMP}/image-ca-certificates.pem"
+          bash .github/scripts/check-ca-bundle.sh "${RUNNER_TEMP}/image-ca-certificates.pem"
   third-party-license:
     if: needs.changes.outputs.rust == 'true'
     needs: [changes]
@@ -1052,6 +1073,7 @@ jobs:
       - cargo-publish-dry-run
       - typos
       - shellcheck
+      - image-ca-certificates
       - third-party-license
       - src
       - smoke
@@ -1093,7 +1115,8 @@ jobs:
       # PR gate would stay green with no Tier A signal at all. The list names
       # the Tier B exemptions, so a newly added job defaults to must-not-skip.
       # Skipped when `changes` found no Rust-relevant path, since then
-      # every Tier A job but typos and shellcheck skips by design.
+      # every Tier A job but typos, shellcheck and image-ca-certificates skips
+      # by design.
       - name: Tier A ran on pull_request
         if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
         env:

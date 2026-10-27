@@ -64,6 +64,9 @@ jobs:
       # release.yml runs check-release-tag.sh only on a `v*` tag, so a PR's
       # edit to it is only tested here, before a release depends on it.
       - run: bash .github/scripts/check-release-tag.test.sh
+      # ci.yml runs check-ca-bundle.sh only on the image's real certificates,
+      # so its failure paths are tested here.
+      - run: bash .github/scripts/check-ca-bundle.test.sh
 
   zizmor:
     runs-on: ubuntu-latest
