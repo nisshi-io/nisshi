@@ -191,455 +191,212 @@ macro_rules! include_sql {
     };
 }
 
-pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
-    let mapping = [
-        (
-            "maintain-vacuum.sql",
-            include_sql!("sql/maintain-vacuum.sql"),
-        ),
-        (
-            "consumer_group_delete.sql",
-            include_sql!("sql/consumer_group_delete.sql"),
-        ),
-        (
-            "consumer_group_detail_delete_by_cg.sql",
-            include_sql!("sql/consumer_group_detail_delete_by_cg.sql"),
-        ),
-        (
-            "consumer_group_detail_insert.sql",
-            include_sql!("sql/consumer_group_detail_insert.sql"),
-        ),
-        (
-            "consumer_group_detail.sql",
-            include_sql!("sql/consumer_group_detail.sql"),
-        ),
-        (
-            "consumer_group_insert.sql",
-            include_sql!("sql/consumer_group_insert.sql"),
-        ),
-        (
-            "consumer_group_select_by_name.sql",
-            include_sql!("sql/consumer_group_select_by_name.sql"),
-        ),
-        (
-            consumer_group_select::QUERY,
-            include_sql!("sql/consumer_group_select.sql"),
-        ),
-        (
-            "consumer_offset_delete_by_cg.sql",
-            include_sql!("sql/consumer_offset_delete_by_cg.sql"),
-        ),
-        (
-            "consumer_offset_delete_by_topic.sql",
-            include_sql!("sql/consumer_offset_delete_by_topic.sql"),
-        ),
-        (
-            "consumer_offset_insert_from_txn.sql",
-            include_sql!("sql/consumer_offset_insert_from_txn.sql"),
-        ),
-        (
-            "consumer_offset_insert.sql",
-            include_sql!("sql/consumer_offset_insert.sql"),
-        ),
-        (
-            "consumer_offset_select_by_group.sql",
-            include_sql!("sql/consumer_offset_select_by_group.sql"),
-        ),
-        (
-            "consumer_offset_select.sql",
-            include_sql!("sql/consumer_offset_select.sql"),
-        ),
-        ("header_copy.sql", include_sql!("sql/header_copy.sql")),
-        (
-            "header_delete_by_topic.sql",
-            include_sql!("sql/header_delete_by_topic.sql"),
-        ),
-        ("header_fetch.sql", include_sql!("sql/header_fetch.sql")),
-        (
-            "header_fetch_range.sql",
-            include_sql!("sql/header_fetch_range.sql"),
-        ),
-        ("header_insert.sql", include_sql!("sql/header_insert.sql")),
-        (
-            "list_earliest_offset.sql",
-            include_sql!("sql/list_earliest_offset.sql"),
-        ),
-        (
-            "list_latest_offset_committed.sql",
-            include_sql!("sql/list_latest_offset_committed.sql"),
-        ),
-        (
-            "list_latest_offset_timestamp.sql",
-            include_sql!("sql/list_latest_offset_timestamp.sql"),
-        ),
-        (
-            "list_latest_offset_uncommitted.sql",
-            include_sql!("sql/list_latest_offset_uncommitted.sql"),
-        ),
-        (
-            "lite/policy_compact_compaction.sql",
-            include_sql!("lite/policy_compact_compaction.sql"),
-        ),
-        (
-            "lite/policy_compact_delete.sql",
-            include_sql!("lite/policy_compact_delete.sql"),
-        ),
-        (
-            "lite/policy_compact_distinct_k.sql",
-            include_sql!("lite/policy_compact_distinct_k.sql"),
-        ),
-        (
-            "lite/policy_compact_max_offset_id.sql",
-            include_sql!("lite/policy_compact_max_offset_id.sql"),
-        ),
-        (
-            "lite/policy_compact_topitions.sql",
-            include_sql!("lite/policy_compact_topitions.sql"),
-        ),
-        (
-            "lite/policy_delete.sql",
-            include_sql!("lite/policy_delete.sql"),
-        ),
-        (
-            "lite/policy_delete_bytes.sql",
-            include_sql!("lite/policy_delete_bytes.sql"),
-        ),
-        ("lite/vacuum_into.sql", include_sql!("lite/vacuum_into.sql")),
-        (
-            "nisshi_schema_version_create.sql",
-            include_sql!("sql/nisshi_schema_version_create.sql"),
-        ),
-        (
-            "nisshi_schema_version_insert.sql",
-            include_sql!("sql/nisshi_schema_version_insert.sql"),
-        ),
-        (
-            "nisshi_schema_version_select.sql",
-            include_sql!("sql/nisshi_schema_version_select.sql"),
-        ),
-        (
-            "pg/nisshi_schema_version_exists.sql",
-            include_sql!("pg/nisshi_schema_version_exists.sql"),
-        ),
-        (
-            "pg/search_path_set_to_cluster_namespace.sql",
-            include_sql!("pg/search_path_set_to_cluster_namespace.sql"),
-        ),
-        ("policy_compact.sql", include_sql!("sql/policy_compact.sql")),
-        ("policy_delete.sql", include_sql!("sql/policy_delete.sql")),
-        (
-            "policy_delete_bytes.sql",
-            include_sql!("sql/policy_delete_bytes.sql"),
-        ),
-        ("ping.sql", "select 1 + 1".to_string()),
-        (
-            "producer_detail_delete_by_topic.sql",
-            include_sql!("sql/producer_detail_delete_by_topic.sql"),
-        ),
-        (
-            "producer_detail_insert.sql",
-            include_sql!("sql/producer_detail_insert.sql"),
-        ),
-        (
-            "producer_epoch_current_for_producer.sql",
-            include_sql!("sql/producer_epoch_current_for_producer.sql"),
-        ),
-        (
-            "producer_epoch_for_current_txn.sql",
-            include_sql!("sql/producer_epoch_for_current_txn.sql"),
-        ),
-        (
-            "producer_epoch_insert.sql",
-            include_sql!("sql/producer_epoch_insert.sql"),
-        ),
-        (
-            "producer_epoch_insert_given.sql",
-            include_sql!("sql/producer_epoch_insert_given.sql"),
-        ),
-        (
-            producer_epochs_select::QUERY,
-            include_sql!("sql/producer_epochs_select.sql"),
-        ),
-        (
-            "producer_insert.sql",
-            include_sql!("sql/producer_insert.sql"),
-        ),
-        (
-            "producer_select_for_update.sql",
-            include_sql!("sql/producer_select_for_update.sql"),
-        ),
-        (
-            "producer_update_epoch_with_txn.sql",
-            include_sql!("sql/producer_update_epoch_with_txn.sql"),
-        ),
-        (
-            "producer_update_sequence.sql",
-            include_sql!("sql/producer_update_sequence.sql"),
-        ),
-        ("record_copy.sql", include_sql!("sql/record_copy.sql")),
-        (
-            "record_delete_by_offset.sql",
-            include_sql!("sql/record_delete_by_offset.sql"),
-        ),
-        (
-            "record_delete_below_log_start.sql",
-            include_sql!("sql/record_delete_below_log_start.sql"),
-        ),
-        (
-            "record_delete_by_topic.sql",
-            include_sql!("sql/record_delete_by_topic.sql"),
-        ),
-        ("record_fetch.sql", include_sql!("sql/record_fetch.sql")),
-        (
-            "record_fetch_keyed.sql",
-            include_sql!("sql/record_fetch_keyed.sql"),
-        ),
-        ("record_fetch_pg.sql", include_sql!("pg/record_fetch.sql")),
-        (
-            "record_fetch_pg_keyed.sql",
-            include_sql!("pg/record_fetch_keyed.sql"),
-        ),
-        ("record_insert.sql", include_sql!("sql/record_insert.sql")),
-        (
-            "register_broker.sql",
-            include_sql!("sql/register_broker.sql"),
-        ),
-        (
-            "scram_credential_delete.sql",
-            include_sql!("sql/scram_credential_delete.sql"),
-        ),
-        (
-            "scram_credential_insert.sql",
-            include_sql!("sql/scram_credential_insert.sql"),
-        ),
-        (
-            "scram_credential_select.sql",
-            include_sql!("sql/scram_credential_select.sql"),
-        ),
-        (
-            "topic_by_cluster.sql",
-            include_sql!("sql/topic_by_cluster.sql"),
-        ),
-        ("topic_by_uuid.sql", include_sql!("sql/topic_by_uuid.sql")),
-        (
-            "topic_configuration_delete_by_topic.sql",
-            include_sql!("sql/topic_configuration_delete_by_topic.sql"),
-        ),
-        (
-            "topic_configuration_delete.sql",
-            include_sql!("sql/topic_configuration_delete.sql"),
-        ),
-        (
-            topic_configuration_select::QUERY,
-            include_sql!("sql/topic_configuration_select.sql"),
-        ),
-        (
-            "topic_configuration_select_name.sql",
-            include_sql!("sql/topic_configuration_select_name.sql"),
-        ),
-        (
-            "topic_configuration_upsert.sql",
-            include_sql!("sql/topic_configuration_upsert.sql"),
-        ),
-        (
-            "topic_delete_by.sql",
-            include_sql!("sql/topic_delete_by.sql"),
-        ),
-        ("topic_insert.sql", include_sql!("sql/topic_insert.sql")),
-        (topic_select::QUERY, include_sql!("sql/topic_select.sql")),
-        (
-            "topic_select_name_for_update.sql",
-            include_sql!("sql/topic_select_name_for_update.sql"),
-        ),
-        (
-            "topic_select_name.sql",
-            include_sql!("sql/topic_select_name.sql"),
-        ),
-        (
-            "topic_select_uuid.sql",
-            include_sql!("sql/topic_select_uuid.sql"),
-        ),
-        (
-            "pg/topic_select_uuid.sql",
-            include_sql!("pg/topic_select_uuid.sql"),
-        ),
-        (
-            topic_configuration_select_keys::QUERY,
-            include_sql!("pg/topic_configuration_select_keys.sql"),
-        ),
-        (
-            "topition_delete_by_topic.sql",
-            include_sql!("sql/topition_delete_by_topic.sql"),
-        ),
-        (
-            "topition_insert.sql",
-            include_sql!("sql/topition_insert.sql"),
-        ),
-        (
-            "topition_select.sql",
-            include_sql!("sql/topition_select.sql"),
-        ),
-        (
-            "topition_select_id.sql",
-            include_sql!("sql/topition_select_id.sql"),
-        ),
-        (
-            "txn_detail_insert.sql",
-            include_sql!("sql/txn_detail_insert.sql"),
-        ),
-        (
-            "txn_detail_select_current.sql",
-            include_sql!("sql/txn_detail_select_current.sql"),
-        ),
-        (
-            "txn_detail_select_for_update.sql",
-            include_sql!("sql/txn_detail_select_for_update.sql"),
-        ),
-        (
-            "txn_detail_select_status_for_update.sql",
-            include_sql!("sql/txn_detail_select_status_for_update.sql"),
-        ),
-        (
-            "txn_detail_select_timed_out.sql",
-            include_sql!("sql/txn_detail_select_timed_out.sql"),
-        ),
-        (
-            "txn_detail_select.sql",
-            include_sql!("sql/txn_detail_select.sql"),
-        ),
-        (
-            "txn_detail_update_sequence.sql",
-            include_sql!("sql/txn_detail_update_sequence.sql"),
-        ),
-        (
-            "txn_detail_update_started_at.sql",
-            include_sql!("sql/txn_detail_update_started_at.sql"),
-        ),
-        ("txn_insert.sql", include_sql!("sql/txn_insert.sql")),
-        (
-            "txn_offset_commit_delete_by_txn.sql",
-            include_sql!("sql/txn_offset_commit_delete_by_txn.sql"),
-        ),
-        (
-            "txn_offset_commit_insert.sql",
-            include_sql!("sql/txn_offset_commit_insert.sql"),
-        ),
-        (
-            "txn_offset_commit_tp_delete_by_topic.sql",
-            include_sql!("sql/txn_offset_commit_tp_delete_by_topic.sql"),
-        ),
-        (
-            "txn_offset_commit_tp_delete_by_txn.sql",
-            include_sql!("sql/txn_offset_commit_tp_delete_by_txn.sql"),
-        ),
-        (
-            "txn_offset_commit_tp_insert.sql",
-            include_sql!("sql/txn_offset_commit_tp_insert.sql"),
-        ),
-        (
-            "txn_produce_offset_delete_by_topic.sql",
-            include_sql!("sql/txn_produce_offset_delete_by_topic.sql"),
-        ),
-        (
-            "txn_produce_offset_delete_by_txn.sql",
-            include_sql!("sql/txn_produce_offset_delete_by_txn.sql"),
-        ),
-        (
-            "txn_produce_offset_insert.sql",
-            include_sql!("sql/txn_produce_offset_insert.sql"),
-        ),
-        (
-            "txn_produce_offset_select_offset_range.sql",
-            include_sql!("sql/txn_produce_offset_select_offset_range.sql"),
-        ),
-        (
-            "txn_produce_offset_select_overlapping_txn.sql",
-            include_sql!("sql/txn_produce_offset_select_overlapping_txn.sql"),
-        ),
-        (
-            "txn_select_name.sql",
-            include_sql!("sql/txn_select_name.sql"),
-        ),
-        (
-            "txn_select_name_for_update.sql",
-            include_sql!("sql/txn_select_name_for_update.sql"),
-        ),
-        (
-            "txn_select_produced_topitions.sql",
-            include_sql!("sql/txn_select_produced_topitions.sql"),
-        ),
-        (
-            "txn_select_producer_epoch.sql",
-            include_sql!("sql/txn_select_producer_epoch.sql"),
-        ),
-        (
-            "txn_status_update.sql",
-            include_sql!("sql/txn_status_update.sql"),
-        ),
-        (
-            "txn_topition_delete_by_topic.sql",
-            include_sql!("sql/txn_topition_delete_by_topic.sql"),
-        ),
-        (
-            "txn_topition_delete_by_txn.sql",
-            include_sql!("sql/txn_topition_delete_by_txn.sql"),
-        ),
-        (
-            "txn_topition_insert.sql",
-            include_sql!("sql/txn_topition_insert.sql"),
-        ),
-        (
-            "txn_topition_select_txns.sql",
-            include_sql!("sql/txn_topition_select_txns.sql"),
-        ),
-        (
-            "txn_topition_select.sql",
-            include_sql!("sql/txn_topition_select.sql"),
-        ),
-        (
-            "txn_update_producer.sql",
-            include_sql!("sql/txn_update_producer.sql"),
-        ),
-        (
-            "virtual_topic_upsert.sql",
-            include_sql!("sql/virtual_topic_upsert.sql"),
-        ),
-        (
-            "watermark_delete_by_topic.sql",
-            include_sql!("sql/watermark_delete_by_topic.sql"),
-        ),
-        (
-            "watermark_insert_from_txn.sql",
-            include_sql!("sql/watermark_insert_from_txn.sql"),
-        ),
-        (
-            "watermark_insert.sql",
-            include_sql!("sql/watermark_insert.sql"),
-        ),
-        (
-            watermark_select_for_write::QUERY,
-            include_sql!("sql/watermark_select_for_write.sql"),
-        ),
-        (
-            watermark_select_for_write::LITE_QUERY,
-            include_sql!("lite/watermark_select_for_write.sql"),
-        ),
-        (
-            "watermark_select_stable.sql",
-            include_sql!("sql/watermark_select_stable.sql"),
-        ),
-        (
-            "watermark_select.sql",
-            include_sql!("sql/watermark_select.sql"),
-        ),
-        (
-            "watermark_update.sql",
-            include_sql!("sql/watermark_update.sql"),
-        ),
-    ];
+/// Returns the SQL cache key of the file `$file` in the folder `$folder` of this crate's `src`: the
+/// file's name for a file in `sql`, and its path for a file in another folder.
+macro_rules! cache_key {
+    ("sql" / $file:literal) => {
+        $file
+    };
+    ($folder:literal / $file:literal) => {
+        concat!($folder, "/", $file)
+    };
+}
 
-    Cache::new(BTreeMap::from(mapping))
-});
+/// Declares the SQL cache, [`SQL`], which holds every query that the engines run, keyed by
+/// [`cache_key!`].
+///
+/// Each line names a query by its folder and file in this crate's `src`. A line in `rows` names
+/// the constant that a query's module declares, because an engine reads the query's rows through
+/// that module, and a compile-time assertion checks that the constant holds the query's key. A
+/// line in `plain` declares the constant here.
+macro_rules! queries {
+    (
+        rows {
+            $($module:ident :: $module_constant:ident = $row_folder:tt / $row_file:literal,)+
+        }
+        plain {
+            $($constant:ident = $folder:tt / $file:literal,)+
+        }
+    ) => {
+        $(
+            #[doc = concat!("The `", $folder, "/", $file, "` query's name in the SQL cache.")]
+            pub(crate) const $constant: &str = cache_key!($folder / $file);
+        )+
+
+        $(
+            const _: () = assert!(
+                const_str_eq($module::$module_constant, cache_key!($row_folder / $row_file)),
+                concat!(
+                    stringify!($module::$module_constant),
+                    " must be the cache key of ",
+                    $row_folder,
+                    "/",
+                    $row_file
+                ),
+            );
+        )+
+
+        pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
+            Cache::new(BTreeMap::from([
+                $(
+                    (
+                        $module::$module_constant,
+                        include_sql!(concat!($row_folder, "/", $row_file)),
+                    ),
+                )+
+                $(($constant, include_sql!(concat!($folder, "/", $file))),)+
+            ]))
+        });
+    };
+}
+
+/// Returns whether `left` and `right` hold the same text. `str`'s `==` can't run in a constant.
+const fn const_str_eq(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+
+    true
+}
+
+queries! {
+    rows {
+        consumer_group_select::QUERY = "sql" / "consumer_group_select.sql",
+        producer_epochs_select::QUERY = "sql" / "producer_epochs_select.sql",
+        topic_configuration_select::QUERY = "sql" / "topic_configuration_select.sql",
+        topic_configuration_select_keys::QUERY = "pg" / "topic_configuration_select_keys.sql",
+        topic_select::QUERY = "sql" / "topic_select.sql",
+        watermark_select_for_write::LITE_QUERY = "lite" / "watermark_select_for_write.sql",
+        watermark_select_for_write::QUERY = "sql" / "watermark_select_for_write.sql",
+    }
+    plain {
+        CONSUMER_GROUP_DELETE = "sql" / "consumer_group_delete.sql",
+        CONSUMER_GROUP_DETAIL = "sql" / "consumer_group_detail.sql",
+        CONSUMER_GROUP_DETAIL_DELETE_BY_CG = "sql" / "consumer_group_detail_delete_by_cg.sql",
+        CONSUMER_GROUP_DETAIL_INSERT = "sql" / "consumer_group_detail_insert.sql",
+        CONSUMER_GROUP_INSERT = "sql" / "consumer_group_insert.sql",
+        CONSUMER_GROUP_SELECT_BY_NAME = "sql" / "consumer_group_select_by_name.sql",
+        CONSUMER_OFFSET_DELETE_BY_CG = "sql" / "consumer_offset_delete_by_cg.sql",
+        CONSUMER_OFFSET_DELETE_BY_TOPIC = "sql" / "consumer_offset_delete_by_topic.sql",
+        CONSUMER_OFFSET_INSERT = "sql" / "consumer_offset_insert.sql",
+        CONSUMER_OFFSET_INSERT_FROM_TXN = "sql" / "consumer_offset_insert_from_txn.sql",
+        CONSUMER_OFFSET_SELECT = "sql" / "consumer_offset_select.sql",
+        CONSUMER_OFFSET_SELECT_BY_GROUP = "sql" / "consumer_offset_select_by_group.sql",
+        HEADER_COPY = "sql" / "header_copy.sql",
+        HEADER_DELETE_BY_TOPIC = "sql" / "header_delete_by_topic.sql",
+        HEADER_FETCH = "sql" / "header_fetch.sql",
+        HEADER_FETCH_RANGE = "sql" / "header_fetch_range.sql",
+        HEADER_INSERT = "sql" / "header_insert.sql",
+        LIST_EARLIEST_OFFSET = "sql" / "list_earliest_offset.sql",
+        LIST_LATEST_OFFSET_COMMITTED = "sql" / "list_latest_offset_committed.sql",
+        LIST_LATEST_OFFSET_TIMESTAMP = "sql" / "list_latest_offset_timestamp.sql",
+        LIST_LATEST_OFFSET_UNCOMMITTED = "sql" / "list_latest_offset_uncommitted.sql",
+        LITE_POLICY_COMPACT_COMPACTION = "lite" / "policy_compact_compaction.sql",
+        LITE_POLICY_COMPACT_DELETE = "lite" / "policy_compact_delete.sql",
+        LITE_POLICY_COMPACT_DISTINCT_K = "lite" / "policy_compact_distinct_k.sql",
+        LITE_POLICY_COMPACT_MAX_OFFSET_ID = "lite" / "policy_compact_max_offset_id.sql",
+        LITE_POLICY_COMPACT_TOPITIONS = "lite" / "policy_compact_topitions.sql",
+        LITE_POLICY_DELETE = "lite" / "policy_delete.sql",
+        LITE_POLICY_DELETE_BYTES = "lite" / "policy_delete_bytes.sql",
+        LITE_VACUUM_INTO = "lite" / "vacuum_into.sql",
+        MAINTAIN_VACUUM = "sql" / "maintain-vacuum.sql",
+        NISSHI_SCHEMA_VERSION_CREATE = "sql" / "nisshi_schema_version_create.sql",
+        NISSHI_SCHEMA_VERSION_INSERT = "sql" / "nisshi_schema_version_insert.sql",
+        NISSHI_SCHEMA_VERSION_SELECT = "sql" / "nisshi_schema_version_select.sql",
+        PG_NISSHI_SCHEMA_VERSION_EXISTS = "pg" / "nisshi_schema_version_exists.sql",
+        PG_RECORD_FETCH = "pg" / "record_fetch.sql",
+        PG_RECORD_FETCH_KEYED = "pg" / "record_fetch_keyed.sql",
+        PG_SEARCH_PATH_SET_TO_CLUSTER_NAMESPACE = "pg" / "search_path_set_to_cluster_namespace.sql",
+        PG_TOPIC_SELECT_UUID = "pg" / "topic_select_uuid.sql",
+        PING = "sql" / "ping.sql",
+        POLICY_COMPACT = "sql" / "policy_compact.sql",
+        POLICY_DELETE = "sql" / "policy_delete.sql",
+        POLICY_DELETE_BYTES = "sql" / "policy_delete_bytes.sql",
+        PRODUCER_DETAIL_DELETE_BY_TOPIC = "sql" / "producer_detail_delete_by_topic.sql",
+        PRODUCER_DETAIL_INSERT = "sql" / "producer_detail_insert.sql",
+        PRODUCER_EPOCH_CURRENT_FOR_PRODUCER = "sql" / "producer_epoch_current_for_producer.sql",
+        PRODUCER_EPOCH_FOR_CURRENT_TXN = "sql" / "producer_epoch_for_current_txn.sql",
+        PRODUCER_EPOCH_INSERT = "sql" / "producer_epoch_insert.sql",
+        PRODUCER_EPOCH_INSERT_GIVEN = "sql" / "producer_epoch_insert_given.sql",
+        PRODUCER_INSERT = "sql" / "producer_insert.sql",
+        PRODUCER_SELECT_FOR_UPDATE = "sql" / "producer_select_for_update.sql",
+        PRODUCER_UPDATE_EPOCH_WITH_TXN = "sql" / "producer_update_epoch_with_txn.sql",
+        PRODUCER_UPDATE_SEQUENCE = "sql" / "producer_update_sequence.sql",
+        RECORD_COPY = "sql" / "record_copy.sql",
+        RECORD_DELETE_BELOW_LOG_START = "sql" / "record_delete_below_log_start.sql",
+        RECORD_DELETE_BY_OFFSET = "sql" / "record_delete_by_offset.sql",
+        RECORD_DELETE_BY_TOPIC = "sql" / "record_delete_by_topic.sql",
+        RECORD_FETCH = "sql" / "record_fetch.sql",
+        RECORD_FETCH_KEYED = "sql" / "record_fetch_keyed.sql",
+        RECORD_INSERT = "sql" / "record_insert.sql",
+        REGISTER_BROKER = "sql" / "register_broker.sql",
+        SCRAM_CREDENTIAL_DELETE = "sql" / "scram_credential_delete.sql",
+        SCRAM_CREDENTIAL_INSERT = "sql" / "scram_credential_insert.sql",
+        SCRAM_CREDENTIAL_SELECT = "sql" / "scram_credential_select.sql",
+        TOPIC_BY_CLUSTER = "sql" / "topic_by_cluster.sql",
+        TOPIC_BY_UUID = "sql" / "topic_by_uuid.sql",
+        TOPIC_CONFIGURATION_DELETE = "sql" / "topic_configuration_delete.sql",
+        TOPIC_CONFIGURATION_DELETE_BY_TOPIC = "sql" / "topic_configuration_delete_by_topic.sql",
+        TOPIC_CONFIGURATION_SELECT_NAME = "sql" / "topic_configuration_select_name.sql",
+        TOPIC_CONFIGURATION_UPSERT = "sql" / "topic_configuration_upsert.sql",
+        TOPIC_DELETE_BY = "sql" / "topic_delete_by.sql",
+        TOPIC_INSERT = "sql" / "topic_insert.sql",
+        TOPIC_SELECT_NAME = "sql" / "topic_select_name.sql",
+        TOPIC_SELECT_NAME_FOR_UPDATE = "sql" / "topic_select_name_for_update.sql",
+        TOPIC_SELECT_UUID = "sql" / "topic_select_uuid.sql",
+        TOPITION_DELETE_BY_TOPIC = "sql" / "topition_delete_by_topic.sql",
+        TOPITION_INSERT = "sql" / "topition_insert.sql",
+        TOPITION_SELECT = "sql" / "topition_select.sql",
+        TOPITION_SELECT_ID = "sql" / "topition_select_id.sql",
+        TXN_DETAIL_INSERT = "sql" / "txn_detail_insert.sql",
+        TXN_DETAIL_SELECT = "sql" / "txn_detail_select.sql",
+        TXN_DETAIL_SELECT_CURRENT = "sql" / "txn_detail_select_current.sql",
+        TXN_DETAIL_SELECT_FOR_UPDATE = "sql" / "txn_detail_select_for_update.sql",
+        TXN_DETAIL_SELECT_STATUS_FOR_UPDATE = "sql" / "txn_detail_select_status_for_update.sql",
+        TXN_DETAIL_SELECT_TIMED_OUT = "sql" / "txn_detail_select_timed_out.sql",
+        TXN_DETAIL_UPDATE_SEQUENCE = "sql" / "txn_detail_update_sequence.sql",
+        TXN_DETAIL_UPDATE_STARTED_AT = "sql" / "txn_detail_update_started_at.sql",
+        TXN_INSERT = "sql" / "txn_insert.sql",
+        TXN_OFFSET_COMMIT_DELETE_BY_TXN = "sql" / "txn_offset_commit_delete_by_txn.sql",
+        TXN_OFFSET_COMMIT_INSERT = "sql" / "txn_offset_commit_insert.sql",
+        TXN_OFFSET_COMMIT_TP_DELETE_BY_TOPIC = "sql" / "txn_offset_commit_tp_delete_by_topic.sql",
+        TXN_OFFSET_COMMIT_TP_DELETE_BY_TXN = "sql" / "txn_offset_commit_tp_delete_by_txn.sql",
+        TXN_OFFSET_COMMIT_TP_INSERT = "sql" / "txn_offset_commit_tp_insert.sql",
+        TXN_PRODUCE_OFFSET_DELETE_BY_TOPIC = "sql" / "txn_produce_offset_delete_by_topic.sql",
+        TXN_PRODUCE_OFFSET_DELETE_BY_TXN = "sql" / "txn_produce_offset_delete_by_txn.sql",
+        TXN_PRODUCE_OFFSET_INSERT = "sql" / "txn_produce_offset_insert.sql",
+        TXN_PRODUCE_OFFSET_SELECT_OFFSET_RANGE = "sql" / "txn_produce_offset_select_offset_range.sql",
+        TXN_PRODUCE_OFFSET_SELECT_OVERLAPPING_TXN = "sql" / "txn_produce_offset_select_overlapping_txn.sql",
+        TXN_SELECT_NAME = "sql" / "txn_select_name.sql",
+        TXN_SELECT_NAME_FOR_UPDATE = "sql" / "txn_select_name_for_update.sql",
+        TXN_SELECT_PRODUCED_TOPITIONS = "sql" / "txn_select_produced_topitions.sql",
+        TXN_SELECT_PRODUCER_EPOCH = "sql" / "txn_select_producer_epoch.sql",
+        TXN_STATUS_UPDATE = "sql" / "txn_status_update.sql",
+        TXN_TOPITION_DELETE_BY_TOPIC = "sql" / "txn_topition_delete_by_topic.sql",
+        TXN_TOPITION_DELETE_BY_TXN = "sql" / "txn_topition_delete_by_txn.sql",
+        TXN_TOPITION_INSERT = "sql" / "txn_topition_insert.sql",
+        TXN_TOPITION_SELECT = "sql" / "txn_topition_select.sql",
+        TXN_TOPITION_SELECT_TXNS = "sql" / "txn_topition_select_txns.sql",
+        TXN_UPDATE_PRODUCER = "sql" / "txn_update_producer.sql",
+        VIRTUAL_TOPIC_UPSERT = "sql" / "virtual_topic_upsert.sql",
+        WATERMARK_DELETE_BY_TOPIC = "sql" / "watermark_delete_by_topic.sql",
+        WATERMARK_INSERT = "sql" / "watermark_insert.sql",
+        WATERMARK_INSERT_FROM_TXN = "sql" / "watermark_insert_from_txn.sql",
+        WATERMARK_SELECT = "sql" / "watermark_select.sql",
+        WATERMARK_SELECT_STABLE = "sql" / "watermark_select_stable.sql",
+        WATERMARK_UPDATE = "sql" / "watermark_update.sql",
+    }
+}
 
 pub(crate) fn remove_comments(commented: &str) -> String {
     commented.lines().fold(String::new(), |uncommented, line| {

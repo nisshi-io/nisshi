@@ -27,8 +27,9 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, QueryRow, QueryRowCursor, consumer_group_select, default_hash,
-        idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select, remove_comments,
+        self,
+        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
         watermark_select_for_write,
     },
@@ -204,7 +205,7 @@ impl Engine {
 
         if tx
             .query(
-                &sql_lookup("topic_select_name.sql")?,
+                &sql_lookup(sql::TOPIC_SELECT_NAME)?,
                 (self.cluster.as_str(), topic),
             )
             .await?
@@ -221,7 +222,7 @@ impl Engine {
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
                 tx.query(
-                    &sql_lookup("topic_configuration_select_name.sql")?,
+                    &sql_lookup(sql::TOPIC_CONFIGURATION_SELECT_NAME)?,
                     (self.cluster.as_str(), topic, name),
                 )
                 .await?
@@ -244,7 +245,7 @@ impl Engine {
                 Some(value) => {
                     _ = tx
                         .query(
-                            &sql_lookup("topic_configuration_upsert.sql")?,
+                            &sql_lookup(sql::TOPIC_CONFIGURATION_UPSERT)?,
                             (self.cluster.as_str(), topic, name, value.as_str()),
                         )
                         .await?
@@ -255,7 +256,7 @@ impl Engine {
                 None => {
                     _ = tx
                         .execute(
-                            &sql_lookup("topic_configuration_delete.sql")?,
+                            &sql_lookup(sql::TOPIC_CONFIGURATION_DELETE)?,
                             (self.cluster.as_str(), topic, name),
                         )
                         .await?;
@@ -374,29 +375,35 @@ impl Engine {
         Ok(row)
     }
 
-    /// Runs `query` on `connection`, and returns its rows, each read as `T` when the caller
-    /// reaches it.
-    async fn query_rows<T: QueryRow>(
+    /// Runs `query` on `connection`, and returns the column names of its result with its rows,
+    /// which a query module's `RowReader` reads.
+    async fn query_rows<P>(
         &self,
         connection: &Connection,
         query: &'static str,
-        params: impl IntoParams,
-    ) -> Result<QueryRowCursor<turso::Rows, T>> {
+        params: P,
+    ) -> Result<(ResultColumns, turso::Rows)>
+    where
+        P: IntoParams,
+    {
         let rows = connection.query(&sql_lookup(query)?, params).await?;
-        QueryRowCursor::new(&ResultColumns::turso(query, &rows), rows)
+        Ok((ResultColumns::turso(query, &rows), rows))
     }
 
-    /// Runs `query` on `connection`, and returns the first row of its result as `T`, or `None`
-    /// when the result has no rows.
+    /// Runs `query` on `connection`, and returns the column names of its result with its first
+    /// row, or with `None` when the result has no rows.
     ///
     /// The function drops the result before it returns, because SQLite can't commit while a
     /// `returning` statement is still open.
-    async fn query_first<T: QueryRow>(
+    async fn query_first<P>(
         &self,
         connection: &Connection,
         query: &'static str,
-        params: impl IntoParams,
-    ) -> Result<Option<T>> {
+        params: P,
+    ) -> Result<(ResultColumns, Option<Row>)>
+    where
+        P: IntoParams,
+    {
         let sql = sql_lookup(query)?;
 
         // The params hold record data, so we log only the SQL.
@@ -414,7 +421,7 @@ impl Engine {
             SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
         })?;
 
-        let reader = T::reader(&ResultColumns::turso(query, &rows))?;
+        let columns = ResultColumns::turso(query, &rows);
 
         let row = rows
             .next()
@@ -423,9 +430,7 @@ impl Engine {
             .inspect_err(|err| {
                 error!(?err, sql);
                 SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
-            })?
-            .map(|row| T::read(&reader, &row))
-            .transpose()?;
+            })?;
 
         let attributes = [
             KeyValue::new("sql", sql),
@@ -441,7 +446,7 @@ impl Engine {
 
         SQL_REQUESTS.add(1, &attributes);
 
-        Ok(row)
+        Ok((columns, row))
     }
 
     async fn prepare_query_one<P>(
@@ -507,8 +512,8 @@ impl Engine {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        let epochs = self
-            .query_first::<producer_epochs_select::Row>(
+        let (columns, row) = self
+            .query_first(
                 connection,
                 producer_epochs_select::QUERY,
                 (
@@ -518,10 +523,13 @@ impl Engine {
                     topition.partition(),
                 ),
             )
-            .await
-            .inspect_err(|err| error!(?err))?;
+            .await?;
 
-        if let Some(epochs) = epochs {
+        let reader = producer_epochs_select::RowReader::new(&columns)?;
+
+        if let Some(row) = row {
+            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
+
             let stored = StoredEpochs {
                 transactional: epochs.transactional != 0,
                 newest: epochs.newest_epoch,
@@ -532,7 +540,7 @@ impl Engine {
                 _ = self
                     .prepare_execute(
                         connection,
-                        &sql_lookup("producer_epoch_insert_given.sql")?,
+                        &sql_lookup(sql::PRODUCER_EPOCH_INSERT_GIVEN)?,
                         (
                             self.cluster.as_str(),
                             deflated.producer_id,
@@ -546,7 +554,7 @@ impl Engine {
             let row = self
                 .prepare_query_one(
                     connection,
-                    &sql_lookup("producer_select_for_update.sql")?,
+                    &sql_lookup(sql::PRODUCER_SELECT_FOR_UPDATE)?,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -595,7 +603,7 @@ impl Engine {
                 1,
                 self.prepare_execute(
                     connection,
-                    &sql_lookup("producer_detail_insert.sql")?,
+                    &sql_lookup(sql::PRODUCER_DETAIL_INSERT)?,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -624,18 +632,26 @@ impl Engine {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition, ?tx);
 
-        self.query_first(
-            tx,
-            watermark_select_for_write::LITE_QUERY,
-            (
-                self.cluster.as_str(),
-                topition.topic(),
-                topition.partition(),
-            ),
-        )
-        .await
-        .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
+        let (columns, row) = self
+            .query_first(
+                tx,
+                watermark_select_for_write::LITE_QUERY,
+                (
+                    self.cluster.as_str(),
+                    topition.topic(),
+                    topition.partition(),
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
+
+        let reader = watermark_select_for_write::RowReader::new(&columns)?;
+
+        let Some(row) = row else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        reader.read_row(&row).inspect_err(|err| error!(?err))
     }
 
     async fn produce_in_tx<'conn>(
@@ -693,7 +709,7 @@ impl Engine {
             _ = self
                 .prepare_execute(
                     tx,
-                    &sql_lookup("record_insert.sql")?,
+                    &sql_lookup(sql::RECORD_INSERT)?,
                     (
                         self.cluster.as_str(),
                         topic,
@@ -727,7 +743,7 @@ impl Engine {
                 _ = self
                     .prepare_execute(
                         tx,
-                        &sql_lookup("header_insert.sql")?,
+                        &sql_lookup(sql::HEADER_INSERT)?,
                         (
                             self.cluster.as_str(),
                             topic,
@@ -753,7 +769,7 @@ impl Engine {
 
             _ = self
                     .prepare_execute(tx,
-                        &sql_lookup("txn_produce_offset_insert.sql")?,
+                        &sql_lookup(sql::TXN_PRODUCE_OFFSET_INSERT)?,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -773,7 +789,7 @@ impl Engine {
         _ = self
             .prepare_execute(
                 tx,
-                &sql_lookup("watermark_update.sql")?,
+                &sql_lookup(sql::WATERMARK_UPDATE)?,
                 (
                     self.cluster.as_str(),
                     topic,
@@ -823,7 +839,7 @@ impl Engine {
         let mut rows = tx
             .deref()
             .query(
-                &sql_lookup("txn_select_produced_topitions.sql")?,
+                &sql_lookup(sql::TXN_SELECT_PRODUCED_TOPITIONS)?,
                 (
                     self.cluster.as_str(),
                     transaction_id,
@@ -891,7 +907,7 @@ impl Engine {
 
             let mut rows = tx
                 .query(
-                    &sql_lookup("txn_produce_offset_select_offset_range.sql")?,
+                    &sql_lookup(sql::TXN_PRODUCE_OFFSET_SELECT_OFFSET_RANGE)?,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -922,7 +938,7 @@ impl Engine {
 
                 let mut rows = tx
                     .query(
-                        &sql_lookup("txn_produce_offset_select_overlapping_txn.sql")?,
+                        &sql_lookup(sql::TXN_PRODUCE_OFFSET_SELECT_OVERLAPPING_TXN)?,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -968,7 +984,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_produce_offset_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_PRODUCE_OFFSET_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -980,7 +996,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_topition_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_TOPITION_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -993,7 +1009,7 @@ impl Engine {
                 if txn.status == TxnState::PrepareCommit {
                     _ = tx
                         .execute(
-                            &sql_lookup("consumer_offset_insert_from_txn.sql")?,
+                            &sql_lookup(sql::CONSUMER_OFFSET_INSERT_FROM_TXN)?,
                             (
                                 self.cluster.as_str(),
                                 txn.name.as_str(),
@@ -1006,7 +1022,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_offset_commit_tp_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1018,7 +1034,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_offset_commit_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_OFFSET_COMMIT_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1038,7 +1054,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_status_update.sql")?,
+                        &sql_lookup(sql::TXN_STATUS_UPDATE)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1060,7 +1076,7 @@ impl Engine {
 
             _ = tx
                 .execute(
-                    &sql_lookup("txn_status_update.sql")?,
+                    &sql_lookup(sql::TXN_STATUS_UPDATE)?,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -1215,7 +1231,7 @@ fn fix_parameters(sql: &str) -> Result<String> {
 }
 
 fn sql_lookup(key: &str) -> Result<String> {
-    crate::sql::SQL
+    sql::SQL
         .get(key)
         .and_then(|sql| fix_parameters(sql).inspect(|sql| debug!(key, sql)))
 }
@@ -1336,7 +1352,7 @@ impl Storage for Engine {
 
         self.prepare_execute(
             &connection,
-            &sql_lookup("register_broker.sql")?,
+            &sql_lookup(sql::REGISTER_BROKER)?,
             &[broker_registration.cluster_id],
         )
         .await
@@ -1383,7 +1399,7 @@ impl Storage for Engine {
                 (topic.replication_factor as i32),
             );
 
-            self.prepare_query_one(&tx, &sql_lookup("topic_insert.sql")?, parameters.clone())
+            self.prepare_query_one(&tx, &sql_lookup(sql::TOPIC_INSERT)?, parameters.clone())
                 .await
                 .inspect_err(|err| error!(?err))
                 .map_err(unique_constraint(ErrorCode::TopicAlreadyExists))
@@ -1407,13 +1423,13 @@ impl Storage for Engine {
             let params = (self.cluster.as_str(), topic.name.as_str(), partition);
 
             _ = self
-                .prepare_query_one(&tx, &sql_lookup("topition_insert.sql")?, params)
+                .prepare_query_one(&tx, &sql_lookup(sql::TOPITION_INSERT)?, params)
                 .await
                 .map(|row| row.get_value(0))
                 .inspect(|topition| debug!(?topition))?;
 
             _ = self
-                .prepare_query_one(&tx, &sql_lookup("watermark_insert.sql")?, params)
+                .prepare_query_one(&tx, &sql_lookup(sql::WATERMARK_INSERT)?, params)
                 .await
                 .map(|row| row.get_value(0))
                 .inspect(|watermark| debug!(?watermark))?;
@@ -1431,7 +1447,7 @@ impl Storage for Engine {
                 );
 
                 _ = self
-                    .prepare_query_one(&tx, &sql_lookup("topic_configuration_upsert.sql")?, params)
+                    .prepare_query_one(&tx, &sql_lookup(sql::TOPIC_CONFIGURATION_UPSERT)?, params)
                     .await
                     .map(|row| row.get_value(0))
                     .inspect_err(|err| error!(?err, ?config))
@@ -1488,7 +1504,7 @@ impl Storage for Engine {
                                         _ = self
                                             .prepare_execute(
                                                 &tx,
-                                                &sql_lookup("record_delete_by_offset.sql")?,
+                                                &sql_lookup(sql::RECORD_DELETE_BY_OFFSET)?,
                                                 (
                                                     self.cluster.as_str(),
                                                     topic.name.as_str(),
@@ -1503,7 +1519,7 @@ impl Storage for Engine {
                                     _ = self
                                         .prepare_execute(
                                             &tx,
-                                            &sql_lookup("watermark_update.sql")?,
+                                            &sql_lookup(sql::WATERMARK_UPDATE)?,
                                             (
                                                 self.cluster.as_str(),
                                                 topic.name.as_str(),
@@ -1553,7 +1569,7 @@ impl Storage for Engine {
         let mut rows = match topic {
             TopicId::Id(id) => {
                 tx.query(
-                    &sql_lookup("topic_select_uuid.sql")?,
+                    &sql_lookup(sql::TOPIC_SELECT_UUID)?,
                     (self.cluster.as_str(), id.to_string().as_str()),
                 )
                 .await?
@@ -1561,7 +1577,7 @@ impl Storage for Engine {
 
             TopicId::Name(name) => {
                 tx.query(
-                    &sql_lookup("topic_select_name.sql")?,
+                    &sql_lookup(sql::TOPIC_SELECT_NAME)?,
                     (self.cluster.as_str(), name.as_str()),
                 )
                 .await?
@@ -1579,16 +1595,16 @@ impl Storage for Engine {
             .ok_or(Error::UnexpectedValue(value.clone()))?;
 
         for sql in [
-            "consumer_offset_delete_by_topic.sql",
-            "topic_configuration_delete_by_topic.sql",
-            "watermark_delete_by_topic.sql",
-            "header_delete_by_topic.sql",
-            "record_delete_by_topic.sql",
-            "txn_offset_commit_tp_delete_by_topic.sql",
-            "txn_produce_offset_delete_by_topic.sql",
-            "txn_topition_delete_by_topic.sql",
-            "producer_detail_delete_by_topic.sql",
-            "topition_delete_by_topic.sql",
+            sql::CONSUMER_OFFSET_DELETE_BY_TOPIC,
+            sql::TOPIC_CONFIGURATION_DELETE_BY_TOPIC,
+            sql::WATERMARK_DELETE_BY_TOPIC,
+            sql::HEADER_DELETE_BY_TOPIC,
+            sql::RECORD_DELETE_BY_TOPIC,
+            sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TOPIC,
+            sql::TXN_PRODUCE_OFFSET_DELETE_BY_TOPIC,
+            sql::TXN_TOPITION_DELETE_BY_TOPIC,
+            sql::PRODUCER_DETAIL_DELETE_BY_TOPIC,
+            sql::TOPITION_DELETE_BY_TOPIC,
         ] {
             let rows = self
                 .prepare_execute(&tx, &sql_lookup(sql)?, (self.cluster.as_str(), topic_name))
@@ -1600,7 +1616,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("topic_delete_by.sql")?,
+                &sql_lookup(sql::TOPIC_DELETE_BY)?,
                 (self.cluster.as_str(), topic_name),
             )
             .await?;
@@ -1713,7 +1729,7 @@ impl Storage for Engine {
 
         let mut records = c
             .query(
-                &sql_lookup("record_fetch.sql")?,
+                &sql_lookup(sql::RECORD_FETCH)?,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -1763,7 +1779,7 @@ impl Storage for Engine {
 
                 let mut headers = c
                     .query(
-                        &sql_lookup("header_fetch.sql")?,
+                        &sql_lookup(sql::HEADER_FETCH)?,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -1939,7 +1955,7 @@ impl Storage for Engine {
 
                     let mut headers = c
                         .query(
-                            &sql_lookup("header_fetch.sql")?,
+                            &sql_lookup(sql::HEADER_FETCH)?,
                             (
                                 self.cluster.as_str(),
                                 topition.topic(),
@@ -2005,7 +2021,7 @@ impl Storage for Engine {
         let row = self
             .prepare_query_one(
                 &c,
-                &sql_lookup("watermark_select.sql")?,
+                &sql_lookup(sql::WATERMARK_SELECT)?,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -2061,7 +2077,7 @@ impl Storage for Engine {
 
             let mut rows = tx
                 .query(
-                    &sql_lookup("topition_select.sql")?,
+                    &sql_lookup(sql::TOPITION_SELECT)?,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -2076,7 +2092,7 @@ impl Storage for Engine {
                     let rows = self
                         .prepare_execute(
                             &tx,
-                            &sql_lookup("consumer_group_insert.sql")?,
+                            &sql_lookup(sql::CONSUMER_GROUP_INSERT)?,
                             (self.cluster.as_str(), group),
                         )
                         .await?;
@@ -2088,7 +2104,7 @@ impl Storage for Engine {
                 let rows = self
                     .prepare_execute(
                         &tx,
-                        &sql_lookup("consumer_offset_insert.sql")?,
+                        &sql_lookup(sql::CONSUMER_OFFSET_INSERT)?,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -2132,7 +2148,7 @@ impl Storage for Engine {
 
         let mut rows = c
             .query(
-                &sql_lookup("consumer_offset_select_by_group.sql")?,
+                &sql_lookup(sql::CONSUMER_OFFSET_SELECT_BY_GROUP)?,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
@@ -2185,7 +2201,7 @@ impl Storage for Engine {
         for topic in topics {
             let mut rows = c
                 .query(
-                    &sql_lookup("consumer_offset_select.sql")?,
+                    &sql_lookup(sql::CONSUMER_OFFSET_SELECT)?,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -2252,15 +2268,15 @@ impl Storage for Engine {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffsetRequest::Earliest, _) => sql_lookup("list_earliest_offset.sql")?,
+                (ListOffsetRequest::Earliest, _) => sql_lookup(sql::LIST_EARLIEST_OFFSET)?,
                 (ListOffsetRequest::Latest, IsolationLevel::ReadCommitted) => {
-                    sql_lookup("list_latest_offset_committed.sql")?
+                    sql_lookup(sql::LIST_LATEST_OFFSET_COMMITTED)?
                 }
                 (ListOffsetRequest::Latest, IsolationLevel::ReadUncommitted) => {
-                    sql_lookup("list_latest_offset_uncommitted.sql")?
+                    sql_lookup(sql::LIST_LATEST_OFFSET_UNCOMMITTED)?
                 }
                 (ListOffsetRequest::Timestamp(_), _) => {
-                    sql_lookup("list_latest_offset_timestamp.sql")?
+                    sql_lookup(sql::LIST_LATEST_OFFSET_TIMESTAMP)?
                 }
             };
 
@@ -2386,7 +2402,7 @@ impl Storage for Engine {
                         TopicId::Name(name) => {
                             let mut rows = c
                                 .query(
-                                    &sql_lookup("topic_select_name.sql")?,
+                                    &sql_lookup(sql::TOPIC_SELECT_NAME)?,
                                     (self.cluster.as_str(), name.as_str()),
                                 )
                                 .await?;
@@ -2494,7 +2510,7 @@ impl Storage for Engine {
                             debug!(?id);
                             let mut rows = c
                                 .query(
-                                    &sql_lookup("topic_select_uuid.sql")?,
+                                    &sql_lookup(sql::TOPIC_SELECT_UUID)?,
                                     (self.cluster.as_str(), id.to_string().as_str()),
                                 )
                                 .await?;
@@ -2606,7 +2622,7 @@ impl Storage for Engine {
 
                 let mut rows = c
                     .query(
-                        &sql_lookup("topic_by_cluster.sql")?,
+                        &sql_lookup(sql::TOPIC_BY_CLUSTER)?,
                         &[self.cluster.as_str()],
                     )
                     .await?;
@@ -2715,19 +2731,22 @@ impl Storage for Engine {
             .await?;
 
         if rows.next().await?.is_some() {
-            let mut rows = self
-                .query_rows::<topic_configuration_select::Row>(
+            let (columns, mut rows) = self
+                .query_rows(
                     &c,
                     topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
+            let reader = topic_configuration_select::RowReader::new(&columns)?;
+
             let mut configs = vec![];
 
-            while let Some(topic_configuration_select::Row { name, value }) =
-                rows.next().await.inspect_err(|err| error!(?err))?
-            {
+            while let Some(row) = rows.next().await? {
+                let topic_configuration_select::Row { name, value } =
+                    reader.read_row(&row).inspect_err(|err| error!(?err))?;
+
                 configs.push(
                     DescribeConfigsResourceResult::default()
                         .name(name)
@@ -2780,7 +2799,7 @@ impl Storage for Engine {
                     match self
                         .prepare_query_opt(
                             &c,
-                            &sql_lookup("topic_select_name.sql")?,
+                            &sql_lookup(sql::TOPIC_SELECT_NAME)?,
                             (self.cluster.as_str(), name.as_str()),
                         )
                         .await
@@ -2908,7 +2927,7 @@ impl Storage for Engine {
                     match self
                         .prepare_query_one(
                             &c,
-                            &sql_lookup("topic_select_uuid.sql")?,
+                            &sql_lookup(sql::TOPIC_SELECT_UUID)?,
                             (self.cluster.as_str(), id.to_string().as_str()),
                         )
                         .await
@@ -3027,15 +3046,15 @@ impl Storage for Engine {
 
         let mut listed_groups = vec![];
 
-        let mut rows = self
-            .query_rows::<consumer_group_select::Row>(
-                &c,
-                consumer_group_select::QUERY,
-                &[self.cluster.as_str()],
-            )
+        let (columns, mut rows) = self
+            .query_rows(&c, consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {
+        let reader = consumer_group_select::RowReader::new(&columns)?;
+
+        while let Some(row) = rows.next().await? {
+            let consumer_group_select::Row { name, detail } = reader.read_row(&row)?;
+
             let stored =
                 detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
@@ -3056,17 +3075,17 @@ impl Storage for Engine {
             let c = self.connection().await?;
 
             let mut consumer_offset = c
-                .prepare(&sql_lookup("consumer_offset_delete_by_cg.sql")?)
+                .prepare(&sql_lookup(sql::CONSUMER_OFFSET_DELETE_BY_CG)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let mut group_detail = c
-                .prepare(&sql_lookup("consumer_group_detail_delete_by_cg.sql")?)
+                .prepare(&sql_lookup(sql::CONSUMER_GROUP_DETAIL_DELETE_BY_CG)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let mut group = c
-                .prepare(&sql_lookup("consumer_group_delete.sql")?)
+                .prepare(&sql_lookup(sql::CONSUMER_GROUP_DELETE)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
@@ -3119,7 +3138,7 @@ impl Storage for Engine {
                 if let Some(row) = self
                     .prepare_query_opt(
                         &c,
-                        &sql_lookup("consumer_group_select_by_name.sql")?,
+                        &sql_lookup(sql::CONSUMER_GROUP_SELECT_BY_NAME)?,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -3168,7 +3187,7 @@ impl Storage for Engine {
 
         self.prepare_query_opt(
             &c,
-            &sql_lookup("consumer_group_detail.sql")?,
+            &sql_lookup(sql::CONSUMER_GROUP_DETAIL)?,
             (group_id, self.cluster.as_str()),
         )
         .await
@@ -3195,7 +3214,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("consumer_group_insert.sql")?,
+                &sql_lookup(sql::CONSUMER_GROUP_INSERT)?,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
@@ -3221,7 +3240,7 @@ impl Storage for Engine {
         let outcome = if let Some(row) = self
             .prepare_query_opt(
                 &tx,
-                &sql_lookup("consumer_group_detail_insert.sql")?,
+                &sql_lookup(sql::CONSUMER_GROUP_DETAIL_INSERT)?,
                 (
                     self.cluster.as_str(),
                     group_id,
@@ -3255,7 +3274,7 @@ impl Storage for Engine {
             let row = self
                 .prepare_query_one(
                     &tx,
-                    &sql_lookup("consumer_group_detail.sql")?,
+                    &sql_lookup(sql::CONSUMER_GROUP_DETAIL)?,
                     (group_id, self.cluster.as_str()),
                 )
                 .await
@@ -3303,7 +3322,7 @@ impl Storage for Engine {
                 if let Some(row) = self
                     .prepare_query_opt(
                         &tx,
-                        &sql_lookup("producer_epoch_for_current_txn.sql")?,
+                        &sql_lookup(sql::PRODUCER_EPOCH_FOR_CURRENT_TXN)?,
                         (self.cluster.as_str(), transaction_id),
                     )
                     .await
@@ -3376,7 +3395,7 @@ impl Storage for Engine {
                 let (producer, epoch) = if let Some(row) = self
                     .prepare_query_opt(
                         &tx,
-                        &sql_lookup("txn_select_name.sql")?,
+                        &sql_lookup(sql::TXN_SELECT_NAME)?,
                         (self.cluster.as_str(), transaction_id),
                     )
                     .await
@@ -3399,7 +3418,7 @@ impl Storage for Engine {
                     let newest = self
                         .prepare_query_opt(
                             &tx,
-                            &sql_lookup("producer_epoch_current_for_producer.sql")?,
+                            &sql_lookup(sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER)?,
                             (self.cluster.as_str(), producer),
                         )
                         .await
@@ -3413,7 +3432,7 @@ impl Storage for Engine {
                         let status = self
                             .prepare_query_opt(
                                 &tx,
-                                &sql_lookup("producer_epoch_for_current_txn.sql")?,
+                                &sql_lookup(sql::PRODUCER_EPOCH_FOR_CURRENT_TXN)?,
                                 (self.cluster.as_str(), transaction_id),
                             )
                             .await
@@ -3444,7 +3463,7 @@ impl Storage for Engine {
                                 _ = self
                                     .prepare_query_opt(
                                         &tx,
-                                        &sql_lookup("producer_epoch_insert.sql")?,
+                                        &sql_lookup(sql::PRODUCER_EPOCH_INSERT)?,
                                         (self.cluster.as_str(), producer),
                                     )
                                     .await
@@ -3466,7 +3485,7 @@ impl Storage for Engine {
                         let producer = self
                             .prepare_query_one(
                                 &tx,
-                                &sql_lookup("producer_insert.sql")?,
+                                &sql_lookup(sql::PRODUCER_INSERT)?,
                                 &[self.cluster.as_str()],
                             )
                             .await
@@ -3477,7 +3496,7 @@ impl Storage for Engine {
                         let epoch = self
                             .prepare_query_one(
                                 &tx,
-                                &sql_lookup("producer_epoch_insert.sql")?,
+                                &sql_lookup(sql::PRODUCER_EPOCH_INSERT)?,
                                 (self.cluster.as_str(), producer),
                             )
                             .await
@@ -3491,7 +3510,7 @@ impl Storage for Engine {
                         _ = self
                             .prepare_query_opt(
                                 &tx,
-                                &sql_lookup("producer_epoch_insert.sql")?,
+                                &sql_lookup(sql::PRODUCER_EPOCH_INSERT)?,
                                 (self.cluster.as_str(), previous),
                             )
                             .await
@@ -3500,7 +3519,7 @@ impl Storage for Engine {
                         let updated = self
                             .prepare_execute(
                                 &tx,
-                                &sql_lookup("txn_update_producer.sql")?,
+                                &sql_lookup(sql::TXN_UPDATE_PRODUCER)?,
                                 (self.cluster.as_str(), transaction_id, producer),
                             )
                             .await
@@ -3525,7 +3544,7 @@ impl Storage for Engine {
                         let epoch = self
                             .prepare_query_one(
                                 &tx,
-                                &sql_lookup("producer_epoch_insert.sql")?,
+                                &sql_lookup(sql::PRODUCER_EPOCH_INSERT)?,
                                 (self.cluster.as_str(), producer),
                             )
                             .await
@@ -3540,7 +3559,7 @@ impl Storage for Engine {
                     let row = self
                         .prepare_query_one(
                             &tx,
-                            &sql_lookup("producer_insert.sql")?,
+                            &sql_lookup(sql::PRODUCER_INSERT)?,
                             &[self.cluster.as_str()],
                         )
                         .await
@@ -3560,7 +3579,7 @@ impl Storage for Engine {
                     let row = self
                         .prepare_query_one(
                             &tx,
-                            &sql_lookup("producer_epoch_insert.sql")?,
+                            &sql_lookup(sql::PRODUCER_EPOCH_INSERT)?,
                             (self.cluster.as_str(), producer),
                         )
                         .await
@@ -3578,7 +3597,7 @@ impl Storage for Engine {
                         1,
                         self.prepare_execute(
                             &tx,
-                            &sql_lookup("txn_insert.sql")?,
+                            &sql_lookup(sql::TXN_INSERT)?,
                             (self.cluster.as_str(), transaction_id, producer),
                         )
                         .await
@@ -3599,7 +3618,7 @@ impl Storage for Engine {
                     1,
                     self.prepare_execute(
                         &tx,
-                        &sql_lookup("txn_detail_insert.sql")?,
+                        &sql_lookup(sql::TXN_DETAIL_INSERT)?,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -3647,7 +3666,7 @@ impl Storage for Engine {
 
                 let mut rows = tx
                     .query(
-                        &sql_lookup("producer_insert.sql")?,
+                        &sql_lookup(sql::PRODUCER_INSERT)?,
                         &[self.cluster.as_str()],
                     )
                     .await?;
@@ -3676,7 +3695,7 @@ impl Storage for Engine {
 
                     let mut rows = tx
                         .query(
-                            &sql_lookup("producer_epoch_insert.sql")?,
+                            &sql_lookup(sql::PRODUCER_EPOCH_INSERT)?,
                             (self.cluster.as_str(), producer),
                         )
                         .await
@@ -3776,7 +3795,7 @@ impl Storage for Engine {
                         _ = self
                             .prepare_execute(
                                 &tx,
-                                &sql_lookup("txn_topition_insert.sql")?,
+                                &sql_lookup(sql::TXN_TOPITION_INSERT)?,
                                 (
                                     self.cluster.as_str(),
                                     topic.name.as_str(),
@@ -3814,7 +3833,7 @@ impl Storage for Engine {
                 _ = self
                     .prepare_execute(
                         &tx,
-                        &sql_lookup("txn_detail_update_started_at.sql")?,
+                        &sql_lookup(sql::TXN_DETAIL_UPDATE_STARTED_AT)?,
                         (
                             self.cluster.as_str(),
                             transaction_id.as_str(),
@@ -3856,7 +3875,7 @@ impl Storage for Engine {
         let (producer_id, producer_epoch) = if let Some(row) = self
             .prepare_query_opt(
                 &tx,
-                &sql_lookup("producer_epoch_for_current_txn.sql")?,
+                &sql_lookup(sql::PRODUCER_EPOCH_FOR_CURRENT_TXN)?,
                 (self.cluster.as_str(), offsets.transaction_id.as_str()),
             )
             .await
@@ -3887,7 +3906,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("consumer_group_insert.sql")?,
+                &sql_lookup(sql::CONSUMER_GROUP_INSERT)?,
                 (self.cluster.as_str(), offsets.group_id.as_str()),
             )
             .await?;
@@ -3897,7 +3916,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("txn_offset_commit_insert.sql")?,
+                &sql_lookup(sql::TXN_OFFSET_COMMIT_INSERT)?,
                 (
                     self.cluster.as_str(),
                     offsets.transaction_id.as_str(),
@@ -3924,7 +3943,7 @@ impl Storage for Engine {
                         _ = self
                             .prepare_execute(
                                 &tx,
-                                &sql_lookup("txn_offset_commit_tp_insert.sql")?,
+                                &sql_lookup(sql::TXN_OFFSET_COMMIT_TP_INSERT)?,
                                 (
                                     self.cluster.as_str(),
                                     offsets.transaction_id.as_str(),
@@ -4058,7 +4077,7 @@ impl Storage for Engine {
 
     async fn ping(&self) -> Result<()> {
         let c = self.connection().await?;
-        let _ = c.query("ping.sql", ()).await?;
+        let _ = c.query(sql::PING, ()).await?;
         Ok(())
     }
 }

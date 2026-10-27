@@ -16,8 +16,9 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, QueryRow, QueryRowCursor, consumer_group_select, default_hash,
-        idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select, remove_comments,
+        self,
+        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
         watermark_select_for_write,
     },
@@ -416,27 +417,34 @@ impl PoolConnection {
             })
     }
 
-    /// Runs `query`, and returns its rows, each read as `T` when the caller reaches it.
-    async fn query_rows<T: QueryRow>(
+    /// Runs `query`, and returns the column names of its result with its rows, which a query
+    /// module's `RowReader` reads.
+    async fn query_rows<P>(
         &self,
         query: &'static str,
-        params: impl IntoParams,
-    ) -> Result<QueryRowCursor<Rows, T>> {
+        params: P,
+    ) -> result::Result<(ResultColumns, Rows), libsql::Error>
+    where
+        P: IntoParams,
+    {
         let rows = self.query(query, params).await?;
-        QueryRowCursor::new(&ResultColumns::libsql(query, &rows), rows)
+        Ok((ResultColumns::libsql(query, &rows), rows))
     }
 
-    /// Runs `query`, and returns the first row of its result as `T`, or `None` when the result
-    /// has no rows.
+    /// Runs `query`, and returns the column names of its result with its first row, or with
+    /// `None` when the result has no rows.
     ///
     /// The function drops the result before it returns, because SQLite can't commit while a
     /// `returning` statement is still open.
     #[instrument(skip_all)]
-    async fn query_first<T: QueryRow>(
+    async fn query_first<P>(
         &self,
         query: &'static str,
-        params: impl IntoParams,
-    ) -> Result<Option<T>> {
+        params: P,
+    ) -> result::Result<(ResultColumns, Option<Row>), libsql::Error>
+    where
+        P: IntoParams,
+    {
         // The params hold record data and SCRAM credentials, so we log only the SQL.
         debug!(sql = query);
 
@@ -450,7 +458,7 @@ impl PoolConnection {
             .inspect(|rows| debug!(?rows))
             .inspect_err(|err| self.record_query_error(query, start, err))?;
 
-        let reader = T::reader(&ResultColumns::libsql(query, &rows))?;
+        let columns = ResultColumns::libsql(query, &rows);
 
         // libSQL reports an error of the statement's first step from this call, not from
         // `query`.
@@ -458,16 +466,14 @@ impl PoolConnection {
             .next()
             .await
             .inspect(|row| debug!(?row))
-            .inspect_err(|err| self.record_query_error(query, start, err))?
-            .map(|row| T::read(&reader, &row))
-            .transpose()?;
+            .inspect_err(|err| self.record_query_error(query, start, err))?;
 
         let attributes = [KeyValue::new("sql", query.to_owned())];
 
         SQL_DURATION.record(elapsed_millis(start), &attributes);
         SQL_REQUESTS.add(1, &attributes);
 
-        Ok(row)
+        Ok((columns, row))
     }
 
     /// Logs `err` from `query`, started at `start`, and counts it in `SQL_ERROR`.
@@ -646,7 +652,7 @@ impl Delegate {
 
         let topic = resource.resource_name.as_str();
 
-        if c.query_opt("topic_select_name.sql", (self.cluster.as_str(), topic))
+        if c.query_opt(sql::TOPIC_SELECT_NAME, (self.cluster.as_str(), topic))
             .await?
             .is_none()
         {
@@ -659,7 +665,7 @@ impl Delegate {
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
                 c.query_opt(
-                    "topic_configuration_select_name.sql",
+                    sql::TOPIC_CONFIGURATION_SELECT_NAME,
                     (self.cluster.as_str(), topic, name),
                 )
                 .await?
@@ -680,7 +686,7 @@ impl Delegate {
                 Some(value) => {
                     _ = c
                         .query_opt(
-                            "topic_configuration_upsert.sql",
+                            sql::TOPIC_CONFIGURATION_UPSERT,
                             (self.cluster.as_str(), topic, name, value.as_str()),
                         )
                         .await?;
@@ -689,7 +695,7 @@ impl Delegate {
                 None => {
                     _ = c
                         .query_opt(
-                            "topic_configuration_delete.sql",
+                            sql::TOPIC_CONFIGURATION_DELETE,
                             (self.cluster.as_str(), topic, name),
                         )
                         .await?;
@@ -720,8 +726,8 @@ impl Delegate {
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
-        let epochs = connection
-            .query_first::<producer_epochs_select::Row>(
+        let (columns, row) = connection
+            .query_first(
                 producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -730,10 +736,13 @@ impl Delegate {
                     topition.partition(),
                 ),
             )
-            .await
-            .inspect_err(|err| error!(?err))?;
+            .await?;
 
-        if let Some(epochs) = epochs {
+        let reader = producer_epochs_select::RowReader::new(&columns)?;
+
+        if let Some(row) = row {
+            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
+
             let stored = StoredEpochs {
                 transactional: epochs.transactional != 0,
                 newest: epochs.newest_epoch,
@@ -743,7 +752,7 @@ impl Delegate {
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
                 _ = connection
                     .execute(
-                        "producer_epoch_insert_given.sql",
+                        sql::PRODUCER_EPOCH_INSERT_GIVEN,
                         (
                             self.cluster.as_str(),
                             deflated.producer_id,
@@ -756,7 +765,7 @@ impl Delegate {
 
             let row = connection
                 .query_one(
-                    "producer_select_for_update.sql",
+                    sql::PRODUCER_SELECT_FOR_UPDATE,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -795,7 +804,7 @@ impl Delegate {
                 1,
                 connection
                     .execute(
-                        "producer_detail_insert.sql",
+                        sql::PRODUCER_DETAIL_INSERT,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -825,7 +834,7 @@ impl Delegate {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition);
 
-        connection
+        let (columns, row) = connection
             .query_first(
                 watermark_select_for_write::LITE_QUERY,
                 (
@@ -835,8 +844,15 @@ impl Delegate {
                 ),
             )
             .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
+
+        let reader = watermark_select_for_write::RowReader::new(&columns)?;
+
+        let Some(row) = row else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        reader.read_row(&row).inspect_err(|err| error!(?err))
     }
 
     #[instrument(skip_all)]
@@ -953,7 +969,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "record_insert.sql",
+                        sql::RECORD_INSERT,
                         (
                             self.cluster.as_str(),
                             topic,
@@ -988,7 +1004,7 @@ impl Delegate {
 
                     _ = connection
                         .execute(
-                            "header_insert.sql",
+                            sql::HEADER_INSERT,
                             (
                                 self.cluster.as_str(),
                                 topic,
@@ -1018,7 +1034,7 @@ impl Delegate {
 
                 _ = connection
                         .execute(
-                            "txn_produce_offset_insert.sql",
+                            sql::TXN_PRODUCE_OFFSET_INSERT,
                             (
                                 self.cluster.as_str(),
                                 transaction_id,
@@ -1040,7 +1056,7 @@ impl Delegate {
 
         _ = connection
             .execute(
-                "watermark_update.sql",
+                sql::WATERMARK_UPDATE,
                 (
                     self.cluster.as_str(),
                     topic,
@@ -1096,7 +1112,7 @@ impl Delegate {
 
         let mut rows = connection
             .query(
-                "txn_select_produced_topitions.sql",
+                sql::TXN_SELECT_PRODUCED_TOPITIONS,
                 (
                     self.cluster.as_str(),
                     transaction_id,
@@ -1153,7 +1169,7 @@ impl Delegate {
 
             let mut rows = connection
                 .query(
-                    "txn_produce_offset_select_offset_range.sql",
+                    sql::TXN_PRODUCE_OFFSET_SELECT_OFFSET_RANGE,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -1172,7 +1188,7 @@ impl Delegate {
 
                 let mut rows = connection
                     .query(
-                        "txn_produce_offset_select_overlapping_txn.sql",
+                        sql::TXN_PRODUCE_OFFSET_SELECT_OVERLAPPING_TXN,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -1218,7 +1234,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_produce_offset_delete_by_txn.sql",
+                        sql::TXN_PRODUCE_OFFSET_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1230,7 +1246,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_topition_delete_by_txn.sql",
+                        sql::TXN_TOPITION_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1243,7 +1259,7 @@ impl Delegate {
                 if txn.status == TxnState::PrepareCommit {
                     _ = connection
                         .execute(
-                            "consumer_offset_insert_from_txn.sql",
+                            sql::CONSUMER_OFFSET_INSERT_FROM_TXN,
                             (
                                 self.cluster.as_str(),
                                 txn.name.as_str(),
@@ -1256,7 +1272,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_offset_commit_tp_delete_by_txn.sql",
+                        sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1268,7 +1284,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_offset_commit_delete_by_txn.sql",
+                        sql::TXN_OFFSET_COMMIT_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1288,7 +1304,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_status_update.sql",
+                        sql::TXN_STATUS_UPDATE,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1310,7 +1326,7 @@ impl Delegate {
 
             _ = connection
                 .execute(
-                    "txn_status_update.sql",
+                    sql::TXN_STATUS_UPDATE,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -1335,7 +1351,7 @@ impl Delegate {
     async fn policy_compact_delete(&self, topition: i64, offset_id: i64) -> Result<u64> {
         let pc = self.connection().await?;
 
-        pc.execute("lite/policy_compact_delete.sql", (topition, offset_id))
+        pc.execute(sql::LITE_POLICY_COMPACT_DELETE, (topition, offset_id))
             .await
             .map(|rows| rows as u64)
             .inspect(|rows| debug!(rows))
@@ -1353,7 +1369,7 @@ impl Delegate {
 
         let mut rows = pc
             .query(
-                "lite/policy_compact_compaction.sql",
+                sql::LITE_POLICY_COMPACT_COMPACTION,
                 (topition, key, max_offset_id),
             )
             .await?;
@@ -1373,7 +1389,7 @@ impl Delegate {
         let pc = self.connection().await?;
 
         if let Some(row) = pc
-            .query_opt("lite/policy_compact_max_offset_id.sql", (topition, key))
+            .query_opt(sql::LITE_POLICY_COMPACT_MAX_OFFSET_ID, (topition, key))
             .await?
         {
             row.get::<i64>(0).map(Some).map_err(Into::into)
@@ -1388,7 +1404,7 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query("lite/policy_compact_distinct_k.sql", [topition])
+            .query(sql::LITE_POLICY_COMPACT_DISTINCT_K, [topition])
             .await?;
 
         let mut keys = BTreeSet::new();
@@ -1409,7 +1425,7 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query("lite/policy_compact_topitions.sql", [self.cluster.as_str()])
+            .query(sql::LITE_POLICY_COMPACT_TOPITIONS, [self.cluster.as_str()])
             .await?;
 
         let mut topitions = BTreeSet::new();
@@ -1430,7 +1446,7 @@ impl Delegate {
             CompactionMode::Single => {
                 let pc = self.connection().await?;
 
-                pc.execute("policy_compact.sql", [self.cluster.as_str()])
+                pc.execute(sql::POLICY_COMPACT, [self.cluster.as_str()])
                     .await
                     .map(|compacted| compacted as u64)
                     .inspect(|_| {
@@ -1492,7 +1508,7 @@ impl Delegate {
                 if let Some(vacuum_temporary) = temporary.to_str() {
                     let pc = self.connection().await?;
                     let rows = pc
-                        .execute("lite/vacuum_into.sql", [vacuum_temporary])
+                        .execute(sql::LITE_VACUUM_INTO, [vacuum_temporary])
                         .await? as u64;
 
                     rename(temporary, vacuum_into).await?;
@@ -1515,12 +1531,12 @@ impl Delegate {
 
         let by_age = pc
             .execute(
-                "lite/policy_delete.sql",
+                sql::LITE_POLICY_DELETE,
                 (self.cluster.as_str(), now, retention_ms),
             )
             .await?;
 
-        pc.execute("lite/policy_delete_bytes.sql", [self.cluster.as_str()])
+        pc.execute(sql::LITE_POLICY_DELETE_BYTES, [self.cluster.as_str()])
             .await
             .map(|by_bytes| (by_age + by_bytes) as u64)
             .map_err(Into::into)
@@ -1575,7 +1591,7 @@ impl Delegate {
 
         let row = c
             .query_one(
-                "virtual_topic_upsert.sql",
+                sql::VIRTUAL_TOPIC_UPSERT,
                 (self.cluster.as_str(), topic, key, uuid.to_string()),
             )
             .await?;
@@ -1765,11 +1781,11 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
         .await?;
 
     _ = tx
-        .execute(SQL.get("nisshi_schema_version_create.sql")?, ())
+        .execute(SQL.get(sql::NISSHI_SCHEMA_VERSION_CREATE)?, ())
         .await?;
 
     let recorded = match tx
-        .query(SQL.get("nisshi_schema_version_select.sql")?, ())
+        .query(SQL.get(sql::NISSHI_SCHEMA_VERSION_SELECT)?, ())
         .await?
         .next()
         .await?
@@ -1806,7 +1822,7 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
 
     _ = tx
         .execute(
-            SQL.get("nisshi_schema_version_insert.sql")?,
+            SQL.get(sql::NISSHI_SCHEMA_VERSION_INSERT)?,
             [SCHEMA_VERSION, OLDEST_COMPATIBLE_SCHEMA_VERSION],
         )
         .await?;
@@ -1827,7 +1843,7 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
 
 pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
     Cache::new(
-        crate::sql::SQL
+        sql::SQL
             .iter()
             .map(|(name, sql)| fix_parameters(sql).map(|sql| (*name, sql)))
             .collect::<Result<BTreeMap<_, _>>>()
@@ -2677,7 +2693,7 @@ impl Storage for Delegate {
 
         connection
             .execute(
-                "register_broker.sql",
+                sql::REGISTER_BROKER,
                 &[broker_registration.cluster_id.as_str()],
             )
             .await
@@ -2739,7 +2755,7 @@ impl Storage for Delegate {
                 (topic.replication_factor as i32),
             );
 
-            pc.query_one("topic_insert.sql", parameters.clone())
+            pc.query_one(sql::TOPIC_INSERT, parameters.clone())
                 .await
                 .inspect_err(|err| {
                     if is_unique_constraint(err) {
@@ -2764,13 +2780,13 @@ impl Storage for Delegate {
             let params = (self.cluster.as_str(), topic.name.as_str(), partition);
 
             _ = pc
-                .query_opt("topition_insert.sql", params)
+                .query_opt(sql::TOPITION_INSERT, params)
                 .await
                 .map(|row| row.map(|row| row.get_value(0)).transpose())
                 .inspect(|topition| debug!(?topition))?;
 
             _ = pc
-                .query_opt("watermark_insert.sql", params)
+                .query_opt(sql::WATERMARK_INSERT, params)
                 .await
                 .map(|row| row.map(|row| row.get_value(0)).transpose())
                 .inspect(|watermark| debug!(?watermark))?;
@@ -2788,7 +2804,7 @@ impl Storage for Delegate {
                 );
 
                 _ = pc
-                    .query_one("topic_configuration_upsert.sql", params)
+                    .query_one(sql::TOPIC_CONFIGURATION_UPSERT, params)
                     .await
                     .map(|row| row.get_value(0))
                     .inspect_err(|err| error!(?err, ?config))
@@ -2847,7 +2863,7 @@ impl Storage for Delegate {
                                     if cutoff > stage.log_start {
                                         _ = pc
                                             .execute(
-                                                "record_delete_by_offset.sql",
+                                                sql::RECORD_DELETE_BY_OFFSET,
                                                 (
                                                     self.cluster.as_str(),
                                                     topic.name.as_str(),
@@ -2861,7 +2877,7 @@ impl Storage for Delegate {
 
                                     _ = pc
                                         .execute(
-                                            "watermark_update.sql",
+                                            sql::WATERMARK_UPDATE,
                                             (
                                                 self.cluster.as_str(),
                                                 topic.name.as_str(),
@@ -2910,7 +2926,7 @@ impl Storage for Delegate {
         let mut rows = match topic {
             TopicId::Id(id) => {
                 pc.query(
-                    "topic_select_uuid.sql",
+                    sql::TOPIC_SELECT_UUID,
                     (self.cluster.as_str(), id.to_string().as_str()),
                 )
                 .await?
@@ -2918,7 +2934,7 @@ impl Storage for Delegate {
 
             TopicId::Name(name) => {
                 pc.query(
-                    "topic_select_name.sql",
+                    sql::TOPIC_SELECT_NAME,
                     (self.cluster.as_str(), name.as_str()),
                 )
                 .await?
@@ -2932,16 +2948,16 @@ impl Storage for Delegate {
         let topic_name = row.get_str(1)?;
 
         for sql in [
-            "consumer_offset_delete_by_topic.sql",
-            "topic_configuration_delete_by_topic.sql",
-            "watermark_delete_by_topic.sql",
-            "header_delete_by_topic.sql",
-            "record_delete_by_topic.sql",
-            "txn_offset_commit_tp_delete_by_topic.sql",
-            "txn_produce_offset_delete_by_topic.sql",
-            "txn_topition_delete_by_topic.sql",
-            "producer_detail_delete_by_topic.sql",
-            "topition_delete_by_topic.sql",
+            sql::CONSUMER_OFFSET_DELETE_BY_TOPIC,
+            sql::TOPIC_CONFIGURATION_DELETE_BY_TOPIC,
+            sql::WATERMARK_DELETE_BY_TOPIC,
+            sql::HEADER_DELETE_BY_TOPIC,
+            sql::RECORD_DELETE_BY_TOPIC,
+            sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TOPIC,
+            sql::TXN_PRODUCE_OFFSET_DELETE_BY_TOPIC,
+            sql::TXN_TOPITION_DELETE_BY_TOPIC,
+            sql::PRODUCER_DETAIL_DELETE_BY_TOPIC,
+            sql::TOPITION_DELETE_BY_TOPIC,
         ] {
             let rows = pc.execute(sql, (self.cluster.as_str(), topic_name)).await?;
 
@@ -2949,7 +2965,7 @@ impl Storage for Delegate {
         }
 
         _ = pc
-            .execute("topic_delete_by.sql", (self.cluster.as_str(), topic_name))
+            .execute(sql::TOPIC_DELETE_BY, (self.cluster.as_str(), topic_name))
             .await?;
 
         pc.commit(tx).await.and(Ok(ErrorCode::None)).inspect(|_| {
@@ -3125,7 +3141,7 @@ impl Storage for Delegate {
         let mut records = if let Some(key) = key_filter {
             let key_bytes = key.as_bytes().to_vec();
             c.query(
-                "record_fetch_keyed.sql",
+                sql::RECORD_FETCH_KEYED,
                 (
                     self.cluster.as_str(),
                     base_topic,
@@ -3140,7 +3156,7 @@ impl Storage for Delegate {
             .inspect_err(|err| error!(?err))?
         } else {
             c.query(
-                "record_fetch.sql",
+                sql::RECORD_FETCH,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -3184,7 +3200,7 @@ impl Storage for Delegate {
 
                 let mut headers = c
                     .query(
-                        "header_fetch.sql",
+                        sql::HEADER_FETCH,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -3326,7 +3342,7 @@ impl Storage for Delegate {
 
                     let mut headers = c
                         .query(
-                            "header_fetch.sql",
+                            sql::HEADER_FETCH,
                             (
                                 self.cluster.as_str(),
                                 topition.topic(),
@@ -3398,7 +3414,7 @@ impl Storage for Delegate {
 
         let row = c
             .query_one(
-                "watermark_select.sql",
+                sql::WATERMARK_SELECT,
                 (
                     self.cluster.as_str(),
                     self.base_topic(topition.topic()).await?,
@@ -3460,7 +3476,7 @@ impl Storage for Delegate {
 
             let mut rows = c
                 .query(
-                    "topition_select.sql",
+                    sql::TOPITION_SELECT,
                     (
                         self.cluster.as_str(),
                         self.base_topic(topition.topic()).await?,
@@ -3473,7 +3489,7 @@ impl Storage for Delegate {
             if rows.next().await.inspect_err(|err| error!(?err))?.is_some() {
                 if !cg_inserted {
                     let rows = c
-                        .execute("consumer_group_insert.sql", (self.cluster.as_str(), group))
+                        .execute(sql::CONSUMER_GROUP_INSERT, (self.cluster.as_str(), group))
                         .await?;
                     debug!(rows);
 
@@ -3482,7 +3498,7 @@ impl Storage for Delegate {
 
                 let rows = c
                     .execute(
-                        "consumer_offset_insert.sql",
+                        sql::CONSUMER_OFFSET_INSERT,
                         (
                             self.cluster.as_str(),
                             self.base_topic(topition.topic()).await?,
@@ -3533,7 +3549,7 @@ impl Storage for Delegate {
 
         let mut rows = c
             .query(
-                "consumer_offset_select_by_group.sql",
+                sql::CONSUMER_OFFSET_SELECT_BY_GROUP,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
@@ -3576,7 +3592,7 @@ impl Storage for Delegate {
         for topic in topics {
             let mut rows = c
                 .query(
-                    "consumer_offset_select.sql",
+                    sql::CONSUMER_OFFSET_SELECT,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -3644,14 +3660,14 @@ impl Storage for Delegate {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
+                (ListOffset::Earliest, _) => sql::LIST_EARLIEST_OFFSET,
                 (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
-                    "list_latest_offset_committed.sql"
+                    sql::LIST_LATEST_OFFSET_COMMITTED
                 }
                 (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
-                    "list_latest_offset_uncommitted.sql"
+                    sql::LIST_LATEST_OFFSET_UNCOMMITTED
                 }
-                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
+                (ListOffset::Timestamp(_), _) => sql::LIST_LATEST_OFFSET_TIMESTAMP,
             };
 
             debug!(?query);
@@ -3795,7 +3811,7 @@ impl Storage for Delegate {
                             }?;
 
                             let mut rows = c
-                                .query("topic_select_name.sql", (self.cluster.as_str(), base_topic))
+                                .query(sql::TOPIC_SELECT_NAME, (self.cluster.as_str(), base_topic))
                                 .await?;
 
                             match rows.next().await.inspect_err(|err| error!(?err)) {
@@ -3869,7 +3885,7 @@ impl Storage for Delegate {
 
                             let mut rows = c
                                 .query(
-                                    "topic_select_uuid.sql",
+                                    sql::TOPIC_SELECT_UUID,
                                     (self.cluster.as_str(), id.to_string().as_str()),
                                 )
                                 .await?;
@@ -3947,7 +3963,7 @@ impl Storage for Delegate {
                 let mut responses = vec![];
 
                 let mut rows = c
-                    .query("topic_by_cluster.sql", &[self.cluster.as_str()])
+                    .query(sql::TOPIC_BY_CLUSTER, &[self.cluster.as_str()])
                     .await?;
 
                 while let Some(row) = rows.next().await? {
@@ -4031,18 +4047,21 @@ impl Storage for Delegate {
             .await?;
 
         if rows.next().await?.is_some() {
-            let mut rows = c
-                .query_rows::<topic_configuration_select::Row>(
+            let (columns, mut rows) = c
+                .query_rows(
                     topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
+            let reader = topic_configuration_select::RowReader::new(&columns)?;
+
             let mut configs = vec![];
 
-            while let Some(topic_configuration_select::Row { name, value }) =
-                rows.next().await.inspect_err(|err| error!(?err))?
-            {
+            while let Some(row) = rows.next().await? {
+                let topic_configuration_select::Row { name, value } =
+                    reader.read_row(&row).inspect_err(|err| error!(?err))?;
+
                 configs.push(
                     DescribeConfigsResourceResult::default()
                         .name(name)
@@ -4109,7 +4128,7 @@ impl Storage for Delegate {
                 TopicId::Name(name) => {
                     match c
                         .query_opt(
-                            "topic_select_name.sql",
+                            sql::TOPIC_SELECT_NAME,
                             (self.cluster.as_str(), name.as_str()),
                         )
                         .await
@@ -4204,7 +4223,7 @@ impl Storage for Delegate {
                     debug!(?id);
                     match c
                         .query_one(
-                            "topic_select_uuid.sql",
+                            sql::TOPIC_SELECT_UUID,
                             (self.cluster.as_str(), id.to_string().as_str()),
                         )
                         .await
@@ -4298,14 +4317,15 @@ impl Storage for Delegate {
 
         let mut listed_groups = vec![];
 
-        let mut rows = c
-            .query_rows::<consumer_group_select::Row>(
-                consumer_group_select::QUERY,
-                &[self.cluster.as_str()],
-            )
+        let (columns, mut rows) = c
+            .query_rows(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {
+        let reader = consumer_group_select::RowReader::new(&columns)?;
+
+        while let Some(row) = rows.next().await? {
+            let consumer_group_select::Row { name, detail } = reader.read_row(&row)?;
+
             let stored =
                 detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
@@ -4336,7 +4356,7 @@ impl Storage for Delegate {
             for group_id in group_ids {
                 _ = c
                     .execute(
-                        "consumer_offset_delete_by_cg.sql",
+                        sql::CONSUMER_OFFSET_DELETE_BY_CG,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4344,7 +4364,7 @@ impl Storage for Delegate {
 
                 _ = c
                     .execute(
-                        "consumer_group_detail_delete_by_cg.sql",
+                        sql::CONSUMER_GROUP_DETAIL_DELETE_BY_CG,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4352,7 +4372,7 @@ impl Storage for Delegate {
 
                 let rows = c
                     .execute(
-                        "consumer_group_delete.sql",
+                        sql::CONSUMER_GROUP_DELETE,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4397,7 +4417,7 @@ impl Storage for Delegate {
             for group_id in group_ids {
                 if let Some(row) = c
                     .query_opt(
-                        "consumer_group_select_by_name.sql",
+                        sql::CONSUMER_GROUP_SELECT_BY_NAME,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4445,7 +4465,7 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         c.query_opt(
-            "consumer_group_detail.sql",
+            sql::CONSUMER_GROUP_DETAIL,
             (group_id, self.cluster.as_str()),
         )
         .await
@@ -4478,7 +4498,7 @@ impl Storage for Delegate {
 
         _ = pc
             .execute(
-                "consumer_group_insert.sql",
+                sql::CONSUMER_GROUP_INSERT,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
@@ -4503,7 +4523,7 @@ impl Storage for Delegate {
 
         let outcome = if let Some(row) = pc
             .query_opt(
-                "consumer_group_detail_insert.sql",
+                sql::CONSUMER_GROUP_DETAIL_INSERT,
                 (
                     self.cluster.as_str(),
                     group_id,
@@ -4531,7 +4551,7 @@ impl Storage for Delegate {
         } else {
             let row = pc
                 .query_one(
-                    "consumer_group_detail.sql",
+                    sql::CONSUMER_GROUP_DETAIL,
                     (group_id, self.cluster.as_str()),
                 )
                 .await
@@ -4593,7 +4613,7 @@ impl Storage for Delegate {
 
                 if let Some(row) = pc
                     .query_opt(
-                        "producer_epoch_for_current_txn.sql",
+                        sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
                         (self.cluster.as_str(), transaction_id),
                     )
                     .await
@@ -4654,7 +4674,7 @@ impl Storage for Delegate {
 
                 let (producer, epoch) = if let Some(row) = pc
                     .query_opt(
-                        "txn_select_name.sql",
+                        sql::TXN_SELECT_NAME,
                         (self.cluster.as_str(), transaction_id),
                     )
                     .await
@@ -4669,7 +4689,7 @@ impl Storage for Delegate {
                     // applies to that epoch, not to the newest epoch with a transaction.
                     let newest = pc
                         .query_opt(
-                            "producer_epoch_current_for_producer.sql",
+                            sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER,
                             (self.cluster.as_str(), producer),
                         )
                         .await
@@ -4686,7 +4706,7 @@ impl Storage for Delegate {
                         // The status after the rollback above, if it ran.
                         let status = pc
                             .query_opt(
-                                "producer_epoch_for_current_txn.sql",
+                                sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
                                 (self.cluster.as_str(), transaction_id),
                             )
                             .await
@@ -4710,7 +4730,7 @@ impl Storage for Delegate {
                             if rolled_back {
                                 _ = pc
                                     .query_opt(
-                                        "producer_epoch_insert.sql",
+                                        sql::PRODUCER_EPOCH_INSERT,
                                         (self.cluster.as_str(), producer),
                                     )
                                     .await
@@ -4735,14 +4755,14 @@ impl Storage for Delegate {
                         let previous = producer;
 
                         let producer: i64 = pc
-                            .query_one("producer_insert.sql", &[self.cluster.as_str()])
+                            .query_one(sql::PRODUCER_INSERT, &[self.cluster.as_str()])
                             .await
                             .and_then(|row| row.get(0))
                             .inspect_err(|err| error!(?err))?;
 
                         let epoch = pc
                             .query_one(
-                                "producer_epoch_insert.sql",
+                                sql::PRODUCER_EPOCH_INSERT,
                                 (self.cluster.as_str(), producer),
                             )
                             .await
@@ -4756,7 +4776,7 @@ impl Storage for Delegate {
                         // i16::MAX gets no new epoch, and is fenced already.
                         _ = pc
                             .query_opt(
-                                "producer_epoch_insert.sql",
+                                sql::PRODUCER_EPOCH_INSERT,
                                 (self.cluster.as_str(), previous),
                             )
                             .await
@@ -4764,7 +4784,7 @@ impl Storage for Delegate {
 
                         let updated = pc
                             .execute(
-                                "txn_update_producer.sql",
+                                sql::TXN_UPDATE_PRODUCER,
                                 (self.cluster.as_str(), transaction_id, producer),
                             )
                             .await
@@ -4788,7 +4808,7 @@ impl Storage for Delegate {
                     } else {
                         let row = pc
                             .query_one(
-                                "producer_epoch_insert.sql",
+                                sql::PRODUCER_EPOCH_INSERT,
                                 (self.cluster.as_str(), producer),
                             )
                             .await
@@ -4804,7 +4824,7 @@ impl Storage for Delegate {
                     }
                 } else {
                     let row = pc
-                        .query_one("producer_insert.sql", &[self.cluster.as_str()])
+                        .query_one(sql::PRODUCER_INSERT, &[self.cluster.as_str()])
                         .await
                         .inspect_err(|err| error!(?err))?;
 
@@ -4812,7 +4832,7 @@ impl Storage for Delegate {
 
                     let row = pc
                         .query_one(
-                            "producer_epoch_insert.sql",
+                            sql::PRODUCER_EPOCH_INSERT,
                             (self.cluster.as_str(), producer),
                         )
                         .await
@@ -4823,7 +4843,7 @@ impl Storage for Delegate {
                     assert_eq!(
                         1,
                         pc.execute(
-                            "txn_insert.sql",
+                            sql::TXN_INSERT,
                             (self.cluster.as_str(), transaction_id, producer),
                         )
                         .await
@@ -4843,7 +4863,7 @@ impl Storage for Delegate {
                 assert_eq!(
                     1,
                     pc.execute(
-                        "txn_detail_insert.sql",
+                        sql::TXN_DETAIL_INSERT,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -4888,7 +4908,7 @@ impl Storage for Delegate {
                 let tx = pc.transaction().await?;
 
                 let mut rows = pc
-                    .query("producer_insert.sql", &[self.cluster.as_str()])
+                    .query(sql::PRODUCER_INSERT, &[self.cluster.as_str()])
                     .await?;
 
                 if let Some(row) = rows.next().await? {
@@ -4900,7 +4920,7 @@ impl Storage for Delegate {
 
                     let mut rows = pc
                         .query(
-                            "producer_epoch_insert.sql",
+                            sql::PRODUCER_EPOCH_INSERT,
                             (self.cluster.as_str(), producer),
                         )
                         .await?;
@@ -5019,7 +5039,7 @@ impl Storage for Delegate {
                     for partition_index in topic.partitions.unwrap_or(vec![]) {
                         _ = pc
                             .execute(
-                                "txn_topition_insert.sql",
+                                sql::TXN_TOPITION_INSERT,
                                 (
                                     self.cluster.as_str(),
                                     topic.name.as_str(),
@@ -5056,7 +5076,7 @@ impl Storage for Delegate {
 
                 _ = pc
                     .execute(
-                        "txn_detail_update_started_at.sql",
+                        sql::TXN_DETAIL_UPDATE_STARTED_AT,
                         (
                             self.cluster.as_str(),
                             transaction_id.as_str(),
@@ -5104,7 +5124,7 @@ impl Storage for Delegate {
 
         let (producer_id, producer_epoch) = if let Some(row) = pc
             .query_opt(
-                "producer_epoch_for_current_txn.sql",
+                sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
                 (self.cluster.as_str(), offsets.transaction_id.as_str()),
             )
             .await
@@ -5129,7 +5149,7 @@ impl Storage for Delegate {
 
         _ = pc
             .execute(
-                "consumer_group_insert.sql",
+                sql::CONSUMER_GROUP_INSERT,
                 (self.cluster.as_str(), offsets.group_id.as_str()),
             )
             .await?;
@@ -5138,7 +5158,7 @@ impl Storage for Delegate {
 
         _ = pc
             .execute(
-                "txn_offset_commit_insert.sql",
+                sql::TXN_OFFSET_COMMIT_INSERT,
                 (
                     self.cluster.as_str(),
                     offsets.transaction_id.as_str(),
@@ -5164,7 +5184,7 @@ impl Storage for Delegate {
                     {
                         _ = pc
                             .execute(
-                                "txn_offset_commit_tp_insert.sql",
+                                sql::TXN_OFFSET_COMMIT_TP_INSERT,
                                 (
                                     self.cluster.as_str(),
                                     offsets.transaction_id.as_str(),
@@ -5276,7 +5296,7 @@ impl Storage for Delegate {
         {
             let connection = self.pool.get().await?;
 
-            let mut rows = connection.query("maintain-vacuum.sql", ()).await?;
+            let mut rows = connection.query(sql::MAINTAIN_VACUUM, ()).await?;
 
             if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
                 debug!(
@@ -5334,7 +5354,7 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
 
         pc.execute(
-            "scram_credential_delete.sql",
+            sql::SCRAM_CREDENTIAL_DELETE,
             (self.cluster.as_str(), user, i32::from(mechanism)),
         )
         .await
@@ -5360,7 +5380,7 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
 
         pc.execute(
-            "scram_credential_insert.sql",
+            sql::SCRAM_CREDENTIAL_INSERT,
             (
                 self.cluster.as_str(),
                 user,
@@ -5393,7 +5413,7 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
 
         pc.query_opt(
-            "scram_credential_select.sql",
+            sql::SCRAM_CREDENTIAL_SELECT,
             (self.cluster.as_str(), user, i32::from(mechanism)),
         )
         .await
@@ -5428,7 +5448,7 @@ impl Storage for Delegate {
     async fn ping(&self) -> Result<()> {
         let start = SystemTime::now();
         let c = self.pool.get().await?;
-        let _ = c.query("ping.sql", ()).await?;
+        let _ = c.query(sql::PING, ()).await?;
         DELEGATE_REQUEST_DURATION
             .record(elapsed_millis(start), &[KeyValue::new("operation", "ping")]);
         Ok(())
@@ -6530,7 +6550,7 @@ mod tests {
         let digest = crate::schema::schema_digest(
             DDL.values()
                 .map(|statement| statement.as_str())
-                .chain([SQL.get("nisshi_schema_version_create.sql")?]),
+                .chain([SQL.get(sql::NISSHI_SCHEMA_VERSION_CREATE)?]),
         );
 
         assert_eq!(

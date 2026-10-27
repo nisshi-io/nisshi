@@ -103,10 +103,10 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        QueryRow, consumer_group_select, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, result_columns::ResultColumns,
-        topic_configuration_select, topic_configuration_select_keys, topic_select,
-        watermark_select_for_write,
+        self,
+        consumer_group_select, default_hash, idempotent_epoch_check, idempotent_sequence_check,
+        producer_epochs_select, result_columns::ResultColumns, topic_configuration_select,
+        topic_configuration_select_keys, topic_select, watermark_select_for_write,
     },
 };
 
@@ -961,7 +961,7 @@ impl Postgres {
         if self
             .prepare_query_opt(
                 &tx,
-                "topic_select_name_for_update.sql",
+                sql::TOPIC_SELECT_NAME_FOR_UPDATE,
                 &[&self.cluster, topic],
             )
             .await?
@@ -976,7 +976,7 @@ impl Postgres {
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
                 self.prepare_query_opt(
                     &tx,
-                    "topic_configuration_select_name.sql",
+                    sql::TOPIC_CONFIGURATION_SELECT_NAME,
                     &[&self.cluster, topic, &config.name],
                 )
                 .await?
@@ -998,7 +998,7 @@ impl Postgres {
                     _ = self
                         .prepare_query_opt(
                             &tx,
-                            "topic_configuration_upsert.sql",
+                            sql::TOPIC_CONFIGURATION_UPSERT,
                             &[&self.cluster, topic, &config.name, &value],
                         )
                         .await?;
@@ -1008,7 +1008,7 @@ impl Postgres {
                     _ = self
                         .prepare_execute(
                             &tx,
-                            "topic_configuration_delete.sql",
+                            sql::TOPIC_CONFIGURATION_DELETE,
                             &[&self.cluster, topic, &config.name],
                         )
                         .await?;
@@ -1134,7 +1134,7 @@ impl Postgres {
         let records = if let Some(key) = key_filter {
             self.prepare_query(
                 &tx,
-                "record_fetch_pg_keyed.sql",
+                sql::PG_RECORD_FETCH_KEYED,
                 &[
                     &self.cluster,
                     &base_topic,
@@ -1151,7 +1151,7 @@ impl Postgres {
         } else {
             self.prepare_query(
                 &tx,
-                "record_fetch_pg.sql",
+                sql::PG_RECORD_FETCH,
                 &[
                     &self.cluster,
                     &topition.topic(),
@@ -1214,7 +1214,7 @@ impl Postgres {
             for header in self
                 .prepare_query(
                     &tx,
-                    "header_fetch_range.sql",
+                    sql::HEADER_FETCH_RANGE,
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
                 )
                 .await
@@ -1362,7 +1362,7 @@ impl Postgres {
         let row = self
             .prepare_query_one(
                 c,
-                "watermark_select.sql",
+                sql::WATERMARK_SELECT,
                 &[&self.cluster, &base_topic, &partition],
             )
             .await
@@ -1406,14 +1406,14 @@ impl Postgres {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
+                (ListOffset::Earliest, _) => sql::LIST_EARLIEST_OFFSET,
                 (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
-                    "list_latest_offset_committed.sql"
+                    sql::LIST_LATEST_OFFSET_COMMITTED
                 }
                 (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
-                    "list_latest_offset_uncommitted.sql"
+                    sql::LIST_LATEST_OFFSET_UNCOMMITTED
                 }
-                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
+                (ListOffset::Timestamp(_), _) => sql::LIST_LATEST_OFFSET_TIMESTAMP,
             };
 
             debug!(?query);
@@ -1568,18 +1568,18 @@ impl Postgres {
         // tables instead of its data. The query returns a row only when `cluster` exists.
         let has_tables = tx
             .query_opt(
-                self.sql_lookup("pg/search_path_set_to_cluster_namespace.sql")?,
+                self.sql_lookup(sql::PG_SEARCH_PATH_SET_TO_CLUSTER_NAMESPACE)?,
                 &[],
             )
             .await?
             .is_some();
 
-        tx.batch_execute(self.sql_lookup("nisshi_schema_version_create.sql")?)
+        tx.batch_execute(self.sql_lookup(sql::NISSHI_SCHEMA_VERSION_CREATE)?)
             .await?;
         tx.batch_execute(SCHEMA).await?;
         _ = tx
             .execute(
-                self.sql_lookup("nisshi_schema_version_insert.sql")?,
+                self.sql_lookup(sql::NISSHI_SCHEMA_VERSION_INSERT)?,
                 &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
             )
             .await?;
@@ -1601,7 +1601,7 @@ impl Postgres {
     /// Returns the schema version that the database records, or `None` when it records none.
     async fn recorded_schema(&self, tx: &Transaction<'_>) -> Result<Option<RecordedSchema>> {
         let version_table_exists = tx
-            .query_one(self.sql_lookup("pg/nisshi_schema_version_exists.sql")?, &[])
+            .query_one(self.sql_lookup(sql::PG_NISSHI_SCHEMA_VERSION_EXISTS)?, &[])
             .await?
             .try_get::<_, bool>(0)?;
         if !version_table_exists {
@@ -1609,7 +1609,7 @@ impl Postgres {
         }
 
         let recorded = tx
-            .query_opt(self.sql_lookup("nisshi_schema_version_select.sql")?, &[])
+            .query_opt(self.sql_lookup(sql::NISSHI_SCHEMA_VERSION_SELECT)?, &[])
             .await?
             .map(|row| {
                 Ok::<_, Error>(RecordedSchema {
@@ -1623,7 +1623,7 @@ impl Postgres {
     }
 
     fn sql_lookup(&self, key: &str) -> Result<&str> {
-        crate::sql::SQL.get(key)
+        sql::SQL.get(key)
     }
 
     async fn idempotent_message_check(
@@ -1635,8 +1635,8 @@ impl Postgres {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        let epochs = self
-            .prepare_query_optional_row::<producer_epochs_select::Row>(
+        let (columns, row) = self
+            .prepare_query_optional_row(
                 tx,
                 producer_epochs_select::QUERY,
                 &[
@@ -1649,7 +1649,11 @@ impl Postgres {
             .await
             .inspect_err(|err| error!(?err))?;
 
-        if let Some(epochs) = epochs {
+        let reader = producer_epochs_select::RowReader::new(&columns)?;
+
+        if let Some(row) = row {
+            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
+
             let stored = StoredEpochs {
                 transactional: epochs.transactional != 0,
                 newest: epochs.newest_epoch,
@@ -1660,7 +1664,7 @@ impl Postgres {
                 _ = self
                     .prepare_execute(
                         tx,
-                        "producer_epoch_insert_given.sql",
+                        sql::PRODUCER_EPOCH_INSERT_GIVEN,
                         &[
                             &self.cluster,
                             &deflated.producer_id,
@@ -1674,7 +1678,7 @@ impl Postgres {
             let row = self
                 .prepare_query_one(
                     tx,
-                    "producer_select_for_update.sql",
+                    sql::PRODUCER_SELECT_FOR_UPDATE,
                     &[
                         &self.cluster,
                         &topition.topic(),
@@ -1713,7 +1717,7 @@ impl Postgres {
                 1,
                 self.prepare_execute(
                     tx,
-                    "producer_detail_insert.sql",
+                    sql::PRODUCER_DETAIL_INSERT,
                     &[
                         &self.cluster,
                         &topition.topic(),
@@ -1740,14 +1744,22 @@ impl Postgres {
         topition: &Topition,
         tx: &Transaction<'_>,
     ) -> Result<watermark_select_for_write::Row> {
-        self.prepare_query_optional_row(
-            tx,
-            watermark_select_for_write::QUERY,
-            &[&self.cluster, &topition.topic(), &topition.partition()],
-        )
-        .await
-        .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
+        let (columns, row) = self
+            .prepare_query_optional_row(
+                tx,
+                watermark_select_for_write::QUERY,
+                &[&self.cluster, &topition.topic(), &topition.partition()],
+            )
+            .await
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
+
+        let reader = watermark_select_for_write::RowReader::new(&columns)?;
+
+        let Some(row) = row else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        reader.read_row(&row).inspect_err(|err| error!(?err))
     }
 
     /// Advances one partition's log start for DeleteRecords, answering the
@@ -1783,7 +1795,7 @@ impl Postgres {
         _ = self
             .prepare_execute(
                 &tx,
-                "watermark_update.sql",
+                sql::WATERMARK_UPDATE,
                 &[
                     &self.cluster,
                     &topition.topic(),
@@ -1819,7 +1831,7 @@ impl Postgres {
         let deleted = self
             .prepare_execute(
                 &tx,
-                "record_delete_by_offset.sql",
+                sql::RECORD_DELETE_BY_OFFSET,
                 &[
                     &self.cluster,
                     &topition.topic(),
@@ -1876,27 +1888,33 @@ impl Postgres {
         // This function runs one query instead of the two that `all_topic_configs` runs, because
         // the broker reads `message.timestamp.type` through here for each topic of each produce
         // request.
-        let rows = self
-            .prepare_query_rows::<topic_configuration_select_keys::Row>(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 c,
                 topic_configuration_select_keys::QUERY,
                 &[&self.cluster.as_str(), &name, &keys],
             )
-            .await
-            .inspect_err(|err| error!(?err))?;
+            .await?;
+
+        let reader = topic_configuration_select_keys::RowReader::new(&columns)?;
 
         if rows.is_empty() {
             return Ok(None);
         }
 
-        Ok(Some(
-            rows.into_iter()
-                .filter_map(topic_configuration_select_keys::Row::config)
-                .map(|topic_configuration_select_keys::Config { name, value }| {
-                    dynamic_topic_config(name, value)
-                })
-                .collect(),
-        ))
+        let mut configs = vec![];
+
+        for row in &rows {
+            if let Some(topic_configuration_select_keys::Config { name, value }) = reader
+                .read_row(row)
+                .inspect_err(|err| error!(?err))?
+                .config()
+            {
+                configs.push(dynamic_topic_config(name, value));
+            }
+        }
+
+        Ok(Some(configs))
     }
 
     /// Returns every config that the topic `name` sets, or `None` when the topic does not exist.
@@ -1913,20 +1931,26 @@ impl Postgres {
             return Ok(None);
         }
 
-        Ok(Some(
-            self.prepare_query_rows::<topic_configuration_select::Row>(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 c,
                 topic_configuration_select::QUERY,
                 &[&self.cluster.as_str(), &name],
             )
-            .await
-            .inspect_err(|err| error!(?err))?
-            .into_iter()
-            .map(|topic_configuration_select::Row { name, value }| {
-                dynamic_topic_config(name, value)
-            })
-            .collect(),
-        ))
+            .await?;
+
+        let reader = topic_configuration_select::RowReader::new(&columns)?;
+
+        let mut configs = vec![];
+
+        for row in &rows {
+            let topic_configuration_select::Row { name, value } =
+                reader.read_row(row).inspect_err(|err| error!(?err))?;
+
+            configs.push(dynamic_topic_config(name, value));
+        }
+
+        Ok(Some(configs))
     }
 
     /// Returns the SQL text that the SQL cache holds for `key`, and the statement that `client`
@@ -2015,41 +2039,45 @@ impl Postgres {
             .await
     }
 
-    /// Runs the query that the SQL cache holds for `query`, and returns each row of its result
-    /// as `T`.
+    /// Runs the query that the SQL cache holds for `query`, and returns its rows with the names
+    /// of its result's columns, which a query module's `RowReader` reads the rows by.
     #[instrument(skip(self, client, params))]
-    async fn prepare_query_rows<T: QueryRow>(
+    async fn prepare_query_rows<C>(
         &self,
-        client: &impl GenericClient,
+        client: &C,
         query: &'static str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Vec<T>> {
+    ) -> Result<(ResultColumns, Vec<Row>)>
+    where
+        C: GenericClient,
+    {
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let reader = T::reader(&ResultColumns::postgres(query, &statement))?;
+        let columns = ResultColumns::postgres(query, &statement);
 
         self.record_sql_metrics(sql, client.query(&statement, params))
-            .await?
-            .iter()
-            .map(|row| T::read(&reader, row))
-            .collect()
+            .await
+            .map(|rows| (columns, rows))
     }
 
-    /// Runs the query that the SQL cache holds for `query`, and returns its row as `T`, or `None`
-    /// when the result has no rows. A result with more than one row is an error.
+    /// Runs the query that the SQL cache holds for `query`, and returns its row with the names of
+    /// its result's columns, or with `None` when the result has no rows. A result with more than
+    /// one row is an error.
     #[instrument(skip(self, client, params))]
-    async fn prepare_query_optional_row<T: QueryRow>(
+    async fn prepare_query_optional_row<C>(
         &self,
-        client: &impl GenericClient,
+        client: &C,
         query: &'static str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<T>> {
+    ) -> Result<(ResultColumns, Option<Row>)>
+    where
+        C: GenericClient,
+    {
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let reader = T::reader(&ResultColumns::postgres(query, &statement))?;
+        let columns = ResultColumns::postgres(query, &statement);
 
         self.record_sql_metrics(sql, client.query_opt(&statement, params))
-            .await?
-            .map(|row| T::read(&reader, &row))
-            .transpose()
+            .await
+            .map(|row| (columns, row))
     }
 
     #[instrument(skip(self, client, params))]
@@ -2099,7 +2127,7 @@ impl Postgres {
         let Some(row) = self
             .prepare_query_opt(
                 tx,
-                "topition_select_id.sql",
+                sql::TOPITION_SELECT_ID,
                 &[&self.cluster, &topic, &partition],
             )
             .await
@@ -2188,7 +2216,7 @@ impl Postgres {
                     .inspect(|nisshi_lake_sink| debug!(nisshi_lake_sink))?)
         {
             {
-                let record_sink = tx.copy_in(self.sql_lookup("record_copy.sql")?).await?;
+                let record_sink = tx.copy_in(self.sql_lookup(sql::RECORD_COPY)?).await?;
 
                 let record_column_types = [
                     Type::INT4,
@@ -2244,7 +2272,7 @@ impl Postgres {
             }
 
             {
-                let header_sink = tx.copy_in(self.sql_lookup("header_copy.sql")?).await?;
+                let header_sink = tx.copy_in(self.sql_lookup(sql::HEADER_COPY)?).await?;
                 let header_column_types =
                     [Type::INT4, Type::INT8, Type::INT4, Type::BYTEA, Type::BYTEA];
                 let header_writer = BinaryCopyInWriter::new(header_sink, &header_column_types);
@@ -2293,7 +2321,7 @@ impl Postgres {
 
                 _ = self
                 .prepare_execute(tx,
-                    "txn_produce_offset_insert.sql",
+                    sql::TXN_PRODUCE_OFFSET_INSERT,
                     &[
                         &self.cluster,
                         &transaction_id,
@@ -2314,7 +2342,7 @@ impl Postgres {
         _ = self
             .prepare_execute(
                 tx,
-                "watermark_update.sql",
+                sql::WATERMARK_UPDATE,
                 &[
                     &self.cluster,
                     &topic,
@@ -2352,7 +2380,7 @@ impl Postgres {
         let Some(row) = self
             .prepare_query_opt(
                 tx,
-                "producer_epoch_current_for_producer.sql",
+                sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER,
                 &[&self.cluster, &producer_id],
             )
             .await?
@@ -2374,7 +2402,7 @@ impl Postgres {
         let status = match self
             .prepare_query_opt(
                 tx,
-                "txn_detail_select_status_for_update.sql",
+                sql::TXN_DETAIL_SELECT_STATUS_FOR_UPDATE,
                 &[
                     &self.cluster,
                     &transaction_id,
@@ -2449,7 +2477,7 @@ impl Postgres {
             _ = self
                 .prepare_query_opt(
                     tx,
-                    "producer_epoch_insert.sql",
+                    sql::PRODUCER_EPOCH_INSERT,
                     &[&self.cluster, &producer_id],
                 )
                 .await?;
@@ -2460,7 +2488,7 @@ impl Postgres {
         let rows = self
             .prepare_query(
                 tx,
-                "txn_select_produced_topitions.sql",
+                sql::TXN_SELECT_PRODUCED_TOPITIONS,
                 &[
                     &self.cluster,
                     &transaction_id,
@@ -2523,7 +2551,7 @@ impl Postgres {
             let row = self
                 .prepare_query_one(
                     tx,
-                    "txn_produce_offset_select_offset_range.sql",
+                    sql::TXN_PRODUCE_OFFSET_SELECT_OFFSET_RANGE,
                     &[
                         &self.cluster,
                         &transaction_id,
@@ -2542,7 +2570,7 @@ impl Postgres {
             let rows = self
                 .prepare_query(
                     tx,
-                    "txn_produce_offset_select_overlapping_txn.sql",
+                    sql::TXN_PRODUCE_OFFSET_SELECT_OVERLAPPING_TXN,
                     &[
                         &self.cluster,
                         &transaction_id,
@@ -2588,7 +2616,7 @@ impl Postgres {
                 _ = self
                     .prepare_execute(
                         tx,
-                        "txn_produce_offset_delete_by_txn.sql",
+                        sql::TXN_PRODUCE_OFFSET_DELETE_BY_TXN,
                         &[
                             &self.cluster,
                             &txn.name,
@@ -2601,7 +2629,7 @@ impl Postgres {
                 _ = self
                     .prepare_execute(
                         tx,
-                        "txn_topition_delete_by_txn.sql",
+                        sql::TXN_TOPITION_DELETE_BY_TXN,
                         &[
                             &self.cluster,
                             &txn.name,
@@ -2615,7 +2643,7 @@ impl Postgres {
                     _ = self
                         .prepare_execute(
                             tx,
-                            "consumer_offset_insert_from_txn.sql",
+                            sql::CONSUMER_OFFSET_INSERT_FROM_TXN,
                             &[
                                 &self.cluster,
                                 &txn.name,
@@ -2629,7 +2657,7 @@ impl Postgres {
                 _ = self
                     .prepare_execute(
                         tx,
-                        "txn_offset_commit_tp_delete_by_txn.sql",
+                        sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TXN,
                         &[
                             &self.cluster,
                             &txn.name,
@@ -2642,7 +2670,7 @@ impl Postgres {
                 _ = self
                     .prepare_execute(
                         tx,
-                        "txn_offset_commit_delete_by_txn.sql",
+                        sql::TXN_OFFSET_COMMIT_DELETE_BY_TXN,
                         &[
                             &self.cluster,
                             &txn.name,
@@ -2663,7 +2691,7 @@ impl Postgres {
                 _ = self
                     .prepare_execute(
                         tx,
-                        "txn_status_update.sql",
+                        sql::TXN_STATUS_UPDATE,
                         &[
                             &self.cluster,
                             &txn.name,
@@ -2686,7 +2714,7 @@ impl Postgres {
             _ = self
                 .prepare_execute(
                     tx,
-                    "txn_status_update.sql",
+                    sql::TXN_STATUS_UPDATE,
                     &[
                         &self.cluster,
                         &transaction_id,
@@ -2747,12 +2775,12 @@ impl Postgres {
         previous: i64,
     ) -> Result<(i64, i16)> {
         let producer: i64 = self
-            .prepare_query_one(tx, "producer_insert.sql", &[&self.cluster])
+            .prepare_query_one(tx, sql::PRODUCER_INSERT, &[&self.cluster])
             .await?
             .try_get(0)?;
 
         let epoch: i16 = self
-            .prepare_query_one(tx, "producer_epoch_insert.sql", &[&self.cluster, &producer])
+            .prepare_query_one(tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &producer])
             .await?
             .try_get(0)?;
 
@@ -2760,13 +2788,13 @@ impl Postgres {
         // epoch i16::MAX fences the previous producer ID. A producer at epoch i16::MAX
         // gets no new epoch, and is fenced already.
         _ = self
-            .prepare_query_opt(tx, "producer_epoch_insert.sql", &[&self.cluster, &previous])
+            .prepare_query_opt(tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &previous])
             .await?;
 
         let updated = self
             .prepare_execute(
                 tx,
-                "txn_update_producer.sql",
+                sql::TXN_UPDATE_PRODUCER,
                 &[&self.cluster, &transaction_id, &producer],
             )
             .await?;
@@ -2817,7 +2845,7 @@ impl Postgres {
             _ = self
                 .prepare_query_opt(
                     &tx,
-                    "txn_select_name_for_update.sql",
+                    sql::TXN_SELECT_NAME_FOR_UPDATE,
                     &[&self.cluster, &transaction_id],
                 )
                 .await
@@ -2828,7 +2856,7 @@ impl Postgres {
             if let Some(row) = self
                 .prepare_query_opt(
                     &tx,
-                    "producer_epoch_for_current_txn.sql",
+                    sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
                     &[&self.cluster, &transaction_id],
                 )
                 .await
@@ -2853,7 +2881,7 @@ impl Postgres {
                     let current = self
                         .prepare_query_opt(
                             &tx,
-                            "producer_epoch_current_for_producer.sql",
+                            sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER,
                             &[&self.cluster, &id],
                         )
                         .await
@@ -2896,7 +2924,7 @@ impl Postgres {
             let (producer, epoch) = if let Some(row) = self
                 .prepare_query_opt(
                     &tx,
-                    "txn_select_name.sql",
+                    sql::TXN_SELECT_NAME,
                     &[&self.cluster, &transaction_id],
                 )
                 .await
@@ -2910,7 +2938,7 @@ impl Postgres {
                 let newest = self
                     .prepare_query_opt(
                         &tx,
-                        "producer_epoch_current_for_producer.sql",
+                        sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER,
                         &[&self.cluster, &producer],
                     )
                     .await
@@ -2924,7 +2952,7 @@ impl Postgres {
                     let status = self
                         .prepare_query_opt(
                             &tx,
-                            "producer_epoch_for_current_txn.sql",
+                            sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
                             &[&self.cluster, &transaction_id],
                         )
                         .await
@@ -2948,7 +2976,7 @@ impl Postgres {
                             _ = self
                                 .prepare_query_opt(
                                     &tx,
-                                    "producer_epoch_insert.sql",
+                                    sql::PRODUCER_EPOCH_INSERT,
                                     &[&self.cluster, &producer],
                                 )
                                 .await
@@ -2972,7 +3000,7 @@ impl Postgres {
                     let row = self
                         .prepare_query_one(
                             &tx,
-                            "producer_epoch_insert.sql",
+                            sql::PRODUCER_EPOCH_INSERT,
                             &[&self.cluster, &producer],
                         )
                         .await
@@ -2984,7 +3012,7 @@ impl Postgres {
                 }
             } else {
                 let row = self
-                    .prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                    .prepare_query_one(&tx, sql::PRODUCER_INSERT, &[&self.cluster])
                     .await
                     .inspect_err(|err| error!(?err))?;
 
@@ -2993,7 +3021,7 @@ impl Postgres {
                 let row = self
                     .prepare_query_one(
                         &tx,
-                        "producer_epoch_insert.sql",
+                        sql::PRODUCER_EPOCH_INSERT,
                         &[&self.cluster, &producer],
                     )
                     .await
@@ -3005,7 +3033,7 @@ impl Postgres {
                     1,
                     self.prepare_execute(
                         &tx,
-                        "txn_insert.sql",
+                        sql::TXN_INSERT,
                         &[&self.cluster, &transaction_id, &producer],
                     )
                     .await
@@ -3026,7 +3054,7 @@ impl Postgres {
                 1,
                 self.prepare_execute(
                     &tx,
-                    "txn_detail_insert.sql",
+                    sql::TXN_DETAIL_INSERT,
                     &[
                         &self.cluster,
                         &transaction_id,
@@ -3069,7 +3097,7 @@ impl Postgres {
             let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
             let row = self
-                .prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                .prepare_query_one(&tx, sql::PRODUCER_INSERT, &[&self.cluster])
                 .await
                 .inspect_err(|err| error!(self.cluster, ?err))?;
 
@@ -3078,7 +3106,7 @@ impl Postgres {
             let row = self
                 .prepare_query_one(
                     &tx,
-                    "producer_epoch_insert.sql",
+                    sql::PRODUCER_EPOCH_INSERT,
                     &[&self.cluster, &producer],
                 )
                 .await
@@ -3144,7 +3172,7 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?;
 
         let compacted = self
-            .prepare_execute(&tx, "policy_compact.sql", &[&self.cluster])
+            .prepare_execute(&tx, sql::POLICY_COMPACT, &[&self.cluster])
             .await?;
 
         tx.commit().await.map_err(Into::into).and(Ok(compacted))
@@ -3165,13 +3193,13 @@ impl Postgres {
         let deleted = self
             .prepare_execute(
                 &tx,
-                "policy_delete.sql",
+                sql::POLICY_DELETE,
                 &[&self.cluster, &now, &retention_secs],
             )
             .await?;
 
         let deleted_by_bytes = self
-            .prepare_execute(&tx, "policy_delete_bytes.sql", &[&self.cluster])
+            .prepare_execute(&tx, sql::POLICY_DELETE_BYTES, &[&self.cluster])
             .await?;
 
         tx.commit()
@@ -3193,7 +3221,7 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?;
 
         let deleted = self
-            .prepare_execute(&tx, "record_delete_below_log_start.sql", &[&self.cluster])
+            .prepare_execute(&tx, sql::RECORD_DELETE_BELOW_LOG_START, &[&self.cluster])
             .await?;
 
         tx.commit().await.map_err(Into::into).and(Ok(deleted))
@@ -3243,7 +3271,7 @@ impl Postgres {
         let row = self
             .prepare_query_one(
                 &c,
-                "virtual_topic_upsert.sql",
+                sql::VIRTUAL_TOPIC_UPSERT,
                 &[&self.cluster, &topic, &key.as_bytes(), &uuid],
             )
             .await?;
@@ -3285,7 +3313,7 @@ impl Storage for Postgres {
         _ = self
             .prepare_execute(
                 &c,
-                "register_broker.sql",
+                sql::REGISTER_BROKER,
                 &[&broker_registration.cluster_id],
             )
             .await
@@ -3328,7 +3356,7 @@ impl Storage for Postgres {
         let topic_uuid = self
             .prepare_query_one(
                 &tx,
-                "topic_insert.sql",
+                sql::TOPIC_INSERT,
                 &[
                     &self.cluster,
                     &topic.name,
@@ -3359,7 +3387,7 @@ impl Storage for Postgres {
         // statement is awaited before the next one is sent on this transaction's connection,
         // which keeps that order. A watermark insert that finds no topition row matches no
         // rows without an error, leaving a topic that rejects every produce.
-        for sql in ["topition_insert.sql", "watermark_insert.sql"] {
+        for sql in [sql::TOPITION_INSERT, sql::WATERMARK_INSERT] {
             for partition in 0..topic.num_partitions {
                 let inserted = self
                     .prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
@@ -3381,7 +3409,7 @@ impl Storage for Postgres {
                 _ = self
                     .prepare_execute(
                         &tx,
-                        "topic_configuration_upsert.sql",
+                        sql::TOPIC_CONFIGURATION_UPSERT,
                         &[
                             &self.cluster,
                             &topic.name,
@@ -3464,12 +3492,12 @@ impl Storage for Postgres {
 
         let row = match topic {
             TopicId::Id(id) => {
-                self.prepare_query_opt(&tx, "topic_select_uuid.sql", &[&self.cluster, &id])
+                self.prepare_query_opt(&tx, sql::TOPIC_SELECT_UUID, &[&self.cluster, &id])
                     .await?
             }
 
             TopicId::Name(name) => {
-                self.prepare_query_opt(&tx, "topic_select_name.sql", &[&self.cluster, name])
+                self.prepare_query_opt(&tx, sql::TOPIC_SELECT_NAME, &[&self.cluster, name])
                     .await?
             }
         };
@@ -3483,7 +3511,7 @@ impl Storage for Postgres {
         _ = self
             .prepare_query_opt(
                 &tx,
-                "topic_select_name_for_update.sql",
+                sql::TOPIC_SELECT_NAME_FOR_UPDATE,
                 &[&self.cluster, &topic_name],
             )
             .await?;
@@ -3493,23 +3521,23 @@ impl Storage for Postgres {
         // join lets the planner scan the whole `record` table when its statistics are
         // skewed (#982).
         for (description, sql) in [
-            ("consumer_offsets", "consumer_offset_delete_by_topic.sql"),
+            ("consumer_offsets", sql::CONSUMER_OFFSET_DELETE_BY_TOPIC),
             (
                 "topic_configuration",
-                "topic_configuration_delete_by_topic.sql",
+                sql::TOPIC_CONFIGURATION_DELETE_BY_TOPIC,
             ),
-            ("watermarks", "watermark_delete_by_topic.sql"),
+            ("watermarks", sql::WATERMARK_DELETE_BY_TOPIC),
             (
                 "txn_offset_commit_tp",
-                "txn_offset_commit_tp_delete_by_topic.sql",
+                sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TOPIC,
             ),
             (
                 "txn_produce_offset_delete",
-                "txn_produce_offset_delete_by_topic.sql",
+                sql::TXN_PRODUCE_OFFSET_DELETE_BY_TOPIC,
             ),
-            ("txn_topition", "txn_topition_delete_by_topic.sql"),
-            ("producer_detail", "producer_detail_delete_by_topic.sql"),
-            ("topitions", "topition_delete_by_topic.sql"),
+            ("txn_topition", sql::TXN_TOPITION_DELETE_BY_TOPIC),
+            ("producer_detail", sql::PRODUCER_DETAIL_DELETE_BY_TOPIC),
+            ("topitions", sql::TOPITION_DELETE_BY_TOPIC),
         ] {
             let rows = self
                 .prepare_execute(&tx, sql, &[&self.cluster, &topic_name])
@@ -3522,7 +3550,7 @@ impl Storage for Postgres {
         }
 
         _ = self
-            .prepare_execute(&tx, "topic_delete_by.sql", &[&self.cluster, &topic_name])
+            .prepare_execute(&tx, sql::TOPIC_DELETE_BY, &[&self.cluster, &topic_name])
             .await?;
 
         tx.commit().await.inspect_err(|err| error!(?err))?;
@@ -3685,7 +3713,7 @@ impl Storage for Postgres {
             if self
                 .prepare_query_opt(
                     &tx,
-                    "topition_select.sql",
+                    sql::TOPITION_SELECT,
                     &[
                         &self.cluster,
                         &self.base_topic(topition.topic()).await?,
@@ -3698,7 +3726,7 @@ impl Storage for Postgres {
             {
                 if !cg_inserted {
                     let rows = self
-                        .prepare_execute(&tx, "consumer_group_insert.sql", &[&self.cluster, &group])
+                        .prepare_execute(&tx, sql::CONSUMER_GROUP_INSERT, &[&self.cluster, &group])
                         .await?;
                     debug!(rows);
 
@@ -3708,7 +3736,7 @@ impl Storage for Postgres {
                 let rows = self
                     .prepare_execute(
                         &tx,
-                        "consumer_offset_insert.sql",
+                        sql::CONSUMER_OFFSET_INSERT,
                         &[
                             &self.cluster,
                             &self.base_topic(topition.topic()).await?,
@@ -3754,7 +3782,7 @@ impl Storage for Postgres {
         for row in self
             .prepare_query(
                 &c,
-                "consumer_offset_select_by_group.sql",
+                sql::CONSUMER_OFFSET_SELECT_BY_GROUP,
                 &[&self.cluster, &group_id],
             )
             .await
@@ -3792,7 +3820,7 @@ impl Storage for Postgres {
             let offset = self
                 .prepare_query_opt(
                     &c,
-                    "consumer_offset_select.sql",
+                    sql::CONSUMER_OFFSET_SELECT,
                     &[
                         &self.cluster,
                         &group_id,
@@ -3892,7 +3920,7 @@ impl Storage for Postgres {
                             match self
                                 .prepare_query_opt(
                                     &c,
-                                    "topic_select_name.sql",
+                                    sql::TOPIC_SELECT_NAME,
                                     &[&self.cluster, &base_topic],
                                 )
                                 .await
@@ -3966,7 +3994,7 @@ impl Storage for Postgres {
                             match self
                                 .prepare_query_one(
                                     &c,
-                                    "pg/topic_select_uuid.sql",
+                                    sql::PG_TOPIC_SELECT_UUID,
                                     &[&self.cluster, &id],
                                 )
                                 .await
@@ -4034,7 +4062,7 @@ impl Storage for Postgres {
                 let mut responses = vec![];
 
                 match self
-                    .prepare_query(&c, "topic_by_cluster.sql", &[&self.cluster])
+                    .prepare_query(&c, sql::TOPIC_BY_CLUSTER, &[&self.cluster])
                     .await
                     .inspect_err(|err| error!(?err))
                 {
@@ -4168,7 +4196,7 @@ impl Storage for Postgres {
                     match self
                         .prepare_query_opt(
                             &c,
-                            "topic_select_name.sql",
+                            sql::TOPIC_SELECT_NAME,
                             &[&self.cluster, &name.as_str()],
                         )
                         .await
@@ -4259,7 +4287,7 @@ impl Storage for Postgres {
                 TopicId::Id(id) => {
                     debug!(?id);
                     match self
-                        .prepare_query_one(&c, "topic_select_uuid.sql", &[&self.cluster, &id])
+                        .prepare_query_one(&c, sql::TOPIC_SELECT_UUID, &[&self.cluster, &id])
                         .await
                     {
                         Ok(row) => {
@@ -4342,11 +4370,16 @@ impl Storage for Postgres {
 
         let mut listed_groups = vec![];
 
-        for consumer_group_select::Row { name, detail } in self
+        let (columns, rows) = self
             .prepare_query_rows(&c, consumer_group_select::QUERY, &[&self.cluster])
             .await
-            .inspect_err(|err| error!(?err))?
-        {
+            .inspect_err(|err| error!(?err))?;
+
+        let reader = consumer_group_select::RowReader::new(&columns)?;
+
+        for row in &rows {
+            let consumer_group_select::Row { name, detail } = reader.read_row(row)?;
+
             let stored =
                 detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
@@ -4369,17 +4402,17 @@ impl Storage for Postgres {
             let c = self.connection().await?;
 
             let consumer_offset = c
-                .prepare_cached(self.sql_lookup("consumer_offset_delete_by_cg.sql")?)
+                .prepare_cached(self.sql_lookup(sql::CONSUMER_OFFSET_DELETE_BY_CG)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let group_detail = c
-                .prepare_cached(self.sql_lookup("consumer_group_detail_delete_by_cg.sql")?)
+                .prepare_cached(self.sql_lookup(sql::CONSUMER_GROUP_DETAIL_DELETE_BY_CG)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let group = c
-                .prepare_cached(self.sql_lookup("consumer_group_delete.sql")?)
+                .prepare_cached(self.sql_lookup(sql::CONSUMER_GROUP_DELETE)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
@@ -4433,7 +4466,7 @@ impl Storage for Postgres {
                 if let Some(row) = self
                     .prepare_query_opt(
                         &c,
-                        "consumer_group_select_by_name.sql",
+                        sql::CONSUMER_GROUP_SELECT_BY_NAME,
                         &[&self.cluster, group_id],
                     )
                     .await
@@ -4473,7 +4506,7 @@ impl Storage for Postgres {
 
         self.prepare_query_opt(
             &c,
-            "consumer_group_detail.sql",
+            sql::CONSUMER_GROUP_DETAIL,
             &[&group_id, &self.cluster.as_str()],
         )
         .await
@@ -4499,7 +4532,7 @@ impl Storage for Postgres {
         _ = self
             .prepare_execute(
                 &tx,
-                "consumer_group_insert.sql",
+                sql::CONSUMER_GROUP_INSERT,
                 &[&self.cluster, &group_id],
             )
             .await?;
@@ -4525,7 +4558,7 @@ impl Storage for Postgres {
         let outcome = if let Some(row) = self
             .prepare_query_opt(
                 &tx,
-                "consumer_group_detail_insert.sql",
+                sql::CONSUMER_GROUP_DETAIL_INSERT,
                 &[
                     &self.cluster,
                     &group_id,
@@ -4552,7 +4585,7 @@ impl Storage for Postgres {
             let row = self
                 .prepare_query_one(
                     &tx,
-                    "consumer_group_detail.sql",
+                    sql::CONSUMER_GROUP_DETAIL,
                     &[&group_id, &self.cluster.as_str()],
                 )
                 .await
@@ -4641,7 +4674,7 @@ impl Storage for Postgres {
                         _ = self
                             .prepare_execute(
                                 &tx,
-                                "txn_topition_insert.sql",
+                                sql::TXN_TOPITION_INSERT,
                                 &[
                                     &self.cluster,
                                     &topic.name,
@@ -4679,7 +4712,7 @@ impl Storage for Postgres {
                 _ = self
                     .prepare_execute(
                         &tx,
-                        "txn_detail_update_started_at.sql",
+                        sql::TXN_DETAIL_UPDATE_STARTED_AT,
                         &[
                             &self.cluster,
                             &transaction_id,
@@ -4722,7 +4755,7 @@ impl Storage for Postgres {
         let (producer_id, producer_epoch) = if let Some(row) = self
             .prepare_query_opt(
                 &tx,
-                "producer_epoch_for_current_txn.sql",
+                sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
                 &[&self.cluster, &offsets.transaction_id],
             )
             .await
@@ -4746,7 +4779,7 @@ impl Storage for Postgres {
         _ = self
             .prepare_execute(
                 &tx,
-                "consumer_group_insert.sql",
+                sql::CONSUMER_GROUP_INSERT,
                 &[&self.cluster, &offsets.group_id],
             )
             .await?;
@@ -4756,7 +4789,7 @@ impl Storage for Postgres {
         _ = self
             .prepare_execute(
                 &tx,
-                "txn_offset_commit_insert.sql",
+                sql::TXN_OFFSET_COMMIT_INSERT,
                 &[
                     &self.cluster,
                     &offsets.transaction_id,
@@ -4783,7 +4816,7 @@ impl Storage for Postgres {
                         _ = self
                             .prepare_execute(
                                 &tx,
-                                "txn_offset_commit_tp_insert.sql",
+                                sql::TXN_OFFSET_COMMIT_TP_INSERT,
                                 &[
                                     &self.cluster,
                                     &offsets.transaction_id,
@@ -4890,7 +4923,7 @@ impl Storage for Postgres {
         let rows = self
             .prepare_query(
                 &c,
-                "txn_detail_select_timed_out.sql",
+                sql::TXN_DETAIL_SELECT_TIMED_OUT,
                 &[&self.cluster, &now],
             )
             .await?;
@@ -4948,7 +4981,7 @@ impl Storage for Postgres {
 
         self.prepare_execute(
             &c,
-            "scram_credential_delete.sql",
+            sql::SCRAM_CREDENTIAL_DELETE,
             &[&self.cluster, &user, &i32::from(mechanism)],
         )
         .await
@@ -4966,7 +4999,7 @@ impl Storage for Postgres {
 
         self.prepare_execute(
             &c,
-            "scram_credential_insert.sql",
+            sql::SCRAM_CREDENTIAL_INSERT,
             &[
                 &self.cluster,
                 &username,
@@ -4991,7 +5024,7 @@ impl Storage for Postgres {
 
         self.prepare_query_opt(
             &c,
-            "scram_credential_select.sql",
+            sql::SCRAM_CREDENTIAL_SELECT,
             &[&self.cluster, &user, &i32::from(mechanism)],
         )
         .await
@@ -5030,7 +5063,7 @@ impl Storage for Postgres {
     #[instrument(skip_all)]
     async fn ping(&self) -> Result<()> {
         let c = self.pool.get().await?;
-        let _ = self.prepare_query(&c, "ping.sql", &[]).await?;
+        let _ = self.prepare_query(&c, sql::PING, &[]).await?;
         Ok(())
     }
 }
@@ -5086,8 +5119,8 @@ mod tests {
     #[test]
     fn schema_matches_its_version() -> Result<()> {
         let digest = crate::schema::schema_digest([
-            crate::sql::remove_comments(SCHEMA).as_str(),
-            crate::sql::SQL.get("nisshi_schema_version_create.sql")?,
+            sql::remove_comments(SCHEMA).as_str(),
+            sql::SQL.get(sql::NISSHI_SCHEMA_VERSION_CREATE)?,
         ]);
 
         assert_eq!(
@@ -6435,7 +6468,7 @@ mod tests {
             _ = storage
                 .prepare_execute(
                     &tx,
-                    "watermark_update.sql",
+                    sql::WATERMARK_UPDATE,
                     &[&cluster, &topic_name, &0i32, &low, &record_count],
                 )
                 .await?;
@@ -9249,7 +9282,7 @@ mod tests {
         {
             let c = storage.connection().await?;
             _ = c
-                .prepare_cached(storage.sql_lookup("watermark_insert.sql")?)
+                .prepare_cached(storage.sql_lookup(sql::WATERMARK_INSERT)?)
                 .await?;
         }
 
@@ -10510,11 +10543,11 @@ mod tests {
                     // The other broker creates only the version table, not the whole schema. A
                     // commit that changes many catalog entries makes the server refresh the waiting
                     // broker's cache of table names, which hides a check that reads that cache.
-                    tx.batch_execute(crate::sql::SQL.get("nisshi_schema_version_create.sql")?)
+                    tx.batch_execute(sql::SQL.get(sql::NISSHI_SCHEMA_VERSION_CREATE)?)
                         .await?;
                     _ = tx
                         .execute(
-                            crate::sql::SQL.get("nisshi_schema_version_insert.sql")?,
+                            sql::SQL.get(sql::NISSHI_SCHEMA_VERSION_INSERT)?,
                             &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
                         )
                         .await?;
