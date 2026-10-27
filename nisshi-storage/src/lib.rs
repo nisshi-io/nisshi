@@ -1408,7 +1408,7 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
 
                         describe_groups_response::DescribedGroupMember::default()
                             .member_id(member_id.into())
-                            .group_instance_id(None)
+                            .group_instance_id(member.join_response.group_instance_id.clone())
                             .client_id(member.client_id.clone())
                             .client_host(member.client_host.clone())
                             .member_metadata(member_metadata)

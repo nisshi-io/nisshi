@@ -240,6 +240,7 @@ async fn group_whose_sessions_expired_is_described_as_empty(
 /// A member of a test group, with the values that `DescribeGroups` reports for it.
 struct TestMember {
     member_id: String,
+    group_instance_id: Option<&'static str>,
     client_id: &'static str,
     client_host: &'static str,
     metadata: Bytes,
@@ -250,10 +251,19 @@ impl TestMember {
     fn new(client_id: &'static str, client_host: &'static str) -> Self {
         Self {
             member_id: alphanumeric_string(15),
+            group_instance_id: None,
             client_id,
             client_host,
             metadata: Bytes::from(format!("{client_id} subscription")),
             assignment: Bytes::from(format!("{client_id} assignment")),
+        }
+    }
+
+    /// Returns the member as a static member, with the given group instance id.
+    fn with_group_instance_id(self, group_instance_id: &'static str) -> Self {
+        Self {
+            group_instance_id: Some(group_instance_id),
+            ..self
         }
     }
 
@@ -267,6 +277,7 @@ impl TestMember {
             GroupMember {
                 join_response: JoinGroupResponseMember::default()
                     .member_id(self.member_id.clone())
+                    .group_instance_id(self.group_instance_id.map(Into::into))
                     .metadata(self.metadata.clone()),
                 last_contact: Some(SystemTime::now()),
                 client_id: self.client_id.into(),
@@ -279,7 +290,7 @@ impl TestMember {
     fn described(&self) -> DescribedGroupMember {
         DescribedGroupMember::default()
             .member_id(self.member_id.clone())
-            .group_instance_id(None)
+            .group_instance_id(self.group_instance_id.map(Into::into))
             .client_id(self.client_id.into())
             .client_host(self.client_host.into())
             .member_metadata(self.metadata.clone())
@@ -330,14 +341,14 @@ async fn store_and_describe(
 }
 
 /// Describing a running group must show who reads which partitions. The broker must answer
-/// `DescribeGroups` for a `Stable` group with each member's client id, host, subscription and
-/// assignment, and the group's assignor.
+/// `DescribeGroups` for a `Stable` group with each member's group instance id, client id, host,
+/// subscription and assignment, and the group's assignor.
 async fn stable_group_reports_each_member_and_the_protocol(
     storage: impl Storage + Clone,
 ) -> Result<()> {
     let members = [
         TestMember::new("first-client", "/192.0.2.1"),
-        TestMember::new("second-client", "/192.0.2.2"),
+        TestMember::new("second-client", "/192.0.2.2").with_group_instance_id("second-instance"),
     ];
 
     let detail = GroupDetail {
@@ -373,14 +384,14 @@ async fn stable_group_reports_each_member_and_the_protocol(
 /// During a rebalance, a member's stored subscription can be for a protocol that the group has not
 /// selected yet, and an admin client that decodes it with the wrong assignor shows a wrong
 /// subscription. The broker must answer `DescribeGroups` for a rebalancing group with each
-/// member's client id and host, and with an empty subscription, assignment and protocol, as Kafka
-/// does.
+/// member's group instance id, client id and host, and with an empty subscription, assignment and
+/// protocol, as Kafka does.
 async fn rebalancing_group_reports_members_without_metadata(
     storage: impl Storage + Clone,
 ) -> Result<()> {
     let members = [
         TestMember::new("first-client", "/192.0.2.1"),
-        TestMember::new("second-client", "/192.0.2.2"),
+        TestMember::new("second-client", "/192.0.2.2").with_group_instance_id("second-instance"),
     ];
 
     let detail = GroupDetail {
