@@ -411,7 +411,14 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
     Ok(())
 }
 
-async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) -> Result<()> {
+/// Resends an idempotent batch. `retry_error` is the engine's answer to the
+/// resend: the object store remembers the producer's recent batches and answers
+/// `None` with the stored batch's offset, as Kafka does, and the SQL engines
+/// answer `DuplicateSequenceNumber` with no offset.
+async fn non_txn_idempotent_duplicate_sequence(
+    storage: impl Storage + Clone,
+    retry_error: ErrorCode,
+) -> Result<()> {
     let topic = &alphanumeric_string(15)[..];
 
     let extensions = Extensions::default();
@@ -545,8 +552,12 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
                     .partition_responses(Some(vec![
                         PartitionProduceResponse::default()
                             .index(index)
-                            .error_code(ErrorCode::DuplicateSequenceNumber.into())
-                            .base_offset(-1)
+                            .error_code(retry_error.into())
+                            .base_offset(if retry_error == ErrorCode::None {
+                                0
+                            } else {
+                                -1
+                            })
                             .log_append_time_ms(Some(-1))
                             .log_start_offset(Some(0))
                             .record_errors(Some(vec![]))
@@ -1901,7 +1912,7 @@ mod in_memory {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+        super::non_txn_idempotent_duplicate_sequence(storage, ErrorCode::None).await?;
 
         Ok(())
     }
@@ -2095,7 +2106,8 @@ mod lite {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+        super::non_txn_idempotent_duplicate_sequence(storage, ErrorCode::DuplicateSequenceNumber)
+            .await?;
 
         Ok(())
     }
@@ -2277,7 +2289,8 @@ mod slatedb {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+        super::non_txn_idempotent_duplicate_sequence(storage, ErrorCode::DuplicateSequenceNumber)
+            .await?;
 
         Ok(())
     }
@@ -2455,7 +2468,8 @@ mod pg {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+        super::non_txn_idempotent_duplicate_sequence(storage, ErrorCode::DuplicateSequenceNumber)
+            .await?;
 
         Ok(())
     }

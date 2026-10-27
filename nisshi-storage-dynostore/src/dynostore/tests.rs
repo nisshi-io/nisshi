@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
+mod concurrent_retry;
 mod delete_records;
 mod describe_groups;
 mod failing_object_store;
@@ -35,6 +36,7 @@ mod list_offsets;
 mod ping;
 mod post_write_failure_reason;
 mod produce_topic_guard;
+mod producer_detail;
 mod stale_watermark;
 mod unknown_partition_guard;
 

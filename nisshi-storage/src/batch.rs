@@ -296,7 +296,15 @@ where
         // takes the first batch's timestamp type and the largest `max_timestamp`. A consumer reads
         // a `LogAppendTime` batch's `max_timestamp` as each record's timestamp, so a merge would
         // give a record a broker time other than the one its produce response returned.
-        if !shares_one_codec(&batches) || !shares_one_log_append_time(&batches) {
+        //
+        // We also write an idempotent producer's queue one batch at a time. The storage answers a
+        // retried batch as a duplicate only when its first and last sequence match a batch that it
+        // stored, as Kafka does. After a merge it stores only the merged span, so a retry of one of
+        // the batches as sent gets OUT_OF_ORDER_SEQUENCE_NUMBER, which a client treats as fatal.
+        if !shares_one_codec(&batches)
+            || !shares_one_log_append_time(&batches)
+            || batches.iter().any(deflated::Batch::is_idempotent)
+        {
             let responses_by_owner = self
                 .write_each_as_sent(transaction_id, topition, owners, batches, &attributes)
                 .await;
@@ -1228,7 +1236,9 @@ mod tests {
         base_offset: i64,
         records: &[Bytes],
     ) -> Result<deflated::Batch> {
-        let base_sequence = 0;
+        // The batch has no sequence, so it is not idempotent, and the batcher can merge it with
+        // the batches queued beside it.
+        let base_sequence = -1;
 
         let mut inflated = inflated::Batch::builder()
             .attributes(attributes)
@@ -1614,6 +1624,60 @@ mod tests {
             Some(compressible_value),
             stored_batches[0].records[0].value()
         );
+
+        Ok(())
+    }
+
+    /// Returns an idempotent batch of one record from [`PRODUCER_ID`], at `base_sequence`.
+    fn idempotent_batch_of(base_sequence: i32) -> Result<deflated::Batch> {
+        inflated::Batch::builder()
+            .producer_id(PRODUCER_ID)
+            .producer_epoch(0)
+            .base_sequence(base_sequence)
+            .record(Record::builder().value(Bytes::from_static(b"value").into()))
+            .build()
+            .and_then(TryInto::try_into)
+            .map_err(Into::into)
+    }
+
+    /// An idempotent producer's queue is written one batch at a time, so the storage stores each
+    /// batch with the sequences that the producer sent, and can recognise a retry of each one.
+    #[tokio::test(start_paused = true)]
+    async fn idempotent_queue_is_written_as_sent() -> Result<()> {
+        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
+        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
+
+        let recorder = FlightRecorder::with_max_message_bytes(MAX_MESSAGE_BYTES);
+        let batcher =
+            ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(Some(MINIMUM_DELAY));
+        let topition = Topition::new("abc", 0);
+
+        let first_produce = spawn_produce(&batcher, &topition, idempotent_batch_of(0)?);
+        // Lets the first request join the queue before the second, so their order in it is fixed.
+        yield_now().await;
+        let second_produce = spawn_produce(&batcher, &topition, idempotent_batch_of(1)?);
+
+        // The clock is paused, so the batching timer fires only here. A request then flushes the
+        // queue that holds both batches.
+        advance(ADVANCE_DELAY).await;
+        yield_now().await;
+
+        assert_matches!(
+            tokio::time::timeout(Duration::from_secs(60), first_produce).await,
+            Ok(Ok(Ok(0)))
+        );
+        assert_matches!(
+            tokio::time::timeout(Duration::from_secs(60), second_produce).await,
+            Ok(Ok(Ok(1)))
+        );
+
+        let stored_sequences = recorder
+            .produced(&topition)?
+            .unwrap_or_default()
+            .iter()
+            .map(|batch| batch.base_sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(vec![0, 1], stored_sequences);
 
         Ok(())
     }

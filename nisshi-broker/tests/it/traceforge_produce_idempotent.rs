@@ -38,7 +38,8 @@
 //! modeling a producer retry or network-level reordering/resend. That's
 //! `48` combinations, matched against an oracle that mirrors dynostore's
 //! exact sequence-check logic (`expected < base_sequence` -> out of order,
-//! `expected > base_sequence` -> duplicate, else accept) tracked
+//! `expected > base_sequence` -> a repeat of a stored batch, answered with its
+//! offset, else accept) tracked
 //! independently in the test - not just special-cased for the one in-order
 //! delivery - and finally cross-checked against what a real `Storage::fetch`
 //! actually returns, so a silently dropped accept or a silently applied
@@ -57,8 +58,8 @@
 //! order, up to 2 attempts get an independent `nondet()`-chosen fault
 //! (succeed / drop / lose the ack) before a final guaranteed-clean attempt,
 //! and the client-side resolution logic mirrors what a real producer does:
-//! a clean success or a `DuplicateSequenceNumber` on retry (proof a prior
-//! ack-lost attempt's hidden write already landed) both count as resolved.
+//! a clean success, or on retry the stored batch's offset (proof a prior
+//! ack-lost attempt's hidden write already landed), both count as resolved.
 //! Across all reachable fault combinations, `Storage::fetch` must always
 //! show exactly the 3 distinct batches - never fewer (a drop never
 //! actually retried) and never more (a hidden ack-lost write duplicated by
@@ -199,7 +200,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
         };
 
         // Oracle: mirrors dynostore's sequence check exactly
-        // (dynostore.rs:845-869) but tracked independently here, so it can
+        // but tracked independently here, so it can
         // be checked against every one of the 48 order/duplicate
         // combinations rather than only the one fully-in-order case.
         let mut expected_sequence: i32 = 0;
@@ -243,12 +244,16 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
                     );
                     cover!("rejected_out_of_order");
                 } else if expected_sequence > base_sequence {
+                    // Each batch holds one record and was accepted in
+                    // order, so the batch at this sequence is stored at the
+                    // offset of the same number.
                     assert_eq!(
                         error_code,
-                        ErrorCode::DuplicateSequenceNumber,
+                        ErrorCode::None,
                         "base_sequence={base_sequence} expected_sequence={expected_sequence}"
                     );
-                    cover!("rejected_duplicate");
+                    assert_eq!(partition_response.base_offset, i64::from(base_sequence));
+                    cover!("answered_duplicate");
                 } else {
                     assert_eq!(
                         error_code,
@@ -304,7 +309,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
             .coverage
             .is_covered("rejected_out_of_order".to_string())
     );
-    assert!(stats.coverage.is_covered("rejected_duplicate".to_string()));
+    assert!(stats.coverage.is_covered("answered_duplicate".to_string()));
     assert!(stats.coverage.is_covered("accepted_in_order".to_string()));
     assert!(
         stats
@@ -699,6 +704,7 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
 
         for base_sequence in 0..3i32 {
             let mut resolved = false;
+            let mut stored_by_an_ack_lost_attempt = false;
 
             for attempt in 0..MAX_ATTEMPTS {
                 let fault = if attempt + 1 == MAX_ATTEMPTS {
@@ -740,16 +746,18 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
                 let error_code = ErrorCode::try_from(partition_response.error_code).unwrap();
 
                 match (fault, error_code) {
+                    // Each batch holds one record and is stored in order, so
+                    // it is at the offset of its sequence number. A retry
+                    // after a lost acknowledgement repeats the stored batch,
+                    // and the broker answers it with that batch's offset.
                     (ProduceFault::None, ErrorCode::None) => {
-                        cover!("resolved_by_direct_accept");
-                        resolved = true;
-                    }
+                        assert_eq!(partition_response.base_offset, i64::from(base_sequence));
 
-                    // A prior AckLost attempt's hidden write already
-                    // landed; a real client recognizes this as
-                    // confirmation, not a failure.
-                    (ProduceFault::None, ErrorCode::DuplicateSequenceNumber) => {
-                        cover!("resolved_by_duplicate_detection");
+                        cover!(if stored_by_an_ack_lost_attempt {
+                            "resolved_by_duplicate_detection"
+                        } else {
+                            "resolved_by_direct_accept"
+                        });
                         resolved = true;
                     }
 
@@ -766,6 +774,8 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
                             ErrorCode::None,
                             "an injected fault must never look like success to the caller"
                         );
+                        stored_by_an_ack_lost_attempt |= fault == ProduceFault::AckLost;
+
                         cover!(match fault {
                             ProduceFault::Dropped => "attempt_dropped",
                             ProduceFault::AckLost => "attempt_ack_lost",
