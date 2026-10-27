@@ -39,7 +39,7 @@ Features:
 
 ## About
 
-Nisshi is now part of Solace. Peter Morgan is a key member of the Solace team that works on it.
+Nisshi is now part of Solace. Its creator, Peter Morgan, is a key member of the Solace team that works on it. [GOVERNANCE][nisshi-governance] says how the project is run.
 
 The license stays Apache 2.0, and what is open stays open.
 
