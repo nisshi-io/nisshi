@@ -268,6 +268,13 @@ export KAFKA_IMAGE=${KAFKA_IMAGE:-apache/kafka:3.9.2}
 # JVM start faster and use less CPU: the JIT compiles only its fast first tier,
 # and one GC thread collects. They don't change what the Kafka client sends.
 jvm_options="-XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Djava.awt.headless=true"
+# The tool JVMs share one perf-data directory, and a JVM whose perf-data file is
+# locked prints a warning on stdout, among the tool output that the tests read.
+# The JVMs keep no perf data, which only jps, jcmd and jstat read.
+jvm_options+=" -XX:-UsePerfData"
+# The JVMs write every other warning to stderr. -Xlog:disable turns off the
+# default output to stdout first, or the JVM prints each warning on both.
+jvm_options+=" -Xlog:disable -Xlog:all=warning:stderr:uptime,level,tags"
 # Under a Docker VM whose host network is the VM's own, not this machine's
 # (colima: NISSHI_SMOKE_DOCKER_HOST_IP=192.168.5.2), the tools get a network of
 # their own, where each connection to 127.0.0.1 goes to that address, which
