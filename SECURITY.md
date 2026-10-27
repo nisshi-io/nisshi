@@ -26,9 +26,12 @@ maintainers.
 ### What to include
 
 - The Nisshi version or commit you tested, and the storage backend in use
-- A description of the vulnerability and its impact
+- A description of the vulnerability
 - Steps to reproduce, or a proof of concept
 - Any configuration that matters (authentication, TLS)
+- The potential impact: what an attacker could achieve
+- A suggested fix, if you have one
+- How to reach you for follow-up questions
 - Your preferred name for credit, if you want it
 
 A partial report is still useful. Send what you have.
@@ -36,14 +39,25 @@ A partial report is still useful. Send what you have.
 ## What happens next
 
 1. **Acknowledge.** We confirm we received your report.
-2. **Assess.** We try to reproduce the issue and judge its severity. We may
-   ask you for more detail.
+2. **Assess.** We try to reproduce the issue and judge its severity. Where
+   we can, we share our severity assessment and an expected timeline for a
+   fix. We may ask you for more detail.
 3. **Fix.** If we confirm the issue, we develop and test a fix in private. If
    we can't confirm it, or decide not to fix it, we tell you, and you are free
    to disclose it. Please tell us before you do.
 4. **Disclose.** We coordinate disclosure with you, release the fix, and
    publish a security advisory.
 5. **Credit.** We credit you in the advisory if you want to be named.
+
+Nisshi is community-supported and provided as-is (see [SUPPORT.md](SUPPORT.md)).
+We don't publish response-time targets for security reports.
+
+## Security updates
+
+Security fixes ship in a release and are listed in the Security section of
+[CHANGELOG.md](CHANGELOG.md). A vulnerability reported under this policy also
+gets a [GitHub security advisory][advisories]. Watch the repository's releases
+on GitHub to be notified.
 
 ## Scope
 
@@ -80,4 +94,12 @@ us too.
 - Access, change or delete data that isn't yours
 - Run tests against systems you don't own
 
+## Questions
+
+For questions about this policy, ask in the
+[Solace community](https://community.solace.com). Report vulnerabilities only
+through the channels under How to report. For non-security bugs and feature
+requests, open a [GitHub issue](https://github.com/nisshi-io/nisshi/issues).
+
 [private-vuln]: https://github.com/nisshi-io/solace-nisshi/security/advisories/new
+[advisories]: https://github.com/nisshi-io/solace-nisshi/security/advisories
