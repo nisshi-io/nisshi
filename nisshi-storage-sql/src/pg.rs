@@ -32,8 +32,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use deadpool::managed;
 use deadpool_postgres::{
-    Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
-    Transaction,
+    GenericClient, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime,
+    TimeoutType, Transaction,
 };
 use futures::pin_mut;
 use nisshi_sans_io::topic_config;
@@ -86,7 +86,7 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 use tokio_postgres::{
-    CancelToken, Config, Row, SimpleQueryMessage,
+    CancelToken, Config, Row, SimpleQueryMessage, Statement,
     binary_copy::BinaryCopyInWriter,
     config::Host,
     error::SqlState,
@@ -104,8 +104,8 @@ use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
         consumer_group_select, default_hash, idempotent_epoch_check, idempotent_sequence_check,
-        producer_epochs_select, topic_configuration_select, topic_configuration_select_keys,
-        topic_select, watermark_select_for_write,
+        producer_epochs_select, result_columns::ResultColumns, topic_configuration_select,
+        topic_configuration_select_keys, topic_select, watermark_select_for_write,
     },
 };
 
@@ -958,7 +958,7 @@ impl Postgres {
         let topic = &resource.resource_name;
 
         if self
-            .tx_prepare_query_opt(
+            .prepare_query_opt(
                 &tx,
                 "topic_select_name_for_update.sql",
                 &[&self.cluster, topic],
@@ -973,7 +973,7 @@ impl Postgres {
             let op = OpType::try_from(config.config_operation)?;
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                self.tx_prepare_query_opt(
+                self.prepare_query_opt(
                     &tx,
                     "topic_configuration_select_name.sql",
                     &[&self.cluster, topic, &config.name],
@@ -995,7 +995,7 @@ impl Postgres {
             )? {
                 Some(value) => {
                     _ = self
-                        .tx_prepare_query_opt(
+                        .prepare_query_opt(
                             &tx,
                             "topic_configuration_upsert.sql",
                             &[&self.cluster, topic, &config.name, &value],
@@ -1005,7 +1005,7 @@ impl Postgres {
 
                 None => {
                     _ = self
-                        .tx_prepare_execute(
+                        .prepare_execute(
                             &tx,
                             "topic_configuration_delete.sql",
                             &[&self.cluster, topic, &config.name],
@@ -1131,7 +1131,7 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?;
 
         let records = if let Some(key) = key_filter {
-            self.tx_prepare_query(
+            self.prepare_query(
                 &tx,
                 "record_fetch_pg_keyed.sql",
                 &[
@@ -1148,7 +1148,7 @@ impl Postgres {
             .await
             .inspect_err(|err| error!(?err))?
         } else {
-            self.tx_prepare_query(
+            self.prepare_query(
                 &tx,
                 "record_fetch_pg.sql",
                 &[
@@ -1211,7 +1211,7 @@ impl Postgres {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             for header in self
-                .tx_prepare_query(
+                .prepare_query(
                     &tx,
                     "header_fetch_range.sql",
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
@@ -1634,8 +1634,8 @@ impl Postgres {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        if let Some(row) = self
-            .tx_prepare_query_opt(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 tx,
                 producer_epochs_select::QUERY,
                 &[
@@ -1646,24 +1646,22 @@ impl Postgres {
                 ],
             )
             .await
-            .inspect_err(|err| error!(?err))?
-        {
+            .inspect_err(|err| error!(?err))?;
+
+        let reader = producer_epochs_select::RowReader::new(&columns)?;
+
+        if let Some(row) = rows.first() {
+            let epochs = reader.read_row(row).inspect_err(|err| error!(?err))?;
+
             let stored = StoredEpochs {
-                transactional: row
-                    .try_get::<_, i32>(producer_epochs_select::TRANSACTIONAL)
-                    .inspect_err(|err| error!(?err))?
-                    != 0,
-                newest: row
-                    .try_get(producer_epochs_select::NEWEST_EPOCH)
-                    .inspect_err(|err| error!(?err))?,
-                partition: row
-                    .try_get(producer_epochs_select::PARTITION_EPOCH)
-                    .inspect_err(|err| error!(?err))?,
+                transactional: epochs.transactional != 0,
+                newest: epochs.newest_epoch,
+                partition: epochs.partition_epoch,
             };
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         tx,
                         "producer_epoch_insert_given.sql",
                         &[
@@ -1677,7 +1675,7 @@ impl Postgres {
             }
 
             let row = self
-                .tx_prepare_query_one(
+                .prepare_query_one(
                     tx,
                     "producer_select_for_update.sql",
                     &[
@@ -1716,7 +1714,7 @@ impl Postgres {
 
             assert_eq!(
                 1,
-                self.tx_prepare_execute(
+                self.prepare_execute(
                     tx,
                     "producer_detail_insert.sql",
                     &[
@@ -1745,29 +1743,22 @@ impl Postgres {
         topition: &Topition,
         tx: &Transaction<'_>,
     ) -> Result<watermark_select_for_write::Row> {
-        let Some(row) = self
-            .tx_prepare_query_opt(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 tx,
                 watermark_select_for_write::QUERY,
                 &[&self.cluster, &topition.topic(), &topition.partition()],
             )
             .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        else {
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
+
+        let reader = watermark_select_for_write::RowReader::new(&columns)?;
+
+        let Some(row) = rows.first() else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
-        Ok(watermark_select_for_write::Row {
-            low: row
-                .try_get(watermark_select_for_write::LOW)
-                .inspect_err(|err| error!(?err))?,
-            high: row
-                .try_get(watermark_select_for_write::HIGH)
-                .inspect_err(|err| error!(?err))?,
-            max_message_bytes: row
-                .try_get(watermark_select_for_write::MAX_MESSAGE_BYTES)
-                .inspect_err(|err| error!(?err))?,
-        })
+        reader.read_row(row).inspect_err(|err| error!(?err))
     }
 
     /// Advances one partition's log start for DeleteRecords, answering the
@@ -1801,7 +1792,7 @@ impl Postgres {
         };
 
         _ = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 &tx,
                 "watermark_update.sql",
                 &[
@@ -1837,7 +1828,7 @@ impl Postgres {
         let tx = c.transaction().await?;
 
         let deleted = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 &tx,
                 "record_delete_by_offset.sql",
                 &[
@@ -1885,48 +1876,6 @@ impl Postgres {
         attributes
     }
 
-    #[instrument(skip(self, c, params))]
-    async fn prepare_execute(
-        &self,
-        c: &Object,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<u64, Error> {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = c
-            .prepare_cached(sql)
-            .await
-            .inspect_err(|err| error!(?err))?;
-
-        let execute_start = SystemTime::now();
-        c.execute(&prepared, params)
-            .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
-            .map_err(Into::into)
-    }
-
     /// Returns the configs among `keys` that the topic `name` sets, or `None` when the topic does
     /// not exist.
     async fn topic_configs_by_key(
@@ -1938,13 +1887,15 @@ impl Postgres {
         // This function runs one query instead of the two that `all_topic_configs` runs, because
         // the broker reads `message.timestamp.type` through here for each topic of each produce
         // request.
-        let rows = self
-            .prepare_query(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 c,
                 topic_configuration_select_keys::QUERY,
                 &[&self.cluster.as_str(), &name, &keys],
             )
             .await?;
+
+        let reader = topic_configuration_select_keys::RowReader::new(&columns)?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -1952,20 +1903,14 @@ impl Postgres {
 
         let mut configs = vec![];
 
-        for row in rows {
-            // The query returns a row with a null name for a topic that sets none of `keys`, and
-            // that row is not a config.
-            let Some(name) = row
-                .try_get::<_, Option<String>>(topic_configuration_select_keys::NAME)
+        for row in &rows {
+            if let Some(topic_configuration_select_keys::Config { name, value }) = reader
+                .read_row(row)
                 .inspect_err(|err| error!(?err))?
-            else {
-                continue;
-            };
-            let value = row
-                .try_get::<_, Option<String>>(topic_configuration_select_keys::VALUE)
-                .inspect_err(|err| error!(?err))?;
-
-            configs.push(dynamic_topic_config(name, value));
+                .config()
+            {
+                configs.push(dynamic_topic_config(name, value));
+            }
         }
 
         Ok(Some(configs))
@@ -1985,23 +1930,21 @@ impl Postgres {
             return Ok(None);
         }
 
-        let rows = self
-            .prepare_query(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 c,
                 topic_configuration_select::QUERY,
                 &[&self.cluster.as_str(), &name],
             )
             .await?;
 
+        let reader = topic_configuration_select::RowReader::new(&columns)?;
+
         let mut configs = vec![];
 
-        for row in rows {
-            let name = row
-                .try_get::<_, String>(topic_configuration_select::NAME)
-                .inspect_err(|err| error!(?err))?;
-            let value = row
-                .try_get::<_, Option<String>>(topic_configuration_select::VALUE)
-                .inspect_err(|err| error!(?err))?;
+        for row in &rows {
+            let topic_configuration_select::Row { name, value } =
+                reader.read_row(row).inspect_err(|err| error!(?err))?;
 
             configs.push(dynamic_topic_config(name, value));
         }
@@ -2009,68 +1952,37 @@ impl Postgres {
         Ok(Some(configs))
     }
 
-    #[instrument(skip(self, c, params))]
-    async fn prepare_query(
-        &self,
-        c: &Object,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Vec<Row>, Error> {
-        let sql = self.sql_lookup(sql)?;
+    /// Returns the SQL text that the SQL cache holds for `key`, and the statement that `client`
+    /// prepares from it.
+    async fn prepare_statement<'a, C>(
+        &'a self,
+        client: &C,
+        key: &str,
+    ) -> Result<(&'a str, Statement)>
+    where
+        C: GenericClient,
+    {
+        let sql = self.sql_lookup(key)?;
 
-        let prepared = c
+        let statement = client
             .prepare_cached(sql)
             .await
             .inspect_err(|err| error!(?err))?;
 
-        let execute_start = SystemTime::now();
-
-        c.query(&prepared, params)
-            .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
-            .map_err(Into::into)
+        Ok((sql, statement))
     }
 
-    #[instrument(skip(self, c, params))]
-    async fn prepare_query_one(
+    /// Awaits `run`, which runs the statement prepared from `sql`, and records its duration, or
+    /// its error, in the SQL metrics.
+    async fn record_sql_metrics<T>(
         &self,
-        c: &Object,
         sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Row, Error> {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = c
-            .prepare_cached(sql)
-            .await
-            .inspect_err(|err| error!(?err))?;
-
+        run: impl Future<Output = Result<T, tokio_postgres::Error>>,
+    ) -> Result<T> {
         let execute_start = SystemTime::now();
 
-        c.query_one(&prepared, params)
-            .await
-            .inspect(|_n| {
+        run.await
+            .inspect(|_| {
                 SQL_DURATION.record(
                     execute_start
                         .elapsed()
@@ -2096,216 +2008,84 @@ impl Postgres {
             .map_err(Into::into)
     }
 
-    #[instrument(skip(self, c, params))]
-    async fn prepare_query_opt(
+    #[instrument(skip(self, client, params))]
+    async fn prepare_execute<C>(
         &self,
-        c: &Object,
+        client: &C,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>, Error> {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = c
-            .prepare_cached(sql)
+    ) -> Result<u64>
+    where
+        C: GenericClient,
+    {
+        let (sql, statement) = self.prepare_statement(client, sql).await?;
+        self.record_sql_metrics(sql, client.execute(&statement, params))
             .await
-            .inspect_err(|err| error!(?err))?;
-
-        let execute_start = SystemTime::now();
-
-        c.query_opt(&prepared, params)
-            .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
-            .map_err(Into::into)
     }
 
-    #[instrument(skip(self, tx, params))]
-    async fn tx_prepare_execute(
+    #[instrument(skip(self, client, params))]
+    async fn prepare_query<C>(
         &self,
-        tx: &Transaction<'_>,
+        client: &C,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<u64, Error> {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = tx
-            .prepare_cached(sql)
+    ) -> Result<Vec<Row>>
+    where
+        C: GenericClient,
+    {
+        let (sql, statement) = self.prepare_statement(client, sql).await?;
+        self.record_sql_metrics(sql, client.query(&statement, params))
             .await
-            .inspect_err(|err| error!(?err))?;
-
-        let execute_start = SystemTime::now();
-
-        tx.execute(&prepared, params)
-            .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
-            .map_err(Into::into)
     }
 
-    #[instrument(skip(self, tx, params))]
-    async fn tx_prepare_query(
+    /// Runs the query that the SQL cache holds for `query`, and returns its rows with the names
+    /// of its result's columns, which a query module's `RowReader` reads the rows by.
+    #[instrument(skip(self, client, params))]
+    async fn prepare_query_rows<C>(
         &self,
-        tx: &Transaction<'_>,
-        sql: &str,
+        client: &C,
+        query: &'static str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Vec<Row>, Error> {
-        let sql = self.sql_lookup(sql)?;
+    ) -> Result<(ResultColumns, Vec<Row>)>
+    where
+        C: GenericClient,
+    {
+        let (sql, statement) = self.prepare_statement(client, query).await?;
+        let columns = ResultColumns::postgres(query, &statement);
 
-        let prepared = tx
-            .prepare_cached(sql)
+        self.record_sql_metrics(sql, client.query(&statement, params))
             .await
-            .inspect_err(|err| error!(?err))?;
-
-        let execute_start = SystemTime::now();
-        tx.query(&prepared, params)
-            .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
-            .map_err(Into::into)
+            .map(|rows| (columns, rows))
     }
 
-    #[instrument(skip(self, tx, params))]
-    async fn tx_prepare_query_one(
+    #[instrument(skip(self, client, params))]
+    async fn prepare_query_one<C>(
         &self,
-        tx: &Transaction<'_>,
+        client: &C,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Row, Error> {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = tx
-            .prepare_cached(sql)
+    ) -> Result<Row>
+    where
+        C: GenericClient,
+    {
+        let (sql, statement) = self.prepare_statement(client, sql).await?;
+        self.record_sql_metrics(sql, client.query_one(&statement, params))
             .await
-            .inspect_err(|err| error!(?err))?;
-
-        let execute_start = SystemTime::now();
-        tx.query_one(&prepared, params)
-            .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
-            .map_err(Into::into)
     }
 
-    #[instrument(skip(self, tx, params))]
-    async fn tx_prepare_query_opt(
+    #[instrument(skip(self, client, params))]
+    async fn prepare_query_opt<C>(
         &self,
-        tx: &Transaction<'_>,
+        client: &C,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>, Error> {
-        let sql = self.sql_lookup(sql)?;
-
-        let prepared = tx
-            .prepare_cached(sql)
+    ) -> Result<Option<Row>>
+    where
+        C: GenericClient,
+    {
+        let (sql, statement) = self.prepare_statement(client, sql).await?;
+        self.record_sql_metrics(sql, client.query_opt(&statement, params))
             .await
-            .inspect_err(|err| error!(?err))?;
-
-        let execute_start = SystemTime::now();
-        tx.query_opt(&prepared, params)
-            .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
-            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -2323,7 +2103,7 @@ impl Postgres {
         let partition = topition.partition();
 
         let Some(row) = self
-            .tx_prepare_query_opt(
+            .prepare_query_opt(
                 tx,
                 "topition_select_id.sql",
                 &[&self.cluster, &topic, &partition],
@@ -2518,7 +2298,7 @@ impl Postgres {
                 let offset_end = high.map_or(last_offset_delta, |high| high + last_offset_delta);
 
                 _ = self
-                .tx_prepare_execute(tx,
+                .prepare_execute(tx,
                     "txn_produce_offset_insert.sql",
                     &[
                         &self.cluster,
@@ -2538,7 +2318,7 @@ impl Postgres {
         }
 
         _ = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 tx,
                 "watermark_update.sql",
                 &[
@@ -2576,7 +2356,7 @@ impl Postgres {
         // an identity problem, and must be reported as such (ProducerFenced) regardless of
         // what the stale epoch's own txn_detail row says.
         let Some(row) = self
-            .tx_prepare_query_opt(
+            .prepare_query_opt(
                 tx,
                 "producer_epoch_current_for_producer.sql",
                 &[&self.cluster, &producer_id],
@@ -2598,7 +2378,7 @@ impl Postgres {
         // finalized this transaction, this blocks until it commits, then sees the
         // terminal status below and no-ops instead of writing a second marker.
         let status = match self
-            .tx_prepare_query_opt(
+            .prepare_query_opt(
                 tx,
                 "txn_detail_select_status_for_update.sql",
                 &[
@@ -2673,7 +2453,7 @@ impl Postgres {
         // A producer at epoch i16::MAX gets no new epoch, and is fenced already.
         if fence && write_marker {
             _ = self
-                .tx_prepare_query_opt(
+                .prepare_query_opt(
                     tx,
                     "producer_epoch_insert.sql",
                     &[&self.cluster, &producer_id],
@@ -2684,7 +2464,7 @@ impl Postgres {
         let mut overlaps = vec![];
 
         let rows = self
-            .tx_prepare_query(
+            .prepare_query(
                 tx,
                 "txn_select_produced_topitions.sql",
                 &[
@@ -2747,7 +2527,7 @@ impl Postgres {
             }
 
             let row = self
-                .tx_prepare_query_one(
+                .prepare_query_one(
                     tx,
                     "txn_produce_offset_select_offset_range.sql",
                     &[
@@ -2766,7 +2546,7 @@ impl Postgres {
             debug!(offset_start, offset_end);
 
             let rows = self
-                .tx_prepare_query(
+                .prepare_query(
                     tx,
                     "txn_produce_offset_select_overlapping_txn.sql",
                     &[
@@ -2812,7 +2592,7 @@ impl Postgres {
                 debug!(?txn);
 
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         tx,
                         "txn_produce_offset_delete_by_txn.sql",
                         &[
@@ -2825,7 +2605,7 @@ impl Postgres {
                     .await?;
 
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         tx,
                         "txn_topition_delete_by_txn.sql",
                         &[
@@ -2839,7 +2619,7 @@ impl Postgres {
 
                 if txn.status == TxnState::PrepareCommit {
                     _ = self
-                        .tx_prepare_execute(
+                        .prepare_execute(
                             tx,
                             "consumer_offset_insert_from_txn.sql",
                             &[
@@ -2853,7 +2633,7 @@ impl Postgres {
                 }
 
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         tx,
                         "txn_offset_commit_tp_delete_by_txn.sql",
                         &[
@@ -2866,7 +2646,7 @@ impl Postgres {
                     .await?;
 
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         tx,
                         "txn_offset_commit_delete_by_txn.sql",
                         &[
@@ -2887,7 +2667,7 @@ impl Postgres {
                 };
 
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         tx,
                         "txn_status_update.sql",
                         &[
@@ -2910,7 +2690,7 @@ impl Postgres {
             };
 
             _ = self
-                .tx_prepare_execute(
+                .prepare_execute(
                     tx,
                     "txn_status_update.sql",
                     &[
@@ -2973,12 +2753,12 @@ impl Postgres {
         previous: i64,
     ) -> Result<(i64, i16)> {
         let producer: i64 = self
-            .tx_prepare_query_one(tx, "producer_insert.sql", &[&self.cluster])
+            .prepare_query_one(tx, "producer_insert.sql", &[&self.cluster])
             .await?
             .try_get(0)?;
 
         let epoch: i16 = self
-            .tx_prepare_query_one(tx, "producer_epoch_insert.sql", &[&self.cluster, &producer])
+            .prepare_query_one(tx, "producer_epoch_insert.sql", &[&self.cluster, &producer])
             .await?
             .try_get(0)?;
 
@@ -2986,11 +2766,11 @@ impl Postgres {
         // epoch i16::MAX fences the previous producer ID. A producer at epoch i16::MAX
         // gets no new epoch, and is fenced already.
         _ = self
-            .tx_prepare_query_opt(tx, "producer_epoch_insert.sql", &[&self.cluster, &previous])
+            .prepare_query_opt(tx, "producer_epoch_insert.sql", &[&self.cluster, &previous])
             .await?;
 
         let updated = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 tx,
                 "txn_update_producer.sql",
                 &[&self.cluster, &transaction_id, &producer],
@@ -3041,7 +2821,7 @@ impl Postgres {
             // committed bump. The unique transactional ID name covers a txn row that does
             // not exist yet.
             _ = self
-                .tx_prepare_query_opt(
+                .prepare_query_opt(
                     &tx,
                     "txn_select_name_for_update.sql",
                     &[&self.cluster, &transaction_id],
@@ -3052,7 +2832,7 @@ impl Postgres {
             let mut rolled_back = false;
 
             if let Some(row) = self
-                .tx_prepare_query_opt(
+                .prepare_query_opt(
                     &tx,
                     "producer_epoch_for_current_txn.sql",
                     &[&self.cluster, &transaction_id],
@@ -3077,7 +2857,7 @@ impl Postgres {
                     // adding an epoch without a transaction, and the fenced producer must
                     // not get the transactional ID back with its old epoch.
                     let current = self
-                        .tx_prepare_query_opt(
+                        .prepare_query_opt(
                             &tx,
                             "producer_epoch_current_for_producer.sql",
                             &[&self.cluster, &id],
@@ -3120,7 +2900,7 @@ impl Postgres {
             }
 
             let (producer, epoch) = if let Some(row) = self
-                .tx_prepare_query_opt(
+                .prepare_query_opt(
                     &tx,
                     "txn_select_name.sql",
                     &[&self.cluster, &transaction_id],
@@ -3134,7 +2914,7 @@ impl Postgres {
                 // because the timeout sweep fences a producer with an epoch that has no
                 // transaction.
                 let newest = self
-                    .tx_prepare_query_opt(
+                    .prepare_query_opt(
                         &tx,
                         "producer_epoch_current_for_producer.sql",
                         &[&self.cluster, &producer],
@@ -3148,7 +2928,7 @@ impl Postgres {
                 if newest.is_some_and(epoch_is_exhausted) {
                     // The status after the rollback above, if it ran.
                     let status = self
-                        .tx_prepare_query_opt(
+                        .prepare_query_opt(
                             &tx,
                             "producer_epoch_for_current_txn.sql",
                             &[&self.cluster, &transaction_id],
@@ -3172,7 +2952,7 @@ impl Postgres {
                         // at epoch i16::MAX gets no new epoch, and is fenced already.
                         if rolled_back {
                             _ = self
-                                .tx_prepare_query_opt(
+                                .prepare_query_opt(
                                     &tx,
                                     "producer_epoch_insert.sql",
                                     &[&self.cluster, &producer],
@@ -3196,7 +2976,7 @@ impl Postgres {
                         .inspect_err(|err| error!(self.cluster, transaction_id, producer, ?err))?
                 } else {
                     let row = self
-                        .tx_prepare_query_one(
+                        .prepare_query_one(
                             &tx,
                             "producer_epoch_insert.sql",
                             &[&self.cluster, &producer],
@@ -3210,14 +2990,14 @@ impl Postgres {
                 }
             } else {
                 let row = self
-                    .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                    .prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
                     .await
                     .inspect_err(|err| error!(?err))?;
 
                 let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
 
                 let row = self
-                    .tx_prepare_query_one(
+                    .prepare_query_one(
                         &tx,
                         "producer_epoch_insert.sql",
                         &[&self.cluster, &producer],
@@ -3229,7 +3009,7 @@ impl Postgres {
 
                 assert_eq!(
                     1,
-                    self.tx_prepare_execute(
+                    self.prepare_execute(
                         &tx,
                         "txn_insert.sql",
                         &[&self.cluster, &transaction_id, &producer],
@@ -3250,7 +3030,7 @@ impl Postgres {
 
             assert_eq!(
                 1,
-                self.tx_prepare_execute(
+                self.prepare_execute(
                     &tx,
                     "txn_detail_insert.sql",
                     &[
@@ -3295,14 +3075,14 @@ impl Postgres {
             let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
             let row = self
-                .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                .prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
                 .await
                 .inspect_err(|err| error!(self.cluster, ?err))?;
 
             let producer: i64 = row.try_get(0)?;
 
             let row = self
-                .tx_prepare_query_one(
+                .prepare_query_one(
                     &tx,
                     "producer_epoch_insert.sql",
                     &[&self.cluster, &producer],
@@ -3370,7 +3150,7 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?;
 
         let compacted = self
-            .tx_prepare_execute(&tx, "policy_compact.sql", &[&self.cluster])
+            .prepare_execute(&tx, "policy_compact.sql", &[&self.cluster])
             .await?;
 
         tx.commit().await.map_err(Into::into).and(Ok(compacted))
@@ -3389,7 +3169,7 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?;
 
         let deleted = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 &tx,
                 "policy_delete.sql",
                 &[&self.cluster, &now, &retention_secs],
@@ -3397,7 +3177,7 @@ impl Postgres {
             .await?;
 
         let deleted_by_bytes = self
-            .tx_prepare_execute(&tx, "policy_delete_bytes.sql", &[&self.cluster])
+            .prepare_execute(&tx, "policy_delete_bytes.sql", &[&self.cluster])
             .await?;
 
         tx.commit()
@@ -3419,7 +3199,7 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?;
 
         let deleted = self
-            .tx_prepare_execute(&tx, "record_delete_below_log_start.sql", &[&self.cluster])
+            .prepare_execute(&tx, "record_delete_below_log_start.sql", &[&self.cluster])
             .await?;
 
         tx.commit().await.map_err(Into::into).and(Ok(deleted))
@@ -3552,7 +3332,7 @@ impl Storage for Postgres {
         let uuid = Uuid::new_v4();
 
         let topic_uuid = self
-            .tx_prepare_query_one(
+            .prepare_query_one(
                 &tx,
                 "topic_insert.sql",
                 &[
@@ -3588,7 +3368,7 @@ impl Storage for Postgres {
         for sql in ["topition_insert.sql", "watermark_insert.sql"] {
             for partition in 0..topic.num_partitions {
                 let inserted = self
-                    .tx_prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
+                    .prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
                     .await?;
 
                 if inserted != 1 {
@@ -3605,7 +3385,7 @@ impl Storage for Postgres {
                 debug!(?config);
 
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         &tx,
                         "topic_configuration_upsert.sql",
                         &[
@@ -3690,12 +3470,12 @@ impl Storage for Postgres {
 
         let row = match topic {
             TopicId::Id(id) => {
-                self.tx_prepare_query_opt(&tx, "topic_select_uuid.sql", &[&self.cluster, &id])
+                self.prepare_query_opt(&tx, "topic_select_uuid.sql", &[&self.cluster, &id])
                     .await?
             }
 
             TopicId::Name(name) => {
-                self.tx_prepare_query_opt(&tx, "topic_select_name.sql", &[&self.cluster, name])
+                self.prepare_query_opt(&tx, "topic_select_name.sql", &[&self.cluster, name])
                     .await?
             }
         };
@@ -3707,7 +3487,7 @@ impl Storage for Postgres {
         let topic_name = row.try_get::<_, String>(1)?;
 
         _ = self
-            .tx_prepare_query_opt(
+            .prepare_query_opt(
                 &tx,
                 "topic_select_name_for_update.sql",
                 &[&self.cluster, &topic_name],
@@ -3738,7 +3518,7 @@ impl Storage for Postgres {
             ("topitions", "topition_delete_by_topic.sql"),
         ] {
             let rows = self
-                .tx_prepare_execute(&tx, sql, &[&self.cluster, &topic_name])
+                .prepare_execute(&tx, sql, &[&self.cluster, &topic_name])
                 .await
                 .inspect_err(|err| {
                     debug!(?description, ?err);
@@ -3748,7 +3528,7 @@ impl Storage for Postgres {
         }
 
         _ = self
-            .tx_prepare_execute(&tx, "topic_delete_by.sql", &[&self.cluster, &topic_name])
+            .prepare_execute(&tx, "topic_delete_by.sql", &[&self.cluster, &topic_name])
             .await?;
 
         tx.commit().await.inspect_err(|err| error!(?err))?;
@@ -3909,7 +3689,7 @@ impl Storage for Postgres {
             debug!(?topition, ?offset);
 
             if self
-                .tx_prepare_query_opt(
+                .prepare_query_opt(
                     &tx,
                     "topition_select.sql",
                     &[
@@ -3924,11 +3704,7 @@ impl Storage for Postgres {
             {
                 if !cg_inserted {
                     let rows = self
-                        .tx_prepare_execute(
-                            &tx,
-                            "consumer_group_insert.sql",
-                            &[&self.cluster, &group],
-                        )
+                        .prepare_execute(&tx, "consumer_group_insert.sql", &[&self.cluster, &group])
                         .await?;
                     debug!(rows);
 
@@ -3936,7 +3712,7 @@ impl Storage for Postgres {
                 }
 
                 let rows = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         &tx,
                         "consumer_offset_insert.sql",
                         &[
@@ -4572,18 +4348,20 @@ impl Storage for Postgres {
 
         let mut listed_groups = vec![];
 
-        for row in self
-            .prepare_query(&c, consumer_group_select::QUERY, &[&self.cluster])
+        let (columns, rows) = self
+            .prepare_query_rows(&c, consumer_group_select::QUERY, &[&self.cluster])
             .await
-            .inspect_err(|err| error!(?err))?
-        {
-            let group_id = row.try_get::<_, String>(consumer_group_select::NAME)?;
+            .inspect_err(|err| error!(?err))?;
 
-            let stored = row
-                .try_get::<_, Option<Value>>(consumer_group_select::DETAIL)?
-                .map(serde_json::from_value::<GroupDetail>);
+        let reader = consumer_group_select::RowReader::new(&columns)?;
 
-            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
+        for row in &rows {
+            let consumer_group_select::Row { name, detail } = reader.read_row(row)?;
+
+            let stored =
+                detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
+
+            listed_groups.push(NamedGroupDetail::decoded(name, stored));
         }
 
         Ok(listed_groups)
@@ -4730,7 +4508,7 @@ impl Storage for Postgres {
         let tx = c.transaction().await?;
 
         _ = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 &tx,
                 "consumer_group_insert.sql",
                 &[&self.cluster, &group_id],
@@ -4756,7 +4534,7 @@ impl Storage for Postgres {
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(?detail))?;
 
         let outcome = if let Some(row) = self
-            .tx_prepare_query_opt(
+            .prepare_query_opt(
                 &tx,
                 "consumer_group_detail_insert.sql",
                 &[
@@ -4783,7 +4561,7 @@ impl Storage for Postgres {
                 .inspect(|version| debug!(?version))
         } else {
             let row = self
-                .tx_prepare_query_one(
+                .prepare_query_one(
                     &tx,
                     "consumer_group_detail.sql",
                     &[&group_id, &self.cluster.as_str()],
@@ -4872,7 +4650,7 @@ impl Storage for Postgres {
 
                     for partition_index in topic.partitions.unwrap_or(vec![]) {
                         _ = self
-                            .tx_prepare_execute(
+                            .prepare_execute(
                                 &tx,
                                 "txn_topition_insert.sql",
                                 &[
@@ -4910,7 +4688,7 @@ impl Storage for Postgres {
                 }
 
                 _ = self
-                    .tx_prepare_execute(
+                    .prepare_execute(
                         &tx,
                         "txn_detail_update_started_at.sql",
                         &[
@@ -4953,7 +4731,7 @@ impl Storage for Postgres {
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
         let (producer_id, producer_epoch) = if let Some(row) = self
-            .tx_prepare_query_opt(
+            .prepare_query_opt(
                 &tx,
                 "producer_epoch_for_current_txn.sql",
                 &[&self.cluster, &offsets.transaction_id],
@@ -4977,7 +4755,7 @@ impl Storage for Postgres {
         };
 
         _ = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 &tx,
                 "consumer_group_insert.sql",
                 &[&self.cluster, &offsets.group_id],
@@ -4987,7 +4765,7 @@ impl Storage for Postgres {
         debug!(?producer_id, ?producer_epoch);
 
         _ = self
-            .tx_prepare_execute(
+            .prepare_execute(
                 &tx,
                 "txn_offset_commit_insert.sql",
                 &[
@@ -5014,7 +4792,7 @@ impl Storage for Postgres {
                         .is_some_and(|producer_epoch| producer_epoch == offsets.producer_epoch)
                     {
                         _ = self
-                            .tx_prepare_execute(
+                            .prepare_execute(
                                 &tx,
                                 "txn_offset_commit_tp_insert.sql",
                                 &[
@@ -6666,7 +6444,7 @@ mod tests {
             let tx = c.transaction().await?;
 
             _ = storage
-                .tx_prepare_execute(
+                .prepare_execute(
                     &tx,
                     "watermark_update.sql",
                     &[&cluster, &topic_name, &0i32, &low, &record_count],

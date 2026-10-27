@@ -12,9 +12,76 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Declares `Row`, one row of a query's result, and `RowReader`, which reads it, in the query's
+/// module, from one line for each column, such as `low: Option<i64> = "low"`: the field, its type,
+/// and the column's name in the query's result.
+///
+/// `RowReader::new` finds each column's index by its name once, before the first row, and
+/// `RowReader::read_row` reads each row by those indexes through any
+/// [`DriverRow`](driver::DriverRow). Each field's type implements [`Column`](driver::Column).
+/// A read error names the query and the column.
+macro_rules! sql_row {
+    (
+        $(#[$row_attribute:meta])*
+        pub(crate) struct Row {
+            $(
+                $(#[$field_attribute:meta])*
+                $field:ident: $type:ty = $column:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$row_attribute])*
+        pub(crate) struct Row {
+            $(
+                $(#[$field_attribute])*
+                pub(crate) $field: $type,
+            )+
+        }
+
+        /// Reads each [`Row`] of the query's result by the index of each of its columns.
+        #[derive(Clone, Debug)]
+        pub(crate) struct RowReader {
+            query: &'static str,
+            $($field: usize,)+
+        }
+
+        impl RowReader {
+            /// Returns a reader for the result with `columns`, or
+            /// [`Error::MissingColumn`](nisshi_storage::Error::MissingColumn) if the result has
+            /// no column of [`Row`].
+            pub(crate) fn new(
+                columns: &$crate::sql::result_columns::ResultColumns,
+            ) -> ::nisshi_storage::Result<Self> {
+                Ok(Self {
+                    query: columns.query(),
+                    $($field: columns.index($column)?,)+
+                })
+            }
+
+            /// Reads `row`, or returns [`Error::Column`](nisshi_storage::Error::Column) for the
+            /// first column that the driver can't read as its field's type.
+            pub(crate) fn read_row<R>(&self, row: &R) -> ::nisshi_storage::Result<Row>
+            where
+                R: $crate::sql::driver::DriverRow,
+            {
+                Ok(Row {
+                    $(
+                        $field: <$type as $crate::sql::driver::Column>::read(row, self.$field)
+                            .map_err(|source| ::nisshi_storage::Error::Column {
+                                query: self.query,
+                                column: $column,
+                                source: Box::new(source),
+                            })?,
+                    )+
+                })
+            }
+        }
+    };
+}
+
 pub(crate) mod consumer_group_select;
+pub(crate) mod driver;
 pub(crate) mod producer_epochs_select;
-#[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
 pub(crate) mod topic_configuration_select;
 pub(crate) mod topic_configuration_select_keys;

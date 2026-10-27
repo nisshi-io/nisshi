@@ -18,7 +18,8 @@ use crate::{
     sql::{
         Cache, consumer_group_select, default_hash, idempotent_epoch_check,
         idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, watermark_select_for_write,
+        result_columns::ResultColumns, topic_configuration_select, topic_select,
+        watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -664,26 +665,18 @@ impl Delegate {
             )
             .await?;
 
-        let columns = ResultColumns::libsql(producer_epochs_select::QUERY, &rows);
-        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)? as i32;
-        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)? as i32;
-        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)? as i32;
+        let reader = producer_epochs_select::RowReader::new(&ResultColumns::libsql(
+            producer_epochs_select::QUERY,
+            &rows,
+        ))?;
 
         if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
+            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
+
             let stored = StoredEpochs {
-                transactional: row
-                    .get::<i32>(transactional)
-                    .inspect_err(|err| error!(?err))?
-                    != 0,
-                newest: i16::try_from(
-                    row.get::<i32>(newest_epoch)
-                        .inspect_err(|err| error!(?err))?,
-                )?,
-                partition: row
-                    .get::<Option<i32>>(partition_epoch)
-                    .inspect_err(|err| error!(?err))?
-                    .map(i16::try_from)
-                    .transpose()?,
+                transactional: epochs.transactional != 0,
+                newest: epochs.newest_epoch,
+                partition: epochs.partition_epoch,
             };
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
@@ -782,11 +775,10 @@ impl Delegate {
             )
             .await?;
 
-        let columns = ResultColumns::libsql(watermark_select_for_write::LITE_QUERY, &rows);
-        let low = columns.index(watermark_select_for_write::LOW)? as i32;
-        let high = columns.index(watermark_select_for_write::HIGH)? as i32;
-        let max_message_bytes =
-            columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)? as i32;
+        let reader = watermark_select_for_write::RowReader::new(&ResultColumns::libsql(
+            watermark_select_for_write::LITE_QUERY,
+            &rows,
+        ))?;
 
         let Some(row) = rows
             .next()
@@ -796,11 +788,7 @@ impl Delegate {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
-        Ok(watermark_select_for_write::Row {
-            low: row.get(low).inspect_err(|err| error!(?err))?,
-            high: row.get(high).inspect_err(|err| error!(?err))?,
-            max_message_bytes: row.get(max_message_bytes).inspect_err(|err| error!(?err))?,
-        })
+        reader.read_row(&row).inspect_err(|err| error!(?err))
     }
 
     #[instrument(skip_all)]
@@ -3991,31 +3979,32 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query("topic_select.sql", (self.cluster.as_str(), name))
+            .query(topic_select::QUERY, (self.cluster.as_str(), name))
             .await?;
 
         if rows.next().await?.is_some() {
             let mut rows = c
                 .query(
-                    "topic_configuration_select.sql",
+                    topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
+            let reader = topic_configuration_select::RowReader::new(&ResultColumns::libsql(
+                topic_configuration_select::QUERY,
+                &rows,
+            ))?;
+
             let mut configs = vec![];
 
             while let Some(row) = rows.next().await? {
-                let name = row.get_str(0).inspect_err(|err| error!(?err))?;
-                let value = row
-                    .get::<Option<String>>(1)
-                    .map(|value| value.unwrap_or_default())
-                    .map(Some)
-                    .inspect_err(|err| error!(?err))?;
+                let topic_configuration_select::Row { name, value } =
+                    reader.read_row(&row).inspect_err(|err| error!(?err))?;
 
                 configs.push(
                     DescribeConfigsResourceResult::default()
-                        .name(name.to_owned())
-                        .value(value)
+                        .name(name)
+                        .value(Some(value.unwrap_or_default()))
                         .read_only(false)
                         .is_default(None)
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
@@ -4271,19 +4260,18 @@ impl Storage for Delegate {
             .query(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let columns = ResultColumns::libsql(consumer_group_select::QUERY, &rows);
-        let name = columns.index(consumer_group_select::NAME)? as i32;
-        let detail = columns.index(consumer_group_select::DETAIL)? as i32;
+        let reader = consumer_group_select::RowReader::new(&ResultColumns::libsql(
+            consumer_group_select::QUERY,
+            &rows,
+        ))?;
 
         while let Some(row) = rows.next().await? {
-            let group_id = row.get_str(name)?.to_owned();
+            let consumer_group_select::Row { name, detail } = reader.read_row(&row)?;
 
-            let stored = row
-                .get::<Option<String>>(detail)
-                .map_err(Error::from)?
-                .map(|detail| serde_json::from_str::<GroupDetail>(&detail));
+            let stored =
+                detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
-            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
+            listed_groups.push(NamedGroupDetail::decoded(name, stored));
         }
 
         Ok(listed_groups).inspect(|_| {

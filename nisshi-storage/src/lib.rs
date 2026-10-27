@@ -273,6 +273,14 @@ pub enum Error {
 
     ChronoParse(#[from] chrono::ParseError),
 
+    /// The driver could not read the column `column` of a row of `query`'s result as the type
+    /// that the query's module declares for it. `source` is the driver's error.
+    Column {
+        query: &'static str,
+        column: &'static str,
+        source: Box<Error>,
+    },
+
     #[cfg(any(feature = "postgres", feature = "libsql"))]
     DeadPoolBuild(#[from] deadpool::managed::BuildError),
 
@@ -343,6 +351,14 @@ pub enum Error {
         limit: usize,
     },
     Message(String),
+
+    /// The result of `query` has no column named `column`. `found` holds the names it has.
+    MissingColumn {
+        query: &'static str,
+        column: &'static str,
+        found: Vec<String>,
+    },
+
     NoSuchEntry {
         nth: u32,
     },

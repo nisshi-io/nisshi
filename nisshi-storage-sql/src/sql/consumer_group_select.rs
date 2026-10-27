@@ -12,20 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `consumer_group_select.sql` query and the names of the columns that the engines read from
-//! its result. A change to the query's `select` list must keep these names.
+//! The `consumer_group_select.sql` query and [`Row`], one row of its result. A change to the
+//! query's `select` list must keep the column names that [`Row`] declares.
 //!
 //! The query takes one parameter, `$1`: the cluster's name.
 //!
 //! An engine that needs its own version of the query gets another key here, such as
 //! `lite/consumer_group_select.sql`, and its version returns the same columns, so every engine
-//! reads them by the names below. A query that returns other columns gets a module of its own.
+//! reads them through [`RowReader`]. A query that returns other columns gets a module of its own.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "consumer_group_select.sql";
 
-/// The group's name.
-pub(crate) const NAME: &str = "name";
-
-/// The group's stored detail, as JSON. It is null for a group that has only committed offsets.
-pub(crate) const DETAIL: &str = "detail";
+sql_row! {
+    /// One consumer group of the cluster.
+    #[derive(Debug)]
+    pub(crate) struct Row {
+        /// The group's name.
+        name: String = "name",
+        /// The group's stored detail, or the error from parsing it as JSON. It is `None` for a
+        /// group that has only committed offsets.
+        detail: Option<serde_json::Result<serde_json::Value>> = "detail",
+    }
+}

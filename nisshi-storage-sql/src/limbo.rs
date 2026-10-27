@@ -29,7 +29,8 @@ use crate::{
     sql::{
         Cache, consumer_group_select, default_hash, idempotent_epoch_check,
         idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, watermark_select_for_write,
+        result_columns::ResultColumns, topic_configuration_select, topic_select,
+        watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -448,21 +449,18 @@ impl Engine {
             )
             .await?;
 
-        let columns = ResultColumns::turso(producer_epochs_select::QUERY, &rows);
-        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)?;
-        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)?;
-        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)?;
+        let reader = producer_epochs_select::RowReader::new(&ResultColumns::turso(
+            producer_epochs_select::QUERY,
+            &rows,
+        ))?;
 
         if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
+            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
+
             let stored = StoredEpochs {
-                transactional: integer_value(&row, transactional)
-                    .inspect_err(|err| error!(?err))?
-                    != 0,
-                newest: epoch_value(&row, newest_epoch).inspect_err(|err| error!(?err))?,
-                partition: match row.get_value(partition_epoch)? {
-                    Value::Null => None,
-                    _ => Some(epoch_value(&row, partition_epoch).inspect_err(|err| error!(?err))?),
-                },
+                transactional: epochs.transactional != 0,
+                newest: epochs.newest_epoch,
+                partition: epochs.partition_epoch,
             };
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
@@ -572,10 +570,10 @@ impl Engine {
             )
             .await?;
 
-        let columns = ResultColumns::turso(watermark_select_for_write::LITE_QUERY, &rows);
-        let low = columns.index(watermark_select_for_write::LOW)?;
-        let high = columns.index(watermark_select_for_write::HIGH)?;
-        let max_message_bytes = columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)?;
+        let reader = watermark_select_for_write::RowReader::new(&ResultColumns::turso(
+            watermark_select_for_write::LITE_QUERY,
+            &rows,
+        ))?;
 
         let Some(row) = rows
             .next()
@@ -585,20 +583,7 @@ impl Engine {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
-        Ok(watermark_select_for_write::Row {
-            low: row
-                .get_value(low)
-                .map(|value| value.as_integer().copied())
-                .inspect_err(|err| error!(?err))?,
-            high: row
-                .get_value(high)
-                .map(|value| value.as_integer().copied())
-                .inspect_err(|err| error!(?err))?,
-            max_message_bytes: row
-                .get_value(max_message_bytes)
-                .map(|value| value.as_text().cloned())
-                .inspect_err(|err| error!(?err))?,
-        })
+        reader.read_row(&row).inspect_err(|err| error!(?err))
     }
 
     async fn produce_in_tx<'conn>(
@@ -2672,7 +2657,7 @@ impl Storage for Engine {
 
         let mut rows = c
             .query(
-                &sql_lookup("topic_select.sql")?,
+                &sql_lookup(topic_select::QUERY)?,
                 (self.cluster.as_str(), name),
             )
             .await?;
@@ -2680,29 +2665,21 @@ impl Storage for Engine {
         if rows.next().await?.is_some() {
             let mut rows = c
                 .query(
-                    &sql_lookup("topic_configuration_select.sql")?,
+                    &sql_lookup(topic_configuration_select::QUERY)?,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
+            let reader = topic_configuration_select::RowReader::new(&ResultColumns::turso(
+                topic_configuration_select::QUERY,
+                &rows,
+            ))?;
+
             let mut configs = vec![];
 
             while let Some(row) = rows.next().await? {
-                let name = row
-                    .get_value(0)
-                    .map_err(Into::into)
-                    .and_then(|value| {
-                        value
-                            .as_text()
-                            .cloned()
-                            .ok_or(Error::UnexpectedValue(value))
-                    })
-                    .inspect_err(|err| error!(?err))?;
-
-                let value = row
-                    .get_value(1)
-                    .map(|value| value.as_text().cloned())
-                    .inspect_err(|err| error!(?err))?;
+                let topic_configuration_select::Row { name, value } =
+                    reader.read_row(&row).inspect_err(|err| error!(?err))?;
 
                 configs.push(
                     DescribeConfigsResourceResult::default()
@@ -3010,32 +2987,18 @@ impl Storage for Engine {
             )
             .await?;
 
-        let columns = ResultColumns::turso(consumer_group_select::QUERY, &rows);
-        let name = columns.index(consumer_group_select::NAME)?;
-        let detail = columns.index(consumer_group_select::DETAIL)?;
+        let reader = consumer_group_select::RowReader::new(&ResultColumns::turso(
+            consumer_group_select::QUERY,
+            &rows,
+        ))?;
 
         while let Some(row) = rows.next().await? {
-            let group_id = row.get_value(name).map_err(Into::into).and_then(|value| {
-                value
-                    .as_text()
-                    .cloned()
-                    .ok_or(Error::UnexpectedValue(value.clone()))
-            })?;
+            let consumer_group_select::Row { name, detail } = reader.read_row(&row)?;
 
-            let detail = row.get_value(detail).map_err(Error::from)?;
+            let stored =
+                detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
-            let stored = if detail.is_null() {
-                None
-            } else {
-                Some(
-                    detail
-                        .as_text()
-                        .ok_or(Error::UnexpectedValue(detail.clone()))
-                        .and_then(|text| serde_json::from_str(text).map_err(Error::from)),
-                )
-            };
-
-            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
+            listed_groups.push(NamedGroupDetail::decoded(name, stored));
         }
 
         Ok(listed_groups)
