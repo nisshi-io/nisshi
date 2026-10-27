@@ -110,7 +110,13 @@ async fn high_watermark(storage: &impl Storage, topition: &Topition) -> Result<O
 
 /// A higher epoch at sequence 0 starts that epoch, and the producer's sequence continues
 /// from there.
-async fn bump_at_sequence_zero_is_stored(storage: impl Storage) -> Result<()> {
+/// `remembers_batches` is whether the engine remembers the producer's recent batches. Such an
+/// engine answers a resent batch with the stored batch's offset, as Kafka does, and the others
+/// answer DUPLICATE_SEQUENCE_NUMBER.
+async fn bump_at_sequence_zero_is_stored(
+    storage: impl Storage,
+    remembers_batches: bool,
+) -> Result<()> {
     let topition = create_topition(&storage).await?;
     let producer = init_idempotent_producer(&storage).await?;
 
@@ -129,12 +135,15 @@ async fn bump_at_sequence_zero_is_stored(storage: impl Storage) -> Result<()> {
     );
 
     // The client resends the bump after a lost response, and treats the duplicate as stored.
-    assert_matches!(
-        storage
-            .produce(None, &topition, batch(producer.id, 1, 0, 2, false)?)
-            .await,
-        Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-    );
+    let resend = storage
+        .produce(None, &topition, batch(producer.id, 1, 0, 2, false)?)
+        .await;
+
+    if remembers_batches {
+        assert_eq!(2, resend?);
+    } else {
+        assert_matches!(resend, Err(Error::Api(ErrorCode::DuplicateSequenceNumber)));
+    }
 
     assert_eq!(
         4,
@@ -356,7 +365,7 @@ async fn registered(
 }
 
 macro_rules! engine_tests {
-    ($engine:ident, $storage:path) => {
+    ($engine:ident, $storage:path, remembers_batches: $remembers_batches:expr) => {
         mod $engine {
             use super::*;
 
@@ -375,7 +384,11 @@ macro_rules! engine_tests {
             #[tokio::test]
             async fn bump_at_sequence_zero_is_stored() -> Result<()> {
                 let _guard = init_tracing()?;
-                super::bump_at_sequence_zero_is_stored(registered_storage().await?).await
+                super::bump_at_sequence_zero_is_stored(
+                    registered_storage().await?,
+                    $remembers_batches,
+                )
+                .await
             }
 
             #[tokio::test]
@@ -422,10 +435,10 @@ macro_rules! engine_tests {
 }
 
 #[cfg(feature = "dynostore")]
-engine_tests!(in_memory, memory_storage);
+engine_tests!(in_memory, memory_storage, remembers_batches: true);
 
 #[cfg(feature = "libsql")]
-engine_tests!(lite, lite_storage);
+engine_tests!(lite, lite_storage, remembers_batches: false);
 
 #[cfg(feature = "postgres")]
-engine_tests!(pg, postgres_storage);
+engine_tests!(pg, postgres_storage, remembers_batches: false);

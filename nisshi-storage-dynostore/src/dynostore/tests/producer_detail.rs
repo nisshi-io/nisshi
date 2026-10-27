@@ -15,7 +15,7 @@
 use std::assert_matches;
 
 use nisshi_sans_io::ErrorCode;
-use nisshi_storage::{Error, Topition};
+use nisshi_storage::{Error, ProduceEpoch, Topition};
 
 use crate::dynostore::{
     ProducerDetail,
@@ -45,24 +45,37 @@ fn producer_stored_before_remembered_batches_keeps_the_duplicate_answer() {
 }
 
 #[test]
-fn advance_remembers_the_batch_and_forgets_older_epochs() {
+fn starting_an_epoch_forgets_only_that_partitions_older_batches() {
     let mut producer = ProducerDetail::default();
-    let topition = Topition::new("orders", 0);
+    let bumped = Topition::new("orders", 0);
+    let other = Topition::new("orders", 1);
 
-    producer.advance(0, &topition, 0, 2, 10);
-    producer.advance(1, &topition, 0, 1, 13);
+    producer.advance(0, ProduceEpoch::Start, &bumped, 0, 2, 10);
+    producer.advance(0, ProduceEpoch::Start, &other, 0, 1, 20);
+    producer.advance(1, ProduceEpoch::Start, &bumped, 0, 1, 13);
 
-    assert_eq!(3, producer.next_sequence(0, &topition));
-    assert_eq!(2, producer.next_sequence(1, &topition));
-    assert_eq!(None, producer.remembered_batches(0, &topition));
+    assert_eq!(2, producer.next_sequence(1, &bumped));
+    assert_eq!(None, producer.remembered_batches(0, &bumped));
 
     assert_matches!(
         produced_batches::check_sequence(
-            producer.next_sequence(1, &topition),
-            producer.remembered_batches(1, &topition),
+            producer.next_sequence(1, &bumped),
+            producer.remembered_batches(1, &bumped),
             0,
             1,
         ),
         Ok(SequenceCheck::Duplicate { base_offset: 13 })
+    );
+
+    // The other partition is still at epoch 0, so a retry of its batch is still a duplicate.
+    assert_eq!(2, producer.next_sequence(0, &other));
+    assert_matches!(
+        produced_batches::check_sequence(
+            producer.next_sequence(0, &other),
+            producer.remembered_batches(0, &other),
+            0,
+            1,
+        ),
+        Ok(SequenceCheck::Duplicate { base_offset: 20 })
     );
 }
