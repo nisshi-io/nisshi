@@ -54,12 +54,18 @@ By default, the broker keeps topics and messages in memory, and loses them when 
 ./bin/nisshi --listener-url tcp://127.0.0.1:9092 --storage-engine sqlite://nisshi.db
 ```
 
-To start again with no data, stop the broker and delete `nisshi.db`, `nisshi.db-shm`, and `nisshi.db-wal`.
+To start again with no data, stop the broker and delete `nisshi.db`, and the `nisshi.db-shm` and `nisshi.db-wal` files if they exist.
 
-If another program already uses port 9092, the broker stops with the error "Address already in use". To use a different port, set both the `--listener-url` and `--advertised-listener-url` options. Then add `--broker` with the same address to each command in Step 3. For example, to use port 9093, run the following command:
+If another program already uses port 9092, the broker stops with the error "Address already in use". To use a different port, set both the `--listener-url` and `--advertised-listener-url` options. For example, to use port 9093, run the following command:
 
 ```shell
 ./bin/nisshi --listener-url tcp://127.0.0.1:9093 --advertised-listener-url tcp://127.0.0.1:9093
+```
+
+In Step 3, add `--broker` with the same address after the topic name in each command, for example:
+
+```shell
+./bin/nisshi topic create hello --broker tcp://127.0.0.1:9093
 ```
 
 The release includes several storage engines. The `./bin/nisshi --help` command lists the available storage engines and includes the options for TLS (`--cert` and `--key`) and authentication (`--authentication`).
@@ -79,6 +85,8 @@ The `nisshi cat` command sends and reads JSON messages from the terminal. The `c
 ```text
 [{"key":null,"value":"hello world"}]
 ```
+
+If a command prints nothing and does not return, check that the broker from Step 2 is running and that the command uses the same address.
 
 ## Step 4: Connect Your Own Client
 
@@ -108,10 +116,13 @@ If there is no release for your operating system or architecture, for example Wi
 
 1. Install Rust with [rustup](https://rustup.rs).
 2. Restart your shell so that `cargo` is on your `PATH`.
-3. Run the following command:
+3. Install a C compiler, because the build compiles C libraries as well as Rust code. On macOS, run `xcode-select --install`. On Debian or Ubuntu, run `sudo apt-get install build-essential`.
+4. Run the following command:
 
    ```shell
-   cargo install nisshi
+   cargo install nisshi --locked --features dynostore,libsql,postgres
    ```
+
+   The `--features` option adds the `memory://`, `s3://`, `gs://`, `sqlite://`, and `postgres://` storage engines. The build takes several minutes.
 
 The build installs the `nisshi` command on your `PATH`. In the other steps, run `nisshi` instead of `./bin/nisshi`.
