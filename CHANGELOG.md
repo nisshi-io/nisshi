@@ -6,7 +6,7 @@ This file is generated from the commit history when a release is cut. Pull reque
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] - 2026-10-26
+## [0.8.0] - 2026-10-27
 
 ### Upgrade notes
 
@@ -80,11 +80,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - A failed connection prints its cause and points at `--broker` (or `ADVERTISED_LISTENER_URL`). It also says these commands connect in plaintext only.
   - Each reported failure starts with `error: `.
 - `nisshi_group_coordinator_requests` also counts ListGroups and DescribeGroups, with `method` set to `list_groups` and `describe_groups` ([#1074](https://github.com/nisshi-io/nisshi/pull/1074)).
-- Docker Compose: `docker compose up -d nisshi` works on a fresh clone without a `.env` ([#1128](https://github.com/nisshi-io/nisshi/pull/1128), [#1127](https://github.com/nisshi-io/nisshi/pull/1127), [#1137](https://github.com/nisshi-io/nisshi/pull/1137)):
+- Docker Compose: `docker compose up -d nisshi` works on a fresh clone without a `.env` ([#1128](https://github.com/nisshi-io/nisshi/pull/1128), [#1127](https://github.com/nisshi-io/nisshi/pull/1127), [#1137](https://github.com/nisshi-io/nisshi/pull/1137), [#1136](https://github.com/nisshi-io/nisshi/pull/1136)):
   - Each variable has a default: `NISSHI_IMAGE` is `ghcr.io/nisshi-io/nisshi:latest`, storage is PostgreSQL on the `db` service, the cluster id is `nisshi`, the advertised listener is `tcp://localhost:9092`, `RUST_LOG` is `warn`, and the credentials are those of the local object store.
   - Ports are published on `127.0.0.1` only, the broker waits until `db` is healthy, and the `db` healthcheck tests TCP.
   - Images are pinned by digest, so the default `postgres:18` no longer floats to the newest 18.x build.
-  - Grafana is 13.2.4 (was 11.5.1).
+  - Grafana is 13.2.4 (was 11.5.1), and Prometheus is v3.15.0 (was v3.1.0).
 
 ### Deprecated
 
