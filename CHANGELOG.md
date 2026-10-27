@@ -95,7 +95,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - On PostgreSQL and SQLite, `retention.ms=-1`, or any negative value, keeps every record, as in Kafka; before, it deleted every record. On PostgreSQL, a `retention.ms` above 2147483647, such as 30 days, no longer fails the retention statement. That failure stopped retention on every topic. A stored `retention.ms` that isn't a whole number now keeps every record of its topic, and a stored `retention.bytes` that isn't one is ignored. On PostgreSQL such a value failed retention for every topic, and on SQLite a bad `retention.ms` was read as 0, which deleted every record. On SQLite, retention no longer reads every record of a compacted topic, or of one with a negative `retention.ms`, on each sweep while it holds the write lock ([#1021](https://github.com/nisshi-io/nisshi/pull/1021)).
 - Produce rejects a batch whose CRC doesn't match its contents with `CORRUPT_MESSAGE`, on every engine, and stores nothing, as Kafka does. A `CreateTime` batch whose `max_timestamp` was already correct skipped the check:
-  - The object store engines stored the bad CRC, so every Java consumer of the partition failed on each poll until someone seeked past the batch.
+  - The object store engines stored the bad CRC, so every Java consumer of the partition failed on each poll until someone moved its offset past the batch.
   - PostgreSQL, SQLite and Turso served the corrupted records under a new, valid CRC.
   - Gzip and LZ4 batches with a bad CRC got `INVALID_RECORD`.
 
