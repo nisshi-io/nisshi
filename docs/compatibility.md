@@ -12,7 +12,7 @@ The tables compare the PostgreSQL, SQLite, in-memory and S3 storage engines. The
 engines share one implementation, so their columns are the same. The tables do not cover Turso,
 which is experimental, or SlateDB, which is deprecated.
 
-The [storage engine table](../README.md) in the README gives each engine's status, and
+The [storage engine table](../README.md#storage-options) in the README gives each engine's status, and
 [What CI tests on each storage engine](../CONTRIBUTING.md#what-ci-tests-on-each-storage-engine)
 gives the checks that CI runs on each engine.
 
