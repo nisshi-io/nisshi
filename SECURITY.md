@@ -55,8 +55,8 @@ We don't publish response-time targets for security reports.
 ## Security updates
 
 Security fixes ship in a release and are listed in the Security section of
-[CHANGELOG.md](CHANGELOG.md). A vulnerability reported under this policy also
-gets a [GitHub security advisory][advisories]. Watch the repository's releases
+[CHANGELOG.md](CHANGELOG.md). A reported vulnerability that we confirm and fix
+also gets a [GitHub security advisory][advisories]. Watch the repository's releases
 on GitHub to be notified.
 
 ## Scope
