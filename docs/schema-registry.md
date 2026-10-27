@@ -1,6 +1,6 @@
 # Schema Registry
 
-Tansu has a schema registry that supports [JSON schema](json-schema-org),
+Nisshi has a schema registry that supports [JSON schema](json-schema-org),
 [Apache Avro](https://avro.apache.org) and [Protocol buffers](protocol-buffers),
 that is embedded in the broker.
 
@@ -147,11 +147,11 @@ message Value {
 
 This example uses JSON schema as it is simpler to use with the Apache Kafka command line tools.
 
-The person schema can be found in the `etc/schema` directory of the Tansu GitHub
-repository. This directory is also used when starting Tansu using
+The person schema can be found in the `etc/schema` directory of the Nisshi GitHub
+repository. This directory is also used when starting Nisshi using
 the `just nisshi-broker` recipe or Docker compose.
 
-Starting Tansu with schema validation enabled:
+Starting Nisshi with schema validation enabled:
 
 ```shell
 target/debug/nisshi broker --schema-registry file://./etc/schema 2>&1 | tee nisshi.log

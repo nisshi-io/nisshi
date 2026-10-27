@@ -2,7 +2,7 @@
 #
 # FINDINGS.md records the compatibility gaps behind the tests that are
 # excluded: TestGroupETL (UNKNOWN_MEMBER_ID under concurrent rebalances),
-# TestTxnEtl (aborted records visible to read_committed).
+# TestTxnEtl (transactions refused).
 #
 # TestSCRAMAuth/TestSCRAMAuthBadCredentials self-skip without
 # KGO_TEST_SCRAM; TestShareGroup*/Test*848* self-skip because tansu does

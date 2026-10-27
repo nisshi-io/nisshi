@@ -36,6 +36,7 @@ use deadpool_postgres::{
     Transaction,
 };
 use futures::pin_mut;
+use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -2235,12 +2236,13 @@ impl Postgres {
                         .configs
                         .as_ref()
                         .and_then(|configs| {
-                            configs
-                                .iter()
-                                .inspect(|config| debug!(?config))
-                                .find(|config| config.name.as_str() == "tansu.schema.validation")
-                                .and_then(|config| config.value.as_deref())
-                                .and_then(|value| bool::from_str(value).ok())
+                            topic_config::lookup(
+                                configs.iter().inspect(|config| debug!(?config)).filter_map(
+                                    |config| Some((config.name.as_str(), config.value.as_deref()?)),
+                                ),
+                                topic_config::SCHEMA_VALIDATION,
+                            )
+                            .and_then(|value| bool::from_str(value).ok())
                         })
                         .unwrap_or(true)
                 })
@@ -2263,12 +2265,15 @@ impl Postgres {
                             .configs
                             .as_ref()
                             .and_then(|configs| {
-                                configs
-                                    .iter()
-                                    .inspect(|config| debug!(?config))
-                                    .find(|config| config.name.as_str() == "tansu.lake.sink")
-                                    .and_then(|config| config.value.as_deref())
-                                    .and_then(|value| bool::from_str(value).ok())
+                                topic_config::lookup(
+                                    configs.iter().inspect(|config| debug!(?config)).filter_map(
+                                        |config| {
+                                            Some((config.name.as_str(), config.value.as_deref()?))
+                                        },
+                                    ),
+                                    topic_config::LAKE_SINK,
+                                )
+                                .and_then(|value| bool::from_str(value).ok())
                             })
                             .unwrap_or_default()
                     })
@@ -3239,7 +3244,7 @@ impl Postgres {
 
     #[instrument(skip(self), ret)]
     async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
-        let retention_secs = i32::try_from(Duration::from_hours(7 * 24).as_secs())?;
+        let retention_secs = i64::try_from(Duration::from_hours(7 * 24).as_secs())?;
 
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
@@ -3292,22 +3297,19 @@ impl Postgres {
                 .describe_config(base, ConfigResource::Topic, None)
                 .await
                 .map(|configs| {
-                    configs
-                        .configs
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .find_map(|config| {
-                            if config.name == "tansu.virtual" {
-                                config
-                                    .value
-                                    .as_deref()
-                                    .and_then(|config| bool::from_str(config).ok())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default()
+                    topic_config::lookup(
+                        configs
+                            .configs
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|config| {
+                                Some((config.name.as_str(), config.value.as_deref()?))
+                            }),
+                        topic_config::VIRTUAL,
+                    )
+                    .and_then(|value| bool::from_str(value).ok())
+                    .unwrap_or_default()
                 })?
         {
             Ok((base, Some(key)))

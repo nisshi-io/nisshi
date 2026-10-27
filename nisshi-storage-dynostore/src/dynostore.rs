@@ -31,6 +31,7 @@ use futures::{
     stream::{self, BoxStream, TryStreamExt},
 };
 use metadata::Cache;
+use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -1868,17 +1869,17 @@ impl Storage for DynoStore {
                 .configs
                 .as_ref()
                 .map(|configs| {
-                    configs
-                        .iter()
-                        .inspect(|config| debug!(?config))
-                        .any(|config| {
-                            config.name.as_str() == "tansu.lake.sink"
-                                && config
-                                    .value
-                                    .as_deref()
-                                    .and_then(|value| bool::from_str(value).ok())
-                                    .unwrap_or(false)
-                        })
+                    topic_config::lookup(
+                        configs
+                            .iter()
+                            .inspect(|config| debug!(?config))
+                            .filter_map(|config| {
+                                Some((config.name.as_str(), config.value.as_deref()?))
+                            }),
+                        topic_config::LAKE_SINK,
+                    )
+                    .and_then(|value| bool::from_str(value).ok())
+                    .unwrap_or(false)
                 })
                 .unwrap_or(false)
         {
@@ -1925,7 +1926,7 @@ impl Storage for DynoStore {
                         |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
                     );
 
-                    // Deliberately not touched: this branch (tansu.lake.sink)
+                    // Deliberately not touched: this branch (`nisshi.lake.sink`)
                     // never writes a `records/*.batch` object, so there is
                     // nothing for a `time_index` entry here to point at. A
                     // sequential scan starting from such an entry would list

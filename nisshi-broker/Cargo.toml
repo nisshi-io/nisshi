@@ -1,6 +1,6 @@
 [package]
 name = "nisshi-broker"
-description = "Tansu Kafka API compatible broker"
+description = "Nisshi Apache Kafka®-compatible broker"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

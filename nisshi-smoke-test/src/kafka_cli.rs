@@ -60,6 +60,7 @@ mod consumer_groups;
 mod delete_records;
 mod get_offsets;
 mod output;
+mod producer_perf_test;
 mod reassign_partitions;
 mod record;
 mod scram_login;
@@ -85,6 +86,8 @@ pub const SASL_MECHANISM_NOT_ENABLED: &str = "not enabled in the server, enabled
 pub const GROUP_ID_NOT_FOUND_EXCEPTION: &str = "GroupIdNotFoundException";
 /// The name the tools print for the broker's `NON_EMPTY_GROUP` error.
 pub const GROUP_NOT_EMPTY_EXCEPTION: &str = "GroupNotEmptyException";
+/// The name the tools print for the broker's `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` error.
+pub const TRANSACTIONAL_ID_AUTHORIZATION_EXCEPTION: &str = "TransactionalIdAuthorizationException";
 
 pub use acls::KafkaAcls;
 pub use background_tool::{BackgroundTool, PrintedLine, StdoutLines};
@@ -103,6 +106,7 @@ pub use consumer_groups::{
 pub use delete_records::{DeleteRecords, KafkaDeleteRecords};
 pub use get_offsets::{GetOffsets, KafkaGetOffsets};
 pub use output::{AnyCommand, Output};
+pub use producer_perf_test::KafkaProducerPerfTest;
 pub use reassign_partitions::{KafkaReassignPartitions, NO_REASSIGNMENTS};
 pub use record::Record;
 pub use scram_login::{ScramLogin, ScramMechanism};
@@ -232,6 +236,11 @@ impl KafkaCli {
         KafkaGetOffsets::new(self)
     }
 
+    /// Returns `kafka-producer-perf-test`, run against this broker.
+    pub fn producer_perf_test(&self) -> KafkaProducerPerfTest<'_> {
+        KafkaProducerPerfTest::new(self)
+    }
+
     /// Returns `kafka-reassign-partitions`, run against this broker.
     pub fn reassign_partitions(&self) -> KafkaReassignPartitions<'_> {
         KafkaReassignPartitions::new(self)
@@ -330,8 +339,10 @@ impl KafkaCli {
         path
     }
 
-    /// Runs `/opt/kafka/bin/<tool>.sh <args> --bootstrap-server <broker>`. The address comes last,
-    /// after a subcommand such as `kafka-cluster.sh cluster-id`, which takes it as its own option.
+    /// Runs `/opt/kafka/bin/<tool>.sh <args>`, followed by the broker's address in the arguments
+    /// that [`Tool::bootstrap_arguments`] returns. The address follows `<args>`, so that a
+    /// subcommand such as `kafka-cluster.sh cluster-id` comes before the address and reads it as
+    /// the subcommand's own option.
     ///
     /// Panics if the tool does not finish within `TOOL_TIMEOUT`.
     #[track_caller]
@@ -539,7 +550,7 @@ impl KafkaCli {
             .arg(format!("{}s", timeout.as_secs()))
             .arg(format!("/opt/kafka/bin/{}.sh", tool.name()))
             .args(args)
-            .args(["--bootstrap-server", &self.bootstrap]);
+            .args(tool.bootstrap_arguments(&self.bootstrap));
 
         if let Some(client_config) = &self.client_config {
             _ = command.args([tool.client_config_option(), client_config]);

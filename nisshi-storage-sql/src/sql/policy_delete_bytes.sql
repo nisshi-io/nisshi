@@ -23,12 +23,16 @@ capped as (
     join topic t on t.id = tp.topic
     join cluster c on t.cluster = c.id
     join topic_configuration tc on tc.topic = t.id
-    join topic_configuration pol on pol.topic = t.id
+    left join topic_configuration pol on pol.topic = t.id and pol.name = 'cleanup.policy'
     where c.name = $1
     and tc.name = 'retention.bytes'
-    and tc.value ~ '^[0-9]+$'
-    and pol.name = 'cleanup.policy'
-    and pol.value like '%delete%'
+    -- A negative retention.bytes is no limit. The pattern allows at most 18 digits, so the cast to
+    -- bigint never overflows and fails this statement for every topic. The broker rejects a value
+    -- that isn't a long, but a topic created before the broker checked the value can hold one, and
+    -- that topic keeps every record.
+    and tc.value ~ '^[0-9]{1,18}$'
+    -- A topic without a cleanup.policy has Kafka's default policy, delete.
+    and coalesce(pol.value, 'delete') like '%delete%'
 ),
 
 sized as (

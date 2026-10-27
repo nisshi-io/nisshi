@@ -1244,6 +1244,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit-set"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d87354e4229f54a44f7bf2435906a4656dba36026ab6eaca629a2c436a691c"
+dependencies = [
+ "bit-vec 0.10.1",
+]
+
+[[package]]
 name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1255,6 +1264,16 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
 dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5727b15fa97d4f4fee0a3b7c3d550ed0269f54329207b86388de918604e31269"
+dependencies = [
+ "borsh",
  "serde",
 ]
 
@@ -1385,8 +1404,22 @@ version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
 dependencies = [
+ "borsh-derive",
  "bytes",
  "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1540,9 +1573,9 @@ dependencies = [
 
 [[package]]
 name = "cached"
-version = "4.0.1"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "292f39b5c459538e148825347c400cb2005a618b897d0e6be183bad677d460b7"
+checksum = "85a0dbacacc2069fc95062beec3f79a28f0f54ef2f72d7fe69000d1557f7c3d0"
 dependencies = [
  "ahash",
  "cached_proc_macro",
@@ -3348,7 +3381,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3624,7 +3657,7 @@ version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
 dependencies = [
- "bit-set",
+ "bit-set 0.8.0",
  "regex-automata",
  "regex-syntax",
 ]
@@ -4061,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "fuzz"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "libfuzzer-sys",
@@ -4114,7 +4147,7 @@ dependencies = [
  "log",
  "rustversion",
  "windows-link 0.1.3",
- "windows-result 0.4.1",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -4536,7 +4569,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -5152,9 +5185,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.58.6"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f622c574a29fb3034a0a90645afee194dfedc75fc124228801b6e77041075bd1"
+checksum = "1b320ad34c177093d21622edc9215bb608294c2333ff296672c0c8265a5ee60c"
 dependencies = [
  "ahash",
  "bytecount",
@@ -5183,18 +5216,18 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.58.6"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7"
+checksum = "1472f7be79026f79e01a9b172263311e829d7c210d57b39cb57037abc0ce0500"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.58.6"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96"
+checksum = "e5a7550a7a84787e715ead0b47e01fa8c6bb7c3413630f91a8f2094c06c2078a"
 dependencies = [
  "ahash",
  "bytecount",
@@ -5304,9 +5337,9 @@ checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -5799,12 +5832,13 @@ dependencies = [
 
 [[package]]
 name = "nisshi"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "dotenv",
  "nisshi-broker",
  "nisshi-cat",
  "nisshi-cli",
+ "nisshi-client",
  "nisshi-generator",
  "nisshi-perf",
  "nisshi-proxy",
@@ -5812,13 +5846,14 @@ dependencies = [
  "nisshi-schema",
  "nisshi-storage",
  "nisshi-topic",
+ "serde_json",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "nisshi-auth"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "nisshi-sans-io",
@@ -5832,7 +5867,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-broker"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5894,7 +5929,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-cat"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "futures",
@@ -5914,7 +5949,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-cli"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "clap",
@@ -5954,7 +5989,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-client"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "backoff",
@@ -5978,7 +6013,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-generator"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "futures",
  "futures-core",
@@ -6005,7 +6040,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-model"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "convert_case 0.12.0",
  "lazy_static",
@@ -6020,7 +6055,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-otel"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -6034,7 +6069,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-perf"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "futures",
@@ -6063,7 +6098,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-proxy"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6093,7 +6128,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-sans-io"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -6124,7 +6159,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-schema"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6172,7 +6207,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-service"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6198,7 +6233,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-smoke-test"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "clap",
  "humantime",
@@ -6214,7 +6249,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6267,7 +6302,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-dynostore"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6299,7 +6334,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-null"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "nisshi-sans-io",
@@ -6313,7 +6348,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-slatedb"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6326,13 +6361,14 @@ dependencies = [
  "slatedb",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
 
 [[package]]
 name = "nisshi-storage-sql"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6371,7 +6407,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-topic"
-version = "0.8.0-pre.1"
+version = "0.8.0"
 dependencies = [
  "futures",
  "futures-core",
@@ -6449,7 +6485,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6864,9 +6900,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-http"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee2c3625b8aa04209f7e01e513bc8044da9687fa38a9eacf59628ca5f3b87300"
+checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6877,9 +6913,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-otlp"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "699a67345e21962a231955b9059a157e428b219fa5df8efe11f08346fb23a344"
+checksum = "0756af24841e367128ef31c831999937b8b5c5197d47914590d8f4e2e88c2e1a"
 dependencies = [
  "http",
  "httpdate",
@@ -6894,9 +6930,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-proto"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25da1ac11a0aeccf38d7f77ee0348715adaf8340f65ad46c94a02c6b20e2f65d"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -6911,9 +6947,9 @@ checksum = "7a3cf639fefd3e852869114f9925b578da6dd8e99281a2089bb0e773ead46962"
 
 [[package]]
 name = "opentelemetry-stdout"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f71803f481d3f5ccbe477edb42a78f473613712b2327835911a9ea0ab069824"
+checksum = "2afbc6661934787ce79bef1e35d0ffe9d62e945f07f664dc1283ce83292b908a"
 dependencies = [
  "chrono",
  "opentelemetry",
@@ -7542,16 +7578,17 @@ dependencies = [
 
 [[package]]
 name = "proptest"
-version = "1.11.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
 dependencies = [
- "bit-set",
- "bit-vec 0.8.0",
+ "bit-set 0.11.1",
+ "bit-vec 0.10.1",
  "bitflags 2.13.2",
+ "chacha20",
+ "core_detect",
  "num-traits",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
+ "rand 0.10.3",
  "rand_xorshift",
  "regex-syntax",
  "rusty-fork",
@@ -7576,7 +7613,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8331,11 +8368,11 @@ dependencies = [
 
 [[package]]
 name = "rand_xorshift"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
 dependencies = [
- "rand_core 0.9.5",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -8460,9 +8497,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.58.6"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "558f3855529c0a7e78a48e409fa653456e55f1b167eab4109c16a255b7727e3f"
+checksum = "473f4dcca28ead7ee0f8e5b5d0bbae2549f4fc4c958fb20af328961b6c174be3"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -8827,7 +8864,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8861,9 +8898,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
@@ -9959,7 +9996,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.52.0",
@@ -10711,7 +10748,7 @@ version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -11290,7 +11327,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
 dependencies = [
  "windows-collections",
- "windows-core 0.61.2",
+ "windows-core",
  "windows-future",
  "windows-link 0.1.3",
  "windows-numerics",
@@ -11302,7 +11339,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -11319,25 +11356,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
-]
-
-[[package]]
 name = "windows-future"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc6a41e98427b19fe4b73c550f060b59fa592d7d686537eebf9385621bfbad8e"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
  "windows-threading",
 ]
@@ -11382,7 +11406,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
 ]
 

@@ -64,9 +64,7 @@ rm -f "${results}/results-${leg}.csv" "${results}/nextest-${leg}.log" \
 export NISSHI_SMOKE_RUN=${engine}-$$
 
 # The run's own compose project, so a run never touches the services and
-# volumes of the default project or of another run. compose.yaml interpolates
-# these images for services this script doesn't start.
-export NISSHI_IMAGE=${NISSHI_IMAGE:-unused} LAKEKEEPER_IMAGE=${LAKEKEEPER_IMAGE:-unused}
+# volumes of the default project or of another run.
 project_prefix=nisshi-smoke-$(id -u)-
 project=${project_prefix}${NISSHI_SMOKE_RUN}
 compose=(docker compose --project-name "${project}" --ansi never)

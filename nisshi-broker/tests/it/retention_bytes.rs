@@ -61,6 +61,9 @@ const VALUE_BYTES: usize = 1000;
 const RETENTION_BYTES: usize = 5 * VALUE_BYTES;
 const PRODUCED: i64 = 20;
 
+/// How many of the newest records fit within [`RETENTION_BYTES`], and remain after maintenance.
+const KEPT: i64 = (RETENTION_BYTES / VALUE_BYTES) as i64;
+
 async fn create_topic(
     broker: &Broker,
     extensions: &Extensions,
@@ -97,6 +100,40 @@ async fn create_topic(
     let topics = response.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
     assert_eq!(i16::from(ErrorCode::None), topics[0].error_code);
+    Ok(())
+}
+
+/// Creates a topic with `configs` through [`Storage::create_topic`], which stores them without the
+/// broker's checks. A test uses it to set up a topic that an earlier version of the broker created,
+/// with a config value that the broker now rejects.
+async fn create_topic_without_validation<G>(
+    sc: &G,
+    name: &str,
+    configs: &[(&str, &str)],
+) -> Result<()>
+where
+    G: Storage,
+{
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(name.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some(
+                    configs
+                        .iter()
+                        .map(|(name, value)| {
+                            CreatableTopicConfig::default()
+                                .name((*name).into())
+                                .value(Some((*value).into()))
+                        })
+                        .collect(),
+                )),
+            false,
+        )
+        .await?;
     Ok(())
 }
 
@@ -208,7 +245,7 @@ where
     sc.maintain(SystemTime::now()).await?;
 
     assert_eq!(
-        Some(15),
+        Some(PRODUCED - KEPT),
         list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
     );
     assert_eq!(
@@ -219,6 +256,38 @@ where
     let value = Bytes::from(format!("{PRODUCED:0>VALUE_BYTES$}"));
     assert_eq!(PRODUCED, produce(&broker, &extensions, topic, value).await?);
 
+    Ok(())
+}
+
+/// Kafka's default `cleanup.policy` is `delete`, so a topic that sets only `retention.bytes` must
+/// stay within it. A broker that skips the topic lets it grow forever.
+pub async fn retention_bytes_without_cleanup_policy_deletes_oldest<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[("retention.bytes", &RETENTION_BYTES.to_string())],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(PRODUCED - KEPT),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
     Ok(())
 }
 
@@ -284,6 +353,95 @@ where
     Ok(())
 }
 
+/// A topic whose `cleanup.policy` is `compact` keeps every record that compaction keeps, whatever
+/// their size. A broker that applies `retention.bytes` to it deletes the only copy of each key's
+/// latest value.
+pub async fn retention_bytes_compacted_topic_keeps_everything<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[
+            ("cleanup.policy", "compact"),
+            ("retention.bytes", &RETENTION_BYTES.to_string()),
+        ],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(0),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
+/// A topic whose stored `retention.bytes` doesn't fit in a long keeps every record, and maintenance
+/// still trims the other topics. Maintenance must not fail on the value, because one failure stops
+/// it for every topic.
+pub async fn retention_bytes_stored_value_that_is_not_a_long_does_not_stop_retention<G>(
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let not_a_long_topic = &alphanumeric_string(15)[..];
+    create_topic_without_validation(
+        &sc,
+        not_a_long_topic,
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.bytes", "99999999999999999999"),
+        ],
+    )
+    .await?;
+    let capped_topic = &alphanumeric_string(15)[..];
+    create_topic(
+        &broker,
+        &extensions,
+        capped_topic,
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.bytes", &RETENTION_BYTES.to_string()),
+        ],
+    )
+    .await?;
+
+    for topic in [not_a_long_topic, capped_topic] {
+        for n in 0..PRODUCED {
+            let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+            _ = produce(&broker, &extensions, topic, value).await?;
+        }
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(PRODUCED - KEPT),
+        list_offset(&broker, &extensions, capped_topic, ListOffset::Earliest).await?
+    );
+    assert_eq!(
+        Some(0),
+        list_offset(&broker, &extensions, not_a_long_topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -315,6 +473,15 @@ macro_rules! backend {
             }
 
             #[tokio::test]
+            async fn without_cleanup_policy_deletes_oldest() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_without_cleanup_policy_deletes_oldest(
+                    storage_container().await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
             async fn unlimited_keeps_everything() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::retention_bytes_unlimited_keeps_everything(storage_container().await?).await
@@ -324,6 +491,21 @@ macro_rules! backend {
             async fn keeps_newest_record() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::retention_bytes_keeps_newest_record(storage_container().await?).await
+            }
+            #[tokio::test]
+            async fn compacted_topic_keeps_everything() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_compacted_topic_keeps_everything(storage_container().await?)
+                    .await
+            }
+
+            #[tokio::test]
+            async fn stored_value_that_is_not_a_long_does_not_stop_retention() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_stored_value_that_is_not_a_long_does_not_stop_retention(
+                    storage_container().await?,
+                )
+                .await
             }
         }
     };

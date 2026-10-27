@@ -185,7 +185,7 @@ use std::{
 };
 use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
@@ -285,6 +285,14 @@ pub enum Error {
     },
 
     Glob(Arc<GlobError>),
+
+    /// No storage factory registered with the builder accepts the `scheme` of the `storage` URL,
+    /// which has its credentials redacted. A build that leaves out the engine's feature has no
+    /// factory for it.
+    NoEngineForScheme {
+        scheme: String,
+        storage: String,
+    },
 
     /// The database records schema `recorded_version`, which a broker of `schema_version` can't
     /// use. Only a broker of `oldest_compatible_version` or later can use it.
@@ -1676,6 +1684,15 @@ pub trait StorageFactory: Debug + Display + Send + Sync + 'static {
     /// What the engine can do. See [`StorageCapabilities`].
     fn capabilities(&self) -> StorageCapabilities;
 
+    /// Returns the notice that [`Builder::build`] logs as a warning when this factory is
+    /// selected, or `None` for an engine that is not deprecated.
+    ///
+    /// The notice is logged as it is written, so it must not hold a storage URL, which
+    /// can carry credentials.
+    fn deprecation(&self) -> Option<&'static str> {
+        None
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage>;
 }
 
@@ -1947,8 +1964,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()>;
 
     /// Aborted transactions overlapping `[offset, last_stable_offset)`, reporting which producer
-    /// ranges a `read_committed` Fetch client should discard. Postgres implements this; other
-    /// backends return `Ok(vec![])` or forward to an inner storage.
+    /// ranges a `read_committed` Fetch client should discard. No engine implements this yet:
+    /// every backend, Postgres included, returns `Ok(vec![])` (wrapper layers such as the proxy
+    /// forward to their inner storage), so a `read_committed` consumer would read aborted records.
     async fn aborted_transactions(
         &self,
         _topition: &Topition,
@@ -2749,9 +2767,9 @@ impl Builder<i32, String, Url, Url> {
             })
             .cloned()
         else {
-            return Err(Error::FeatureNotEnabled {
-                feature: self.storage.scheme().into(),
-                message: redact_url(&self.storage).to_string(),
+            return Err(Error::NoEngineForScheme {
+                scheme: self.storage.scheme().into(),
+                storage: redact_url(&self.storage).to_string(),
             });
         };
 
@@ -2765,6 +2783,10 @@ impl Builder<i32, String, Url, Url> {
                     .map(|factory| factory.to_string())
                     .collect(),
             });
+        }
+
+        if let Some(notice) = factory.deprecation() {
+            warn!("{notice}");
         }
 
         let silent = self.silent;
@@ -3253,7 +3275,7 @@ mod tests {
         // No factories are registered on a bare `StorageContainer::builder()`
         // (those come from the storage backend crates, e.g.
         // `nisshi-storage-sql`), so this always falls into the
-        // `Error::FeatureNotEnabled` branch regardless of scheme, which used
+        // `Error::NoEngineForScheme` branch regardless of scheme, which used
         // to embed the raw, unredacted URL in its `message` field.
         let err = StorageContainer::builder()
             .node_id(1)

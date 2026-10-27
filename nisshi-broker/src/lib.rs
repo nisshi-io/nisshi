@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     env::vars,
     fmt, io,
-    net::AddrParseError,
+    net::{AddrParseError, SocketAddr},
     num::TryFromIntError,
     result,
     str::{FromStr, Utf8Error},
@@ -90,6 +90,11 @@ pub enum Error {
     Join(Arc<JoinError>),
     Json(Arc<serde_json::Error>),
     KafkaProtocol(#[from] nisshi_sans_io::Error),
+
+    /// Another socket already listens on the address that the broker's listener binds.
+    ListenerInUse {
+        addr: SocketAddr,
+    },
 
     Message(String),
     Model(#[from] nisshi_model::Error),

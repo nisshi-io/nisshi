@@ -31,7 +31,7 @@ pub(super) enum Command {
         #[clap(value_parser)]
         topic: String,
 
-        /// Input filename or '-' for stdin
+        /// Input file, or '-' for stdin. Without --schema-registry, each message is a JSON object with a "value" and an optional "key", one per line on stdin, or in a JSON array in a file
         #[clap(value_parser, default_value = "-")]
         file: String,
 

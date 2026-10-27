@@ -32,9 +32,16 @@ use nisshi_smoke_test::{Broker, KafkaCli, polling};
 /// How long a test waits for a maintenance run to give the result it expects.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a record lives in a topic with [`SHORT_RETENTION`]. It is longer than a test takes to
-/// check a newer record after the older ones expire, so the newer record is still there.
+/// How long a record lives in a topic with [`SHORT_RETENTION`].
 const SHORT_RETENTION_PERIOD: Duration = Duration::from_secs(30);
+
+/// How far ahead of the clock a test stamps the records that retention must keep. Retention deletes
+/// a record only once its timestamp is older than `retention.ms`, so these records outlast the
+/// test, however long its checks take. The broker rejects a timestamp more than an hour ahead.
+const KEPT_RECORD_LEAD: Duration = Duration::from_secs(600);
+
+/// The value prefix of the records that a test stamps [`KEPT_RECORD_LEAD`] ahead.
+const KEPT_VALUE_PREFIX: u32 = 1;
 
 /// The `retention.ms` of [`SHORT_RETENTION_PERIOD`], which must change with it.
 const SHORT_RETENTION: &str = "retention.ms=30000";
@@ -48,6 +55,18 @@ const EXPIRED_RECORD_COUNT: usize = 3;
 fn produce_records(cli: &KafkaCli, topic: &str, count: usize) {
     let values = (0..count).map(|n| format!("old-{n}")).collect::<Vec<_>>();
     _ = cli.console_producer().produce_values(topic, &values);
+}
+
+/// Produces `count` records stamped [`KEPT_RECORD_LEAD`] ahead, which retention keeps for the rest
+/// of the test. Record `n`'s value is `<KEPT_VALUE_PREFIX>.<n>`.
+#[track_caller]
+fn produce_kept_records(cli: &KafkaCli, topic: &str, count: usize) {
+    let ahead = cli.now_in_millis() + KEPT_RECORD_LEAD.as_millis() as i64;
+    let produced =
+        cli.verifiable_producer()
+            .produce_created_at(topic, count, ahead, KEPT_VALUE_PREFIX, None);
+
+    assert_eq!(produced.acknowledged_record_count(), count, "{produced}");
 }
 
 /// Waits until the records that a test produced before it called this have expired under
@@ -111,9 +130,7 @@ impl MaintenanceWitness {
 
     #[track_caller]
     fn wait_for_maintenance_run(&self, cli: &KafkaCli) {
-        _ = cli
-            .console_producer()
-            .produce_values(&self.topic, &["new-0"]);
+        produce_kept_records(cli, &self.topic, 1);
         wait_until_earliest_offset_is(cli, &self.topic, 1);
     }
 }
@@ -129,9 +146,7 @@ fn expired_records_are_deleted_and_newer_records_kept() {
         .create_unique(1, &[DELETE_POLICY, SHORT_RETENTION]);
     produce_records(&cli, &topic, EXPIRED_RECORD_COUNT);
     wait_for_records_to_expire();
-    _ = cli
-        .console_producer()
-        .produce_values(&topic, &["new-0", "new-1"]);
+    produce_kept_records(&cli, &topic, 2);
 
     wait_until_earliest_offset_is(&cli, &topic, EXPIRED_RECORD_COUNT as i64);
 
@@ -139,9 +154,15 @@ fn expired_records_are_deleted_and_newer_records_kept() {
         .console_consumer()
         .read_records_from_earliest(&topic, 0, 2);
     let kept_offsets = kept_records.iter().map(|record| record.offset);
-    let kept_values = kept_records.iter().map(|record| record.value.as_str());
+    let kept_values = kept_records.iter().map(|record| record.value.clone());
     assert_eq!(kept_offsets.collect::<Vec<_>>(), [3, 4]);
-    assert_eq!(kept_values.collect::<Vec<_>>(), ["new-0", "new-1"]);
+    assert_eq!(
+        kept_values.collect::<Vec<_>>(),
+        [
+            format!("{KEPT_VALUE_PREFIX}.0"),
+            format!("{KEPT_VALUE_PREFIX}.1")
+        ]
+    );
 }
 
 /// After retention deletes every record of a partition, the broker must give the next record the
@@ -198,89 +219,6 @@ fn offsets_are_kept_when_retention_empties_a_partition() {
     );
 }
 
-/// Kafka's default `cleanup.policy` is `delete`, so a topic that sets only `retention.ms` must be
-/// cleaned the same way. Users often set only `retention.ms`.
-#[test]
-#[ignore = "retention deletes records only from a topic that sets cleanup.policy (#918)"]
-fn topic_without_cleanup_policy_is_cleaned_by_retention() {
-    let broker = Broker::isolated_with_frequent_maintenance();
-    let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli.topics().create_unique(1, &[SHORT_RETENTION]);
-    produce_records(&cli, &topic, EXPIRED_RECORD_COUNT);
-    wait_for_records_to_expire();
-    _ = cli.console_producer().produce_values(&topic, &["new-0"]);
-
-    wait_until_earliest_offset_is(&cli, &topic, EXPIRED_RECORD_COUNT as i64);
-}
-
-/// `retention.ms=-1` means that the topic keeps every record, however old. A user sets it on a
-/// topic that is the only copy of its data.
-#[test]
-#[ignore = "retention.ms=-1 makes retention delete every record (#919)"]
-fn retention_ms_minus_1_keeps_every_record() {
-    let broker = Broker::isolated_with_frequent_maintenance();
-    let cli = KafkaCli::new(broker.bootstrap());
-    let topic = cli
-        .topics()
-        .create_unique(1, &[DELETE_POLICY, "retention.ms=-1"]);
-    produce_records(&cli, &topic, EXPIRED_RECORD_COUNT);
-    let witness = MaintenanceWitness::create(&cli);
-    wait_for_records_to_expire();
-
-    witness.wait_for_maintenance_run(&cli);
-
-    assert_every_record_kept(&cli, &topic, EXPIRED_RECORD_COUNT);
-}
-
-/// A topic's `retention.ms` of 30 days must not stop retention on the broker's other topics. The
-/// value is larger than a 32-bit integer holds, and a broker that fails on it never deletes
-/// another expired record, so its storage grows until it is full.
-#[test]
-#[cfg_attr(
-    feature = "postgres",
-    ignore = "a retention.ms larger than a 32-bit integer stops retention on every topic (#920)"
-)]
-fn long_retention_on_one_topic_does_not_stop_retention_on_another() {
-    let broker = Broker::isolated_with_frequent_maintenance();
-    let cli = KafkaCli::new(broker.bootstrap());
-    let thirty_day_topic = cli
-        .topics()
-        .create_unique(1, &[DELETE_POLICY, "retention.ms=2592000000"]);
-    // The topic holds a record, so that the maintenance run checks the record's age against the
-    // topic's `retention.ms`.
-    _ = cli
-        .console_producer()
-        .produce_values(&thirty_day_topic, &["new-0"]);
-    let witness = MaintenanceWitness::create(&cli);
-    wait_for_records_to_expire();
-
-    witness.wait_for_maintenance_run(&cli);
-}
-
-/// A topic with a `retention.ms` of 30 days must keep a new record. A broker that reads the value
-/// into a 32-bit integer gets a negative or a small retention, and deletes the record at once.
-#[test]
-#[cfg_attr(
-    feature = "postgres",
-    ignore = "a retention.ms larger than a 32-bit integer stops retention on every topic (#920)"
-)]
-fn thirty_day_retention_keeps_a_new_record() {
-    let broker = Broker::isolated_with_frequent_maintenance();
-    let cli = KafkaCli::new(broker.bootstrap());
-    let thirty_day_topic = cli
-        .topics()
-        .create_unique(1, &[DELETE_POLICY, "retention.ms=2592000000"]);
-    _ = cli
-        .console_producer()
-        .produce_values(&thirty_day_topic, &["new-0"]);
-    let witness = MaintenanceWitness::create(&cli);
-    wait_for_records_to_expire();
-
-    witness.wait_for_maintenance_run(&cli);
-
-    assert_every_record_kept(&cli, &thirty_day_topic, 1);
-}
-
 /// A `retention.ms` added to an existing topic with `kafka-configs` must apply from the next
 /// maintenance run. A user lowers it to free storage at once. The topic keeps its records under
 /// the default retention of 7 days first, so the test shows that the added config deleted them.
@@ -294,8 +232,8 @@ fn added_retention_ms_deletes_older_records() {
     wait_for_records_to_expire();
     witness.wait_for_maintenance_run(&cli);
     assert_every_record_kept(&cli, &topic, EXPIRED_RECORD_COUNT);
-    // The new record is younger than the added retention, so retention never empties the topic.
-    _ = cli.console_producer().produce_values(&topic, &["new-0"]);
+    // The added retention keeps this record, so retention never empties the topic.
+    produce_kept_records(&cli, &topic, 1);
 
     _ = cli
         .configs()

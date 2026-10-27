@@ -767,7 +767,7 @@ where
 {
     register_broker(cluster_id, broker_id, &sc).await?;
 
-    // Topic name contains "/" but tansu.virtual is NOT set — the slash is just
+    // Topic name contains "/" but nisshi.virtual is NOT set — the slash is just
     // part of the topic name, not a key filter.
     let topic_name: String = format!("{}/{}", alphanumeric_string(10), alphanumeric_string(5));
     debug!(?topic_name);
@@ -835,7 +835,7 @@ where
         })
     };
 
-    // All six records are returned — tansu.virtual is not set so the "/" is
+    // All six records are returned — nisshi.virtual is not set so the "/" is
     // treated as part of the topic name with no key filtering applied.
     let all_records = sc
         .fetch(&topition, offset, min_bytes, max_bytes, isolation, max_wait)

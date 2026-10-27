@@ -12,14 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! List-typed configuration, as altered by the `APPEND` and `SUBTRACT`
-//! operations of [`IncrementalAlterConfigsRequest`](nisshi_sans_io::IncrementalAlterConfigsRequest).
+//! Topic configuration rules from Kafka: the values that Kafka accepts for a topic configuration,
+//! and the list-typed configuration that the `APPEND` and `SUBTRACT` operations of
+//! [`IncrementalAlterConfigsRequest`](nisshi_sans_io::IncrementalAlterConfigsRequest) alter.
 
 use std::collections::{HashMap, HashSet};
 
 use nisshi_sans_io::{ConfigResource, ErrorCode, OpType};
 
 use crate::{Error, Result};
+
+/// Checks `value` against Kafka's rules for the topic configuration `key`. Returns the value to
+/// store, or Kafka's [`ErrorCode::InvalidConfig`] message when Kafka rejects it.
+///
+/// This function checks `retention.ms` and `retention.bytes`, with the rules that Kafka defines for
+/// them in [`LogConfig`], and returns the value of any other configuration without a check.
+/// [`crate::max_message_bytes`] checks `max.message.bytes`. The storage engines read the retention
+/// values in their maintenance queries, so a value that doesn't parse can stop maintenance for every
+/// topic.
+///
+/// For a checked configuration, it returns the plain number that it parses, without white space or
+/// a `+`, because the maintenance queries read anything else as no limit.
+///
+/// [`LogConfig`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogConfig.java#L277-L279
+pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    let minimum: Option<i64> = match key {
+        "retention.bytes" => None,
+        "retention.ms" => Some(-1),
+        _ => return Ok(value.map(ToOwned::to_owned)),
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    // Kafka trims the value before it parses it, in `ConfigDef.parseType`.
+    let reason = match value.trim().parse::<i64>() {
+        Ok(number) => match minimum {
+            Some(minimum) if number < minimum => format!("Value must be at least {minimum}"),
+            _ => return Ok(Some(number.to_string())),
+        },
+        Err(_) => "Not a number of type LONG".to_owned(),
+    };
+
+    Err(format!(
+        "Invalid value {value} for configuration {key}: {reason}"
+    ))
+}
+
+/// Kafka's default `cleanup.policy`, which applies to a topic that doesn't set one.
+const DEFAULT_CLEANUP_POLICY: &str = "delete";
 
 /// The topic configuration keys whose type is `LIST`.
 ///
@@ -34,14 +75,14 @@ pub const TOPIC_LIST_CONFIGS: [&str; 3] = [
     "follower.replication.throttled.replicas",
 ];
 
-/// Whether `key` is a `LIST` configuration of `resource`, the only kind that
-/// `APPEND` and `SUBTRACT` may alter.
+/// Whether `key` is a `LIST` configuration of `resource`, the only kind that `APPEND` and
+/// `SUBTRACT` may alter.
 pub fn is_list_config(resource: ConfigResource, key: &str) -> bool {
     resource == ConfigResource::Topic && TOPIC_LIST_CONFIGS.contains(&key)
 }
 
-/// Returns the value of the configuration `key` of `resource` after applying
-/// `op` with `value` to `current`, or `None` when `op` removes the key.
+/// Returns the value of the configuration `key` of `resource` after applying `op` with `value` to
+/// `current`, or `None` when `op` removes the key.
 ///
 /// `APPEND` and `SUBTRACT` follow Kafka's [`incrementalAlterConfigResource`]
 /// and [`getParts`]:
@@ -49,16 +90,13 @@ pub fn is_list_config(resource: ConfigResource, key: &str) -> bool {
 /// - `APPEND` adds each item of `value` that isn't already present;
 /// - `SUBTRACT` removes the first occurrence of each item of `value`.
 ///
-/// An unset `current` is an empty list. Kafka uses the default of `key`
-/// instead, which makes `APPEND compact` to an unset `cleanup.policy` give
-/// `delete,compact`. Nisshi deletes old records only when `cleanup.policy`
-/// is set and contains `delete`, so that default would turn on deletion the
-/// client didn't ask for.
+/// An unset `current` is the default of `key`, as in Kafka, so `APPEND compact` to an unset
+/// `cleanup.policy` gives `delete,compact`.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorCode::InvalidConfig`] for `APPEND` or `SUBTRACT` on a key
-/// that [isn't a list](is_list_config).
+/// Returns [`ErrorCode::InvalidConfig`] for `APPEND` or `SUBTRACT` on a key that
+/// [isn't a list](is_list_config).
 ///
 /// [`incrementalAlterConfigResource`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L232-L250
 /// [`getParts`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ConfigurationControlManager.java#L389-L404
@@ -80,22 +118,28 @@ pub fn apply_op(
         return Err(Error::Api(ErrorCode::InvalidConfig));
     }
 
+    let default = if key == "cleanup.policy" {
+        DEFAULT_CLEANUP_POLICY
+    } else {
+        ""
+    };
+
     let mut items: Vec<&str> = current
-        .unwrap_or_default()
+        .unwrap_or(default)
         .split(',')
         .filter(|item| !item.is_empty())
         .collect();
 
-    // Kafka keeps an empty item of `value` (from `a,,b`) and then rejects the
-    // result when it validates the new value. We ignore an empty item instead,
-    // because Nisshi doesn't validate values and would store it.
+    // Kafka keeps an empty item of `value` (from `a,,b`) and then rejects the result when it
+    // validates the new value. We ignore an empty item instead, because Nisshi doesn't validate
+    // list values and would store it.
     let changes = value
         .unwrap_or_default()
         .split(',')
         .filter(|item| !item.is_empty());
 
-    // The sets keep the cost linear in the number of items: a client sets the
-    // size of `value`, and the backends apply it inside a write transaction.
+    // The sets keep the cost linear in the number of items: a client sets the size of `value`, and
+    // the backends apply it inside a write transaction.
     if append {
         let mut present: HashSet<&str> = items.iter().copied().collect();
 
@@ -192,13 +236,112 @@ mod tests {
         }
     }
 
+    /// A topic without a `cleanup.policy` deletes old records, so `APPEND compact` must keep
+    /// `delete`, or the topic stops deleting old records.
     #[test]
-    fn append_to_unset_does_not_add_kafka_default() -> Result<()> {
+    fn append_to_unset_cleanup_policy_keeps_kafka_default() -> Result<()> {
         assert_eq!(
-            Some("compact"),
+            Some("delete,compact"),
             apply(None, OpType::Append, "compact")?.as_deref()
         );
         Ok(())
+    }
+
+    /// Kafka's default for a replication throttle list is an empty list, so the `delete` default
+    /// of `cleanup.policy` must not end up in it.
+    #[test]
+    fn append_to_unset_replication_throttle_list_starts_empty() -> Result<()> {
+        assert_eq!(
+            Some("0:111"),
+            apply_op(
+                ConfigResource::Topic,
+                "leader.replication.throttled.replicas",
+                None,
+                OpType::Append,
+                Some("0:111")
+            )?
+            .as_deref()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_ms_accepts_minus_1_and_above() {
+        for value in ["-1", "0", "2592000000"] {
+            assert_eq!(
+                Ok(Some(value.to_owned())),
+                validate_topic_config("retention.ms", Some(value))
+            );
+        }
+    }
+
+    /// The maintenance queries read only a plain number, so a value that Kafka accepts with white
+    /// space or a `+` around it must be stored as that plain number. Stored as sent, the queries
+    /// read it as no limit, and the topic keeps every record.
+    #[test]
+    fn retention_ms_is_stored_as_the_number_that_kafka_parses() {
+        for value in [" 600000 ", "+600000", "600000\n", "\t600000"] {
+            assert_eq!(
+                Ok(Some("600000".to_owned())),
+                validate_topic_config("retention.ms", Some(value))
+            );
+        }
+    }
+
+    #[test]
+    fn retention_ms_rejects_values_below_minus_1() {
+        assert_eq!(
+            Err(
+                "Invalid value -2 for configuration retention.ms: Value must be at least -1"
+                    .to_owned()
+            ),
+            validate_topic_config("retention.ms", Some("-2"))
+        );
+    }
+
+    #[test]
+    fn retention_ms_rejects_a_value_that_is_not_a_long() {
+        for value in ["abc", "", "1.5", "9223372036854775808"] {
+            assert_eq!(
+                Err(format!(
+                    "Invalid value {value} for configuration retention.ms: Not a number of type LONG"
+                )),
+                validate_topic_config("retention.ms", Some(value))
+            );
+        }
+    }
+
+    /// Kafka sets no minimum for `retention.bytes`, and reads any negative value as no limit.
+    #[test]
+    fn retention_bytes_accepts_any_long() {
+        for value in ["-2", "-1", "0", "1073741824", "9223372036854775807"] {
+            assert_eq!(
+                Ok(Some(value.to_owned())),
+                validate_topic_config("retention.bytes", Some(value))
+            );
+        }
+    }
+
+    /// A `retention.bytes` that doesn't fit in a long fails the PostgreSQL maintenance statement,
+    /// which stops maintenance for every topic, so the broker must reject it as Kafka does.
+    #[test]
+    fn retention_bytes_rejects_a_value_that_is_not_a_long() {
+        for value in ["abc", "1.5", "99999999999999999999"] {
+            assert_eq!(
+                Err(format!(
+                    "Invalid value {value} for configuration retention.bytes: Not a number of type LONG"
+                )),
+                validate_topic_config("retention.bytes", Some(value))
+            );
+        }
+    }
+
+    #[test]
+    fn other_configs_are_stored_as_sent() {
+        assert_eq!(
+            Ok(Some(" compact ".to_owned())),
+            validate_topic_config("cleanup.policy", Some(" compact "))
+        );
     }
 
     #[test]
@@ -281,7 +424,7 @@ mod tests {
     fn empty_items_are_ignored() -> Result<()> {
         assert_eq!(
             Some("a,b"),
-            apply(None, OpType::Append, "a,,b,")?.as_deref()
+            apply(Some(""), OpType::Append, "a,,b,")?.as_deref()
         );
 
         assert_eq!(
@@ -298,7 +441,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
 
-        let appended = apply(None, OpType::Append, &value)?;
+        let appended = apply(Some(""), OpType::Append, &value)?;
         assert_eq!(Some(value.as_str()), appended.as_deref());
 
         assert_eq!(

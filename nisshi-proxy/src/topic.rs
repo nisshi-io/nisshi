@@ -20,7 +20,7 @@ use std::{
 use nisshi_sans_io::{
     ConfigResource, ConfigType, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode,
     ProduceRequest, ProduceResponse, RequestInput,
-    describe_configs_request::DescribeConfigsResource,
+    describe_configs_request::DescribeConfigsResource, topic_config,
 };
 use rama::{Layer, Service, extensions::Extensions, matcher::Matcher};
 use tracing::{debug, error};
@@ -244,7 +244,10 @@ impl ResourceConfig {
                 guard
                     .get(resource_name)
                     .inspect(|resource_configuration| debug!(?resource_configuration))
-                    .and_then(|resource_configuration| resource_configuration.get(key).cloned())
+                    .and_then(|resource_configuration| {
+                        topic_config::lookup_by(key, |name| resource_configuration.get(name))
+                            .cloned()
+                    })
             })
             .inspect_err(|err| error!(resource_name, key, ?err))
             .ok()
@@ -639,6 +642,72 @@ mod tests {
             Some(ResourceConfigValue::Boolean(false)),
             configuration.get(RESOURCE_NAME_1, PARAMETER)
         );
+
+        Ok(())
+    }
+
+    fn produce_request_for(topic: &str) -> RequestInput<ProduceRequest> {
+        RequestInput {
+            request: ProduceRequest::default().topic_data(Some(
+                [TopicProduceData::default().name(topic.into())].into(),
+            )),
+            extensions: Extensions::default(),
+        }
+    }
+
+    #[test]
+    fn alias_supplies_the_value_of_its_key() -> Result<(), Error> {
+        let configuration = ResourceConfig::default();
+        configuration.put("a", "tansu.batch.max_records", "7")?;
+
+        assert_eq!(
+            Some(7),
+            configuration
+                .get("a", topic_config::BATCH_MAX_RECORDS)
+                .and_then(|value| value.as_usize())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn key_wins_over_alias_whatever_the_order_of_arrival() -> Result<(), Error> {
+        for first_alias in [true, false] {
+            let configuration = ResourceConfig::default();
+            let alias = ("tansu.batch.max_records", "7");
+            let key = ("nisshi.batch.max_records", "9");
+
+            for (name, value) in if first_alias {
+                [alias, key]
+            } else {
+                [key, alias]
+            } {
+                configuration.put("a", name, value)?;
+            }
+
+            assert_eq!(
+                Some(9),
+                configuration
+                    .get("a", topic_config::BATCH_MAX_RECORDS)
+                    .and_then(|value| value.as_usize())
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_matcher_matches_the_alias_like_its_key() -> Result<(), Error> {
+        for name in ["tansu.batch", "nisshi.batch"] {
+            let configuration = ResourceConfig::default();
+            configuration.put("a", name, "true")?;
+
+            let matcher =
+                ResourceConfigValueMatcher::new(configuration, topic_config::BATCH, "true");
+
+            assert!(matcher.matches(None, &produce_request_for("a")), "{name}");
+            assert!(!matcher.matches(None, &produce_request_for("b")), "{name}");
+        }
 
         Ok(())
     }

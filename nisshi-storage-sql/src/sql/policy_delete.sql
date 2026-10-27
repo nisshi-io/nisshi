@@ -41,18 +41,29 @@ with recursive
 deletion as (
     select
     tp.id as topition,
-    coalesce(cast(rt.value as integer) / 1000, $3) as retention_secs,
+    coalesce(cast(rt.value as bigint) / 1000, $3) as retention_secs,
     coalesce(w.low, 0) as low,
     coalesce(w.high, 0) as high
     from topition tp
     join topic t on t.id = tp.topic
     join cluster c on t.cluster = c.id
-    join topic_configuration tc on tc.topic = t.id
+    left join topic_configuration cp on cp.topic = t.id and cp.name = 'cleanup.policy'
     left join topic_configuration rt on rt.topic = t.id and rt.name = 'retention.ms'
     join watermark w on w.topition = tp.id
     where c.name = $1
-    and tc.name = 'cleanup.policy'
-    and tc.value like '%delete%'
+    -- A topic without a cleanup.policy has Kafka's default policy, delete.
+    and coalesce(cp.value, 'delete') like '%delete%'
+    and case
+        when rt.value is null then true
+        -- A negative retention.ms keeps every record, because Kafka reads any negative value as no
+        -- limit. The broker rejects a value below -1, but a topic created before the broker checked
+        -- the value can hold one. The pattern allows a sign, as Kafka does, and at most 18 digits,
+        -- so the cast to bigint never overflows and fails this statement for every topic.
+        when trim(rt.value) ~ '^[-+]?[0-9]{1,18}$' then cast(rt.value as bigint) >= 0
+        -- A retention.ms stored before the broker validated it can be any text. The topic keeps
+        -- every record, because casting that text fails this statement for every topic.
+        else false
+    end
 ),
 
 -- Each step narrows lo..hi, where lo is the first offset that may be kept and hi the first offset

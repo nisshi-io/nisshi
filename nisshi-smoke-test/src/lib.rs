@@ -39,13 +39,14 @@ pub use kafka_cli::{
     DescribeUsers, GROUP_ID_NOT_FOUND_EXCEPTION, GROUP_NOT_EMPTY_EXCEPTION, GetOffsets,
     GroupOffsets, GroupState, KafkaAcls, KafkaBrokerApiVersions, KafkaCli, KafkaCluster,
     KafkaConfigs, KafkaConsoleConsumer, KafkaConsoleProducer, KafkaConsumerGroups,
-    KafkaDeleteRecords, KafkaGetOffsets, KafkaReassignPartitions, KafkaTopics,
-    KafkaVerifiableConsumer, KafkaVerifiableProducer, LOG_APPEND_TIME, ListGroups,
+    KafkaDeleteRecords, KafkaGetOffsets, KafkaProducerPerfTest, KafkaReassignPartitions,
+    KafkaTopics, KafkaVerifiableConsumer, KafkaVerifiableProducer, LOG_APPEND_TIME, ListGroups,
     ListGroupsInState, ListTopics, NO_REASSIGNMENTS, Output, PRINTED_NULL, PartitionAssignor,
     PartitionReplicas, PrintedLine, PrintsPartitionLines, RECORD_TOO_LARGE_EXCEPTION, Record,
     SASL_AUTHENTICATION_EXCEPTION, SASL_MECHANISM_NOT_ENABLED, SECURITY_DISABLED_EXCEPTION,
     ScramLogin, ScramMechanism, SendResult, StdoutLines, StoredRecord, TOPIC_EXISTS_EXCEPTION,
-    TopicPartition, UNSUPPORTED_VERSION_EXCEPTION, VerifiableConsume, VerifiableProduce,
+    TRANSACTIONAL_ID_AUTHORIZATION_EXCEPTION, TopicPartition, UNSUPPORTED_VERSION_EXCEPTION,
+    VerifiableConsume, VerifiableProduce,
 };
 pub use postgres_server::PostgresServer;
 pub use storage_url::StorageUrl;

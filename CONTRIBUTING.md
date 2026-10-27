@@ -11,9 +11,9 @@ it:
 
 1. Open an issue describing the problem and your idea.
 2. Wait for approval from the Solace Nisshi team. An idea is approved when
-   a maintainer listed in [`.github/CODEOWNERS`](.github/CODEOWNERS)
-   comments on the issue to say so. For these purposes the maintainers are
-   the members of the Solace Nisshi team.
+   a maintainer listed in [MAINTAINERS.md](MAINTAINERS.md) comments on the
+   issue to say so. For these purposes the maintainers are the members of
+   the Solace Nisshi team.
 3. Open a pull request that links the approved issue.
 
 This respects your time. Pull requests without prior approval are generally
@@ -30,6 +30,9 @@ If you're unsure whether a change counts as small, open an issue and ask.
 
 Approved pull requests are reviewed and either merged or given a clear
 reason why not.
+
+Sustained contribution can lead to becoming a maintainer. See
+[MAINTAINERS.md](MAINTAINERS.md) for who maintains Nisshi and how that works.
 
 ## Questions
 
@@ -163,9 +166,9 @@ sign off each of them.
 
 A `DCO` check reports on every pull request. It fails if a commit in the
 pull request has no `Signed-off-by` line, or has one that doesn't match the
-name and email of the commit's author or committer. It is not a required
-status check, but a reviewer will ask you to fix a failure: run the
-`git rebase --signoff main` command above, then force-push. Commits already
+name and email of the commit's author or committer. It is a required status
+check, so a pull request can't merge while it fails. To fix a failure, run
+the `git rebase --signoff main` command above, then force-push. Commits already
 on `main` predate this expectation and aren't checked.
 
 ## Code of conduct

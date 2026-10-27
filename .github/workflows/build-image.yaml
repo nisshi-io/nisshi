@@ -78,22 +78,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      # Same as ci.yml's `release`: embeds the crate list so an image scanner
-      # can read the binary's dependencies. The image carries no Cargo.lock
-      # (.dockerignore), so without it the scan sees no crates.
-      - name: Install cargo-auditable
+      # Same as ci.yml's `release`. cargo-auditable embeds the crate list so an
+      # image scanner can read the binary's dependencies. The image carries no
+      # Cargo.lock (.dockerignore), so without it the scan sees no crates.
+      # cargo-about writes the licence list that the Dockerfile copies into the
+      # image.
+      - name: Install cargo-auditable and cargo-about
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
-          tool: cargo-auditable@0.7.6
+          tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
 
       - name: Build static binary
         run: |
+          # The Dockerfile copies the licence list into the image, so the scan
+          # image needs it too. wait returns cargo about's exit status, so a
+          # failed licence scan fails the step.
+          cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html &
+          about=$!
           cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+          wait "$about"
           bin=target/"${TARGET}"/release/nisshi
           file "$bin" | grep -Eq 'static(-pie|ally) linked' || { echo "::error::$bin is not statically linked"; exit 1; }
           mkdir -p dist/linux/amd64
           cp "$bin" dist/linux/amd64/nisshi
+          cp THIRD-PARTY-LICENSE.html dist/linux/amd64/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

@@ -1,6 +1,6 @@
 [package]
 name = "nisshi-model"
-description = "Kafka JSON protocol definitions, bootstrapping Tansu sans I/O"
+description = "Kafka JSON protocol definitions, bootstrapping Nisshi sans I/O"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

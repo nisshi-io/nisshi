@@ -87,6 +87,27 @@ impl<G> ApiKey for CreateTopicsService<G> {
     const KEY: i16 = CreateTopicsRequest::KEY;
 }
 
+impl<G> CreateTopicsService<G>
+where
+    G: Storage,
+{
+    /// Whether the topic `name` exists. A topic whose lookup fails counts as missing, so that its
+    /// rejection keeps the error that the request caused.
+    async fn topic_exists(&self, name: &str) -> bool {
+        self.storage
+            .metadata(Some(&[TopicId::Name(name.to_owned())]))
+            .await
+            .inspect_err(|error| debug!(topic = name, ?error))
+            .is_ok_and(|metadata| {
+                // A backend can return topics other than the one that the lookup names.
+                metadata.topics().iter().any(|topic| {
+                    topic.name.as_deref() == Some(name)
+                        && topic.error_code == i16::from(ErrorCode::None)
+                })
+            })
+    }
+}
+
 impl<G> Service<ValidatedCreateTopicsRequest> for CreateTopicsService<G>
 where
     G: Storage,
@@ -106,6 +127,24 @@ where
                 ValidatedTopic::Valid(topic) => topic,
 
                 ValidatedTopic::Rejected(result) => {
+                    // Kafka answers TOPIC_ALREADY_EXISTS for an existing topic before it checks
+                    // the configs ([ReplicationControlManager.java#L601-L609]), and a client that
+                    // treats that answer as success repeats a create with the same configs.
+                    //
+                    // [ReplicationControlManager.java#L601-L609]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L601-L609
+                    let result = if result.error_code == i16::from(ErrorCode::InvalidConfig)
+                        && self.topic_exists(&result.name).await
+                    {
+                        error_result(
+                            result.name,
+                            result.num_partitions,
+                            result.replication_factor,
+                            ErrorCode::TopicAlreadyExists,
+                        )
+                    } else {
+                        result
+                    };
+
                     topics.push(result);
                     continue;
                 }

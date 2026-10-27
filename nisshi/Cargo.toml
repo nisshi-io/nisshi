@@ -1,6 +1,6 @@
 [package]
 name = "nisshi"
-description = "Apache Kafka compatible broker with S3, PostgreSQL, Apache Iceberg and Delta Lake"
+description = "Apache Kafka®-compatible broker with S3, PostgreSQL, Apache Iceberg and Delta Lake"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -18,6 +18,7 @@ dotenv.workspace = true
 nisshi-broker = { workspace = true, default-features = false, optional = true }
 nisshi-cat.workspace = true
 nisshi-cli = { workspace = true, default-features = false, optional = true }
+nisshi-client.workspace = true
 nisshi-generator.workspace = true
 nisshi-perf.workspace = true
 nisshi-proxy.workspace = true
@@ -28,8 +29,11 @@ nisshi-topic.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [features]
-default = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage"]
+default = ["dynostore", "libsql", "postgres"]
 delta = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-cli/delta", "nisshi-schema/delta"]
 dynostore = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-broker/dynostore", "nisshi-cli/dynostore", "nisshi-storage/dynostore"]
 iceberg = ["dep:nisshi-broker", "dep:nisshi-cli", "dep:nisshi-schema", "dep:nisshi-storage", "nisshi-cli/iceberg", "nisshi-schema/iceberg"]
