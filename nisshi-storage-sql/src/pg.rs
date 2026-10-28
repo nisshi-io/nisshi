@@ -9846,6 +9846,69 @@ mod tests {
         Ok(())
     }
 
+    /// A read with the largest `max_wait` that a client can send still reads at most
+    /// `ROWS_PER_FETCH` rows, and then returns its connection and its Fetch permit. The
+    /// budget only stops the assembly of records, so the row limit is the bound that keeps
+    /// one read over a large backlog from holding a permit for minutes.
+    #[tokio::test]
+    async fn fetch_with_the_largest_max_wait_returns_its_permit_within_a_bounded_read() -> Result<()>
+    {
+        const RECORDS: i64 = 3 * ROWS_PER_FETCH;
+
+        // Measured reads of `ROWS_PER_FETCH` rows take about 300 ms.
+        const READ_BOUND: Duration = Duration::from_secs(10);
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let batch = (0..RECORDS)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                )
+            })
+            .last_offset_delta(i32::try_from(RECORDS - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let largest_max_wait = Duration::from_millis(u64::try_from(i32::MAX)?);
+
+        let batches = timeout(
+            READ_BOUND,
+            storage.fetch(
+                &topition,
+                0,
+                1,
+                5 * 1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                largest_max_wait,
+            ),
+        )
+        .await
+        .map_err(|_elapsed| {
+            Error::Message(format!("the read took longer than {READ_BOUND:?}"))
+        })??;
+
+        assert_eq!(
+            (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+            records_with_offsets(batches)?
+                .iter()
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>(),
+            "one read must stop at the row limit, whatever its budget",
+        );
+
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
     /// Gives the topic a delete policy with a retention of one minute.
     async fn retain_for_one_minute(storage: &Postgres, topition: &Topition) -> Result<()> {
         let c = storage.connection().await?;
