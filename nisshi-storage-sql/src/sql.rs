@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub(crate) mod consumer_group_select;
+pub(crate) mod consumer_offset_select;
+pub(crate) mod consumer_offset_select_by_group;
 pub(crate) mod producer_epochs_select;
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;

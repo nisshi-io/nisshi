@@ -27,9 +27,9 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, watermark_select_for_write,
+        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        remove_comments, result_columns::ResultColumns, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -64,8 +64,8 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
     Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
@@ -1235,6 +1235,37 @@ fn epoch_value(row: &Row, index: usize) -> Result<i16> {
     integer_value(row, index).and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
 }
 
+/// Returns the leader epoch in column `index` of `row`, or `None` when the column is null.
+/// Returns an error when the stored integer is outside `i32`.
+fn leader_epoch_value(row: &Row, index: usize) -> Result<Option<i32>> {
+    row.get_value(index).map_err(Error::from).and_then(|value| {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value
+                .as_integer()
+                .copied()
+                .ok_or(Error::UnexpectedValue(value))
+                .and_then(|epoch| i32::try_from(epoch).map(Some).map_err(Error::from))
+        }
+    })
+}
+
+/// Returns the text in column `index` of `row`, or `None` when the column is null.
+fn optional_text_value(row: &Row, index: usize) -> Result<Option<String>> {
+    row.get_value(index).map_err(Error::from).and_then(|value| {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value
+                .as_text()
+                .cloned()
+                .map(Some)
+                .ok_or(Error::UnexpectedValue(value))
+        }
+    })
+}
+
 /// Returns a mapper that turns a unique constraint failure into [`Error::Api`] with
 /// `error_code`, and passes any other error through.
 ///
@@ -2104,7 +2135,10 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(group_id);
 
         let mut results = BTreeMap::new();
@@ -2113,39 +2147,48 @@ impl Storage for Engine {
 
         let mut rows = c
             .query(
-                &sql_lookup("consumer_offset_select_by_group.sql")?,
+                &sql_lookup(consumer_offset_select_by_group::QUERY)?,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
+        let columns = ResultColumns::turso(consumer_offset_select_by_group::QUERY, &rows);
+        let topic = columns.index(consumer_offset_select_by_group::TOPIC)?;
+        let partition = columns.index(consumer_offset_select_by_group::PARTITION)?;
+        let committed_offset = columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)?;
+        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)?;
+        let metadata = columns.index(consumer_offset_select_by_group::METADATA)?;
+
         while let Some(row) = rows.next().await? {
-            let topic = row.get_value(0).map_err(Into::into).and_then(|value| {
+            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
                 value
                     .as_text()
                     .cloned()
                     .ok_or(Error::UnexpectedValue(value))
             })?;
 
-            let partition = row.get_value(1).map_err(Into::into).and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .map(|partition| partition as i32)
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
+            let partition = row
+                .get_value(partition)
+                .map_err(Into::into)
+                .and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .map(|partition| partition as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
 
-            let offset = row.get_value(2).map_err(Into::into).and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
+            let committed = CommittedOffset {
+                offset: integer_value(&row, committed_offset)?,
+                leader_epoch: leader_epoch_value(&row, leader_epoch)?,
+                metadata: optional_text_value(&row, metadata)?,
+            };
 
-            debug!(group_id, topic, partition, offset);
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
@@ -2157,7 +2200,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
         let c = self.connection().await?;
 
@@ -2166,7 +2209,7 @@ impl Storage for Engine {
         for topic in topics {
             let mut rows = c
                 .query(
-                    &sql_lookup("consumer_offset_select.sql")?,
+                    &sql_lookup(consumer_offset_select::QUERY)?,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -2185,24 +2228,31 @@ impl Storage for Engine {
                     )
                 })?;
 
-            let offset = rows
+            let columns = ResultColumns::turso(consumer_offset_select::QUERY, &rows);
+            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)?;
+            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)?;
+            let metadata = columns.index(consumer_offset_select::METADATA)?;
+
+            let committed = rows
                 .next()
                 .await
+                .map_err(Error::from)
                 .and_then(|row| {
-                    row.and_then(|row| {
-                        row.get_value(0)
-                            .map(|value| value.as_integer().copied())
-                            .transpose()
+                    row.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: integer_value(&row, committed_offset)?,
+                            leader_epoch: leader_epoch_value(&row, leader_epoch)?,
+                            metadata: optional_text_value(&row, metadata)?,
+                        })
                     })
-                    .unwrap_or(Ok(-1))
                 })
-                .inspect(|offset| {
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -2215,7 +2265,7 @@ impl Storage for Engine {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets)

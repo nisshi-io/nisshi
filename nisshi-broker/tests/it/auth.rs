@@ -40,10 +40,10 @@ use nisshi_sans_io::{
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use nisshi_storage::{
-    BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential,
+    Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rsasl::{
@@ -927,7 +927,7 @@ impl Storage for Engine {
     async fn committed_offset_topitions(
         &self,
         _group_id: &str,
-    ) -> nisshi_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         unimplemented!()
     }
 
@@ -937,7 +937,7 @@ impl Storage for Engine {
         _group_id: Option<&str>,
         _topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> nisshi_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         unimplemented!()
     }
 

@@ -380,9 +380,9 @@ mod tests {
 
     use super::CreateTopicsService;
     use crate::{
-        BrokerRegistrationRequest, CreateTopicsValidationLayer, Error, GroupDetail,
-        ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-        ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+        BrokerRegistrationRequest, CommittedOffset, CreateTopicsValidationLayer, Error,
+        GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+        OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
         TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
         Version,
     };
@@ -498,7 +498,7 @@ mod tests {
         async fn committed_offset_topitions(
             &self,
             _group_id: &str,
-        ) -> Result<BTreeMap<Topition, i64>> {
+        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
             unimplemented!()
         }
 
@@ -507,7 +507,7 @@ mod tests {
             _group_id: Option<&str>,
             _topics: &[Topition],
             _require_stable: Option<bool>,
-        ) -> Result<BTreeMap<Topition, i64>> {
+        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
             unimplemented!()
         }
 
