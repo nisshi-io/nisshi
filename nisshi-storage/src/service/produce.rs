@@ -1301,10 +1301,12 @@ where
                     "message.timestamp.type lookup failed"
                 );
 
+                let error_code = storage_error_code(&error);
+
                 partitions.extend(
-                    partition_data.iter().map(|partition| {
-                        self.error(partition.index, ErrorCode::UnknownServerError)
-                    }),
+                    partition_data
+                        .iter()
+                        .map(|partition| self.error(partition.index, error_code)),
                 );
             }
         }

@@ -839,11 +839,13 @@ impl DynoStore {
     /// below the topic's partition count. Returns the topic's metadata.
     ///
     /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic or an
-    /// index outside the topic.
+    /// index outside the topic, and with [`ErrorCode::KafkaStorageError`] for a failed read of
+    /// the object store.
     async fn ensure_partition_exists(&self, topition: &Topition) -> Result<TopicMetadata> {
         let Some(metadata) = self
             .topic_metadata(&TopicId::Name(topition.topic.clone()))
-            .await?
+            .await
+            .map_err(metadata_read_error)?
         else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
@@ -2009,6 +2011,27 @@ impl Storage for DynoStore {
         ])
     }
 
+    /// Appends `deflated` to `topition`, and returns the base offset of the batch.
+    ///
+    /// The produce takes its offsets in the watermark document of the
+    /// partition, before the writes that follow: the lake table, the
+    /// transaction metadata and the batch object. If one of those writes
+    /// fails, the client gets an error and the taken offsets hold no batch.
+    /// The produce does not move the high watermark back, because a rollback
+    /// is another conditional write that can fail in the same way, and a
+    /// concurrent produce can already hold the next offset. A fetch skips the
+    /// gap, and the time index backfill settles it as a failed produce after
+    /// `BATCH_SETTLED_AFTER`. `ListOffsets` reports a high watermark past the
+    /// gap.
+    ///
+    /// Kafka does not use an offset for an append that it rejects. After it
+    /// appends to the log, Kafka does not move the log end offset back, also
+    /// when the transaction index write that follows fails
+    /// ([`UnifiedLog.append`]). This engine takes its offsets earlier, at the
+    /// watermark write, so a failed batch write leaves a gap that Kafka does
+    /// not have.
+    ///
+    /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L905-L912
     async fn produce(
         &self,
         transaction_id: Option<&str>,
@@ -3071,7 +3094,7 @@ impl Storage for DynoStore {
                     .resource_name(name.into())
                     .configs(Some(vec![]))),
 
-                Err(error) => Err(error),
+                Err(error) => Err(metadata_read_error(error)),
             },
 
             _ => Ok(DescribeConfigsResult::default()
@@ -4278,6 +4301,27 @@ impl Storage for DynoStore {
             .await
             .transpose()?;
         Ok(())
+    }
+}
+
+/// Returns the error that a client gets for a failed read of the cluster's metadata: an object
+/// store error becomes [`Error::Api`] with [`ErrorCode::KafkaStorageError`], and any other error
+/// stays as it is.
+///
+/// A failed read of the object store is usually transient. Kafka answers a failed log read with
+/// `KAFKA_STORAGE_ERROR` ([`LocalLog.scala`]), and a producer retries that code, but fails on
+/// `UNKNOWN_SERVER_ERROR`. A retry does not fix metadata that can't be decoded, so that error
+/// keeps its type.
+///
+/// [`LocalLog.scala`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L709-L721
+fn metadata_read_error(error: Error) -> Error {
+    match error {
+        Error::ObjectStore(error) => {
+            error!(?error, "reading metadata");
+            Error::Api(ErrorCode::KafkaStorageError)
+        }
+
+        otherwise => otherwise,
     }
 }
 

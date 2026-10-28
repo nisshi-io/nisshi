@@ -17,6 +17,7 @@ use nisshi_broker::Error;
 use nisshi_sans_io::{
     CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID, RequestInput,
     create_topics_request::{CreatableReplicaAssignment, CreatableTopic, CreatableTopicConfig},
+    create_topics_response::CreatableTopicResult,
     describe_topic_partitions_request::TopicRequest,
 };
 use nisshi_storage::{
@@ -940,6 +941,144 @@ async fn existing_topic_with_invalid_config_already_exists(
     Ok(())
 }
 
+/// Serves one `CreateTopics` request for `topics`, each with one partition, one replica and the
+/// given configs, and returns the topic results.
+async fn create_topics(
+    storage: impl Storage + Clone,
+    topics: &[(&str, Vec<CreatableTopicConfig>)],
+    validate_only: bool,
+) -> Result<Vec<CreatableTopicResult>, Error> {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(
+                    topics
+                        .iter()
+                        .map(|(name, configs)| {
+                            CreatableTopic::default()
+                                .name((*name).into())
+                                .num_partitions(1)
+                                .replication_factor(1)
+                                .assignments(Some([].into()))
+                                .configs(Some(configs.clone()))
+                        })
+                        .collect(),
+                ))
+                .validate_only(Some(validate_only)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    Ok(response.topics.unwrap_or_default())
+}
+
+/// Kafka refuses a topic whose name differs from an existing topic's only by '.' and '_',
+/// because its per-topic metric names map '.' to '_'. It checks the name against existing
+/// topics only, before it checks the configs, and an exact match is `TOPIC_ALREADY_EXISTS`.
+async fn colliding_name_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let prefix = alphanumeric_string(15);
+    let period = format!("{prefix}.x");
+    let underscore = format!("{prefix}_x");
+
+    let topics = create_topics(storage.clone(), &[(&period, vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    for validate_only in [false, true] {
+        let topics =
+            create_topics(storage.clone(), &[(&underscore, vec![])], validate_only).await?;
+        assert_eq!(1, topics.len());
+        assert_eq!(
+            ErrorCode::InvalidTopicException,
+            ErrorCode::try_from(topics[0].error_code)?,
+            "validate_only = {validate_only}"
+        );
+        assert_eq!(
+            Some(format!("Topic '{underscore}' collides with existing topic: {period}").as_str()),
+            topics[0].error_message.as_deref()
+        );
+        assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+    }
+
+    let topics = create_topics(storage.clone(), &[(&period, vec![])], false).await?;
+    assert_eq!(
+        ErrorCode::TopicAlreadyExists,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+
+    let hyphen = format!("{prefix}-x");
+    let topics = create_topics(storage.clone(), &[(&hyphen, vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let invalid_retention = vec![
+        CreatableTopicConfig::default()
+            .name("retention.ms".into())
+            .value(Some("-2".into())),
+    ];
+    let topics = create_topics(storage.clone(), &[(&underscore, invalid_retention)], false).await?;
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+
+    let prefix = alphanumeric_string(15);
+    let underscore = format!("{prefix}_x");
+    let period = format!("{prefix}.x");
+
+    let topics = create_topics(storage.clone(), &[(&underscore, vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let topics = create_topics(storage.clone(), &[(&period, vec![])], false).await?;
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(
+        Some(format!("Topic '{period}' collides with existing topic: {underscore}").as_str()),
+        topics[0].error_message.as_deref()
+    );
+
+    // Kafka checks a name against the topics that exist before the request, so two names in
+    // one request do not collide with each other.
+    let prefix = alphanumeric_string(15);
+    let period = format!("{prefix}.x");
+    let underscore = format!("{prefix}_x");
+
+    let topics = create_topics(
+        storage.clone(),
+        &[(&period, vec![]), (&underscore, vec![])],
+        false,
+    )
+    .await?;
+    assert_eq!(2, topics.len());
+    for topic in topics {
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(topic.error_code)?,
+            "{}",
+            topic.name
+        );
+    }
+
+    // Kafka checks an invalid name for a collision too, and the collision message replaces the
+    // invalid-name message.
+    let topics = create_topics(storage.clone(), &[("_", vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let topics = create_topics(storage, &[(".", vec![])], false).await?;
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(
+        Some("Topic '.' collides with existing topic: _"),
+        topics[0].error_message.as_deref()
+    );
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use nisshi_broker::Result;
@@ -1178,6 +1317,20 @@ mod in_memory {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn colliding_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::colliding_name_rejected(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -1347,6 +1500,20 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn colliding_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::colliding_name_rejected(storage).await?;
 
         Ok(())
     }
@@ -1691,6 +1858,20 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn colliding_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::colliding_name_rejected(storage).await?;
 
         Ok(())
     }
