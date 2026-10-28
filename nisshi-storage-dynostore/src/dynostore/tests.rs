@@ -29,6 +29,7 @@ mod concurrent_retry;
 mod delete_records;
 mod describe_groups;
 mod failing_object_store;
+mod fetch_listing;
 mod init_producer;
 mod latency;
 mod list_groups;
