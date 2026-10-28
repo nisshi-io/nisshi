@@ -65,6 +65,7 @@ pub mod produce_crc;
 pub mod produce_fetch;
 pub mod produce_idempotent_duplicate;
 pub mod produce_idempotent_epoch_bump;
+pub mod produce_invalid_acks;
 pub mod produce_invalid_record;
 pub mod produce_max_message_bytes;
 pub mod produce_post_write_advance_failed;

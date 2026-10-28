@@ -1073,6 +1073,20 @@ where
             .current_leader(None)
     }
 
+    /// Returns the response for `topic` that answers each of its partitions with `error_code`.
+    fn topic_error(&self, topic: TopicProduceData, error_code: ErrorCode) -> TopicProduceResponse {
+        let partitions = topic
+            .partition_data
+            .unwrap_or_default()
+            .iter()
+            .map(|partition| self.error(partition.index, error_code))
+            .collect();
+
+        TopicProduceResponse::default()
+            .name(topic.name)
+            .partition_responses(Some(partitions))
+    }
+
     fn reject(
         &self,
         name: &str,
@@ -1313,15 +1327,28 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        let mut responses = Vec::with_capacity(
-            input
-                .request
-                .topic_data
-                .as_ref()
-                .map_or(0, |topic_data| topic_data.len()),
-        );
+        let topics = input.request.topic_data.unwrap_or_default();
+        let mut responses = Vec::with_capacity(topics.len());
 
-        if let Some(topics) = input.request.topic_data {
+        // Kafka refuses a Produce whose `acks` is not -1, 0 or 1 before it appends anything, and
+        // answers every partition `INVALID_REQUIRED_ACKS` ([`ReplicaManager.appendRecords`]).
+        //
+        // Kafka first answers an unknown partition `UNKNOWN_TOPIC_OR_PARTITION`, and a partition
+        // without exactly one batch `INVALID_RECORD`. We answer every partition
+        // `INVALID_REQUIRED_ACKS` instead, because we find an unknown partition only inside
+        // `storage.produce`, and this check must run before any storage call. Each such partition
+        // still fails, only with another error code.
+        //
+        // [`ReplicaManager.appendRecords`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L762-L765
+        if let Err(error) = Ack::try_from(input.request.acks) {
+            warn!(acks = input.request.acks, ?error, "invalid acks");
+
+            responses.extend(
+                topics
+                    .into_iter()
+                    .map(|topic| self.topic_error(topic, ErrorCode::InvalidRequiredAcks)),
+            );
+        } else {
             for topic in topics {
                 responses.push(
                     self.topic(input.request.transactional_id.as_deref(), topic)
