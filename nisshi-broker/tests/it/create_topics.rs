@@ -1045,7 +1045,12 @@ async fn colliding_name_rejected(storage: impl Storage + Clone) -> Result<(), Er
     let period = format!("{prefix}.x");
     let underscore = format!("{prefix}_x");
 
-    let topics = create_topics(storage, &[(&period, vec![]), (&underscore, vec![])], false).await?;
+    let topics = create_topics(
+        storage.clone(),
+        &[(&period, vec![]), (&underscore, vec![])],
+        false,
+    )
+    .await?;
     assert_eq!(2, topics.len());
     for topic in topics {
         assert_eq!(
@@ -1055,6 +1060,21 @@ async fn colliding_name_rejected(storage: impl Storage + Clone) -> Result<(), Er
             topic.name
         );
     }
+
+    // Kafka checks an invalid name for a collision too, and the collision message replaces the
+    // invalid-name message.
+    let topics = create_topics(storage.clone(), &[("_", vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let topics = create_topics(storage, &[(".", vec![])], false).await?;
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(
+        Some("Topic '.' collides with existing topic: _"),
+        topics[0].error_message.as_deref()
+    );
 
     Ok(())
 }
