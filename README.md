@@ -725,6 +725,71 @@ and change the data. These variables are for testing only and are not
 supported. The broker logs a warning at startup for each one that is set to
 true.
 
+### Authentication
+
+With `--authentication`, the broker requires each client to log in with SASL
+SCRAM-SHA-256 or SCRAM-SHA-512. Before a client logs in, the broker answers
+only ApiVersions, SaslHandshake and SaslAuthenticate, and it closes the
+connection on any other request, as a Kafka SASL listener does. SCRAM does not
+encrypt the connection, so use it with [TLS](#tls) when the network is not
+trusted. Nisshi does not have an authorizer, so each user who logs in can use
+every API, including the ones that create and delete topics and users.
+
+The broker keeps its users in the storage engine. `--authentication` therefore
+needs an engine that can store them, such as SQLite (`sqlite://`) or
+PostgreSQL (`postgres://`). On an engine that can't, such as `memory://` or
+`s3://`, the broker refuses to start and names the engines that can.
+
+The `nisshi` commands, such as `user`, `topic` and `cat`, don't log in yet.
+Against a broker with `--authentication` they fail with `error: Connected to
+the broker, but it closed the connection`.
+
+To create the first user, run the broker on the same storage without
+`--authentication`, and then restart it:
+
+1. Start the broker without `--authentication`. Without it, any client that
+   can reach the broker can use it, so listen on `127.0.0.1` only:
+
+   ```shell
+   nisshi broker --storage-engine sqlite://nisshi.db --listener-url tcp://127.0.0.1:9092
+   ```
+
+2. In another shell, create the user. `--mechanism` is `scram256` or
+   `scram512` (the default). The broker stores a credential for each
+   mechanism, so create the user with the mechanism that its clients use, or
+   once for each:
+
+   ```shell
+   nisshi user create alice alice-secret --mechanism scram256
+   ```
+
+   The password is an argument, so it is in your shell history, and other
+   users of the machine can see it while the command runs.
+
+3. Stop the broker, and start it again with `--authentication`:
+
+   ```shell
+   nisshi broker --storage-engine sqlite://nisshi.db --authentication
+   ```
+
+Until the `nisshi` commands support SASL, manage users and topics on a broker
+with `--authentication` with the Apache Kafka® command line tools and a client
+configuration file:
+
+```properties
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=SCRAM-SHA-256
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="alice" password="alice-secret";
+```
+
+```shell
+kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --command-config client.properties --list
+kafka-configs.sh --bootstrap-server 127.0.0.1:9092 --command-config client.properties \
+  --alter --entity-type users --entity-name bob --add-config 'SCRAM-SHA-256=[password=bob-secret]'
+```
+
+With TLS on the listener, set `security.protocol=SASL_SSL` instead.
+
 ### Metrics
 
 Metrics are exported over OTLP/HTTP when `--otlp-endpoint-url` (or
