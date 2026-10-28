@@ -46,17 +46,19 @@ changes.
   once, in the query, and the reader checks it against the field.
 - **Share one row type between the queries that return the same thing.** When two or more queries
   return the same columns with the same meaning, such as a topic found by its name and a topic
-  found by its ID, declare the row once in `sql/row/<thing>.rs`, named for what one row holds, and
-  re-export it from each query's module:
+  found by its ID, declare the row once, in an inline module of `sql/row.rs` named for what one row
+  holds, and re-export it from each query's module:
 
   ```rust
   pub(crate) use super::row::topic::{Row, RowReader};
   ```
 
-  Each engine still names the query's own module, `topic_select::RowReader`, so the query's module
-  stays the one place that says what the query returns. A row that only one query returns stays in
-  that query's module. Variants of one query, such as a PostgreSQL version and a SQLite version,
-  are constants in one module, not separate modules.
+  Each `sql_row!` declares types named `Row` and `RowReader`, so each shared row needs a module of
+  its own. Re-export only `RowReader` when no engine names `Row`, because the compiler rejects an
+  unused re-export. Each engine still names the query's own module, `topic_select::RowReader`, so
+  the query's module stays the one place that says what the query returns. A row that only one
+  query returns stays in that query's module. Variants of one query, such as a PostgreSQL version
+  and a SQLite version, are constants in one module, not separate modules.
 - **Run the query by `QUERY` through the engine's helper, and read each row with the module's
   `RowReader`.** Never write the query's file name or a column's index at a call site. Each helper
   returns the result's column names with its rows. Build the reader once, before the first row,
@@ -104,4 +106,4 @@ Change the order of a query's `select` list. Every engine still reads the same v
 column in the query. Every engine returns `Error::MissingColumn`, which names the column, even when
 the result has no rows. Store a value of the wrong type. Every engine returns `Error::Column`,
 which names the query and the column. Find two row types with the same columns and the same
-meaning. They should be one type in `sql/row/`.
+meaning. They should be one type in `sql/row.rs`.
