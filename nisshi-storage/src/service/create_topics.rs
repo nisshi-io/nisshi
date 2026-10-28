@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, NULL_TOPIC_ID,
     create_topics_response::CreatableTopicResult,
+    topic::{has_collision_chars, unify_collision_chars},
 };
 use rama::Service;
 use tracing::{debug, instrument};
@@ -106,6 +109,60 @@ where
                 })
             })
     }
+
+    /// Returns the existing topics whose names have collision characters.
+    async fn topics_with_collision_chars(&self) -> Result<TopicsWithCollisionChars> {
+        let metadata = self.storage.metadata(None).await?;
+
+        let mut by_unified_name = BTreeMap::<String, BTreeSet<String>>::new();
+
+        for name in metadata.topics().iter().filter_map(|topic| {
+            topic.name.as_deref().filter(|name| {
+                topic.error_code == i16::from(ErrorCode::None) && has_collision_chars(name)
+            })
+        }) {
+            _ = by_unified_name
+                .entry(unify_collision_chars(name))
+                .or_default()
+                .insert(name.to_owned());
+        }
+
+        Ok(TopicsWithCollisionChars(by_unified_name))
+    }
+}
+
+/// The existing topics whose names have collision characters, keyed by their unified name (see
+/// [`unify_collision_chars`]).
+#[derive(Clone, Debug, Default)]
+struct TopicsWithCollisionChars(BTreeMap<String, BTreeSet<String>>);
+
+impl TopicsWithCollisionChars {
+    /// Returns the existing topic that `name` collides with: a topic whose name differs from
+    /// `name` only in its collision characters.
+    ///
+    /// Returns `None` when a topic named `name` exists, because that topic is answered with
+    /// `TOPIC_ALREADY_EXISTS` instead.
+    fn colliding_topic(&self, name: &str) -> Option<&str> {
+        self.0
+            .get(&unify_collision_chars(name))
+            .filter(|existing| !existing.contains(name))
+            .and_then(|existing| existing.first())
+            .map(String::as_str)
+    }
+}
+
+/// Builds the [`CreatableTopicResult`] for a topic whose create failed with a storage error that
+/// is not a Kafka error code.
+fn unknown_server_error(name: String) -> CreatableTopicResult {
+    CreatableTopicResult::default()
+        .name(name)
+        .topic_id(Some(NULL_TOPIC_ID))
+        .error_code(ErrorCode::UnknownServerError.into())
+        .error_message(None)
+        .topic_config_error_code(None)
+        .num_partitions(None)
+        .replication_factor(None)
+        .configs(Some([].into()))
 }
 
 impl<G> Service<ValidatedCreateTopicsRequest> for CreateTopicsService<G>
@@ -122,7 +179,54 @@ where
     ) -> Result<Self::Output, Self::Error> {
         let mut topics = vec![];
 
+        // Kafka refuses a topic whose name collides with an existing topic's name, because its
+        // per-topic metric names do not tell '.' and '_' apart. It checks every topic, also a
+        // topic with an invalid name, against the topics that exist before the request. It
+        // checks the names before it looks for an existing topic, and before it checks the
+        // configs ([`createTopics`], [`validateNewTopicNames`]).
+        //
+        // [`createTopics`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L598-L603
+        // [`validateNewTopicNames`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L846-L867
+        let topics_with_collision_chars = if request
+            .topics
+            .iter()
+            .any(|topic| has_collision_chars(topic.name()))
+        {
+            self.topics_with_collision_chars()
+                .await
+                .inspect_err(|error| debug!(?error))
+        } else {
+            Ok(TopicsWithCollisionChars::default())
+        };
+
         for topic in request.topics {
+            // Kafka's controller serves one create at a time, and nisshi serves creates
+            // concurrently. Two concurrent creates of colliding names can both pass this check,
+            // and both topics then exist. We accept this race instead of adding a lock or a
+            // unique index to every storage engine (SOL-156700).
+            let collision = match &topics_with_collision_chars {
+                _ if !has_collision_chars(topic.name()) => None,
+
+                Ok(existing) => existing.colliding_topic(topic.name()).map(|colliding| {
+                    topic
+                        .error_result(ErrorCode::InvalidTopicException)
+                        .error_message(Some(format!(
+                            "Topic '{}' collides with existing topic: {colliding}",
+                            topic.name()
+                        )))
+                }),
+
+                // A rejected topic keeps its own error. A valid topic fails, instead of being
+                // created without the check.
+                Err(_) => matches!(topic, ValidatedTopic::Valid(_))
+                    .then(|| unknown_server_error(topic.name().to_owned())),
+            };
+
+            if let Some(result) = collision {
+                topics.push(result);
+                continue;
+            }
+
             let topic = match topic {
                 ValidatedTopic::Valid(topic) => topic,
 
@@ -187,17 +291,7 @@ where
                 Err(error) => {
                     debug!(?error);
 
-                    topics.push(
-                        CreatableTopicResult::default()
-                            .name(name)
-                            .topic_id(Some(NULL_TOPIC_ID))
-                            .error_code(ErrorCode::UnknownServerError.into())
-                            .error_message(None)
-                            .topic_config_error_code(None)
-                            .num_partitions(None)
-                            .replication_factor(None)
-                            .configs(Some([].into())),
-                    )
+                    topics.push(unknown_server_error(name))
                 }
             }
         }
