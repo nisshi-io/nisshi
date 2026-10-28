@@ -46,6 +46,7 @@ pub mod join_invalid_session_timeout;
 pub mod list_groups;
 pub mod list_offsets;
 pub mod list_offsets_after_retention;
+pub mod list_offsets_storage_error;
 pub mod list_partition_reassignments;
 pub mod log_append_time;
 pub mod log_redaction;
