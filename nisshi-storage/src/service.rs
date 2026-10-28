@@ -36,6 +36,7 @@ mod list_offsets;
 mod list_partition_reassignments;
 mod metadata;
 mod produce;
+pub mod read_share;
 mod txn;
 
 use std::{
@@ -76,7 +77,7 @@ pub use find_coordinator::FindCoordinatorService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
 pub use init_producer_id::InitProducerIdService;
 pub use list_groups::{ListGroupsService, list_groups_response};
-pub use list_offsets::ListOffsetsService;
+pub use list_offsets::{LIST_OFFSETS_CONCURRENCY, ListOffsetsService};
 pub use list_partition_reassignments::ListPartitionReassignmentsService;
 pub use metadata::MetadataService;
 use nisshi_sans_io::{

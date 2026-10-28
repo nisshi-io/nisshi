@@ -66,11 +66,14 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
+    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    config::apply_op,
+    deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
+    producer_claim,
+    read_share::{FetchReadShare, ListOffsetsReadShare},
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -82,7 +85,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
     runtime::Handle,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{AcquireError, OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout, timeout_at},
 };
 use tokio_postgres::{
@@ -124,6 +127,12 @@ pub struct Postgres {
     list_offsets_reads: Arc<Semaphore>,
     /// Permits for the Fetch partition reads in flight, see [`FETCH_READS`].
     fetch_reads: Arc<Semaphore>,
+    /// How many of `list_offsets_reads` one connection may hold, see
+    /// [`LIST_OFFSETS_READS_PER_CONNECTION`].
+    list_offsets_reads_per_connection: usize,
+    /// How many of `fetch_reads` one connection may hold, see
+    /// [`FETCH_READS_PER_CONNECTION`].
+    fetch_reads_per_connection: usize,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
@@ -203,6 +212,8 @@ impl Builder<String, i32, Url, Pool> {
             cancel: self.cancel,
             list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
             fetch_reads: Arc::new(Semaphore::new(FETCH_READS)),
+            list_offsets_reads_per_connection: LIST_OFFSETS_READS_PER_CONNECTION,
+            fetch_reads_per_connection: FETCH_READS_PER_CONNECTION,
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -222,9 +233,23 @@ const POOL_MAX_SIZE: usize = 16;
 /// most half the pool. Together with [`FETCH_READS`], they can take all of
 /// it, see [`FETCH_READS`]. A read past this limit waits for a permit, and
 /// [`ListOffsetsService`]'s deadline drops it if the wait lasts too long.
+/// One connection holds at most [`LIST_OFFSETS_READS_PER_CONNECTION`] of
+/// these permits.
 ///
 /// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
 const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
+
+/// How many of the [`LIST_OFFSETS_READS`] one client connection holds at
+/// once, see [`read_share`](nisshi_storage::read_share).
+///
+/// The share equals [`LIST_OFFSETS_CONCURRENCY`], the number of partitions
+/// that one ListOffsets request reads at once, so a single request is not
+/// slowed. A client retries a `REQUEST_TIMED_OUT` partition at once, and the
+/// retry's reads wait for the share while the abandoned reads of the request
+/// before it still run, so one connection cannot take the whole limit. The
+/// share follows the request, not the pool, so a larger pool does not let
+/// one connection hold more.
+const LIST_OFFSETS_READS_PER_CONNECTION: usize = LIST_OFFSETS_CONCURRENCY;
 
 /// How many Fetch partition reads, of records or of an offset stage, this
 /// engine has in flight at once, across every request, counting an
@@ -239,12 +264,31 @@ const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
 /// a connection. A smaller limit would slow down healthy consumers, because
 /// a fetch read holds its connection for its whole storage budget. A read
 /// past this limit waits for a permit, and [`FetchService`]'s deadline drops
-/// it if the wait lasts too long.
+/// it if the wait lasts too long. One connection holds at most
+/// [`FETCH_READS_PER_CONNECTION`] of these permits.
 ///
 /// [`FetchService`]: nisshi_storage::FetchService
 const FETCH_READS: usize = POOL_MAX_SIZE / 2;
 
+/// How many of the [`FETCH_READS`] one client connection holds at once, see
+/// [`read_share`](nisshi_storage::read_share).
+///
+/// A Fetch gives each partition half of the time left, so one wide Fetch
+/// can abandon several partitions in a row, and each abandoned read holds
+/// its permit until its statement ends. Without a share, one connection
+/// could hold most of the limit that way, and every other consumer's reads
+/// would wait and come back empty.
+///
+/// A Fetch reads its partitions one after another, so a connection holds
+/// one live read at a time. The second permit lets that read run while one
+/// abandoned read of the connection still holds its permit. The share
+/// follows how a Fetch reads, not the pool, so a larger pool does not let
+/// one connection hold more.
+const FETCH_READS_PER_CONNECTION: usize = 2;
+
 const _: () = assert!(LIST_OFFSETS_READS + FETCH_READS <= POOL_MAX_SIZE);
+const _: () = assert!(LIST_OFFSETS_READS_PER_CONNECTION <= LIST_OFFSETS_READS);
+const _: () = assert!(FETCH_READS_PER_CONNECTION <= FETCH_READS);
 
 /// How much longer than its connection's `statement_timeout` an abandoned
 /// statement is waited for before its connection is closed, see
@@ -802,6 +846,44 @@ where
 /// read that left no block open.
 const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp()";
 
+/// The permits that a read holds while it is in flight: one from its
+/// connection's share, see [`read_share`](nisshi_storage::read_share), and
+/// one from the engine's limit on reads in flight ([`LIST_OFFSETS_READS`]
+/// or [`FETCH_READS`]).
+///
+/// An abandoned read keeps both until its statement ends, see
+/// [`cancel_and_return`].
+#[derive(Debug)]
+// Nothing reads the permits: holding them is the point, and dropping
+// `ReadPermits` returns them.
+#[allow(dead_code)]
+struct ReadPermits {
+    /// `None` for a read that runs outside a connection's read share.
+    connection_share: Option<OwnedSemaphorePermit>,
+    limit: OwnedSemaphorePermit,
+}
+
+impl ReadPermits {
+    /// Waits for `connection_share`, a permit from the connection's share,
+    /// and then for a permit from `limit`.
+    ///
+    /// The share comes first, so a connection never waits on `limit` for
+    /// more reads than its share. `limit` is a FIFO queue, and those reads
+    /// would hold places in it ahead of other connections' reads.
+    async fn acquire(
+        connection_share: impl Future<Output = Result<Option<OwnedSemaphorePermit>, AcquireError>>,
+        limit: &Arc<Semaphore>,
+    ) -> Result<Self> {
+        let connection_share = connection_share.await?;
+        let limit = deadline::queued(limit.clone().acquire_owned()).await?;
+
+        Ok(Self {
+            connection_share,
+            limit,
+        })
+    }
+}
+
 /// Waits for the statement on `connection` to end, then returns whether the
 /// connection is outside any transaction block, see [`SETTLE_QUERY`].
 async fn settled_outside_a_transaction(connection: &Object) -> Result<bool, tokio_postgres::Error> {
@@ -816,10 +898,12 @@ async fn settled_outside_a_transaction(connection: &Object) -> Result<bool, toki
 /// the connection to its pool once that statement has ended, so the pool
 /// stays within its [`POOL_MAX_SIZE`] server connections.
 ///
-/// The connection and `permit` are held until the statement has ended,
+/// The connection and `permits` are held until the statement has ended,
 /// whether or not the cancel request reached the server, so the statement
-/// counts against the limit that `permit` comes from ([`LIST_OFFSETS_READS`]
-/// or [`FETCH_READS`]) meanwhile. A cancel request that misses its
+/// counts against the limit that `permits` come from ([`LIST_OFFSETS_READS`]
+/// or [`FETCH_READS`]), and against its connection's share of that limit,
+/// meanwhile. The share keeps a connection whose reads are abandoned in a
+/// row from holding the whole limit. A cancel request that misses its
 /// statement (a host other than the one running the statement, or a proxy
 /// that does not forward it) then shows as reads that wait for a permit,
 /// under the `queued` stage, rather than as server connections beyond the
@@ -841,9 +925,9 @@ async fn cancel_and_return(
     connection: Object,
     cancel: Option<CancelRequests>,
     bound: Duration,
-    permit: OwnedSemaphorePermit,
+    permits: ReadPermits,
 ) {
-    let _permit = permit;
+    let _permits = permits;
     let settle_by = Instant::now() + bound;
 
     let host = match cancel {
@@ -1053,16 +1137,15 @@ impl Postgres {
     }
 
     /// Checks out a connection for a read that a caller may drop
-    /// mid-statement, holding `permit` from the read's limit on reads in
-    /// flight.
+    /// mid-statement, holding the read's `permits`.
     ///
     /// Dropping the guard before [`Abandonable::release`] asks the server to
     /// cancel the statement, so it stops instead of running until
-    /// `statement_timeout`, and keeps the connection and the permit until
+    /// `statement_timeout`, and keeps the connection and the permits until
     /// the statement has ended, see [`cancel_and_return`].
     async fn abandonable_connection(
         &self,
-        permit: OwnedSemaphorePermit,
+        permits: ReadPermits,
     ) -> Result<Abandonable<Manager, impl FnOnce(Object) + use<>>> {
         let cancel = self.cancel.clone();
         let bound = self.abandoned_statement_bound;
@@ -1074,7 +1157,7 @@ impl Postgres {
                     // name the peer, the correlation id and the partition.
                     Ok(runtime) => {
                         _ = runtime.spawn(
-                            cancel_and_return(connection, cancel, bound, permit).in_current_span(),
+                            cancel_and_return(connection, cancel, bound, permits).in_current_span(),
                         );
                     }
 
@@ -1085,6 +1168,26 @@ impl Postgres {
                 }
             })
         })
+    }
+
+    /// Waits for the permits of a Fetch read, of records or of an offset
+    /// stage, see [`FETCH_READS`].
+    async fn fetch_read_permits(&self) -> Result<ReadPermits> {
+        ReadPermits::acquire(
+            FetchReadShare::acquire(self.fetch_reads_per_connection),
+            &self.fetch_reads,
+        )
+        .await
+    }
+
+    /// Waits for the permits of a ListOffsets read, see
+    /// [`LIST_OFFSETS_READS`].
+    async fn list_offsets_read_permits(&self) -> Result<ReadPermits> {
+        ReadPermits::acquire(
+            ListOffsetsReadShare::acquire(self.list_offsets_reads_per_connection),
+            &self.list_offsets_reads,
+        )
+        .await
     }
 
     /// Reads the records of `topition` from `offset` on `c`, in one
@@ -3853,8 +3956,8 @@ impl Storage for Postgres {
         let (base_topic, key_filter): (&str, Option<&str>) =
             self.topic_with_key(topition.topic()).await?;
 
-        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
-        let mut connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let permits = self.fetch_read_permits().await?;
+        let mut connection = deadline::queued(self.abandonable_connection(permits)).await?;
         let batches = self
             .fetch_on(
                 connection.object_mut()?,
@@ -3879,8 +3982,8 @@ impl Storage for Postgres {
 
         let base_topic = self.base_topic(topition.topic()).await?;
 
-        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
-        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let permits = self.fetch_read_permits().await?;
+        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
         let offset_stage = self
             .offset_stage_on(connection.object()?, base_topic, topition.partition())
             .await;
@@ -4067,8 +4170,8 @@ impl Storage for Postgres {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         debug!(cluster = self.cluster, ?isolation_level);
 
-        let permit = deadline::queued(self.list_offsets_reads.clone().acquire_owned()).await?;
-        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let permits = self.list_offsets_read_permits().await?;
+        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
         let responses = self
             .list_offsets_on(connection.object()?, isolation_level, offsets)
             .await;
@@ -5300,6 +5403,7 @@ mod tests {
     };
     use rand::distr::Alphanumeric;
     use std::assert_matches;
+    use tokio::task::JoinHandle;
 
     // mirrors nisshi-broker/tests/it/common/mod.rs storage_container(StorageType::Postgres)
     const CONNECTION: &str = "postgres://postgres:postgres@localhost";
@@ -5607,14 +5711,10 @@ mod tests {
         Ok(())
     }
 
-    /// At most `LIST_OFFSETS_READS` ListOffsets reads reach the pool at
-    /// once; the rest wait for a permit, and the permits come back when the
-    /// reads are dropped.
-    ///
-    /// The pool has no permits at all, so each read that has a ListOffsets
-    /// permit waits in the pool, where the pool counts it, without a server.
-    #[tokio::test]
-    async fn list_offsets_reads_are_limited_before_the_pool() -> Result<()> {
+    /// Returns a storage whose pool has no permits at all, so each read that
+    /// has its read permits waits in the pool, where the pool counts it,
+    /// without a server.
+    fn storage_without_connections() -> Result<Postgres> {
         let pool = Pool::builder(Manager::new(
             Config::from_str(CONNECTION)?,
             tokio_postgres::NoTls,
@@ -5624,13 +5724,231 @@ mod tests {
         .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
         .build()?;
 
-        let storage = Postgres {
+        Ok(Postgres {
             pool,
             ..Postgres::builder(CONNECTION)?
                 .cluster(alphanumeric_string(15).as_str())
                 .node(rng().random_range(0..i32::MAX))
                 .build()
+        })
+    }
+
+    /// Waits until at least `waiting` reads wait in `storage`'s pool, gives
+    /// other reads time to reach it too, and returns how many wait.
+    async fn reads_waiting_in_the_pool(storage: &Postgres, waiting: usize) -> usize {
+        let settled = Instant::now() + Duration::from_secs(5);
+        while storage.pool.status().waiting < waiting {
+            assert!(Instant::now() < settled, "{:?}", storage.pool.status());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        storage.pool.status().waiting
+    }
+
+    /// Aborts each of `reads` and waits for it to end.
+    async fn abort_reads<T: Debug>(reads: Vec<JoinHandle<T>>) {
+        for read in &reads {
+            read.abort();
+        }
+        for read in reads {
+            let outcome = read.await;
+            assert!(
+                outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// Spawns a ListOffsets read of `topition` on a connection with `share`.
+    fn spawn_list_offsets(
+        storage: &Postgres,
+        topition: &Topition,
+        share: ListOffsetsReadShare,
+    ) -> JoinHandle<Result<Vec<(Topition, ListOffsetResponse)>>> {
+        let storage = storage.clone();
+        let offsets = [(topition.clone(), ListOffset::Latest)];
+
+        tokio::spawn(share.scope(async move {
+            storage
+                .list_offsets(IsolationLevel::ReadUncommitted, &offsets)
+                .await
+        }))
+    }
+
+    /// Spawns a read of `topition`'s offset stage on a connection with
+    /// `share`.
+    fn spawn_offset_stage(
+        storage: &Postgres,
+        topition: &Topition,
+        share: FetchReadShare,
+    ) -> JoinHandle<Result<OffsetStage>> {
+        let storage = storage.clone();
+        let topition = topition.clone();
+
+        tokio::spawn(share.scope(async move { storage.offset_stage(&topition).await }))
+    }
+
+    /// One connection's ListOffsets reads reach the pool only up to its
+    /// share, `LIST_OFFSETS_READS_PER_CONNECTION`, and leave the rest of
+    /// `LIST_OFFSETS_READS` to other connections.
+    #[tokio::test]
+    async fn one_connection_holds_at_most_its_share_of_list_offsets_reads() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+
+        let connection = ListOffsetsReadShare::default();
+        let mut reads = (0..LIST_OFFSETS_READS)
+            .map(|_| spawn_list_offsets(&storage, &topition, connection.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            LIST_OFFSETS_READS_PER_CONNECTION,
+            reads_waiting_in_the_pool(&storage, LIST_OFFSETS_READS_PER_CONNECTION).await
+        );
+
+        reads.push(spawn_list_offsets(
+            &storage,
+            &topition,
+            ListOffsetsReadShare::default(),
+        ));
+
+        assert_eq!(
+            LIST_OFFSETS_READS_PER_CONNECTION + 1,
+            reads_waiting_in_the_pool(&storage, LIST_OFFSETS_READS_PER_CONNECTION + 1).await
+        );
+
+        abort_reads(reads).await;
+        assert_eq!(
+            LIST_OFFSETS_READS,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// One connection's Fetch reads reach the pool only up to its share,
+    /// `FETCH_READS_PER_CONNECTION`, and leave the rest of `FETCH_READS` to
+    /// other connections.
+    #[tokio::test]
+    async fn one_connection_holds_at_most_its_share_of_fetch_reads() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+
+        let connection = FetchReadShare::default();
+        let mut reads = (0..FETCH_READS)
+            .map(|_| spawn_offset_stage(&storage, &topition, connection.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            FETCH_READS_PER_CONNECTION,
+            reads_waiting_in_the_pool(&storage, FETCH_READS_PER_CONNECTION).await
+        );
+
+        reads.push(spawn_offset_stage(
+            &storage,
+            &topition,
+            FetchReadShare::default(),
+        ));
+
+        assert_eq!(
+            FETCH_READS_PER_CONNECTION + 1,
+            reads_waiting_in_the_pool(&storage, FETCH_READS_PER_CONNECTION + 1).await
+        );
+
+        abort_reads(reads).await;
+        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// A connection's abandoned Fetch reads keep their permits from its
+    /// share, as well as from `FETCH_READS`, until their statements end. The
+    /// connection's next read waits meanwhile, and another connection's
+    /// read goes ahead.
+    #[tokio::test]
+    async fn abandoned_fetch_reads_count_against_their_connection() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!("skipping abandoned_fetch_reads_count_against_their_connection: {err:?}");
+                return Ok(());
+            }
         };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let marker = alphanumeric_string(15);
+        let connection = FetchReadShare::default();
+
+        for _ in 0..FETCH_READS_PER_CONNECTION {
+            let permits = connection
+                .clone()
+                .scope(storage.fetch_read_permits())
+                .await?;
+            abandon_sleeping_statement(&storage, permits, &marker).await?;
+        }
+
+        assert_eq!(
+            i64::try_from(FETCH_READS_PER_CONNECTION)?,
+            backends_running(&monitor, &marker).await?
+        );
+        assert_eq!(
+            FETCH_READS - FETCH_READS_PER_CONNECTION,
+            storage.fetch_reads.available_permits()
+        );
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                connection.clone().scope(storage.fetch_read_permits())
+            )
+            .await
+            .is_err(),
+            "the connection read beyond its share while its abandoned reads ran"
+        );
+
+        let other_connection = timeout(
+            Duration::from_millis(200),
+            FetchReadShare::default().scope(storage.fetch_read_permits()),
+        )
+        .await
+        .map_err(|_| Error::Message("another connection's read waited".into()))??;
+        drop(other_connection);
+
+        assert_eq!(
+            FETCH_READS_PER_CONNECTION,
+            cancel_backends(&monitor, &marker).await?
+        );
+
+        wait_until(&storage, |storage| {
+            storage.fetch_reads.available_permits() == FETCH_READS
+        })
+        .await;
+
+        _ = timeout(
+            Duration::from_secs(1),
+            connection.scope(storage.fetch_read_permits()),
+        )
+        .await
+        .map_err(|_| Error::Message("the connection's share did not come back".into()))??;
+
+        Ok(())
+    }
+
+    /// At most `LIST_OFFSETS_READS` ListOffsets reads reach the pool at
+    /// once; the rest wait for a permit, and the permits come back when the
+    /// reads are dropped.
+    ///
+    /// The pool has no permits at all, so each read that has a ListOffsets
+    /// permit waits in the pool, where the pool counts it, without a server.
+    #[tokio::test]
+    async fn list_offsets_reads_are_limited_before_the_pool() -> Result<()> {
+        let storage = storage_without_connections()?;
 
         let topition = Topition::new("limited", 0);
         let reads = (0..LIST_OFFSETS_READS + 3)
@@ -5701,8 +6019,8 @@ mod tests {
         let marker = alphanumeric_string(15);
         let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
 
-        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
-        let connection = storage.abandonable_connection(permit).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        let connection = storage.abandonable_connection(permits).await?;
         assert_eq!(
             LIST_OFFSETS_READS - 1,
             storage.list_offsets_reads.available_permits()
@@ -5809,13 +6127,17 @@ mod tests {
     }
 
     /// Runs `SELECT pg_sleep(30)` marked `marker` on an abandonable
-    /// connection and drops the connection mid-statement, returning once the
-    /// cancel task has had time to send its cancel request.
-    async fn abandon_sleeping_statement(storage: &Postgres, marker: &str) -> Result<()> {
+    /// connection holding `permits` and drops the connection mid-statement,
+    /// returning once the cancel task has had time to send its cancel
+    /// request.
+    async fn abandon_sleeping_statement(
+        storage: &Postgres,
+        permits: ReadPermits,
+        marker: &str,
+    ) -> Result<()> {
         let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
 
-        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
-        let connection = storage.abandonable_connection(permit).await?;
+        let connection = storage.abandonable_connection(permits).await?;
 
         assert!(
             timeout(
@@ -5873,7 +6195,8 @@ mod tests {
         let storage = with_cancel_requests_refused(storage).await?;
         let marker = alphanumeric_string(15);
 
-        abandon_sleeping_statement(&storage, &marker).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        abandon_sleeping_statement(&storage, permits, &marker).await?;
 
         assert_eq!(1, backends_running(&monitor, &marker).await?);
         assert_eq!(
@@ -5923,7 +6246,8 @@ mod tests {
         };
         let marker = alphanumeric_string(15);
 
-        abandon_sleeping_statement(&storage, &marker).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        abandon_sleeping_statement(&storage, permits, &marker).await?;
 
         assert_eq!(
             LIST_OFFSETS_READS - 1,
@@ -5965,7 +6289,8 @@ mod tests {
         let storage = with_cancel_requests_refused(storage).await?;
         let marker = alphanumeric_string(15);
 
-        abandon_sleeping_statement(&storage, &marker).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        abandon_sleeping_statement(&storage, permits, &marker).await?;
 
         assert_eq!(
             LIST_OFFSETS_READS - 1,
@@ -6001,22 +6326,7 @@ mod tests {
     /// permit waits in the pool, where the pool counts it, without a server.
     #[tokio::test]
     async fn fetch_reads_are_limited_before_the_pool() -> Result<()> {
-        let pool = Pool::builder(Manager::new(
-            Config::from_str(CONNECTION)?,
-            tokio_postgres::NoTls,
-        ))
-        .max_size(0)
-        .runtime(Runtime::Tokio1)
-        .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
-        .build()?;
-
-        let storage = Postgres {
-            pool,
-            ..Postgres::builder(CONNECTION)?
-                .cluster(alphanumeric_string(15).as_str())
-                .node(rng().random_range(0..i32::MAX))
-                .build()
-        };
+        let storage = storage_without_connections()?;
 
         let topition = Topition::new("limited", 0);
         let reads = (0..FETCH_READS + 3)
@@ -6101,8 +6411,8 @@ mod tests {
         let failed = format!("BEGIN; SELECT pg_sleep(30) /* {marker} */");
 
         for read in [open, failed] {
-            let permit = storage.fetch_reads.clone().acquire_owned().await?;
-            let connection = storage.abandonable_connection(permit).await?;
+            let permits = storage.fetch_read_permits().await?;
+            let connection = storage.abandonable_connection(permits).await?;
             let backend = connection
                 .object()?
                 .query_one("SELECT pg_backend_pid()", &[])

@@ -41,7 +41,6 @@ pub struct ValidatedFetchRequest {
     pub(super) topics: Vec<FetchTopic>,
     /// The request's extensions, carried so a service behind the layer sees the same
     /// per-connection state (e.g. the authenticated principal) as one without it.
-    #[allow(dead_code)]
     pub(super) extensions: Extensions,
 }
 
