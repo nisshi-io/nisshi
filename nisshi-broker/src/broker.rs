@@ -43,14 +43,13 @@ use std::{
     io::{self, ErrorKind},
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
-    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, lookup_host},
     task::{AbortHandle, JoinSet},
     time::{self, Instant, sleep, timeout},
 };
@@ -196,6 +195,71 @@ fn bind(addr: SocketAddr) -> Result<TcpListener> {
         })
 }
 
+/// Returns the address that the broker's listener binds for the `listener` URL.
+///
+/// A URL without a host listens on `[::]`, and the port defaults to 9092. An IP literal is
+/// used as it is: under a non-special scheme such as `tcp`, the `url` crate parses an IPv4
+/// literal as a domain, so a domain is parsed as an IP address before it is looked up. Any
+/// other host name is resolved, as Apache Kafka resolves the host of a listener, and the
+/// listener binds the address that [`preferred_listener_addr`] picks.
+///
+/// # Errors
+///
+/// Returns [`Error::ListenerHostUnresolved`] when the host name resolves to no address.
+async fn listener_addr(listener: &Url) -> Result<SocketAddr> {
+    let port = listener.port().unwrap_or(9092);
+
+    match listener.host() {
+        None => Ok(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))),
+        Some(url::Host::Ipv4(ip)) => Ok(SocketAddr::from((ip, port))),
+        Some(url::Host::Ipv6(ip)) => Ok(SocketAddr::from((ip, port))),
+        Some(url::Host::Domain(domain)) => {
+            if let Ok(ip) = domain.parse::<IpAddr>() {
+                return Ok(SocketAddr::from((ip, port)));
+            }
+
+            let unresolved = |source| Error::ListenerHostUnresolved {
+                host: domain.to_owned(),
+                source: Arc::new(source),
+            };
+
+            let resolved = lookup_host((domain, port))
+                .await
+                .map_err(unresolved)?
+                .collect::<Vec<_>>();
+            debug!(domain, ?resolved);
+
+            preferred_listener_addr(resolved)
+                .inspect(|addr| info!(host = domain, %addr, "listener host resolved"))
+                .ok_or_else(|| {
+                    unresolved(io::Error::new(
+                        ErrorKind::NotFound,
+                        "the name resolved to no address",
+                    ))
+                })
+        }
+    }
+}
+
+/// Picks the address that the listener binds from the addresses that its host name resolved
+/// to: the first IPv4 address, or the first address when there is none.
+///
+/// The JDK does the same by default (`java.net.preferIPv6Addresses=false`), so a name such as
+/// `localhost`, which macOS resolves to `::1` first, binds `127.0.0.1` as Apache Kafka would.
+fn preferred_listener_addr(resolved: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut first = None;
+
+    for addr in resolved {
+        if addr.is_ipv4() {
+            return Some(addr);
+        }
+
+        _ = first.get_or_insert(addr);
+    }
+
+    first
+}
+
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
     node_id: i32,
@@ -308,9 +372,11 @@ where
             v = set.join_next() => {
                 debug!(?v);
                 failure = match v {
-                    // The caller reports `ListenerInUse` with the fix, so it is logged
-                    // here only at debug, to avoid printing it twice.
-                    Some(Ok(Err(err @ Error::ListenerInUse { .. }))) => {
+                    // The caller reports these errors with the fix, so they are logged
+                    // here only at debug, to avoid printing them twice.
+                    Some(Ok(Err(
+                        err @ (Error::ListenerInUse { .. } | Error::ListenerHostUnresolved { .. }),
+                    ))) => {
                         debug!(?err);
                         Some(err)
                     }
@@ -410,25 +476,7 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
-        let addr = self.listener.host().map_or_else(
-            || {
-                SocketAddr::from((
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    self.listener.port().unwrap_or(9092),
-                ))
-            },
-            |host| {
-                let port = self.listener.port().unwrap_or(9092);
-                debug!(?host, port);
-
-                match host {
-                    url::Host::Domain(domain) => SocketAddr::from_str(&format!("{domain}:{port}"))
-                        .unwrap_or(SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))),
-                    url::Host::Ipv4(ipv4_addr) => SocketAddr::from((IpAddr::V4(ipv4_addr), port)),
-                    url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
-                }
-            },
-        );
+        let addr = listener_addr(&self.listener).await?;
 
         let listener = bind(addr)
             .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
@@ -1021,6 +1069,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 mod tests {
     use super::{
         address_family_unsupported_os_error, arm, bind, configure_listener, ipv4_fallback,
+        listener_addr, preferred_listener_addr,
     };
     use crate::Error;
     use socket2::{Domain, Protocol, Socket, Type};
@@ -1029,6 +1078,73 @@ mod tests {
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     };
     use tokio::net::{TcpListener, TcpStream};
+    use url::Url;
+
+    async fn listener_addr_of(listener: &str) -> crate::Result<SocketAddr> {
+        listener_addr(&Url::parse(listener).expect("listener URL")).await
+    }
+
+    /// The `url` crate parses an IPv4 literal under a non-special scheme such as `tcp` as
+    /// `Host::Domain`, so this covers the literal path of the domain arm.
+    #[tokio::test]
+    async fn ipv4_literal_under_tcp_scheme_keeps_its_address() {
+        for (listener, expected) in [
+            (
+                "tcp://127.0.0.1:9092",
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 9092)),
+            ),
+            (
+                "tcp://0.0.0.0:9092",
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9092)),
+            ),
+        ] {
+            assert_matches!(listener_addr_of(listener).await, Ok(addr) if addr == expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_and_missing_host_keep_their_address() {
+        assert_matches!(
+            listener_addr_of("tcp://[::1]:9092").await,
+            Ok(addr) if addr == SocketAddr::from((Ipv6Addr::LOCALHOST, 9092))
+        );
+        assert_matches!(
+            listener_addr_of("tcp:///").await,
+            Ok(addr) if addr == SocketAddr::from((Ipv6Addr::UNSPECIFIED, 9092))
+        );
+    }
+
+    /// `localhost` resolves to `::1` before `127.0.0.1` on macOS. The listener takes the IPv4
+    /// address, as the JDK does by default, so it accepts clients of the default advertised
+    /// listener, `tcp://127.0.0.1:9092`.
+    #[tokio::test]
+    async fn host_name_resolves_instead_of_binding_unspecified() {
+        assert_matches!(
+            listener_addr_of("tcp://localhost:9092").await,
+            Ok(addr) if addr == SocketAddr::from((Ipv4Addr::LOCALHOST, 9092))
+        );
+    }
+
+    /// RFC 6761 reserves `.invalid`, so the lookup goes through the system resolver and
+    /// never succeeds.
+    #[tokio::test]
+    async fn unresolvable_host_fails_naming_the_host() {
+        assert_matches!(
+            listener_addr_of("tcp://nisshi-listener.invalid:9092").await,
+            Err(Error::ListenerHostUnresolved { host, .. }) if host == "nisshi-listener.invalid"
+        );
+    }
+
+    #[test]
+    fn preferred_listener_addr_takes_the_first_ipv4_address() {
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9092));
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 9092));
+        let other_v4 = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 9092));
+
+        assert_eq!(Some(v4), preferred_listener_addr([v6, v4, other_v4]));
+        assert_eq!(Some(v6), preferred_listener_addr([v6]));
+        assert_eq!(None, preferred_listener_addr([]));
+    }
 
     #[tokio::test]
     async fn binding_an_address_in_use_names_the_address() {

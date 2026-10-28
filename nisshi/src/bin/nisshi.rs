@@ -122,6 +122,16 @@ fn listener_in_use_message(addr: SocketAddr) -> String {
     )
 }
 
+/// Returns the error message for a broker whose listener URL names a host that did not
+/// resolve to an address.
+fn listener_host_unresolved_message(host: &str, source: &io::Error) -> String {
+    format!(
+        "the --listener-url host {host} could not be resolved: {source}. Set --listener-url to \
+        an IP address, or to a host name that this machine resolves, for example \
+        tcp://0.0.0.0:9092"
+    )
+}
+
 /// Runs the command, and exits with failure when it returns an error or a Kafka error code.
 ///
 /// `main` reports an error and then returns [`ExitCode::FAILURE`], instead of returning the
@@ -275,6 +285,9 @@ fn report_error(err: &nisshi_cli::Error) {
             nisshi_broker::Error::ListenerInUse { addr } => {
                 report_failure!("{}", listener_in_use_message(*addr))
             }
+            nisshi_broker::Error::ListenerHostUnresolved { host, source } => {
+                report_failure!("{}", listener_host_unresolved_message(host, source))
+            }
             nisshi_broker::Error::Storage(nisshi_storage::Error::NoEngineForScheme {
                 scheme,
                 storage,
@@ -345,7 +358,7 @@ fn report_error(err: &nisshi_cli::Error) {
 mod tests {
     use super::{
         BROKER_OPTION, TOPIC_BROKER_OPTION, cat_error_message, client_error_message, failure_line,
-        feature_not_enabled_message, listener_in_use_message,
+        feature_not_enabled_message, listener_host_unresolved_message, listener_in_use_message,
     };
 
     /// The smoke tests find a failed start by the `error: ` prefix.
@@ -481,6 +494,18 @@ mod tests {
             process that uses it (perhaps another broker), or start this broker on another port, \
             with --listener-url and --advertised-listener-url both set to tcp://<host>:<port>",
             listener_in_use_message(SocketAddr::from((Ipv4Addr::LOCALHOST, 9092)))
+        );
+    }
+
+    #[test]
+    fn listener_host_unresolved_message_names_the_host_and_the_fix() {
+        let source = io::Error::other("nodename nor servname provided, or not known");
+
+        assert_eq!(
+            "the --listener-url host eth1.internal could not be resolved: nodename nor servname \
+            provided, or not known. Set --listener-url to an IP address, or to a host name that \
+            this machine resolves, for example tcp://0.0.0.0:9092",
+            listener_host_unresolved_message("eth1.internal", &source)
         );
     }
 }

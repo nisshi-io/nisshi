@@ -96,6 +96,12 @@ pub enum Error {
         addr: SocketAddr,
     },
 
+    /// The host of the broker's listener URL is a name that did not resolve to an address.
+    ListenerHostUnresolved {
+        host: String,
+        source: Arc<io::Error>,
+    },
+
     Message(String),
     Model(#[from] nisshi_model::Error),
 
