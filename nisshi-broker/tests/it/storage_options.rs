@@ -20,6 +20,7 @@ use nisshi_broker::{
     Error, NODE_ID, Result, broker::Broker, coordinator::group::administrator::Controller,
 };
 use nisshi_storage::ArcDynStorage;
+use std::assert_matches;
 use url::Url;
 use uuid::Uuid;
 
@@ -90,6 +91,32 @@ async fn memory_rejects_misspelt_option() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(feature = "postgres")]
+mod postgres {
+    use super::*;
+
+    /// The engine rejects the pool size before it connects, so this test
+    /// needs no server.
+    #[tokio::test]
+    async fn rejects_invalid_pool_max_size() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let error = build("postgres://postgres:postgres@localhost?pool_max_size=1")
+            .await
+            .unwrap_err();
+        assert_matches!(
+            &error,
+            Error::Storage(nisshi_storage::Error::InvalidStorageOptionValue {
+                scheme,
+                option,
+                value,
+            }) if scheme == "postgres" && option == "pool_max_size" && value == "1"
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]

@@ -289,6 +289,15 @@ fn report_error(err: &nisshi_cli::Error) {
             }) => {
                 report_failure!("storage option {option} is not recognised by the {scheme} engine")
             }
+            nisshi_broker::Error::Storage(nisshi_storage::Error::InvalidStorageOptionValue {
+                scheme,
+                option,
+                value,
+            }) => {
+                report_failure!(
+                    "storage option {option}={value} is not valid for the {scheme} engine"
+                )
+            }
             _ => report_failure!("Unknown error occurred during command: {}", err),
         },
         nisshi_cli::Error::TlsCertificate { path, source } => report_failure!(

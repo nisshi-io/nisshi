@@ -431,6 +431,14 @@ pub enum Error {
         option: String,
     },
 
+    /// A storage URL gave a query option that scheme's engine reads a value
+    /// that the engine rejects, such as a number out of range.
+    InvalidStorageOptionValue {
+        scheme: String,
+        option: String,
+        value: String,
+    },
+
     /// The v4+ (multi-transaction) field shape of `AddPartitionsToTxn` is not implemented on
     /// this backend.
     UnsupportedTxnAddPartitionsVersion,
