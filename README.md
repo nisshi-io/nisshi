@@ -75,7 +75,7 @@ Use the [latest release][nisshi-latest-release], the one marked **Latest** on th
 
 Releases marked **Pre-release**, with tags such as `v0.8.0-pre.1`, are builds of `main` published ahead of the next release. Their behaviour and storage formats can still change, and a later version may not read the data they wrote (upgrading from 0.7.0-pre.1 or pre.2 to 0.7.0 needs the manual steps in the 0.7.0 upgrade notes). Use them for testing, not for data you want to keep. To install one, name its exact version, for example `ghcr.io/nisshi-io/nisshi:0.8.0-pre.1`.
 
-Upgrading from a release before 0.8.0? The default cluster id and the Iceberg and Delta namespace changed in 0.7.0, and the topic configuration keys changed in 0.8.0. Read the upgrade notes for both in [CHANGELOG.md](CHANGELOG.md) before you upgrade.
+Upgrading? Read the upgrade notes in [CHANGELOG.md](CHANGELOG.md) for every release after the one you run. The default cluster id and the Iceberg and Delta namespace changed in 0.7.0, and the topic configuration keys changed in 0.8.0.
 
 This README describes `main`, which can be ahead of the latest release. To read the README of a release, open it at its tag, for example [v0.7.0](https://github.com/nisshi-io/solace-nisshi/blob/v0.7.0/README.md).
 
