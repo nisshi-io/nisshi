@@ -24,18 +24,14 @@ use std::{
 use async_trait::async_trait;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    TimestampType,
-    create_topics_request::CreatableTopic,
-    delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic,
+    TimestampType, create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult, delete_records_request::DeleteRecordsTopic,
     delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_response::AbortedTransaction,
-    incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    record::{Record, deflated},
+    fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::{
@@ -338,9 +334,13 @@ where
         };
 
         let responses_by_owner = match outcome {
-            // The merged batch is over `max.message.bytes`, but each batch as sent may fit. Kafka
-            // checks each batch as sent, so we write each one on its own.
-            Err(Error::MessageTooLarge { .. }) => {
+            // The merged batch is over `max.message.bytes`, or one of its offset deltas overflows
+            // an `i32`. Kafka checks and stores each batch as sent, and each one may be valid, so we
+            // write each one on its own.
+            Err(
+                Error::MessageTooLarge { .. }
+                | Error::SansIo(nisshi_sans_io::Error::OffsetDeltaOverflow(_)),
+            ) => {
                 self.write_each_as_sent(
                     transaction_id,
                     topition,
@@ -847,26 +847,7 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
             sink.max_timestamp, batch.base_offset, batch.last_offset_delta, batch.base_sequence
         );
 
-        sink.records.append(
-            &mut batch
-                .records
-                .into_iter()
-                .map(|record| Record {
-                    offset_delta: record.offset_delta + sink.last_offset_delta + 1,
-                    // The difference of two bases can overflow, because nothing checks the
-                    // producer's `base_timestamp` on a `LogAppendTime` batch. Wrapping arithmetic
-                    // keeps each record's timestamp, the wrapping sum of the sink's base and the
-                    // new delta, equal to its timestamp before the merge.
-                    timestamp_delta: record
-                        .timestamp_delta
-                        .wrapping_add(batch.base_timestamp.wrapping_sub(sink.base_timestamp)),
-                    ..record
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        sink.last_offset_delta += batch.last_offset_delta + 1;
-        sink.max_timestamp = sink.max_timestamp.max(batch.max_timestamp);
+        sink.append_rebased(batch)?;
     }
 
     debug!(
@@ -1890,6 +1871,62 @@ mod tests {
             Some(second_record_value),
             stored_batches[1].records[0].value()
         );
+
+        Ok(())
+    }
+
+    /// Two batches are written one at a time when a record offset delta of the second overflows
+    /// once that batch is appended to the first. Kafka accepts each batch as sent, so each request
+    /// receives its own offset, and the record keeps the offset delta that its producer sent.
+    #[tokio::test(start_paused = true)]
+    async fn merged_batch_whose_offset_delta_overflows_is_written_as_sent() -> Result<()> {
+        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
+        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
+
+        let recorder = FlightRecorder::new();
+        let batcher =
+            ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(Some(MINIMUM_DELAY));
+        let topition = Topition::new("abc", 0);
+
+        let first_batch = batch_of(
+            PRODUCER_ID,
+            BatchAttribute::default().into(),
+            &Bytes::from_static(b"first"),
+        )?;
+        // The batch has no sequence, so the batcher can merge it with the first.
+        let batch_with_maximum_offset_delta = inflated::Batch::builder()
+            .producer_id(PRODUCER_ID)
+            .base_sequence(-1)
+            .record(
+                Record::builder()
+                    .offset_delta(i32::MAX)
+                    .value(Bytes::from_static(b"second").into()),
+            )
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let first_produce = spawn_produce(&batcher, &topition, first_batch);
+        // Lets the first request join the queue before the second, so their order in it is fixed.
+        yield_now().await;
+        let second_produce = spawn_produce(&batcher, &topition, batch_with_maximum_offset_delta);
+
+        // The clock is paused, so the batching timer fires only here. A request then flushes the
+        // queue that holds both batches.
+        advance(ADVANCE_DELAY).await;
+        yield_now().await;
+
+        assert_matches!(
+            tokio::time::timeout(Duration::from_secs(60), first_produce).await,
+            Ok(Ok(Ok(0)))
+        );
+        assert_matches!(
+            tokio::time::timeout(Duration::from_secs(60), second_produce).await,
+            Ok(Ok(Ok(1)))
+        );
+
+        let stored_batches = recorder.produced(&topition)?.unwrap_or_default();
+        assert_eq!(2, stored_batches.len());
+        assert_eq!(i32::MAX, stored_batches[1].records[0].offset_delta);
 
         Ok(())
     }

@@ -364,6 +364,9 @@ pub enum Error {
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
     NotAuthenticated,
+    /// Appending a batch to another overflows an `i32` offset delta. The value names the sum that
+    /// overflows: `"record offset_delta"` or `"last_offset_delta"`.
+    OffsetDeltaOverflow(&'static str),
     Overflow,
     ParseFilter(Arc<ParseError>),
     ParseScram(String),
@@ -398,6 +401,9 @@ impl Display for Error {
             }
             Error::FromUtf8 { len, error } => {
                 write!(f, "string of {len} bytes is not valid UTF-8: {error}")
+            }
+            Error::OffsetDeltaOverflow(sum) => {
+                write!(f, "{sum} overflows i32 when a batch is appended")
             }
             e => write!(f, "{e:?}"),
         }
