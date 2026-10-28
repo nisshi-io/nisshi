@@ -301,8 +301,9 @@ async fn retry_of_a_batch_in_flight_is_stored_once() -> Result<()> {
 }
 
 /// A client gives up on a batch at epoch 0, bumps its own epoch, and sends its records again at
-/// epoch 1 from sequence 0 (KIP-360). The produce at epoch 0 is still in flight. Each batch that the broker acknowledges is stored once, at the offset that
-/// its produce returned, and the batch at epoch 0 is not stored after the batch at epoch 1.
+/// epoch 1 from sequence 0 (KIP-360). The produce at epoch 0 is still in flight. Each batch that
+/// the broker acknowledges is stored once, at the offset that its produce returned, and the batch
+/// at epoch 0 is not stored after the batch at epoch 1.
 #[tokio::test]
 async fn older_epoch_is_not_stored_after_the_bump() -> Result<()> {
     const OLDER: &str = "epoch 0";
