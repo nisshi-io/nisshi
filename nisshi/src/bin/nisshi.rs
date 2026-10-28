@@ -124,11 +124,11 @@ fn listener_in_use_message(addr: SocketAddr) -> String {
 
 /// Returns the error message for a broker whose listener URL names a host that did not
 /// resolve to an address.
-fn listener_host_unresolved_message(host: &str, source: &io::Error) -> String {
+fn listener_host_unresolved_message(host: &str, port: u16, source: &io::Error) -> String {
     format!(
         "the --listener-url host {host} could not be resolved: {source}. Set --listener-url to \
         an IP address, or to a host name that this machine resolves, for example \
-        tcp://0.0.0.0:9092"
+        tcp://127.0.0.1:{port} for local clients only, or tcp://<interface address>:{port}"
     )
 }
 
@@ -285,8 +285,8 @@ fn report_error(err: &nisshi_cli::Error) {
             nisshi_broker::Error::ListenerInUse { addr } => {
                 report_failure!("{}", listener_in_use_message(*addr))
             }
-            nisshi_broker::Error::ListenerHostUnresolved { host, source } => {
-                report_failure!("{}", listener_host_unresolved_message(host, source))
+            nisshi_broker::Error::ListenerHostUnresolved { host, port, source } => {
+                report_failure!("{}", listener_host_unresolved_message(host, *port, source))
             }
             nisshi_broker::Error::Storage(nisshi_storage::Error::NoEngineForScheme {
                 scheme,
@@ -504,8 +504,9 @@ mod tests {
         assert_eq!(
             "the --listener-url host eth1.internal could not be resolved: nodename nor servname \
             provided, or not known. Set --listener-url to an IP address, or to a host name that \
-            this machine resolves, for example tcp://0.0.0.0:9092",
-            listener_host_unresolved_message("eth1.internal", &source)
+            this machine resolves, for example tcp://127.0.0.1:9093 for local clients only, or \
+            tcp://<interface address>:9093",
+            listener_host_unresolved_message("eth1.internal", 9093, &source)
         );
     }
 }

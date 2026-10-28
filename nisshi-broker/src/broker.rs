@@ -220,6 +220,7 @@ async fn listener_addr(listener: &Url) -> Result<SocketAddr> {
 
             let unresolved = |source| Error::ListenerHostUnresolved {
                 host: domain.to_owned(),
+                port,
                 source: Arc::new(source),
             };
 
@@ -1126,12 +1127,14 @@ mod tests {
     }
 
     /// RFC 6761 reserves `.invalid`, so the lookup goes through the system resolver and
-    /// never succeeds.
+    /// never succeeds. The trailing dot makes the name fully qualified, so the resolver
+    /// does not append a search domain, which a wildcard record could resolve.
     #[tokio::test]
-    async fn unresolvable_host_fails_naming_the_host() {
+    async fn unresolvable_host_fails_naming_the_host_and_port() {
         assert_matches!(
-            listener_addr_of("tcp://nisshi-listener.invalid:9092").await,
-            Err(Error::ListenerHostUnresolved { host, .. }) if host == "nisshi-listener.invalid"
+            listener_addr_of("tcp://nisshi-listener.invalid.:9093").await,
+            Err(Error::ListenerHostUnresolved { host, port: 9093, .. })
+                if host == "nisshi-listener.invalid."
         );
     }
 

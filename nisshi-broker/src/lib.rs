@@ -99,6 +99,7 @@ pub enum Error {
     /// The host of the broker's listener URL is a name that did not resolve to an address.
     ListenerHostUnresolved {
         host: String,
+        port: u16,
         source: Arc<io::Error>,
     },
 
