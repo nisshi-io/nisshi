@@ -320,7 +320,8 @@ jobs:
   macos-release:
     if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
-    timeout-minutes: 45
+    # The same timeout as the `macos` job in ci.yml, which builds the same release.
+    timeout-minutes: 75
     env:
       TARGET: aarch64-apple-darwin
     steps:

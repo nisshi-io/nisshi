@@ -997,7 +997,7 @@ jobs:
           # it for smoke.
           retention-days: ${{ github.ref == 'refs/heads/main' && 30 || github.event_name == 'push' && 3 || 1 }}
           if-no-files-found: error
-  # The full release build (about 20 minutes) runs on a `v*` tag only. Every
+  # The full release build (about 40 minutes) runs on a `v*` tag only. Every
   # other run compiles the binary without optimizing or linking it, which
   # keeps the queue's critical path short. The nightly
   # macos-release job in tier-c.yml builds the release on main's tip, so a
@@ -1006,7 +1006,9 @@ jobs:
     if: *tier_b
     needs: [changes, typos]
     runs-on: macos-latest
-    timeout-minutes: 45
+    # The timeout is well above the build's usual time, because a busy macOS
+    # runner adds several minutes, and a timeout on a tag cancels the release.
+    timeout-minutes: 75
     env:
       TARGET: aarch64-apple-darwin
     steps:
