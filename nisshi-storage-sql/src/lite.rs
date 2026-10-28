@@ -6607,6 +6607,37 @@ mod tests {
         Ok(())
     }
 
+    /// Each query that libSQL runs returns every column that its module's `RowReader` reads, once.
+    /// The broker reads a query's rows only on the paths that run it, so this test finds a query
+    /// that doesn't match its row before a rare path does.
+    #[tokio::test]
+    async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+        let connection = db.connect()?;
+
+        let mut failures = Vec::new();
+        for row_query in sql::row_queries(sql::SqlEngine::Libsql) {
+            let checked = match connection.prepare(SQL.get(row_query.query)?).await {
+                Ok(statement) => (row_query.check_columns)(&ResultColumns::libsql_statement(
+                    row_query.query,
+                    &statement,
+                )),
+                Err(error) => Err(error.into()),
+            };
+
+            if let Err(error) = checked {
+                failures.push(format!("{}: {error:?}", row_query.query));
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        Ok(())
+    }
+
     /// Returns the version that `db`'s `nisshi_schema_version` table records, or `None` when it
     /// records none.
     async fn recorded_version(db: &Database) -> Result<Option<i32>> {

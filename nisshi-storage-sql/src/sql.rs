@@ -247,12 +247,26 @@ macro_rules! cache_key {
 ///
 /// Each line names a query by its folder and file in this crate's `src`. A line in `rows` names
 /// the constant that a query's module declares, because an engine reads the query's rows through
-/// that module. A compile-time assertion checks that the constant holds the query's key. A line in
-/// `plain` declares the constant here.
+/// that module's `RowReader`. A line in `without_columns` names a module's constant too, for a
+/// query whose rows an engine counts but reads no column of. A compile-time assertion checks that
+/// each such constant holds the query's key. A line in `plain` declares the constant here.
+///
+/// A line in `rows` or `without_columns` starts with the engines that run the query, and
+/// `ROW_QUERIES` lists those queries for a test that prepares each one on each of its engines.
 macro_rules! queries {
     (
         rows {
-            $($module:ident :: $module_constant:ident = $row_folder:tt / $row_file:literal,)+
+            $(
+                [$($row_engine:ident),+]
+                $module:ident :: $module_constant:ident = $row_folder:tt / $row_file:literal,
+            )+
+        }
+        without_columns {
+            $(
+                [$($counted_engine:ident),+]
+                $counted_module:ident :: $counted_constant:ident
+                    = $counted_folder:tt / $counted_file:literal,
+            )+
         }
         plain {
             $($constant:ident = $folder:tt / $file:literal,)+
@@ -276,6 +290,22 @@ macro_rules! queries {
             );
         )+
 
+        $(
+            const _: () = assert!(
+                const_str_eq(
+                    $counted_module::$counted_constant,
+                    cache_key!($counted_folder / $counted_file)
+                ),
+                concat!(
+                    stringify!($counted_module::$counted_constant),
+                    " must be the cache key of ",
+                    $counted_folder,
+                    "/",
+                    $counted_file
+                ),
+            );
+        )+
+
         pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             Cache::new(BTreeMap::from([
                 $(
@@ -284,9 +314,33 @@ macro_rules! queries {
                         include_sql!(concat!($row_folder, "/", $row_file)),
                     ),
                 )+
+                $(
+                    (
+                        $counted_module::$counted_constant,
+                        include_sql!(concat!($counted_folder, "/", $counted_file)),
+                    ),
+                )+
                 $(($constant, include_sql!(concat!($folder, "/", $file))),)+
             ]))
         });
+
+        #[cfg(test)]
+        pub(crate) static ROW_QUERIES: &[RowQuery] = &[
+            $(
+                RowQuery {
+                    query: $module::$module_constant,
+                    engines: &[$(SqlEngine::$row_engine),+],
+                    check_columns: |columns| $module::RowReader::new(columns).map(|_| ()),
+                },
+            )+
+            $(
+                RowQuery {
+                    query: $counted_module::$counted_constant,
+                    engines: &[$(SqlEngine::$counted_engine),+],
+                    check_columns: |_| Ok(()),
+                },
+            )+
+        ];
     };
 }
 
@@ -309,61 +363,91 @@ const fn const_str_eq(left: &str, right: &str) -> bool {
     true
 }
 
+/// An engine that runs the queries of [`SQL`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlEngine {
+    Postgres,
+    Libsql,
+    Turso,
+}
+
+/// A query in [`ROW_QUERIES`]: one whose rows an engine reads.
+#[cfg(test)]
+pub(crate) struct RowQuery {
+    /// The query's name in [`SQL`].
+    pub(crate) query: &'static str,
+    /// The engines that run the query.
+    pub(crate) engines: &'static [SqlEngine],
+    /// Returns the error of the query's `RowReader` for the columns of the query's result.
+    pub(crate) check_columns: fn(&result_columns::ResultColumns) -> Result<()>,
+}
+
+/// Returns each query of [`ROW_QUERIES`] that `engine` runs.
+#[cfg(test)]
+pub(crate) fn row_queries(engine: SqlEngine) -> impl Iterator<Item = &'static RowQuery> {
+    ROW_QUERIES
+        .iter()
+        .filter(move |row_query| row_query.engines.contains(&engine))
+}
+
 queries! {
     rows {
-        consumer_group_detail::QUERY = "sql" / "consumer_group_detail.sql",
-        consumer_group_detail_insert::QUERY = "sql" / "consumer_group_detail_insert.sql",
-        consumer_group_select::QUERY = "sql" / "consumer_group_select.sql",
-        consumer_group_select_by_name::QUERY = "sql" / "consumer_group_select_by_name.sql",
-        consumer_offset_select::QUERY = "sql" / "consumer_offset_select.sql",
-        consumer_offset_select_by_group::QUERY = "sql" / "consumer_offset_select_by_group.sql",
-        header_fetch::QUERY = "sql" / "header_fetch.sql",
-        header_fetch_range::QUERY = "sql" / "header_fetch_range.sql",
-        list_offset::EARLIEST_QUERY = "sql" / "list_earliest_offset.sql",
-        list_offset::LATEST_COMMITTED_QUERY = "sql" / "list_latest_offset_committed.sql",
-        list_offset::LATEST_TIMESTAMP_QUERY = "sql" / "list_latest_offset_timestamp.sql",
-        list_offset::LATEST_UNCOMMITTED_QUERY = "sql" / "list_latest_offset_uncommitted.sql",
-        lite_policy_compact_compaction::QUERY = "lite" / "policy_compact_compaction.sql",
-        lite_policy_compact_distinct_k::QUERY = "lite" / "policy_compact_distinct_k.sql",
-        lite_policy_compact_max_offset_id::QUERY = "lite" / "policy_compact_max_offset_id.sql",
-        lite_policy_compact_topitions::QUERY = "lite" / "policy_compact_topitions.sql",
-        maintain_vacuum::QUERY = "sql" / "maintain-vacuum.sql",
-        nisshi_schema_version_select::QUERY = "sql" / "nisshi_schema_version_select.sql",
-        pg_nisshi_schema_version_exists::QUERY = "pg" / "nisshi_schema_version_exists.sql",
-        producer_epoch_current_for_producer::QUERY = "sql" / "producer_epoch_current_for_producer.sql",
-        producer_epoch_for_current_txn::QUERY = "sql" / "producer_epoch_for_current_txn.sql",
-        producer_epoch_insert::QUERY = "sql" / "producer_epoch_insert.sql",
-        producer_epochs_select::QUERY = "sql" / "producer_epochs_select.sql",
-        producer_insert::QUERY = "sql" / "producer_insert.sql",
-        producer_select_for_update::QUERY = "sql" / "producer_select_for_update.sql",
-        record_fetch::KEYED_QUERY = "sql" / "record_fetch_keyed.sql",
-        record_fetch::PG_KEYED_QUERY = "pg" / "record_fetch_keyed.sql",
-        record_fetch::PG_QUERY = "pg" / "record_fetch.sql",
-        record_fetch::QUERY = "sql" / "record_fetch.sql",
-        scram_credential_select::QUERY = "sql" / "scram_credential_select.sql",
-        topic_by_cluster::QUERY = "sql" / "topic_by_cluster.sql",
-        topic_configuration_select::QUERY = "sql" / "topic_configuration_select.sql",
-        topic_configuration_select_keys::QUERY = "pg" / "topic_configuration_select_keys.sql",
-        topic_configuration_select_name::QUERY = "sql" / "topic_configuration_select_name.sql",
-        topic_configuration_upsert::QUERY = "sql" / "topic_configuration_upsert.sql",
-        topic_insert::QUERY = "sql" / "topic_insert.sql",
-        topic_select::QUERY = "sql" / "topic_select.sql",
-        topic_select_name::QUERY = "sql" / "topic_select_name.sql",
-        topic_select_uuid::PG_QUERY = "pg" / "topic_select_uuid.sql",
-        topic_select_uuid::QUERY = "sql" / "topic_select_uuid.sql",
-        topition_insert::QUERY = "sql" / "topition_insert.sql",
-        topition_select_id::QUERY = "sql" / "topition_select_id.sql",
-        txn_detail_select_status_for_update::QUERY = "sql" / "txn_detail_select_status_for_update.sql",
-        txn_detail_select_timed_out::QUERY = "sql" / "txn_detail_select_timed_out.sql",
-        txn_produce_offset_select_offset_range::QUERY = "sql" / "txn_produce_offset_select_offset_range.sql",
-        txn_produce_offset_select_overlapping_txn::QUERY = "sql" / "txn_produce_offset_select_overlapping_txn.sql",
-        txn_select_name::QUERY = "sql" / "txn_select_name.sql",
-        txn_select_produced_topitions::QUERY = "sql" / "txn_select_produced_topitions.sql",
-        virtual_topic_upsert::QUERY = "sql" / "virtual_topic_upsert.sql",
-        watermark_insert::QUERY = "sql" / "watermark_insert.sql",
-        watermark_select::QUERY = "sql" / "watermark_select.sql",
-        watermark_select_for_write::LITE_QUERY = "lite" / "watermark_select_for_write.sql",
-        watermark_select_for_write::QUERY = "sql" / "watermark_select_for_write.sql",
+        [Postgres, Libsql, Turso] consumer_group_detail::QUERY = "sql" / "consumer_group_detail.sql",
+        [Postgres, Libsql, Turso] consumer_group_detail_insert::QUERY = "sql" / "consumer_group_detail_insert.sql",
+        [Postgres, Libsql, Turso] consumer_group_select::QUERY = "sql" / "consumer_group_select.sql",
+        [Postgres, Libsql, Turso] consumer_group_select_by_name::QUERY = "sql" / "consumer_group_select_by_name.sql",
+        [Postgres, Libsql, Turso] consumer_offset_select::QUERY = "sql" / "consumer_offset_select.sql",
+        [Postgres, Libsql, Turso] consumer_offset_select_by_group::QUERY = "sql" / "consumer_offset_select_by_group.sql",
+        [Libsql, Turso] header_fetch::QUERY = "sql" / "header_fetch.sql",
+        [Postgres] header_fetch_range::QUERY = "sql" / "header_fetch_range.sql",
+        [Postgres, Libsql, Turso] list_offset::EARLIEST_QUERY = "sql" / "list_earliest_offset.sql",
+        [Postgres, Libsql, Turso] list_offset::LATEST_COMMITTED_QUERY = "sql" / "list_latest_offset_committed.sql",
+        [Postgres, Libsql, Turso] list_offset::LATEST_TIMESTAMP_QUERY = "sql" / "list_latest_offset_timestamp.sql",
+        [Postgres, Libsql, Turso] list_offset::LATEST_UNCOMMITTED_QUERY = "sql" / "list_latest_offset_uncommitted.sql",
+        [Libsql] lite_policy_compact_compaction::QUERY = "lite" / "policy_compact_compaction.sql",
+        [Libsql] lite_policy_compact_distinct_k::QUERY = "lite" / "policy_compact_distinct_k.sql",
+        [Libsql] lite_policy_compact_max_offset_id::QUERY = "lite" / "policy_compact_max_offset_id.sql",
+        [Libsql] lite_policy_compact_topitions::QUERY = "lite" / "policy_compact_topitions.sql",
+        [Libsql] maintain_vacuum::QUERY = "sql" / "maintain-vacuum.sql",
+        [Postgres, Libsql] nisshi_schema_version_select::QUERY = "sql" / "nisshi_schema_version_select.sql",
+        [Postgres] pg_nisshi_schema_version_exists::QUERY = "pg" / "nisshi_schema_version_exists.sql",
+        [Postgres, Libsql, Turso] producer_epoch_current_for_producer::QUERY = "sql" / "producer_epoch_current_for_producer.sql",
+        [Postgres, Libsql, Turso] producer_epoch_for_current_txn::QUERY = "sql" / "producer_epoch_for_current_txn.sql",
+        [Postgres, Libsql, Turso] producer_epoch_insert::QUERY = "sql" / "producer_epoch_insert.sql",
+        [Postgres, Libsql, Turso] producer_epochs_select::QUERY = "sql" / "producer_epochs_select.sql",
+        [Postgres, Libsql, Turso] producer_insert::QUERY = "sql" / "producer_insert.sql",
+        [Postgres, Libsql, Turso] producer_select_for_update::QUERY = "sql" / "producer_select_for_update.sql",
+        [Libsql] record_fetch::KEYED_QUERY = "sql" / "record_fetch_keyed.sql",
+        [Postgres] record_fetch::PG_KEYED_QUERY = "pg" / "record_fetch_keyed.sql",
+        [Postgres] record_fetch::PG_QUERY = "pg" / "record_fetch.sql",
+        [Libsql, Turso] record_fetch::QUERY = "sql" / "record_fetch.sql",
+        [Postgres, Libsql] scram_credential_select::QUERY = "sql" / "scram_credential_select.sql",
+        [Postgres, Libsql, Turso] topic_by_cluster::QUERY = "sql" / "topic_by_cluster.sql",
+        [Postgres, Libsql, Turso] topic_configuration_select::QUERY = "sql" / "topic_configuration_select.sql",
+        [Postgres] topic_configuration_select_keys::QUERY = "pg" / "topic_configuration_select_keys.sql",
+        [Postgres, Libsql, Turso] topic_configuration_select_name::QUERY = "sql" / "topic_configuration_select_name.sql",
+        [Postgres, Libsql, Turso] topic_configuration_upsert::QUERY = "sql" / "topic_configuration_upsert.sql",
+        [Postgres, Libsql, Turso] topic_insert::QUERY = "sql" / "topic_insert.sql",
+        [Postgres, Libsql, Turso] topic_select_name::QUERY = "sql" / "topic_select_name.sql",
+        [Postgres] topic_select_uuid::PG_QUERY = "pg" / "topic_select_uuid.sql",
+        [Postgres, Libsql, Turso] topic_select_uuid::QUERY = "sql" / "topic_select_uuid.sql",
+        [Postgres, Libsql, Turso] topition_insert::QUERY = "sql" / "topition_insert.sql",
+        [Postgres] topition_select_id::QUERY = "sql" / "topition_select_id.sql",
+        [Postgres] txn_detail_select_status_for_update::QUERY = "sql" / "txn_detail_select_status_for_update.sql",
+        [Postgres] txn_detail_select_timed_out::QUERY = "sql" / "txn_detail_select_timed_out.sql",
+        [Postgres, Libsql, Turso] txn_produce_offset_select_offset_range::QUERY = "sql" / "txn_produce_offset_select_offset_range.sql",
+        [Postgres, Libsql, Turso] txn_produce_offset_select_overlapping_txn::QUERY = "sql" / "txn_produce_offset_select_overlapping_txn.sql",
+        [Postgres, Libsql, Turso] txn_select_name::QUERY = "sql" / "txn_select_name.sql",
+        [Postgres, Libsql, Turso] txn_select_produced_topitions::QUERY = "sql" / "txn_select_produced_topitions.sql",
+        [Postgres, Libsql] virtual_topic_upsert::QUERY = "sql" / "virtual_topic_upsert.sql",
+        [Postgres, Libsql, Turso] watermark_insert::QUERY = "sql" / "watermark_insert.sql",
+        [Postgres, Libsql, Turso] watermark_select::QUERY = "sql" / "watermark_select.sql",
+        [Libsql, Turso] watermark_select_for_write::LITE_QUERY = "lite" / "watermark_select_for_write.sql",
+        [Postgres] watermark_select_for_write::QUERY = "sql" / "watermark_select_for_write.sql",
+    }
+    without_columns {
+        [Postgres, Libsql, Turso] topic_select::QUERY = "sql" / "topic_select.sql",
     }
     plain {
         CONSUMER_GROUP_DELETE = "sql" / "consumer_group_delete.sql",

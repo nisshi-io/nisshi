@@ -54,6 +54,25 @@ impl ResultColumns {
         )
     }
 
+    /// Returns the column names of `statement`, libSQL's prepared statement of `query`.
+    #[cfg(all(test, feature = "libsql"))]
+    pub(crate) fn libsql_statement(query: &'static str, statement: &libsql::Statement) -> Self {
+        Self::new(
+            query,
+            statement
+                .columns()
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect(),
+        )
+    }
+
+    /// Returns the column names of `statement`, Turso's prepared statement of `query`.
+    #[cfg(all(test, feature = "turso"))]
+    pub(crate) fn turso_statement(query: &'static str, statement: &turso::Statement) -> Self {
+        Self::new(query, statement.column_names())
+    }
+
     /// Returns the column names of `rows`, Turso's result of `query`.
     #[cfg(feature = "turso")]
     pub(crate) fn turso(query: &'static str, rows: &turso::Rows) -> Self {

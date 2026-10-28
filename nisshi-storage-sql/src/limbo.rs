@@ -3754,6 +3754,47 @@ mod tests {
 
     use super::*;
 
+    /// Each query that Turso runs returns every column that its module's `RowReader` reads, once.
+    /// The broker reads a query's rows only on the paths that run it, so this test finds a query
+    /// that doesn't match its row before a rare path does.
+    #[ignore = "Turso fails to parse the DDL of the consumer_group, producer and topic tables"]
+    #[tokio::test]
+    async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = turso::Builder::new_local(
+            path.to_str()
+                .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?,
+        )
+        .build()
+        .await?;
+        let connection = db.connect()?;
+
+        let mut failures = Vec::new();
+        for (name, ddl) in DDL.iter() {
+            if let Err(error) = connection.execute(ddl.as_str(), ()).await {
+                failures.push(format!("{name}: {error:?}"));
+            }
+        }
+
+        for row_query in sql::row_queries(sql::SqlEngine::Turso) {
+            let checked = match connection.prepare(sql::SQL.get(row_query.query)?).await {
+                Ok(statement) => (row_query.check_columns)(&ResultColumns::turso_statement(
+                    row_query.query,
+                    &statement,
+                )),
+                Err(error) => Err(error.into()),
+            };
+
+            if let Err(error) = checked {
+                failures.push(format!("{}: {error:?}", row_query.query));
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        Ok(())
+    }
+
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};
 

@@ -5281,6 +5281,43 @@ mod tests {
         Ok(Some(storage))
     }
 
+    /// Each query that PostgreSQL runs returns every column that its module's `RowReader` reads,
+    /// once. The broker reads a query's rows only on the paths that run it, so this test finds a
+    /// query that doesn't match its row before a rare path does.
+    #[tokio::test]
+    async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "every_row_query_returns_the_columns_of_its_row",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let connection = storage.connection().await?;
+
+        let mut failures = Vec::new();
+        for row_query in sql::row_queries(sql::SqlEngine::Postgres) {
+            let checked = match connection.prepare(sql::SQL.get(row_query.query)?).await {
+                Ok(statement) => {
+                    (row_query.check_columns)(&ResultColumns::postgres(row_query.query, &statement))
+                }
+                Err(error) => Err(error.into()),
+            };
+
+            if let Err(error) = checked {
+                failures.push(format!("{}: {error:?}", row_query.query));
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        Ok(())
+    }
+
     #[test]
     fn merge_statement_timeout_option_no_existing_options() {
         assert_eq!(
