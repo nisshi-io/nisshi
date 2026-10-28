@@ -1,0 +1,33 @@
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The query that reads every committed offset of a consumer group, one row for each partition.
+//!
+//! The query takes two parameters: `$1` is the cluster's name, and `$2` the group's name.
+
+/// The query's name in the SQL cache.
+pub(crate) const QUERY: &str = "consumer_offset_select_by_group.sql";
+
+sql_row! {
+    /// The committed offset of a consumer group on one partition.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The topic's name.
+        topic: String,
+        /// The partition's index.
+        partition: i32,
+        /// The committed offset.
+        committed_offset: i64,
+    }
+}

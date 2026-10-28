@@ -19,7 +19,7 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     hash::Hash,
-    io,
+    io, iter,
     marker::PhantomData,
     pin::Pin,
     str::FromStr,
@@ -75,7 +75,6 @@ use nisshi_storage::{
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
-use serde_json::Value;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::{
@@ -103,10 +102,17 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        self, consumer_group_select, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, result_columns::ResultColumns,
-        topic_configuration_select, topic_configuration_select_keys, topic_select,
-        watermark_select_for_write,
+        self, consumer_group_select, default_hash, header_fetch_range, idempotent_epoch_check,
+        idempotent_sequence_check, list_offset, producer_epoch_current_for_producer,
+        producer_epoch_for_current_txn, producer_epoch_insert, producer_epochs_select,
+        producer_insert, producer_select_for_update, record_fetch, result_columns::ResultColumns,
+        topic_by_cluster, topic_configuration_select, topic_configuration_select_keys,
+        topic_configuration_select_name, topic_configuration_upsert, topic_insert, topic_select,
+        topic_select_name, topic_select_uuid, topition_insert, topition_select_id,
+        txn_detail_select_status_for_update, txn_detail_select_timed_out,
+        txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
+        txn_select_name, txn_select_produced_topitions, virtual_topic_upsert, watermark_insert,
+        watermark_select, watermark_select_for_write,
     },
 };
 
@@ -910,19 +916,18 @@ struct Txn {
     status: TxnState,
 }
 
-impl TryFrom<Row> for Txn {
+impl TryFrom<txn_produce_offset_select_overlapping_txn::Row> for Txn {
     type Error = Error;
 
-    fn try_from(row: Row) -> Result<Self, Self::Error> {
-        let name = row
-            .try_get::<_, String>(0)
-            .inspect_err(|err| error!(?err))?;
-        let producer_id = row.try_get::<_, i64>(1).inspect_err(|err| error!(?err))?;
-        let producer_epoch = row.try_get::<_, i16>(2).inspect_err(|err| error!(?err))?;
-        let status = row
-            .try_get::<_, Option<String>>(3)
-            .map_err(Into::into)
-            .and_then(|status| status.map_or(Ok(TxnState::Begin), TxnState::try_from))
+    fn try_from(row: txn_produce_offset_select_overlapping_txn::Row) -> Result<Self, Self::Error> {
+        let txn_produce_offset_select_overlapping_txn::Row {
+            name,
+            producer_id,
+            producer_epoch,
+            status,
+        } = row;
+        let status = status
+            .map_or(Ok(TxnState::Begin), TxnState::try_from)
             .inspect_err(|err| error!(?err))?;
 
         Ok(Self {
@@ -974,15 +979,20 @@ impl Postgres {
             let op = OpType::try_from(config.config_operation)?;
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                self.prepare_query_opt(
-                    &tx,
-                    sql::TOPIC_CONFIGURATION_SELECT_NAME,
-                    &[&self.cluster, topic, &config.name],
-                )
-                .await?
-                .map(|row| row.try_get::<_, Option<String>>(0))
-                .transpose()?
-                .flatten()
+                let (columns, rows) = self
+                    .prepare_query_rows(
+                        &tx,
+                        topic_configuration_select_name::QUERY,
+                        &[&self.cluster, topic, &config.name],
+                    )
+                    .await?;
+
+                let reader = topic_configuration_select_name::RowReader::new(&columns)?;
+
+                rows.first()
+                    .map(|row| reader.read_row(row))
+                    .transpose()?
+                    .and_then(|row| row.value)
             } else {
                 None
             };
@@ -998,7 +1008,7 @@ impl Postgres {
                     _ = self
                         .prepare_query_opt(
                             &tx,
-                            sql::TOPIC_CONFIGURATION_UPSERT,
+                            topic_configuration_upsert::QUERY,
                             &[&self.cluster, topic, &config.name, &value],
                         )
                         .await?;
@@ -1131,10 +1141,10 @@ impl Postgres {
             .await
             .inspect_err(|err| error!(?err))?;
 
-        let records = if let Some(key) = key_filter {
-            self.prepare_query(
+        let (columns, rows) = if let Some(key) = key_filter {
+            self.prepare_query_rows(
                 &tx,
-                sql::PG_RECORD_FETCH_KEYED,
+                record_fetch::PG_KEYED_QUERY,
                 &[
                     &self.cluster,
                     &base_topic,
@@ -1149,9 +1159,9 @@ impl Postgres {
             .await
             .inspect_err(|err| error!(?err))?
         } else {
-            self.prepare_query(
+            self.prepare_query_rows(
                 &tx,
-                sql::PG_RECORD_FETCH,
+                record_fetch::PG_QUERY,
                 &[
                     &self.cluster,
                     &topition.topic(),
@@ -1166,85 +1176,81 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?
         };
 
+        let reader = record_fetch::RowReader::new(&columns)?;
+        let offset_reader = record_fetch::offset::RowReader::new(&columns)?;
+
+        // Each row is read when the loop below reaches it, and not at all after the deadline, so a
+        // fetch copies no key or value that it then drops.
+        let mut records = rows
+            .iter()
+            .map(|row| reader.read_row(row).inspect_err(|err| error!(?err)));
+
         let mut batches = vec![];
 
-        if let Some(first) = records.first() {
+        if let Some(first) = records.next().transpose()? {
+            debug!(base_offset = first.offset_id);
+
             let mut batch_builder = Batch::builder()
-                .base_offset(
-                    first
-                        .try_get::<_, i64>(0)
-                        .inspect(|base_offset| debug!(base_offset))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .attributes(
-                    first
-                        .try_get::<_, Option<i16>>(1)
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))?,
-                )
+                .base_offset(first.offset_id)
+                .attributes(first.attributes.unwrap_or(0))
                 .base_timestamp(
-                    first
-                        .try_get::<_, SystemTime>(2)
+                    to_timestamp(&first.timestamp)
                         .map_err(Error::from)
-                        .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
                         .inspect_err(|err| error!(?err))?,
                 )
-                .producer_id(
-                    first
-                        .try_get::<_, Option<i64>>(6)
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(
-                    first
-                        .try_get::<_, Option<i16>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                );
+                .producer_id(first.producer_id.unwrap_or(-1))
+                .producer_epoch(first.producer_epoch.unwrap_or(-1));
 
             // One query for the headers of the returned records. A query per record costs a
             // round trip each, which capped a consumer at a few thousand records a second.
             // The topic is the base topic: a keyed fetch has a name that is not a topic.
-            let mut headers: BTreeMap<i64, Vec<Row>> = BTreeMap::new();
-            let offsets = records
+            let mut headers: BTreeMap<i64, Vec<header_fetch_range::Row>> = BTreeMap::new();
+            let offsets = rows
                 .iter()
-                .map(|record| record.try_get::<_, i64>(0))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+                .map(|row| {
+                    offset_reader
+                        .read_row(row)
+                        .map(|offset| offset.offset_id)
+                        .inspect_err(|err| error!(?err))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-            for header in self
-                .prepare_query(
+            let (header_columns, header_rows) = self
+                .prepare_query_rows(
                     &tx,
-                    sql::HEADER_FETCH_RANGE,
+                    header_fetch_range::QUERY,
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
                 )
                 .await
-                .inspect_err(|err| error!(?err))?
-            {
-                headers
-                    .entry(header.try_get::<_, i64>(0)?)
-                    .or_default()
-                    .push(header);
+                .inspect_err(|err| error!(?err))?;
+
+            let header_reader = header_fetch_range::RowReader::new(&header_columns)?;
+
+            for header in &header_rows {
+                let header = header_reader
+                    .read_row(header)
+                    .inspect_err(|err| error!(?err))?;
+
+                headers.entry(header.offset_id).or_default().push(header);
             }
 
-            for record in records.iter() {
-                let attributes = record
-                    .try_get::<_, Option<i16>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?;
+            for record in iter::once(Ok(first)).chain(records) {
+                let record_fetch::Row {
+                    offset_id: offset,
+                    attributes,
+                    timestamp,
+                    k,
+                    v,
+                    producer_id,
+                    producer_epoch,
+                } = record?;
 
-                let producer_id = record
-                    .try_get::<_, Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-                let producer_epoch = record
-                    .try_get::<_, Option<i16>>(7)
-                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
+                let attributes = attributes.unwrap_or(0);
+                let producer_id = producer_id.unwrap_or(-1);
+                let producer_epoch = producer_epoch.unwrap_or(-1);
 
-                let timestamp = record
-                    .try_get::<_, SystemTime>(2)
+                let timestamp = to_timestamp(&timestamp)
                     .map_err(Error::from)
-                    .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
                     .inspect(|timestamp| debug!(?timestamp))
                     .inspect_err(|err| error!(?err))?;
 
@@ -1265,39 +1271,24 @@ impl Postgres {
                             .and_then(TryInto::try_into)?,
                     );
 
+                    debug!(base_offset = offset);
+
                     batch_builder = Batch::builder()
-                        .base_offset(
-                            record
-                                .try_get::<_, i64>(0)
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
+                        .base_offset(offset)
                         .base_timestamp(timestamp)
                         .attributes(attributes)
                         .producer_id(producer_id)
                         .producer_epoch(producer_epoch);
                 }
 
-                let offset = record
-                    .try_get::<_, i64>(0)
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
+                debug!(offset);
 
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
                 let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
-                let k = record
-                    .try_get::<_, Option<&[u8]>>(3)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
-
-                let v = record
-                    .try_get::<_, Option<&[u8]>>(4)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
+                debug!(key_len = ?k.as_ref().map(Bytes::len));
+                debug!(value_len = ?v.as_ref().map(Bytes::len));
 
                 let mut record_builder = Record::builder()
                     .offset_delta(offset_delta)
@@ -1308,18 +1299,12 @@ impl Postgres {
                 for header in headers.remove(&offset).unwrap_or_default() {
                     let mut header_builder = Header::builder();
 
-                    if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::copy_from_slice(k));
+                    if let Some(k) = header.k {
+                        header_builder = header_builder.key(k);
                     }
 
-                    if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(2)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::copy_from_slice(v));
+                    if let Some(v) = header.v {
+                        header_builder = header_builder.value(v);
                     }
 
                     record_builder = record_builder.header(header_builder);
@@ -1359,29 +1344,29 @@ impl Postgres {
         base_topic: &str,
         partition: i32,
     ) -> Result<OffsetStage> {
-        let row = self
-            .prepare_query_one(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 c,
-                sql::WATERMARK_SELECT,
+                watermark_select::QUERY,
                 &[&self.cluster, &base_topic, &partition],
             )
             .await
             .inspect_err(|err| error!(base_topic, partition, ?err))?;
 
-        let log_start = row
-            .try_get::<_, Option<i64>>(0)
-            .inspect_err(|err| error!(base_topic, partition, ?err))?
-            .unwrap_or_default();
+        let reader = watermark_select::RowReader::new(&columns)?;
 
-        let high_watermark = row
-            .try_get::<_, Option<i64>>(1)
-            .inspect_err(|err| error!(base_topic, partition, ?err))?
-            .unwrap_or_default();
+        let row = rows
+            .first()
+            .ok_or_else(|| Error::Message(format!("{} returned no rows", watermark_select::QUERY)))
+            .inspect_err(|err| error!(base_topic, partition, ?err))?;
 
-        let last_stable = row
-            .try_get::<_, Option<i64>>(2)
-            .inspect_err(|err| error!(base_topic, partition, ?err))?
-            .unwrap_or(high_watermark);
+        let watermark_select::Row { low, high, stable } = reader
+            .read_row(row)
+            .inspect_err(|err| error!(base_topic, partition, ?err))?;
+
+        let log_start = low.unwrap_or_default();
+        let high_watermark = high.unwrap_or_default();
+        let last_stable = stable.unwrap_or(high_watermark);
 
         debug!(
             cluster = self.cluster,
@@ -1406,21 +1391,21 @@ impl Postgres {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => sql::LIST_EARLIEST_OFFSET,
+                (ListOffset::Earliest, _) => list_offset::EARLIEST_QUERY,
                 (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
-                    sql::LIST_LATEST_OFFSET_COMMITTED
+                    list_offset::LATEST_COMMITTED_QUERY
                 }
                 (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
-                    sql::LIST_LATEST_OFFSET_UNCOMMITTED
+                    list_offset::LATEST_UNCOMMITTED_QUERY
                 }
-                (ListOffset::Timestamp(_), _) => sql::LIST_LATEST_OFFSET_TIMESTAMP,
+                (ListOffset::Timestamp(_), _) => list_offset::LATEST_TIMESTAMP_QUERY,
             };
 
             debug!(?query);
 
-            let list_offset = match offset_type {
+            let (columns, rows) = match offset_type {
                 ListOffset::Earliest | ListOffset::Latest => self
-                    .prepare_query_opt(
+                    .prepare_query_rows(
                         c,
                         query,
                         &[&self.cluster, &topition.topic(), &topition.partition()],
@@ -1429,7 +1414,7 @@ impl Postgres {
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
                 ListOffset::Timestamp(timestamp) => self
-                    .prepare_query_opt(
+                    .prepare_query_rows(
                         c,
                         query,
                         &[
@@ -1444,49 +1429,58 @@ impl Postgres {
             }
             .inspect_err(|err| {
                 error!(?err, cluster = self.cluster, ?topition);
-            })
-            .inspect(|result| debug!(?result))?
-            .map_or_else(
-                || {
-                    // Earliest and Latest find no row only when the partition does not exist,
-                    // because creating a partition also creates its watermark row. A Timestamp
-                    // lookup finds no row when no record matches, and also when the partition
-                    // does not exist. Both answer no offset (see `ListOffsetResponse::offset`).
-                    let error_code = match offset_type {
-                        ListOffset::Earliest | ListOffset::Latest => {
-                            ErrorCode::UnknownTopicOrPartition
-                        }
-                        ListOffset::Timestamp(_) => ErrorCode::None,
-                    };
-                    debug!(cluster = self.cluster, ?topition, ?offset_type, ?error_code);
+            })?;
 
-                    Ok(ListOffsetResponse {
-                        error_code,
-                        ..Default::default()
-                    })
-                },
-                |row| {
-                    debug!(?row);
+            let reader = list_offset::RowReader::new(&columns)?;
 
-                    row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
-                        row.try_get::<_, Option<SystemTime>>(1).map(|timestamp| {
-                            debug!(
-                                cluster = self.cluster,
-                                ?topition,
-                                ?offset_type,
-                                offset,
-                                ?timestamp
-                            );
-
-                            ListOffsetResponse {
-                                timestamp,
-                                offset,
-                                ..Default::default()
+            let list_offset = rows
+                .first()
+                .map(|row| reader.read_row(row))
+                .transpose()
+                .inspect_err(|err| {
+                    error!(?err, cluster = self.cluster, ?topition);
+                })
+                .inspect(|result| debug!(?result))?
+                .map_or_else(
+                    || {
+                        // Earliest and Latest find no row only when the partition does not exist,
+                        // because creating a partition also creates its watermark row. A Timestamp
+                        // lookup finds no row when no record matches, and also when the partition
+                        // does not exist. Both answer no offset (see `ListOffsetResponse::offset`).
+                        let error_code = match offset_type {
+                            ListOffset::Earliest | ListOffset::Latest => {
+                                ErrorCode::UnknownTopicOrPartition
                             }
-                        })
-                    })
-                },
-            )?;
+                            ListOffset::Timestamp(_) => ErrorCode::None,
+                        };
+                        debug!(cluster = self.cluster, ?topition, ?offset_type, ?error_code);
+
+                        ListOffsetResponse {
+                            error_code,
+                            ..Default::default()
+                        }
+                    },
+                    |list_offset::Row {
+                         offset_id,
+                         timestamp,
+                     }| {
+                        let offset = Some(offset_id);
+
+                        debug!(
+                            cluster = self.cluster,
+                            ?topition,
+                            ?offset_type,
+                            offset,
+                            ?timestamp
+                        );
+
+                        ListOffsetResponse {
+                            timestamp,
+                            offset,
+                            ..Default::default()
+                        }
+                    },
+                );
 
             responses.push((topition.clone(), list_offset));
         }
@@ -1600,21 +1594,38 @@ impl Postgres {
 
     /// Returns the schema version that the database records, or `None` when it records none.
     async fn recorded_schema(&self, tx: &Transaction<'_>) -> Result<Option<RecordedSchema>> {
-        let version_table_exists = tx
-            .query_one(self.sql_lookup(sql::PG_NISSHI_SCHEMA_VERSION_EXISTS)?, &[])
-            .await?
-            .try_get::<_, bool>(0)?;
+        let statement = tx
+            .prepare(self.sql_lookup(sql::pg_nisshi_schema_version_exists::QUERY)?)
+            .await?;
+        let reader = sql::pg_nisshi_schema_version_exists::RowReader::new(
+            &ResultColumns::postgres(sql::pg_nisshi_schema_version_exists::QUERY, &statement),
+        )?;
+        let sql::pg_nisshi_schema_version_exists::Row {
+            version_table_exists,
+        } = reader.read_row(&tx.query_one(&statement, &[]).await?)?;
         if !version_table_exists {
             return Ok(None);
         }
 
+        let statement = tx
+            .prepare(self.sql_lookup(sql::nisshi_schema_version_select::QUERY)?)
+            .await?;
+        let reader = sql::nisshi_schema_version_select::RowReader::new(&ResultColumns::postgres(
+            sql::nisshi_schema_version_select::QUERY,
+            &statement,
+        ))?;
         let recorded = tx
-            .query_opt(self.sql_lookup(sql::NISSHI_SCHEMA_VERSION_SELECT)?, &[])
+            .query_opt(&statement, &[])
             .await?
             .map(|row| {
+                let sql::nisshi_schema_version_select::Row {
+                    version,
+                    oldest_compatible_version,
+                } = reader.read_row(&row)?;
+
                 Ok::<_, Error>(RecordedSchema {
-                    version: row.try_get(0)?,
-                    oldest_compatible_version: row.try_get(1)?,
+                    version,
+                    oldest_compatible_version,
                 })
             })
             .transpose()?;
@@ -1675,10 +1686,10 @@ impl Postgres {
                     .inspect_err(|err| error!(?err))?;
             }
 
-            let row = self
-                .prepare_query_one(
+            let (columns, rows) = self
+                .prepare_query_rows(
                     tx,
-                    sql::PRODUCER_SELECT_FOR_UPDATE,
+                    producer_select_for_update::QUERY,
                     &[
                         &self.cluster,
                         &topition.topic(),
@@ -1698,7 +1709,16 @@ impl Postgres {
                     )
                 })?;
 
-            let sequence = row.try_get::<_, i32>(0).inspect_err(|err| error!(?err))?;
+            let reader = producer_select_for_update::RowReader::new(&columns)?;
+
+            let producer_select_for_update::Row { sequence } = reader
+                .read_row(rows.first().ok_or_else(|| {
+                    Error::Message(format!(
+                        "{} returned no rows",
+                        producer_select_for_update::QUERY
+                    ))
+                })?)
+                .inspect_err(|err| error!(?err))?;
 
             debug!(
                 self.cluster,
@@ -2081,21 +2101,6 @@ impl Postgres {
     }
 
     #[instrument(skip(self, client, params))]
-    async fn prepare_query_one<C>(
-        &self,
-        client: &C,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Row>
-    where
-        C: GenericClient,
-    {
-        let (sql, statement) = self.prepare_statement(client, sql).await?;
-        self.record_sql_metrics(sql, client.query_one(&statement, params))
-            .await
-    }
-
-    #[instrument(skip(self, client, params))]
     async fn prepare_query_opt<C>(
         &self,
         client: &C,
@@ -2124,19 +2129,23 @@ impl Postgres {
         let topic = topition.topic();
         let partition = topition.partition();
 
-        let Some(row) = self
-            .prepare_query_opt(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 tx,
-                sql::TOPITION_SELECT_ID,
+                topition_select_id::QUERY,
                 &[&self.cluster, &topic, &partition],
             )
             .await
-            .inspect_err(|err| debug!(?err))?
-        else {
+            .inspect_err(|err| debug!(?err))?;
+
+        let reader = topition_select_id::RowReader::new(&columns)?;
+
+        let Some(row) = rows.first() else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
-        let topition_id = row.try_get::<_, i32>(0).inspect_err(|err| error!(?err))?;
+        let topition_select_id::Row { id: topition_id } =
+            reader.read_row(row).inspect_err(|err| error!(?err))?;
         debug!(topition_id);
 
         if deflated.is_idempotent() {
@@ -2377,17 +2386,9 @@ impl Postgres {
         // at all: a request carrying a stale epoch is not this transaction's problem, it's
         // an identity problem, and must be reported as such (ProducerFenced) regardless of
         // what the stale epoch's own txn_detail row says.
-        let Some(row) = self
-            .prepare_query_opt(
-                tx,
-                sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER,
-                &[&self.cluster, &producer_id],
-            )
-            .await?
-        else {
+        let Some(current_epoch) = self.producer_epoch_current(tx, producer_id).await? else {
             return Ok(ErrorCode::UnknownProducerId);
         };
-        let current_epoch = row.try_get::<_, i16>(0)?;
 
         match producer_epoch.cmp(&current_epoch) {
             Ordering::Less => return Ok(ErrorCode::ProducerFenced),
@@ -2399,10 +2400,10 @@ impl Postgres {
         // EndTxn racing the maintain_transactions sweep, or a retried EndTxn) already
         // finalized this transaction, this blocks until it commits, then sees the
         // terminal status below and no-ops instead of writing a second marker.
-        let status = match self
-            .prepare_query_opt(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 tx,
-                sql::TXN_DETAIL_SELECT_STATUS_FOR_UPDATE,
+                txn_detail_select_status_for_update::QUERY,
                 &[
                     &self.cluster,
                     &transaction_id,
@@ -2410,10 +2411,12 @@ impl Postgres {
                     &producer_epoch,
                 ],
             )
-            .await?
-        {
-            Some(row) => row
-                .try_get::<_, Option<String>>(0)? // nullable transaction status column -> Option<String>
+            .await?;
+        let reader = txn_detail_select_status_for_update::RowReader::new(&columns)?;
+        let status = match rows.first() {
+            Some(row) => reader
+                .read_row(row)?
+                .status // nullable transaction status column -> Option<String>
                 .map(TxnState::try_from) // parse if present -> Option<Result<TxnState, _>>
                 .transpose()?, // Option<Result<_>> -> Result<Option<_>>, then `?` -> Option<TxnState>
             None => None, // no txn_detail row found
@@ -2477,7 +2480,7 @@ impl Postgres {
             _ = self
                 .prepare_query_opt(
                     tx,
-                    sql::PRODUCER_EPOCH_INSERT,
+                    producer_epoch_insert::QUERY,
                     &[&self.cluster, &producer_id],
                 )
                 .await?;
@@ -2485,10 +2488,10 @@ impl Postgres {
 
         let mut overlaps = vec![];
 
-        let rows = self
-            .prepare_query(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 tx,
-                sql::TXN_SELECT_PRODUCED_TOPITIONS,
+                txn_select_produced_topitions::QUERY,
                 &[
                     &self.cluster,
                     &transaction_id,
@@ -2498,9 +2501,10 @@ impl Postgres {
             )
             .await?;
 
+        let reader = txn_select_produced_topitions::RowReader::new(&columns)?;
+
         for row in rows {
-            let topic = row.try_get::<_, String>(0)?;
-            let partition = row.try_get::<_, i32>(1)?;
+            let txn_select_produced_topitions::Row { topic, partition } = reader.read_row(&row)?;
 
             let topition = Topition::new(topic.clone(), partition);
 
@@ -2548,10 +2552,10 @@ impl Postgres {
                 debug!(offset, ?topition);
             }
 
-            let row = self
-                .prepare_query_one(
+            let (columns, rows) = self
+                .prepare_query_rows(
                     tx,
-                    sql::TXN_PRODUCE_OFFSET_SELECT_OFFSET_RANGE,
+                    txn_produce_offset_select_offset_range::QUERY,
                     &[
                         &self.cluster,
                         &transaction_id,
@@ -2563,14 +2567,23 @@ impl Postgres {
                 )
                 .await?;
 
-            let offset_start = row.try_get::<_, i64>(0)?;
-            let offset_end = row.try_get::<_, i64>(1)?;
+            let reader = txn_produce_offset_select_offset_range::RowReader::new(&columns)?;
+
+            let txn_produce_offset_select_offset_range::Row {
+                offset_start,
+                offset_end,
+            } = reader.read_row(rows.first().ok_or_else(|| {
+                Error::Message(format!(
+                    "{} returned no rows",
+                    txn_produce_offset_select_offset_range::QUERY
+                ))
+            })?)?;
             debug!(offset_start, offset_end);
 
-            let rows = self
-                .prepare_query(
+            let (columns, rows) = self
+                .prepare_query_rows(
                     tx,
-                    sql::TXN_PRODUCE_OFFSET_SELECT_OVERLAPPING_TXN,
+                    txn_produce_offset_select_overlapping_txn::QUERY,
                     &[
                         &self.cluster,
                         &transaction_id,
@@ -2583,7 +2596,10 @@ impl Postgres {
                 )
                 .await?;
 
+            let reader = txn_produce_offset_select_overlapping_txn::RowReader::new(&columns)?;
+
             for row in rows {
+                let row = reader.read_row(&row).inspect_err(|err| error!(?err))?;
                 overlaps.push(Txn::try_from(row).inspect(|txn| debug!(?txn))?);
             }
         }
@@ -2765,6 +2781,93 @@ impl Postgres {
         Ok(error_code)
     }
 
+    /// Returns the newest epoch of `producer`, or `None` when the producer does not exist or has
+    /// no epoch.
+    async fn producer_epoch_current<C>(&self, client: &C, producer: i64) -> Result<Option<i16>>
+    where
+        C: GenericClient,
+    {
+        let (columns, rows) = self
+            .prepare_query_rows(
+                client,
+                producer_epoch_current_for_producer::QUERY,
+                &[&self.cluster, &producer],
+            )
+            .await?;
+
+        let reader = producer_epoch_current_for_producer::RowReader::new(&columns)?;
+
+        rows.first()
+            .map(|row| reader.read_row(row).map(|row| row.epoch))
+            .transpose()
+    }
+
+    /// Returns the producer that owns `transaction_id`, the newest of its epochs with a
+    /// transaction, and that transaction's status, or `None` when there is no such epoch.
+    async fn producer_epoch_for_current_txn<C>(
+        &self,
+        client: &C,
+        transaction_id: &str,
+    ) -> Result<Option<producer_epoch_for_current_txn::Row>>
+    where
+        C: GenericClient,
+    {
+        let (columns, rows) = self
+            .prepare_query_rows(
+                client,
+                producer_epoch_for_current_txn::QUERY,
+                &[&self.cluster, &transaction_id],
+            )
+            .await?;
+
+        let reader = producer_epoch_for_current_txn::RowReader::new(&columns)?;
+
+        rows.first().map(|row| reader.read_row(row)).transpose()
+    }
+
+    /// Adds a producer to the cluster, and returns its ID.
+    async fn producer_insert<C>(&self, client: &C) -> Result<i64>
+    where
+        C: GenericClient,
+    {
+        let (columns, rows) = self
+            .prepare_query_rows(client, producer_insert::QUERY, &[&self.cluster])
+            .await?;
+
+        let reader = producer_insert::RowReader::new(&columns)?;
+
+        reader
+            .read_row(rows.first().ok_or_else(|| {
+                Error::Message(format!("{} returned no rows", producer_insert::QUERY))
+            })?)
+            .map(|row| row.id)
+    }
+
+    /// Adds the next epoch to `producer`, and returns it.
+    ///
+    /// Returns [`Error::Message`] when the producer does not exist, or when its newest epoch is
+    /// `i16::MAX`.
+    async fn producer_epoch_insert<C>(&self, client: &C, producer: i64) -> Result<i16>
+    where
+        C: GenericClient,
+    {
+        let (columns, rows) = self
+            .prepare_query_rows(
+                client,
+                producer_epoch_insert::QUERY,
+                &[&self.cluster, &producer],
+            )
+            .await?;
+
+        let reader = producer_epoch_insert::RowReader::new(&columns)?;
+
+        reader
+            .read_row(rows.first().ok_or_else(|| {
+                Error::Message(format!("{} returned no rows", producer_epoch_insert::QUERY))
+            })?)
+            .map(|row| row.epoch)
+    }
+
     /// Moves `transaction_id` from the `previous` producer ID, whose epoch is exhausted, to a
     /// new producer ID at epoch 0, and fences `previous`. Returns the new producer ID and
     /// epoch.
@@ -2774,21 +2877,19 @@ impl Postgres {
         transaction_id: &str,
         previous: i64,
     ) -> Result<(i64, i16)> {
-        let producer: i64 = self
-            .prepare_query_one(tx, sql::PRODUCER_INSERT, &[&self.cluster])
-            .await?
-            .try_get(0)?;
+        let producer = self.producer_insert(tx).await?;
 
-        let epoch: i16 = self
-            .prepare_query_one(tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &producer])
-            .await?
-            .try_get(0)?;
+        let epoch = self.producer_epoch_insert(tx, producer).await?;
 
         // A produce or an EndTxn with an epoch below the producer's newest is fenced, so
         // epoch i16::MAX fences the previous producer ID. A producer at epoch i16::MAX
         // gets no new epoch, and is fenced already.
         _ = self
-            .prepare_query_opt(tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &previous])
+            .prepare_query_opt(
+                tx,
+                producer_epoch_insert::QUERY,
+                &[&self.cluster, &previous],
+            )
             .await?;
 
         let updated = self
@@ -2853,23 +2954,18 @@ impl Postgres {
 
             let mut rolled_back = false;
 
-            if let Some(row) = self
-                .prepare_query_opt(
-                    &tx,
-                    sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
-                    &[&self.cluster, &transaction_id],
-                )
+            if let Some(producer_epoch_for_current_txn::Row {
+                producer: id,
+                epoch,
+                status,
+            }) = self
+                .producer_epoch_for_current_txn(&tx, transaction_id)
                 .await
                 .inspect_err(|err| error!(?err))?
             {
-                let id: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-                let epoch: i16 = row.try_get(1).inspect_err(|err| error!(?err))?;
-                let status = row
-                    .try_get::<_, Option<String>>(2)
-                    .inspect_err(|err| error!(?err))?
-                    .map_or(Ok(None), |status| {
-                        TxnState::from_str(status.as_str()).map(Some)
-                    })?;
+                let status = status.map_or(Ok(None), |status| {
+                    TxnState::from_str(status.as_str()).map(Some)
+                })?;
 
                 debug!(transaction_id, id, epoch, ?status, ?claim);
 
@@ -2879,15 +2975,8 @@ impl Postgres {
                     // adding an epoch without a transaction, and the fenced producer must
                     // not get the transactional ID back with its old epoch.
                     let current = self
-                        .prepare_query_opt(
-                            &tx,
-                            sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER,
-                            &[&self.cluster, &id],
-                        )
+                        .producer_epoch_current(&tx, id)
                         .await
-                        .inspect_err(|err| error!(?err))?
-                        .map(|row| row.try_get::<_, i16>(0))
-                        .transpose()
                         .inspect_err(|err| error!(?err))?
                         .unwrap_or(epoch);
 
@@ -2921,42 +3010,37 @@ impl Postgres {
                 }
             }
 
-            let (producer, epoch) = if let Some(row) = self
-                .prepare_query_opt(&tx, sql::TXN_SELECT_NAME, &[&self.cluster, &transaction_id])
+            let (columns, rows) = self
+                .prepare_query_rows(
+                    &tx,
+                    txn_select_name::QUERY,
+                    &[&self.cluster, &transaction_id],
+                )
                 .await
-                .inspect_err(|err| error!(?err))?
-            {
-                let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
+                .inspect_err(|err| error!(?err))?;
+
+            let reader = txn_select_name::RowReader::new(&columns)?;
+
+            let (producer, epoch) = if let Some(row) = rows.first() {
+                let txn_select_name::Row {
+                    producer_id: producer,
+                } = reader.read_row(row).inspect_err(|err| error!(?err))?;
 
                 // The producer's newest epoch, not the newest epoch with a transaction,
                 // because the timeout sweep fences a producer with an epoch that has no
                 // transaction.
                 let newest = self
-                    .prepare_query_opt(
-                        &tx,
-                        sql::PRODUCER_EPOCH_CURRENT_FOR_PRODUCER,
-                        &[&self.cluster, &producer],
-                    )
+                    .producer_epoch_current(&tx, producer)
                     .await
-                    .inspect_err(|err| error!(?err))?
-                    .map(|row| row.try_get::<_, i16>(0))
-                    .transpose()
                     .inspect_err(|err| error!(?err))?;
 
                 if newest.is_some_and(epoch_is_exhausted) {
                     // The status after the rollback above, if it ran.
                     let status = self
-                        .prepare_query_opt(
-                            &tx,
-                            sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
-                            &[&self.cluster, &transaction_id],
-                        )
+                        .producer_epoch_for_current_txn(&tx, transaction_id)
                         .await
                         .inspect_err(|err| error!(?err))?
-                        .map(|row| row.try_get::<_, Option<String>>(2))
-                        .transpose()
-                        .inspect_err(|err| error!(?err))?
-                        .flatten()
+                        .and_then(|row| row.status)
                         .map(|status| TxnState::from_str(status.as_str()))
                         .transpose()?;
 
@@ -2972,7 +3056,7 @@ impl Postgres {
                             _ = self
                                 .prepare_query_opt(
                                     &tx,
-                                    sql::PRODUCER_EPOCH_INSERT,
+                                    producer_epoch_insert::QUERY,
                                     &[&self.cluster, &producer],
                                 )
                                 .await
@@ -2993,33 +3077,23 @@ impl Postgres {
                         .await
                         .inspect_err(|err| error!(self.cluster, transaction_id, producer, ?err))?
                 } else {
-                    let row = self
-                        .prepare_query_one(
-                            &tx,
-                            sql::PRODUCER_EPOCH_INSERT,
-                            &[&self.cluster, &producer],
-                        )
+                    let epoch = self
+                        .producer_epoch_insert(&tx, producer)
                         .await
                         .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                    let epoch: i16 = row.try_get(0)?;
 
                     (producer, epoch)
                 }
             } else {
-                let row = self
-                    .prepare_query_one(&tx, sql::PRODUCER_INSERT, &[&self.cluster])
+                let producer = self
+                    .producer_insert(&tx)
                     .await
                     .inspect_err(|err| error!(?err))?;
 
-                let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-
-                let row = self
-                    .prepare_query_one(&tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &producer])
+                let epoch = self
+                    .producer_epoch_insert(&tx, producer)
                     .await
                     .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                let epoch: i16 = row.try_get(0)?;
 
                 assert_eq!(
                     1,
@@ -3088,19 +3162,15 @@ impl Postgres {
             let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
             let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
-            let row = self
-                .prepare_query_one(&tx, sql::PRODUCER_INSERT, &[&self.cluster])
+            let producer = self
+                .producer_insert(&tx)
                 .await
                 .inspect_err(|err| error!(self.cluster, ?err))?;
 
-            let producer: i64 = row.try_get(0)?;
-
-            let row = self
-                .prepare_query_one(&tx, sql::PRODUCER_EPOCH_INSERT, &[&self.cluster, &producer])
+            let epoch = self
+                .producer_epoch_insert(&tx, producer)
                 .await
                 .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-            let epoch: i16 = row.try_get(0)?;
 
             let error = match tx
                 .commit()
@@ -3256,36 +3326,41 @@ impl Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let row = self
-            .prepare_query_one(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 &c,
-                sql::VIRTUAL_TOPIC_UPSERT,
+                virtual_topic_upsert::QUERY,
                 &[&self.cluster, &topic, &key.as_bytes(), &uuid],
             )
             .await?;
 
-        row.try_get::<_, Uuid>(0)
+        let reader = virtual_topic_upsert::RowReader::new(&columns)?;
+
+        let row = rows.first().ok_or_else(|| {
+            Error::Message(format!("{} returned no rows", virtual_topic_upsert::QUERY))
+        })?;
+
+        reader
+            .read_row(row)
+            .map(|row| row.uuid)
             .inspect_err(|err| error!(?err))
-            .map_err(Into::into)
             .inspect(|vt| debug!(%vt))
     }
 }
 
 /// Reads a `consumer_group_detail.sql` row as the stored group and the version that
 /// `update_group` compares against.
-fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
-    let version = row
-        .try_get::<_, Uuid>(0)
-        .inspect_err(|err| error!(?err))
-        .map(|uuid| Version {
-            e_tag: Some(uuid.to_string()),
-            version: None,
-        })
-        .inspect(|version| debug!(?version))?;
+fn group_detail_with_version(
+    row: sql::consumer_group_detail::Row,
+) -> Result<(GroupDetail, Version)> {
+    let version = Version {
+        e_tag: Some(row.e_tag.to_string()),
+        version: None,
+    };
+    debug!(?version);
 
-    let value = row.try_get::<_, Value>(1)?;
     let current =
-        serde_json::from_value::<GroupDetail>(value).inspect(|current| debug!(?current))?;
+        serde_json::from_value::<GroupDetail>(row.detail?).inspect(|current| debug!(?current))?;
 
     Ok((current, version))
 }
@@ -3337,10 +3412,10 @@ impl Storage for Postgres {
 
         let uuid = Uuid::new_v4();
 
-        let topic_uuid = self
-            .prepare_query_one(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 &tx,
-                sql::TOPIC_INSERT,
+                topic_insert::QUERY,
                 &[
                     &self.cluster,
                     &topic.name,
@@ -3351,7 +3426,6 @@ impl Storage for Postgres {
             )
             .await
             .inspect_err(|err| debug!(?err, ?topic, ?validate_only))
-            .map(|row| row.get(0))
             .map_err(|error| {
                 if let Error::TokioPostgres(ref error) = error
                     && error
@@ -3364,6 +3438,13 @@ impl Storage for Postgres {
                 }
             })?;
 
+        let reader = topic_insert::RowReader::new(&columns)?;
+
+        let topic_insert::Row { uuid: topic_uuid } =
+            reader.read_row(rows.first().ok_or_else(|| {
+                Error::Message(format!("{} returned no rows", topic_insert::QUERY))
+            })?)?;
+
         debug!(?topic_uuid, cluster = self.cluster, ?topic);
 
         // The watermark insert selects the topition rows that the topition insert creates, so
@@ -3371,7 +3452,7 @@ impl Storage for Postgres {
         // statement is awaited before the next one is sent on this transaction's connection,
         // which keeps that order. A watermark insert that finds no topition row matches no
         // rows without an error, leaving a topic that rejects every produce.
-        for sql in [sql::TOPITION_INSERT, sql::WATERMARK_INSERT] {
+        for sql in [topition_insert::QUERY, watermark_insert::QUERY] {
             for partition in 0..topic.num_partitions {
                 let inserted = self
                     .prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
@@ -3393,7 +3474,7 @@ impl Storage for Postgres {
                 _ = self
                     .prepare_execute(
                         &tx,
-                        sql::TOPIC_CONFIGURATION_UPSERT,
+                        topic_configuration_upsert::QUERY,
                         &[
                             &self.cluster,
                             &topic.name,
@@ -3474,23 +3555,37 @@ impl Storage for Postgres {
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
 
-        let row = match topic {
+        let topic_name = match topic {
             TopicId::Id(id) => {
-                self.prepare_query_opt(&tx, sql::TOPIC_SELECT_UUID, &[&self.cluster, &id])
-                    .await?
+                let (columns, rows) = self
+                    .prepare_query_rows(&tx, topic_select_uuid::QUERY, &[&self.cluster, &id])
+                    .await?;
+
+                let reader = topic_select_uuid::RowReader::new(&columns)?;
+
+                rows.first()
+                    .map(|row| reader.read_row(row))
+                    .transpose()?
+                    .map(|row| row.name)
             }
 
             TopicId::Name(name) => {
-                self.prepare_query_opt(&tx, sql::TOPIC_SELECT_NAME, &[&self.cluster, name])
-                    .await?
+                let (columns, rows) = self
+                    .prepare_query_rows(&tx, topic_select_name::QUERY, &[&self.cluster, name])
+                    .await?;
+
+                let reader = topic_select_name::RowReader::new(&columns)?;
+
+                rows.first()
+                    .map(|row| reader.read_row(row))
+                    .transpose()?
+                    .map(|row| row.name)
             }
         };
 
-        let Some(row) = row else {
+        let Some(topic_name) = topic_name else {
             return Ok(ErrorCode::UnknownTopicOrPartition);
         };
-
-        let topic_name = row.try_get::<_, String>(1)?;
 
         _ = self
             .prepare_query_opt(
@@ -3763,18 +3858,23 @@ impl Storage for Postgres {
 
         let c = self.connection().await?;
 
-        for row in self
-            .prepare_query(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 &c,
-                sql::CONSUMER_OFFSET_SELECT_BY_GROUP,
+                sql::consumer_offset_select_by_group::QUERY,
                 &[&self.cluster, &group_id],
             )
             .await
-            .inspect_err(|err| error!(?err))?
-        {
-            let topic = row.try_get::<_, String>(0)?;
-            let partition = row.try_get::<_, i32>(1)?;
-            let offset = row.try_get::<_, i64>(2)?;
+            .inspect_err(|err| error!(?err))?;
+
+        let reader = sql::consumer_offset_select_by_group::RowReader::new(&columns)?;
+
+        for row in rows {
+            let sql::consumer_offset_select_by_group::Row {
+                topic,
+                partition,
+                committed_offset: offset,
+            } = reader.read_row(&row)?;
 
             debug!(group_id, topic, partition, offset);
 
@@ -3802,9 +3902,9 @@ impl Storage for Postgres {
 
         for topic in topics {
             let offset = self
-                .prepare_query_opt(
+                .prepare_query_rows(
                     &c,
-                    sql::CONSUMER_OFFSET_SELECT,
+                    sql::consumer_offset_select::QUERY,
                     &[
                         &self.cluster,
                         &group_id,
@@ -3813,8 +3913,12 @@ impl Storage for Postgres {
                     ],
                 )
                 .await
-                .and_then(|maybe| {
-                    maybe.map_or(Ok(-1), |row| row.try_get::<_, i64>(0).map_err(Into::into))
+                .and_then(|(columns, rows)| {
+                    let reader = sql::consumer_offset_select::RowReader::new(&columns)?;
+
+                    rows.first().map_or(Ok(-1), |row| {
+                        reader.read_row(row).map(|row| row.committed_offset)
+                    })
                 })
                 .inspect(|offset| {
                     debug!(
@@ -3901,26 +4005,34 @@ impl Storage for Postgres {
                                 Ok(None)
                             }?;
 
-                            match self
-                                .prepare_query_opt(
+                            let selected = match self
+                                .prepare_query_rows(
                                     &c,
-                                    sql::TOPIC_SELECT_NAME,
+                                    topic_select_name::QUERY,
                                     &[&self.cluster, &base_topic],
                                 )
                                 .await
                                 .inspect_err(|err| error!(?err))
                             {
-                                Ok(Some(row)) => {
+                                Ok((columns, rows)) => {
+                                    let reader = topic_select_name::RowReader::new(&columns)?;
+                                    Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                                }
+
+                                Err(error) => Err(error),
+                            };
+
+                            match selected {
+                                Ok(Some(topic_select_name::Row {
+                                    uuid,
+                                    is_internal,
+                                    partitions,
+                                    replication_factor,
+                                    ..
+                                })) => {
                                     let error_code = ErrorCode::None.into();
-
-                                    let topic_id = vtid.or(row
-                                        .try_get::<_, Uuid>(0)
-                                        .map(|uuid| uuid.into_bytes())
-                                        .map(Some)?);
-
-                                    let is_internal = row.try_get::<_, bool>(2).map(Some)?;
-                                    let partitions = row.try_get::<_, i32>(3)?;
-                                    let replication_factor = row.try_get::<_, i32>(4)?;
+                                    let topic_id = vtid.or(Some(uuid.into_bytes()));
+                                    let is_internal = Some(is_internal);
 
                                     debug!(
                                         ?error_code,
@@ -3975,24 +4087,34 @@ impl Storage for Postgres {
                         }
                         TopicId::Id(id) => {
                             debug!(?id);
-                            match self
-                                .prepare_query_one(
+                            let selected = match self
+                                .prepare_query_rows(
                                     &c,
-                                    sql::PG_TOPIC_SELECT_UUID,
+                                    topic_select_uuid::PG_QUERY,
                                     &[&self.cluster, &id],
                                 )
                                 .await
                             {
-                                Ok(row) => {
+                                Ok((columns, rows)) => {
+                                    let reader = topic_select_uuid::RowReader::new(&columns)?;
+                                    Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                                }
+
+                                Err(error) => Err(error),
+                            };
+
+                            match selected {
+                                Ok(Some(topic_select_uuid::Row {
+                                    uuid,
+                                    name,
+                                    is_internal,
+                                    partitions,
+                                    replication_factor,
+                                })) => {
                                     let error_code = ErrorCode::None.into();
-                                    let topic_id = row
-                                        .try_get::<_, Uuid>(0)
-                                        .map(|uuid| uuid.into_bytes())
-                                        .map(Some)?;
-                                    let name = row.try_get::<_, String>(1).map(Some)?;
-                                    let is_internal = row.try_get::<_, bool>(2).map(Some)?;
-                                    let partitions = row.try_get::<_, i32>(3)?;
-                                    let replication_factor = row.try_get::<_, i32>(4)?;
+                                    let topic_id = Some(uuid.into_bytes());
+                                    let name = Some(name);
+                                    let is_internal = Some(is_internal);
 
                                     debug!(
                                         ?error_code,
@@ -4024,6 +4146,13 @@ impl Storage for Postgres {
                                         .partitions(partitions)
                                         .topic_authorized_operations(Some(-2147483648))
                                 }
+                                Ok(None) => MetadataResponseTopic::default()
+                                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                    .name(None)
+                                    .topic_id(Some(id.into_bytes()))
+                                    .is_internal(Some(false))
+                                    .partitions(Some([].into()))
+                                    .topic_authorized_operations(Some(-2147483648)),
                                 Err(reason) => {
                                     debug!(?reason);
                                     MetadataResponseTopic::default()
@@ -4046,21 +4175,26 @@ impl Storage for Postgres {
                 let mut responses = vec![];
 
                 match self
-                    .prepare_query(&c, sql::TOPIC_BY_CLUSTER, &[&self.cluster])
+                    .prepare_query_rows(&c, topic_by_cluster::QUERY, &[&self.cluster])
                     .await
                     .inspect_err(|err| error!(?err))
                 {
-                    Ok(rows) => {
+                    Ok((columns, rows)) => {
+                        let reader = topic_by_cluster::RowReader::new(&columns)?;
+
                         for row in rows {
+                            let topic_by_cluster::Row {
+                                uuid,
+                                name,
+                                is_internal,
+                                partitions,
+                                replication_factor,
+                            } = reader.read_row(&row)?;
+
                             let error_code = ErrorCode::None.into();
-                            let topic_id = row
-                                .try_get::<_, Uuid>(0)
-                                .map(|uuid| uuid.into_bytes())
-                                .map(Some)?;
-                            let name = row.try_get::<_, String>(1).map(Some)?;
-                            let is_internal = row.try_get::<_, bool>(2).map(Some)?;
-                            let partitions = row.try_get::<_, i32>(3)?;
-                            let replication_factor = row.try_get::<_, i32>(4)?;
+                            let topic_id = Some(uuid.into_bytes());
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
                             debug!(
                                 ?error_code,
@@ -4177,22 +4311,34 @@ impl Storage for Postgres {
 
             responses.push(match topic {
                 TopicId::Name(name) => {
-                    match self
-                        .prepare_query_opt(
+                    let selected = match self
+                        .prepare_query_rows(
                             &c,
-                            sql::TOPIC_SELECT_NAME,
+                            topic_select_name::QUERY,
                             &[&self.cluster, &name.as_str()],
                         )
                         .await
                         .inspect_err(|err| error!(?err))
                     {
-                        Ok(Some(row)) => {
-                            let topic_id =
-                                row.try_get::<_, Uuid>(0).map(|uuid| uuid.into_bytes())?;
-                            let name = row.try_get::<_, String>(1).map(Some)?;
-                            let is_internal = row.try_get::<_, bool>(2).map(Some)?;
-                            let partitions = row.try_get::<_, i32>(3)?;
-                            let replication_factor = row.try_get::<_, i32>(4)?;
+                        Ok((columns, rows)) => {
+                            let reader = topic_select_name::RowReader::new(&columns)?;
+                            Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                        }
+
+                        Err(error) => Err(error),
+                    };
+
+                    match selected {
+                        Ok(Some(topic_select_name::Row {
+                            uuid,
+                            name,
+                            is_internal,
+                            partitions,
+                            replication_factor,
+                        })) => {
+                            let topic_id = uuid.into_bytes();
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
                             debug!(
                                 ?topic_id,
@@ -4270,17 +4416,29 @@ impl Storage for Postgres {
                 }
                 TopicId::Id(id) => {
                     debug!(?id);
-                    match self
-                        .prepare_query_one(&c, sql::TOPIC_SELECT_UUID, &[&self.cluster, &id])
+                    let selected = match self
+                        .prepare_query_rows(&c, topic_select_uuid::QUERY, &[&self.cluster, &id])
                         .await
                     {
-                        Ok(row) => {
-                            let topic_id =
-                                row.try_get::<_, Uuid>(0).map(|uuid| uuid.into_bytes())?;
-                            let name = row.try_get::<_, String>(1).map(Some)?;
-                            let is_internal = row.try_get::<_, bool>(2).map(Some)?;
-                            let partitions = row.try_get::<_, i32>(3)?;
-                            let replication_factor = row.try_get::<_, i32>(4)?;
+                        Ok((columns, rows)) => {
+                            let reader = topic_select_uuid::RowReader::new(&columns)?;
+                            Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                        }
+
+                        Err(error) => Err(error),
+                    };
+
+                    match selected {
+                        Ok(Some(topic_select_uuid::Row {
+                            uuid,
+                            name,
+                            is_internal,
+                            partitions,
+                            replication_factor,
+                        })) => {
+                            let topic_id = uuid.into_bytes();
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
                             debug!(
                                 ?topic_id,
@@ -4323,6 +4481,20 @@ impl Storage for Postgres {
                                 ))
                                 .topic_authorized_operations(-2147483648)
                         }
+
+                        Ok(None) => DescribeTopicPartitionsResponseTopic::default()
+                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                            .name(match topic {
+                                TopicId::Name(name) => Some(name.into()),
+                                TopicId::Id(_) => None,
+                            })
+                            .topic_id(match topic {
+                                TopicId::Name(_) => NULL_TOPIC_ID,
+                                TopicId::Id(id) => id.into_bytes(),
+                            })
+                            .is_internal(false)
+                            .partitions(Some([].into()))
+                            .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
                             debug!(?reason);
@@ -4447,24 +4619,28 @@ impl Storage for Postgres {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                if let Some(row) = self
-                    .prepare_query_opt(
+                let (columns, rows) = self
+                    .prepare_query_rows(
                         &c,
-                        sql::CONSUMER_GROUP_SELECT_BY_NAME,
+                        sql::consumer_group_select_by_name::QUERY,
                         &[&self.cluster, group_id],
                     )
                     .await
-                    .inspect_err(|err| error!(?err, group_id))?
-                {
+                    .inspect_err(|err| error!(?err, group_id))?;
+
+                let reader = sql::consumer_group_select_by_name::RowReader::new(&columns)?;
+
+                if let Some(row) = rows.first() {
                     // A group row with no detail row (e.g. a group that only ever
                     // committed offsets, never a JoinGroup) joins to a NULL
                     // `detail` column here: that group exists and is empty, not
                     // an error.
-                    let current = match row
-                        .try_get::<_, Option<Value>>(1)
+                    let current = match reader
+                        .read_row(row)
                         .inspect_err(|err| error!(?err, group_id))?
+                        .detail
                     {
-                        Some(value) => serde_json::from_value::<GroupDetail>(value)
+                        Some(value) => serde_json::from_value::<GroupDetail>(value?)
                             .inspect(|current| debug!(?current))?,
                         None => GroupDetail::default(),
                     };
@@ -4488,17 +4664,21 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        self.prepare_query_opt(
-            &c,
-            sql::CONSUMER_GROUP_DETAIL,
-            &[&group_id, &self.cluster.as_str()],
-        )
-        .await
-        .inspect_err(|err| error!(?err, group_id))?
-        .as_ref()
-        .map(group_detail_with_version)
-        .transpose()
-        .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
+        let (columns, rows) = self
+            .prepare_query_rows(
+                &c,
+                sql::consumer_group_detail::QUERY,
+                &[&group_id, &self.cluster.as_str()],
+            )
+            .await
+            .inspect_err(|err| error!(?err, group_id))?;
+
+        let reader = sql::consumer_group_detail::RowReader::new(&columns)?;
+
+        rows.first()
+            .map(|row| reader.read_row(row).and_then(group_detail_with_version))
+            .transpose()
+            .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
     }
 
     #[instrument(skip_all)]
@@ -4535,10 +4715,10 @@ impl Storage for Postgres {
 
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(?detail))?;
 
-        let outcome = if let Some(row) = self
-            .prepare_query_opt(
+        let (columns, rows) = self
+            .prepare_query_rows(
                 &tx,
-                sql::CONSUMER_GROUP_DETAIL_INSERT,
+                sql::consumer_group_detail_insert::QUERY,
                 &[
                     &self.cluster,
                     &group_id,
@@ -4548,13 +4728,17 @@ impl Storage for Postgres {
                 ],
             )
             .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| error!(?err))?
-        {
-            row.try_get::<_, Uuid>(2)
+            .inspect(|(_, rows)| debug!(?rows))
+            .inspect_err(|err| error!(?err))?;
+
+        let reader = sql::consumer_group_detail_insert::RowReader::new(&columns)?;
+
+        let outcome = if let Some(row) = rows.first() {
+            reader
+                .read_row(row)
                 .inspect_err(|err| error!(?err))
                 .map_err(Into::into)
-                .map(|uuid| uuid.to_string())
+                .map(|row| row.e_tag.to_string())
                 .map(Some)
                 .map(|e_tag| Version {
                     e_tag,
@@ -4562,17 +4746,29 @@ impl Storage for Postgres {
                 })
                 .inspect(|version| debug!(?version))
         } else {
-            let row = self
-                .prepare_query_one(
+            let (columns, rows) = self
+                .prepare_query_rows(
                     &tx,
-                    sql::CONSUMER_GROUP_DETAIL,
+                    sql::consumer_group_detail::QUERY,
                     &[&group_id, &self.cluster.as_str()],
                 )
                 .await
-                .inspect(|row| debug!(?row))
+                .inspect(|(_, rows)| debug!(?rows))
                 .inspect_err(|err| error!(?err))?;
 
-            let (current, version) = group_detail_with_version(&row)?;
+            let reader = sql::consumer_group_detail::RowReader::new(&columns)?;
+
+            let row = rows
+                .first()
+                .ok_or_else(|| {
+                    Error::Message(format!(
+                        "{} returned no rows",
+                        sql::consumer_group_detail::QUERY
+                    ))
+                })
+                .inspect_err(|err| error!(?err))?;
+
+            let (current, version) = group_detail_with_version(reader.read_row(row)?)?;
 
             Err(UpdateError::Outdated {
                 current: Box::new(current),
@@ -4733,25 +4929,11 @@ impl Storage for Postgres {
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
         let (producer_id, producer_epoch) = if let Some(row) = self
-            .prepare_query_opt(
-                &tx,
-                sql::PRODUCER_EPOCH_FOR_CURRENT_TXN,
-                &[&self.cluster, &offsets.transaction_id],
-            )
+            .producer_epoch_for_current_txn(&tx, &offsets.transaction_id)
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let producer_id = row
-                .try_get::<_, i64>(0)
-                .map(Some)
-                .inspect_err(|err| error!(?err))?;
-
-            let epoch = row
-                .try_get::<_, i16>(1)
-                .map(Some)
-                .inspect_err(|err| error!(?err))?;
-
-            (producer_id, epoch)
+            (Some(row.producer), Some(row.epoch))
         } else {
             (None, None)
         };
@@ -4900,9 +5082,15 @@ impl Storage for Postgres {
     async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
         let c = self.connection().await?;
 
-        let rows = self
-            .prepare_query(&c, sql::TXN_DETAIL_SELECT_TIMED_OUT, &[&self.cluster, &now])
+        let (columns, rows) = self
+            .prepare_query_rows(
+                &c,
+                txn_detail_select_timed_out::QUERY,
+                &[&self.cluster, &now],
+            )
             .await?;
+
+        let reader = txn_detail_select_timed_out::RowReader::new(&columns)?;
 
         // release the listing connection before aborting: each abort_timed_out below checks
         // out its own connection from the same pool, and the pool can be small
@@ -4910,9 +5098,11 @@ impl Storage for Postgres {
         drop(c);
 
         for row in rows {
-            let transaction_id = row.try_get::<_, String>(0)?;
-            let producer_id = row.try_get::<_, i64>(1)?;
-            let producer_epoch = row.try_get::<_, i16>(2)?;
+            let txn_detail_select_timed_out::Row {
+                name: transaction_id,
+                producer_id,
+                producer_epoch,
+            } = reader.read_row(&row)?;
 
             match self
                 .abort_timed_out(&transaction_id, producer_id, producer_epoch)
@@ -4998,18 +5188,22 @@ impl Storage for Postgres {
     ) -> Result<Option<ScramCredential>> {
         let c = self.connection().await?;
 
-        self.prepare_query_opt(
+        self.prepare_query_rows(
             &c,
-            sql::SCRAM_CREDENTIAL_SELECT,
+            sql::scram_credential_select::QUERY,
             &[&self.cluster, &user, &i32::from(mechanism)],
         )
         .await
-        .and_then(|maybe| {
-            if let Some(row) = maybe {
-                let salt = row.try_get::<_, &[u8]>(0).map(Bytes::copy_from_slice)?;
-                let iterations = row.try_get::<_, i32>(1)?;
-                let stored_key = row.try_get::<_, &[u8]>(2).map(Bytes::copy_from_slice)?;
-                let server_key = row.try_get::<_, &[u8]>(3).map(Bytes::copy_from_slice)?;
+        .and_then(|(columns, rows)| {
+            let reader = sql::scram_credential_select::RowReader::new(&columns)?;
+
+            if let Some(row) = rows.first() {
+                let sql::scram_credential_select::Row {
+                    salt,
+                    iterations,
+                    stored_key,
+                    server_key,
+                } = reader.read_row(row)?;
 
                 Ok(Some(ScramCredential {
                     salt,
@@ -9258,7 +9452,7 @@ mod tests {
         {
             let c = storage.connection().await?;
             _ = c
-                .prepare_cached(storage.sql_lookup(sql::WATERMARK_INSERT)?)
+                .prepare_cached(storage.sql_lookup(watermark_insert::QUERY)?)
                 .await?;
         }
 

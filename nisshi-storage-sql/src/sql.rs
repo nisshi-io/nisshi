@@ -142,13 +142,52 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
     }
 }
 
+pub(crate) mod consumer_group_detail;
+pub(crate) mod consumer_group_detail_insert;
 pub(crate) mod consumer_group_select;
+pub(crate) mod consumer_group_select_by_name;
+pub(crate) mod consumer_offset_select;
+pub(crate) mod consumer_offset_select_by_group;
 pub(crate) mod driver;
+pub(crate) mod header_fetch;
+pub(crate) mod header_fetch_range;
+pub(crate) mod list_offset;
+pub(crate) mod lite_policy_compact_compaction;
+pub(crate) mod lite_policy_compact_distinct_k;
+pub(crate) mod lite_policy_compact_max_offset_id;
+pub(crate) mod lite_policy_compact_topitions;
+pub(crate) mod maintain_vacuum;
+pub(crate) mod nisshi_schema_version_select;
+pub(crate) mod pg_nisshi_schema_version_exists;
+pub(crate) mod producer_epoch_current_for_producer;
+pub(crate) mod producer_epoch_for_current_txn;
+pub(crate) mod producer_epoch_insert;
 pub(crate) mod producer_epochs_select;
+pub(crate) mod producer_insert;
+pub(crate) mod producer_select_for_update;
+pub(crate) mod record_fetch;
 pub(crate) mod result_columns;
+pub(crate) mod scram_credential_select;
+pub(crate) mod topic_by_cluster;
 pub(crate) mod topic_configuration_select;
 pub(crate) mod topic_configuration_select_keys;
+pub(crate) mod topic_configuration_select_name;
+pub(crate) mod topic_configuration_upsert;
+pub(crate) mod topic_insert;
 pub(crate) mod topic_select;
+pub(crate) mod topic_select_name;
+pub(crate) mod topic_select_uuid;
+pub(crate) mod topition_insert;
+pub(crate) mod topition_select_id;
+pub(crate) mod txn_detail_select_status_for_update;
+pub(crate) mod txn_detail_select_timed_out;
+pub(crate) mod txn_produce_offset_select_offset_range;
+pub(crate) mod txn_produce_offset_select_overlapping_txn;
+pub(crate) mod txn_select_name;
+pub(crate) mod txn_select_produced_topitions;
+pub(crate) mod virtual_topic_upsert;
+pub(crate) mod watermark_insert;
+pub(crate) mod watermark_select;
 pub(crate) mod watermark_select_for_write;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
@@ -271,99 +310,106 @@ const fn const_str_eq(left: &str, right: &str) -> bool {
 
 queries! {
     rows {
+        consumer_group_detail::QUERY = "sql" / "consumer_group_detail.sql",
+        consumer_group_detail_insert::QUERY = "sql" / "consumer_group_detail_insert.sql",
         consumer_group_select::QUERY = "sql" / "consumer_group_select.sql",
+        consumer_group_select_by_name::QUERY = "sql" / "consumer_group_select_by_name.sql",
+        consumer_offset_select::QUERY = "sql" / "consumer_offset_select.sql",
+        consumer_offset_select_by_group::QUERY = "sql" / "consumer_offset_select_by_group.sql",
+        header_fetch::QUERY = "sql" / "header_fetch.sql",
+        header_fetch_range::QUERY = "sql" / "header_fetch_range.sql",
+        list_offset::EARLIEST_QUERY = "sql" / "list_earliest_offset.sql",
+        list_offset::LATEST_COMMITTED_QUERY = "sql" / "list_latest_offset_committed.sql",
+        list_offset::LATEST_TIMESTAMP_QUERY = "sql" / "list_latest_offset_timestamp.sql",
+        list_offset::LATEST_UNCOMMITTED_QUERY = "sql" / "list_latest_offset_uncommitted.sql",
+        lite_policy_compact_compaction::QUERY = "lite" / "policy_compact_compaction.sql",
+        lite_policy_compact_distinct_k::QUERY = "lite" / "policy_compact_distinct_k.sql",
+        lite_policy_compact_max_offset_id::QUERY = "lite" / "policy_compact_max_offset_id.sql",
+        lite_policy_compact_topitions::QUERY = "lite" / "policy_compact_topitions.sql",
+        maintain_vacuum::QUERY = "sql" / "maintain-vacuum.sql",
+        nisshi_schema_version_select::QUERY = "sql" / "nisshi_schema_version_select.sql",
+        pg_nisshi_schema_version_exists::QUERY = "pg" / "nisshi_schema_version_exists.sql",
+        producer_epoch_current_for_producer::QUERY = "sql" / "producer_epoch_current_for_producer.sql",
+        producer_epoch_for_current_txn::QUERY = "sql" / "producer_epoch_for_current_txn.sql",
+        producer_epoch_insert::QUERY = "sql" / "producer_epoch_insert.sql",
         producer_epochs_select::QUERY = "sql" / "producer_epochs_select.sql",
+        producer_insert::QUERY = "sql" / "producer_insert.sql",
+        producer_select_for_update::QUERY = "sql" / "producer_select_for_update.sql",
+        record_fetch::KEYED_QUERY = "sql" / "record_fetch_keyed.sql",
+        record_fetch::PG_KEYED_QUERY = "pg" / "record_fetch_keyed.sql",
+        record_fetch::PG_QUERY = "pg" / "record_fetch.sql",
+        record_fetch::QUERY = "sql" / "record_fetch.sql",
+        scram_credential_select::QUERY = "sql" / "scram_credential_select.sql",
+        topic_by_cluster::QUERY = "sql" / "topic_by_cluster.sql",
         topic_configuration_select::QUERY = "sql" / "topic_configuration_select.sql",
         topic_configuration_select_keys::QUERY = "pg" / "topic_configuration_select_keys.sql",
+        topic_configuration_select_name::QUERY = "sql" / "topic_configuration_select_name.sql",
+        topic_configuration_upsert::QUERY = "sql" / "topic_configuration_upsert.sql",
+        topic_insert::QUERY = "sql" / "topic_insert.sql",
         topic_select::QUERY = "sql" / "topic_select.sql",
+        topic_select_name::QUERY = "sql" / "topic_select_name.sql",
+        topic_select_uuid::PG_QUERY = "pg" / "topic_select_uuid.sql",
+        topic_select_uuid::QUERY = "sql" / "topic_select_uuid.sql",
+        topition_insert::QUERY = "sql" / "topition_insert.sql",
+        topition_select_id::QUERY = "sql" / "topition_select_id.sql",
+        txn_detail_select_status_for_update::QUERY = "sql" / "txn_detail_select_status_for_update.sql",
+        txn_detail_select_timed_out::QUERY = "sql" / "txn_detail_select_timed_out.sql",
+        txn_produce_offset_select_offset_range::QUERY = "sql" / "txn_produce_offset_select_offset_range.sql",
+        txn_produce_offset_select_overlapping_txn::QUERY = "sql" / "txn_produce_offset_select_overlapping_txn.sql",
+        txn_select_name::QUERY = "sql" / "txn_select_name.sql",
+        txn_select_produced_topitions::QUERY = "sql" / "txn_select_produced_topitions.sql",
+        virtual_topic_upsert::QUERY = "sql" / "virtual_topic_upsert.sql",
+        watermark_insert::QUERY = "sql" / "watermark_insert.sql",
+        watermark_select::QUERY = "sql" / "watermark_select.sql",
         watermark_select_for_write::LITE_QUERY = "lite" / "watermark_select_for_write.sql",
         watermark_select_for_write::QUERY = "sql" / "watermark_select_for_write.sql",
     }
     plain {
         CONSUMER_GROUP_DELETE = "sql" / "consumer_group_delete.sql",
-        CONSUMER_GROUP_DETAIL = "sql" / "consumer_group_detail.sql",
         CONSUMER_GROUP_DETAIL_DELETE_BY_CG = "sql" / "consumer_group_detail_delete_by_cg.sql",
-        CONSUMER_GROUP_DETAIL_INSERT = "sql" / "consumer_group_detail_insert.sql",
         CONSUMER_GROUP_INSERT = "sql" / "consumer_group_insert.sql",
-        CONSUMER_GROUP_SELECT_BY_NAME = "sql" / "consumer_group_select_by_name.sql",
         CONSUMER_OFFSET_DELETE_BY_CG = "sql" / "consumer_offset_delete_by_cg.sql",
         CONSUMER_OFFSET_DELETE_BY_TOPIC = "sql" / "consumer_offset_delete_by_topic.sql",
         CONSUMER_OFFSET_INSERT = "sql" / "consumer_offset_insert.sql",
         CONSUMER_OFFSET_INSERT_FROM_TXN = "sql" / "consumer_offset_insert_from_txn.sql",
-        CONSUMER_OFFSET_SELECT = "sql" / "consumer_offset_select.sql",
-        CONSUMER_OFFSET_SELECT_BY_GROUP = "sql" / "consumer_offset_select_by_group.sql",
         HEADER_COPY = "sql" / "header_copy.sql",
         HEADER_DELETE_BY_TOPIC = "sql" / "header_delete_by_topic.sql",
-        HEADER_FETCH = "sql" / "header_fetch.sql",
-        HEADER_FETCH_RANGE = "sql" / "header_fetch_range.sql",
         HEADER_INSERT = "sql" / "header_insert.sql",
-        LIST_EARLIEST_OFFSET = "sql" / "list_earliest_offset.sql",
-        LIST_LATEST_OFFSET_COMMITTED = "sql" / "list_latest_offset_committed.sql",
-        LIST_LATEST_OFFSET_TIMESTAMP = "sql" / "list_latest_offset_timestamp.sql",
-        LIST_LATEST_OFFSET_UNCOMMITTED = "sql" / "list_latest_offset_uncommitted.sql",
-        LITE_POLICY_COMPACT_COMPACTION = "lite" / "policy_compact_compaction.sql",
         LITE_POLICY_COMPACT_DELETE = "lite" / "policy_compact_delete.sql",
-        LITE_POLICY_COMPACT_DISTINCT_K = "lite" / "policy_compact_distinct_k.sql",
-        LITE_POLICY_COMPACT_MAX_OFFSET_ID = "lite" / "policy_compact_max_offset_id.sql",
-        LITE_POLICY_COMPACT_TOPITIONS = "lite" / "policy_compact_topitions.sql",
         LITE_POLICY_DELETE = "lite" / "policy_delete.sql",
         LITE_POLICY_DELETE_BYTES = "lite" / "policy_delete_bytes.sql",
         LITE_VACUUM_INTO = "lite" / "vacuum_into.sql",
-        MAINTAIN_VACUUM = "sql" / "maintain-vacuum.sql",
         NISSHI_SCHEMA_VERSION_CREATE = "sql" / "nisshi_schema_version_create.sql",
         NISSHI_SCHEMA_VERSION_INSERT = "sql" / "nisshi_schema_version_insert.sql",
-        NISSHI_SCHEMA_VERSION_SELECT = "sql" / "nisshi_schema_version_select.sql",
-        PG_NISSHI_SCHEMA_VERSION_EXISTS = "pg" / "nisshi_schema_version_exists.sql",
-        PG_RECORD_FETCH = "pg" / "record_fetch.sql",
-        PG_RECORD_FETCH_KEYED = "pg" / "record_fetch_keyed.sql",
         PG_SEARCH_PATH_SET_TO_CLUSTER_NAMESPACE = "pg" / "search_path_set_to_cluster_namespace.sql",
-        PG_TOPIC_SELECT_UUID = "pg" / "topic_select_uuid.sql",
         PING = "sql" / "ping.sql",
         POLICY_COMPACT = "sql" / "policy_compact.sql",
         POLICY_DELETE = "sql" / "policy_delete.sql",
         POLICY_DELETE_BYTES = "sql" / "policy_delete_bytes.sql",
         PRODUCER_DETAIL_DELETE_BY_TOPIC = "sql" / "producer_detail_delete_by_topic.sql",
         PRODUCER_DETAIL_INSERT = "sql" / "producer_detail_insert.sql",
-        PRODUCER_EPOCH_CURRENT_FOR_PRODUCER = "sql" / "producer_epoch_current_for_producer.sql",
-        PRODUCER_EPOCH_FOR_CURRENT_TXN = "sql" / "producer_epoch_for_current_txn.sql",
-        PRODUCER_EPOCH_INSERT = "sql" / "producer_epoch_insert.sql",
         PRODUCER_EPOCH_INSERT_GIVEN = "sql" / "producer_epoch_insert_given.sql",
-        PRODUCER_INSERT = "sql" / "producer_insert.sql",
-        PRODUCER_SELECT_FOR_UPDATE = "sql" / "producer_select_for_update.sql",
         PRODUCER_UPDATE_EPOCH_WITH_TXN = "sql" / "producer_update_epoch_with_txn.sql",
         PRODUCER_UPDATE_SEQUENCE = "sql" / "producer_update_sequence.sql",
         RECORD_COPY = "sql" / "record_copy.sql",
         RECORD_DELETE_BELOW_LOG_START = "sql" / "record_delete_below_log_start.sql",
         RECORD_DELETE_BY_OFFSET = "sql" / "record_delete_by_offset.sql",
         RECORD_DELETE_BY_TOPIC = "sql" / "record_delete_by_topic.sql",
-        RECORD_FETCH = "sql" / "record_fetch.sql",
-        RECORD_FETCH_KEYED = "sql" / "record_fetch_keyed.sql",
         RECORD_INSERT = "sql" / "record_insert.sql",
         REGISTER_BROKER = "sql" / "register_broker.sql",
         SCRAM_CREDENTIAL_DELETE = "sql" / "scram_credential_delete.sql",
         SCRAM_CREDENTIAL_INSERT = "sql" / "scram_credential_insert.sql",
-        SCRAM_CREDENTIAL_SELECT = "sql" / "scram_credential_select.sql",
-        TOPIC_BY_CLUSTER = "sql" / "topic_by_cluster.sql",
         TOPIC_BY_UUID = "sql" / "topic_by_uuid.sql",
         TOPIC_CONFIGURATION_DELETE = "sql" / "topic_configuration_delete.sql",
         TOPIC_CONFIGURATION_DELETE_BY_TOPIC = "sql" / "topic_configuration_delete_by_topic.sql",
-        TOPIC_CONFIGURATION_SELECT_NAME = "sql" / "topic_configuration_select_name.sql",
-        TOPIC_CONFIGURATION_UPSERT = "sql" / "topic_configuration_upsert.sql",
         TOPIC_DELETE_BY = "sql" / "topic_delete_by.sql",
-        TOPIC_INSERT = "sql" / "topic_insert.sql",
-        TOPIC_SELECT_NAME = "sql" / "topic_select_name.sql",
         TOPIC_SELECT_NAME_FOR_UPDATE = "sql" / "topic_select_name_for_update.sql",
-        TOPIC_SELECT_UUID = "sql" / "topic_select_uuid.sql",
         TOPITION_DELETE_BY_TOPIC = "sql" / "topition_delete_by_topic.sql",
-        TOPITION_INSERT = "sql" / "topition_insert.sql",
         TOPITION_SELECT = "sql" / "topition_select.sql",
-        TOPITION_SELECT_ID = "sql" / "topition_select_id.sql",
         TXN_DETAIL_INSERT = "sql" / "txn_detail_insert.sql",
         TXN_DETAIL_SELECT = "sql" / "txn_detail_select.sql",
         TXN_DETAIL_SELECT_CURRENT = "sql" / "txn_detail_select_current.sql",
         TXN_DETAIL_SELECT_FOR_UPDATE = "sql" / "txn_detail_select_for_update.sql",
-        TXN_DETAIL_SELECT_STATUS_FOR_UPDATE = "sql" / "txn_detail_select_status_for_update.sql",
-        TXN_DETAIL_SELECT_TIMED_OUT = "sql" / "txn_detail_select_timed_out.sql",
         TXN_DETAIL_UPDATE_SEQUENCE = "sql" / "txn_detail_update_sequence.sql",
         TXN_DETAIL_UPDATE_STARTED_AT = "sql" / "txn_detail_update_started_at.sql",
         TXN_INSERT = "sql" / "txn_insert.sql",
@@ -375,11 +421,7 @@ queries! {
         TXN_PRODUCE_OFFSET_DELETE_BY_TOPIC = "sql" / "txn_produce_offset_delete_by_topic.sql",
         TXN_PRODUCE_OFFSET_DELETE_BY_TXN = "sql" / "txn_produce_offset_delete_by_txn.sql",
         TXN_PRODUCE_OFFSET_INSERT = "sql" / "txn_produce_offset_insert.sql",
-        TXN_PRODUCE_OFFSET_SELECT_OFFSET_RANGE = "sql" / "txn_produce_offset_select_offset_range.sql",
-        TXN_PRODUCE_OFFSET_SELECT_OVERLAPPING_TXN = "sql" / "txn_produce_offset_select_overlapping_txn.sql",
-        TXN_SELECT_NAME = "sql" / "txn_select_name.sql",
         TXN_SELECT_NAME_FOR_UPDATE = "sql" / "txn_select_name_for_update.sql",
-        TXN_SELECT_PRODUCED_TOPITIONS = "sql" / "txn_select_produced_topitions.sql",
         TXN_SELECT_PRODUCER_EPOCH = "sql" / "txn_select_producer_epoch.sql",
         TXN_STATUS_UPDATE = "sql" / "txn_status_update.sql",
         TXN_TOPITION_DELETE_BY_TOPIC = "sql" / "txn_topition_delete_by_topic.sql",
@@ -388,11 +430,8 @@ queries! {
         TXN_TOPITION_SELECT = "sql" / "txn_topition_select.sql",
         TXN_TOPITION_SELECT_TXNS = "sql" / "txn_topition_select_txns.sql",
         TXN_UPDATE_PRODUCER = "sql" / "txn_update_producer.sql",
-        VIRTUAL_TOPIC_UPSERT = "sql" / "virtual_topic_upsert.sql",
         WATERMARK_DELETE_BY_TOPIC = "sql" / "watermark_delete_by_topic.sql",
-        WATERMARK_INSERT = "sql" / "watermark_insert.sql",
         WATERMARK_INSERT_FROM_TXN = "sql" / "watermark_insert_from_txn.sql",
-        WATERMARK_SELECT = "sql" / "watermark_select.sql",
         WATERMARK_SELECT_STABLE = "sql" / "watermark_select_stable.sql",
         WATERMARK_UPDATE = "sql" / "watermark_update.sql",
     }
