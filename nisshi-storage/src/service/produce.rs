@@ -1340,8 +1340,12 @@ where
         // still fails, only with another error code.
         //
         // [`ReplicaManager.appendRecords`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L762-L765
-        if let Err(error) = Ack::try_from(input.request.acks) {
-            warn!(acks = input.request.acks, ?error, "invalid acks");
+        if Ack::try_from(input.request.acks).is_err() {
+            warn!(
+                acks = input.request.acks,
+                topics = topics.len(),
+                "rejecting produce request: acks must be -1, 0 or 1"
+            );
 
             responses.extend(
                 topics

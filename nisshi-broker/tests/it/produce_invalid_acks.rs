@@ -128,6 +128,7 @@ async fn produce(
 
     let topics = response.responses.unwrap_or_default();
     assert_eq!(1, topics.len());
+    assert_eq!(name, topics[0].name);
 
     let partitions = topics[0].partition_responses.clone().unwrap_or_default();
     assert_eq!(PARTITIONS.len(), partitions.len());
@@ -218,9 +219,34 @@ async fn invalid_acks_is_refused(storage: impl Storage + Clone) -> Result<()> {
     Ok(())
 }
 
+/// A partition of a topic that does not exist gets `INVALID_REQUIRED_ACKS`.
+/// Kafka answers it `UNKNOWN_TOPIC_OR_PARTITION`, because it checks `acks`
+/// after it finds the partition. We check `acks` before any storage call.
+async fn unknown_topic_is_refused_for_invalid_acks(storage: impl Storage + Clone) -> Result<()> {
+    let name = &alphanumeric_string(15)[..];
+
+    for response in produce(&storage, name, 2).await? {
+        assert_eq!(
+            ErrorCode::InvalidRequiredAcks,
+            ErrorCode::try_from(response.error_code)?,
+            "{response:?}"
+        );
+        assert_eq!(-1, response.base_offset);
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_topic_is_refused_for_invalid_acks() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::unknown_topic_is_refused_for_invalid_acks(storage(StorageType::InMemory).await?)
+            .await
+    }
 
     #[tokio::test]
     async fn invalid_acks_is_refused() -> Result<()> {
