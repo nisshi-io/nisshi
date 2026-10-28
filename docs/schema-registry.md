@@ -10,6 +10,9 @@ schemas used to validate messages.
 When a message is produced to a topic with an associated schema,
 the message is validated against the schema. If a message does not conform to its
 schema it is rejected by the broker with an `INVALID_RECORD` error.
+An Apache Avro key or value must be an Avro object container whose `avro.codec`
+is `null` or absent. The broker rejects a container with any other codec, such as
+`deflate`, `snappy` or `zstandard`, with `INVALID_RECORD`.
 
 Each schema is found in the root directory of the registry, named after the topic.
 A `.json` extension is used for JSON schema, `.avsc` for Apache Avro, and  `.proto` for Protocol buffers.
