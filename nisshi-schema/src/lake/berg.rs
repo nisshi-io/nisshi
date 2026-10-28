@@ -242,12 +242,25 @@ impl Iceberg {
             .inspect(|namespace| debug!(?namespace))
             .inspect_err(|err| debug!(?err))?
         {
-            _ = self
+            match self
                 .catalog
                 .create_namespace(&namespace_ident, HashMap::new())
                 .await
-                .inspect(|namespace| debug!(?namespace))
-                .inspect_err(|err| debug!(?err))?;
+            {
+                Ok(namespace) => debug!(?namespace),
+
+                // Produces to different partitions store concurrently, so the first produces
+                // each try to create the namespace. A produce that loses that race uses the
+                // namespace that the winner created, instead of failing.
+                Err(err) if self.catalog.namespace_exists(&namespace_ident).await? => {
+                    debug!(?err);
+                }
+
+                Err(err) => {
+                    debug!(?err);
+                    return Err(err.into());
+                }
+            }
         }
 
         Ok(namespace_ident)
@@ -289,7 +302,8 @@ impl Iceberg {
 
             table
         } else {
-            self.catalog
+            match self
+                .catalog
                 .create_table(
                     &namespace_ident,
                     TableCreation::builder()
@@ -298,8 +312,28 @@ impl Iceberg {
                         .build(),
                 )
                 .await
-                .inspect(|table| debug!(?table))
-                .inspect_err(|err| debug!(?err))?
+            {
+                Ok(table) => {
+                    debug!(?table);
+                    table
+                }
+
+                // Produces to different partitions of a topic store concurrently, so the first
+                // produces to a new topic each try to create its table. A produce that loses
+                // that race loads the table that the winner created, instead of failing.
+                Err(err) if self.catalog.table_exists(&table_ident).await? => {
+                    debug!(?err);
+                    self.catalog
+                        .load_table(&table_ident)
+                        .await
+                        .inspect_err(|err| debug!(?err))?
+                }
+
+                Err(err) => {
+                    debug!(?err);
+                    return Err(err.into());
+                }
+            }
         };
 
         _ = self
