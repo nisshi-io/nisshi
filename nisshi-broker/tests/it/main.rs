@@ -67,6 +67,7 @@ pub mod produce_idempotent_duplicate;
 pub mod produce_idempotent_epoch_bump;
 pub mod produce_invalid_record;
 pub mod produce_max_message_bytes;
+pub mod produce_post_watermark_failure;
 pub mod produce_post_write_advance_failed;
 pub mod rebalance_timing;
 pub mod replication_factor;

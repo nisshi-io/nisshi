@@ -2009,6 +2009,27 @@ impl Storage for DynoStore {
         ])
     }
 
+    /// Appends `deflated` to `topition`, and returns the base offset of the batch.
+    ///
+    /// The produce takes its offsets in the watermark document of the
+    /// partition, before the writes that follow: the lake table, the
+    /// transaction metadata and the batch object. If one of those writes
+    /// fails, the client gets an error and the taken offsets hold no batch.
+    /// The produce does not move the high watermark back, because a rollback
+    /// is another conditional write that can fail in the same way, and a
+    /// concurrent produce can already hold the next offset. A fetch skips the
+    /// gap, and the time index backfill settles it as a failed produce after
+    /// `BATCH_SETTLED_AFTER`. `ListOffsets` reports a high watermark past the
+    /// gap.
+    ///
+    /// Kafka does not use an offset for an append that it rejects. After it
+    /// appends to the log, Kafka does not move the log end offset back, also
+    /// when the transaction index write that follows fails
+    /// ([`UnifiedLog.append`]). This engine takes its offsets earlier, at the
+    /// watermark write, so a failed batch write leaves a gap that Kafka does
+    /// not have.
+    ///
+    /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L905-L912
     async fn produce(
         &self,
         transaction_id: Option<&str>,
