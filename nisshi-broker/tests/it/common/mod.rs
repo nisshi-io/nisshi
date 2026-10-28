@@ -77,6 +77,9 @@ pub(crate) fn init_tracing() -> Result<DefaultGuard> {
     ))
 }
 
+/// The PostgreSQL database that [`StorageType::Postgres`] stores to.
+pub(crate) const POSTGRES_URL: &str = "postgres://postgres:postgres@localhost";
+
 pub(crate) enum StorageType {
     InMemory,
     Lite,
@@ -130,7 +133,7 @@ pub(crate) async fn storage_container(
                 .node_id(node)
                 .advertised_listener(advertised_listener)
                 .schema_registry(schemas)
-                .storage(Url::parse("postgres://postgres:postgres@localhost")?)
+                .storage(Url::parse(POSTGRES_URL)?)
                 .build()
                 .await
         }

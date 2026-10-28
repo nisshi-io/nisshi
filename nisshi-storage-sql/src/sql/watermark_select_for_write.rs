@@ -19,8 +19,8 @@
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the partition's index.
 
-/// The PostgreSQL version's name in the SQL cache. This version locks the partition's cluster,
-/// topic, topition and watermark rows.
+/// The PostgreSQL version's name in the SQL cache. This version locks the partition's watermark
+/// row.
 pub(crate) const QUERY: &str = "watermark_select_for_write.sql";
 
 /// The libSQL and Turso version's name in the SQL cache. This version does not lock rows, because

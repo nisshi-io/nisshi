@@ -68,7 +68,10 @@ pub mod produce_idempotent_duplicate;
 pub mod produce_idempotent_epoch_bump;
 pub mod produce_invalid_record;
 pub mod produce_max_message_bytes;
+pub mod produce_post_watermark_failure;
 pub mod produce_post_write_advance_failed;
+#[cfg(feature = "postgres")]
+pub mod produce_row_locks;
 pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;
@@ -92,6 +95,7 @@ pub mod storage_options;
 pub mod tls;
 pub mod topic;
 pub mod topic_config_aliases;
+pub mod topic_config_read_failed;
 pub mod topic_lifecycle;
 pub mod traceforge_delete_topic_object_store_fault;
 pub mod traceforge_group_join;

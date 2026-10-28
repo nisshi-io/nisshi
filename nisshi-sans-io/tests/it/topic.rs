@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::topic::is_valid_topic_name;
+use nisshi_sans_io::topic::{has_collision_chars, is_valid_topic_name, unify_collision_chars};
 
 #[test]
 fn accepts_legal_names() {
@@ -37,4 +37,20 @@ fn rejects_illegal_names() {
     // The rule checks bytes, not chars, so every multi-byte character is
     // rejected; swapping the check to `.chars()` would silently widen it.
     assert!(!is_valid_topic_name("é"));
+}
+
+#[test]
+fn collision_chars_are_period_and_underscore() {
+    assert!(has_collision_chars("a.b"));
+    assert!(has_collision_chars("a_b"));
+    assert!(!has_collision_chars("a-b"));
+    assert!(!has_collision_chars("ab"));
+}
+
+#[test]
+fn unify_collision_chars_maps_period_to_underscore() {
+    assert_eq!("a_b_c", unify_collision_chars("a.b_c"));
+    assert_eq!(unify_collision_chars("a_b"), unify_collision_chars("a.b"));
+    assert_eq!("a-b", unify_collision_chars("a-b"));
+    assert_eq!("ab", unify_collision_chars("ab"));
 }

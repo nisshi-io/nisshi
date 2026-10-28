@@ -111,7 +111,16 @@
 //! ```
 //!
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::todo, clippy::unimplemented)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use async_trait::async_trait;
 use bytes::{Bytes, TryGetError};
 
@@ -420,6 +429,9 @@ pub enum Error {
 
     #[cfg(feature = "turso")]
     UnexpectedValue(turso::Value),
+
+    #[cfg(feature = "libsql")]
+    UnexpectedLibSqlValue(libsql::Value),
 
     UnknownCacheKey(String),
 

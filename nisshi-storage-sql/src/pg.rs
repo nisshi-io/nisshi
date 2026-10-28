@@ -1737,8 +1737,8 @@ impl Postgres {
         }
     }
 
-    /// Locks the rows that a write to the partition changes, until `tx` ends. Returns the
-    /// partition's low and high watermarks and its topic's stored `max.message.bytes`. Fails with
+    /// Locks the partition's watermark row until `tx` ends. Returns the partition's low and high
+    /// watermarks and its topic's stored `max.message.bytes`. Fails with
     /// `UNKNOWN_TOPIC_OR_PARTITION` when the partition does not exist.
     async fn watermark_select_for_write(
         &self,

@@ -5460,9 +5460,9 @@ impl TryFrom<Value> for LiteTimestamp {
                 .map(LiteTimestamp::from)
                 .map_err(Into::into),
 
-            Value::Real(_) => unimplemented!("{value:?}"),
-            Value::Null => unimplemented!("{value:?}"),
-            Value::Blob(_) => unimplemented!("{value:?}"),
+            Value::Real(_) | Value::Null | Value::Blob(_) => {
+                Err(Error::UnexpectedLibSqlValue(value))
+            }
         }
     }
 }
@@ -5480,6 +5480,14 @@ mod tests {
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+
+    #[test]
+    fn timestamp_from_null_is_an_error() {
+        assert_matches!(
+            LiteTimestamp::try_from(Value::Null),
+            Err(Error::UnexpectedLibSqlValue(Value::Null))
+        );
+    }
 
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};
