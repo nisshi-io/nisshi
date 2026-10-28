@@ -4878,7 +4878,7 @@ mod tests {
 
         assert!(matches!(
             engine.init_producer(Some("txn"), 10_000, None, None).await,
-            Err(Error::Column { column: "epoch", source, .. })
+            Err(Error::UnreadableColumn { column: "epoch", source, .. })
                 if matches!(*source, Error::TryFromInt(_))
         ));
 

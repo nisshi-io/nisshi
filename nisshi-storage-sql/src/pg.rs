@@ -979,8 +979,8 @@ impl Postgres {
             let op = OpType::try_from(config.config_operation)?;
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                let (columns, rows) = self
-                    .prepare_query_rows(
+                let (columns, row) = self
+                    .prepare_query_optional_row(
                         &tx,
                         topic_configuration_select_name::QUERY,
                         &[&self.cluster, topic, &config.name],
@@ -989,8 +989,7 @@ impl Postgres {
 
                 let reader = topic_configuration_select_name::RowReader::new(&columns)?;
 
-                rows.first()
-                    .map(|row| reader.read_row(row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .and_then(|row| row.value)
             } else {
@@ -1344,8 +1343,8 @@ impl Postgres {
         base_topic: &str,
         partition: i32,
     ) -> Result<OffsetStage> {
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_one_row(
                 c,
                 watermark_select::QUERY,
                 &[&self.cluster, &base_topic, &partition],
@@ -1355,13 +1354,8 @@ impl Postgres {
 
         let reader = watermark_select::RowReader::new(&columns)?;
 
-        let row = rows
-            .first()
-            .ok_or_else(|| Error::Message(format!("{} returned no rows", watermark_select::QUERY)))
-            .inspect_err(|err| error!(base_topic, partition, ?err))?;
-
         let watermark_select::Row { low, high, stable } = reader
-            .read_row(row)
+            .read_row(&row)
             .inspect_err(|err| error!(base_topic, partition, ?err))?;
 
         let log_start = low.unwrap_or_default();
@@ -1403,9 +1397,9 @@ impl Postgres {
 
             debug!(?query);
 
-            let (columns, rows) = match offset_type {
+            let (columns, row) = match offset_type {
                 ListOffset::Earliest | ListOffset::Latest => self
-                    .prepare_query_rows(
+                    .prepare_query_optional_row(
                         c,
                         query,
                         &[&self.cluster, &topition.topic(), &topition.partition()],
@@ -1414,7 +1408,7 @@ impl Postgres {
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
                 ListOffset::Timestamp(timestamp) => self
-                    .prepare_query_rows(
+                    .prepare_query_optional_row(
                         c,
                         query,
                         &[
@@ -1433,9 +1427,8 @@ impl Postgres {
 
             let reader = list_offset::RowReader::new(&columns)?;
 
-            let list_offset = rows
-                .first()
-                .map(|row| reader.read_row(row))
+            let list_offset = row
+                .map(|row| reader.read_row(&row))
                 .transpose()
                 .inspect_err(|err| {
                     error!(?err, cluster = self.cluster, ?topition);
@@ -1686,8 +1679,8 @@ impl Postgres {
                     .inspect_err(|err| error!(?err))?;
             }
 
-            let (columns, rows) = self
-                .prepare_query_rows(
+            let (columns, row) = self
+                .prepare_query_one_row(
                     tx,
                     producer_select_for_update::QUERY,
                     &[
@@ -1711,14 +1704,8 @@ impl Postgres {
 
             let reader = producer_select_for_update::RowReader::new(&columns)?;
 
-            let producer_select_for_update::Row { sequence } = reader
-                .read_row(rows.first().ok_or_else(|| {
-                    Error::Message(format!(
-                        "{} returned no rows",
-                        producer_select_for_update::QUERY
-                    ))
-                })?)
-                .inspect_err(|err| error!(?err))?;
+            let producer_select_for_update::Row { sequence } =
+                reader.read_row(&row).inspect_err(|err| error!(?err))?;
 
             debug!(
                 self.cluster,
@@ -2100,6 +2087,26 @@ impl Postgres {
             .map(|row| (columns, row))
     }
 
+    /// Runs the query that the SQL cache holds for `query`, and returns its row with the names of
+    /// its result's columns. A result with no rows or with more than one row is an error.
+    #[instrument(skip(self, client, params))]
+    async fn prepare_query_one_row<C>(
+        &self,
+        client: &C,
+        query: &'static str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<(ResultColumns, Row)>
+    where
+        C: GenericClient,
+    {
+        let (sql, statement) = self.prepare_statement(client, query).await?;
+        let columns = ResultColumns::postgres(query, &statement);
+
+        self.record_sql_metrics(sql, client.query_one(&statement, params))
+            .await
+            .map(|row| (columns, row))
+    }
+
     #[instrument(skip(self, client, params))]
     async fn prepare_query_opt<C>(
         &self,
@@ -2129,8 +2136,8 @@ impl Postgres {
         let topic = topition.topic();
         let partition = topition.partition();
 
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_optional_row(
                 tx,
                 topition_select_id::QUERY,
                 &[&self.cluster, &topic, &partition],
@@ -2140,12 +2147,12 @@ impl Postgres {
 
         let reader = topition_select_id::RowReader::new(&columns)?;
 
-        let Some(row) = rows.first() else {
+        let Some(row) = row else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
         let topition_select_id::Row { id: topition_id } =
-            reader.read_row(row).inspect_err(|err| error!(?err))?;
+            reader.read_row(&row).inspect_err(|err| error!(?err))?;
         debug!(topition_id);
 
         if deflated.is_idempotent() {
@@ -2400,8 +2407,8 @@ impl Postgres {
         // EndTxn racing the maintain_transactions sweep, or a retried EndTxn) already
         // finalized this transaction, this blocks until it commits, then sees the
         // terminal status below and no-ops instead of writing a second marker.
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_optional_row(
                 tx,
                 txn_detail_select_status_for_update::QUERY,
                 &[
@@ -2413,9 +2420,9 @@ impl Postgres {
             )
             .await?;
         let reader = txn_detail_select_status_for_update::RowReader::new(&columns)?;
-        let status = match rows.first() {
+        let status = match row {
             Some(row) => reader
-                .read_row(row)?
+                .read_row(&row)?
                 .status // nullable transaction status column -> Option<String>
                 .map(TxnState::try_from) // parse if present -> Option<Result<TxnState, _>>
                 .transpose()?, // Option<Result<_>> -> Result<Option<_>>, then `?` -> Option<TxnState>
@@ -2552,8 +2559,8 @@ impl Postgres {
                 debug!(offset, ?topition);
             }
 
-            let (columns, rows) = self
-                .prepare_query_rows(
+            let (columns, row) = self
+                .prepare_query_one_row(
                     tx,
                     txn_produce_offset_select_offset_range::QUERY,
                     &[
@@ -2572,12 +2579,7 @@ impl Postgres {
             let txn_produce_offset_select_offset_range::Row {
                 offset_start,
                 offset_end,
-            } = reader.read_row(rows.first().ok_or_else(|| {
-                Error::Message(format!(
-                    "{} returned no rows",
-                    txn_produce_offset_select_offset_range::QUERY
-                ))
-            })?)?;
+            } = reader.read_row(&row)?;
             debug!(offset_start, offset_end);
 
             let (columns, rows) = self
@@ -2787,8 +2789,8 @@ impl Postgres {
     where
         C: GenericClient,
     {
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_optional_row(
                 client,
                 producer_epoch_current_for_producer::QUERY,
                 &[&self.cluster, &producer],
@@ -2797,8 +2799,7 @@ impl Postgres {
 
         let reader = producer_epoch_current_for_producer::RowReader::new(&columns)?;
 
-        rows.first()
-            .map(|row| reader.read_row(row).map(|row| row.epoch))
+        row.map(|row| reader.read_row(&row).map(|row| row.epoch))
             .transpose()
     }
 
@@ -2812,8 +2813,8 @@ impl Postgres {
     where
         C: GenericClient,
     {
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_optional_row(
                 client,
                 producer_epoch_for_current_txn::QUERY,
                 &[&self.cluster, &transaction_id],
@@ -2822,7 +2823,7 @@ impl Postgres {
 
         let reader = producer_epoch_for_current_txn::RowReader::new(&columns)?;
 
-        rows.first().map(|row| reader.read_row(row)).transpose()
+        row.map(|row| reader.read_row(&row)).transpose()
     }
 
     /// Adds a producer to the cluster, and returns its ID.
@@ -2830,29 +2831,25 @@ impl Postgres {
     where
         C: GenericClient,
     {
-        let (columns, rows) = self
-            .prepare_query_rows(client, producer_insert::QUERY, &[&self.cluster])
+        let (columns, row) = self
+            .prepare_query_one_row(client, producer_insert::QUERY, &[&self.cluster])
             .await?;
 
         let reader = producer_insert::RowReader::new(&columns)?;
 
-        reader
-            .read_row(rows.first().ok_or_else(|| {
-                Error::Message(format!("{} returned no rows", producer_insert::QUERY))
-            })?)
-            .map(|row| row.id)
+        reader.read_row(&row).map(|row| row.id)
     }
 
     /// Adds the next epoch to `producer`, and returns it.
     ///
-    /// Returns [`Error::Message`] when the producer does not exist, or when its newest epoch is
-    /// `i16::MAX`.
+    /// Returns [`Error::TokioPostgres`] when the producer does not exist, or when its newest epoch
+    /// is `i16::MAX`.
     async fn producer_epoch_insert<C>(&self, client: &C, producer: i64) -> Result<i16>
     where
         C: GenericClient,
     {
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_one_row(
                 client,
                 producer_epoch_insert::QUERY,
                 &[&self.cluster, &producer],
@@ -2861,11 +2858,7 @@ impl Postgres {
 
         let reader = producer_epoch_insert::RowReader::new(&columns)?;
 
-        reader
-            .read_row(rows.first().ok_or_else(|| {
-                Error::Message(format!("{} returned no rows", producer_epoch_insert::QUERY))
-            })?)
-            .map(|row| row.epoch)
+        reader.read_row(&row).map(|row| row.epoch)
     }
 
     /// Moves `transaction_id` from the `previous` producer ID, whose epoch is exhausted, to a
@@ -3010,8 +3003,8 @@ impl Postgres {
                 }
             }
 
-            let (columns, rows) = self
-                .prepare_query_rows(
+            let (columns, row) = self
+                .prepare_query_optional_row(
                     &tx,
                     txn_select_name::QUERY,
                     &[&self.cluster, &transaction_id],
@@ -3021,10 +3014,10 @@ impl Postgres {
 
             let reader = txn_select_name::RowReader::new(&columns)?;
 
-            let (producer, epoch) = if let Some(row) = rows.first() {
+            let (producer, epoch) = if let Some(row) = row {
                 let txn_select_name::Row {
                     producer_id: producer,
-                } = reader.read_row(row).inspect_err(|err| error!(?err))?;
+                } = reader.read_row(&row).inspect_err(|err| error!(?err))?;
 
                 // The producer's newest epoch, not the newest epoch with a transaction,
                 // because the timeout sweep fences a producer with an epoch that has no
@@ -3326,8 +3319,8 @@ impl Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_one_row(
                 &c,
                 virtual_topic_upsert::QUERY,
                 &[&self.cluster, &topic, &key.as_bytes(), &uuid],
@@ -3336,12 +3329,8 @@ impl Postgres {
 
         let reader = virtual_topic_upsert::RowReader::new(&columns)?;
 
-        let row = rows.first().ok_or_else(|| {
-            Error::Message(format!("{} returned no rows", virtual_topic_upsert::QUERY))
-        })?;
-
         reader
-            .read_row(row)
+            .read_row(&row)
             .map(|row| row.uuid)
             .inspect_err(|err| error!(?err))
             .inspect(|vt| debug!(%vt))
@@ -3412,8 +3401,8 @@ impl Storage for Postgres {
 
         let uuid = Uuid::new_v4();
 
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_one_row(
                 &tx,
                 topic_insert::QUERY,
                 &[
@@ -3440,10 +3429,7 @@ impl Storage for Postgres {
 
         let reader = topic_insert::RowReader::new(&columns)?;
 
-        let topic_insert::Row { uuid: topic_uuid } =
-            reader.read_row(rows.first().ok_or_else(|| {
-                Error::Message(format!("{} returned no rows", topic_insert::QUERY))
-            })?)?;
+        let topic_insert::Row { uuid: topic_uuid } = reader.read_row(&row)?;
 
         debug!(?topic_uuid, cluster = self.cluster, ?topic);
 
@@ -3557,27 +3543,33 @@ impl Storage for Postgres {
 
         let topic_name = match topic {
             TopicId::Id(id) => {
-                let (columns, rows) = self
-                    .prepare_query_rows(&tx, topic_select_uuid::QUERY, &[&self.cluster, &id])
+                let (columns, row) = self
+                    .prepare_query_optional_row(
+                        &tx,
+                        topic_select_uuid::QUERY,
+                        &[&self.cluster, &id],
+                    )
                     .await?;
 
                 let reader = topic_select_uuid::RowReader::new(&columns)?;
 
-                rows.first()
-                    .map(|row| reader.read_row(row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .map(|row| row.name)
             }
 
             TopicId::Name(name) => {
-                let (columns, rows) = self
-                    .prepare_query_rows(&tx, topic_select_name::QUERY, &[&self.cluster, name])
+                let (columns, row) = self
+                    .prepare_query_optional_row(
+                        &tx,
+                        topic_select_name::QUERY,
+                        &[&self.cluster, name],
+                    )
                     .await?;
 
                 let reader = topic_select_name::RowReader::new(&columns)?;
 
-                rows.first()
-                    .map(|row| reader.read_row(row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .map(|row| row.name)
             }
@@ -3902,7 +3894,7 @@ impl Storage for Postgres {
 
         for topic in topics {
             let offset = self
-                .prepare_query_rows(
+                .prepare_query_optional_row(
                     &c,
                     sql::consumer_offset_select::QUERY,
                     &[
@@ -3913,11 +3905,11 @@ impl Storage for Postgres {
                     ],
                 )
                 .await
-                .and_then(|(columns, rows)| {
+                .and_then(|(columns, row)| {
                     let reader = sql::consumer_offset_select::RowReader::new(&columns)?;
 
-                    rows.first().map_or(Ok(-1), |row| {
-                        reader.read_row(row).map(|row| row.committed_offset)
+                    row.map_or(Ok(-1), |row| {
+                        reader.read_row(&row).map(|row| row.committed_offset)
                     })
                 })
                 .inspect(|offset| {
@@ -4006,7 +3998,7 @@ impl Storage for Postgres {
                             }?;
 
                             let selected = match self
-                                .prepare_query_rows(
+                                .prepare_query_optional_row(
                                     &c,
                                     topic_select_name::QUERY,
                                     &[&self.cluster, &base_topic],
@@ -4014,9 +4006,9 @@ impl Storage for Postgres {
                                 .await
                                 .inspect_err(|err| error!(?err))
                             {
-                                Ok((columns, rows)) => {
+                                Ok((columns, row)) => {
                                     let reader = topic_select_name::RowReader::new(&columns)?;
-                                    Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                                    Ok(row.map(|row| reader.read_row(&row)).transpose()?)
                                 }
 
                                 Err(error) => Err(error),
@@ -4088,29 +4080,29 @@ impl Storage for Postgres {
                         TopicId::Id(id) => {
                             debug!(?id);
                             let selected = match self
-                                .prepare_query_rows(
+                                .prepare_query_one_row(
                                     &c,
                                     topic_select_uuid::PG_QUERY,
                                     &[&self.cluster, &id],
                                 )
                                 .await
                             {
-                                Ok((columns, rows)) => {
+                                Ok((columns, row)) => {
                                     let reader = topic_select_uuid::RowReader::new(&columns)?;
-                                    Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                                    Ok(reader.read_row(&row)?)
                                 }
 
                                 Err(error) => Err(error),
                             };
 
                             match selected {
-                                Ok(Some(topic_select_uuid::Row {
+                                Ok(topic_select_uuid::Row {
                                     uuid,
                                     name,
                                     is_internal,
                                     partitions,
                                     replication_factor,
-                                })) => {
+                                }) => {
                                     let error_code = ErrorCode::None.into();
                                     let topic_id = Some(uuid.into_bytes());
                                     let name = Some(name);
@@ -4146,13 +4138,6 @@ impl Storage for Postgres {
                                         .partitions(partitions)
                                         .topic_authorized_operations(Some(-2147483648))
                                 }
-                                Ok(None) => MetadataResponseTopic::default()
-                                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                                    .name(None)
-                                    .topic_id(Some(id.into_bytes()))
-                                    .is_internal(Some(false))
-                                    .partitions(Some([].into()))
-                                    .topic_authorized_operations(Some(-2147483648)),
                                 Err(reason) => {
                                     debug!(?reason);
                                     MetadataResponseTopic::default()
@@ -4312,7 +4297,7 @@ impl Storage for Postgres {
             responses.push(match topic {
                 TopicId::Name(name) => {
                     let selected = match self
-                        .prepare_query_rows(
+                        .prepare_query_optional_row(
                             &c,
                             topic_select_name::QUERY,
                             &[&self.cluster, &name.as_str()],
@@ -4320,9 +4305,9 @@ impl Storage for Postgres {
                         .await
                         .inspect_err(|err| error!(?err))
                     {
-                        Ok((columns, rows)) => {
+                        Ok((columns, row)) => {
                             let reader = topic_select_name::RowReader::new(&columns)?;
-                            Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                            Ok(row.map(|row| reader.read_row(&row)).transpose()?)
                         }
 
                         Err(error) => Err(error),
@@ -4417,25 +4402,25 @@ impl Storage for Postgres {
                 TopicId::Id(id) => {
                     debug!(?id);
                     let selected = match self
-                        .prepare_query_rows(&c, topic_select_uuid::QUERY, &[&self.cluster, &id])
+                        .prepare_query_one_row(&c, topic_select_uuid::QUERY, &[&self.cluster, &id])
                         .await
                     {
-                        Ok((columns, rows)) => {
+                        Ok((columns, row)) => {
                             let reader = topic_select_uuid::RowReader::new(&columns)?;
-                            Ok(rows.first().map(|row| reader.read_row(row)).transpose()?)
+                            Ok(reader.read_row(&row)?)
                         }
 
                         Err(error) => Err(error),
                     };
 
                     match selected {
-                        Ok(Some(topic_select_uuid::Row {
+                        Ok(topic_select_uuid::Row {
                             uuid,
                             name,
                             is_internal,
                             partitions,
                             replication_factor,
-                        })) => {
+                        }) => {
                             let topic_id = uuid.into_bytes();
                             let name = Some(name);
                             let is_internal = Some(is_internal);
@@ -4481,20 +4466,6 @@ impl Storage for Postgres {
                                 ))
                                 .topic_authorized_operations(-2147483648)
                         }
-
-                        Ok(None) => DescribeTopicPartitionsResponseTopic::default()
-                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                            .name(match topic {
-                                TopicId::Name(name) => Some(name.into()),
-                                TopicId::Id(_) => None,
-                            })
-                            .topic_id(match topic {
-                                TopicId::Name(_) => NULL_TOPIC_ID,
-                                TopicId::Id(id) => id.into_bytes(),
-                            })
-                            .is_internal(false)
-                            .partitions(Some([].into()))
-                            .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
                             debug!(?reason);
@@ -4619,8 +4590,8 @@ impl Storage for Postgres {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                let (columns, rows) = self
-                    .prepare_query_rows(
+                let (columns, row) = self
+                    .prepare_query_optional_row(
                         &c,
                         sql::consumer_group_select_by_name::QUERY,
                         &[&self.cluster, group_id],
@@ -4630,13 +4601,13 @@ impl Storage for Postgres {
 
                 let reader = sql::consumer_group_select_by_name::RowReader::new(&columns)?;
 
-                if let Some(row) = rows.first() {
+                if let Some(row) = row {
                     // A group row with no detail row (e.g. a group that only ever
                     // committed offsets, never a JoinGroup) joins to a NULL
                     // `detail` column here: that group exists and is empty, not
                     // an error.
                     let current = match reader
-                        .read_row(row)
+                        .read_row(&row)
                         .inspect_err(|err| error!(?err, group_id))?
                         .detail
                     {
@@ -4664,8 +4635,8 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_optional_row(
                 &c,
                 sql::consumer_group_detail::QUERY,
                 &[&group_id, &self.cluster.as_str()],
@@ -4675,8 +4646,7 @@ impl Storage for Postgres {
 
         let reader = sql::consumer_group_detail::RowReader::new(&columns)?;
 
-        rows.first()
-            .map(|row| reader.read_row(row).and_then(group_detail_with_version))
+        row.map(|row| reader.read_row(&row).and_then(group_detail_with_version))
             .transpose()
             .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
     }
@@ -4715,8 +4685,8 @@ impl Storage for Postgres {
 
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(?detail))?;
 
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_optional_row(
                 &tx,
                 sql::consumer_group_detail_insert::QUERY,
                 &[
@@ -4728,14 +4698,14 @@ impl Storage for Postgres {
                 ],
             )
             .await
-            .inspect(|(_, rows)| debug!(?rows))
+            .inspect(|(_, row)| debug!(?row))
             .inspect_err(|err| error!(?err))?;
 
         let reader = sql::consumer_group_detail_insert::RowReader::new(&columns)?;
 
-        let outcome = if let Some(row) = rows.first() {
+        let outcome = if let Some(row) = row {
             reader
-                .read_row(row)
+                .read_row(&row)
                 .inspect_err(|err| error!(?err))
                 .map_err(Into::into)
                 .map(|row| row.e_tag.to_string())
@@ -4746,29 +4716,19 @@ impl Storage for Postgres {
                 })
                 .inspect(|version| debug!(?version))
         } else {
-            let (columns, rows) = self
-                .prepare_query_rows(
+            let (columns, row) = self
+                .prepare_query_one_row(
                     &tx,
                     sql::consumer_group_detail::QUERY,
                     &[&group_id, &self.cluster.as_str()],
                 )
                 .await
-                .inspect(|(_, rows)| debug!(?rows))
+                .inspect(|(_, row)| debug!(?row))
                 .inspect_err(|err| error!(?err))?;
 
             let reader = sql::consumer_group_detail::RowReader::new(&columns)?;
 
-            let row = rows
-                .first()
-                .ok_or_else(|| {
-                    Error::Message(format!(
-                        "{} returned no rows",
-                        sql::consumer_group_detail::QUERY
-                    ))
-                })
-                .inspect_err(|err| error!(?err))?;
-
-            let (current, version) = group_detail_with_version(reader.read_row(row)?)?;
+            let (current, version) = group_detail_with_version(reader.read_row(&row)?)?;
 
             Err(UpdateError::Outdated {
                 current: Box::new(current),
@@ -5188,22 +5148,22 @@ impl Storage for Postgres {
     ) -> Result<Option<ScramCredential>> {
         let c = self.connection().await?;
 
-        self.prepare_query_rows(
+        self.prepare_query_optional_row(
             &c,
             sql::scram_credential_select::QUERY,
             &[&self.cluster, &user, &i32::from(mechanism)],
         )
         .await
-        .and_then(|(columns, rows)| {
+        .and_then(|(columns, row)| {
             let reader = sql::scram_credential_select::RowReader::new(&columns)?;
 
-            if let Some(row) = rows.first() {
+            if let Some(row) = row {
                 let sql::scram_credential_select::Row {
                     salt,
                     iterations,
                     stored_key,
                     server_key,
-                } = reader.read_row(row)?;
+                } = reader.read_row(&row)?;
 
                 Ok(Some(ScramCredential {
                     salt,
