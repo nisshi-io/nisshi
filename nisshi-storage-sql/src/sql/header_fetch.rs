@@ -26,8 +26,8 @@ sql_row! {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct Row {
         /// The header's key.
-        k: Option<bytes::Bytes>,
+        key: Option<bytes::Bytes>,
         /// The header's value.
-        v: Option<bytes::Bytes>,
+        value: Option<bytes::Bytes>,
     }
 }

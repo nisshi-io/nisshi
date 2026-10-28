@@ -19,11 +19,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "producer_insert.sql";
 
-sql_row! {
-    /// The new producer.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(crate) struct Row {
-        /// The producer ID.
-        id: i64,
-    }
-}
+/// Reads each row of the query's result.
+pub(crate) use super::row::written_id::RowReader;

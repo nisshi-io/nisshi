@@ -21,11 +21,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "lite/policy_compact_compaction.sql";
 
-sql_row! {
-    /// One record that compaction deletes.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(crate) struct Row {
-        /// The record's offset.
-        offset_id: i64,
-    }
-}
+/// One record that compaction deletes.
+pub(crate) use super::row::record_offset::{Row, RowReader};

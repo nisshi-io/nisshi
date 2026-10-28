@@ -24,6 +24,6 @@ sql_row! {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct Row {
         /// The key, or `None` for the records without a key.
-        k: Option<bytes::Bytes>,
+        key: Option<bytes::Bytes>,
     }
 }

@@ -30,7 +30,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::NaiveDateTime;
 use deadpool::managed;
 use libsql::{
     Connection, Database, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
@@ -57,7 +56,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
-    to_system_time, to_timestamp,
+    to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
@@ -1148,8 +1147,8 @@ impl Delegate {
 
         let mut overlaps = vec![];
 
-        let mut rows = connection
-            .query(
+        let (columns, mut rows) = connection
+            .query_rows(
                 txn_select_produced_topitions::QUERY,
                 (
                     self.cluster.as_str(),
@@ -1160,10 +1159,7 @@ impl Delegate {
             )
             .await?;
 
-        let reader = txn_select_produced_topitions::RowReader::new(&ResultColumns::libsql(
-            txn_select_produced_topitions::QUERY,
-            &rows,
-        ))?;
+        let reader = txn_select_produced_topitions::RowReader::new(&columns)?;
 
         while let Some(row) = rows.next().await? {
             let txn_select_produced_topitions::Row { topic, partition } = reader.read_row(&row)?;
@@ -1209,8 +1205,8 @@ impl Delegate {
 
             debug!(offset, ?topition);
 
-            let mut rows = connection
-                .query(
+            let (columns, row) = connection
+                .query_first(
                     txn_produce_offset_select_offset_range::QUERY,
                     (
                         self.cluster.as_str(),
@@ -1223,19 +1219,17 @@ impl Delegate {
                 )
                 .await?;
 
-            let reader = txn_produce_offset_select_offset_range::RowReader::new(
-                &ResultColumns::libsql(txn_produce_offset_select_offset_range::QUERY, &rows),
-            )?;
+            let reader = txn_produce_offset_select_offset_range::RowReader::new(&columns)?;
 
-            if let Some(row) = rows.next().await? {
+            if let Some(row) = row {
                 let txn_produce_offset_select_offset_range::Row {
                     offset_start,
                     offset_end,
                 } = reader.read_row(&row)?;
                 debug!(offset_start, offset_end);
 
-                let mut rows = connection
-                    .query(
+                let (columns, mut rows) = connection
+                    .query_rows(
                         txn_produce_offset_select_overlapping_txn::QUERY,
                         (
                             self.cluster.as_str(),
@@ -1249,9 +1243,7 @@ impl Delegate {
                     )
                     .await?;
 
-                let reader = txn_produce_offset_select_overlapping_txn::RowReader::new(
-                    &ResultColumns::libsql(txn_produce_offset_select_overlapping_txn::QUERY, &rows),
-                )?;
+                let reader = txn_produce_offset_select_overlapping_txn::RowReader::new(&columns)?;
 
                 while let Some(row) = rows.next().await? {
                     let row = reader.read_row(&row).inspect_err(|err| error!(?err))?;
@@ -1420,17 +1412,14 @@ impl Delegate {
     ) -> Result<Vec<i64>> {
         let pc = self.connection().await?;
 
-        let mut rows = pc
-            .query(
+        let (columns, mut rows) = pc
+            .query_rows(
                 sql::lite_policy_compact_compaction::QUERY,
                 (topition, key, max_offset_id),
             )
             .await?;
 
-        let reader = sql::lite_policy_compact_compaction::RowReader::new(&ResultColumns::libsql(
-            sql::lite_policy_compact_compaction::QUERY,
-            &rows,
-        ))?;
+        let reader = sql::lite_policy_compact_compaction::RowReader::new(&columns)?;
 
         let mut offsets = Vec::new();
 
@@ -1468,19 +1457,16 @@ impl Delegate {
     async fn policy_compact_distinct_k(&self, topition: i64) -> Result<BTreeSet<Vec<u8>>> {
         let pc = self.connection().await?;
 
-        let mut rows = pc
-            .query(sql::lite_policy_compact_distinct_k::QUERY, [topition])
+        let (columns, mut rows) = pc
+            .query_rows(sql::lite_policy_compact_distinct_k::QUERY, [topition])
             .await?;
 
-        let reader = sql::lite_policy_compact_distinct_k::RowReader::new(&ResultColumns::libsql(
-            sql::lite_policy_compact_distinct_k::QUERY,
-            &rows,
-        ))?;
+        let reader = sql::lite_policy_compact_distinct_k::RowReader::new(&columns)?;
 
         let mut keys = BTreeSet::new();
 
         while let Some(row) = rows.next().await? {
-            if let Some(key) = reader.read_row(&row)?.k {
+            if let Some(key) = reader.read_row(&row)?.key {
                 _ = keys.insert(Vec::from(key));
             }
         }
@@ -1494,17 +1480,14 @@ impl Delegate {
     async fn policy_compact_topitions(&self) -> Result<BTreeSet<i64>> {
         let pc = self.connection().await?;
 
-        let mut rows = pc
-            .query(
+        let (columns, mut rows) = pc
+            .query_rows(
                 sql::lite_policy_compact_topitions::QUERY,
                 [self.cluster.as_str()],
             )
             .await?;
 
-        let reader = sql::lite_policy_compact_topitions::RowReader::new(&ResultColumns::libsql(
-            sql::lite_policy_compact_topitions::QUERY,
-            &rows,
-        ))?;
+        let reader = sql::lite_policy_compact_topitions::RowReader::new(&columns)?;
 
         let mut topitions = BTreeSet::new();
 
@@ -3008,41 +2991,31 @@ impl Storage for Delegate {
 
         let topic_name = match topic {
             TopicId::Id(id) => {
-                let mut rows = pc
-                    .query(
+                let (columns, row) = pc
+                    .query_first(
                         topic_select_uuid::QUERY,
                         (self.cluster.as_str(), id.to_string().as_str()),
                     )
                     .await?;
 
-                let reader = topic_select_uuid::RowReader::new(&ResultColumns::libsql(
-                    topic_select_uuid::QUERY,
-                    &rows,
-                ))?;
+                let reader = topic_select_uuid::RowReader::new(&columns)?;
 
-                rows.next()
-                    .await?
-                    .map(|row| reader.read_row(&row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .map(|row| row.name)
             }
 
             TopicId::Name(name) => {
-                let mut rows = pc
-                    .query(
+                let (columns, row) = pc
+                    .query_first(
                         topic_select_name::QUERY,
                         (self.cluster.as_str(), name.as_str()),
                     )
                     .await?;
 
-                let reader = topic_select_name::RowReader::new(&ResultColumns::libsql(
-                    topic_select_name::QUERY,
-                    &rows,
-                ))?;
+                let reader = topic_select_name::RowReader::new(&columns)?;
 
-                rows.next()
-                    .await?
-                    .map(|row| reader.read_row(&row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .map(|row| row.name)
             }
@@ -3245,45 +3218,39 @@ impl Storage for Delegate {
 
         let c = self.connection().await?;
 
-        let (query, mut records) = if let Some(key) = key_filter {
+        let (columns, mut records) = if let Some(key) = key_filter {
             let key_bytes = key.as_bytes().to_vec();
-            let records = c
-                .query(
-                    record_fetch::KEYED_QUERY,
-                    (
-                        self.cluster.as_str(),
-                        base_topic,
-                        topition.partition(),
-                        offset,
-                        (max_bytes as i64),
-                        high_watermark,
-                        key_bytes,
-                    ),
-                )
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            (record_fetch::KEYED_QUERY, records)
+            c.query_rows(
+                record_fetch::KEYED_QUERY,
+                (
+                    self.cluster.as_str(),
+                    base_topic,
+                    topition.partition(),
+                    offset,
+                    (max_bytes as i64),
+                    high_watermark,
+                    key_bytes,
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
         } else {
-            let records = c
-                .query(
-                    record_fetch::QUERY,
-                    (
-                        self.cluster.as_str(),
-                        topition.topic(),
-                        topition.partition(),
-                        offset,
-                        (max_bytes as i64),
-                        high_watermark,
-                    ),
-                )
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            (record_fetch::QUERY, records)
+            c.query_rows(
+                record_fetch::QUERY,
+                (
+                    self.cluster.as_str(),
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                    (max_bytes as i64),
+                    high_watermark,
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
         };
 
-        let reader = record_fetch::RowReader::new(&ResultColumns::libsql(query, &records))?;
+        let reader = record_fetch::RowReader::new(&columns)?;
 
         let mut batches = vec![];
 
@@ -3292,8 +3259,8 @@ impl Storage for Delegate {
                 offset_id: base_offset,
                 attributes,
                 timestamp,
-                k,
-                v,
+                key,
+                value,
                 producer_id,
                 producer_epoch,
             } = reader.read_row(&row).inspect_err(|err| error!(?err))?;
@@ -3302,18 +3269,18 @@ impl Storage for Delegate {
             let timestamp_delta = 0;
 
             debug!(base_offset);
-            debug!(key_len = ?k.as_ref().map(Bytes::len));
-            debug!(value_len = ?v.as_ref().map(Bytes::len));
+            debug!(key_len = ?key.as_ref().map(Bytes::len));
+            debug!(value_len = ?value.as_ref().map(Bytes::len));
 
             let record_builder = {
                 let mut record_builder = Record::builder()
                     .offset_delta(offset_delta)
                     .timestamp_delta(timestamp_delta)
-                    .key(k)
-                    .value(v);
+                    .key(key)
+                    .value(value);
 
-                let mut headers = c
-                    .query(
+                let (columns, mut headers) = c
+                    .query_rows(
                         header_fetch::QUERY,
                         (
                             self.cluster.as_str(),
@@ -3324,10 +3291,7 @@ impl Storage for Delegate {
                     )
                     .await?;
 
-                let header_reader = header_fetch::RowReader::new(&ResultColumns::libsql(
-                    header_fetch::QUERY,
-                    &headers,
-                ))?;
+                let header_reader = header_fetch::RowReader::new(&columns)?;
 
                 while let Some(header) = headers.next().await? {
                     let header = header_reader
@@ -3336,12 +3300,12 @@ impl Storage for Delegate {
 
                     let mut header_builder = Header::builder();
 
-                    if let Some(k) = header.k {
-                        header_builder = header_builder.key(k);
+                    if let Some(key) = header.key {
+                        header_builder = header_builder.key(key);
                     }
 
-                    if let Some(v) = header.v {
-                        header_builder = header_builder.value(v);
+                    if let Some(value) = header.value {
+                        header_builder = header_builder.value(value);
                     }
 
                     record_builder = record_builder.header(header_builder);
@@ -3370,8 +3334,8 @@ impl Storage for Delegate {
                     offset_id: offset,
                     attributes,
                     timestamp,
-                    k,
-                    v,
+                    key,
+                    value,
                     producer_id,
                     producer_epoch,
                 } = reader.read_row(&row).inspect_err(|err| error!(?err))?;
@@ -3418,18 +3382,18 @@ impl Storage for Delegate {
 
                 let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
-                debug!(key_len = ?k.as_ref().map(Bytes::len));
-                debug!(value_len = ?v.as_ref().map(Bytes::len));
+                debug!(key_len = ?key.as_ref().map(Bytes::len));
+                debug!(value_len = ?value.as_ref().map(Bytes::len));
 
                 let record_builder = {
                     let mut record_builder = Record::builder()
                         .offset_delta(offset_delta)
                         .timestamp_delta(timestamp_delta)
-                        .key(k)
-                        .value(v);
+                        .key(key)
+                        .value(value);
 
-                    let mut headers = c
-                        .query(
+                    let (columns, mut headers) = c
+                        .query_rows(
                             header_fetch::QUERY,
                             (
                                 self.cluster.as_str(),
@@ -3440,10 +3404,7 @@ impl Storage for Delegate {
                         )
                         .await?;
 
-                    let header_reader = header_fetch::RowReader::new(&ResultColumns::libsql(
-                        header_fetch::QUERY,
-                        &headers,
-                    ))?;
+                    let header_reader = header_fetch::RowReader::new(&columns)?;
 
                     while let Some(header) = headers.next().await? {
                         let header = header_reader
@@ -3452,12 +3413,12 @@ impl Storage for Delegate {
 
                         let mut header_builder = Header::builder();
 
-                        if let Some(k) = header.k {
-                            header_builder = header_builder.key(k);
+                        if let Some(key) = header.key {
+                            header_builder = header_builder.key(key);
                         }
 
-                        if let Some(v) = header.v {
-                            header_builder = header_builder.value(v);
+                        if let Some(value) = header.value {
+                            header_builder = header_builder.value(value);
                         }
 
                         record_builder = record_builder.header(header_builder);
@@ -3632,17 +3593,14 @@ impl Storage for Delegate {
 
         let c = self.connection().await?;
 
-        let mut rows = c
-            .query(
+        let (columns, mut rows) = c
+            .query_rows(
                 sql::consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
-        let reader = sql::consumer_offset_select_by_group::RowReader::new(&ResultColumns::libsql(
-            sql::consumer_offset_select_by_group::QUERY,
-            &rows,
-        ))?;
+        let reader = sql::consumer_offset_select_by_group::RowReader::new(&columns)?;
 
         while let Some(row) = rows.next().await? {
             let sql::consumer_offset_select_by_group::Row {
@@ -3682,8 +3640,8 @@ impl Storage for Delegate {
         let mut offsets = BTreeMap::new();
 
         for topic in topics {
-            let mut rows = c
-                .query(
+            let (columns, mut rows) = c
+                .query_rows(
                     sql::consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
@@ -3703,10 +3661,7 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            let reader = sql::consumer_offset_select::RowReader::new(&ResultColumns::libsql(
-                sql::consumer_offset_select::QUERY,
-                &rows,
-            ))?;
+            let reader = sql::consumer_offset_select::RowReader::new(&columns)?;
 
             let offset = rows
                 .next()
@@ -3909,16 +3864,14 @@ impl Storage for Delegate {
                                 Ok(None)
                             }?;
 
-                            let mut rows = c
-                                .query(
+                            let (columns, mut rows) = c
+                                .query_rows(
                                     topic_select_name::QUERY,
                                     (self.cluster.as_str(), base_topic),
                                 )
                                 .await?;
 
-                            let reader = topic_select_name::RowReader::new(
-                                &ResultColumns::libsql(topic_select_name::QUERY, &rows),
-                            )?;
+                            let reader = topic_select_name::RowReader::new(&columns)?;
 
                             match rows.next().await.inspect_err(|err| error!(?err)) {
                                 Ok(Some(row)) => {
@@ -3988,16 +3941,14 @@ impl Storage for Delegate {
                         TopicId::Id(id) => {
                             debug!(?id);
 
-                            let mut rows = c
-                                .query(
+                            let (columns, mut rows) = c
+                                .query_rows(
                                     topic_select_uuid::QUERY,
                                     (self.cluster.as_str(), id.to_string().as_str()),
                                 )
                                 .await?;
 
-                            let reader = topic_select_uuid::RowReader::new(
-                                &ResultColumns::libsql(topic_select_uuid::QUERY, &rows),
-                            )?;
+                            let reader = topic_select_uuid::RowReader::new(&columns)?;
 
                             match rows.next().await {
                                 Ok(Some(row)) => {
@@ -4072,14 +4023,11 @@ impl Storage for Delegate {
             _ => {
                 let mut responses = vec![];
 
-                let mut rows = c
-                    .query(topic_by_cluster::QUERY, &[self.cluster.as_str()])
+                let (columns, mut rows) = c
+                    .query_rows(topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                let reader = topic_by_cluster::RowReader::new(&ResultColumns::libsql(
-                    topic_by_cluster::QUERY,
-                    &rows,
-                ))?;
+                let reader = topic_by_cluster::RowReader::new(&columns)?;
 
                 while let Some(row) = rows.next().await? {
                     let topic_by_cluster::Row {
@@ -5026,14 +4974,11 @@ impl Storage for Delegate {
                 let pc = self.connection().await?;
                 let tx = pc.transaction().await?;
 
-                let mut rows = pc
-                    .query(producer_insert::QUERY, &[self.cluster.as_str()])
+                let (columns, mut rows) = pc
+                    .query_rows(producer_insert::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                let reader = producer_insert::RowReader::new(&ResultColumns::libsql(
-                    producer_insert::QUERY,
-                    &rows,
-                ))?;
+                let reader = producer_insert::RowReader::new(&columns)?;
 
                 if let Some(row) = rows.next().await? {
                     let producer = reader
@@ -5045,17 +4990,14 @@ impl Storage for Delegate {
                         debug!(?row)
                     }
 
-                    let mut rows = pc
-                        .query(
+                    let (columns, mut rows) = pc
+                        .query_rows(
                             producer_epoch_insert::QUERY,
                             (self.cluster.as_str(), producer),
                         )
                         .await?;
 
-                    let reader = producer_epoch_insert::RowReader::new(&ResultColumns::libsql(
-                        producer_epoch_insert::QUERY,
-                        &rows,
-                    ))?;
+                    let reader = producer_epoch_insert::RowReader::new(&columns)?;
 
                     if let Some(row) = rows.next().await? {
                         let epoch = reader
@@ -5412,12 +5354,11 @@ impl Storage for Delegate {
         {
             let connection = self.pool.get().await?;
 
-            let mut rows = connection.query(sql::maintain_vacuum::QUERY, ()).await?;
+            let (columns, mut rows) = connection
+                .query_rows(sql::maintain_vacuum::QUERY, ())
+                .await?;
 
-            let reader = sql::maintain_vacuum::RowReader::new(&ResultColumns::libsql(
-                sql::maintain_vacuum::QUERY,
-                &rows,
-            ))?;
+            let reader = sql::maintain_vacuum::RowReader::new(&columns)?;
 
             if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
                 let sql::maintain_vacuum::Row {
@@ -5612,29 +5553,6 @@ impl From<LiteTimestamp> for SystemTime {
 impl From<LiteTimestamp> for Value {
     fn from(value: LiteTimestamp) -> Self {
         Value::Integer(to_timestamp(&value.0).unwrap_or_default())
-    }
-}
-
-impl TryFrom<Value> for LiteTimestamp {
-    type Error = Error;
-
-    fn try_from(value: Value) -> result::Result<Self, Self::Error> {
-        match value {
-            Value::Integer(timestamp) => to_system_time(timestamp)
-                .map_err(Into::into)
-                .map(LiteTimestamp::from),
-
-            Value::Text(text) => NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f")
-                .map(|date_time| date_time.and_utc())
-                .inspect(|dt| debug!(?dt))
-                .map(SystemTime::from)
-                .map(LiteTimestamp::from)
-                .map_err(Into::into),
-
-            Value::Real(_) => unimplemented!("{value:?}"),
-            Value::Null => unimplemented!("{value:?}"),
-            Value::Blob(_) => unimplemented!("{value:?}"),
-        }
     }
 }
 
@@ -5963,7 +5881,8 @@ mod tests {
             .query("select last_updated from cluster where name = ?1", &[name])
             .await?;
         let row = rows.next().await?.unwrap();
-        let _timestamp = LiteTimestamp::try_from(row.get_value(0)?)?;
+        let last_updated = row.get::<String>(0)?;
+        _ = chrono::NaiveDateTime::parse_from_str(&last_updated, "%Y-%m-%d %H:%M:%S%.f")?;
 
         Ok(())
     }
@@ -7076,7 +6995,8 @@ mod tests {
 
         assert_matches!(
             engine.init_producer(Some("txn"), 10_000, None, None).await,
-            Err(Error::TryFromInt(_))
+            Err(Error::Column { column: "epoch", source, .. })
+                if matches!(*source, Error::TryFromInt(_))
         );
 
         Ok(())

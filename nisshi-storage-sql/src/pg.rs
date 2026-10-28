@@ -1239,8 +1239,8 @@ impl Postgres {
                     offset_id: offset,
                     attributes,
                     timestamp,
-                    k,
-                    v,
+                    key,
+                    value,
                     producer_id,
                     producer_epoch,
                 } = record?;
@@ -1287,24 +1287,24 @@ impl Postgres {
 
                 let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
-                debug!(key_len = ?k.as_ref().map(Bytes::len));
-                debug!(value_len = ?v.as_ref().map(Bytes::len));
+                debug!(key_len = ?key.as_ref().map(Bytes::len));
+                debug!(value_len = ?value.as_ref().map(Bytes::len));
 
                 let mut record_builder = Record::builder()
                     .offset_delta(offset_delta)
                     .timestamp_delta(timestamp_delta)
-                    .key(k)
-                    .value(v);
+                    .key(key)
+                    .value(value);
 
                 for header in headers.remove(&offset).unwrap_or_default() {
                     let mut header_builder = Header::builder();
 
-                    if let Some(k) = header.k {
-                        header_builder = header_builder.key(k);
+                    if let Some(key) = header.key {
+                        header_builder = header_builder.key(key);
                     }
 
-                    if let Some(v) = header.v {
-                        header_builder = header_builder.value(v);
+                    if let Some(value) = header.value {
+                        header_builder = header_builder.value(value);
                     }
 
                     record_builder = record_builder.header(header_builder);

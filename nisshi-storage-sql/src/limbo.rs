@@ -41,7 +41,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::NaiveDateTime;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
@@ -62,7 +61,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
-    to_system_time, to_timestamp,
+    to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
@@ -195,20 +194,17 @@ impl Engine {
             let name = config.name.as_str();
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                let mut rows = tx
-                    .query(
-                        &sql_lookup(topic_configuration_select_name::QUERY)?,
+                let (columns, row) = self
+                    .query_first(
+                        &tx,
+                        topic_configuration_select_name::QUERY,
                         (self.cluster.as_str(), topic, name),
                     )
                     .await?;
 
-                let reader = topic_configuration_select_name::RowReader::new(
-                    &ResultColumns::turso(topic_configuration_select_name::QUERY, &rows),
-                )?;
+                let reader = topic_configuration_select_name::RowReader::new(&columns)?;
 
-                rows.next()
-                    .await?
-                    .map(|row| reader.read_row(&row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .and_then(|row| row.value)
             } else {
@@ -848,10 +844,10 @@ impl Engine {
 
         let mut overlaps = vec![];
 
-        let mut rows = tx
-            .deref()
-            .query(
-                &sql_lookup(txn_select_produced_topitions::QUERY)?,
+        let (columns, mut rows) = self
+            .query_rows(
+                tx,
+                txn_select_produced_topitions::QUERY,
                 (
                     self.cluster.as_str(),
                     transaction_id,
@@ -861,10 +857,7 @@ impl Engine {
             )
             .await?;
 
-        let reader = txn_select_produced_topitions::RowReader::new(&ResultColumns::turso(
-            txn_select_produced_topitions::QUERY,
-            &rows,
-        ))?;
+        let reader = txn_select_produced_topitions::RowReader::new(&columns)?;
 
         while let Some(row) = rows.next().await? {
             let txn_select_produced_topitions::Row { topic, partition } = reader.read_row(&row)?;
@@ -910,9 +903,10 @@ impl Engine {
 
             debug!(offset, ?topition);
 
-            let mut rows = tx
-                .query(
-                    &sql_lookup(txn_produce_offset_select_offset_range::QUERY)?,
+            let (columns, row) = self
+                .query_first(
+                    tx,
+                    txn_produce_offset_select_offset_range::QUERY,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -924,11 +918,9 @@ impl Engine {
                 )
                 .await?;
 
-            let reader = txn_produce_offset_select_offset_range::RowReader::new(
-                &ResultColumns::turso(txn_produce_offset_select_offset_range::QUERY, &rows),
-            )?;
+            let reader = txn_produce_offset_select_offset_range::RowReader::new(&columns)?;
 
-            if let Some(row) = rows.next().await? {
+            if let Some(row) = row {
                 let txn_produce_offset_select_offset_range::Row {
                     offset_start,
                     offset_end,
@@ -936,9 +928,10 @@ impl Engine {
 
                 debug!(offset_start, offset_end);
 
-                let mut rows = tx
-                    .query(
-                        &sql_lookup(txn_produce_offset_select_overlapping_txn::QUERY)?,
+                let (columns, mut rows) = self
+                    .query_rows(
+                        tx,
+                        txn_produce_offset_select_overlapping_txn::QUERY,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -951,9 +944,7 @@ impl Engine {
                     )
                     .await?;
 
-                let reader = txn_produce_offset_select_overlapping_txn::RowReader::new(
-                    &ResultColumns::turso(txn_produce_offset_select_overlapping_txn::QUERY, &rows),
-                )?;
+                let reader = txn_produce_offset_select_overlapping_txn::RowReader::new(&columns)?;
 
                 while let Some(row) = rows.next().await? {
                     let row = reader.read_row(&row).inspect_err(|err| error!(?err))?;
@@ -1535,41 +1526,33 @@ impl Storage for Engine {
 
         let topic_name = match topic {
             TopicId::Id(id) => {
-                let mut rows = tx
-                    .query(
-                        &sql_lookup(topic_select_uuid::QUERY)?,
+                let (columns, row) = self
+                    .query_first(
+                        &tx,
+                        topic_select_uuid::QUERY,
                         (self.cluster.as_str(), id.to_string().as_str()),
                     )
                     .await?;
 
-                let reader = topic_select_uuid::RowReader::new(&ResultColumns::turso(
-                    topic_select_uuid::QUERY,
-                    &rows,
-                ))?;
+                let reader = topic_select_uuid::RowReader::new(&columns)?;
 
-                rows.next()
-                    .await?
-                    .map(|row| reader.read_row(&row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .map(|row| row.name)
             }
 
             TopicId::Name(name) => {
-                let mut rows = tx
-                    .query(
-                        &sql_lookup(topic_select_name::QUERY)?,
+                let (columns, row) = self
+                    .query_first(
+                        &tx,
+                        topic_select_name::QUERY,
                         (self.cluster.as_str(), name.as_str()),
                     )
                     .await?;
 
-                let reader = topic_select_name::RowReader::new(&ResultColumns::turso(
-                    topic_select_name::QUERY,
-                    &rows,
-                ))?;
+                let reader = topic_select_name::RowReader::new(&columns)?;
 
-                rows.next()
-                    .await?
-                    .map(|row| reader.read_row(&row))
+                row.map(|row| reader.read_row(&row))
                     .transpose()?
                     .map(|row| row.name)
             }
@@ -1714,9 +1697,10 @@ impl Storage for Engine {
 
         let c = self.connection().await?;
 
-        let mut records = c
-            .query(
-                &sql_lookup(record_fetch::QUERY)?,
+        let (columns, mut records) = self
+            .query_rows(
+                &c,
+                record_fetch::QUERY,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -1729,8 +1713,7 @@ impl Storage for Engine {
             .await
             .inspect_err(|err| error!(?err))?;
 
-        let reader =
-            record_fetch::RowReader::new(&ResultColumns::turso(record_fetch::QUERY, &records))?;
+        let reader = record_fetch::RowReader::new(&columns)?;
 
         let mut batches = vec![];
 
@@ -1739,8 +1722,8 @@ impl Storage for Engine {
                 offset_id: base_offset,
                 attributes,
                 timestamp,
-                k,
-                v,
+                key,
+                value,
                 producer_id,
                 producer_epoch,
             } = reader.read_row(&row).inspect_err(|err| error!(?err))?;
@@ -1749,19 +1732,20 @@ impl Storage for Engine {
             let timestamp_delta = 0;
 
             debug!(base_offset);
-            debug!(key_len = ?k.as_ref().map(Bytes::len));
-            debug!(value_len = ?v.as_ref().map(Bytes::len));
+            debug!(key_len = ?key.as_ref().map(Bytes::len));
+            debug!(value_len = ?value.as_ref().map(Bytes::len));
 
             let record_builder = {
                 let mut record_builder = Record::builder()
                     .offset_delta(offset_delta)
                     .timestamp_delta(timestamp_delta)
-                    .key(k)
-                    .value(v);
+                    .key(key)
+                    .value(value);
 
-                let mut headers = c
-                    .query(
-                        &sql_lookup(header_fetch::QUERY)?,
+                let (columns, mut headers) = self
+                    .query_rows(
+                        &c,
+                        header_fetch::QUERY,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -1771,10 +1755,7 @@ impl Storage for Engine {
                     )
                     .await?;
 
-                let header_reader = header_fetch::RowReader::new(&ResultColumns::turso(
-                    header_fetch::QUERY,
-                    &headers,
-                ))?;
+                let header_reader = header_fetch::RowReader::new(&columns)?;
 
                 while let Some(header) = headers.next().await? {
                     let header = header_reader
@@ -1783,12 +1764,12 @@ impl Storage for Engine {
 
                     let mut header_builder = Header::builder();
 
-                    if let Some(k) = header.k {
-                        header_builder = header_builder.key(k);
+                    if let Some(key) = header.key {
+                        header_builder = header_builder.key(key);
                     }
 
-                    if let Some(v) = header.v {
-                        header_builder = header_builder.value(v);
+                    if let Some(value) = header.value {
+                        header_builder = header_builder.value(value);
                     }
 
                     record_builder = record_builder.header(header_builder);
@@ -1815,8 +1796,8 @@ impl Storage for Engine {
                     offset_id: offset,
                     attributes,
                     timestamp,
-                    k,
-                    v,
+                    key,
+                    value,
                     producer_id,
                     producer_epoch,
                 } = reader.read_row(&row).inspect_err(|err| error!(?err))?;
@@ -1863,19 +1844,20 @@ impl Storage for Engine {
 
                 let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
-                debug!(key_len = ?k.as_ref().map(Bytes::len));
-                debug!(value_len = ?v.as_ref().map(Bytes::len));
+                debug!(key_len = ?key.as_ref().map(Bytes::len));
+                debug!(value_len = ?value.as_ref().map(Bytes::len));
 
                 let record_builder = {
                     let mut record_builder = Record::builder()
                         .offset_delta(offset_delta)
                         .timestamp_delta(timestamp_delta)
-                        .key(k)
-                        .value(v);
+                        .key(key)
+                        .value(value);
 
-                    let mut headers = c
-                        .query(
-                            &sql_lookup(header_fetch::QUERY)?,
+                    let (columns, mut headers) = self
+                        .query_rows(
+                            &c,
+                            header_fetch::QUERY,
                             (
                                 self.cluster.as_str(),
                                 topition.topic(),
@@ -1885,10 +1867,7 @@ impl Storage for Engine {
                         )
                         .await?;
 
-                    let header_reader = header_fetch::RowReader::new(&ResultColumns::turso(
-                        header_fetch::QUERY,
-                        &headers,
-                    ))?;
+                    let header_reader = header_fetch::RowReader::new(&columns)?;
 
                     while let Some(header) = headers.next().await? {
                         let header = header_reader
@@ -1897,12 +1876,12 @@ impl Storage for Engine {
 
                         let mut header_builder = Header::builder();
 
-                        if let Some(k) = header.k {
-                            header_builder = header_builder.key(k);
+                        if let Some(key) = header.key {
+                            header_builder = header_builder.key(key);
                         }
 
-                        if let Some(v) = header.v {
-                            header_builder = header_builder.value(v);
+                        if let Some(value) = header.value {
+                            header_builder = header_builder.value(value);
                         }
 
                         record_builder = record_builder.header(header_builder);
@@ -2056,17 +2035,15 @@ impl Storage for Engine {
 
         let c = self.connection().await?;
 
-        let mut rows = c
-            .query(
-                &sql_lookup(sql::consumer_offset_select_by_group::QUERY)?,
+        let (columns, mut rows) = self
+            .query_rows(
+                &c,
+                sql::consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
-        let reader = sql::consumer_offset_select_by_group::RowReader::new(&ResultColumns::turso(
-            sql::consumer_offset_select_by_group::QUERY,
-            &rows,
-        ))?;
+        let reader = sql::consumer_offset_select_by_group::RowReader::new(&columns)?;
 
         while let Some(row) = rows.next().await? {
             let sql::consumer_offset_select_by_group::Row {
@@ -2098,9 +2075,10 @@ impl Storage for Engine {
         let mut offsets = BTreeMap::new();
 
         for topic in topics {
-            let mut rows = c
-                .query(
-                    &sql_lookup(sql::consumer_offset_select::QUERY)?,
+            let (columns, mut rows) = self
+                .query_rows(
+                    &c,
+                    sql::consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -2119,10 +2097,7 @@ impl Storage for Engine {
                     )
                 })?;
 
-            let reader = sql::consumer_offset_select::RowReader::new(&ResultColumns::turso(
-                sql::consumer_offset_select::QUERY,
-                &rows,
-            ))?;
+            let reader = sql::consumer_offset_select::RowReader::new(&columns)?;
 
             let offset = rows
                 .next()
@@ -2290,239 +2265,230 @@ impl Storage for Engine {
 
         debug!(?brokers);
 
-        let responses =
-            match topics {
-                Some(topics) if !topics.is_empty() => {
-                    let mut responses = vec![];
+        let responses = match topics {
+            Some(topics) if !topics.is_empty() => {
+                let mut responses = vec![];
 
-                    for topic in topics {
-                        responses.push(match topic {
-                            TopicId::Name(name) => {
-                                let mut rows = c
-                                    .query(
-                                        &sql_lookup(topic_select_name::QUERY)?,
-                                        (self.cluster.as_str(), name.as_str()),
-                                    )
-                                    .await?;
+                for topic in topics {
+                    responses.push(match topic {
+                        TopicId::Name(name) => {
+                            let (columns, mut rows) = self
+                                .query_rows(
+                                    &c,
+                                    topic_select_name::QUERY,
+                                    (self.cluster.as_str(), name.as_str()),
+                                )
+                                .await?;
 
-                                let reader = topic_select_name::RowReader::new(
-                                    &ResultColumns::turso(topic_select_name::QUERY, &rows),
-                                )?;
+                            let reader = topic_select_name::RowReader::new(&columns)?;
 
-                                match rows.next().await.inspect_err(|err| error!(?err)) {
-                                    Ok(Some(row)) => {
-                                        let topic_select_name::Row {
-                                            uuid,
-                                            name,
-                                            is_internal,
-                                            partitions,
-                                            replication_factor,
-                                        } = reader.read_row(&row)?;
+                            match rows.next().await.inspect_err(|err| error!(?err)) {
+                                Ok(Some(row)) => {
+                                    let topic_select_name::Row {
+                                        uuid,
+                                        name,
+                                        is_internal,
+                                        partitions,
+                                        replication_factor,
+                                    } = reader.read_row(&row)?;
 
-                                        let error_code = ErrorCode::None.into();
-                                        let topic_id = Some(uuid.into_bytes());
-                                        let name = Some(name);
-                                        let is_internal = Some(is_internal);
+                                    let error_code = ErrorCode::None.into();
+                                    let topic_id = Some(uuid.into_bytes());
+                                    let name = Some(name);
+                                    let is_internal = Some(is_internal);
 
-                                        debug!(
-                                            ?error_code,
-                                            ?topic_id,
-                                            ?name,
-                                            ?is_internal,
-                                            ?partitions,
-                                            ?replication_factor
-                                        );
+                                    debug!(
+                                        ?error_code,
+                                        ?topic_id,
+                                        ?name,
+                                        ?is_internal,
+                                        ?partitions,
+                                        ?replication_factor
+                                    );
 
-                                        let mut rng = rng();
-                                        let mut broker_ids: Vec<_> =
-                                            brokers.iter().map(|broker| broker.node_id).collect();
-                                        broker_ids.shuffle(&mut rng);
+                                    let mut rng = rng();
+                                    let mut broker_ids: Vec<_> =
+                                        brokers.iter().map(|broker| broker.node_id).collect();
+                                    broker_ids.shuffle(&mut rng);
 
-                                        let partitions = Some(nisshi_storage::assign_replicas(
-                                            &broker_ids,
-                                            partitions,
-                                            replication_factor,
-                                            error_code,
-                                            -1,
-                                        )?);
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
-                                        MetadataResponseTopic::default()
-                                            .error_code(error_code)
-                                            .name(name)
-                                            .topic_id(topic_id)
-                                            .is_internal(is_internal)
-                                            .partitions(partitions)
-                                            .topic_authorized_operations(Some(-2147483648))
-                                    }
+                                    MetadataResponseTopic::default()
+                                        .error_code(error_code)
+                                        .name(name)
+                                        .topic_id(topic_id)
+                                        .is_internal(is_internal)
+                                        .partitions(partitions)
+                                        .topic_authorized_operations(Some(-2147483648))
+                                }
 
-                                    Ok(None) => MetadataResponseTopic::default()
+                                Ok(None) => MetadataResponseTopic::default()
+                                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                    .name(Some(name.into()))
+                                    .topic_id(Some(NULL_TOPIC_ID))
+                                    .is_internal(Some(false))
+                                    .partitions(Some([].into()))
+                                    .topic_authorized_operations(Some(-2147483648)),
+
+                                Err(reason) => {
+                                    debug!(?reason);
+                                    MetadataResponseTopic::default()
                                         .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
                                         .partitions(Some([].into()))
-                                        .topic_authorized_operations(Some(-2147483648)),
-
-                                    Err(reason) => {
-                                        debug!(?reason);
-                                        MetadataResponseTopic::default()
-                                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                                            .name(Some(name.into()))
-                                            .topic_id(Some(NULL_TOPIC_ID))
-                                            .is_internal(Some(false))
-                                            .partitions(Some([].into()))
-                                            .topic_authorized_operations(Some(-2147483648))
-                                    }
+                                        .topic_authorized_operations(Some(-2147483648))
                                 }
                             }
-                            TopicId::Id(id) => {
-                                debug!(?id);
-                                let mut rows = c
-                                    .query(
-                                        &sql_lookup(topic_select_uuid::QUERY)?,
-                                        (self.cluster.as_str(), id.to_string().as_str()),
-                                    )
-                                    .await?;
+                        }
+                        TopicId::Id(id) => {
+                            debug!(?id);
+                            let (columns, mut rows) = self
+                                .query_rows(
+                                    &c,
+                                    topic_select_uuid::QUERY,
+                                    (self.cluster.as_str(), id.to_string().as_str()),
+                                )
+                                .await?;
 
-                                let reader = topic_select_uuid::RowReader::new(
-                                    &ResultColumns::turso(topic_select_uuid::QUERY, &rows),
-                                )?;
+                            let reader = topic_select_uuid::RowReader::new(&columns)?;
 
-                                match rows.next().await {
-                                    Ok(Some(row)) => {
-                                        let topic_select_uuid::Row {
-                                            uuid,
-                                            name,
-                                            is_internal,
-                                            partitions,
-                                            replication_factor,
-                                        } = reader.read_row(&row)?;
+                            match rows.next().await {
+                                Ok(Some(row)) => {
+                                    let topic_select_uuid::Row {
+                                        uuid,
+                                        name,
+                                        is_internal,
+                                        partitions,
+                                        replication_factor,
+                                    } = reader.read_row(&row)?;
 
-                                        let error_code = ErrorCode::None.into();
-                                        let topic_id = Some(uuid.into_bytes());
-                                        let name = Some(name);
-                                        let is_internal = Some(is_internal);
+                                    let error_code = ErrorCode::None.into();
+                                    let topic_id = Some(uuid.into_bytes());
+                                    let name = Some(name);
+                                    let is_internal = Some(is_internal);
 
-                                        debug!(
-                                            ?error_code,
-                                            ?topic_id,
-                                            ?name,
-                                            ?is_internal,
-                                            ?partitions,
-                                            ?replication_factor
-                                        );
+                                    debug!(
+                                        ?error_code,
+                                        ?topic_id,
+                                        ?name,
+                                        ?is_internal,
+                                        ?partitions,
+                                        ?replication_factor
+                                    );
 
-                                        let mut rng = rng();
-                                        let mut broker_ids: Vec<_> =
-                                            brokers.iter().map(|broker| broker.node_id).collect();
-                                        broker_ids.shuffle(&mut rng);
+                                    let mut rng = rng();
+                                    let mut broker_ids: Vec<_> =
+                                        brokers.iter().map(|broker| broker.node_id).collect();
+                                    broker_ids.shuffle(&mut rng);
 
-                                        let partitions = Some(nisshi_storage::assign_replicas(
-                                            &broker_ids,
-                                            partitions,
-                                            replication_factor,
-                                            error_code,
-                                            -1,
-                                        )?);
+                                    let partitions = Some(nisshi_storage::assign_replicas(
+                                        &broker_ids,
+                                        partitions,
+                                        replication_factor,
+                                        error_code,
+                                        -1,
+                                    )?);
 
-                                        MetadataResponseTopic::default()
-                                            .error_code(error_code)
-                                            .name(name)
-                                            .topic_id(topic_id)
-                                            .is_internal(is_internal)
-                                            .partitions(partitions)
-                                            .topic_authorized_operations(Some(-2147483648))
-                                    }
-                                    Ok(None) => MetadataResponseTopic::default()
+                                    MetadataResponseTopic::default()
+                                        .error_code(error_code)
+                                        .name(name)
+                                        .topic_id(topic_id)
+                                        .is_internal(is_internal)
+                                        .partitions(partitions)
+                                        .topic_authorized_operations(Some(-2147483648))
+                                }
+                                Ok(None) => MetadataResponseTopic::default()
+                                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                    .name(None)
+                                    .topic_id(Some(id.into_bytes()))
+                                    .is_internal(Some(false))
+                                    .partitions(Some([].into()))
+                                    .topic_authorized_operations(Some(-2147483648)),
+                                Err(reason) => {
+                                    debug!(?reason);
+                                    MetadataResponseTopic::default()
                                         .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
                                         .partitions(Some([].into()))
-                                        .topic_authorized_operations(Some(-2147483648)),
-                                    Err(reason) => {
-                                        debug!(?reason);
-                                        MetadataResponseTopic::default()
-                                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                                            .name(None)
-                                            .topic_id(Some(id.into_bytes()))
-                                            .is_internal(Some(false))
-                                            .partitions(Some([].into()))
-                                            .topic_authorized_operations(Some(-2147483648))
-                                    }
+                                        .topic_authorized_operations(Some(-2147483648))
                                 }
                             }
-                        });
-                    }
-
-                    responses
+                        }
+                    });
                 }
 
-                _ => {
-                    let mut responses = vec![];
+                responses
+            }
 
-                    let mut rows = c
-                        .query(
-                            &sql_lookup(topic_by_cluster::QUERY)?,
-                            &[self.cluster.as_str()],
-                        )
-                        .await?;
+            _ => {
+                let mut responses = vec![];
 
-                    let reader = topic_by_cluster::RowReader::new(&ResultColumns::turso(
-                        topic_by_cluster::QUERY,
-                        &rows,
-                    ))?;
+                let (columns, mut rows) = self
+                    .query_rows(&c, topic_by_cluster::QUERY, &[self.cluster.as_str()])
+                    .await?;
 
-                    while let Some(row) = rows.next().await? {
-                        let topic_by_cluster::Row {
-                            uuid,
-                            name,
-                            is_internal,
-                            partitions,
-                            replication_factor,
-                        } = reader.read_row(&row)?;
+                let reader = topic_by_cluster::RowReader::new(&columns)?;
 
-                        let error_code = ErrorCode::None.into();
-                        let topic_id = Some(uuid.into_bytes());
-                        let name = Some(name);
-                        let is_internal = Some(is_internal);
+                while let Some(row) = rows.next().await? {
+                    let topic_by_cluster::Row {
+                        uuid,
+                        name,
+                        is_internal,
+                        partitions,
+                        replication_factor,
+                    } = reader.read_row(&row)?;
 
-                        debug!(
-                            ?error_code,
-                            ?topic_id,
-                            ?name,
-                            ?is_internal,
-                            ?partitions,
-                            ?replication_factor
-                        );
+                    let error_code = ErrorCode::None.into();
+                    let topic_id = Some(uuid.into_bytes());
+                    let name = Some(name);
+                    let is_internal = Some(is_internal);
 
-                        let mut rng = rng();
-                        let mut broker_ids: Vec<_> =
-                            brokers.iter().map(|broker| broker.node_id).collect();
-                        broker_ids.shuffle(&mut rng);
+                    debug!(
+                        ?error_code,
+                        ?topic_id,
+                        ?name,
+                        ?is_internal,
+                        ?partitions,
+                        ?replication_factor
+                    );
 
-                        let partitions = Some(nisshi_storage::assign_replicas(
-                            &broker_ids,
-                            partitions,
-                            replication_factor,
-                            error_code,
-                            -1,
-                        )?);
+                    let mut rng = rng();
+                    let mut broker_ids: Vec<_> =
+                        brokers.iter().map(|broker| broker.node_id).collect();
+                    broker_ids.shuffle(&mut rng);
 
-                        responses.push(
-                            MetadataResponseTopic::default()
-                                .error_code(error_code)
-                                .name(name)
-                                .topic_id(topic_id)
-                                .is_internal(is_internal)
-                                .partitions(partitions)
-                                .topic_authorized_operations(Some(-2147483648)),
-                        );
-                    }
+                    let partitions = Some(nisshi_storage::assign_replicas(
+                        &broker_ids,
+                        partitions,
+                        replication_factor,
+                        error_code,
+                        -1,
+                    )?);
 
-                    responses
+                    responses.push(
+                        MetadataResponseTopic::default()
+                            .error_code(error_code)
+                            .name(name)
+                            .topic_id(topic_id)
+                            .is_internal(is_internal)
+                            .partitions(partitions)
+                            .topic_authorized_operations(Some(-2147483648)),
+                    );
                 }
-            };
+
+                responses
+            }
+        };
 
         Ok(MetadataResponse {
             cluster: Some(self.cluster.clone()),
@@ -3358,17 +3324,11 @@ impl Storage for Engine {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .await?;
 
-                let mut rows = tx
-                    .query(
-                        &sql_lookup(producer_insert::QUERY)?,
-                        &[self.cluster.as_str()],
-                    )
+                let (columns, mut rows) = self
+                    .query_rows(&tx, producer_insert::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                let reader = producer_insert::RowReader::new(&ResultColumns::turso(
-                    producer_insert::QUERY,
-                    &rows,
-                ))?;
+                let reader = producer_insert::RowReader::new(&columns)?;
 
                 if let Some(row) = rows.next().await? {
                     let producer = reader
@@ -3386,18 +3346,16 @@ impl Storage for Engine {
                         debug!(?row)
                     }
 
-                    let mut rows = tx
-                        .query(
-                            &sql_lookup(producer_epoch_insert::QUERY)?,
+                    let (columns, mut rows) = self
+                        .query_rows(
+                            &tx,
+                            producer_epoch_insert::QUERY,
                             (self.cluster.as_str(), producer),
                         )
                         .await
                         .inspect_err(|err| error!(?err, cluster = self.cluster, producer))?;
 
-                    let reader = producer_epoch_insert::RowReader::new(&ResultColumns::turso(
-                        producer_epoch_insert::QUERY,
-                        &rows,
-                    ))?;
+                    let reader = producer_epoch_insert::RowReader::new(&columns)?;
 
                     if let Some(row) = rows.next().await? {
                         let epoch = reader
@@ -3787,29 +3745,6 @@ impl From<LiteTimestamp> for Value {
     }
 }
 
-impl TryFrom<Value> for LiteTimestamp {
-    type Error = Error;
-
-    fn try_from(value: Value) -> result::Result<Self, Self::Error> {
-        match value {
-            Value::Integer(timestamp) => to_system_time(timestamp)
-                .map_err(Into::into)
-                .map(LiteTimestamp::from),
-
-            Value::Text(text) => NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f")
-                .map(|date_time| date_time.and_utc())
-                .inspect(|dt| debug!(?dt))
-                .map(SystemTime::from)
-                .map(LiteTimestamp::from)
-                .map_err(Into::into),
-
-            Value::Real(_) => unimplemented!("{value:?}"),
-            Value::Null => unimplemented!("{value:?}"),
-            Value::Blob(_) => unimplemented!("{value:?}"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use tempfile::{TempDir, tempdir, tempdir_in};
@@ -4132,7 +4067,8 @@ mod tests {
             .query("select last_updated from cluster where name = ?1", &[name])
             .await?;
         let row = rows.next().await?.unwrap();
-        let _timestamp = LiteTimestamp::try_from(row.get_value(0)?)?;
+        let last_updated = row.get::<String>(0)?;
+        _ = chrono::NaiveDateTime::parse_from_str(&last_updated, "%Y-%m-%d %H:%M:%S%.f")?;
 
         Ok(())
     }
@@ -4942,7 +4878,8 @@ mod tests {
 
         assert!(matches!(
             engine.init_producer(Some("txn"), 10_000, None, None).await,
-            Err(Error::TryFromInt(_))
+            Err(Error::Column { column: "epoch", source, .. })
+                if matches!(*source, Error::TryFromInt(_))
         ));
 
         Ok(())

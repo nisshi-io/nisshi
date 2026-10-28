@@ -20,11 +20,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "producer_epoch_current_for_producer.sql";
 
-sql_row! {
-    /// The producer's newest epoch.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(crate) struct Row {
-        /// The producer's newest epoch.
-        epoch: i16,
-    }
-}
+/// Reads each row of the query's result.
+pub(crate) use super::row::producer_epoch::RowReader;

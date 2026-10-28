@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_by_cluster.sql` query and [`Row`], one row of its result. A change to the query's
-//! `select` list must keep the column names that [`Row`] declares.
+//! The `topic_by_cluster.sql` query, which returns a [`row::topic`](super::row::topic) row. A
+//! change to the query's `select` list must keep the column names that [`Row`] declares.
 //!
 //! The query takes one parameter, `$1`: the cluster's name. It returns one row for each topic of
 //! the cluster.
@@ -21,19 +21,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_by_cluster.sql";
 
-sql_row! {
-    /// One topic of the cluster.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(crate) struct Row {
-        /// The topic's ID.
-        uuid: uuid::Uuid,
-        /// The topic's name.
-        name: String,
-        /// Whether the topic is internal.
-        is_internal: bool,
-        /// The topic's partition count.
-        partitions: i32,
-        /// The topic's replication factor.
-        replication_factor: i32,
-    }
-}
+/// One row of the query's result.
+pub(crate) use super::row::topic::{Row, RowReader};

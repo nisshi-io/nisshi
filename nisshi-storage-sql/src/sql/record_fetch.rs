@@ -47,9 +47,9 @@ sql_row! {
         /// The record's timestamp.
         timestamp: std::time::SystemTime,
         /// The record's key.
-        k: Option<bytes::Bytes>,
+        key: Option<bytes::Bytes>,
         /// The record's value.
-        v: Option<bytes::Bytes>,
+        value: Option<bytes::Bytes>,
         /// The ID of the producer that wrote the record.
         producer_id: Option<i64>,
         /// The epoch of the producer that wrote the record.
@@ -60,15 +60,6 @@ sql_row! {
 /// The offset of each record of the same result, read without its key and value.
 ///
 /// An engine reads every record's offset before it builds the first batch, and reads a whole
-/// [`Row`](super::Row) only for the records that it returns before the fetch's deadline, so that it
-/// copies no key or value that it then drops.
-pub(crate) mod offset {
-    sql_row! {
-        /// One record's offset.
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub(crate) struct Row {
-            /// The record's offset.
-            offset_id: i64,
-        }
-    }
-}
+/// [`Row`] only for the records that it returns before the fetch's deadline, so that it copies no
+/// key or value that it then drops.
+pub(crate) use super::row::record_offset as offset;

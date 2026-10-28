@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_configuration_upsert.sql` query, which sets one config of a topic, and [`Row`], the
-//! row that it returns. A change to the query's `returning` list must keep the column names that
-//! [`Row`] declares.
+//! The `topic_configuration_upsert.sql` query, which sets one config of a topic, and
+//! [`Row`](super::row::written_id::Row), the row that it returns. A change to the query's
+//! `returning` list must keep the column names that [`Row`](super::row::written_id::Row) declares.
 //!
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! config's key, and `$4` its value.
@@ -22,11 +22,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_configuration_upsert.sql";
 
-sql_row! {
-    /// The config that the query inserted or updated.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(crate) struct Row {
-        /// The config's row ID.
-        id: i64,
-    }
-}
+/// Reads each row of the query's result.
+pub(crate) use super::row::written_id::RowReader;

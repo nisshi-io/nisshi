@@ -21,11 +21,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_insert.sql";
 
-sql_row! {
-    /// The topic that the query created.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(crate) struct Row {
-        /// The topic's ID.
-        uuid: uuid::Uuid,
-    }
-}
+/// One row of the query's result.
+pub(crate) use super::row::topic_id::{Row, RowReader};
