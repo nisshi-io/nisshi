@@ -34,6 +34,14 @@
 //! method, so an engine that reads on a task of its own, as in `mpsc` mode,
 //! sees no share.
 //!
+//! The share assumes one client per connection. A proxy that sends several
+//! clients' requests over one connection, as `nisshi-proxy` does with its
+//! pool of origin connections, gives those clients one share, so one
+//! client's abandoned reads hold back the next client on that connection.
+//! A client that reconnects gets a new share, while its abandoned reads
+//! still hold the engine's permits. Kafka has no such carry-over, because
+//! none of a request's work outlives its response.
+//!
 //! [`Storage`]: crate::Storage
 
 use std::sync::{Arc, OnceLock};
@@ -65,8 +73,9 @@ impl ReadShare {
     /// Waits for a permit from the share that `key` holds on this task,
     /// creating `size` permits in it if it has none yet.
     ///
-    /// The wait runs in [`deadline::queued`], so a read abandoned while it
-    /// waits for its share is counted under the `queued` stage. Returns
+    /// The wait runs in [`deadline::queued_for_connection_share`], so a read
+    /// abandoned while it waits for its share is counted under the `queued`
+    /// stage with the `connection` limit. Returns
     /// `None` when `key` holds no share on this task, so a read that no
     /// connection makes is limited only by its engine.
     async fn acquire(
@@ -77,7 +86,9 @@ impl ReadShare {
             return Ok(None);
         };
 
-        deadline::queued(permits.acquire_owned()).await.map(Some)
+        deadline::queued_for_connection_share(permits.acquire_owned())
+            .await
+            .map(Some)
     }
 }
 
@@ -115,7 +126,8 @@ impl FetchReadShare {
     /// has none yet.
     ///
     /// Returns `None` outside a scope. A read waiting for its share is
-    /// counted under the `queued` stage if its deadline passes.
+    /// counted under the `queued` stage, with the `connection` limit, if its
+    /// deadline passes.
     pub async fn acquire(size: usize) -> Result<Option<OwnedSemaphorePermit>, AcquireError> {
         ReadShare::acquire(&FETCH, size).await
     }
@@ -147,7 +159,8 @@ impl ListOffsetsReadShare {
     /// if it has none yet.
     ///
     /// Returns `None` outside a scope. A read waiting for its share is
-    /// counted under the `queued` stage if its deadline passes.
+    /// counted under the `queued` stage, with the `connection` limit, if its
+    /// deadline passes.
     pub async fn acquire(size: usize) -> Result<Option<OwnedSemaphorePermit>, AcquireError> {
         ReadShare::acquire(&LIST_OFFSETS, size).await
     }
@@ -189,7 +202,8 @@ mod tests {
     }
 
     /// A read waits for a permit while the share's permits are held, and
-    /// one abandoned during that wait is a queued miss.
+    /// one abandoned during that wait is a miss queued for its connection's
+    /// share.
     #[tokio::test(start_paused = true)]
     async fn read_waiting_for_its_share_is_abandoned_as_queued() {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -204,7 +218,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(Err(Missed::Queued), outcome);
+        assert_eq!(Err(Missed::QueuedForConnectionShare), outcome);
     }
 
     /// A permit taken in one scope counts against every scope with a clone

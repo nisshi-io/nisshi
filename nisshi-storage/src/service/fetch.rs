@@ -146,21 +146,16 @@ fn missed(
     started_at: Instant,
 ) {
     let stage = missed.stage();
+    let limit = missed.limit();
 
-    READ_DEADLINE_EXCEEDED.add(
-        1,
-        &[
-            KeyValue::new("operation", operation),
-            KeyValue::new("stage", stage),
-        ],
-    );
+    READ_DEADLINE_EXCEEDED.add(1, &missed.attributes(operation));
 
     match missed {
         Missed::NotStarted => {
             debug!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
         }
-        Missed::Queued | Missed::Reading => {
-            warn!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
+        Missed::Queued | Missed::QueuedForConnectionShare | Missed::Reading => {
+            warn!(?tp, operation, offset, stage, limit, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
         }
     }
 }

@@ -215,6 +215,7 @@ where
                 partitions = offsets.len(),
                 reading = count(Missed::Reading),
                 queued = count(Missed::Queued),
+                queued_for_connection_share = count(Missed::QueuedForConnectionShare),
                 not_started = count(Missed::NotStarted),
                 sample = ?&timed_out[..timed_out.len().min(TIMED_OUT_SAMPLE)],
                 "list offsets answered REQUEST_TIMED_OUT for partitions unread at the deadline"
