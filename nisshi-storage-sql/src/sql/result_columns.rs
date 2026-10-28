@@ -65,16 +65,29 @@ impl ResultColumns {
         self.query
     }
 
-    /// Returns the index of the column `name`, or [`Error::MissingColumn`] if the result does not
-    /// have that column.
+    /// Returns the index of the column `name`. Returns [`Error::MissingColumn`] if the result does
+    /// not have that column, and [`Error::DuplicateColumn`] if it has more than one.
     pub(crate) fn index(&self, name: &'static str) -> Result<usize> {
-        self.names
+        let mut indexes = self
+            .names
             .iter()
-            .position(|found| found == name)
-            .ok_or_else(|| Error::MissingColumn {
+            .enumerate()
+            .filter(|(_, found)| *found == name)
+            .map(|(index, _)| index);
+
+        let index = indexes.next().ok_or_else(|| Error::MissingColumn {
+            query: self.query,
+            column: name,
+            found: self.names.clone(),
+        })?;
+
+        if indexes.next().is_some() {
+            return Err(Error::DuplicateColumn {
                 query: self.query,
                 column: name,
-                found: self.names.clone(),
-            })
+            });
+        }
+
+        Ok(index)
     }
 }

@@ -273,6 +273,13 @@ pub enum Error {
 
     ChronoParse(#[from] chrono::ParseError),
 
+    /// The result of `query` has more than one column named `column`, so a reader can't tell which
+    /// one holds the field.
+    DuplicateColumn {
+        query: &'static str,
+        column: &'static str,
+    },
+
     /// The reader of `query`'s result could not read the column `column` of a row as the column's
     /// declared type. `source` is the error of that read: the driver's error, or an integer
     /// overflow.

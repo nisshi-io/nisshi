@@ -97,8 +97,8 @@ changes.
 - **Do not write `select *` in a query that an engine reads.** Its column names come from the
   tables, and a change to a table changes the result without a change to the query.
 - **Give each column of a result a unique, lower-case name.** PostgreSQL folds an unquoted name to
-  lower case and SQLite does not, and a name that appears twice finds only its first column. Do not
-  quote a column name.
+  lower case and SQLite does not, and a reader returns `Error::DuplicateColumn` for a name that
+  appears twice. Do not quote a column name.
 
 ## The Test
 

@@ -262,6 +262,8 @@ mod tests {
         name_is_null: &'static str,
         /// Returns an `epoch` larger than `i16::MAX`.
         epoch_overflows: &'static str,
+        /// Returns two columns named `name`.
+        name_twice: &'static str,
     }
 
     const SQLITE: ProbeSql = ProbeSql {
@@ -272,6 +274,7 @@ mod tests {
         epoch_is_text: "select 'x' as epoch, 7 as high, 'a' as name, null as detail",
         name_is_null: "select 3 as epoch, 7 as high, null as name, null as detail",
         epoch_overflows: "select 40000 as epoch, 7 as high, 'a' as name, null as detail",
+        name_twice: "select 3 as epoch, 7 as high, 'a' as name, 'b' as name, null as detail",
     };
 
     const POSTGRES: ProbeSql = ProbeSql {
@@ -287,6 +290,8 @@ mod tests {
                        null::json as detail",
         epoch_overflows: "select 40000::int4 as epoch, 7::int8 as high, 'a'::text as name, \
                           null::json as detail",
+        name_twice: "select 3::int2 as epoch, 7::int8 as high, 'a'::text as name, \
+                     'b'::text as name, null::json as detail",
     };
 
     /// Runs probe queries through one driver.
@@ -398,6 +403,18 @@ mod tests {
         Ok(())
     }
 
+    /// A result with two columns of one name is an error, instead of a read of the first of them.
+    async fn duplicate_column_is_an_error<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
+        assert_matches!(
+            D::probe_rows(sql.name_twice).await,
+            Err(Error::DuplicateColumn {
+                query: probe::QUERY,
+                column: "name"
+            })
+        );
+        Ok(())
+    }
+
     /// A value that the reader can't read as its field's type is an error that names the query
     /// and the column, instead of a value read as missing.
     async fn unreadable_value_names_its_column<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
@@ -438,6 +455,12 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    async fn postgres_duplicate_column_is_an_error() -> Result<()> {
+        duplicate_column_is_an_error::<Postgres>(&POSTGRES).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
     async fn postgres_unreadable_value_names_its_column() -> Result<()> {
         unreadable_value_names_its_column::<Postgres>(&POSTGRES).await
     }
@@ -452,6 +475,12 @@ mod tests {
     #[tokio::test]
     async fn libsql_renamed_column_is_missing_without_rows() -> Result<()> {
         renamed_column_is_missing_without_rows::<Libsql>(&SQLITE).await
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_duplicate_column_is_an_error() -> Result<()> {
+        duplicate_column_is_an_error::<Libsql>(&SQLITE).await
     }
 
     #[cfg(feature = "libsql")]
@@ -476,6 +505,12 @@ mod tests {
     #[tokio::test]
     async fn turso_renamed_column_is_missing_without_rows() -> Result<()> {
         renamed_column_is_missing_without_rows::<Turso>(&SQLITE).await
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_duplicate_column_is_an_error() -> Result<()> {
+        duplicate_column_is_an_error::<Turso>(&SQLITE).await
     }
 
     #[cfg(feature = "turso")]
