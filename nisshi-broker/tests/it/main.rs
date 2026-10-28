@@ -93,6 +93,7 @@ pub mod storage_options;
 pub mod tls;
 pub mod topic;
 pub mod topic_config_aliases;
+pub mod topic_config_read_failed;
 pub mod topic_lifecycle;
 pub mod traceforge_delete_topic_object_store_fault;
 pub mod traceforge_group_join;

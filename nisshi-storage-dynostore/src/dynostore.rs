@@ -839,11 +839,13 @@ impl DynoStore {
     /// below the topic's partition count. Returns the topic's metadata.
     ///
     /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic or an
-    /// index outside the topic.
+    /// index outside the topic, and with [`ErrorCode::KafkaStorageError`] for a failed read of
+    /// the object store.
     async fn ensure_partition_exists(&self, topition: &Topition) -> Result<TopicMetadata> {
         let Some(metadata) = self
             .topic_metadata(&TopicId::Name(topition.topic.clone()))
-            .await?
+            .await
+            .map_err(metadata_read_error)?
         else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
@@ -3071,7 +3073,7 @@ impl Storage for DynoStore {
                     .resource_name(name.into())
                     .configs(Some(vec![]))),
 
-                Err(error) => Err(error),
+                Err(error) => Err(metadata_read_error(error)),
             },
 
             _ => Ok(DescribeConfigsResult::default()
@@ -4278,6 +4280,27 @@ impl Storage for DynoStore {
             .await
             .transpose()?;
         Ok(())
+    }
+}
+
+/// Returns the error that a client gets for a failed read of the cluster's metadata: an object
+/// store error becomes [`Error::Api`] with [`ErrorCode::KafkaStorageError`], and any other error
+/// stays as it is.
+///
+/// A failed read of the object store is usually transient. Kafka answers a failed log read with
+/// `KAFKA_STORAGE_ERROR` ([`LocalLog.scala`]), and a producer retries that code, but fails on
+/// `UNKNOWN_SERVER_ERROR`. A retry does not fix metadata that can't be decoded, so that error
+/// keeps its type.
+///
+/// [`LocalLog.scala`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L709-L721
+fn metadata_read_error(error: Error) -> Error {
+    match error {
+        Error::ObjectStore(error) => {
+            error!(?error, "reading metadata");
+            Error::Api(ErrorCode::KafkaStorageError)
+        }
+
+        otherwise => otherwise,
     }
 }
 
