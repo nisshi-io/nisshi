@@ -26,7 +26,7 @@ use uuid::Uuid;
 /// Each method reads one kind of value that the queries store, and returns `None` for a null and
 /// an error for a value of another kind. Each method reads the value from the row once, so that a
 /// large value, such as a record's key, is copied at most once. [`FromColumn`] reads each Rust type
-/// that a query module declares on these methods.
+/// that a query module declares through these methods.
 pub(crate) trait DriverRow {
     /// Returns the integer at `index`, widened to `i64`.
     fn integer(&self, index: usize) -> Result<Option<i64>>;

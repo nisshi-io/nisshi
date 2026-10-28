@@ -428,7 +428,8 @@ impl Engine {
     /// Runs `query` on `connection`, and returns the column names of its result with its first
     /// row.
     ///
-    /// Returns [`turso::Error::QueryReturnedNoRows`] when the result has no rows.
+    /// Returns [`Error::Turso`] with [`turso::Error::QueryReturnedNoRows`] when the result has no
+    /// rows.
     async fn query_one<P>(
         &self,
         connection: &Connection,
@@ -502,8 +503,8 @@ impl Engine {
 
     /// Adds the next epoch to `producer`, and returns it.
     ///
-    /// Returns [`turso::Error::QueryReturnedNoRows`] when the producer does not exist, or when
-    /// its newest epoch is `i16::MAX`.
+    /// Returns [`Error::Turso`] with [`turso::Error::QueryReturnedNoRows`] when the producer does
+    /// not exist, or when its newest epoch is `i16::MAX`.
     async fn producer_epoch_insert(&self, connection: &Connection, producer: i64) -> Result<i16> {
         let (columns, row) = self
             .query_one(

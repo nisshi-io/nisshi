@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The query that finds each open transaction whose transaction timeout has expired.
+//! The query that finds each transaction with the status `BEGIN` whose transaction timeout has
+//! expired.
 //!
 //! The query takes two parameters: `$1` is the cluster's name, and `$2` the current time.
 

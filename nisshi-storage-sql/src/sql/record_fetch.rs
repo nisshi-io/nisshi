@@ -59,7 +59,7 @@ sql_row! {
 
 /// The offset of each record of the same result, read without its key and value.
 ///
-/// An engine reads every record's offset before it builds the first batch, and reads a whole
-/// [`Row`] only for the records that it returns before the fetch's deadline, so that it copies no
-/// key or value that it then drops.
+/// The PostgreSQL engine reads every record's offset for its header query, and reads a whole
+/// [`Row`] only for the records that it returns before the fetch's deadline, so that it does not
+/// copy a key or a value that it then drops.
 pub(crate) use super::row::record_offset as offset;

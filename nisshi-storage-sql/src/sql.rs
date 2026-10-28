@@ -247,8 +247,8 @@ macro_rules! cache_key {
 ///
 /// Each line names a query by its folder and file in this crate's `src`. A line in `rows` names
 /// the constant that a query's module declares, because an engine reads the query's rows through
-/// that module, and a compile-time assertion checks that the constant holds the query's key. A
-/// line in `plain` declares the constant here.
+/// that module. A compile-time assertion checks that the constant holds the query's key. A line in
+/// `plain` declares the constant here.
 macro_rules! queries {
     (
         rows {

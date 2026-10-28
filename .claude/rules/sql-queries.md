@@ -74,11 +74,11 @@ changes.
   ```
 
   For a result of at most one row, use the engine's one-row helper, which records the same SQL
-  metrics as a many-row query. On PostgreSQL, a query that reads at most one row uses
-  `prepare_query_optional_row`, for none or one row, or `prepare_query_one_row`, for exactly one
-  row. Both fail on a second row. `prepare_query_rows` is for a result of any number of rows.
-  libSQL and Turso have `query_rows` and `query_first`. PostgreSQL gets the column names from the
-  prepared statement, so a result without rows has them too.
+  metrics as a many-row query. On PostgreSQL, the engine runs a query of at most one row with
+  `prepare_query_optional_row`, for none or one row, or with `prepare_query_one_row`, for
+  exactly one row. Both fail on a second row. `prepare_query_rows` is for a result of any number
+  of rows. libSQL and Turso have `query_rows` and `query_first`. PostgreSQL gets the column
+  names from the prepared statement, so a result without rows has them too.
 - **Write the row type qualified, as `topic_select::Row`.** The module already names the query, so
   the type needs no other name. Each engine file also imports its driver's own `Row`, and the
   qualified name shows which of the two a line means.

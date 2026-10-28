@@ -1178,8 +1178,8 @@ impl Postgres {
         let reader = record_fetch::RowReader::new(&columns)?;
         let offset_reader = record_fetch::offset::RowReader::new(&columns)?;
 
-        // Each row is read when the loop below reaches it, and not at all after the deadline, so a
-        // fetch copies no key or value that it then drops.
+        // The iterator reads each row only when the loop below reaches it, and the loop stops at
+        // the deadline, so that a fetch does not copy a key or a value that it then drops.
         let mut records = rows
             .iter()
             .map(|row| reader.read_row(row).inspect_err(|err| error!(?err)));

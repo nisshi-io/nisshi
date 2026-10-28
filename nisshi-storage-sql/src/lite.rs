@@ -615,8 +615,8 @@ impl PoolConnection {
 
     /// Adds the next epoch to `producer` in `cluster`, and returns it.
     ///
-    /// Returns [`libsql::Error::Misuse`] when the producer does not exist, or when its newest
-    /// epoch is `i16::MAX`.
+    /// Returns [`Error::LibSql`] with [`libsql::Error::Misuse`] when the producer does not exist,
+    /// or when its newest epoch is `i16::MAX`.
     async fn producer_epoch_insert(&self, cluster: &str, producer: i64) -> Result<i16> {
         let (columns, row) = self
             .query_one(producer_epoch_insert::QUERY, (cluster, producer))

@@ -43,7 +43,8 @@ sql_row! {
     pub(crate) struct Row {
         /// The offset.
         offset_id: i64,
-        /// The timestamp of the record at the offset, or `None` when that record is not stored.
+        /// The timestamp of the record at the offset, or of the newest record when a latest version
+        /// answers the high watermark. It is `None` when that record is not stored.
         timestamp: Option<std::time::SystemTime>,
     }
 }
