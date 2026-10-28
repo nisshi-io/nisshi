@@ -7114,7 +7114,7 @@ mod tests {
     }
 
     /// Returns an engine on `db_file` with the groups `healthy` and `undecodable` stored, each
-    /// with the returned detail, and a connection of the test's own to the same file.
+    /// with the returned detail, and a connection to the same file, separate from the engine's own.
     async fn engine_with_stored_groups(
         db_file: &'static str,
         cluster: &str,
@@ -7137,7 +7137,7 @@ mod tests {
             .await?;
 
         // `GroupDetail::default` records the current time as the group's inception, so a second
-        // call returns a different detail. The test compares the answer with this value.
+        // call returns a different detail. The helper therefore returns the detail that it stored.
         let stored = GroupDetail::default();
 
         for group_id in ["healthy", "undecodable"] {
