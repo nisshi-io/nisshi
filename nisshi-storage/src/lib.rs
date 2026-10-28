@@ -435,7 +435,7 @@ pub enum Error {
 
     UnknownCacheKey(String),
 
-    /// A storage URL gave an option that the engine reads a value that the
+    /// A storage URL gave an option that the engine reads, with a value that the
     /// engine cannot parse.
     InvalidStorageOptionValue {
         scheme: String,
