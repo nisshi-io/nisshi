@@ -229,7 +229,7 @@ mod libsql {
     use bytes::Bytes;
     use libsql::{Row, Rows, Value};
     use nisshi_sans_io::to_system_time;
-    use nisshi_storage::Result;
+    use nisshi_storage::{Error, Result};
     use std::time::SystemTime;
     use uuid::Uuid;
 
@@ -248,7 +248,7 @@ mod libsql {
     fn integer_of(value: Value) -> Result<i64> {
         match value {
             Value::Integer(integer) => Ok(integer),
-            _ => Err(libsql::Error::InvalidColumnType.into()),
+            value => Err(Error::UnexpectedLibsqlValue(value)),
         }
     }
 
@@ -256,7 +256,7 @@ mod libsql {
     fn text_of(value: Value) -> Result<String> {
         match value {
             Value::Text(text) => Ok(text),
-            _ => Err(libsql::Error::InvalidColumnType.into()),
+            value => Err(Error::UnexpectedLibsqlValue(value)),
         }
     }
 
@@ -278,7 +278,7 @@ mod libsql {
                 .map(|integer| match integer {
                     0 => Ok(false),
                     1 => Ok(true),
-                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                    integer => Err(Error::UnexpectedLibsqlValue(Value::Integer(integer))),
                 })
                 .transpose()
         }
@@ -291,7 +291,7 @@ mod libsql {
             nullable_value(self, index)?
                 .map(|value| match value {
                     Value::Blob(blob) => Ok(Bytes::from(blob)),
-                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                    value => Err(Error::UnexpectedLibsqlValue(value)),
                 })
                 .transpose()
         }

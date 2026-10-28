@@ -446,6 +446,10 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// libSQL returned this value for a column whose declared type can't hold it.
+    #[cfg(feature = "libsql")]
+    UnexpectedLibsqlValue(libsql::Value),
+
     #[cfg(feature = "turso")]
     UnexpectedValue(turso::Value),
 
