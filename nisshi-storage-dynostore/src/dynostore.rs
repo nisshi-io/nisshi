@@ -3065,8 +3065,8 @@ impl Storage for DynoStore {
                 Ok(Some(topic_metadata)) => Ok(topic_metadata.describe_configs_result(name)),
 
                 Ok(None) => Ok(DescribeConfigsResult::default()
-                    .error_code(ErrorCode::None.into())
-                    .error_message(Some(ErrorCode::None.to_string()))
+                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                    .error_message(Some(ErrorCode::UnknownTopicOrPartition.to_string()))
                     .resource_type(i8::from(resource))
                     .resource_name(name.into())
                     .configs(Some(vec![]))),

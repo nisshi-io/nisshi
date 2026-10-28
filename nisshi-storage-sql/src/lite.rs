@@ -65,8 +65,9 @@ use nisshi_storage::{
     ProducerIdResponse, RequestChannelService, RequestStorageService, Result, ScramCredential,
     SemaphoreProxy, StartupFailure, Storage, StoredEpochs, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, bounded_channel, check_claim, config::apply_op, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    UpdateError, Version, bounded_channel, check_claim,
+    config::{self, apply_op},
+    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1473,7 +1474,7 @@ impl Delegate {
         let start = SystemTime::now();
 
         let now = to_timestamp(&now)?;
-        let retention_ms = u64::try_from(Duration::from_hours(7 * 24).as_millis())?;
+        let retention_ms = u64::try_from(config::DEFAULT_RETENTION.as_millis())?;
 
         let pc = self.connection().await?;
 

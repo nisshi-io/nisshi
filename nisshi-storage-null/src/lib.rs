@@ -299,12 +299,25 @@ impl Storage for Engine {
         resource: ConfigResource,
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
+        let error_code = if resource == ConfigResource::Topic
+            && !self
+                .topics
+                .lock()
+                .map_err(Error::from)?
+                .iter()
+                .any(|topic| topic.name == name)
+        {
+            ErrorCode::UnknownTopicOrPartition
+        } else {
+            ErrorCode::None
+        };
+
         Ok(DescribeConfigsResult::default()
             .configs(Some([].into()))
             .resource_name(name.to_string())
             .resource_type(resource.into())
-            .error_code(ErrorCode::None.into())
-            .error_message(Some(ErrorCode::None.to_string())))
+            .error_code(error_code.into())
+            .error_message(Some(error_code.to_string())))
     }
 
     #[instrument(skip_all)]
@@ -615,6 +628,37 @@ mod tests {
             ],
             offsets
         );
+
+        Ok(())
+    }
+
+    /// A topic that the engine doesn't track is unknown, as on the other engines, so that
+    /// `DescribeConfigsService` doesn't list Kafka's defaults for it.
+    #[tokio::test]
+    async fn describe_config_of_unknown_topic_is_unknown_topic_or_partition() -> Result<()> {
+        let engine = Engine::new(
+            "cluster".into(),
+            111,
+            Url::parse("tcp://127.0.0.1:9092/").expect("valid url"),
+        );
+
+        _ = engine
+            .create_topic(CreatableTopic::default().name("known".into()), false)
+            .await?;
+
+        let known = engine
+            .describe_config("known", ConfigResource::Topic, None)
+            .await?;
+        assert_eq!(i16::from(ErrorCode::None), known.error_code);
+
+        let unknown = engine
+            .describe_config("unknown", ConfigResource::Topic, None)
+            .await?;
+        assert_eq!(
+            i16::from(ErrorCode::UnknownTopicOrPartition),
+            unknown.error_code
+        );
+        assert_eq!("unknown", unknown.resource_name);
 
         Ok(())
     }

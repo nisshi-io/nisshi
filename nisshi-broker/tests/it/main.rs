@@ -31,6 +31,7 @@ pub mod delete_records;
 pub mod delete_topics;
 pub mod describe_cluster;
 pub mod describe_configs;
+pub mod describe_configs_topic_defaults;
 pub mod describe_groups;
 pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;

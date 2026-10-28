@@ -201,6 +201,7 @@ pub mod message_timestamp_type;
 mod producer;
 mod proxy;
 mod service;
+mod topic_defaults;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
@@ -1883,6 +1884,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// [`DescribeConfigsService`] answers a [`ConfigResource::Broker`] resource itself, so an
     /// implementation needs to answer only the other resource types.
+    ///
+    /// For a topic, an implementation returns only the configs that the topic sets, and answers
+    /// [`ErrorCode::UnknownTopicOrPartition`] for a topic that it doesn't store.
+    /// [`DescribeConfigsService`] adds Kafka's default for each other topic config when the error
+    /// code is [`ErrorCode::None`]. The broker also calls this method, and reads a config that the
+    /// topic doesn't set as Nisshi's own default.
     async fn describe_config(
         &self,
         name: &str,

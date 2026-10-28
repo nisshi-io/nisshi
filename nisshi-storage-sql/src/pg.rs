@@ -69,8 +69,10 @@ use nisshi_storage::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
     TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    TxnState, UpdateError, Version, check_claim,
+    config::{self, apply_op},
+    deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
+    producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -3378,7 +3380,7 @@ impl Postgres {
 
     #[instrument(skip(self), ret)]
     async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
-        let retention_secs = i64::try_from(Duration::from_hours(7 * 24).as_secs())?;
+        let retention_secs = i64::try_from(config::DEFAULT_RETENTION.as_secs())?;
 
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
