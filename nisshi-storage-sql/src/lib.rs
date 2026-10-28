@@ -41,7 +41,7 @@ pub use pg::factory::PostgresFactory as PostgresEngineFactory;
 
 /// Returns the PostgreSQL query that locks a partition's watermark row before a write, as the
 /// engine runs it, so that a test can hold the lock from its own connection while a produce runs.
-#[cfg(feature = "test-support")]
+#[cfg(all(feature = "test-support", feature = "postgres"))]
 #[doc(hidden)]
 pub fn watermark_select_for_write() -> nisshi_storage::Result<&'static str> {
     sql::SQL.get(sql::watermark_select_for_write::QUERY)
