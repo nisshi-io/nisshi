@@ -99,8 +99,8 @@ impl Cluster {
     /// that produces to one partition wait for each other.
     ///
     /// The test reads the answer from PostgreSQL instead of from a timer. The produce waits when
-    /// `pg_stat_activity` shows a backend that waits for a row lock and lists the holder in
-    /// `pg_blocking_pids`. The holder then rolls back, so the produce completes in both cases.
+    /// `pg_blocking_pids` lists the holder for a backend. The holder then rolls back, so the
+    /// produce completes in both cases.
     async fn produce_waits_for_lock(&self, locked: &Topition, produced: &Topition) -> Result<bool> {
         let holder = connect().await?;
         let observer = connect().await?;
@@ -143,12 +143,12 @@ impl Cluster {
 
             let blocked: bool = observer
                 .query_one(
-                    // The query counts only row lock waits, which report `transactionid` or
-                    // `tuple`, because the produce competes with the holder only for rows.
+                    // The query detects a wait from `pg_blocking_pids` alone, because it lists
+                    // a blocker only while a backend waits for a lock. The query does not filter
+                    // on `wait_event`. If a later PostgreSQL renamed the event, the filter would
+                    // match no backend, and the tests that require no wait would pass unchecked.
                     "select exists (select 1 from pg_stat_activity \
-                     where wait_event_type = 'Lock' \
-                     and wait_event in ('transactionid', 'tuple') \
-                     and $1 = any(pg_blocking_pids(pid)))",
+                     where $1 = any(pg_blocking_pids(pid)))",
                     &[&holder_pid],
                 )
                 .await?
