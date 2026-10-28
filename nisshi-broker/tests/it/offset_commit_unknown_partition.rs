@@ -30,7 +30,11 @@ use uuid::Uuid;
 const PARTITIONS: i32 = 3;
 const OFFSET: i64 = 42;
 
-pub async fn partition_index_outside_topic<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
+pub async fn offset_commit_rejects_partition_outside_topic<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
 where
     C: Into<String>,
     G: Storage,
@@ -53,14 +57,27 @@ where
         )
         .await?;
 
-    let known = Topition::new(topic_name.as_str(), PARTITIONS - 1);
-    let unknown =
-        [PARTITIONS, -1, i32::MAX].map(|partition| Topition::new(topic_name.as_str(), partition));
+    let committed = Topition::new(topic_name.as_str(), PARTITIONS - 1);
 
-    let offsets = [&known]
-        .into_iter()
-        .chain(&unknown)
-        .map(|topition| {
+    let expected_responses = vec![
+        (committed.clone(), ErrorCode::None),
+        (
+            Topition::new(topic_name.as_str(), PARTITIONS),
+            ErrorCode::UnknownTopicOrPartition,
+        ),
+        (
+            Topition::new(topic_name.as_str(), -1),
+            ErrorCode::UnknownTopicOrPartition,
+        ),
+        (
+            Topition::new(topic_name.as_str(), i32::MAX),
+            ErrorCode::UnknownTopicOrPartition,
+        ),
+    ];
+
+    let offsets = expected_responses
+        .iter()
+        .map(|(topition, _)| {
             (
                 topition.to_owned(),
                 OffsetCommitRequest::default().offset(OFFSET),
@@ -68,22 +85,13 @@ where
         })
         .collect::<Vec<_>>();
 
-    let responses = sc.offset_commit(&group_id, None, &offsets).await?;
-
     assert_eq!(
-        [(known.clone(), ErrorCode::None)]
-            .into_iter()
-            .chain(
-                unknown
-                    .iter()
-                    .map(|topition| (topition.to_owned(), ErrorCode::UnknownTopicOrPartition))
-            )
-            .collect::<Vec<_>>(),
-        responses
+        expected_responses,
+        sc.offset_commit(&group_id, None, &offsets).await?
     );
 
     assert_eq!(
-        BTreeMap::from([(known.clone(), OFFSET)]),
+        BTreeMap::from([(committed, OFFSET)]),
         sc.committed_offset_topitions(&group_id).await?
     );
 
@@ -98,10 +106,12 @@ where
         )
         .await?;
 
-    assert_eq!(Some(&OFFSET), fetched.get(&known));
-
-    for topition in &unknown {
-        assert_matches!(fetched.get(topition), None | Some(-1), "{topition:?}");
+    for (topition, error_code) in &expected_responses {
+        if *error_code == ErrorCode::None {
+            assert_eq!(Some(&OFFSET), fetched.get(topition), "{topition:?}");
+        } else {
+            assert_matches!(fetched.get(topition), None | Some(-1), "{topition:?}");
+        }
     }
 
     Ok(())
@@ -128,7 +138,7 @@ async fn run(storage_type: StorageType) -> Result<()> {
     let cluster_id = Uuid::now_v7();
     let broker_id = rng().random_range(0..i32::MAX);
 
-    partition_index_outside_topic(
+    offset_commit_rejects_partition_outside_topic(
         cluster_id,
         broker_id,
         storage_container(storage_type, cluster_id, broker_id).await?,
@@ -141,7 +151,7 @@ mod pg {
     use super::*;
 
     #[tokio::test]
-    async fn partition_index_outside_topic() -> Result<()> {
+    async fn offset_commit_rejects_partition_outside_topic() -> Result<()> {
         run(StorageType::Postgres).await
     }
 }
@@ -151,7 +161,7 @@ mod in_memory {
     use super::*;
 
     #[tokio::test]
-    async fn partition_index_outside_topic() -> Result<()> {
+    async fn offset_commit_rejects_partition_outside_topic() -> Result<()> {
         run(StorageType::InMemory).await
     }
 }
@@ -161,7 +171,7 @@ mod lite {
     use super::*;
 
     #[tokio::test]
-    async fn partition_index_outside_topic() -> Result<()> {
+    async fn offset_commit_rejects_partition_outside_topic() -> Result<()> {
         run(StorageType::Lite).await
     }
 }
@@ -172,7 +182,7 @@ mod turso {
 
     #[ignore = "the turso backend fails its connection check in tests"]
     #[tokio::test]
-    async fn partition_index_outside_topic() -> Result<()> {
+    async fn offset_commit_rejects_partition_outside_topic() -> Result<()> {
         run(StorageType::Turso).await
     }
 }

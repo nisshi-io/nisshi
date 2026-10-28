@@ -30,7 +30,7 @@ const GROUP: &str = "group";
 const OFFSET: i64 = 42;
 
 #[tokio::test]
-async fn partition_index_outside_topic() -> Result<(), Error> {
+async fn offset_commit_rejects_partition_outside_topic() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let storage = DynoStore::new("nisshi", 1, Arc::new(InMemory::new()))?;
@@ -47,17 +47,24 @@ async fn partition_index_outside_topic() -> Result<(), Error> {
         )
         .await?;
 
-    let known = Topition::new(TOPIC, PARTITIONS - 1);
-    let unknown = [
-        Topition::new(TOPIC, PARTITIONS),
-        Topition::new(TOPIC, -1),
-        Topition::new(TOPIC, i32::MAX),
+    let committed = Topition::new(TOPIC, PARTITIONS - 1);
+
+    let expected_responses = vec![
+        (committed.clone(), ErrorCode::None),
+        (
+            Topition::new(TOPIC, PARTITIONS),
+            ErrorCode::UnknownTopicOrPartition,
+        ),
+        (Topition::new(TOPIC, -1), ErrorCode::UnknownTopicOrPartition),
+        (
+            Topition::new(TOPIC, i32::MAX),
+            ErrorCode::UnknownTopicOrPartition,
+        ),
     ];
 
-    let offsets = [&known]
-        .into_iter()
-        .chain(&unknown)
-        .map(|topition| {
+    let offsets = expected_responses
+        .iter()
+        .map(|(topition, _)| {
             (
                 topition.to_owned(),
                 OffsetCommitRequest::default().offset(OFFSET),
@@ -65,22 +72,13 @@ async fn partition_index_outside_topic() -> Result<(), Error> {
         })
         .collect::<Vec<_>>();
 
-    let responses = storage.offset_commit(GROUP, None, &offsets).await?;
-
     assert_eq!(
-        [(known.clone(), ErrorCode::None)]
-            .into_iter()
-            .chain(
-                unknown
-                    .iter()
-                    .map(|topition| (topition.to_owned(), ErrorCode::UnknownTopicOrPartition))
-            )
-            .collect::<Vec<_>>(),
-        responses
+        expected_responses,
+        storage.offset_commit(GROUP, None, &offsets).await?
     );
 
     assert_eq!(
-        BTreeMap::from([(known.clone(), OFFSET)]),
+        BTreeMap::from([(committed, OFFSET)]),
         storage.committed_offset_topitions(GROUP).await?
     );
 
@@ -95,10 +93,12 @@ async fn partition_index_outside_topic() -> Result<(), Error> {
         )
         .await?;
 
-    assert_eq!(Some(&OFFSET), fetched.get(&known));
-
-    for topition in &unknown {
-        assert_matches!(fetched.get(topition), None | Some(-1), "{topition:?}");
+    for (topition, error_code) in &expected_responses {
+        if *error_code == ErrorCode::None {
+            assert_eq!(Some(&OFFSET), fetched.get(topition), "{topition:?}");
+        } else {
+            assert_matches!(fetched.get(topition), None | Some(-1), "{topition:?}");
+        }
     }
 
     Ok(())
