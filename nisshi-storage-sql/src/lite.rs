@@ -477,8 +477,8 @@ impl PoolConnection {
 
     /// Logs `err` from `query`, started at `start`, and counts it in `SQL_ERROR`.
     ///
-    /// A unique-constraint violation is logged at debug level and not counted, because a caller
-    /// can expect one, as a topic insert does for an existing topic.
+    /// A unique-constraint violation is logged at debug level and not counted, because some
+    /// callers expect one, as a topic insert does for an existing topic.
     fn record_query_error(&self, query: &str, start: SystemTime, err: &libsql::Error) {
         if is_unique_constraint(err) {
             debug!(?err);

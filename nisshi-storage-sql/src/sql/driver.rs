@@ -398,7 +398,7 @@ mod tests {
         Ok(())
     }
 
-    /// A value that the driver can't read as its field's type is an error that names the query
+    /// A value that the reader can't read as its field's type is an error that names the query
     /// and the column, instead of a value read as missing.
     async fn unreadable_value_names_its_column<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
         for (query, column) in [

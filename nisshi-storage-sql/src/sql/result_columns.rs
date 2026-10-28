@@ -65,8 +65,8 @@ impl ResultColumns {
         self.query
     }
 
-    /// Returns the index of the column `name`, or [`Error::MissingColumn`] if the result has no
-    /// such column.
+    /// Returns the index of the column `name`, or [`Error::MissingColumn`] if the result does not
+    /// have that column.
     pub(crate) fn index(&self, name: &'static str) -> Result<usize> {
         self.names
             .iter()

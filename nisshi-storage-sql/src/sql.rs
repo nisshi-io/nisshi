@@ -13,9 +13,9 @@
 // limitations under the License.
 
 /// Declares `Row`, one row of a query's result, and `RowReader`, which reads it, in the query's
-/// module, from one line for each column, such as `low: Option<i64>`: the field and its type. The
-/// field's name is the column's name in the query's result, so a query that needs another Rust
-/// name renames the column with `as`.
+/// module. The macro takes one line for each column, such as `low: Option<i64>`: the field and its
+/// type. The field's name is the column's name in the query's result, so a query that needs another
+/// Rust name renames the column with `as`.
 ///
 /// `RowReader::new` finds each column's index by its name once, before the first row, and
 /// `RowReader::read_row` reads each row by those indexes through any
@@ -48,8 +48,8 @@ macro_rules! sql_row {
 
         impl RowReader {
             /// Returns a reader for the result with `columns`, or
-            /// [`Error::MissingColumn`](nisshi_storage::Error::MissingColumn) if the result has
-            /// no column of [`Row`].
+            /// [`Error::MissingColumn`](nisshi_storage::Error::MissingColumn) for the first
+            /// column of [`Row`] that the result does not have.
             pub(crate) fn new(
                 columns: &$crate::sql::result_columns::ResultColumns,
             ) -> ::nisshi_storage::Result<Self> {
@@ -60,7 +60,7 @@ macro_rules! sql_row {
             }
 
             /// Reads `row`, or returns [`Error::Column`](nisshi_storage::Error::Column) for the
-            /// first column that the driver can't read as its field's type.
+            /// first column that the reader can't read as its field's type.
             pub(crate) fn read_row<R>(&self, row: &R) -> ::nisshi_storage::Result<Row>
             where
                 R: $crate::sql::driver::DriverRow,

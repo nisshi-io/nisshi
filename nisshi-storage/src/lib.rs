@@ -273,8 +273,9 @@ pub enum Error {
 
     ChronoParse(#[from] chrono::ParseError),
 
-    /// The driver could not read the column `column` of a row of `query`'s result as the type
-    /// that the query's module declares for it. `source` is the driver's error.
+    /// The reader of `query`'s result could not read the column `column` of a row as the column's
+    /// declared type. `source` is the error of that read: the driver's error, or an integer
+    /// overflow.
     Column {
         query: &'static str,
         column: &'static str,
@@ -352,7 +353,8 @@ pub enum Error {
     },
     Message(String),
 
-    /// The result of `query` has no column named `column`. `found` holds the names it has.
+    /// The result of `query` does not have a column named `column`. `found` holds the names it
+    /// has.
     MissingColumn {
         query: &'static str,
         column: &'static str,
