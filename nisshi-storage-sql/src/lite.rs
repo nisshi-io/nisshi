@@ -416,6 +416,78 @@ impl PoolConnection {
             })
     }
 
+    /// Runs `query`, and returns the column names of its result with its rows, which a query
+    /// module's `RowReader` reads.
+    async fn query_rows<P>(
+        &self,
+        query: &'static str,
+        params: P,
+    ) -> result::Result<(ResultColumns, Rows), libsql::Error>
+    where
+        P: IntoParams,
+    {
+        let rows = self.query(query, params).await?;
+        Ok((ResultColumns::libsql(query, &rows), rows))
+    }
+
+    /// Runs `query`, and returns the column names of its result with its first row, or with
+    /// `None` when the result has no rows.
+    ///
+    /// The function drops the result before it returns, because SQLite can't commit while a
+    /// `returning` statement is still open.
+    #[instrument(skip_all)]
+    async fn query_first<P>(
+        &self,
+        query: &'static str,
+        params: P,
+    ) -> result::Result<(ResultColumns, Option<Row>), libsql::Error>
+    where
+        P: IntoParams,
+    {
+        // The params hold record data and SCRAM credentials, so we log only the SQL.
+        debug!(sql = query);
+
+        let start = SystemTime::now();
+
+        let statement = self.prepared_statement(query).await?;
+
+        let mut rows = statement
+            .query(params)
+            .await
+            .inspect(|rows| debug!(?rows))
+            .inspect_err(|err| self.record_query_error(query, start, err))?;
+
+        let columns = ResultColumns::libsql(query, &rows);
+
+        // libSQL reports an error of the statement's first step from this call, not from
+        // `query`.
+        let row = rows
+            .next()
+            .await
+            .inspect(|row| debug!(?row))
+            .inspect_err(|err| self.record_query_error(query, start, err))?;
+
+        let attributes = [KeyValue::new("sql", query.to_owned())];
+
+        SQL_DURATION.record(elapsed_millis(start), &attributes);
+        SQL_REQUESTS.add(1, &attributes);
+
+        Ok((columns, row))
+    }
+
+    /// Logs `err` from `query`, started at `start`, and counts it in `SQL_ERROR`.
+    ///
+    /// A unique-constraint violation is logged at debug level and not counted, because a caller
+    /// can expect one, as a topic insert does for an existing topic.
+    fn record_query_error(&self, query: &str, start: SystemTime, err: &libsql::Error) {
+        if is_unique_constraint(err) {
+            debug!(?err);
+        } else {
+            error!(?err, elapsed_millis = elapsed_millis(start));
+            SQL_ERROR.add(1, &self.attributes_for_error(Some(query), err)[..]);
+        }
+    }
+
     #[instrument(skip_all)]
     async fn execute<P>(&self, sql: &str, params: P) -> result::Result<usize, libsql::Error>
     where
@@ -653,8 +725,8 @@ impl Delegate {
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
-        let mut rows = connection
-            .query(
+        let (columns, row) = connection
+            .query_first(
                 producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -665,12 +737,9 @@ impl Delegate {
             )
             .await?;
 
-        let reader = producer_epochs_select::RowReader::new(&ResultColumns::libsql(
-            producer_epochs_select::QUERY,
-            &rows,
-        ))?;
+        let reader = producer_epochs_select::RowReader::new(&columns)?;
 
-        if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
+        if let Some(row) = row {
             let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
 
             let stored = StoredEpochs {
@@ -764,8 +833,8 @@ impl Delegate {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition);
 
-        let mut rows = connection
-            .query(
+        let (columns, row) = connection
+            .query_first(
                 watermark_select_for_write::LITE_QUERY,
                 (
                     self.cluster.as_str(),
@@ -773,18 +842,12 @@ impl Delegate {
                     topition.partition(),
                 ),
             )
-            .await?;
-
-        let reader = watermark_select_for_write::RowReader::new(&ResultColumns::libsql(
-            watermark_select_for_write::LITE_QUERY,
-            &rows,
-        ))?;
-
-        let Some(row) = rows
-            .next()
             .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        else {
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
+
+        let reader = watermark_select_for_write::RowReader::new(&columns)?;
+
+        let Some(row) = row else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
@@ -3983,17 +4046,14 @@ impl Storage for Delegate {
             .await?;
 
         if rows.next().await?.is_some() {
-            let mut rows = c
-                .query(
+            let (columns, mut rows) = c
+                .query_rows(
                     topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
-            let reader = topic_configuration_select::RowReader::new(&ResultColumns::libsql(
-                topic_configuration_select::QUERY,
-                &rows,
-            ))?;
+            let reader = topic_configuration_select::RowReader::new(&columns)?;
 
             let mut configs = vec![];
 
@@ -4256,14 +4316,11 @@ impl Storage for Delegate {
 
         let mut listed_groups = vec![];
 
-        let mut rows = c
-            .query(consumer_group_select::QUERY, &[self.cluster.as_str()])
+        let (columns, mut rows) = c
+            .query_rows(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let reader = consumer_group_select::RowReader::new(&ResultColumns::libsql(
-            consumer_group_select::QUERY,
-            &rows,
-        ))?;
+        let reader = consumer_group_select::RowReader::new(&columns)?;
 
         while let Some(row) = rows.next().await? {
             let consumer_group_select::Row { name, detail } = reader.read_row(&row)?;

@@ -32,10 +32,10 @@ sql_row! {
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
     pub(crate) struct Row {
         /// The partition's low watermark.
-        low: Option<i64> = "low",
+        low: Option<i64>,
         /// The partition's high watermark.
-        high: Option<i64> = "high",
+        high: Option<i64>,
         /// The topic's stored `max.message.bytes`, or `None` when the topic does not set the key.
-        max_message_bytes: Option<String> = "max_message_bytes",
+        max_message_bytes: Option<String>,
     }
 }

@@ -29,9 +29,9 @@ sql_row! {
     #[derive(Debug)]
     pub(crate) struct Row {
         /// The group's name.
-        name: String = "name",
+        name: String,
         /// The group's stored detail, or the error from parsing it as JSON. It is `None` for a
         /// group that has only committed offsets.
-        detail: Option<serde_json::Result<serde_json::Value>> = "detail",
+        detail: Option<serde_json::Result<serde_json::Value>>,
     }
 }

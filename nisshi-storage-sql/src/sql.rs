@@ -13,8 +13,9 @@
 // limitations under the License.
 
 /// Declares `Row`, one row of a query's result, and `RowReader`, which reads it, in the query's
-/// module, from one line for each column, such as `low: Option<i64> = "low"`: the field, its type,
-/// and the column's name in the query's result.
+/// module, from one line for each column, such as `low: Option<i64>`: the field and its type. The
+/// field's name is the column's name in the query's result, so a query that needs another Rust
+/// name renames the column with `as`.
 ///
 /// `RowReader::new` finds each column's index by its name once, before the first row, and
 /// `RowReader::read_row` reads each row by those indexes through any
@@ -26,7 +27,7 @@ macro_rules! sql_row {
         pub(crate) struct Row {
             $(
                 $(#[$field_attribute:meta])*
-                $field:ident: $type:ty = $column:literal
+                $field:ident: $type:ty
             ),+ $(,)?
         }
     ) => {
@@ -54,7 +55,7 @@ macro_rules! sql_row {
             ) -> ::nisshi_storage::Result<Self> {
                 Ok(Self {
                     query: columns.query(),
-                    $($field: columns.index($column)?,)+
+                    $($field: columns.index(stringify!($field))?,)+
                 })
             }
 
@@ -69,7 +70,7 @@ macro_rules! sql_row {
                         $field: <$type as $crate::sql::driver::Column>::read(row, self.$field)
                             .map_err(|source| ::nisshi_storage::Error::Column {
                                 query: self.query,
-                                column: $column,
+                                column: stringify!($field),
                                 source: Box::new(source),
                             })?,
                     )+

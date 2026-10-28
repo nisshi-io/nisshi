@@ -26,8 +26,8 @@ sql_row! {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct Row {
         /// The config's key.
-        name: String = "name",
+        name: String,
         /// The config's stored value.
-        value: Option<String> = "value",
+        value: Option<String>,
     }
 }

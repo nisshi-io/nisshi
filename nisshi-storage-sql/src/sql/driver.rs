@@ -240,10 +240,10 @@ mod tests {
         sql_row! {
             #[derive(Debug)]
             pub(crate) struct Row {
-                epoch: i16 = "epoch",
-                high: Option<i64> = "high",
-                name: String = "name",
-                detail: Option<serde_json::Result<serde_json::Value>> = "detail",
+                epoch: i16,
+                high: Option<i64>,
+                name: String,
+                detail: Option<serde_json::Result<serde_json::Value>>,
             }
         }
     }

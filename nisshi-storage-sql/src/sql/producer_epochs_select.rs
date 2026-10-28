@@ -27,11 +27,11 @@ sql_row! {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct Row {
         /// The producer's newest epoch.
-        newest_epoch: i16 = "newest_epoch",
+        newest_epoch: i16,
         /// The producer's newest epoch with a sequence on the partition, or `None` when the
         /// producer has not written to the partition.
-        partition_epoch: Option<i16> = "partition_epoch",
+        partition_epoch: Option<i16>,
         /// 1 when a transactional ID owns the producer, and 0 otherwise.
-        transactional: i32 = "transactional",
+        transactional: i32,
     }
 }

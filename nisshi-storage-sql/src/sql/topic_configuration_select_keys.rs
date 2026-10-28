@@ -27,9 +27,9 @@ sql_row! {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct Row {
         /// The config's key, or `None` in the row for a topic that sets none of the keys.
-        name: Option<String> = "name",
+        name: Option<String>,
         /// The config's stored value.
-        value: Option<String> = "value",
+        value: Option<String>,
     }
 }
 

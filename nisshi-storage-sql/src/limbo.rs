@@ -374,6 +374,80 @@ impl Engine {
         Ok(row)
     }
 
+    /// Runs `query` on `connection`, and returns the column names of its result with its rows,
+    /// which a query module's `RowReader` reads.
+    async fn query_rows<P>(
+        &self,
+        connection: &Connection,
+        query: &'static str,
+        params: P,
+    ) -> Result<(ResultColumns, turso::Rows)>
+    where
+        P: IntoParams,
+    {
+        let rows = connection.query(&sql_lookup(query)?, params).await?;
+        Ok((ResultColumns::turso(query, &rows), rows))
+    }
+
+    /// Runs `query` on `connection`, and returns the column names of its result with its first
+    /// row, or with `None` when the result has no rows.
+    ///
+    /// The function drops the result before it returns, because SQLite can't commit while a
+    /// `returning` statement is still open.
+    async fn query_first<P>(
+        &self,
+        connection: &Connection,
+        query: &'static str,
+        params: P,
+    ) -> Result<(ResultColumns, Option<Row>)>
+    where
+        P: IntoParams,
+    {
+        let sql = sql_lookup(query)?;
+
+        // The params hold record data, so we log only the SQL.
+        debug!(?connection, sql);
+
+        let mut statement = connection
+            .prepare(&sql)
+            .await
+            .inspect_err(|err| error!(?err, sql))?;
+
+        let execute_start = SystemTime::now();
+
+        let mut rows = statement.query(params).await.inspect_err(|err| {
+            error!(?err, sql);
+            SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
+        })?;
+
+        let columns = ResultColumns::turso(query, &rows);
+
+        let row = rows
+            .next()
+            .await
+            .inspect(|row| debug!(?row))
+            .inspect_err(|err| {
+                error!(?err, sql);
+                SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
+            })?;
+
+        let attributes = [
+            KeyValue::new("sql", sql),
+            KeyValue::new("cluster_id", self.cluster.clone()),
+        ];
+
+        SQL_DURATION.record(
+            execute_start
+                .elapsed()
+                .map_or(0, |duration| duration.as_millis() as u64),
+            &attributes,
+        );
+
+        SQL_REQUESTS.add(1, &attributes);
+
+        Ok((columns, row))
+    }
+
     async fn prepare_query_one<P>(
         &self,
         connection: &Connection,
@@ -437,9 +511,10 @@ impl Engine {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        let mut rows = connection
-            .query(
-                &sql_lookup(producer_epochs_select::QUERY)?,
+        let (columns, row) = self
+            .query_first(
+                connection,
+                producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
                     deflated.producer_id,
@@ -449,12 +524,9 @@ impl Engine {
             )
             .await?;
 
-        let reader = producer_epochs_select::RowReader::new(&ResultColumns::turso(
-            producer_epochs_select::QUERY,
-            &rows,
-        ))?;
+        let reader = producer_epochs_select::RowReader::new(&columns)?;
 
-        if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
+        if let Some(row) = row {
             let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
 
             let stored = StoredEpochs {
@@ -559,27 +631,22 @@ impl Engine {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition, ?tx);
 
-        let mut rows = tx
-            .query(
-                &sql_lookup(watermark_select_for_write::LITE_QUERY)?,
+        let (columns, row) = self
+            .query_first(
+                tx,
+                watermark_select_for_write::LITE_QUERY,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
                     topition.partition(),
                 ),
             )
-            .await?;
-
-        let reader = watermark_select_for_write::RowReader::new(&ResultColumns::turso(
-            watermark_select_for_write::LITE_QUERY,
-            &rows,
-        ))?;
-
-        let Some(row) = rows
-            .next()
             .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        else {
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
+
+        let reader = watermark_select_for_write::RowReader::new(&columns)?;
+
+        let Some(row) = row else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
@@ -2663,17 +2730,15 @@ impl Storage for Engine {
             .await?;
 
         if rows.next().await?.is_some() {
-            let mut rows = c
-                .query(
-                    &sql_lookup(topic_configuration_select::QUERY)?,
+            let (columns, mut rows) = self
+                .query_rows(
+                    &c,
+                    topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
-            let reader = topic_configuration_select::RowReader::new(&ResultColumns::turso(
-                topic_configuration_select::QUERY,
-                &rows,
-            ))?;
+            let reader = topic_configuration_select::RowReader::new(&columns)?;
 
             let mut configs = vec![];
 
@@ -2980,17 +3045,11 @@ impl Storage for Engine {
 
         let mut listed_groups = vec![];
 
-        let mut rows = c
-            .query(
-                &sql_lookup(consumer_group_select::QUERY)?,
-                &[self.cluster.as_str()],
-            )
+        let (columns, mut rows) = self
+            .query_rows(&c, consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let reader = consumer_group_select::RowReader::new(&ResultColumns::turso(
-            consumer_group_select::QUERY,
-            &rows,
-        ))?;
+        let reader = consumer_group_select::RowReader::new(&columns)?;
 
         while let Some(row) = rows.next().await? {
             let consumer_group_select::Row { name, detail } = reader.read_row(&row)?;

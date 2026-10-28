@@ -1634,8 +1634,8 @@ impl Postgres {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_opt_row(
                 tx,
                 producer_epochs_select::QUERY,
                 &[
@@ -1650,8 +1650,8 @@ impl Postgres {
 
         let reader = producer_epochs_select::RowReader::new(&columns)?;
 
-        if let Some(row) = rows.first() {
-            let epochs = reader.read_row(row).inspect_err(|err| error!(?err))?;
+        if let Some(row) = row {
+            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
 
             let stored = StoredEpochs {
                 transactional: epochs.transactional != 0,
@@ -1743,8 +1743,8 @@ impl Postgres {
         topition: &Topition,
         tx: &Transaction<'_>,
     ) -> Result<watermark_select_for_write::Row> {
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let (columns, row) = self
+            .prepare_query_opt_row(
                 tx,
                 watermark_select_for_write::QUERY,
                 &[&self.cluster, &topition.topic(), &topition.partition()],
@@ -1754,11 +1754,11 @@ impl Postgres {
 
         let reader = watermark_select_for_write::RowReader::new(&columns)?;
 
-        let Some(row) = rows.first() else {
+        let Some(row) = row else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
 
-        reader.read_row(row).inspect_err(|err| error!(?err))
+        reader.read_row(&row).inspect_err(|err| error!(?err))
     }
 
     /// Advances one partition's log start for DeleteRecords, answering the
@@ -2056,6 +2056,27 @@ impl Postgres {
         self.record_sql_metrics(sql, client.query(&statement, params))
             .await
             .map(|rows| (columns, rows))
+    }
+
+    /// Runs the query that the SQL cache holds for `query`, and returns its row with the names of
+    /// its result's columns, or with `None` when the result has no rows. A result with more than
+    /// one row is an error.
+    #[instrument(skip(self, client, params))]
+    async fn prepare_query_opt_row<C>(
+        &self,
+        client: &C,
+        query: &'static str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<(ResultColumns, Option<Row>)>
+    where
+        C: GenericClient,
+    {
+        let (sql, statement) = self.prepare_statement(client, query).await?;
+        let columns = ResultColumns::postgres(query, &statement);
+
+        self.record_sql_metrics(sql, client.query_opt(&statement, params))
+            .await
+            .map(|row| (columns, row))
     }
 
     #[instrument(skip(self, client, params))]
