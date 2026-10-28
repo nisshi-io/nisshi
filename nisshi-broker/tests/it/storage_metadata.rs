@@ -17,13 +17,16 @@ use nisshi_broker::Result;
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, NULL_TOPIC_ID, RequestInput, metadata_request::MetadataRequestTopic,
 };
-use nisshi_storage::{ArcDynStorage, MetadataService, Storage};
+use nisshi_storage::{ArcDynStorage, MetadataService, Storage, TopicCreationConfig};
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
-    let service = MetadataService { storage };
+    let service = MetadataService {
+        storage,
+        topic_creation: TopicCreationConfig::default(),
+    };
 
     let response = service
         .serve(RequestInput {
@@ -45,7 +48,10 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
 }
 
 async fn auto_create_topic(storage: impl Storage + Clone) -> Result<()> {
-    let service = MetadataService { storage };
+    let service = MetadataService {
+        storage,
+        topic_creation: TopicCreationConfig::default(),
+    };
 
     let name = "auto-created";
 
@@ -65,13 +71,16 @@ async fn auto_create_topic(storage: impl Storage + Clone) -> Result<()> {
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
     assert_eq!(Some(name.into()), topics[0].name);
     assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(4, topics[0].partitions.as_deref().unwrap_or_default().len());
+    assert_eq!(1, topics[0].partitions.as_deref().unwrap_or_default().len());
 
     Ok(())
 }
 
 async fn auto_create_topic_invalid_name(storage: impl Storage + Clone) -> Result<()> {
-    let service = MetadataService { storage };
+    let service = MetadataService {
+        storage,
+        topic_creation: TopicCreationConfig::default(),
+    };
 
     let name = "not a valid topic name";
 
@@ -97,7 +106,10 @@ async fn auto_create_topic_invalid_name(storage: impl Storage + Clone) -> Result
 }
 
 async fn auto_create_topic_not_allowed(storage: impl Storage + Clone) -> Result<()> {
-    let service = MetadataService { storage };
+    let service = MetadataService {
+        storage,
+        topic_creation: TopicCreationConfig::default(),
+    };
 
     let name = "not-auto-created";
 

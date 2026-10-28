@@ -18,6 +18,7 @@ mod common;
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
 pub mod auth;
 pub mod authentication_storage;
+pub mod auto_create_topics;
 pub mod cg;
 pub mod cg_dynamic;
 pub mod cg_latency;

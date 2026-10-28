@@ -33,7 +33,9 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_service::{PeerAddressExtension, ProgressBarExtension};
-use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
+use nisshi_storage::{
+    ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicCreationConfig,
+};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
@@ -205,6 +207,7 @@ pub struct Broker<G, S> {
     advertised_listener: Url,
     storage: S,
     groups: G,
+    topic_creation: TopicCreationConfig,
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
@@ -242,6 +245,7 @@ where
             advertised_listener,
             storage,
             groups,
+            topic_creation: TopicCreationConfig::default(),
 
             sasl_config: None,
             tls_server_config: None,
@@ -568,6 +572,7 @@ where
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
+                        self.topic_creation,
                         self.sasl_config.clone()
                     )?;
 
@@ -743,6 +748,7 @@ pub struct Builder<N, C, I, A, S, L> {
     tls_server_config: Option<ServerConfig>,
     silent: bool,
     group_coordinator: GroupCoordinatorConfig,
+    topic_creation: TopicCreationConfig,
 
     cancellation: CancellationToken,
 }
@@ -772,6 +778,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
             cancellation: self.cancellation,
         }
     }
@@ -791,6 +798,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -811,6 +819,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -834,6 +843,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -856,6 +866,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -878,6 +889,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -925,6 +937,13 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     pub fn group_coordinator(self, group_coordinator: GroupCoordinatorConfig) -> Self {
         Self {
             group_coordinator,
+            ..self
+        }
+    }
+
+    pub fn topic_creation(self, topic_creation: TopicCreationConfig) -> Self {
+        Self {
+            topic_creation,
             ..self
         }
     }
@@ -1005,6 +1024,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            topic_creation: self.topic_creation,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
