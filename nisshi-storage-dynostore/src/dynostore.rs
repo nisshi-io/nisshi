@@ -2959,6 +2959,11 @@ impl Storage for DynoStore {
             if let Some(transaction_id) = transaction_id
                 && attributes.transaction
             {
+                // This costs a `meta.json` write on the transaction's first batch to the
+                // partition, and a cached read on each later batch. Recording the bound in
+                // AddPartitionsToTxn instead would ride on that call's `meta.json` write, but
+                // the end of the transaction writes a marker to each partition with a recorded
+                // range, so an added partition that gets no batch would get a marker too.
                 self.record_transaction_start(transaction_id, deflated.producer_epoch, topition)
                     .await?;
             }
