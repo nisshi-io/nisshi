@@ -85,6 +85,9 @@ jobs:
       # The medium/medium thresholds below also hide the open
       # `cache-poisoning` findings. zizmor applies the thresholds globally,
       # so this step cannot show one audit without the other.
+      #
+      # `just lint-workflows` runs both zizmor steps locally. Keep its zizmor
+      # arguments in step with these.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor --min-confidence medium --min-severity medium .github/workflows/
