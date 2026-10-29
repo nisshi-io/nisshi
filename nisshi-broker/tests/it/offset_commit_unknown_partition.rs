@@ -92,7 +92,11 @@ where
 
     assert_eq!(
         BTreeMap::from([(committed, OFFSET)]),
-        sc.committed_offset_topitions(&group_id).await?
+        sc.committed_offset_topitions(&group_id)
+            .await?
+            .into_iter()
+            .map(|(topition, committed)| (topition, committed.offset))
+            .collect::<BTreeMap<_, _>>()
     );
 
     let fetched = sc
@@ -108,9 +112,17 @@ where
 
     for (topition, error_code) in &expected_responses {
         if *error_code == ErrorCode::None {
-            assert_eq!(Some(&OFFSET), fetched.get(topition), "{topition:?}");
+            assert_eq!(
+                Some(OFFSET),
+                fetched.get(topition).map(|committed| committed.offset),
+                "{topition:?}"
+            );
         } else {
-            assert_matches!(fetched.get(topition), None | Some(-1), "{topition:?}");
+            assert_matches!(
+                fetched.get(topition).map(|committed| committed.offset),
+                None | Some(-1),
+                "{topition:?}"
+            );
         }
     }
 

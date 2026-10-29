@@ -207,6 +207,7 @@ mod inflate;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
+pub mod offset_metadata;
 mod producer;
 mod proxy;
 mod service;
@@ -853,6 +854,43 @@ impl TryFrom<&OffsetCommitRequestPartition> for OffsetCommitRequest {
                 timestamp,
                 metadata: value.committed_metadata.clone(),
             })
+    }
+}
+
+/// Committed Offset
+///
+/// The offset that a consumer group committed for a partition, with the leader
+/// epoch and the metadata of that commit.
+///
+/// The type does not implement `Default`, because an offset of 0 tells a consumer to
+/// read the partition from its start. [`CommittedOffset::uncommitted`] is the value for
+/// a partition without a committed offset.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct CommittedOffset {
+    pub offset: i64,
+    pub leader_epoch: Option<i32>,
+    pub metadata: Option<String>,
+}
+
+impl CommittedOffset {
+    /// Returns the committed offset of a partition that the group has not
+    /// committed: offset -1, with no leader epoch and no metadata.
+    pub fn uncommitted() -> Self {
+        Self {
+            offset: -1,
+            leader_epoch: None,
+            metadata: None,
+        }
+    }
+}
+
+impl From<OffsetCommitRequest> for CommittedOffset {
+    fn from(value: OffsetCommitRequest) -> Self {
+        Self {
+            offset: value.offset,
+            leader_epoch: value.leader_epoch,
+            metadata: value.metadata,
+        }
     }
 }
 
@@ -1880,10 +1918,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>>;
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
     /// Fetch all committed offsets in a consumer group.
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>>;
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
@@ -2127,13 +2168,16 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
     }
 
@@ -2401,13 +2445,16 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
     }
 

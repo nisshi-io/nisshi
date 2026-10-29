@@ -66,12 +66,13 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option, producer_claim,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
+    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
+    parse_storage_option, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -104,9 +105,10 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        consumer_group_select, default_hash, idempotent_epoch_check, idempotent_sequence_check,
-        producer_epochs_select, topic_configuration_select, topic_configuration_select_keys,
-        topic_select, watermark_select_for_write,
+        consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        topic_configuration_select, topic_configuration_select_keys, topic_select,
+        watermark_select_for_write,
     },
 };
 
@@ -4078,7 +4080,10 @@ impl Storage for Postgres {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(group_id);
 
         let mut results = BTreeMap::new();
@@ -4088,21 +4093,25 @@ impl Storage for Postgres {
         for row in self
             .prepare_query(
                 &c,
-                "consumer_offset_select_by_group.sql",
+                consumer_offset_select_by_group::QUERY,
                 &[&self.cluster, &group_id],
             )
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let topic = row.try_get::<_, String>(0)?;
-            let partition = row.try_get::<_, i32>(1)?;
-            let offset = row.try_get::<_, i64>(2)?;
+            let topic = row.try_get::<_, String>(consumer_offset_select_by_group::TOPIC)?;
+            let partition = row.try_get::<_, i32>(consumer_offset_select_by_group::PARTITION)?;
+            let committed = CommittedOffset {
+                offset: row.try_get(consumer_offset_select_by_group::COMMITTED_OFFSET)?,
+                leader_epoch: row.try_get(consumer_offset_select_by_group::LEADER_EPOCH)?,
+                metadata: row.try_get(consumer_offset_select_by_group::METADATA)?,
+            };
 
-            debug!(group_id, topic, partition, offset);
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
@@ -4115,7 +4124,7 @@ impl Storage for Postgres {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
 
         let c = self.connection().await?;
@@ -4123,10 +4132,10 @@ impl Storage for Postgres {
         let mut offsets = BTreeMap::new();
 
         for topic in topics {
-            let offset = self
+            let committed = self
                 .prepare_query_opt(
                     &c,
-                    "consumer_offset_select.sql",
+                    consumer_offset_select::QUERY,
                     &[
                         &self.cluster,
                         &group_id,
@@ -4136,15 +4145,21 @@ impl Storage for Postgres {
                 )
                 .await
                 .and_then(|maybe| {
-                    maybe.map_or(Ok(-1), |row| row.try_get::<_, i64>(0).map_err(Into::into))
+                    maybe.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: row.try_get(consumer_offset_select::COMMITTED_OFFSET)?,
+                            leader_epoch: row.try_get(consumer_offset_select::LEADER_EPOCH)?,
+                            metadata: row.try_get(consumer_offset_select::METADATA)?,
+                        })
+                    })
                 })
-                .inspect(|offset| {
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -4157,7 +4172,7 @@ impl Storage for Postgres {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets)
