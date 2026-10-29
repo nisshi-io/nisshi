@@ -61,9 +61,9 @@ use nisshi_sans_io::{
     sync_group_response::SyncGroupResponse,
 };
 use nisshi_storage::{
-    GroupDetail, GroupDetailResponse, GroupMember, GroupRebalance, GroupState, InitialDelay,
-    JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync, Storage, Topition, UpdateError,
-    Version, describe_groups_response, list_groups_response,
+    CommittedOffset, GroupDetail, GroupDetailResponse, GroupMember, GroupRebalance, GroupState,
+    InitialDelay, JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync, Storage, Topition,
+    UpdateError, Version, describe_groups_response, list_groups_response, offset_metadata,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::{
@@ -1904,14 +1904,16 @@ where
                                 .partitions(Some(
                                     offsets
                                         .iter()
-                                        .filter_map(|(topition, offset)| {
+                                        .filter_map(|(topition, committed)| {
                                             if topition.topic() == *topic_name {
                                                 Some(
                                                     OffsetFetchResponsePartition::default()
                                                         .partition_index(topition.partition())
-                                                        .committed_offset(*offset)
-                                                        .committed_leader_epoch(Some(-1))
-                                                        .metadata(Some("".into()))
+                                                        .committed_offset(committed.offset)
+                                                        .committed_leader_epoch(Some(
+                                                            fetched_leader_epoch(committed),
+                                                        ))
+                                                        .metadata(Some(fetched_metadata(committed)))
                                                         .error_code(ErrorCode::None.into()),
                                                 )
                                             } else {
@@ -1986,15 +1988,19 @@ where
                                         .partitions(Some(
                                             offsets
                                                 .iter()
-                                                .filter_map(|(topition, offset)| {
+                                                .filter_map(|(topition, committed)| {
                                                     if topition.topic() == *topic_name {
                                                         Some(
                                                             OffsetFetchResponsePartitions::default(
                                                             )
                                                             .partition_index(topition.partition())
-                                                            .committed_offset(*offset)
-                                                            .committed_leader_epoch(-1)
-                                                            .metadata(None)
+                                                            .committed_offset(committed.offset)
+                                                            .committed_leader_epoch(
+                                                                fetched_leader_epoch(committed),
+                                                            )
+                                                            .metadata(Some(fetched_metadata(
+                                                                committed,
+                                                            )))
                                                             .error_code(ErrorCode::None.into()),
                                                         )
                                                     } else {
@@ -2044,11 +2050,18 @@ where
 
         if let Some(topics) = detail.topics {
             let mut offsets = vec![];
+            let mut too_large = vec![];
 
             for topic in topics {
                 if let Some(ref partitions) = topic.partitions {
                     for partition in partitions {
                         let topition = Topition::new(topic.name.clone(), partition.partition_index);
+
+                        if offset_metadata::is_too_large(partition.committed_metadata.as_deref()) {
+                            too_large.push((topition, ErrorCode::OffsetMetadataTooLarge));
+                            continue;
+                        }
+
                         let offset = OffsetCommitRequest::try_from(partition)?;
 
                         offsets.push((topition, offset));
@@ -2059,7 +2072,9 @@ where
             self.storage
                 .offset_commit(detail.group_id, retention_time_ms, offsets.deref())
                 .await
-                .map(|value| {
+                .map(|mut value| {
+                    value.append(&mut too_large);
+
                     let topics = value
                         .iter()
                         .fold(BTreeSet::new(), |mut topics, (topition, _)| {
@@ -3743,6 +3758,28 @@ fn offset_commit_response(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> B
                 .collect()
         }))
         .into()
+}
+
+/// Returns the leader epoch that `OffsetFetch` answers for a committed offset: the
+/// committed epoch, or -1 when the commit did not give one, as Kafka does
+/// ([`OffsetMetadataManager.fetchOffsets`]).
+///
+/// [`OffsetMetadataManager.fetchOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L775-L780
+fn fetched_leader_epoch(committed: &CommittedOffset) -> i32 {
+    committed.leader_epoch.unwrap_or(-1)
+}
+
+/// Returns the metadata that `OffsetFetch` answers for a committed offset: the
+/// committed metadata, or `""` when the commit did not give any.
+///
+/// Kafka never answers a null metadata. It stores a null commit metadata as `""`
+/// ([`OffsetAndMetadata.fromRequest`]), and it answers `""` for a partition without a
+/// committed offset ([`OffsetMetadataManager.fetchOffsets`]).
+///
+/// [`OffsetAndMetadata.fromRequest`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetAndMetadata.java#L159-L171
+/// [`OffsetMetadataManager.fetchOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L769-L774
+fn fetched_metadata(committed: &CommittedOffset) -> String {
+    committed.metadata.clone().unwrap_or_default()
 }
 
 /// Returns the error code that an `OffsetFetch` reports when storage fails

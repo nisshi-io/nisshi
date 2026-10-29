@@ -66,8 +66,8 @@ Nisshi does not implement them, because the storage engine holds all the state.
 
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | |
-| OffsetFetch | 9 | 0-9 | Partial | Partial | Partial | Partial | Returns empty metadata for a committed offset. |
+| OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | Answers OFFSET_METADATA_TOO_LARGE for a partition whose metadata is longer than 4096 characters, the default of Kafka's `offset.metadata.max.bytes`. Nisshi does not make the limit configurable. |
+| OffsetFetch | 9 | 0-9 | Yes | Yes | Yes | Yes | |
 | FindCoordinator | 10 | 0-6 | Yes | Yes | Yes | Yes | Answers with the broker that receives the request. |
 | JoinGroup | 11 | 0-9 | Partial | Partial | Partial | Partial | A consumer group cannot change to the `cooperative-sticky` assignor with a rolling restart ([#1051]). |
 | Heartbeat | 12 | 0-4 | Yes | Yes | Yes | Yes | |

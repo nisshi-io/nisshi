@@ -60,12 +60,13 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff,
-    epoch_is_exhausted, inflate_produced, max_message_bytes, offload, producer_claim,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
+    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    delete_records_cutoff, epoch_is_exhausted, inflate_produced, max_message_bytes, offload,
+    producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -2916,7 +2917,10 @@ impl Storage for DynoStore {
         Ok(responses)
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let mut topitions = vec![];
 
         {
@@ -2977,7 +2981,7 @@ impl Storage for DynoStore {
         group_id: Option<&str>,
         topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let mut responses = BTreeMap::new();
 
         if let Some(group_id) = group_id {
@@ -2987,7 +2991,7 @@ impl Storage for DynoStore {
                 // An object store failure may clear on a retry, so it stays a
                 // plain error. An offset that doesn't decode won't, so it is
                 // UNKNOWN_SERVER_ERROR.
-                let offset = match self.object_store.get(&location).await {
+                let committed = match self.object_store.get(&location).await {
                     Ok(get_result) => {
                         let encoded = get_result
                             .bytes()
@@ -2995,12 +2999,12 @@ impl Storage for DynoStore {
                             .inspect_err(|error| error!(?error, ?group_id, ?topition))?;
 
                         serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
-                            .map(|commit| commit.offset)
+                            .map(CommittedOffset::from)
                             .inspect_err(|error| error!(?error, ?group_id, ?topition))
                             .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
                     }
 
-                    Err(object_store::Error::NotFound { .. }) => Ok(-1),
+                    Err(object_store::Error::NotFound { .. }) => Ok(CommittedOffset::uncommitted()),
 
                     Err(error) => {
                         error!(?error, ?group_id, ?topition);
@@ -3008,7 +3012,7 @@ impl Storage for DynoStore {
                     }
                 }?;
 
-                _ = responses.insert(topition.to_owned(), offset);
+                _ = responses.insert(topition.to_owned(), committed);
             }
         }
 

@@ -16,9 +16,9 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, watermark_select_for_write,
+        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        remove_comments, result_columns::ResultColumns, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -59,7 +59,7 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
+    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, CommittedOffset,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
     ProducerIdResponse, RequestChannelService, RequestStorageService, Result, ScramCredential,
@@ -1981,7 +1981,10 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         self.inner
             .committed_offset_topitions(group_id)
@@ -2000,7 +2003,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         self.inner
             .offset_fetch(group_id, topics, require_stable)
@@ -3523,7 +3526,10 @@ impl Storage for Delegate {
         })
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
 
         debug!(group_id);
@@ -3534,21 +3540,33 @@ impl Storage for Delegate {
 
         let mut rows = c
             .query(
-                "consumer_offset_select_by_group.sql",
+                consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
-        while let Some(row) = rows.next().await? {
-            let topic = row.get_str(0)?;
-            let partition = row.get::<i32>(1)?;
-            let offset = row.get::<i64>(2)?;
+        let columns = ResultColumns::libsql(consumer_offset_select_by_group::QUERY, &rows);
+        let topic = columns.index(consumer_offset_select_by_group::TOPIC)? as i32;
+        let partition = columns.index(consumer_offset_select_by_group::PARTITION)? as i32;
+        let committed_offset =
+            columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)? as i32;
+        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)? as i32;
+        let metadata = columns.index(consumer_offset_select_by_group::METADATA)? as i32;
 
-            debug!(group_id, topic, partition, offset);
+        while let Some(row) = rows.next().await? {
+            let topic = row.get_str(topic)?;
+            let partition = row.get::<i32>(partition)?;
+            let committed = CommittedOffset {
+                offset: row.get::<i64>(committed_offset)?,
+                leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
+                metadata: row.get::<Option<String>>(metadata)?,
+            };
+
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
@@ -3565,7 +3583,7 @@ impl Storage for Delegate {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
 
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
@@ -3577,7 +3595,7 @@ impl Storage for Delegate {
         for topic in topics {
             let mut rows = c
                 .query(
-                    "consumer_offset_select.sql",
+                    consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -3596,17 +3614,30 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            let offset = rows
+            let columns = ResultColumns::libsql(consumer_offset_select::QUERY, &rows);
+            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)? as i32;
+            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)? as i32;
+            let metadata = columns.index(consumer_offset_select::METADATA)? as i32;
+
+            let committed = rows
                 .next()
                 .await
-                .and_then(|maybe| maybe.map_or(Ok(-1), |row| row.get::<i64>(0)))
-                .inspect(|offset| {
+                .and_then(|maybe| {
+                    maybe.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: row.get::<i64>(committed_offset)?,
+                            leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
+                            metadata: row.get::<Option<String>>(metadata)?,
+                        })
+                    })
+                })
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -3619,7 +3650,7 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets).inspect(|_| {
