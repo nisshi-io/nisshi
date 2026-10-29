@@ -36,6 +36,7 @@ pub mod describe_configs_topic_defaults;
 pub mod describe_groups;
 pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;
+pub mod dynostore_meta_cache;
 pub mod fetch;
 pub mod fetch_unknown_partition;
 pub mod fetch_wire;
