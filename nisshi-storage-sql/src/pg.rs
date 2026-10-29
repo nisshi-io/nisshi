@@ -8683,9 +8683,12 @@ mod tests {
             .await;
 
         assert!(
-            matches!(zombie_result, Err(Error::Api(ErrorCode::ProducerFenced))),
-            "a zombie produce under the pre-sweep epoch must be rejected as ProducerFenced, \
-             got {zombie_result:?}",
+            matches!(
+                zombie_result,
+                Err(Error::Api(ErrorCode::InvalidProducerEpoch))
+            ),
+            "a zombie produce under the pre-sweep epoch must be rejected as \
+             InvalidProducerEpoch, got {zombie_result:?}",
         );
 
         let stage_after_zombie_write = storage.offset_stage(&topition).await?;

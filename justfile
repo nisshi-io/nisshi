@@ -56,6 +56,49 @@ seed-target:
     rm -rf target/.seed
     echo "seed-target: seeded target/debug from $main/target/debug" >&2
 
+# The Apache Kafka tag that `just kafka-ref` checks out. It must stay the Kafka
+# version that the message descriptors in nisshi-sans-io/message/ come from.
+kafka_ref_version := "3.9.1"
+
+# clone Apache Kafka at the version the message descriptors come from into kafka-ref/, to read as the reference
+kafka-ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version={{ kafka_ref_version }}
+    main=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+    # Every checkout reads one clone in the main checkout, and a linked worktree
+    # gets a symlink to it, so a new worktree doesn't download Kafka again.
+    clone="$main/kafka-ref"
+    if [[ ! -e "$clone" ]]; then
+        echo "kafka-ref: cloning Apache Kafka $version into $clone" >&2
+        # We clone into kafka-ref.tmp and move it to kafka-ref last, so an
+        # interrupted clone leaves no kafka-ref. A rerun starts again from here.
+        rm -rf "$clone.tmp"
+        # The clone is blobless: it fetches each file's contents only when a
+        # command reads them. It keeps the full history, so `git log` and
+        # `git blame` show Kafka's fixes, and origin/trunk shows what changed
+        # since the tag.
+        git clone --quiet --filter=blob:none --branch "$version" https://github.com/apache/kafka.git "$clone.tmp"
+        mv "$clone.tmp" "$clone"
+    elif [[ ! -e "$clone/.git" ]]; then
+        # Without this check, git would find this repository above the
+        # directory and switch this repository's checkout instead.
+        echo "kafka-ref: $clone exists and isn't a git clone; remove it and rerun" >&2
+        exit 1
+    elif [[ "$(git -C "$clone" rev-parse HEAD)" != "$(git -C "$clone" rev-parse --verify --quiet "refs/tags/$version^{commit}")" ]]; then
+        if [[ -n "$(git -C "$clone" status --porcelain)" ]]; then
+            echo "kafka-ref: $clone has local changes; not switching it to $version" >&2
+            exit 1
+        fi
+        echo "kafka-ref: switching $clone to $version" >&2
+        git -C "$clone" fetch --quiet --tags origin
+        git -C "$clone" checkout --quiet --detach "refs/tags/$version"
+    fi
+    if [[ "$PWD" != "$main" && ! -e kafka-ref && ! -L kafka-ref ]]; then
+        ln -s "$clone" kafka-ref
+    fi
+    echo "kafka-ref: kafka-ref/ is Apache Kafka $version" >&2
+
 license:
     cargo about generate about.hbs > license.html
 
@@ -177,6 +220,50 @@ fmt-fix:
 
 shellcheck:
     git ls-files -z '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
+
+# Not in `default`, because it needs these tools and a GitHub token for zizmor's online audits:
+#   brew install actionlint zizmor pinact jq
+#   gh auth login    (the recipe uses `gh auth token` when GITHUB_TOKEN and GH_TOKEN are unset)
+# `pinact run` fixes what pinact reports.
+#
+# lint .github/workflows as workflow-lint.yml does, and check each pin's version comment with pinact
+lint-workflows:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=()
+    for tool in actionlint zizmor pinact jq; do
+        command -v "$tool" >/dev/null || missing+=("$tool")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "lint-workflows: missing ${missing[*]}; install with: brew install actionlint zizmor pinact jq" >&2
+        exit 1
+    fi
+    # zizmor reads GH_TOKEN and pinact reads GITHUB_TOKEN, so the recipe sets both.
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}}"
+    if [[ -z "$token" ]]; then
+        echo "lint-workflows: set GITHUB_TOKEN, or run gh auth login" >&2
+        exit 1
+    fi
+    export GITHUB_TOKEN="$token" GH_TOKEN="$token"
+    # Each check runs even when an earlier one fails, so one run reports every failure.
+    status=0
+    echo "== actionlint"
+    actionlint || status=1
+    # Keep the zizmor arguments in step with workflow-lint.yml.
+    echo "== zizmor"
+    zizmor --min-confidence medium --min-severity medium .github/workflows/ || status=1
+    echo "== zizmor artipacked"
+    artipacked_findings=$(zizmor --offline --no-exit-codes --strict-collection --format json .github/workflows/ \
+        | jq -r '.[] | select(.ident == "artipacked" and (.ignored | not))
+            | .locations[0] as $l
+            | "\($l.symbolic.key.Local.verbatim_path):\($l.concrete.location.start_point.row + 1): artipacked: \($l.symbolic.annotation)"') || status=1
+    if [[ -n "$artipacked_findings" ]]; then
+        printf '%s\n' "$artipacked_findings" >&2
+        status=1
+    fi
+    echo "== pinact"
+    pinact run --check || status=1
+    exit "$status"
 
 # check that compose.yaml loads with no .env and no variables set, as on a fresh clone
 compose-check:
