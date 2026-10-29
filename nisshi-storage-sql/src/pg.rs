@@ -21,6 +21,7 @@ use std::{
     hash::Hash,
     io,
     marker::PhantomData,
+    ops::RangeInclusive,
     pin::Pin,
     str::FromStr,
     sync::{Arc, LazyLock},
@@ -72,7 +73,7 @@ use nisshi_storage::{
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
     deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
-    producer_claim,
+    parse_storage_option, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -99,7 +100,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(unix)]
 use tokio_util::either::Either;
 use tracing::{Instrument as _, debug, error, info, instrument, warn};
-use url::Url;
+use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{
@@ -123,9 +124,10 @@ pub struct Postgres {
     pool: Pool,
     cancel: Option<CancelRequests>,
     /// Permits for the ListOffsets partition reads in flight, see
-    /// [`LIST_OFFSETS_READS`].
+    /// [`ReadLimits::list_offsets`].
     list_offsets_reads: Arc<Semaphore>,
-    /// Permits for the Fetch partition reads in flight, see [`FETCH_READS`].
+    /// Permits for the Fetch partition reads in flight, see
+    /// [`ReadLimits::fetch`].
     fetch_reads: Arc<Semaphore>,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
@@ -141,6 +143,7 @@ pub struct Builder<C, N, L, P> {
     node: N,
     advertised_listener: L,
     pool: P,
+    read_limits: ReadLimits,
     cancel: Option<CancelRequests>,
     abandoned_statement_bound: Duration,
     schemas: Option<Registry>,
@@ -154,6 +157,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
@@ -167,6 +171,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
@@ -180,6 +185,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener,
             pool: self.pool,
+            read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
@@ -204,8 +210,8 @@ impl Builder<String, i32, Url, Pool> {
             advertised_listener: self.advertised_listener,
             pool: self.pool,
             cancel: self.cancel,
-            list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
-            fetch_reads: Arc::new(Semaphore::new(FETCH_READS)),
+            list_offsets_reads: Arc::new(Semaphore::new(self.read_limits.list_offsets)),
+            fetch_reads: Arc::new(Semaphore::new(self.read_limits.fetch)),
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -213,41 +219,77 @@ impl Builder<String, i32, Url, Pool> {
     }
 }
 
-/// How many connections the pool opens at most.
-const POOL_MAX_SIZE: usize = 16;
+/// How many connections the pool opens at most when the storage URL does not
+/// set [`POOL_MAX_SIZE`].
+const DEFAULT_POOL_MAX_SIZE: usize = 16;
 
-/// How many ListOffsets partition reads this engine has in flight at once,
-/// across every request, counting an abandoned read until its statement
-/// has ended, its connection has failed, or the bound on it has passed,
-/// see [`cancel_and_return`].
-///
-/// Each read holds a pooled connection, so ListOffsets reads alone take at
-/// most half the pool. Together with [`FETCH_READS`], they can take all of
-/// it, see [`FETCH_READS`]. A read past this limit waits for a permit, and
-/// [`ListOffsetsService`]'s deadline drops it if the wait lasts too long.
-///
-/// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
-const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
+/// The storage URL option that sets how many connections the pool opens at
+/// most.
+const POOL_MAX_SIZE: &str = "pool_max_size";
 
-/// How many Fetch partition reads, of records or of an offset stage, this
-/// engine has in flight at once, across every request, counting an
-/// abandoned read until its statement has ended, its connection has failed,
-/// or the bound on it has passed, see [`cancel_and_return`].
-///
-/// Each read holds a pooled connection, so Fetch reads alone take at most
-/// half the pool. Fetch reads have their own limit instead of sharing
-/// [`LIST_OFFSETS_READS`], so slow fetches cannot hold up the ListOffsets
-/// reads that a consumer needs to start or reset. The two limits together
-/// equal the pool, so when slow reads use up both, other requests wait for
-/// a connection. A smaller limit would slow down healthy consumers, because
-/// a fetch read holds its connection for its whole storage budget. A read
-/// past this limit waits for a permit, and [`FetchService`]'s deadline drops
-/// it if the wait lasts too long.
-///
-/// [`FetchService`]: nisshi_storage::FetchService
-const FETCH_READS: usize = POOL_MAX_SIZE / 2;
+/// The range of [`POOL_MAX_SIZE`]. Below 2, [`ReadLimits::for_pool`] gives a
+/// limit of 0, and no read of that kind ever runs. 262143 is PostgreSQL's
+/// `MAX_BACKENDS`, the most connections that a server accepts. The pool and
+/// the read limits each make a [`Semaphore`] of this size, and
+/// [`Semaphore::new`] panics above [`Semaphore::MAX_PERMITS`], which is much
+/// larger.
+const POOL_MAX_SIZE_RANGE: RangeInclusive<usize> = 2..=262_143;
 
-const _: () = assert!(LIST_OFFSETS_READS + FETCH_READS <= POOL_MAX_SIZE);
+/// The values that [`POOL_MAX_SIZE`] takes, as an error message gives them.
+const POOL_MAX_SIZE_EXPECTED: &str = "a whole number from 2 to 262143";
+
+/// How many partition reads of each kind this engine has in flight at once,
+/// across every request, counting an abandoned read until its statement has
+/// ended, its connection has failed, or the bound on it has passed, see
+/// [`cancel_and_return`].
+#[derive(Clone, Copy, Debug)]
+struct ReadLimits {
+    /// How many ListOffsets partition reads are in flight at once.
+    ///
+    /// Each read holds a pooled connection, so ListOffsets reads alone take
+    /// at most half the pool. Together with the Fetch reads, they can take
+    /// all of it, see [`ReadLimits::fetch`]. A read past this limit waits for
+    /// a permit, and [`ListOffsetsService`]'s deadline drops it if the wait
+    /// lasts too long.
+    ///
+    /// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
+    list_offsets: usize,
+
+    /// How many Fetch partition reads, of records or of an offset stage, are
+    /// in flight at once.
+    ///
+    /// Each read holds a pooled connection, so Fetch reads alone take at most
+    /// half the pool. Fetch reads have their own limit instead of sharing
+    /// [`ReadLimits::list_offsets`], so slow fetches cannot hold up the
+    /// ListOffsets reads that a consumer needs to start or reset. The two
+    /// limits together equal the pool, so when slow reads use up both, other
+    /// requests wait for a connection. A smaller limit would slow down
+    /// healthy consumers, because a fetch read holds its connection for its
+    /// whole storage budget. A read past this limit waits for a permit, and
+    /// [`FetchService`]'s deadline drops it if the wait lasts too long.
+    ///
+    /// [`FetchService`]: nisshi_storage::FetchService
+    fetch: usize,
+}
+
+impl ReadLimits {
+    /// Returns the read limits for a pool of `max_size` connections: half
+    /// the pool for each kind of read.
+    fn for_pool(max_size: usize) -> Self {
+        let limits = Self {
+            list_offsets: max_size / 2,
+            fetch: max_size / 2,
+        };
+        debug_assert!(limits.list_offsets + limits.fetch <= max_size);
+        limits
+    }
+}
+
+impl Default for ReadLimits {
+    fn default() -> Self {
+        Self::for_pool(DEFAULT_POOL_MAX_SIZE)
+    }
+}
 
 /// How much longer than its connection's `statement_timeout` an abandoned
 /// statement is waited for before its connection is closed, see
@@ -377,6 +419,58 @@ fn statement_timeout_value(value: &str) -> Option<Duration> {
     Duration::try_from_secs_f64(seconds).ok()
 }
 
+/// Removes every [`POOL_MAX_SIZE`] option from `config`, a connection URL,
+/// and returns the pool size that the last one sets, or
+/// [`DEFAULT_POOL_MAX_SIZE`] when the URL sets none.
+///
+/// Returns [`Error::InvalidStorageOptionValue`] when any of them is not a
+/// number in [`POOL_MAX_SIZE_RANGE`], as [`parse_storage_option`] does for
+/// every storage option.
+fn take_pool_max_size(config: &mut String) -> Result<usize> {
+    // A key/value connection string, such as `host=db user=nisshi`, is not a
+    // URL, and sets no storage URL options.
+    let Ok(storage) = Url::parse(config) else {
+        return Ok(DEFAULT_POOL_MAX_SIZE);
+    };
+
+    let Some(pool_max_size) =
+        parse_storage_option(&storage, POOL_MAX_SIZE, POOL_MAX_SIZE_EXPECTED, |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
+        })?
+    else {
+        return Ok(DEFAULT_POOL_MAX_SIZE);
+    };
+
+    // tokio-postgres rejects an option that it does not read, so this option
+    // must go before it parses the URL.
+    let Some((base, query)) = config.split_once('?') else {
+        return Ok(pool_max_size);
+    };
+
+    // The retained options keep their bytes, instead of going through
+    // `Url::query_pairs_mut`, because that writes a space as `+`, and
+    // tokio-postgres reads a `+` as itself.
+    let retained = query
+        .split('&')
+        .filter(|option| {
+            form_urlencoded::parse(option.as_bytes())
+                .next()
+                .is_none_or(|(key, _)| key != POOL_MAX_SIZE)
+        })
+        .collect::<Vec<_>>();
+
+    *config = if retained.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", retained.join("&"))
+    };
+
+    Ok(pool_max_size)
+}
+
 impl<C, N> FromStr for Builder<C, N, Url, Pool>
 where
     C: Default,
@@ -385,7 +479,16 @@ where
     type Err = Error;
 
     fn from_str(config: &str) -> Result<Self, Self::Err> {
-        let mut pg_config = Config::from_str(config).inspect(|pg_config| debug!(?pg_config))?;
+        let mut config = config.to_owned();
+        let pool_max_size = take_pool_max_size(&mut config)?;
+        let read_limits = ReadLimits::for_pool(pool_max_size);
+        info!(
+            pool_max_size,
+            list_offsets_reads = read_limits.list_offsets,
+            fetch_reads = read_limits.fetch
+        );
+
+        let mut pg_config = Config::from_str(&config).inspect(|pg_config| debug!(?pg_config))?;
 
         let options =
             merge_statement_timeout_option(pg_config.get_options(), DEFAULT_STATEMENT_TIMEOUT_MS);
@@ -424,13 +527,14 @@ where
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
 
         Pool::builder(mgr)
-            .max_size(POOL_MAX_SIZE)
+            .max_size(pool_max_size)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
             .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
             .build()
             .map(|pool| Self {
                 pool,
+                read_limits,
                 cancel,
                 abandoned_statement_bound,
                 advertised_listener,
@@ -817,16 +921,16 @@ async fn settled_outside_a_transaction(connection: &Object) -> Result<bool, toki
 
 /// Cancels the statement running on an abandoned `connection`, and returns
 /// the connection to its pool once that statement has ended, so the pool
-/// stays within its [`POOL_MAX_SIZE`] server connections.
+/// opens no more server connections than its maximum size.
 ///
 /// The connection and `permit` are held until the statement has ended,
 /// whether or not the cancel request reached the server, so the statement
-/// counts against the limit that `permit` comes from ([`LIST_OFFSETS_READS`]
-/// or [`FETCH_READS`]) meanwhile. A cancel request that misses its
-/// statement (a host other than the one running the statement, or a proxy
-/// that does not forward it) then shows as reads that wait for a permit,
-/// under the `queued` stage, rather than as server connections beyond the
-/// pool.
+/// counts against the limit that `permit` comes from
+/// ([`ReadLimits::list_offsets`] or [`ReadLimits::fetch`]) meanwhile. A
+/// cancel request that misses its statement (a host other than the one
+/// running the statement, or a proxy that does not forward it) then shows as
+/// reads that wait for a permit, under the `queued` stage, rather than as
+/// server connections beyond the pool.
 ///
 /// The connection goes back to the pool only when [`SETTLE_QUERY`] shows it
 /// outside any transaction block. The connection is closed and taken out of
@@ -5522,6 +5626,155 @@ mod tests {
         assert!(error.to_string().contains("vacuum_into"), "{error}");
     }
 
+    /// Without `pool_max_size`, the pool opens at most 16 connections, and
+    /// each kind of read takes half of them.
+    #[test]
+    fn pool_max_size_defaults_to_sixteen() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster("default")
+            .node(0)
+            .build();
+
+        assert_eq!(16, storage.pool.status().max_size);
+        assert_eq!(8, storage.list_offsets_reads.available_permits());
+        assert_eq!(8, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// `pool_max_size` sets how many connections the pool opens at most, and
+    /// each kind of read takes half of them, rounded down. The other options
+    /// in the URL still reach tokio-postgres.
+    #[test]
+    fn pool_max_size_sets_the_pool_and_its_read_limits() -> Result<()> {
+        for (pool_max_size, read_limit) in [(32, 16), (33, 16), (2, 1)] {
+            let storage = Postgres::builder(&format!(
+                "{CONNECTION}?options=-c%20statement_timeout%3D120000&pool_max_size={pool_max_size}"
+            ))?
+            .cluster("sized")
+            .node(0)
+            .build();
+
+            assert_eq!(pool_max_size, storage.pool.status().max_size);
+            assert_eq!(read_limit, storage.list_offsets_reads.available_permits());
+            assert_eq!(read_limit, storage.fetch_reads.available_permits());
+            assert_eq!(
+                Duration::from_secs(120) + ABANDONED_STATEMENT_MARGIN,
+                storage.abandoned_statement_bound
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A `pool_max_size` that is not a number in [`POOL_MAX_SIZE_RANGE`]
+    /// stops the build before any connection, and the error names the option
+    /// and its value.
+    #[test]
+    fn pool_max_size_rejects_invalid_values() {
+        for value in [
+            "banana",
+            "",
+            "-1",
+            "0",
+            "1",
+            "262144",
+            "18446744073709551616",
+        ] {
+            let error =
+                Postgres::builder(&format!("{CONNECTION}?pool_max_size={value}")).expect_err(value);
+
+            assert_matches!(
+                &error,
+                Error::InvalidStorageOptionValue { scheme, option, value: rejected, expected }
+                    if scheme == "postgres"
+                        && option == POOL_MAX_SIZE
+                        && rejected == value
+                        && *expected == "a whole number from 2 to 262143",
+                "{value}"
+            );
+        }
+    }
+
+    /// An invalid `pool_max_size` stops the build wherever it is in the URL,
+    /// even when a later one is valid, as every storage option does.
+    #[test]
+    fn pool_max_size_rejects_an_invalid_earlier_occurrence() {
+        let error = Postgres::builder(&format!(
+            "{CONNECTION}?pool_max_size=banana&pool_max_size=4"
+        ))
+        .expect_err("an invalid pool_max_size must be rejected");
+
+        assert_matches!(
+            &error,
+            Error::InvalidStorageOptionValue { option, value, .. }
+                if option == POOL_MAX_SIZE && value == "banana"
+        );
+    }
+
+    /// [`take_pool_max_size`] removes every `pool_max_size` from the URL, and
+    /// keeps the bytes of every other option: a re-encoded `%20` would reach
+    /// tokio-postgres as a `+`. The last `pool_max_size` wins.
+    #[test]
+    fn take_pool_max_size_removes_only_its_option() -> Result<()> {
+        for (config, expected) in [
+            ("postgres://h/db?pool_max_size=4", "postgres://h/db"),
+            (
+                "postgres://h/db?pool_max_size=4&sslmode=require",
+                "postgres://h/db?sslmode=require",
+            ),
+            (
+                "postgres://h/db?sslmode=require&pool_max_size=4&options=-c%20search_path%3Dfoo",
+                "postgres://h/db?sslmode=require&options=-c%20search_path%3Dfoo",
+            ),
+            (
+                "postgres://h/db?options=-c%20search_path%3Dfoo&pool_max_size=4",
+                "postgres://h/db?options=-c%20search_path%3Dfoo",
+            ),
+            (
+                "postgres://h/db?pool_max_size=8&sslmode=require&pool_max_size=4",
+                "postgres://h/db?sslmode=require",
+            ),
+        ] {
+            let mut stripped = config.to_owned();
+            assert_eq!(4, take_pool_max_size(&mut stripped)?, "{config}");
+            assert_eq!(expected, stripped, "{config}");
+        }
+
+        Ok(())
+    }
+
+    /// A URL without `pool_max_size` keeps every byte, and the pool gets
+    /// [`DEFAULT_POOL_MAX_SIZE`].
+    #[test]
+    fn take_pool_max_size_defaults_without_its_option() -> Result<()> {
+        for config in [
+            "postgres://h/db",
+            "postgres://h/db?sslmode=require&options=-c%20search_path%3Dfoo",
+        ] {
+            let mut stripped = config.to_owned();
+            assert_eq!(
+                DEFAULT_POOL_MAX_SIZE,
+                take_pool_max_size(&mut stripped)?,
+                "{config}"
+            );
+            assert_eq!(config, stripped);
+        }
+
+        Ok(())
+    }
+
+    /// Both ends of [`POOL_MAX_SIZE_RANGE`] are accepted.
+    #[test]
+    fn take_pool_max_size_accepts_its_range() -> Result<()> {
+        for size in [*POOL_MAX_SIZE_RANGE.start(), *POOL_MAX_SIZE_RANGE.end()] {
+            let mut config = format!("postgres://h/db?pool_max_size={size}");
+            assert_eq!(size, take_pool_max_size(&mut config)?);
+        }
+
+        Ok(())
+    }
+
     /// Hands out numbered objects, so a test can tell a fresh object from a
     /// recycled one.
     #[derive(Debug, Default)]
@@ -5639,7 +5892,7 @@ mod tests {
         Ok(())
     }
 
-    /// At most `LIST_OFFSETS_READS` ListOffsets reads reach the pool at
+    /// At most `ReadLimits::list_offsets` ListOffsets reads reach the pool at
     /// once; the rest wait for a permit, and the permits come back when the
     /// reads are dropped.
     ///
@@ -5665,7 +5918,7 @@ mod tests {
         };
 
         let topition = Topition::new("limited", 0);
-        let reads = (0..LIST_OFFSETS_READS + 3)
+        let reads = (0..ReadLimits::default().list_offsets + 3)
             .map(|_| {
                 let storage = storage.clone();
                 let topition = topition.clone();
@@ -5682,12 +5935,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         let settled = Instant::now() + Duration::from_secs(5);
-        while storage.pool.status().waiting < LIST_OFFSETS_READS {
+        while storage.pool.status().waiting < ReadLimits::default().list_offsets {
             assert!(Instant::now() < settled, "{:?}", storage.pool.status());
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(LIST_OFFSETS_READS, storage.pool.status().waiting);
+        assert_eq!(
+            ReadLimits::default().list_offsets,
+            storage.pool.status().waiting
+        );
         assert_eq!(0, storage.list_offsets_reads.available_permits());
 
         for read in &reads {
@@ -5703,7 +5959,7 @@ mod tests {
 
         assert_eq!(0, storage.pool.status().waiting);
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5736,7 +5992,7 @@ mod tests {
         let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
         let connection = storage.abandonable_connection(permit).await?;
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5754,7 +6010,7 @@ mod tests {
         // The cancel task holds the permit, so the statement still counts
         // against the limit while it runs.
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5782,7 +6038,7 @@ mod tests {
 
         assert_eq!(2, storage.pool.status().size);
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5909,7 +6165,7 @@ mod tests {
 
         assert_eq!(1, backends_running(&monitor, &marker).await?);
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
         assert_eq!(0, storage.pool.status().available);
@@ -5922,7 +6178,7 @@ mod tests {
         assert_eq!(0, backends_running(&monitor, &marker).await?);
         assert_eq!(2, storage.pool.status().size);
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5958,13 +6214,13 @@ mod tests {
         abandon_sleeping_statement(&storage, &marker).await?;
 
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
         assert_eq!(2, storage.pool.status().size);
 
         wait_until(&storage, |storage| {
-            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+            storage.list_offsets_reads.available_permits() == ReadLimits::default().list_offsets
         })
         .await;
 
@@ -6000,7 +6256,7 @@ mod tests {
         abandon_sleeping_statement(&storage, &marker).await?;
 
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -6014,7 +6270,7 @@ mod tests {
         assert_eq!(1, terminated);
 
         wait_until(&storage, |storage| {
-            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+            storage.list_offsets_reads.available_permits() == ReadLimits::default().list_offsets
         })
         .await;
 
@@ -6025,7 +6281,7 @@ mod tests {
         Ok(())
     }
 
-    /// At most `FETCH_READS` Fetch reads, of records and of offset stages
+    /// At most `ReadLimits::fetch` Fetch reads, of records and of offset stages
     /// alike, reach the pool at once; the rest wait for a permit, and the
     /// permits come back when the reads are dropped.
     ///
@@ -6051,7 +6307,7 @@ mod tests {
         };
 
         let topition = Topition::new("limited", 0);
-        let reads = (0..FETCH_READS + 3)
+        let reads = (0..ReadLimits::default().fetch + 3)
             .map(|read| {
                 let storage = storage.clone();
                 let topition = topition.clone();
@@ -6077,15 +6333,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         let settled = Instant::now() + Duration::from_secs(5);
-        while storage.pool.status().waiting < FETCH_READS {
+        while storage.pool.status().waiting < ReadLimits::default().fetch {
             assert!(Instant::now() < settled, "{:?}", storage.pool.status());
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(FETCH_READS, storage.pool.status().waiting);
+        assert_eq!(ReadLimits::default().fetch, storage.pool.status().waiting);
         assert_eq!(0, storage.fetch_reads.available_permits());
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -6101,7 +6357,10 @@ mod tests {
         }
 
         assert_eq!(0, storage.pool.status().waiting);
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         Ok(())
     }
@@ -6153,7 +6412,7 @@ mod tests {
 
             wait_until(&storage, |storage| {
                 storage.pool.status().size == 0
-                    && storage.fetch_reads.available_permits() == FETCH_READS
+                    && storage.fetch_reads.available_permits() == ReadLimits::default().fetch
             })
             .await;
 
@@ -6240,7 +6499,7 @@ mod tests {
             .map(drop)
     }
 
-    /// More fetches than `FETCH_READS` at once all finish: each fetch reads
+    /// More fetches than `ReadLimits::fetch` at once all finish: each fetch reads
     /// its watermark on the connection it already holds, so no fetch waits
     /// for a second permit while it holds one.
     #[tokio::test]
@@ -6258,7 +6517,7 @@ mod tests {
 
         let topition = topic_with_one_record(&storage, &cluster).await?;
 
-        let fetches = (0..FETCH_READS + 2)
+        let fetches = (0..ReadLimits::default().fetch + 2)
             .map(|_| {
                 let storage = storage.clone();
                 let topition = topition.clone();
@@ -6273,7 +6532,10 @@ mod tests {
                 .map_err(|err| Error::Message(err.to_string()))??;
         }
 
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         Ok(())
     }
@@ -6361,7 +6623,10 @@ mod tests {
         };
 
         assert_eq!(Some(SETTLE_QUERY), last_query.as_deref());
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         lock.rollback().await?;
 
@@ -6421,11 +6686,17 @@ mod tests {
         // instead would not have it back yet.
         fetch_from_start(&storage, &topition).await?;
         assert_eq!(1, storage.pool.status().available);
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         _ = storage.offset_stage(&topition).await?;
         assert_eq!(1, storage.pool.status().available);
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         let fetching = {
             let storage = storage.clone();
@@ -9936,7 +10207,10 @@ mod tests {
             "one read must stop at the row limit, whatever its budget",
         );
 
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         Ok(())
     }
