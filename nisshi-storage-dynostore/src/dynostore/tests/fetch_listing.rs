@@ -112,6 +112,10 @@ impl Listing {
 
     /// Counts, delays and orders the objects of `listing` as this store is
     /// set up to.
+    ///
+    /// The listing panics when it is polled after it ends, as the S3
+    /// store's listing does, so that a test fails for a caller that polls
+    /// a listing again after it ends.
     fn shape(
         &self,
         listing: BoxStream<'static, Result<ObjectMeta, object_store::Error>>,
@@ -143,26 +147,28 @@ impl Listing {
         let delay = Duration::from_millis(self.delay_millis.load(Ordering::SeqCst));
         let listed_batches = self.listed_batches.clone();
 
-        listing
-            .then(move |object| {
-                let listed_batches = listed_batches.clone();
+        stream::unfold(listing, |mut listing| async move {
+            listing.next().await.map(|object| (object, listing))
+        })
+        .then(move |object| {
+            let listed_batches = listed_batches.clone();
 
-                async move {
-                    if object
-                        .as_ref()
-                        .is_ok_and(|meta| meta.location.as_ref().ends_with(".batch"))
-                    {
-                        _ = listed_batches.fetch_add(1, Ordering::SeqCst);
-                    }
-
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-
-                    object
+            async move {
+                if object
+                    .as_ref()
+                    .is_ok_and(|meta| meta.location.as_ref().ends_with(".batch"))
+                {
+                    _ = listed_batches.fetch_add(1, Ordering::SeqCst);
                 }
-            })
-            .boxed()
+
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+
+                object
+            }
+        })
+        .boxed()
     }
 }
 

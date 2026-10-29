@@ -1277,9 +1277,13 @@ impl DynoStore {
         loop {
             let start_offset = offset.saturating_sub(window).max(0);
 
+            // The listing can end inside the loop below and then go on
+            // behind the batches it found. An S3 listing panics when it is
+            // polled after it ends, so the listing is fused.
             let mut listing = self
                 .batch_stream(topition, start_offset)
-                .map_ok(|(base_offset, _)| base_offset);
+                .map_ok(|(base_offset, _)| base_offset)
+                .fuse();
 
             let mut holding = None;
             let mut after_holding = None;
