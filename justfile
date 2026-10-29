@@ -311,16 +311,16 @@ docker-rm-f:
     docker rm --force nisshi
 
 list-topics:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command.properties --list
 
 list-topics-plain:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command-plain.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command-plain.properties --list
 
 list-topics-scram-256:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command-scram-256.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command-scram-256.properties --list
 
 list-topics-scram-512:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command-scram-512.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command-scram-512.properties --list
 
 user-create user password profile mechanism="scram512":
     target/{{ replace(profile, "dev", "debug") }}/nisshi user create {{ user }} {{ password }} --mechanism {{ mechanism }}
@@ -387,10 +387,10 @@ generator topic *args:
     target/debug/nisshi generator {{ args }} {{ topic }} 2>&1 >generator.log
 
 duckdb-k-unnest-v-parquet topic:
-    duckdb -init duckdb-init.sql :memory: "SELECT key,unnest(value) FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
+    duckdb -init etc/duckdb-init.sql :memory: "SELECT key,unnest(value) FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
 
 duckdb-parquet topic:
-    duckdb -init duckdb-init.sql :memory: "SELECT * FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
+    duckdb -init etc/duckdb-init.sql :memory: "SELECT * FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
 
 # create person topic with schema etc/schema/person.json
 person-topic-create: (topic-create "person")
@@ -552,7 +552,7 @@ observation-topic-create: (topic-create "observation")
 observation-duckdb-parquet: (duckdb-k-unnest-v-parquet "observation")
 
 duckdb *sql:
-    duckdb -init duckdb-init.sql -markdown :memory: {{ sql }}
+    duckdb -init etc/duckdb-init.sql -markdown :memory: {{ sql }}
 
 # produce etc/data/trips.json with schema etc/schema/taxi.proto
 taxi-topic-populate: (cat-produce "taxi" "etc/data/trips.json")
