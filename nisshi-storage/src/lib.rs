@@ -221,6 +221,7 @@ pub use latency::LatencyIntroducingStorage;
 pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
+pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
@@ -231,13 +232,13 @@ pub use service::{
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FetchValidationLayer, FetchValidationService, FindCoordinatorService,
-    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
-    MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
-    RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, bounded_channel, describe_groups_response, inflate_produced,
-    list_groups_response,
+    IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
+    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, ProduceService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]

@@ -26,7 +26,10 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     Error, ListOffsetResponse, Result, Storage, Topition,
-    service::deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
+    service::{
+        deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
+        read_share::ListOffsetsReadShare,
+    },
 };
 
 /// How many partitions of one ListOffsets request are read from storage at
@@ -34,7 +37,7 @@ use crate::{
 ///
 /// A storage engine with a connection pool adds its own limit across all
 /// requests, where it can size that limit from the pool.
-const LIST_OFFSETS_CONCURRENCY: usize = 4;
+pub const LIST_OFFSETS_CONCURRENCY: usize = 4;
 
 /// How many partitions each per-request warning of a timeout or a storage
 /// error names.
@@ -235,6 +238,7 @@ where
                 partitions = offsets.len(),
                 reading = count(Missed::Reading),
                 queued = count(Missed::Queued),
+                queued_for_connection_share = count(Missed::QueuedForConnectionShare),
                 not_started = count(Missed::NotStarted),
                 sample = ?&timed_out[..timed_out.len().min(PARTITION_SAMPLE)],
                 "list offsets answered REQUEST_TIMED_OUT for partitions unread at the deadline"
@@ -383,7 +387,9 @@ where
                 );
             }
 
-            let mut offsets = self.list_offsets(isolation_level, &offsets).await;
+            let mut offsets = ListOffsetsReadShare::of(&input.extensions)
+                .scope(self.list_offsets(isolation_level, &offsets))
+                .await;
             debug!(?offsets);
 
             offsets.extend(invalid_timestamps);
@@ -466,7 +472,8 @@ mod tests {
 
     use async_trait::async_trait;
     use nisshi_sans_io::{
-        ConfigResource, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest, ScramMechanism,
+        ConfigResource, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest, RequestInput,
+        ScramMechanism,
         create_topics_request::CreatableTopic,
         delete_groups_response::DeletableGroupResult,
         delete_records_request::DeleteRecordsTopic,
@@ -483,8 +490,11 @@ mod tests {
         to_system_time,
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
-    use rama::Service as _;
-    use tokio::time::{Duration, Instant, timeout};
+    use rama::{Service as _, extensions::Extensions};
+    use tokio::{
+        sync::OwnedSemaphorePermit,
+        time::{Duration, Instant, timeout},
+    };
     use url::Url;
     use uuid::Uuid;
 
@@ -498,6 +508,7 @@ mod tests {
         service::{
             RequestChannelService, bounded_channel,
             deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
+            read_share::ListOffsetsReadShare,
         },
     };
 
@@ -512,6 +523,10 @@ mod tests {
         Offset(i64),
         /// An offset and the timestamp, in milliseconds, of its record.
         OffsetAt(i64, i64),
+        /// An offset, read with a permit from a read share of one permit
+        /// that the read keeps, as an abandoned read keeps its permit until
+        /// its statement ends.
+        OffsetKeepingReadShare(i64),
         Stall,
         Fail,
         FailWith(ErrorCode),
@@ -539,6 +554,7 @@ mod tests {
         partitions: BTreeMap<i32, Answer>,
         calls: Arc<Mutex<Vec<i32>>>,
         dropped: Arc<Mutex<Vec<i32>>>,
+        kept_read_shares: Arc<Mutex<Vec<OwnedSemaphorePermit>>>,
     }
 
     impl Stub {
@@ -612,6 +628,22 @@ mod tests {
                         offset: Some(*offset),
                     },
                 )]),
+
+                Some(Answer::OffsetKeepingReadShare(offset)) => {
+                    let permit = ListOffsetsReadShare::acquire(1).await?.ok_or_else(|| {
+                        Error::Message("the read ran outside a read share".into())
+                    })?;
+                    self.kept_read_shares.lock()?.push(permit);
+
+                    Ok(vec![(
+                        topition.clone(),
+                        ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            timestamp: None,
+                            offset: Some(*offset),
+                        },
+                    )])
+                }
 
                 Some(Answer::Stall) => {
                     let _guard = Dropped {
@@ -862,6 +894,15 @@ mod tests {
         storage: Stub,
         partitions: i32,
     ) -> Result<Vec<ListOffsetsPartitionResponse>> {
+        list_offsets_on_connection(storage, partitions, Extensions::default()).await
+    }
+
+    /// As [`list_offsets`], on the connection that `extensions` belongs to.
+    async fn list_offsets_on_connection(
+        storage: Stub,
+        partitions: i32,
+        extensions: Extensions,
+    ) -> Result<Vec<ListOffsetsPartitionResponse>> {
         let request = ListOffsetsRequest::default()
             .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
             .replica_id(-1)
@@ -880,13 +921,49 @@ mod tests {
                     )),
             ]));
 
-        let response = timeout(HANG, ListOffsetsService { storage }.serve(request))
-            .await
-            .map_err(|_| Error::Message("list offsets hung on a stalled read".into()))??;
+        let response = timeout(
+            HANG,
+            ListOffsetsService { storage }.serve(RequestInput {
+                request,
+                extensions,
+            }),
+        )
+        .await
+        .map_err(|_| Error::Message("list offsets hung on a stalled read".into()))??;
 
         let topics = response.topics.unwrap_or_default();
         assert_eq!(1, topics.len());
         Ok(topics[0].partitions.clone().unwrap_or_default())
+    }
+
+    /// A ListOffsets's reads take their permits from the read share of the
+    /// request's connection. A permit that one request's read keeps then
+    /// holds back the reads of the connection's next request until the
+    /// deadline, and not those of another connection.
+    #[tokio::test(start_paused = true)]
+    async fn requests_on_a_connection_share_its_read_share() -> Result<()> {
+        let storage = Stub::new(&[Answer::OffsetKeepingReadShare(10)]);
+        let listener = Extensions::default();
+        let connection = listener.fork();
+
+        assert_eq!(
+            vec![(0, ErrorCode::None, Some(10))],
+            answers(&list_offsets_on_connection(storage.clone(), 1, connection.clone()).await?)?
+        );
+
+        let started_at = Instant::now();
+        assert_eq!(
+            vec![(0, ErrorCode::RequestTimedOut, Some(-1))],
+            answers(&list_offsets_on_connection(storage.clone(), 1, connection).await?)?
+        );
+        assert_eq!(LIST_OFFSETS_READ_DEADLINE, started_at.elapsed());
+
+        assert_eq!(
+            vec![(0, ErrorCode::None, Some(10))],
+            answers(&list_offsets_on_connection(storage, 1, listener.fork()).await?)?
+        );
+
+        Ok(())
     }
 
     fn answers(
