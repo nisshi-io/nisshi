@@ -25,3 +25,23 @@ pub fn is_valid_topic_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
+
+/// Returns whether `name` has a collision character: a period or an underscore.
+///
+/// Kafka maps '.' to '_' in per-topic metric names, so two topic names that differ only in these
+/// characters share their metrics ([`Topic.hasCollisionChars`]).
+///
+/// [`Topic.hasCollisionChars`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/internals/Topic.java#L81-L89
+pub fn has_collision_chars(name: &str) -> bool {
+    name.contains(['.', '_'])
+}
+
+/// Returns `name` with its collision characters unified: each '.' replaced with '_'.
+///
+/// Two names collide when their unified names are equal ([`Topic.unifyCollisionChars`]). The
+/// unified name is only for that comparison, and never names a topic.
+///
+/// [`Topic.unifyCollisionChars`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/internals/Topic.java#L91-L100
+pub fn unify_collision_chars(name: &str) -> String {
+    name.replace('.', "_")
+}

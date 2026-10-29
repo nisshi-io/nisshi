@@ -29,7 +29,6 @@ use nisshi_sans_io::{
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::{
-        Record,
         deflated::{self, Frame},
         inflated,
     },
@@ -636,41 +635,33 @@ impl IntoIterator for PartitionBatch {
 fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error> {
     debug!(len = ?batches.len());
 
-    if batches.len() >= 2 {
-        let mut i = batches.into_iter();
-
-        if let Some(first) = i.next() {
-            let mut sink = inflated::Batch::try_from(first)?;
-
-            for batch in i {
-                let batch = inflated::Batch::try_from(batch)?;
-
-                sink.records.append(
-                    &mut batch
-                        .records
-                        .into_iter()
-                        .map(|record| Record {
-                            offset_delta: record.offset_delta + sink.last_offset_delta + 1,
-                            timestamp_delta: record.timestamp_delta
-                                + (batch.base_timestamp - sink.base_timestamp),
-                            ..record
-                        })
-                        .collect::<Vec<_>>(),
-                );
-
-                sink.last_offset_delta += batch.last_offset_delta + 1;
-                sink.max_timestamp = sink.max_timestamp.max(batch.max_timestamp);
-            }
-
-            deflated::Batch::try_from(sink)
-                .map(|batch| vec![batch])
-                .map_err(Into::into)
-        } else {
-            unreachable!()
-        }
-    } else {
-        Ok(batches)
+    if batches.len() < 2 {
+        return Ok(batches);
     }
+
+    // A clone of a batch shares its record bytes, so keeping the batches as sent costs no copy.
+    let batches_as_sent = batches.clone();
+
+    let mut i = batches.into_iter();
+
+    let Some(first) = i.next() else {
+        return Ok(Vec::new());
+    };
+
+    let mut sink = inflated::Batch::try_from(first)?;
+
+    for batch in i {
+        match sink.append_rebased(inflated::Batch::try_from(batch)?) {
+            // An offset delta of the merged batch overflows an `i32`. Kafka checks and stores each
+            // batch as sent, and each one may be valid, so we forward each one.
+            Err(nisshi_sans_io::Error::OffsetDeltaOverflow(_)) => return Ok(batches_as_sent),
+            appended => appended?,
+        }
+    }
+
+    deflated::Batch::try_from(sink)
+        .map(|batch| vec![batch])
+        .map_err(Into::into)
 }
 
 #[derive(Clone)]
@@ -912,6 +903,26 @@ mod tests {
                 .map(|record| record.offset_delta)
                 .collect::<Vec<_>>()
         );
+
+        Ok(())
+    }
+
+    /// A record offset delta of the second batch overflows once that batch is appended to the
+    /// first, so `combine` returns both batches as sent, for Kafka to check each one.
+    #[test]
+    fn combine_returns_the_batches_as_sent_when_an_offset_delta_overflows() -> Result<(), Error> {
+        let batch_with_maximum_offset_delta = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .offset_delta(i32::MAX)
+                    .value(Bytes::from_static(b"b").into()),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let batches = vec![record_data_batch(b"a")?, batch_with_maximum_offset_delta];
+
+        assert_eq!(batches, combine(batches.clone())?);
 
         Ok(())
     }

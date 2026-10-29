@@ -845,7 +845,7 @@ where
         &self,
         max_wait: Duration,
         min_bytes: u32,
-        max_bytes: &mut u32,
+        max_bytes: u32,
         isolation: IsolationLevel,
         topics: &[FetchTopic],
     ) -> Result<Vec<FetchableTopicResponse>> {
@@ -861,14 +861,23 @@ where
             let mut responses = vec![];
             let mut iteration = 0;
             let mut bytes = 0;
-            let mut is_first_non_empty = true;
 
-            while !max_wait.saturating_sub(started_at.elapsed()).is_zero() && bytes <= min_bytes {
+            while !max_wait.saturating_sub(started_at.elapsed()).is_zero() {
                 debug!(?bytes, remaining = ?max_wait.saturating_sub(started_at.elapsed()));
 
                 responses.clear();
 
-                // Every round reads every partition again
+                // Every round reads every partition again from its fetch
+                // offset, and answers with only its own records. So each
+                // round starts with the whole `max_bytes`, and only its own
+                // bytes count toward `min_bytes`. Kafka also counts the bytes
+                // available at each check, not a sum over the checks
+                // ([DelayedFetch.scala]).
+                //
+                // [DelayedFetch.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L74-L148
+                let mut round_max_bytes = max_bytes;
+                let mut is_first_non_empty = true;
+
                 let mut left = topics
                     .iter()
                     .map(|topic| topic.partitions.as_ref().map_or(0, Vec::len))
@@ -881,7 +890,7 @@ where
                             deadlines,
                             &mut left,
                             min_bytes,
-                            max_bytes,
+                            &mut round_max_bytes,
                             isolation,
                             fetch,
                             &mut is_first_non_empty,
@@ -891,13 +900,17 @@ where
                     responses.push(fetch_response);
                 }
 
-                bytes += u32::try_from(responses.byte_size())?;
+                bytes = u32::try_from(responses.byte_size())?;
 
                 let remaining = max_wait.saturating_sub(started_at.elapsed());
 
                 debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
 
-                if bytes > min_bytes {
+                // Kafka answers once the bytes reach `min_bytes`
+                // ([DelayedFetch.scala#L147]).
+                //
+                // [DelayedFetch.scala#L147]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L147
+                if bytes >= min_bytes {
                     break;
                 }
 
@@ -971,13 +984,13 @@ where
     type Error = Error;
 
     #[instrument(skip(self, request))]
-    async fn serve(&self, mut request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
+    async fn serve(&self, request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
         let started_at = Instant::now();
 
         self.fetch(
             request.max_wait,
             request.min_bytes,
-            &mut request.max_bytes,
+            request.max_bytes,
             request.isolation_level,
             &request.topics,
         )
@@ -2403,6 +2416,78 @@ mod tests {
         assert_eq!(second_round + (READ_DEADLINE - second_round) / 2, elapsed);
 
         assert_eq!(0, batches(&partitions[0]));
+        assert_eq!(1, batches(&partitions[1]));
+
+        Ok(())
+    }
+
+    /// Every round of the long poll reads the partitions again as the first
+    /// round does: the first partition with the whole `max_bytes`, and the
+    /// others with their `partition_max_bytes`. Only the round's own bytes
+    /// count toward `min_bytes`. Each round reads the same records again, so
+    /// `max_bytes` spent by the rounds before would leave the last round with
+    /// nothing to return, and a sum over the rounds would meet `min_bytes`
+    /// with the same records counted more than once.
+    #[tokio::test(start_paused = true)]
+    async fn every_round_reads_as_the_first() -> Result<()> {
+        const PARTITION_MAX_BYTES: i32 = 1024;
+
+        let record_batch = batch(0, &[0])?;
+        let round_bytes = 2 * u32::try_from(record_batch.record_data.len())?;
+
+        // Each round reads a batch from each partition, then reads nothing
+        // from the next offset. The script holds more rounds than the long
+        // poll can take within `MAX_WAIT`.
+        let script = (0..64)
+            .flat_map(|_| [Read::Batch(record_batch.clone()), Read::Empty])
+            .collect::<Vec<_>>();
+        let storage = Partitions::new([(0, script.clone()), (1, script)]);
+
+        let responses = FetchService {
+            storage: storage.clone(),
+        }
+        .fetch(
+            MAX_WAIT,
+            round_bytes + 1,
+            u32::try_from(MAX_BYTES)?,
+            IsolationLevel::ReadUncommitted,
+            &[FetchTopic::default()
+                .topic(Some(TOPIC.into()))
+                .partitions(Some(
+                    (0..2)
+                        .map(|partition| {
+                            FetchPartition::default()
+                                .partition(partition)
+                                .fetch_offset(0)
+                                .partition_max_bytes(PARTITION_MAX_BYTES)
+                        })
+                        .collect(),
+                ))],
+        )
+        .await?;
+
+        for (partition, round_max_bytes) in [(0, MAX_BYTES), (1, PARTITION_MAX_BYTES)] {
+            let calls = storage.calls(partition);
+            assert!(
+                calls.len() > 4,
+                "the long poll stopped after two rounds: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .step_by(2)
+                    .all(|call| i64::from(call.max_bytes) == i64::from(round_max_bytes)),
+                "a round read partition {partition} with other than {round_max_bytes} bytes: \
+                 {calls:?}"
+            );
+        }
+
+        let partitions = responses
+            .into_iter()
+            .flat_map(|topic| topic.partitions.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(2, partitions.len());
+        assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1, batches(&partitions[1]));
 
         Ok(())

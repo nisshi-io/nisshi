@@ -194,7 +194,9 @@ async fn group_with_only_committed_offsets_is_empty(storage: impl Storage + Clon
 /// A group whose consumers stopped without sending `LeaveGroup` must be described as `Empty` once
 /// their sessions expire, as Kafka describes it, so that tools that need an empty group, such as
 /// an offset reset, accept it. The broker must remove each member whose session has expired before
-/// it describes the group, also when no member has sent a request since.
+/// it describes the group, also when no member has sent a request since. The broker answers no
+/// protocol for the group, as Kafka does: Kafka forgets the protocol when the group becomes
+/// `Empty`, and answers a protocol only for a `Stable` group.
 async fn group_whose_sessions_expired_is_described_as_empty(
     storage: impl Storage + Clone,
 ) -> Result<()> {
@@ -232,6 +234,7 @@ async fn group_whose_sessions_expired_is_described_as_empty(
     let groups = describe(storage, &[group_id], false).await?;
     assert_eq!(1, groups.len());
     assert_eq!("Empty", groups[0].group_state);
+    assert_eq!("", groups[0].protocol_data);
     assert_eq!(Some(vec![]), groups[0].members);
 
     Ok(())
