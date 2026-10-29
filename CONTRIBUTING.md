@@ -49,7 +49,12 @@ just ci                # start postgres, minio, and lakehouse via docker compose
 just                   # fmt, build, test, clippy
 ```
 
-See `CLAUDE.md` at the repo root for the full command reference and
+Without Docker, `just test-fast` runs every test that needs no Postgres,
+MinIO or Iceberg catalog, and `just test-doc` runs the doc tests. Run the full
+suite with `just ci` and `just test` before you ask for review; CI runs it on
+every pull request.
+
+See `AGENTS.md` at the repo root for the full command reference and
 architecture overview.
 
 ## Making a change

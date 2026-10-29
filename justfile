@@ -75,6 +75,9 @@ test: test-workspace test-doc
 
 test-workspace *args: (nextest "run" "--workspace" "--all-targets" "--all-features" "--no-fail-fast" "--exclude" "fuzz" "--exclude" "nisshi-smoke-test" args)
 
+# the tests that need no docker compose service (no Postgres, MinIO or Iceberg catalog)
+test-fast *args: (test-workspace "--profile" "fast" args)
+
 nextest *args:
     cargo nextest {{ args }}
 
