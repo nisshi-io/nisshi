@@ -55,8 +55,10 @@ architecture overview.
 In a linked git worktree, the tests start the worktree's own services
 (`etc/worktree-services.sh`) on ports that Docker picks, and write those ports
 to the worktree's `.env`, so several worktrees can run their tests at once.
-`just services-down` removes a worktree's services, and
-`just services-prune` removes those of each worktree that is gone.
+This needs Docker, `jq` and `curl`. `just services-down` removes a
+worktree's services, and `just services-prune` removes those of each
+worktree that is gone. Set `NISSHI_WORKTREE_SERVICES=0` to use the default
+project's services from a worktree instead.
 
 ### Local services on macOS (colima)
 

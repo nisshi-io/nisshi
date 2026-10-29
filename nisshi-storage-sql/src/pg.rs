@@ -5577,8 +5577,12 @@ mod tests {
     use std::assert_matches;
     use tokio::task::JoinHandle;
 
-    // mirrors nisshi-broker/tests/it/common/mod.rs storage_container(StorageType::Postgres)
-    const CONNECTION: &str = "postgres://postgres:postgres@localhost";
+    /// The PostgreSQL server that the tests use: `NISSHI_TEST_DATABASE_URL`, or else the `db`
+    /// service of compose.yaml on its default port.
+    static CONNECTION: LazyLock<String> = LazyLock::new(|| {
+        std::env::var("NISSHI_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| String::from("postgres://postgres:postgres@localhost"))
+    });
 
     fn alphanumeric_string(length: usize) -> String {
         rng()
@@ -5716,7 +5720,7 @@ mod tests {
     /// `statement_timeout`: the default, or an operator's own in the URL.
     #[test]
     fn abandoned_statement_bound_follows_the_statement_timeout() -> Result<()> {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster("default")
             .node(0)
             .build();
@@ -5726,7 +5730,8 @@ mod tests {
         );
 
         let storage = Postgres::builder(&format!(
-            "{CONNECTION}?options=-c%20statement_timeout%3D120000"
+            "{}?options=-c%20statement_timeout%3D120000",
+            *CONNECTION
         ))?
         .cluster("longer")
         .node(0)
@@ -5746,7 +5751,7 @@ mod tests {
     /// connect.
     #[test]
     fn pool_builds_with_configured_timeouts() -> Result<()> {
-        let builder = Postgres::builder(CONNECTION)?;
+        let builder = Postgres::builder(&CONNECTION)?;
 
         let timeouts = builder.pool.timeouts();
         assert_eq!(timeouts.wait, Some(DEFAULT_POOL_WAIT_TIMEOUT));
@@ -5760,7 +5765,7 @@ mod tests {
     /// error names the option.
     #[test]
     fn unrecognized_query_option_rejected_without_connecting() {
-        let error = Postgres::builder(&format!("{CONNECTION}?vacuum_into=/tmp/does-not-matter"))
+        let error = Postgres::builder(&format!("{}?vacuum_into=/tmp/does-not-matter", *CONNECTION))
             .expect_err("an option that tokio-postgres does not read must be rejected");
 
         assert!(error.to_string().contains("vacuum_into"), "{error}");
@@ -5770,7 +5775,7 @@ mod tests {
     /// each kind of read takes half of them.
     #[test]
     fn pool_max_size_defaults_to_sixteen() -> Result<()> {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster("default")
             .node(0)
             .build();
@@ -5789,7 +5794,8 @@ mod tests {
     fn pool_max_size_sets_the_pool_and_its_read_limits() -> Result<()> {
         for (pool_max_size, read_limit) in [(32, 16), (33, 16), (2, 1)] {
             let storage = Postgres::builder(&format!(
-                "{CONNECTION}?options=-c%20statement_timeout%3D120000&pool_max_size={pool_max_size}"
+                "{}?options=-c%20statement_timeout%3D120000&pool_max_size={pool_max_size}",
+                *CONNECTION
             ))?
             .cluster("sized")
             .node(0)
@@ -5820,7 +5826,7 @@ mod tests {
             (64, LIST_OFFSETS_CONCURRENCY, 2),
         ] {
             let storage =
-                Postgres::builder(&format!("{CONNECTION}?pool_max_size={pool_max_size}"))?
+                Postgres::builder(&format!("{}?pool_max_size={pool_max_size}", *CONNECTION))?
                     .cluster("shared")
                     .node(0)
                     .build();
@@ -5862,8 +5868,8 @@ mod tests {
             "262144",
             "18446744073709551616",
         ] {
-            let error =
-                Postgres::builder(&format!("{CONNECTION}?pool_max_size={value}")).expect_err(value);
+            let error = Postgres::builder(&format!("{}?pool_max_size={value}", *CONNECTION))
+                .expect_err(value);
 
             assert_matches!(
                 &error,
@@ -5882,7 +5888,8 @@ mod tests {
     #[test]
     fn pool_max_size_rejects_an_invalid_earlier_occurrence() {
         let error = Postgres::builder(&format!(
-            "{CONNECTION}?pool_max_size=banana&pool_max_size=4"
+            "{}?pool_max_size=banana&pool_max_size=4",
+            *CONNECTION
         ))
         .expect_err("an invalid pool_max_size must be rejected");
 
@@ -6078,7 +6085,7 @@ mod tests {
     /// without a server.
     fn storage_without_connections() -> Result<Postgres> {
         let pool = Pool::builder(Manager::new(
-            Config::from_str(CONNECTION)?,
+            Config::from_str(&CONNECTION)?,
             tokio_postgres::NoTls,
         ))
         .max_size(0)
@@ -6088,7 +6095,7 @@ mod tests {
 
         Ok(Postgres {
             pool,
-            ..Postgres::builder(CONNECTION)?
+            ..Postgres::builder(&CONNECTION)?
                 .cluster(alphanumeric_string(15).as_str())
                 .node(rng().random_range(0..i32::MAX))
                 .build()
@@ -6242,7 +6249,7 @@ mod tests {
     /// read goes ahead.
     #[tokio::test]
     async fn abandoned_fetch_reads_count_against_their_connection() -> Result<()> {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(alphanumeric_string(15).as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -6378,7 +6385,7 @@ mod tests {
     /// permit.
     #[tokio::test]
     async fn abandoned_statement_is_cancelled_and_its_connection_returned() -> Result<()> {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(alphanumeric_string(15).as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -6554,7 +6561,7 @@ mod tests {
     #[tokio::test]
     async fn abandoned_statement_outliving_its_cancel_keeps_its_connection_and_permit() -> Result<()>
     {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(alphanumeric_string(15).as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -6602,7 +6609,7 @@ mod tests {
     /// runs on until the statement ends.
     #[tokio::test]
     async fn abandoned_statement_still_running_at_the_bound_loses_its_connection() -> Result<()> {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(alphanumeric_string(15).as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -6650,7 +6657,7 @@ mod tests {
     /// out of the pool, and its permit comes back.
     #[tokio::test]
     async fn abandoned_statement_whose_connection_fails_loses_it() -> Result<()> {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(alphanumeric_string(15).as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -6773,7 +6780,7 @@ mod tests {
     /// tokio-postgres queues for a dropped `Transaction`.
     #[tokio::test]
     async fn abandoned_read_left_inside_a_transaction_loses_its_connection() -> Result<()> {
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(alphanumeric_string(15).as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -6904,7 +6911,7 @@ mod tests {
     #[tokio::test]
     async fn fetches_beyond_the_limit_all_finish() -> Result<()> {
         let cluster = alphanumeric_string(15);
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(cluster.as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -7040,14 +7047,16 @@ mod tests {
     ) -> Result<Option<(Postgres, Postgres, String)>> {
         let application_name = format!("abandoned_read_{}", alphanumeric_string(15));
 
-        let storage =
-            Postgres::builder(&format!("{CONNECTION}?application_name={application_name}"))?
-                .cluster(cluster)
-                .node(rng().random_range(0..i32::MAX))
-                .build();
+        let storage = Postgres::builder(&format!(
+            "{}?application_name={application_name}",
+            *CONNECTION
+        ))?
+        .cluster(cluster)
+        .node(rng().random_range(0..i32::MAX))
+        .build();
         storage.pool.resize(1);
 
-        let monitor = Postgres::builder(CONNECTION)?
+        let monitor = Postgres::builder(&CONNECTION)?
             .cluster(cluster)
             .node(0)
             .build();
@@ -7207,7 +7216,8 @@ mod tests {
         let cluster = alphanumeric_string(15);
 
         let storage = Postgres::builder(&format!(
-            "{CONNECTION}?options=-c%20statement_timeout%3D100"
+            "{}?options=-c%20statement_timeout%3D100",
+            *CONNECTION
         ))?
         .cluster(cluster.as_str())
         .node(rng().random_range(0..i32::MAX))
@@ -7272,7 +7282,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "maintenance_sweeps_are_exempt_from_statement_timeout",
-            &format!("{CONNECTION}?options=-c%20statement_timeout%3D100"),
+            &format!("{}?options=-c%20statement_timeout%3D100", *CONNECTION),
             &cluster,
         )
         .await?
@@ -7304,7 +7314,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "maintain_removes_records_left_below_log_start",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -7410,7 +7420,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "read_committed_last_stable_offset_pinned_by_open_transaction",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -7502,7 +7512,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "maintain_transactions_aborts_timed_out_transaction",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -7604,7 +7614,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "maintain_transactions_leaves_transaction_before_timeout",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -7706,7 +7716,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "maintain_transactions_defers_when_older_overlapping_transaction_still_open",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -7844,7 +7854,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "txn_end_after_already_finalized_is_a_no_op",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -7959,7 +7969,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "deferred_txn_end_retry_does_not_duplicate_marker",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -8116,7 +8126,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "late_commit_after_sweep_abort_is_rejected",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -8249,7 +8259,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "txn_end_scopes_bookkeeping_delete_to_its_own_epoch",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -8463,7 +8473,7 @@ mod tests {
         let cluster = alphanumeric_string(15);
 
         let Some(storage) =
-            storage_with_schema("race_concurrent_commit_and_abort", CONNECTION, &cluster).await?
+            storage_with_schema("race_concurrent_commit_and_abort", &CONNECTION, &cluster).await?
         else {
             return Ok(());
         };
@@ -8596,7 +8606,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "sweep_fenced_producer_zombie_produce_is_rejected",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -8707,7 +8717,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "sweep_fenced_producer_can_reconnect_and_produce_normally",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -8837,7 +8847,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "txn_end_for_unknown_producer_is_unknown_producer_id",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -8874,7 +8884,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "txn_end_with_future_epoch_is_invalid_producer_epoch",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -8916,7 +8926,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "sweep_abort_retry_is_fenced_and_does_not_double_bump",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -9082,7 +9092,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "init_producer_old_api_version_is_treated_as_fresh",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -9119,7 +9129,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "init_producer_recovery_with_current_epoch_succeeds",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -9172,7 +9182,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "init_producer_recovery_with_stale_epoch_is_fenced",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -9227,7 +9237,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "init_producer_recovery_after_sweep_is_fenced",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -9323,7 +9333,7 @@ mod tests {
     async fn storage_with_topic(test: &str) -> Result<Option<(Postgres, Topition)>> {
         let cluster = alphanumeric_string(15);
 
-        let Some(storage) = storage_with_schema(test, CONNECTION, &cluster).await? else {
+        let Some(storage) = storage_with_schema(test, &CONNECTION, &cluster).await? else {
             return Ok(None);
         };
 
@@ -9858,7 +9868,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "init_producer_concurrent_claims_bump_once",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -9945,7 +9955,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "init_producer_malformed_partial_fields_is_rejected",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -9982,7 +9992,7 @@ mod tests {
         let cluster = alphanumeric_string(15);
 
         let Some(storage) =
-            storage_with_schema("txn_add_partitions_is_idempotent", CONNECTION, &cluster).await?
+            storage_with_schema("txn_add_partitions_is_idempotent", &CONNECTION, &cluster).await?
         else {
             return Ok(());
         };
@@ -10060,7 +10070,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "fetch_serves_committed_records_despite_concurrent_transaction",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -10164,7 +10174,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "create_topic_writes_the_watermark_when_only_its_statement_is_cached",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -10226,7 +10236,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "delete_topic_leaves_the_other_topics_in_the_cluster_intact",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -10331,7 +10341,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "headers_keep_produce_order_and_allow_repeated_keys",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
@@ -10439,7 +10449,7 @@ mod tests {
     async fn storage_with_empty_topic() -> Result<Option<(Postgres, Topition)>> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(CONNECTION)?
+        let storage = Postgres::builder(&CONNECTION)?
             .cluster(cluster.as_str())
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -11100,7 +11110,7 @@ mod tests {
     impl EmptyDatabase {
         /// Creates the database. Returns `None` when the server isn't reachable.
         async fn create(test: &str) -> Result<Option<Self>> {
-            let admin = Postgres::builder(CONNECTION)?
+            let admin = Postgres::builder(&CONNECTION)?
                 .cluster(alphanumeric_string(15).as_str())
                 .node(0)
                 .build();
@@ -11120,7 +11130,7 @@ mod tests {
         }
 
         fn url(&self) -> Result<Url> {
-            let mut url = Url::parse(CONNECTION)?;
+            let mut url = Url::parse(&CONNECTION)?;
             url.set_path(&self.name);
             Ok(url)
         }
@@ -11654,7 +11664,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "describe_groups_answers_unknown_server_error_for_an_undecodable_group",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?

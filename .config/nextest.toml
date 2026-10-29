@@ -12,6 +12,9 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # nothing, and the tests use the services that `just ci` started.
 [scripts.setup.worktree-services]
 command = "etc/worktree-services.sh up"
+# A cold start of the services on a loaded machine takes minutes, and a start
+# still running after 10 minutes is killed instead of holding the run.
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.scripts]]
 filter = "package(nisshi-broker) | package(nisshi-storage-sql) | package(nisshi-schema)"

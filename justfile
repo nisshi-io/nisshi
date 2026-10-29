@@ -284,6 +284,15 @@ docker-compose-up *args:
     docker compose --ansi never --progress plain up --no-color --quiet-pull --wait --detach {{ args }}
 
 docker-compose-down *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Before services-up has written COMPOSE_PROJECT_NAME to .env, a worktree's
+    # compose commands act on the default project, which the main checkout and
+    # other worktrees use, so this recipe refuses to remove it.
+    if [[ {{ worktree_services }} == true && "${COMPOSE_PROJECT_NAME:-}" != nisshi-wt-* ]]; then
+        echo "docker-compose-down: run 'just services-up' first, so that this removes this worktree's services and not the default project's" >&2
+        exit 1
+    fi
     docker compose down --remove-orphans --volumes {{ args }}
 
 ps:
@@ -542,7 +551,7 @@ ci-default-project: docker-compose-down db-up minio-up minio-ready-local minio-l
 # true in a linked worktree outside CI, where the services run in the
 # worktree's own compose project (etc/worktree-services.sh), so that `ci`,
 # `broker` and `server` never remove the services that other worktrees use
-worktree_services := if env("CI", "") != "" { "false" } else if `git rev-parse --path-format=absolute --git-dir` == `git rev-parse --path-format=absolute --git-common-dir` { "false" } else { "true" }
+worktree_services := if env("CI", "") != "" { "false" } else if env("NISSHI_WORKTREE_SERVICES", "") == "0" { "false" } else if `git rev-parse --path-format=absolute --git-dir` == `git rev-parse --path-format=absolute --git-common-dir` { "false" } else { "true" }
 
 # start this worktree's services and write their ports to .env (does nothing in the main checkout)
 services-up:

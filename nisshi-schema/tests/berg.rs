@@ -127,11 +127,18 @@ async fn lake_store_with_catalog(
     // The namespace is removed before the caller checks the results, so a
     // test that fails leaves no namespace behind either. A store that failed
     // can fail before it creates the namespace.
-    if catalog.namespace_exists(&namespace_ident).await? {
-        drop_namespace_with_tables(catalog.as_ref(), &namespace_ident).await?;
+    let cleanup = async {
+        if catalog.namespace_exists(&namespace_ident).await? {
+            drop_namespace_with_tables(catalog.as_ref(), &namespace_ident).await?;
+        }
+        Ok::<_, Error>(())
     }
+    .await
+    .inspect_err(|err| debug!(?err, "cleanup"));
 
-    results
+    // The store's or the query's error is the one that explains a failed test,
+    // so it wins over an error of the cleanup.
+    results.and_then(|results| cleanup.map(|()| results))
 }
 
 /// Removes the namespace and purges each of its tables, so that the catalog
@@ -3575,8 +3582,20 @@ mod catalog_connections {
         let beside_others = others.and(beside_others)?;
 
         debug!(alone, beside_others);
-        assert!(alone <= 10, "{alone} connections to the catalog");
-        assert_eq!(alone, beside_others);
+        // The store and the read each connect at least once, so a lower count
+        // means that they reached the catalog without the forwarder, and the
+        // test counted nothing.
+        assert!(
+            (2..=10).contains(&alone),
+            "{alone} connections to the catalog"
+        );
+        // A client can reconnect when the catalog closes an idle connection,
+        // so the counts may differ by a connection or two. Loading every
+        // table of the 20 namespaces would add 20.
+        assert!(
+            beside_others <= alone + 2,
+            "{alone} connections alone, {beside_others} beside 20 other tables"
+        );
 
         Ok(())
     }
