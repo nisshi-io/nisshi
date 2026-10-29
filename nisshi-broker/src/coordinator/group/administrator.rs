@@ -1369,12 +1369,12 @@ where
             group_instance_id,
             retention_time_ms: None,
             topics: None,
+            is_transactional: true,
         };
 
         loop {
-            // As `offset_commit` does: against the group in storage, and a member's accepted
-            // commit refreshes its contact. The offsets are not stored here, so a lost write
-            // only means the fence is checked again.
+            // As `offset_commit` does: against the group in storage. The offsets are not stored
+            // here, so a lost write only means the fence is checked again.
             let (original, version) = self.stored_group(group_id).await?;
             let now = SystemTime::now();
 
@@ -2450,7 +2450,8 @@ where
     /// generation or a member, from a simple consumer or an admin client, needs an empty
     /// group. Any other commit must come from a member in the group's current generation. A
     /// member that commits while the group waits for the leader's assignment gets
-    /// `REBALANCE_IN_PROGRESS`.
+    /// `REBALANCE_IN_PROGRESS`, unless the commit is transactional, which Kafka does not hold
+    /// to the group's state.
     ///
     /// [`validateOffsetCommit`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java#L825
     #[instrument(skip(self, now, detail), fields(generation_id = detail.generation_id_or_member_epoch, member_id = detail.member_id))]
@@ -2479,11 +2480,13 @@ where
             return Some(ErrorCode::UnknownMemberId);
         }
 
-        if is_completing_rebalance {
+        if is_completing_rebalance && !detail.is_transactional {
             return Some(ErrorCode::RebalanceInProgress);
         }
 
-        if let Some(member) = self.members.get_mut(member_id) {
+        if !detail.is_transactional
+            && let Some(member) = self.members.get_mut(member_id)
+        {
             member.last_contact = Some(now);
         }
 

@@ -342,6 +342,34 @@ async fn without_member_fields(storage_type: StorageType) -> Result<()> {
     Ok(())
 }
 
+/// A transactional commit is not refused while the group waits for its leader's assignment, where
+/// an `OffsetCommit` gets REBALANCE_IN_PROGRESS: Kafka does not hold a transactional commit to the
+/// group's state, and the Java producer treats that error as fatal.
+async fn group_completing_rebalance(storage_type: StorageType) -> Result<()> {
+    let mut fixture = Fixture::new(storage_type).await?;
+
+    // The member joins and does not sync, so the group waits for the leader's assignment.
+    let member = join(
+        &mut fixture.broker,
+        &fixture.group,
+        None,
+        None,
+        None,
+        SESSION_TIMEOUT_MS,
+        Some(REBALANCE_TIMEOUT_MS),
+    )
+    .await?;
+
+    assert_eq!(
+        vec![ErrorCode::None],
+        fixture
+            .commit(3, member.generation(), member.id(), None)
+            .await?
+    );
+
+    Ok(())
+}
+
 macro_rules! engine_tests {
     ($engine:ident, $storage_type:expr) => {
         mod $engine {
@@ -369,6 +397,12 @@ macro_rules! engine_tests {
             async fn current_member() -> Result<()> {
                 let _guard = crate::common::init_tracing()?;
                 super::current_member($storage_type).await
+            }
+
+            #[tokio::test]
+            async fn group_completing_rebalance() -> Result<()> {
+                let _guard = crate::common::init_tracing()?;
+                super::group_completing_rebalance($storage_type).await
             }
 
             #[tokio::test]

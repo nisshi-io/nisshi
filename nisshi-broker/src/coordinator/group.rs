@@ -34,6 +34,10 @@ pub struct OffsetCommit<'a> {
     pub group_instance_id: Option<&'a str>,
     pub retention_time_ms: Option<i64>,
     pub topics: Option<&'a [OffsetCommitRequestTopic]>,
+    /// Whether this is the group check of a `TxnOffsetCommit`, which Kafka does not hold to the
+    /// group's state: a group that waits for its leader's assignment does not refuse it, and
+    /// it is not a contact from the member.
+    pub is_transactional: bool,
 }
 
 #[async_trait]
