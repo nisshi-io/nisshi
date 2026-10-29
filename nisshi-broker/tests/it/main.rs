@@ -32,6 +32,7 @@ pub mod delete_records;
 pub mod delete_topics;
 pub mod describe_cluster;
 pub mod describe_configs;
+pub mod describe_configs_topic_defaults;
 pub mod describe_groups;
 pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;
@@ -70,6 +71,8 @@ pub mod produce_crc;
 pub mod produce_fetch;
 pub mod produce_idempotent_duplicate;
 pub mod produce_idempotent_epoch_bump;
+#[cfg(feature = "postgres")]
+pub mod produce_idempotent_race;
 pub mod produce_invalid_acks;
 pub mod produce_invalid_record;
 pub mod produce_max_message_bytes;

@@ -64,9 +64,10 @@ Sweeps of the librdkafka integration test suite against
 4. **OffsetCommit `metadata` is not round-tripped** — committed metadata
    comes back empty from OffsetFetch (0099, 0140).
 
-5. **DescribeConfigs returns no config entries** — topics report zero
-   ConfigEntry rows where Kafka reports every config with its default
-   (0092 via AlterConfigs read-modify-write).
+5. **AlterConfigs is not implemented** — 0092 reads a topic's configs
+   with DescribeConfigs and writes them back with AlterConfigs. DescribeConfigs
+   now lists every topic config with its default, as Kafka does, but the
+   broker does not implement AlterConfigs.
 
 6. **Transactions are refused** — nisshi answers InitProducerId with a
    `transactional.id` with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, so

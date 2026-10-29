@@ -16,7 +16,8 @@ use std::collections::BTreeSet;
 
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, RequestInput,
-    create_topics_request::CreatableTopic, topic::is_valid_topic_name,
+    create_topics_request::CreatableTopic, create_topics_response::CreatableTopicResult,
+    topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
@@ -170,18 +171,8 @@ where
 
             let mut created = false;
 
-            for result in results {
-                match ErrorCode::try_from(result.error_code) {
-                    Ok(ErrorCode::None) => {
-                        info!(topic = %result.name, num_partitions = ?result.num_partitions, "auto-created topic");
-                        created = true;
-                    }
-
-                    // concurrent metadata requests can race to create
-                    Ok(ErrorCode::TopicAlreadyExists) => created = true,
-
-                    _ => debug!(?result, "not auto-creating topic"),
-                }
+            for result in &results {
+                created |= topic_exists_after(result);
             }
 
             if created {
@@ -226,5 +217,118 @@ where
             .controller_id(controller_id)
             .topics(topics)
             .cluster_authorized_operations(cluster_authorized_operations))
+    }
+}
+
+/// Logs the result of auto-creating one topic, and returns whether the topic exists afterwards.
+fn topic_exists_after(result: &CreatableTopicResult) -> bool {
+    match ErrorCode::try_from(result.error_code) {
+        Ok(ErrorCode::None) => {
+            info!(topic = %result.name, num_partitions = ?result.num_partitions, "auto-created topic");
+            true
+        }
+
+        // concurrent metadata requests can race to create
+        Ok(ErrorCode::TopicAlreadyExists) => true,
+
+        // A client sends a colliding name again on each retry, so we log the refusal at debug,
+        // instead of at warn on every retry.
+        Ok(ErrorCode::InvalidTopicException) => {
+            debug!(?result, "not auto-creating topic");
+            false
+        }
+
+        // Any other failure is the broker's, such as a storage error, and the producer sees
+        // only `UNKNOWN_TOPIC_OR_PARTITION`, so we log it where an operator sees it.
+        _ => {
+            warn!(
+                topic = %result.name,
+                error_code = result.error_code,
+                error_message = ?result.error_message,
+                "auto-creating topic failed"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    use nisshi_sans_io::{ErrorCode, create_topics_response::CreatableTopicResult};
+    use tracing::Level;
+
+    use super::topic_exists_after;
+
+    /// The log lines written at `warn` or above.
+    #[derive(Clone, Default)]
+    struct WarnLog(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for WarnLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns whether the topic exists after `error_code`, and what was logged at `warn` or
+    /// above.
+    fn outcome(error_code: ErrorCode) -> (bool, String) {
+        let log = WarnLog::default();
+        let writer = log.clone();
+
+        let exists = tracing::subscriber::with_default(
+            tracing_subscriber::fmt()
+                .with_max_level(Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+            || {
+                topic_exists_after(
+                    &CreatableTopicResult::default()
+                        .name("orders".into())
+                        .error_code(error_code.into()),
+                )
+            },
+        );
+
+        let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+        (exists, text)
+    }
+
+    /// A storage failure is the broker's problem, not the client's, so the operator sees it at
+    /// the default log level. The producer only sees `UNKNOWN_TOPIC_OR_PARTITION`.
+    #[test]
+    fn a_storage_failure_is_logged_at_warn() {
+        for error_code in [ErrorCode::UnknownServerError, ErrorCode::KafkaStorageError] {
+            let (exists, log) = outcome(error_code);
+
+            assert!(!exists, "{error_code:?}");
+            assert!(log.contains("orders"), "{error_code:?}: {log:?}");
+        }
+    }
+
+    /// A client sends a colliding name again on each retry, so the refusal stays below `warn`.
+    #[test]
+    fn a_refused_name_is_not_logged_at_warn() {
+        let (exists, log) = outcome(ErrorCode::InvalidTopicException);
+
+        assert!(!exists);
+        assert_eq!("", log);
+    }
+
+    #[test]
+    fn a_created_or_existing_topic_exists() {
+        for error_code in [ErrorCode::None, ErrorCode::TopicAlreadyExists] {
+            assert!(outcome(error_code).0, "{error_code:?}");
+        }
     }
 }
