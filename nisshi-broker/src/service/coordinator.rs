@@ -53,11 +53,6 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, coordinator.clone())
     })
-    // The storage route of TxnOffsetCommit is registered first (`storage::services`); the
-    // group's coordinator fences the commit before it.
-    .and_then(|builder| {
-        crate::service::txn_offset_commit::fence_txn_offset_commit(builder, coordinator)
-    })
 }
 
 pub fn delete_groups<C>(

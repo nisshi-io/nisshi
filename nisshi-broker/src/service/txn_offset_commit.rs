@@ -25,9 +25,8 @@ use rama::{Service, service::BoxService};
 use crate::{Error, Result, coordinator::group::Coordinator};
 
 /// Wraps the registered route of `TxnOffsetCommit`: the group coordinator fences the commit, then
-/// the storage's route commits it. [`crate::service::storage::txn_offset_commit`] registers that
-/// route, before this call: a route table without it, or one that registers it later, is not
-/// fenced.
+/// the storage's route commits it. Fails with [`nisshi_service::Error::NoRouteToWrap`] when the
+/// route is not registered yet, so that a route table cannot leave the commit unfenced.
 pub fn fence_txn_offset_commit<C>(
     builder: FrameRouteBuilder<Error>,
     coordinator: C,
@@ -35,9 +34,11 @@ pub fn fence_txn_offset_commit<C>(
 where
     C: Coordinator,
 {
-    Ok(builder.wrap_route(TxnOffsetCommitRequest::KEY, |inner| {
-        TxnOffsetCommitFenceService { coordinator, inner }.boxed()
-    }))
+    builder
+        .wrap_route(TxnOffsetCommitRequest::KEY, |inner| {
+            TxnOffsetCommitFenceService { coordinator, inner }.boxed()
+        })
+        .map_err(Into::into)
 }
 
 #[derive(Clone, Debug)]

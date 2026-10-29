@@ -22,7 +22,7 @@ use bytes::Bytes;
 use nisshi_broker::{
     Error, Result,
     coordinator::group::administrator::{Controller, GroupCoordinatorConfig},
-    service::{storage, txn_offset_commit::fence_txn_offset_commit},
+    service,
 };
 use nisshi_sans_io::{
     ApiKey as _, Body, ErrorCode, Frame, FrameInput, Header, TxnOffsetCommitRequest,
@@ -31,7 +31,7 @@ use nisshi_sans_io::{
     txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
 };
 use nisshi_service::FrameRouteService;
-use nisshi_storage::{ArcDynStorage, Storage, Topition};
+use nisshi_storage::{ArcDynStorage, Storage, TopicCreationConfig, Topition};
 use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use url::Url;
@@ -54,7 +54,8 @@ const GROUP_COORDINATOR: GroupCoordinatorConfig = GroupCoordinatorConfig {
 };
 
 /// A transactional producer that has added `group` to its transaction, a topic with one
-/// partition, and a route that serves `TxnOffsetCommit` with the group's coordinator.
+/// partition, and the broker's route table, which serves `TxnOffsetCommit` with the group's
+/// coordinator.
 struct Fixture {
     storage: ArcDynStorage,
     broker: Controller<ArcDynStorage>,
@@ -116,10 +117,14 @@ impl Fixture {
 
         let broker = Controller::new(storage.clone(), GROUP_COORDINATOR);
 
-        let route =
-            storage::txn_offset_commit(FrameRouteService::<Error>::builder(), storage.clone())
-                .and_then(|builder| fence_txn_offset_commit(builder, broker.clone()))
-                .and_then(|builder| builder.build().map_err(Into::into))?;
+        // The broker's own route table, so that the fence is where the broker puts it, not
+        // where this test does.
+        let route = service::routes(
+            broker.clone(),
+            storage.clone(),
+            TopicCreationConfig::default(),
+        )
+        .and_then(|builder| builder.build().map_err(Into::into))?;
 
         Ok(Self {
             storage,
