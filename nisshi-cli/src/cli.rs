@@ -31,6 +31,7 @@ use tracing::debug;
 mod broker;
 mod cat;
 mod generator;
+mod output;
 mod perf;
 mod proxy;
 mod topic;
