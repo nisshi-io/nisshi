@@ -160,8 +160,9 @@ a comment on each line that the reader can't follow without help, and on no othe
     with because building the value again gives a different result
   - an assertion on the test's own setup, which stops the test from failing, or passing, for a
     reason other than the code under test
-- **Say what the line does for the test, and why the test needs it.** The test's doc comment
-  states the behaviour that the test checks, so a comment in the body does not repeat it.
+- **Say what the line does for the test, and why the test needs it.** The test's name, and its
+  doc comment if it has one, state the behaviour that the test checks. A comment in the body says
+  only how its line serves that check, so the body and the doc comment never say the same thing.
 - **Leave every other line uncommented.** A line that builds the input that the test's name
   describes, or whose purpose its code shows, needs no comment. A comment there gives the reader
   one more thing to read and tells them nothing new.
