@@ -4911,38 +4911,61 @@ impl Storage for Postgres {
         debug!(?group_ids, include_authorized_operations);
 
         let mut results = vec![];
-        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+        let c = self.connection().await.inspect_err(|err| error!(?err));
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                if let Some(row) = self
+                // The engine answers a group whose read fails with an error code, as Apache Kafka's
+                // [`GroupCoordinatorService`] does, instead of failing the request, because the
+                // broker closes the client's connection on a failed request and sends no response.
+                // Kafka clients retry `COORDINATOR_NOT_AVAILABLE`.
+                //
+                // [`GroupCoordinatorService`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1184
+                let Ok(c) = &c else {
+                    results.push(NamedGroupDetail::error_code(
+                        group_id.into(),
+                        ErrorCode::CoordinatorNotAvailable,
+                    ));
+                    continue;
+                };
+
+                match self
                     .prepare_query_opt(
-                        &c,
+                        c,
                         "consumer_group_select_by_name.sql",
                         &[&self.cluster, group_id],
                     )
                     .await
-                    .inspect_err(|err| error!(?err, group_id))?
+                    .inspect_err(|err| error!(?err, group_id))
                 {
-                    // A group row with no detail row (e.g. a group that only ever
-                    // committed offsets, never a JoinGroup) joins to a NULL
-                    // `detail` column here: that group exists and is empty, not
-                    // an error.
-                    let current = match row
-                        .try_get::<_, Option<Value>>(1)
-                        .inspect_err(|err| error!(?err, group_id))?
-                    {
-                        Some(value) => serde_json::from_value::<GroupDetail>(value)
-                            .inspect(|current| debug!(?current))?,
-                        None => GroupDetail::default(),
-                    };
+                    Ok(Some(row)) => {
+                        // A group row with no detail row (e.g. a group that only ever committed
+                        // offsets, never a JoinGroup) joins to a NULL `detail` column here: that
+                        // group exists and is empty, not an error.
+                        let stored = row
+                            .try_get::<_, Option<Value>>(1)
+                            .map_err(Error::from)
+                            .transpose()
+                            .map(|stored| {
+                                stored.and_then(|value| {
+                                    serde_json::from_value::<GroupDetail>(value)
+                                        .map_err(Error::from)
+                                        .inspect(|current| debug!(?current))
+                                })
+                            });
 
-                    results.push(NamedGroupDetail::found(group_id.into(), current));
-                } else {
-                    results.push(NamedGroupDetail::error_code(
+                        results.push(NamedGroupDetail::decoded(group_id.into(), stored));
+                    }
+
+                    Ok(None) => results.push(NamedGroupDetail::error_code(
                         group_id.into(),
                         ErrorCode::GroupIdNotFound,
-                    ));
+                    )),
+
+                    Err(_) => results.push(NamedGroupDetail::error_code(
+                        group_id.into(),
+                        ErrorCode::CoordinatorNotAvailable,
+                    )),
                 }
             }
         }
@@ -11587,5 +11610,104 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// A DescribeGroups whose storage can't get a connection must answer each group with
+    /// `COORDINATOR_NOT_AVAILABLE`, which clients retry. A failed request instead closes the
+    /// client's connection without a response.
+    #[tokio::test]
+    async fn describe_groups_answers_coordinator_not_available_without_a_connection() -> Result<()>
+    {
+        // The listener closes when this statement ends, so the engine's connection attempt to its
+        // port fails at once. The test then runs without a PostgreSQL server.
+        let closed_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await?
+            .local_addr()?
+            .port();
+
+        let storage = Postgres::builder(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{closed_port}"
+        ))?
+        .cluster(alphanumeric_string(15))
+        .node(111)
+        .build();
+
+        let group_ids = ["abc", "pqr"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::error_code("abc".into(), ErrorCode::CoordinatorNotAvailable),
+                NamedGroupDetail::error_code("pqr".into(), ErrorCode::CoordinatorNotAvailable),
+            ],
+            storage.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
+    }
+
+    /// A DescribeGroups must answer a stored group that can't be decoded with
+    /// `UNKNOWN_SERVER_ERROR`, which clients report at once, and answer the other groups in the
+    /// request as usual.
+    #[tokio::test]
+    async fn describe_groups_answers_unknown_server_error_for_an_undecodable_group() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "describe_groups_answers_unknown_server_error_for_an_undecodable_group",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        // `GroupDetail::default` records the current time as the group's inception, so a second
+        // call returns a different detail. The test compares the answer with this value.
+        let stored = GroupDetail::default();
+
+        for group_id in ["healthy", "undecodable"] {
+            _ = storage
+                .update_group(group_id, stored.clone(), None)
+                .await
+                .map_err(|err| Error::Message(format!("{err:?}")))?;
+        }
+
+        // `42` is valid JSON, so the database accepts it, but it doesn't decode to a `GroupDetail`.
+        let changed = storage
+            .connection()
+            .await?
+            .execute(
+                "update consumer_group_detail cgd set detail = '42'
+                from consumer_group cg join cluster c on c.id = cg.cluster
+                where cgd.consumer_group = cg.id and c.name = $1 and cg.name = $2",
+                &[&cluster, &"undecodable"],
+            )
+            .await?;
+        // The update must change the group's row. An update that changes no row leaves the group
+        // decodable, and the test then fails for that reason instead of testing the engine.
+        assert_eq!(1, changed);
+
+        let group_ids = ["healthy", "undecodable", "missing"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+                NamedGroupDetail::error_code("missing".into(), ErrorCode::GroupIdNotFound),
+            ],
+            storage.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
     }
 }
