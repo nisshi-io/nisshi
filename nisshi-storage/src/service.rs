@@ -110,10 +110,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -273,7 +273,7 @@ pub enum Response {
     AdvertisedListener(Result<Url>),
     Brokers(Result<Vec<DescribeClusterBroker>>),
     ClusterId(Result<String>),
-    CommittedOffsetTopitions(Result<BTreeMap<Topition, i64>>),
+    CommittedOffsetTopitions(Result<BTreeMap<Topition, CommittedOffset>>),
     CreateTopic(Result<Uuid>),
     DeleteGroups(Result<Vec<DeletableGroupResult>>),
     DeleteRecords(Result<Vec<DeleteRecordsTopicResult>>),
@@ -294,7 +294,7 @@ pub enum Response {
     Metadata(Result<MetadataResponse>),
     Node(Result<i32>),
     OffsetCommit(Result<Vec<(Topition, ErrorCode)>>),
-    OffsetFetch(Result<BTreeMap<Topition, i64>>),
+    OffsetFetch(Result<BTreeMap<Topition, CommittedOffset>>),
     OffsetStage(Result<OffsetStage>),
     Ping(Result<()>),
     Produce(Result<i64>),
@@ -654,7 +654,10 @@ impl Storage for RequestChannelService {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let group_id = group_id.to_string();
 
         serve_and_extract!(
@@ -670,7 +673,7 @@ impl Storage for RequestChannelService {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let group_id = group_id.map(|s| s.to_string());
         let topics = Vec::from(topics);
 
