@@ -278,6 +278,26 @@ impl Batch {
         Ok(())
     }
 
+    /// Returns the greatest timestamp that a consumer reads from this batch (see
+    /// [`Batch::record_timestamp`]), whatever its header claims.
+    ///
+    /// For a [`TimestampType::CreateTime`] batch this is the greatest record timestamp, starting
+    /// from `-1` (Kafka's `NO_TIMESTAMP`), as Kafka's [`LogValidator`] computes the
+    /// `max_timestamp` that it writes to the header. For a [`TimestampType::LogAppendTime`]
+    /// batch, it is `max_timestamp`.
+    ///
+    /// [`LogValidator`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L249-L281
+    pub fn max_record_timestamp(&self) -> i64 {
+        match TimestampType::from(self.attributes) {
+            TimestampType::LogAppendTime => self.max_timestamp,
+            TimestampType::CreateTime => self
+                .records
+                .iter()
+                .map(|record| self.record_timestamp(record))
+                .fold(-1, i64::max),
+        }
+    }
+
     pub fn keys(&self) -> BTreeSet<Bytes> {
         self.records
             .iter()
@@ -1023,6 +1043,70 @@ mod tests {
         assert_eq!(1, records.len());
         assert_eq!(0, records[0].offset_delta);
         assert_eq!(None, records[0].key);
+
+        Ok(())
+    }
+
+    fn timestamped(
+        timestamp_type: TimestampType,
+        base_timestamp: i64,
+        max_timestamp: i64,
+        deltas: &[i64],
+    ) -> Result<Batch> {
+        deltas
+            .iter()
+            .zip(0..)
+            .fold(
+                Batch::builder()
+                    .attributes(BatchAttribute::default().timestamp(timestamp_type).into())
+                    .base_timestamp(base_timestamp)
+                    .max_timestamp(max_timestamp)
+                    .last_offset_delta(i32::try_from(deltas.len())? - 1),
+                |builder, (&timestamp_delta, offset_delta)| {
+                    builder.record(
+                        Record::builder()
+                            .timestamp_delta(timestamp_delta)
+                            .offset_delta(offset_delta)
+                            .value(Some(Bytes::from_static(b"v"))),
+                    )
+                },
+            )
+            .build()
+    }
+
+    #[test]
+    fn max_record_timestamp_is_the_largest_record_not_the_last() -> Result<()> {
+        let batch = timestamped(TimestampType::CreateTime, 1_000, -1, &[0, 300, 100])?;
+        assert_eq!(1_300, batch.max_record_timestamp());
+
+        Ok(())
+    }
+
+    /// A record whose `base_timestamp + timestamp_delta` wraps has the wrapped timestamp, as
+    /// Java's `long` addition gives a consumer, so it is below the record before it here.
+    #[test]
+    fn max_record_timestamp_takes_a_wrapped_record_timestamp() -> Result<()> {
+        let batch = timestamped(TimestampType::CreateTime, i64::MAX - 10, -1, &[5, 11])?;
+        assert_eq!(i64::MIN, batch.record_timestamp(&batch.records[1]));
+        assert_eq!(i64::MAX - 5, batch.max_record_timestamp());
+
+        Ok(())
+    }
+
+    #[test]
+    fn max_record_timestamp_of_a_batch_without_a_timestamp_is_no_timestamp() -> Result<()> {
+        let batch = timestamped(TimestampType::CreateTime, -1, 5_000, &[0])?;
+        assert_eq!(-1, batch.max_record_timestamp());
+
+        Ok(())
+    }
+
+    /// A consumer reads `max_timestamp` for each record of a `LogAppendTime` batch, whatever its
+    /// deltas.
+    #[test]
+    fn max_record_timestamp_of_log_append_time_is_the_header() -> Result<()> {
+        let batch = timestamped(TimestampType::LogAppendTime, 1_000, 2_000, &[0, 5_000])?;
+        assert_eq!(2_000, batch.max_record_timestamp());
 
         Ok(())
     }

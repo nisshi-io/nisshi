@@ -41,9 +41,9 @@ use nisshi_sans_io::{
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use nisshi_storage::{
     BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential, Storage,
+    TopicCreationConfig, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rsasl::{
@@ -60,12 +60,16 @@ fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+    )
+    .and_then(auth::services)
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
+    })
 }
 
 /// Asserts that a SaslHandshake response lists the mechanisms that the broker
