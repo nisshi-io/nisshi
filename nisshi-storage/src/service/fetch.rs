@@ -1134,11 +1134,11 @@ mod tests {
         Deadlines, FetchService, MIN_BUDGET_MARGIN, Missed, READ_DEADLINE_OVERHEAD, before,
     };
     use crate::{
-        BrokerRegistrationRequest, Error, FetchValidationLayer, GroupDetail, ListOffsetResponse,
-        MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-        Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-        TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
-        read_share::FetchReadShare,
+        BrokerRegistrationRequest, CommittedOffset, Error, FetchValidationLayer, GroupDetail,
+        ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+        ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+        TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+        Version, read_share::FetchReadShare,
     };
 
     /// A batch at `base_offset` holding one record per entry in `deltas`,
@@ -1224,7 +1224,7 @@ mod tests {
                 async fn committed_offset_topitions(
                     &self,
                     _group_id: &str,
-                ) -> Result<BTreeMap<Topition, i64>> {
+                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
                     unimplemented!()
                 }
 
@@ -1233,7 +1233,7 @@ mod tests {
                     _group_id: Option<&str>,
                     _topics: &[Topition],
                     _require_stable: Option<bool>,
-                ) -> Result<BTreeMap<Topition, i64>> {
+                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
                     unimplemented!()
                 }
 

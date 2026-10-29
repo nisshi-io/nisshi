@@ -79,7 +79,12 @@ async fn offset_commit_rejects_partition_outside_topic() -> Result<(), Error> {
 
     assert_eq!(
         BTreeMap::from([(committed, OFFSET)]),
-        storage.committed_offset_topitions(GROUP).await?
+        storage
+            .committed_offset_topitions(GROUP)
+            .await?
+            .into_iter()
+            .map(|(topition, committed)| (topition, committed.offset))
+            .collect::<BTreeMap<_, _>>()
     );
 
     let fetched = storage
@@ -95,9 +100,17 @@ async fn offset_commit_rejects_partition_outside_topic() -> Result<(), Error> {
 
     for (topition, error_code) in &expected_responses {
         if *error_code == ErrorCode::None {
-            assert_eq!(Some(&OFFSET), fetched.get(topition), "{topition:?}");
+            assert_eq!(
+                Some(OFFSET),
+                fetched.get(topition).map(|committed| committed.offset),
+                "{topition:?}"
+            );
         } else {
-            assert_matches!(fetched.get(topition), None | Some(-1), "{topition:?}");
+            assert_matches!(
+                fetched.get(topition).map(|committed| committed.offset),
+                None | Some(-1),
+                "{topition:?}"
+            );
         }
     }
 

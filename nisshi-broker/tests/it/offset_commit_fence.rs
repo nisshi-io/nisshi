@@ -178,7 +178,9 @@ where
         .await?;
 
     assert!(
-        stored.get(&topition).is_none_or(|offset| *offset == -1),
+        stored
+            .get(&topition)
+            .is_none_or(|committed| committed.offset == -1),
         "a fenced commit stored offset {:?}",
         stored.get(&topition)
     );

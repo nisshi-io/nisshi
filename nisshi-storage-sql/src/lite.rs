@@ -16,9 +16,9 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, watermark_select_for_write,
+        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        remove_comments, result_columns::ResultColumns, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -59,14 +59,14 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
+    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, CommittedOffset,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
     ProducerIdResponse, RequestChannelService, RequestStorageService, Result, ScramCredential,
     SemaphoreProxy, StartupFailure, Storage, StoredEpochs, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, bounded_channel, check_claim, config::apply_op, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1979,7 +1979,10 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         self.inner
             .committed_offset_topitions(group_id)
@@ -1998,7 +2001,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         self.inner
             .offset_fetch(group_id, topics, require_stable)
@@ -2424,9 +2427,84 @@ impl FromStr for CommunicationMode {
     }
 }
 
+const BUSY_TIMEOUT: &str = "busy_timeout";
+const COMPACTION: &str = "compaction";
+const MODE: &str = "mode";
+
+/// What `busy_timeout` takes. Every example here must parse (see the tests).
+const BUSY_TIMEOUT_HINT: &str = "a duration, such as 5s or 500ms";
+
+/// What `compaction` takes. Every value here must parse (see the tests).
+const COMPACTION_HINT: &str = "single or multi";
+
+/// What `mode` takes. Every value here must parse (see the tests).
+const MODE_HINT: &str = "semaphore, mpsc or direct";
+
+/// The storage URL options of the SQLite engine that take a parsed value. An option
+/// that the URL doesn't give takes its default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiteOptions {
+    busy_timeout: Duration,
+    compaction: CompactionMode,
+    mode: CommunicationMode,
+}
+
+impl Default for LiteOptions {
+    fn default() -> Self {
+        Self {
+            busy_timeout: Duration::from_secs(5),
+            compaction: CompactionMode::default(),
+            mode: CommunicationMode::default(),
+        }
+    }
+}
+
+impl LiteOptions {
+    /// Reads the options from `storage`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidStorageOptionValue`] when an option's value doesn't parse.
+    fn parse(storage: &Url) -> Result<Self> {
+        let defaults = Self::default();
+
+        Ok(Self {
+            busy_timeout: parse_storage_option(
+                storage,
+                BUSY_TIMEOUT,
+                BUSY_TIMEOUT_HINT,
+                |value| {
+                    human_units::Duration::from_str(value)
+                        .ok()
+                        .map(|duration| duration.0)
+                },
+            )?
+            .unwrap_or(defaults.busy_timeout),
+
+            compaction: parse_storage_option(storage, COMPACTION, COMPACTION_HINT, |value| {
+                CompactionMode::from_str(value).ok()
+            })?
+            .unwrap_or(defaults.compaction),
+
+            mode: parse_storage_option(storage, MODE, MODE_HINT, |value| {
+                CommunicationMode::from_str(value).ok()
+            })?
+            .unwrap_or(defaults.mode),
+        })
+    }
+}
+
 impl Builder<String, i32, Url, Url> {
     pub(crate) async fn build(self) -> Result<ArcDynStorage> {
         debug!(domain = self.storage.domain(), path = self.storage.path());
+
+        // Read the options before the database file is opened, so that a value that
+        // doesn't parse stops startup before the file is created.
+        let LiteOptions {
+            busy_timeout,
+            compaction,
+            mode,
+        } = LiteOptions::parse(&self.storage)?;
 
         let path = env::current_dir()
             .inspect(|current_dir| debug!(?current_dir))
@@ -2442,35 +2520,6 @@ impl Builder<String, i32, Url, Url> {
             }
         });
 
-        let busy_timeout = self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "busy_timeout" {
-                    human_units::Duration::from_str(v.as_ref())
-                        .map(|duration| duration.0)
-                        .inspect_err(
-                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
-                        )
-                        .ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(Duration::from_secs(5));
-
-        let compaction = self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "compaction" {
-                    CompactionMode::from_str(v.as_ref()).ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
         let db = libsql::Builder::new_local(path).build().await?;
 
         ensure_schema(&db, busy_timeout)
@@ -2481,18 +2530,7 @@ impl Builder<String, i32, Url, Url> {
                 source: Arc::new(source),
             })?;
 
-        match self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "mode" {
-                    CommunicationMode::from_str(v.as_ref()).ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default()
-        {
+        match mode {
             CommunicationMode::Mpsc => {
                 let (sender, receiver) = bounded_channel(1);
                 let mut server = JoinSet::new();
@@ -3486,7 +3524,10 @@ impl Storage for Delegate {
         })
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
 
         debug!(group_id);
@@ -3497,21 +3538,33 @@ impl Storage for Delegate {
 
         let mut rows = c
             .query(
-                "consumer_offset_select_by_group.sql",
+                consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
-        while let Some(row) = rows.next().await? {
-            let topic = row.get_str(0)?;
-            let partition = row.get::<i32>(1)?;
-            let offset = row.get::<i64>(2)?;
+        let columns = ResultColumns::libsql(consumer_offset_select_by_group::QUERY, &rows);
+        let topic = columns.index(consumer_offset_select_by_group::TOPIC)? as i32;
+        let partition = columns.index(consumer_offset_select_by_group::PARTITION)? as i32;
+        let committed_offset =
+            columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)? as i32;
+        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)? as i32;
+        let metadata = columns.index(consumer_offset_select_by_group::METADATA)? as i32;
 
-            debug!(group_id, topic, partition, offset);
+        while let Some(row) = rows.next().await? {
+            let topic = row.get_str(topic)?;
+            let partition = row.get::<i32>(partition)?;
+            let committed = CommittedOffset {
+                offset: row.get::<i64>(committed_offset)?,
+                leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
+                metadata: row.get::<Option<String>>(metadata)?,
+            };
+
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
@@ -3528,7 +3581,7 @@ impl Storage for Delegate {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
 
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
@@ -3540,7 +3593,7 @@ impl Storage for Delegate {
         for topic in topics {
             let mut rows = c
                 .query(
-                    "consumer_offset_select.sql",
+                    consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -3559,17 +3612,30 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            let offset = rows
+            let columns = ResultColumns::libsql(consumer_offset_select::QUERY, &rows);
+            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)? as i32;
+            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)? as i32;
+            let metadata = columns.index(consumer_offset_select::METADATA)? as i32;
+
+            let committed = rows
                 .next()
                 .await
-                .and_then(|maybe| maybe.map_or(Ok(-1), |row| row.get::<i64>(0)))
-                .inspect(|offset| {
+                .and_then(|maybe| {
+                    maybe.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: row.get::<i64>(committed_offset)?,
+                            leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
+                            metadata: row.get::<Option<String>>(metadata)?,
+                        })
+                    })
+                })
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -3582,7 +3648,7 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets).inspect(|_| {
@@ -5466,6 +5532,9 @@ impl TryFrom<Value> for LiteTimestamp {
         }
     }
 }
+
+#[cfg(test)]
+mod options_tests;
 
 #[cfg(test)]
 mod tests {

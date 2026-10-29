@@ -49,10 +49,11 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, GroupDetailResponse, ListOffsetResponse,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, GroupDetailResponse,
+    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 use tracing::instrument;
 use url::Url;
@@ -208,7 +209,10 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, _group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        _group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         Ok(BTreeMap::new())
     }
 
@@ -218,10 +222,19 @@ impl Storage for Engine {
         _group_id: Option<&str>,
         topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         Ok(topics
             .iter()
-            .map(|topition| (topition.to_owned(), 0))
+            .map(|topition| {
+                (
+                    topition.to_owned(),
+                    CommittedOffset {
+                        offset: 0,
+                        leader_epoch: None,
+                        metadata: None,
+                    },
+                )
+            })
             .collect())
     }
 
