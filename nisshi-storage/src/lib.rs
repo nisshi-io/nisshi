@@ -1500,6 +1500,26 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                     .authorized_operations(Some(authorized_operations::OMITTED))
             }
 
+            // `DescribeGroups` v0 to v5 describes a group that does not exist with the error
+            // NONE and the state `Dead`. Kafka adds `GROUP_ID_NOT_FOUND` to `DescribeGroups` from
+            // v6 ([KIP-1043]), and Nisshi supports v5 at most. An admin client reads the group
+            // as missing from `Dead`, but fails on `GROUP_ID_NOT_FOUND` as an unexpected error
+            // ([`GroupCoordinator.handleDescribeGroup`]).
+            //
+            // [KIP-1043]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
+            // [`GroupCoordinator.handleDescribeGroup`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
+            NamedGroupDetail {
+                name,
+                response: GroupDetailResponse::ErrorCode(ErrorCode::GroupIdNotFound),
+            } => Self::default()
+                .error_code(ErrorCode::None.into())
+                .group_id(name.clone())
+                .group_state(ConsumerGroupState::Dead.to_string())
+                .protocol_type("".into())
+                .protocol_data("".into())
+                .members(Some(vec![]))
+                .authorized_operations(Some(authorized_operations::OMITTED)),
+
             NamedGroupDetail {
                 name,
                 response: GroupDetailResponse::ErrorCode(error_code),
