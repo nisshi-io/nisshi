@@ -363,6 +363,50 @@ impl Meta {
         Ok(produced)
     }
 
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction. EndTxn clears a transaction's `produces`, so a partition is there
+    /// only while the transaction is ongoing.
+    ///
+    /// Kafka's transaction coordinator answers an unknown transactional ID, or one that another
+    /// producer ID owns, `INVALID_PRODUCER_ID_MAPPING`, and a partition that is not in the
+    /// transaction `TRANSACTION_ABORTABLE` ([TransactionCoordinator.scala#L357-L402]). Storing the
+    /// batch anyway would leave records that no transaction marker ever closes.
+    ///
+    /// [TransactionCoordinator.scala#L357-L402]: https://github.com/apache/kafka/blob/4.1.0/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala#L357-L402
+    fn ensure_partition_in_transaction(
+        &self,
+        transaction_id: &str,
+        producer_id: ProducerId,
+        producer_epoch: ProducerEpoch,
+        topition: &Topition,
+    ) -> Result<()> {
+        let Some(txn) = self
+            .transactions
+            .get(transaction_id)
+            .filter(|txn| txn.producer == producer_id)
+        else {
+            return Err(Error::Api(ErrorCode::InvalidProducerIdMapping));
+        };
+
+        let Some(txn_detail) = txn.epochs.get(&producer_epoch).filter(|txn_detail| {
+            txn_detail
+                .produces
+                .get(topition.topic())
+                .is_some_and(|partitions| partitions.contains_key(&topition.partition()))
+        }) else {
+            return Err(Error::Api(ErrorCode::TransactionAbortable));
+        };
+
+        // A transaction that is preparing to commit or abort has its markers written, and its
+        // `produces` stays until an older overlapping transaction resolves, so a batch stored
+        // now would land after the marker.
+        if txn_detail.state.is_some_and(|state| state.is_prepared()) {
+            Err(Error::Api(ErrorCode::ConcurrentTransactions))
+        } else {
+            Ok(())
+        }
+    }
+
     fn overlapping_transactions(
         &self,
         transaction_id: &str,
@@ -1138,6 +1182,47 @@ impl DynoStore {
         _ = self.ensure_partition_exists(topition).await?;
 
         self.watermark_for(topition)
+    }
+
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction (see [`Meta::ensure_partition_in_transaction`]). A batch without a
+    /// transactional ID, a non-transactional batch and a control batch are not checked: only the
+    /// broker writes control batches, when it ends a transaction.
+    ///
+    /// This reads `meta.json` with a conditional GET; it does not change it.
+    async fn ensure_partition_in_transaction(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+    ) -> Result<()> {
+        let Some(transaction_id) = transaction_id else {
+            return Ok(());
+        };
+
+        if !deflated.is_transactional() || deflated.is_control() {
+            return Ok(());
+        }
+
+        self.meta
+            .with(&self.object_store, |meta| {
+                meta.ensure_partition_in_transaction(
+                    transaction_id,
+                    deflated.producer_id,
+                    deflated.producer_epoch,
+                    topition,
+                )
+            })
+            .await
+            .inspect_err(|err| {
+                debug!(
+                    transaction_id,
+                    ?topition,
+                    deflated.producer_id,
+                    deflated.producer_epoch,
+                    ?err
+                )
+            })
     }
 
     /// Returns the (cached, shared) `OptiCon` handle for `topition`'s
@@ -2391,6 +2476,10 @@ impl Storage for DynoStore {
                 })
                 .unwrap_or(false)
         {
+            // Keep in step with the check on the non-lake path below.
+            self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
+                .await?;
+
             // Decode and validate before the high watermark moves, so that a
             // batch rejected here leaves no state behind.
             let inflated = if let Some(ref registry) = self.schemas {
@@ -2604,6 +2693,9 @@ impl Storage for DynoStore {
                 }
             }
 
+            self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
+                .await?;
+
             let watermark = self.watermark_for(topition)?;
 
             let offset = watermark
@@ -2660,6 +2752,18 @@ impl Storage for DynoStore {
             {
                 self.meta
                     .with_mut(&self.object_store, |meta| {
+                        // The check before the write is a read that can go stale. This one
+                        // runs on the version of `meta.json` that the write below replaces,
+                        // so it decides, and the bookkeeping never adds a partition itself.
+                        if !deflated.is_control() {
+                            meta.ensure_partition_in_transaction(
+                                transaction_id,
+                                deflated.producer_id,
+                                deflated.producer_epoch,
+                                topition,
+                            )?;
+                        }
+
                         if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
                             debug!(?transaction);
 
@@ -2672,10 +2776,9 @@ impl Storage for DynoStore {
 
                                 _ = txn_detail
                                     .produces
-                                    .entry(topition.topic.clone())
-                                    .or_default()
-                                    .entry(topition.partition)
-                                    .and_modify(|entry| {
+                                    .get_mut(&topition.topic)
+                                    .and_then(|partitions| partitions.get_mut(&topition.partition))
+                                    .map(|entry| {
                                         let range = entry.get_or_insert(TxnProduceOffset {
                                             offset_start: offset,
                                             offset_end,
@@ -2684,11 +2787,7 @@ impl Storage for DynoStore {
                                         if offset_end > range.offset_end {
                                             range.offset_end = offset_end;
                                         }
-                                    })
-                                    .or_insert(Some(TxnProduceOffset {
-                                        offset_start: offset,
-                                        offset_end,
-                                    }));
+                                    });
                             }
                         }
 

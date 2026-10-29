@@ -18,7 +18,8 @@ use crate::{
     sql::{
         Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, watermark_select_for_write,
+        remove_comments, result_columns::ResultColumns, txn_produce_partition_check,
+        txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -805,6 +806,48 @@ impl Delegate {
         })
     }
 
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction (see [`txn_produce_partition_check`]). EndTxn deletes a transaction's
+    /// `txn_topition` rows, so a row is present only while the transaction is ongoing.
+    async fn txn_produce_partition_check(
+        &self,
+        transaction_id: &str,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+        connection: &PoolConnection,
+    ) -> Result<()> {
+        let mut rows = connection
+            .query(
+                txn_produce_partition_select::QUERY,
+                (
+                    self.cluster.as_str(),
+                    transaction_id,
+                    deflated.producer_id,
+                    deflated.producer_epoch,
+                    topition.topic(),
+                    topition.partition(),
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        let columns = ResultColumns::libsql(txn_produce_partition_select::QUERY, &rows);
+        let producer = columns.index(txn_produce_partition_select::PRODUCER)? as i32;
+        let added = columns.index(txn_produce_partition_select::ADDED)? as i32;
+
+        let row = match rows.next().await.inspect_err(|err| error!(?err))? {
+            Some(row) => Some((
+                row.get::<Option<i64>>(producer)
+                    .inspect_err(|err| error!(?err))?,
+                row.get::<i32>(added).inspect_err(|err| error!(?err))?,
+            )),
+            None => None,
+        };
+
+        txn_produce_partition_check(row, deflated.producer_id)
+            .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
+    }
+
     #[instrument(skip_all)]
     async fn produce_in_tx(
         &self,
@@ -823,6 +866,14 @@ impl Delegate {
             self.idempotent_message_check(transaction_id, topition, &deflated, connection)
                 .await
                 .inspect_err(|err| error!(?err))?;
+        }
+
+        if let Some(transaction_id) = transaction_id
+            && deflated.is_transactional()
+            && !deflated.is_control()
+        {
+            self.txn_produce_partition_check(transaction_id, topition, &deflated, connection)
+                .await?;
         }
 
         debug!(after_idempotent_check = elapsed_millis(start));
