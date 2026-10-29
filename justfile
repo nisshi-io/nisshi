@@ -53,6 +53,49 @@ seed-target:
     # and cargo reuses only dependency artifacts.
     cargo clean --workspace --quiet --target-dir target/.seed
     mv target/.seed/debug target/debug
+
+# The Apache Kafka tag that `just kafka-ref` checks out. It must stay the Kafka
+# version that the message descriptors in nisshi-sans-io/message/ come from.
+kafka_ref_version := "3.9.1"
+
+# clone Apache Kafka at the version the message descriptors come from into kafka-ref/, to read as the reference
+kafka-ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version={{ kafka_ref_version }}
+    main=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+    # Every checkout reads one clone in the main checkout, and a linked worktree
+    # gets a symlink to it, so a new worktree doesn't download Kafka again.
+    clone="$main/kafka-ref"
+    if [[ ! -e "$clone" ]]; then
+        echo "kafka-ref: cloning Apache Kafka $version into $clone" >&2
+        # We clone into kafka-ref.tmp and move it to kafka-ref last, so an
+        # interrupted clone leaves no kafka-ref. A rerun starts again from here.
+        rm -rf "$clone.tmp"
+        # The clone is blobless: it fetches each file's contents only when a
+        # command reads them. It keeps the full history, so `git log` and
+        # `git blame` show Kafka's fixes, and origin/trunk shows what changed
+        # since the tag.
+        git clone --quiet --filter=blob:none --branch "$version" https://github.com/apache/kafka.git "$clone.tmp"
+        mv "$clone.tmp" "$clone"
+    elif [[ ! -e "$clone/.git" ]]; then
+        # Without this check, git would find this repository above the
+        # directory and switch this repository's checkout instead.
+        echo "kafka-ref: $clone exists and isn't a git clone; remove it and rerun" >&2
+        exit 1
+    elif [[ "$(git -C "$clone" rev-parse HEAD)" != "$(git -C "$clone" rev-parse --verify --quiet "refs/tags/$version^{commit}")" ]]; then
+        if [[ -n "$(git -C "$clone" status --porcelain)" ]]; then
+            echo "kafka-ref: $clone has local changes; not switching it to $version" >&2
+            exit 1
+        fi
+        echo "kafka-ref: switching $clone to $version" >&2
+        git -C "$clone" fetch --quiet --tags origin
+        git -C "$clone" checkout --quiet --detach "refs/tags/$version"
+    fi
+    if [[ "$PWD" != "$main" && ! -e kafka-ref && ! -L kafka-ref ]]; then
+        ln -s "$clone" kafka-ref
+    fi
+    echo "kafka-ref: kafka-ref/ is Apache Kafka $version" >&2
     rm -rf target/.seed
     echo "seed-target: seeded target/debug from $main/target/debug" >&2
 
