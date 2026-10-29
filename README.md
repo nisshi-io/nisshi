@@ -439,9 +439,12 @@ Consumer:
 Nisshi is a single statically linked binary containing the following:
 
 - [broker](#broker) — an Apache Kafka®-compatible broker and schema registry
-- [topic](#topic) — a command line interface to create or delete topics
-- [cat](#cat) — a command line interface to consume or produce Avro, JSON, or Protobuf messages to a topic
-- [proxy](#proxy) — an Apache Kafka®-compatible proxy
+- [topic](#topic) — create, list or delete topics (development and demos; plaintext only: no TLS or SASL)
+- [user](#authentication) — create, list or delete users (development and demos; plaintext only: no TLS or SASL)
+- [cat](#cat) — consume or produce Avro, JSON or Protobuf messages to a topic (development and demos; plaintext only: no TLS or SASL)
+- generator — generate fake messages for schema-backed topics (development and demos; plaintext only: no TLS or SASL)
+- perf — measure produce and consume throughput against a broker (development and demos; plaintext only: no TLS or SASL)
+- [proxy](#proxy) — an Apache Kafka®-compatible proxy (development and demos, not production)
 
 ## broker
 
@@ -452,11 +455,14 @@ Usage: nisshi [OPTIONS]
        nisshi <COMMAND>
 
 Commands:
-  broker  Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
-  cat     Easily consume or produce Avro, JSON or Protobuf messages to a topic
-  topic   Create or delete topics managed by the broker
-  proxy   Apache Kafka®-compatible proxy
-  help    Print this message or the help of the given subcommand(s)
+  broker     Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
+  cat        Consume or produce Avro, JSON or Protobuf messages to a topic (development and demos)
+  generator  Generate fake messages for schema-backed topics (development and demos)
+  perf       Measure produce and consume throughput against a broker (development and demos)
+  proxy      Apache Kafka®-compatible proxy (development and demos)
+  topic      Create, list or delete topics managed by the broker (development and demos)
+  user       Create, list or delete users managed by the broker (development and demos)
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
       --kafka-cluster-id <KAFKA_CLUSTER_ID>
