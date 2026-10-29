@@ -176,6 +176,10 @@ struct Backfill {
     /// When the backfill began, on the store's clock: the write time the
     /// store reports for the watermark document after the begin CAS.
     began: SystemTime,
+    /// Whether the index was at an older version when the backfill began
+    /// (see [`TimeIndex::is_older_version`]), so that the logs say why the
+    /// partition is rebuilt.
+    older_version: bool,
 }
 
 /// Encode a Kafka group id as a single, opaque `object_store` path segment.
@@ -1220,12 +1224,15 @@ impl DynoStore {
         let token = rng().random::<u64>();
         let watermark = self.watermark_for(topition)?;
 
-        let (token, low, high) = watermark
+        let (token, low, high, older_version) = watermark
             .with_mut(&self.object_store, |w| {
+                let older_version = w.time_index.is_older_version();
+
                 Ok((
                     w.time_index.begin_backfill(token),
                     w.low.unwrap_or(0),
                     w.high.unwrap_or(0),
+                    older_version,
                 ))
             })
             .await?;
@@ -1244,12 +1251,14 @@ impl DynoStore {
             low,
             high,
             began,
+            older_version,
         })
     }
 
     /// Lists every batch object of `topition` below the high watermark of
-    /// `backfill` and replays the time index's append rule over their
-    /// headers, in offset order, into a candidate index. Returns that index
+    /// `backfill` and replays the time index's append rule over each batch's
+    /// maximum record timestamp (see [`DynoStore::max_record_timestamp`]),
+    /// in offset order, into a candidate index. Returns that index
     /// and the number of batches listed. Pure read: never writes anything.
     ///
     /// The candidate is complete when the listed batches cover every offset
@@ -1274,7 +1283,12 @@ impl DynoStore {
         let listed = self.list_batches(topition, 0, backfill.high).await?;
         let batches = listed.len();
 
-        info!(?topition, batches, "time index backfill: starting");
+        info!(
+            ?topition,
+            batches,
+            older_version = backfill.older_version,
+            "time index backfill: starting"
+        );
 
         let mut candidate = TimeIndex::default();
 
@@ -1283,6 +1297,8 @@ impl DynoStore {
         // so the gap check is off for the batch after it.
         let mut next_offset = Some(backfill.low);
         let mut settled = true;
+        let mut headers_disagreeing = 0_usize;
+        let mut first_disagreeing_offset = None;
 
         for (base_offset, written) in listed {
             if settled
@@ -1312,14 +1328,28 @@ impl DynoStore {
                 continue;
             };
 
+            let max_timestamp = Self::max_record_timestamp(topition, base_offset, &batch).await?;
+            if max_timestamp != batch.max_timestamp {
+                debug!(
+                    ?topition,
+                    base_offset,
+                    header = batch.max_timestamp,
+                    records = max_timestamp,
+                    "time index backfill: header disagrees with its records"
+                );
+
+                headers_disagreeing += 1;
+                _ = first_disagreeing_offset.get_or_insert(base_offset);
+            }
+
             if settled {
                 candidate.append(
-                    batch.max_timestamp,
+                    max_timestamp,
                     base_offset,
                     u64::try_from(batch.batch_length).unwrap_or_default(),
                 );
             } else {
-                candidate.observe(batch.max_timestamp);
+                candidate.observe(max_timestamp);
             }
 
             next_offset = Some(base_offset + i64::from(batch.last_offset_delta) + 1);
@@ -1337,11 +1367,72 @@ impl DynoStore {
             settled = false;
         }
 
+        // A broker rewrites each header from its records at produce, so only
+        // a batch that an older broker stored can disagree.
+        if let Some(first_disagreeing_offset) = first_disagreeing_offset {
+            warn!(
+                ?topition,
+                batches,
+                headers_disagreeing,
+                first_disagreeing_offset,
+                "time index backfill: taking each batch's maximum timestamp from its records, not \
+                 from a header that disagrees with them, as an older broker stored it"
+            );
+        }
+
         if settled {
             candidate.mark_complete();
         }
 
         Ok((candidate, batches))
+    }
+
+    /// Returns the greatest timestamp that a consumer reads from `batch`
+    /// (see [`inflated::Batch::max_record_timestamp`]), for the time index.
+    ///
+    /// A batch that a broker stored before it rewrote `max_timestamp` from
+    /// the records carries the header that its client wrote, which can be
+    /// below a record (or -1) or far above every record. An index built from
+    /// such a header answers no match for a record that exists, or gives no
+    /// entry to the batches after it. Kafka's index reads the header, which
+    /// `LogValidator` has already rewritten from the records, so the values
+    /// here are the ones that Kafka's index holds ([`LogSegment.java`]).
+    ///
+    /// The function returns the header for a batch that does not decode,
+    /// instead of failing the backfill, so that one corrupt batch does not
+    /// fail every lookup on its partition. A scan that reaches the batch
+    /// still answers an error.
+    ///
+    /// The decode runs on the blocking pool, as a produce's does, because a
+    /// backfill decodes every batch of its partition.
+    ///
+    /// [`LogSegment.java`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L487-L495
+    async fn max_record_timestamp(
+        topition: &Topition,
+        base_offset: i64,
+        batch: &deflated::Batch,
+    ) -> Result<i64> {
+        let decoded = {
+            let batch = batch.clone();
+            offload(move || {
+                Ok(inflated::Batch::try_from(&batch)
+                    .map(|inflated| inflated.max_record_timestamp()))
+            })
+        }
+        .await?;
+
+        Ok(decoded
+            .inspect_err(|error| {
+                warn!(
+                    ?error,
+                    ?topition,
+                    base_offset,
+                    max_timestamp = batch.max_timestamp,
+                    "time index backfill: taking the header's maximum timestamp of a batch that \
+                     does not decode"
+                )
+            })
+            .unwrap_or(batch.max_timestamp))
     }
 
     /// Commits a backfill `candidate` (from

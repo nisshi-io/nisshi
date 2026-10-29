@@ -36,8 +36,9 @@ use crate::{
 /// requests, where it can size that limit from the pool.
 const LIST_OFFSETS_CONCURRENCY: usize = 4;
 
-/// How many timed-out partitions the deadline warning names.
-const TIMED_OUT_SAMPLE: usize = 8;
+/// How many partitions each per-request warning of a timeout or a storage
+/// error names.
+const PARTITION_SAMPLE: usize = 8;
 
 /// A [`Service`] using its [`Storage`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
 /// ```no_run
@@ -123,13 +124,14 @@ where
     /// bounded by one deadline for the whole request. A partition still
     /// unanswered at the deadline gets `REQUEST_TIMED_OUT`, which clients
     /// retry, so one slow partition neither delays the others nor holds the
-    /// request past the client's own timeout. A storage error still fails
-    /// the whole request.
+    /// request past the client's own timeout. A storage error answers in its
+    /// own partition (see [`Self::storage_error_code`]), and the other
+    /// partitions still answer.
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
-    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+    ) -> Vec<(Topition, ListOffsetResponse)> {
         let started_at = Instant::now();
         let deadline = started_at + LIST_OFFSETS_READ_DEADLINE;
 
@@ -155,6 +157,8 @@ where
 
         let mut responses = vec![Vec::new(); offsets.len()];
         let mut timed_out = Vec::new();
+        let mut failed = Vec::new();
+        let mut first_error = None;
 
         while let Some((index, (topition, list_offset), answer)) = answers.next().await {
             responses[index] = match answer {
@@ -165,8 +169,10 @@ where
                 //
                 // [Partition.scala#L1617-L1619]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1617-L1619
                 // [UnifiedLog.scala#L1325-L1336]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1325-L1336
-                Ok(answer) if matches!(list_offset, ListOffset::Earliest | ListOffset::Latest) => {
-                    answer?
+                Ok(Ok(answer))
+                    if matches!(list_offset, ListOffset::Earliest | ListOffset::Latest) =>
+                {
+                    answer
                         .into_iter()
                         .map(|(topition, response)| {
                             (
@@ -180,7 +186,24 @@ where
                         .collect()
                 }
 
-                Ok(answer) => answer?,
+                Ok(Ok(answer)) => answer,
+
+                Ok(Err(error)) => {
+                    let error_code = Self::storage_error_code(&error);
+                    debug!(?error, ?topition, ?error_code, "list offsets");
+
+                    failed.push((topition, error_code));
+                    _ = first_error.get_or_insert(error);
+
+                    vec![(
+                        topition.clone(),
+                        ListOffsetResponse {
+                            error_code,
+                            timestamp: None,
+                            offset: Some(-1),
+                        },
+                    )]
+                }
 
                 Err(missed) => {
                     timed_out.push((topition, missed));
@@ -213,12 +236,45 @@ where
                 reading = count(Missed::Reading),
                 queued = count(Missed::Queued),
                 not_started = count(Missed::NotStarted),
-                sample = ?&timed_out[..timed_out.len().min(TIMED_OUT_SAMPLE)],
+                sample = ?&timed_out[..timed_out.len().min(PARTITION_SAMPLE)],
                 "list offsets answered REQUEST_TIMED_OUT for partitions unread at the deadline"
             );
         }
 
-        Ok(responses.into_iter().flatten().collect())
+        // One line per request, not per partition, so an unavailable storage
+        // engine can't flood the log with a line for every partition of every
+        // retry; each partition is at `debug!` above.
+        if let Some(first_error) = first_error {
+            error!(
+                failed = failed.len(),
+                partitions = offsets.len(),
+                sample = ?&failed[..failed.len().min(PARTITION_SAMPLE)],
+                ?first_error,
+                "list offsets answered an error for partitions whose storage read failed"
+            );
+        }
+
+        responses.into_iter().flatten().collect()
+    }
+
+    /// Returns the error code that a partition answers when storage fails
+    /// to read its offset: the code of an [`Error::Api`], and
+    /// `KAFKA_STORAGE_ERROR` for every other error.
+    ///
+    /// Kafka answers `UNKNOWN_SERVER_ERROR` for an exception that it does
+    /// not map to a code ([KafkaApis.scala#L1228-L1251]). We answer
+    /// `KAFKA_STORAGE_ERROR` instead, because these errors come from the
+    /// storage engine (a database or object store that times out or is
+    /// unavailable), and Kafka answers that code for a log that it cannot
+    /// read. A client retries `KAFKA_STORAGE_ERROR` after a metadata
+    /// refresh, and gives up on `UNKNOWN_SERVER_ERROR`.
+    ///
+    /// [KafkaApis.scala#L1228-L1251]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1228-L1251
+    fn storage_error_code(error: &Error) -> ErrorCode {
+        match error {
+            Error::Api(error_code) => *error_code,
+            _ => ErrorCode::KafkaStorageError,
+        }
     }
 }
 
@@ -327,11 +383,8 @@ where
                 );
             }
 
-            let mut offsets = self
-                .list_offsets(isolation_level, &offsets)
-                .await
-                .inspect(|r| debug!(?r, ?offsets))
-                .inspect_err(|err| error!(?err, ?offsets))?;
+            let mut offsets = self.list_offsets(isolation_level, &offsets).await;
+            debug!(?offsets);
 
             offsets.extend(invalid_timestamps);
 
@@ -461,6 +514,7 @@ mod tests {
         OffsetAt(i64, i64),
         Stall,
         Fail,
+        FailWith(ErrorCode),
     }
 
     /// Records the partition of a stalled storage read when nisshi drops it.
@@ -567,6 +621,8 @@ mod tests {
 
                     pending().await
                 }
+
+                Some(Answer::FailWith(error_code)) => Err(Error::Api(*error_code)),
 
                 Some(Answer::Fail) | None => Err(Error::Message(format!(
                     "storage failed for partition {partition}"
@@ -977,23 +1033,38 @@ mod tests {
         Ok(())
     }
 
-    /// A storage error still fails the whole request, dropping the reads
-    /// still in flight without reading any partition twice.
+    /// A storage error answers `KAFKA_STORAGE_ERROR` in its own partition, an
+    /// API error answers its own code, and the other partitions still answer,
+    /// beside one that times out.
     #[tokio::test(start_paused = true)]
-    async fn storage_error_fails_the_request() -> Result<()> {
-        let storage = Stub::new(&[Answer::Stall, Answer::Fail, Answer::Offset(30)]);
+    async fn storage_error_answers_in_its_partition() -> Result<()> {
+        let storage = Stub::new(&[
+            Answer::Offset(10),
+            Answer::Fail,
+            Answer::Offset(30),
+            Answer::FailWith(ErrorCode::NotLeaderOrFollower),
+            Answer::Stall,
+        ]);
 
-        let outcome = list_offsets(storage.clone(), 3).await;
+        let partitions = list_offsets(storage.clone(), 5).await?;
 
-        assert!(
-            matches!(outcome, Err(Error::Message(ref message)) if message.contains("partition 1")),
-            "{outcome:?}"
+        assert_eq!(
+            vec![
+                (0, ErrorCode::None, Some(10)),
+                (1, ErrorCode::KafkaStorageError, Some(-1)),
+                (2, ErrorCode::None, Some(30)),
+                (3, ErrorCode::NotLeaderOrFollower, Some(-1)),
+                (4, ErrorCode::RequestTimedOut, Some(-1)),
+            ],
+            answers(&partitions)?
         );
-        assert_eq!(vec![0], storage.dropped());
-
-        let calls = storage.calls();
-        assert!(calls.starts_with(&[0, 1]), "{calls:?}");
-        assert!(calls.len() <= 3, "{calls:?}");
+        assert!(
+            partitions
+                .iter()
+                .all(|partition| partition.timestamp == Some(-1)),
+            "{partitions:?}"
+        );
+        assert_eq!(vec![0, 1, 2, 3, 4], storage.calls());
 
         Ok(())
     }
