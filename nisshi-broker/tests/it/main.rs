@@ -52,6 +52,7 @@ pub mod log_redaction;
 pub mod metadata;
 pub mod new_cg;
 pub mod offset_commit_fence;
+pub mod offset_commit_unknown_partition;
 pub mod offset_fetch_storage_error;
 pub mod person;
 pub mod pg_init_producer;

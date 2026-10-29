@@ -2785,35 +2785,41 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_commit) in offsets {
-            if self
-                .topic_metadata(&TopicId::from(topition))
-                .await?
-                .is_some()
-            {
-                let location = self.committed_offset_location(group_id, topition)?;
-
-                let payload = serde_json::to_vec(&offset_commit)
-                    .map(Bytes::from)
-                    .map(PutPayload::from)?;
-
-                let options = PutOptions {
-                    mode: PutMode::Overwrite,
-                    attributes: json_content_type(),
-                    ..Default::default()
-                };
-
-                let error_code = self
-                    .object_store
-                    .put_opts(&location, payload, options)
-                    .await
-                    .inspect_err(|err| error!(?err))
-                    .inspect(|outcome| debug!(?outcome))
-                    .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None);
-
-                responses.push((topition.to_owned(), error_code));
-            } else {
-                responses.push((topition.to_owned(), ErrorCode::UnknownTopicOrPartition));
+            // Kafka answers `UNKNOWN_TOPIC_OR_PARTITION` for each partition
+            // of an unknown topic, and for each index that a known topic does
+            // not have, and commits the other partitions of the request
+            // ([KafkaApis.scala#L476-L491]).
+            //
+            // [KafkaApis.scala#L476-L491]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L476-L491
+            match self.ensure_partition_exists(topition).await {
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                    responses.push((topition.to_owned(), ErrorCode::UnknownTopicOrPartition));
+                    continue;
+                }
+                checked => _ = checked?,
             }
+
+            let location = self.committed_offset_location(group_id, topition)?;
+
+            let payload = serde_json::to_vec(&offset_commit)
+                .map(Bytes::from)
+                .map(PutPayload::from)?;
+
+            let options = PutOptions {
+                mode: PutMode::Overwrite,
+                attributes: json_content_type(),
+                ..Default::default()
+            };
+
+            let error_code = self
+                .object_store
+                .put_opts(&location, payload, options)
+                .await
+                .inspect_err(|err| error!(?err))
+                .inspect(|outcome| debug!(?outcome))
+                .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None);
+
+            responses.push((topition.to_owned(), error_code));
         }
 
         Ok(responses)
