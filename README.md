@@ -211,7 +211,7 @@ topics needs the `parquet`, `iceberg`, or `delta` feature.
 
 The engines differ in what they support. For example, only PostgreSQL and SQLite apply
 retention and compaction. [Compatibility and feature status](docs/compatibility.md) lists what
-each engine supports, which Kafka APIs the broker answers, and which Kafka clients CI tests.
+each engine supports.
 
 Switching storage engines does not move data: topics, messages, and consumer group offsets stay in the old engine, and the new one starts empty. The release binary starts on `memory://`, and Docker Compose runs on PostgreSQL unless you set `STORAGE_ENGINE`.
 
@@ -836,13 +836,13 @@ broker now flushes pending metrics before exiting.
 
 Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Kafka 3.9.1
 message descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). Clients on
-Kafka 4.x negotiate down to those protocol versions. CI tests the broker with the librdkafka and
-franz-go integration test suites and the Apache Kafka command line tools.
-[Kafka clients tested](docs/compatibility.md#kafka-clients-tested) lists the versions and the
-known client gaps. Please [raise an issue][nisshi-issues] if a client or Kafka version you rely on
-behaves differently.
+Kafka 4.x negotiate down to those protocol versions. Idempotent producers work. Transactions are
+not supported, so Kafka Streams with `exactly_once_v2` fails.
 
-Transactions are not supported: a producer that calls `initTransactions()`, including Kafka Streams with `exactly_once_v2`, fails with `TransactionalIdAuthorizationException`. Idempotent producers work.
+For the details, see [Compatibility and feature status](docs/compatibility.md). It lists which
+Kafka APIs and topic configurations each storage engine supports, and the client versions CI tests
+along with their known gaps. Please [raise an issue][nisshi-issues] if a client or Kafka version
+you rely on behaves differently.
 
 ## Feedback
 
