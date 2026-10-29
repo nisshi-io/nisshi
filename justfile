@@ -178,13 +178,32 @@ fmt-fix:
 shellcheck:
     git ls-files -z '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
 
+# check that compose.yaml loads with no .env and no variables set, as on a fresh clone
+compose-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # dotenv-load puts .env in this recipe's environment, and compose reads that
+    # environment before the defaults, so compose runs with an empty environment.
+    status=0
+    stderr=$(env -i PATH="$PATH" HOME="$HOME" docker compose --env-file /dev/null config --quiet 2>&1 >/dev/null) || status=$?
+    if [[ -n "$stderr" ]]; then
+        printf '%s\n' "$stderr" >&2
+    fi
+    # The check fails only on a load error or an unset variable, and prints
+    # other warnings, because the runner's Compose version is not pinned and a
+    # newer one can add a warning for an unchanged file.
+    if [[ $status -ne 0 ]] || grep -q 'variable is not set' <<<"$stderr"; then
+        echo "compose-check: compose.yaml must load with no .env and give each variable a default" >&2
+        exit 1
+    fi
+
 miri:
     cargo +nightly miri test --no-fail-fast --all-features
 
 docker_arch := if arch() == "aarch64" { "arm64" } else { "amd64" }
 
 # build the static musl binary the Dockerfile packages into dist/linux/<arch>/nisshi
-# (needs zig and cargo-zigbuild; works on macOS and Linux hosts)
+# (needs zig, cargo-zigbuild and cargo-about; works on macOS and Linux hosts)
 docker-dist arch=docker_arch:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -199,6 +218,7 @@ docker-dist arch=docker_arch:
     target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
     mkdir -p dist/linux/{{ arch }}
     cp "${target_dir}/${target}"/release/nisshi dist/linux/{{ arch }}/nisshi
+    cargo about generate --all-features about.hbs > dist/linux/{{ arch }}/THIRD-PARTY-LICENSE.html
 
 docker-build: docker-dist
     docker build --tag ghcr.io/nisshi-io/nisshi --progress plain --debug .
@@ -279,7 +299,7 @@ docker-run-postgres:
         --publish 5432:5432 \
         --env PGUSER=postgres \
         --env POSTGRES_PASSWORD=postgres \
-        postgres:16.4
+        postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
 
 docker-prune:
     docker system prune --force
@@ -423,13 +443,13 @@ nisshi-server:
     target/debug/nisshi broker --schema-registry file://./etc/schema 2>&1 | tee broker.log
 
 kafka39:
-    docker run --d -p 9092:9092 apache/kafka:3.9.0
+    docker run --d -p 9092:9092 apache/kafka:3.9.0@sha256:fbc7d7c428e3755cf36518d4976596002477e4c052d1f80b5b9eafd06d0fff2f
 
 proxy-kafka39:
-    docker run --rm -p 19092:9092 apache/kafka:3.9.0
+    docker run --rm -p 19092:9092 apache/kafka:3.9.0@sha256:fbc7d7c428e3755cf36518d4976596002477e4c052d1f80b5b9eafd06d0fff2f
 
 proxy-kafka41:
-    docker run --rm -p 19092:9092 apache/kafka:4.1.0
+    docker run --rm -p 19092:9092 apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
 
 codespace-create:
     gh codespace create \
@@ -541,13 +561,13 @@ taxi-topic-populate: (cat-produce "taxi" "etc/data/trips.json")
 taxi-topic-consume: (cat-consume "taxi")
 
 # create taxi topic with generated fields with schema etc/schema/taxi.proto
-taxi-topic-create: (topic-create "taxi" "--partitions=1" "--config=tansu.lake.normalize=true" "--config=tansu.lake.partition=meta.day" "--config=tansu.lake.z_order=vendor_id" "--config=tansu.lake.sink=true" "--config=tansu.batch=true" "--config=tansu.batch.max_records=200" "--config=tansu.batch.timeout_ms=1000")
+taxi-topic-create: (topic-create "taxi" "--partitions=1" "--config=nisshi.lake.normalize=true" "--config=nisshi.lake.partition=meta.day" "--config=nisshi.lake.z_order=vendor_id" "--config=nisshi.lake.sink=true" "--config=nisshi.batch=true" "--config=nisshi.batch.max_records=200" "--config=nisshi.batch.timeout_ms=1000")
 
 # create taxi topic with schema etc/schema/taxi.proto
-taxi-topic-create-plain: (topic-create "taxi" "--partitions" "1" "--config" "tansu.lake.sink=true")
+taxi-topic-create-plain: (topic-create "taxi" "--partitions" "1" "--config" "nisshi.lake.sink=true")
 
 # create taxi topic with a flattened schema etc/schema/taxi.proto
-taxi-topic-create-normalize: (topic-create "taxi" "--partitions" "1" "--config" "tansu.lake.sink=true" "--config" "tansu.lake.normalize=true" "--config" "tansu.lake.normalize.separator=_" "--config" "tansu.lake.z_order=value_vendor_id")
+taxi-topic-create-normalize: (topic-create "taxi" "--partitions" "1" "--config" "nisshi.lake.sink=true" "--config" "nisshi.lake.normalize=true" "--config" "nisshi.lake.normalize.separator=_" "--config" "nisshi.lake.z_order=value_vendor_id")
 
 taxi-topic-generator: (generator "taxi" "--broker=tcp://localhost:9092" "--per-second=10" "--producers=16" "--batch-size=1" "--duration-seconds=60")
 
@@ -570,7 +590,7 @@ employee-produce: (cat-produce "employee" "etc/data/employees.json")
 employee-duckdb-delta: (duckdb "\"select * from delta_scan('s3://lake/nisshi.employee');\"")
 
 # create customer topic with schema etc/schema/customer.proto
-customer-topic-create *args: (topic-create "customer" "--partitions=1" "--config=tansu.lake.normalize=true" "--config=tansu.lake.partition=meta.day" "--config=tansu.lake.sink=true" "--config=tansu.batch=true" "--config=tansu.batch.max_records=200" "--config=tansu.batch.timeout_ms=1000" args)
+customer-topic-create *args: (topic-create "customer" "--partitions=1" "--config=nisshi.lake.normalize=true" "--config=nisshi.lake.partition=meta.day" "--config=nisshi.lake.sink=true" "--config=nisshi.batch=true" "--config=nisshi.batch.max_records=200" "--config=nisshi.batch.timeout_ms=1000" args)
 
 customer-topic-generator *args: (generator "customer" args)
 
@@ -760,7 +780,7 @@ producer-perf-1000000: (producer-perf "1000000" "1024" "25000000")
 ps-nisshi-rss:
     ps -p $(pgrep nisshi) -o rss= | awk '{print $1/1024 " MB"}'
 
-telemetry-topic-create: (topic-create "telemetry" "--config" "tansu.virtual=true")
+telemetry-topic-create: (topic-create "telemetry" "--config" "nisshi.virtual=true")
 
 telemetry-produce-valid profile="dev":
     echo '{"key": "SK06 YPM", "value": {"latitude":52.930412156530465,"longitude":-4.894550244518114,"altitude":158.06766871179406}}' | target/{{ replace(profile, "dev", "debug") }}/nisshi cat produce telemetry

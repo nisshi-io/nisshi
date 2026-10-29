@@ -15,6 +15,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! SlateDB storage engine implementation
 //!
+//! This engine is deprecated and may be removed in a future release. Use `postgres://` for
+//! production, or `sqlite://` or `memory://` for development.
+//!
 //! This module provides a storage engine implementation using SlateDB,
 //! a key-value store built on object storage.
 //!

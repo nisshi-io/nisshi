@@ -16,11 +16,14 @@ use nisshi_sans_io::{
     ApiKey, ErrorCode, InitProducerIdRequest, InitProducerIdResponse, RequestInput,
 };
 use rama::Service;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::{Error, ProducerIdResponse, Result, Storage, producer_claim};
 
 /// A [`Service`] using its [`Storage`] taking [`InitProducerIdRequest`] returning [`InitProducerIdResponse`].
+///
+/// The service serves only idempotent producers, and answers a request that carries a transactional
+/// ID with [`ErrorCode::TransactionalIdAuthorizationFailed`] before it calls the storage.
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{ErrorCode, InitProducerIdRequest, InitProducerIdResponse};
@@ -103,24 +106,41 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        let response = match producer_claim(input.request.producer_id, input.request.producer_epoch)
-        {
-            Ok(claim) => {
-                // v0-2 have no ProducerId or ProducerEpoch, so a fresh request reaches
-                // storage as -1, the default Kafka gives those fields.
-                let (producer_id, producer_epoch) = claim.unwrap_or((-1, -1));
+        // Nisshi does not support transactions.
+        let response = if input.request.transactional_id.is_some() {
+            // Kafka answers this error to a principal that may not use a transactional ID
+            // ([KafkaApis.scala#L2310-L2312]). The Java client's `initTransactions()` throws it
+            // ([TransactionManager.java#L1325-L1329]). librdkafka treats it as fatal
+            // ([rdkafka_idempotence.c#L162-L165]). In both clients, the producer stops before it
+            // sends a record.
+            //
+            // [KafkaApis.scala#L2310-L2312]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2310-L2312
+            // [TransactionManager.java#L1325-L1329]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java#L1325-L1329
+            // [rdkafka_idempotence.c#L162-L165]: https://github.com/confluentinc/librdkafka/blob/v2.3.0/src/rdkafka_idempotence.c#L162-L165
+            warn!(
+                transactional_id = ?input.request.transactional_id,
+                "refusing InitProducerId: transactions are not supported"
+            );
+            ProducerIdResponse::failed(ErrorCode::TransactionalIdAuthorizationFailed)
+        } else {
+            match producer_claim(input.request.producer_id, input.request.producer_epoch) {
+                Ok(claim) => {
+                    // v0-2 have no ProducerId or ProducerEpoch, so a fresh request reaches storage
+                    // as -1, the default Kafka gives those fields.
+                    let (producer_id, producer_epoch) = claim.unwrap_or((-1, -1));
 
-                self.storage
-                    .init_producer(
-                        input.request.transactional_id.as_deref(),
-                        input.request.transaction_timeout_ms,
-                        Some(producer_id),
-                        Some(producer_epoch),
-                    )
-                    .await?
+                    self.storage
+                        .init_producer(
+                            None,
+                            input.request.transaction_timeout_ms,
+                            Some(producer_id),
+                            Some(producer_epoch),
+                        )
+                        .await?
+                }
+
+                Err(error) => ProducerIdResponse::failed(error),
             }
-
-            Err(error) => ProducerIdResponse::failed(error),
         };
 
         // A failed answer carries producer ID and epoch -1, so this log is the only

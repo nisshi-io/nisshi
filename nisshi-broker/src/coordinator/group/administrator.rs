@@ -62,7 +62,8 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     GroupDetail, GroupDetailResponse, GroupMember, GroupRebalance, GroupState, InitialDelay,
-    JoinPhase, OffsetCommitRequest, PendingSync, Storage, Topition, UpdateError, Version,
+    JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync, Storage, Topition, UpdateError,
+    Version, describe_groups_response, list_groups_response,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::{
@@ -136,6 +137,8 @@ impl Default for GroupCoordinatorConfig {
 pub struct JoinRequest<'a> {
     pub api_version: i16,
     pub client_id: Option<&'a str>,
+    /// The client's address, as `DescribeGroups` reports it.
+    pub client_host: Option<&'a str>,
     pub group_id: &'a str,
     pub session_timeout_ms: i32,
     /// The request's rebalance timeout, or its session timeout for version 0, which has no
@@ -947,6 +950,7 @@ where
     #[instrument(skip(
         self,
         client_id,
+        client_host,
         session_timeout_ms,
         rebalance_timeout_ms,
         group_instance_id,
@@ -958,6 +962,7 @@ where
         &self,
         api_version: i16,
         client_id: Option<&str>,
+        client_host: Option<&str>,
         group_id: &str,
         session_timeout_ms: i32,
         rebalance_timeout_ms: Option<i32>,
@@ -970,6 +975,7 @@ where
         debug!(
             api_version,
             ?client_id,
+            ?client_host,
             ?session_timeout_ms,
             ?rebalance_timeout_ms,
             ?group_instance_id,
@@ -1035,6 +1041,7 @@ where
             let request = JoinRequest {
                 api_version,
                 client_id,
+                client_host,
                 group_id,
                 session_timeout_ms,
                 rebalance_timeout_ms: rebalance_timeout_ms.unwrap_or(session_timeout_ms),
@@ -1502,6 +1509,76 @@ where
                 .results(Some(results)),
         ))
     }
+
+    /// Lists each group with its state at the current time, after the changes that the passing
+    /// of time makes, as Kafka's timers would have made them.
+    #[instrument(skip(self))]
+    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Body> {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "list_groups")]);
+
+        let listed = self
+            .storage
+            .list_groups()
+            .await
+            .map(|groups| settled_groups(&self.storage, groups, SystemTime::now()));
+
+        Ok(Body::ListGroupsResponse(list_groups_response(
+            listed,
+            states_filter,
+        )))
+    }
+
+    /// Describes each group as it is at the current time, after the changes that the passing of
+    /// time makes, as Kafka's timers would have made them.
+    #[instrument(skip(self))]
+    async fn describe_groups(
+        &self,
+        group_ids: Option<&[String]>,
+        include_authorized_operations: bool,
+    ) -> Result<Body> {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "describe_groups")]);
+
+        let described = self
+            .storage
+            .describe_groups(group_ids, include_authorized_operations)
+            .await
+            .map(|groups| settled_groups(&self.storage, groups, SystemTime::now()));
+
+        Ok(Body::DescribeGroupsResponse(describe_groups_response(
+            described,
+            group_ids,
+            include_authorized_operations,
+        )))
+    }
+}
+
+/// Returns each group in `groups` as it is at `now`. A request reads a group to report its state,
+/// so the group gets each change that is due by then, as for any other request: a member whose
+/// session has expired is removed, and a join phase whose deadline has passed ends. The settled
+/// group is not stored.
+fn settled_groups<O>(
+    storage: &O,
+    groups: Vec<NamedGroupDetail>,
+    now: SystemTime,
+) -> Vec<NamedGroupDetail>
+where
+    O: Storage + Clone,
+{
+    groups
+        .into_iter()
+        .map(|NamedGroupDetail { name, response }| match response {
+            GroupDetailResponse::Found(detail) => {
+                let settled =
+                    Wrapper::with_storage_group_detail(storage.clone(), detail).settle(&name, now);
+
+                NamedGroupDetail::found(name, GroupDetail::from(&settled))
+            }
+
+            GroupDetailResponse::ErrorCode(error_code) => {
+                NamedGroupDetail::error_code(name, error_code)
+            }
+        })
+        .collect()
 }
 
 /// Kafka's Empty, PreparingRebalance and CompletingRebalance states. A group with a join phase is
@@ -2134,11 +2211,13 @@ where
                 join_response: JoinGroupResponseMember::default()
                     .member_id(member_id.to_owned())
                     .group_instance_id(request.group_instance_id.map(ToOwned::to_owned)),
-                last_contact: None,
+                ..Member::default()
             });
 
         member.join_response.metadata = metadata.clone();
         member.last_contact = Some(now);
+        member.client_id = request.client_id.unwrap_or_default().to_owned();
+        member.client_host = request.client_host.unwrap_or_default().to_owned();
     }
 
     /// Forgets each pending member id whose session timeout has expired. Returns whether it forgot
@@ -2942,6 +3021,8 @@ where
 pub struct Member {
     join_response: JoinGroupResponseMember,
     last_contact: Option<SystemTime>,
+    client_id: String,
+    client_host: String,
 }
 
 impl From<&Member> for GroupMember {
@@ -2949,6 +3030,8 @@ impl From<&Member> for GroupMember {
         Self {
             join_response: member.join_response.clone(),
             last_contact: member.last_contact,
+            client_id: member.client_id.clone(),
+            client_host: member.client_host.clone(),
         }
     }
 }
@@ -2958,6 +3041,8 @@ impl From<&GroupMember> for Member {
         Self {
             join_response: member.join_response.clone(),
             last_contact: member.last_contact,
+            client_id: member.client_id.clone(),
+            client_host: member.client_host.clone(),
         }
     }
 }
@@ -3878,6 +3963,7 @@ mod tests {
             s.join(
                 9,
                 Some(CLIENT_ID),
+                None,
                 GROUP_ID,
                 session_timeout_ms,
                 rebalance_timeout_ms,

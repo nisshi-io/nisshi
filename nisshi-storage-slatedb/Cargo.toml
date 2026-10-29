@@ -1,6 +1,6 @@
 [package]
 name = "nisshi-storage-slatedb"
-description = "Nisshi storage backend for slatedb:// using SlateDB on object storage"
+description = "Deprecated Nisshi storage backend for slatedb:// using SlateDB on object storage"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -24,6 +24,9 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

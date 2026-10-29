@@ -210,6 +210,74 @@ impl Batch {
         self.base_offset + i64::from(self.last_offset_delta)
     }
 
+    /// Returns the timestamp that a consumer reads for `record`.
+    ///
+    /// For each record of a [`TimestampType::LogAppendTime`] batch, a consumer reads the batch's
+    /// `max_timestamp`. For each record of a [`TimestampType::CreateTime`] batch, it reads
+    /// `base_timestamp` plus the record's `timestamp_delta`, with Java's wrapping `long`
+    /// addition. Kafka defines `max_timestamp` for each type in [`DefaultRecordBatch`].
+    ///
+    /// [`DefaultRecordBatch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L90-L93
+    pub fn record_timestamp(&self, record: &Record) -> i64 {
+        match TimestampType::from(self.attributes) {
+            TimestampType::LogAppendTime => self.max_timestamp,
+            TimestampType::CreateTime => self.base_timestamp.wrapping_add(record.timestamp_delta),
+        }
+    }
+
+    /// Appends the records of `other` to this batch, rebased onto this batch's base offset and
+    /// base timestamp. Each record keeps its timestamp, and each offset delta moves past this
+    /// batch's `last_offset_delta`, so the records of a well-formed `other` continue this batch's
+    /// offsets.
+    ///
+    /// Returns [`Error::OffsetDeltaOverflow`] when an offset delta of the merged batch does not
+    /// fit in an `i32`. This batch is then unchanged.
+    ///
+    /// Timestamp deltas use wrapping arithmetic, not checked arithmetic, because a checked rebase
+    /// would reject batches that Kafka accepts: Kafka's default `timestamp.before.max.ms` is
+    /// `Long.MAX_VALUE`, and nothing checks the producer's `base_timestamp` on a
+    /// [`TimestampType::LogAppendTime`] batch, so two valid bases can be more than `i64::MAX`
+    /// apart. The wrapping sum of this batch's base and a rebased delta is each record's original
+    /// timestamp, which is the sum that a consumer computes in [`DefaultRecord`].
+    ///
+    /// [`DefaultRecord`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecord.java#L314
+    pub fn append_rebased(&mut self, other: Batch) -> Result<()> {
+        let first_offset_delta = self
+            .last_offset_delta
+            .checked_add(1)
+            .ok_or(Error::OffsetDeltaOverflow("last_offset_delta"))?;
+
+        let last_offset_delta = other
+            .last_offset_delta
+            .checked_add(1)
+            .and_then(|appended| self.last_offset_delta.checked_add(appended))
+            .ok_or(Error::OffsetDeltaOverflow("last_offset_delta"))?;
+
+        let timestamp_shift = other.base_timestamp.wrapping_sub(self.base_timestamp);
+
+        let records = other
+            .records
+            .into_iter()
+            .map(|record| {
+                record
+                    .offset_delta
+                    .checked_add(first_offset_delta)
+                    .map(|offset_delta| Record {
+                        offset_delta,
+                        timestamp_delta: record.timestamp_delta.wrapping_add(timestamp_shift),
+                        ..record
+                    })
+                    .ok_or(Error::OffsetDeltaOverflow("record offset_delta"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.records.extend(records);
+        self.last_offset_delta = last_offset_delta;
+        self.max_timestamp = self.max_timestamp.max(other.max_timestamp);
+
+        Ok(())
+    }
+
     pub fn keys(&self) -> BTreeSet<Bytes> {
         self.records
             .iter()
@@ -426,6 +494,26 @@ impl Builder {
         self
     }
 
+    /// Sets `max_timestamp` to the largest timestamp of the records. The largest timestamp is
+    /// `base_timestamp` plus the largest `timestamp_delta`. If the builder has no records,
+    /// `max_timestamp` does not change.
+    #[must_use]
+    pub fn max_timestamp_of_records(self) -> Self {
+        let Some(max_delta) = self
+            .records
+            .iter()
+            .map(|record| i64::from(record.timestamp_delta))
+            .max()
+        else {
+            return self;
+        };
+
+        Self {
+            max_timestamp: self.base_timestamp + max_delta,
+            ..self
+        }
+    }
+
     fn crc(&self) -> Result<u32> {
         let mut encoder = RecordBatchEncoder::new(BytesMut::with_capacity(self.size_in_bytes()?));
         self.attributes.serialize(&mut encoder)?;
@@ -483,6 +571,8 @@ impl Builder {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -753,6 +843,159 @@ mod tests {
         assert_eq!(None, records[0].key);
         assert_eq!(2, records[1].offset_delta);
         assert_eq!(Some(Bytes::from_static(b"k1")), records[1].key);
+
+        Ok(())
+    }
+
+    /// Returns a `CreateTime` batch with one record for each of `timestamp_deltas`, at
+    /// consecutive offset deltas from 0.
+    fn batch_with_timestamp_deltas(base_timestamp: i64, timestamp_deltas: &[i64]) -> Result<Batch> {
+        let builder = timestamp_deltas.iter().zip(0..).fold(
+            Batch::builder()
+                .base_timestamp(base_timestamp)
+                .max_timestamp(
+                    base_timestamp
+                        .wrapping_add(timestamp_deltas.iter().copied().max().unwrap_or_default()),
+                )
+                .last_offset_delta(i32::try_from(timestamp_deltas.len())? - 1),
+            |builder, (timestamp_delta, offset_delta)| {
+                builder.record(
+                    Record::builder()
+                        .offset_delta(offset_delta)
+                        .timestamp_delta(*timestamp_delta)
+                        .value(Some(Bytes::from_static(b"v"))),
+                )
+            },
+        );
+
+        builder.build()
+    }
+
+    fn record_timestamps(batch: &Batch) -> Vec<i64> {
+        batch
+            .records
+            .iter()
+            .map(|record| batch.record_timestamp(record))
+            .collect()
+    }
+
+    fn offset_deltas(batch: &Batch) -> Vec<i32> {
+        batch
+            .records
+            .iter()
+            .map(|record| record.offset_delta)
+            .collect()
+    }
+
+    #[test]
+    fn append_rebased_gives_contiguous_offsets_and_keeps_each_record_timestamp() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut sink = batch_with_timestamp_deltas(1_000, &[0, 5])?;
+        let appended = batch_with_timestamp_deltas(2_000, &[0, 7])?;
+
+        sink.append_rebased(appended)?;
+
+        assert_eq!(vec![0, 1, 2, 3], offset_deltas(&sink));
+        assert_eq!(vec![1_000, 1_005, 2_000, 2_007], record_timestamps(&sink));
+        assert_eq!(3, sink.last_offset_delta);
+        assert_eq!(2_007, sink.max_timestamp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn append_rebased_keeps_each_record_timestamp_when_the_appended_base_is_earlier() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        let mut sink = batch_with_timestamp_deltas(2_000, &[0, 7])?;
+        let appended = batch_with_timestamp_deltas(1_000, &[0, 5])?;
+
+        sink.append_rebased(appended)?;
+
+        assert_eq!(vec![0, 1, 2, 3], offset_deltas(&sink));
+        assert_eq!(vec![2_000, 2_007, 1_000, 1_005], record_timestamps(&sink));
+        assert_eq!(3, sink.last_offset_delta);
+        assert_eq!(2_007, sink.max_timestamp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn append_rebased_keeps_each_record_timestamp_when_the_bases_are_more_than_i64_max_apart()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut sink = batch_with_timestamp_deltas(i64::MIN, &[0])?;
+        let appended = batch_with_timestamp_deltas(i64::MAX, &[0])?;
+
+        assert_eq!(vec![i64::MIN], record_timestamps(&sink));
+        assert_eq!(vec![i64::MAX], record_timestamps(&appended));
+
+        sink.append_rebased(appended)?;
+
+        assert_eq!(vec![0, 1], offset_deltas(&sink));
+        assert_eq!(vec![i64::MIN, i64::MAX], record_timestamps(&sink));
+        assert_eq!(i64::MAX, sink.max_timestamp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn append_rebased_rejects_a_record_offset_delta_that_overflows_and_leaves_the_sink_unchanged()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut sink = batch_with_timestamp_deltas(1_000, &[0])?;
+        let appended = Batch::builder()
+            .base_timestamp(2_000)
+            .max_timestamp(2_000)
+            .record(
+                Record::builder()
+                    .offset_delta(i32::MAX)
+                    .value(Some(Bytes::from_static(b"v"))),
+            )
+            .build()?;
+
+        let before = sink.clone();
+
+        assert_matches!(
+            sink.append_rebased(appended),
+            Err(Error::OffsetDeltaOverflow("record offset_delta"))
+        );
+        assert_eq!(before, sink);
+
+        Ok(())
+    }
+
+    #[test]
+    fn append_rebased_rejects_a_last_offset_delta_that_overflows_and_leaves_the_sink_unchanged()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+
+        for (sink_last_offset_delta, appended_last_offset_delta) in [
+            (i32::MAX, 0),
+            (i32::MAX, -1),
+            (0, i32::MAX),
+            (i32::MAX - 1, 1),
+        ] {
+            let mut sink = batch_with_timestamp_deltas(1_000, &[0])?;
+            sink.last_offset_delta = sink_last_offset_delta;
+
+            let mut appended = batch_with_timestamp_deltas(2_000, &[0])?;
+            appended.last_offset_delta = appended_last_offset_delta;
+
+            let before = sink.clone();
+
+            assert_matches!(
+                sink.append_rebased(appended),
+                Err(Error::OffsetDeltaOverflow("last_offset_delta")),
+                "sink last_offset_delta: {sink_last_offset_delta}, appended last_offset_delta: \
+                 {appended_last_offset_delta}"
+            );
+            assert_eq!(before, sink);
+        }
 
         Ok(())
     }

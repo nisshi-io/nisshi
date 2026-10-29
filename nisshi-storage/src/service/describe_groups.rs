@@ -17,9 +17,9 @@ use nisshi_sans_io::{
     describe_groups_response::DescribedGroup,
 };
 use rama::Service;
-use tracing::instrument;
+use tracing::{error, instrument};
 
-use crate::{Error, Result, Storage, authorized_operations};
+use crate::{Error, NamedGroupDetail, Result, Storage, authorized_operations};
 
 /// A [`Service`] using its [`Storage`] taking [`DescribeGroupsRequest`] returning [`DescribeGroupsResponse`].
 /// ```no_run
@@ -80,30 +80,87 @@ where
         let include_authorized_operations =
             input.request.include_authorized_operations.unwrap_or(false);
 
-        self.storage
-            .describe_groups(
-                input.request.groups.as_deref(),
-                include_authorized_operations,
-            )
-            .await
-            .map(|described| {
-                described
-                    .iter()
-                    .map(DescribedGroup::from)
-                    .map(|group| {
-                        let operations = authorized_operations::group(
-                            include_authorized_operations,
-                            group.error_code,
-                        );
-                        group.authorized_operations(Some(operations))
-                    })
-                    .collect::<Vec<_>>()
+        let group_ids = input.request.groups.as_deref();
+
+        Ok(describe_groups_response(
+            self.storage
+                .describe_groups(group_ids, include_authorized_operations)
+                .await,
+            group_ids,
+            include_authorized_operations,
+        ))
+    }
+}
+
+/// Returns the `DescribeGroups` response that describes each group in `described`, with its
+/// authorized operations when `include_authorized_operations` asks for them.
+///
+/// A storage error answers each group in `group_ids` with an error code instead of being
+/// returned, as Kafka answers each group, because the connection closes on a returned error, and
+/// the client gets no answer.
+pub fn describe_groups_response(
+    described: Result<Vec<NamedGroupDetail>>,
+    group_ids: Option<&[String]>,
+    include_authorized_operations: bool,
+) -> DescribeGroupsResponse {
+    let described = described.unwrap_or_else(|err| {
+        error!(?err, "the groups could not be described");
+
+        group_ids
+            .unwrap_or_default()
+            .iter()
+            .map(|group_id| {
+                NamedGroupDetail::error_code(group_id.clone(), err.group_request_error_code())
             })
-            .map(Some)
-            .map(|groups| {
-                DescribeGroupsResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .groups(groups)
-            })
+            .collect()
+    });
+
+    let groups = described
+        .iter()
+        .map(DescribedGroup::from)
+        .map(|group| {
+            let operations =
+                authorized_operations::group(include_authorized_operations, group.error_code);
+            group.authorized_operations(Some(operations))
+        })
+        .collect::<Vec<_>>();
+
+    DescribeGroupsResponse::default()
+        .throttle_time_ms(Some(0))
+        .groups(Some(groups))
+}
+
+#[cfg(test)]
+mod tests {
+    use nisshi_sans_io::ErrorCode;
+
+    use super::*;
+
+    #[test]
+    fn storage_error_answers_each_group_with_coordinator_not_available() -> Result<()> {
+        let group_ids = ["a".to_owned(), "b".to_owned()];
+
+        let response = describe_groups_response(
+            Err(Error::Message("connection refused".into())),
+            Some(&group_ids),
+            false,
+        );
+
+        let answered = response
+            .groups
+            .unwrap_or_default()
+            .into_iter()
+            .map(|group| Ok((group.group_id, ErrorCode::try_from(group.error_code)?)))
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(
+            vec![
+                ("a".to_owned(), ErrorCode::CoordinatorNotAvailable),
+                ("b".to_owned(), ErrorCode::CoordinatorNotAvailable),
+            ],
+            answered
+        );
+
+        Ok(())
     }
 }

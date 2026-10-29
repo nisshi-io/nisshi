@@ -1,0 +1,118 @@
+name: Release Readiness Check
+
+# Re-runs the Guardian scan (trunk mode) against main or a v* tag and blocks on
+# the gate. release.yml calls it on every `v*` tag and publishes nothing unless
+# it passes or an admin approves the `override` job. A dispatch re-checks main
+# or an existing tag on demand; before tagging, the push run of
+# guardian-scan.yaml on the merge commit already gives the trunk verdict.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "main, or a v* tag (e.g. v0.8.0)."
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      # The qualified ref (refs/tags/vX.Y.Z) and its bare name.
+      ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Anything but main or a v* tag would put guardian-scan.yaml in branch mode,
+  # where nothing enforces, and the check would go green without asking
+  # Guardian. A tag is always passed qualified: actions/checkout resolves a
+  # bare name to a branch before a tag.
+  resolve:
+    name: Resolve ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+      full_version: ${{ steps.ref.outputs.full_version }}
+    steps:
+      - id: ref
+        env:
+          REF_INPUT: ${{ inputs.ref }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tag_re='^v[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?$'
+          if [ -n "$REF_INPUT" ]; then
+            # workflow_call from release.yml: the tag and its name must agree.
+            if ! [[ "$VERSION" =~ $tag_re ]] || [ "$REF_INPUT" != "refs/tags/$VERSION" ]; then
+              echo "::error::ref '$REF_INPUT' and version '$VERSION' are not a v* tag and its name" >&2
+              exit 1
+            fi
+            ref="$REF_INPUT"; full_version="$VERSION"
+          elif [ "$VERSION" = "main" ]; then
+            # Empty, so guardian-scan uses `git describe`, as main's push run does.
+            ref="refs/heads/main"; full_version=""
+          elif [[ "$VERSION" =~ $tag_re ]]; then
+            ref="refs/tags/$VERSION"; full_version="$VERSION"
+          else
+            echo "::error::version '$VERSION' is neither main nor a v* tag" >&2
+            exit 1
+          fi
+          echo "checking $ref (full version: ${full_version:-from git describe})"
+          {
+            echo "ref=$ref"
+            echo "full_version=$full_version"
+          } >> "$GITHUB_OUTPUT"
+
+  guardian:
+    name: Guardian gate
+    needs: resolve
+    uses: ./.github/workflows/guardian-scan.yaml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      packages: read        # ceiling for guardian-scan's FOSSA job (private scan container)
+      pull-requests: write
+      checks: write
+      statuses: write
+      # Ceiling for guardian-scan's `update-manifest` job (OIDC). It writes no
+      # row on this path, but a reusable workflow's permissions must be a
+      # SUBSET of the caller's - under-granting fails at run creation.
+      id-token: write
+    # Load-bearing - do not remove, and do not replace with named secrets.
+    # `environment: guardian-trunk` on guardian-scan's jobs does not resolve
+    # their secrets when the workflow is reached via `workflow_call`: the
+    # `secrets` context arrives empty unless the caller opens it, so every
+    # secret comes through as an empty string and every scan job fails. They
+    # exist only in that environment, which a `uses:` job cannot enter, so
+    # naming them here is impossible, not merely verbose. release.yml's call
+    # of this workflow carries the same directive for the same reason.
+    secrets: inherit
+    with:
+      git_ref: ${{ needs.resolve.outputs.ref }}
+      product_full_version: ${{ needs.resolve.outputs.full_version }}
+
+  # In any mode but trunk the Guardian gate passes as report-only, so the check
+  # would go green without asking Guardian. `resolve` limits the ref to main or
+  # a v* tag, but that pattern is a copy of the one in guardian-scan-context.sh.
+  # This job reads the mode the scan actually ran in, so the check fails closed
+  # whatever either pattern accepts.
+  trunk-mode:
+    name: Verify trunk mode
+    needs: guardian
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          MODE: ${{ needs.guardian.outputs.mode }}
+        run: |
+          if [ "$MODE" != "trunk" ]; then
+            echo "::error::the scan ran in mode '${MODE:-unknown}', not trunk, so the Guardian gate did not enforce a verdict"
+            exit 1
+          fi

@@ -31,6 +31,8 @@ use uuid::Uuid;
 
 use crate::{AsJsonValue, AsKafkaRecord, Error, Generator, Result, Validator};
 
+mod container;
+
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 use apache_avro::schema::RecordSchema;
 
@@ -335,6 +337,13 @@ fn decode(validator: Option<&AvroSchema>, encoded: Option<Bytes>) -> Result<Opti
     debug!(?validator, len = ?encoded.as_ref().map(Bytes::len));
     validator.map_or(Ok(None), |schema| {
         encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
+            // apache_avro decompresses a block without a limit on its decompressed size, so a few
+            // compressed bytes can expand to gigabytes. We refuse every codec except `null`
+            // before the reader reads a block, because Nisshi writes Avro with `null`.
+            container::require_null_codec(&encoded).inspect_err(|_| {
+                debug!("record is not an Avro object container with the null codec")
+            })?;
+
             // The apache_avro error writes the record's values into its
             // message, so we log that the record failed and not the error.
             Reader::with_schema(schema, &encoded[..])
@@ -659,12 +668,12 @@ pub fn schema_write(schema: &AvroSchema, value: Value) -> Result<Bytes> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, sync::Arc, thread};
+    use std::{assert_matches, fs::File, sync::Arc, thread};
 
     use crate::Registry;
 
     use super::*;
-    use apache_avro::{Reader, types::Value};
+    use apache_avro::{Codec, DeflateSettings, Reader, types::Value};
 
     use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
@@ -1334,6 +1343,123 @@ mod tests {
                 r1.iter().find(|(name, _)| name == "lucky").unwrap().1
             );
         }
+
+        Ok(())
+    }
+
+    async fn validate_with_codecs(key_codec: Codec, value_codec: Codec) -> Result<()> {
+        let topic = "codec";
+
+        let schema = json!({
+            "type": "record",
+            "name": "Test",
+            "fields": [
+                {"name": "key", "type": "int"},
+                {"name": "value", "type": {
+                    "name": "value",
+                    "type": "record",
+                    "fields": [
+                        {"name": "name", "type": "string"},
+                        {"name": "email", "type": "string"}]}}]});
+
+        let object_store = InMemory::new();
+        _ = object_store
+            .put(
+                &Path::from(format!("{topic}.avsc")),
+                serde_json::to_vec(&schema)
+                    .map(Bytes::from)
+                    .map(PutPayload::from)?,
+            )
+            .await?;
+
+        let registry = Registry::new(object_store);
+
+        let key = encode_with_codec(&json!({"type": "int"}), Value::Int(32123), key_codec)?;
+
+        let value = encode_with_codec(
+            &json!({
+                "type": "record",
+                "name": "value",
+                "fields": [{"name": "name", "type": "string"}, {"name": "email", "type": "string"}]
+            }),
+            Value::Record(vec![
+                ("name".into(), Value::String("alice".into())),
+                ("email".into(), Value::String("alice@example.com".into())),
+            ]),
+            value_codec,
+        )?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().key(key.into()).value(value.into()))
+            .build()?;
+
+        registry.validate(topic, &batch).await
+    }
+
+    fn encode_with_codec(schema: &JsonValue, value: Value, codec: Codec) -> Result<Bytes> {
+        let schema = AvroSchema::parse(schema)?;
+        let mut writer = apache_avro::Writer::with_codec(&schema, vec![], codec);
+        _ = writer.append(value)?;
+        writer.into_inner().map(Bytes::from).map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn null_codec_key_and_value_is_valid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        validate_with_codecs(Codec::Null, Codec::Null).await
+    }
+
+    #[tokio::test]
+    async fn deflate_key_is_invalid_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_matches!(
+            validate_with_codecs(Codec::Deflate(DeflateSettings::default()), Codec::Null).await,
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deflate_value_is_invalid_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_matches!(
+            validate_with_codecs(Codec::Null, Codec::Deflate(DeflateSettings::default())).await,
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn snappy_value_is_invalid_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_matches!(
+            validate_with_codecs(Codec::Null, Codec::Snappy).await,
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn zstandard_value_is_invalid_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_matches!(
+            validate_with_codecs(
+                Codec::Null,
+                Codec::Zstandard(apache_avro::ZstandardSettings::default())
+            )
+            .await,
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
 
         Ok(())
     }

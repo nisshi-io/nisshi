@@ -1,6 +1,6 @@
 [package]
 name = "nisshi-auth"
-description = "Tansu Auth"
+description = "Nisshi Auth"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

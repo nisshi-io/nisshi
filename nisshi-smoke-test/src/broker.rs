@@ -35,7 +35,7 @@ mod host;
 mod stop_failure;
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, SystemTime},
 };
@@ -44,7 +44,9 @@ pub use failed_start::FailedStart;
 pub use stop_failure::StopFailure;
 
 use self::{deployment::Deployment, files::BrokerFiles, host::Shutdown};
-use crate::{KafkaCli, ReservedPort, ScramLogin, StorageUrl, common::unique, settings};
+use crate::{
+    KafkaCli, ReservedPort, ScramLogin, StorageUrl, TlsCertificate, common::unique, settings,
+};
 
 /// The storage URL option that makes a broker run maintenance every 2 seconds instead of every 10
 /// minutes, for a test that waits for a maintenance run.
@@ -76,6 +78,10 @@ pub struct LaunchOptions {
     pub log: Option<PathBuf>,
     /// The storage engine URL, usually [`settings::storage_url_under_test`].
     pub storage: StorageUrl,
+    /// The certificate the broker serves TLS with. When it is set, the broker accepts only TLS
+    /// connections, and the harness's own Kafka CLI tools connect with TLS and trust this
+    /// certificate.
+    pub tls: Option<TlsCertificate>,
 }
 
 impl LaunchOptions {
@@ -89,10 +95,13 @@ impl LaunchOptions {
             login: None,
             log: None,
             storage,
+            tls: None,
         }
     }
 
-    fn broker_args(&self) -> Vec<String> {
+    /// Returns the broker's command-line arguments. A TLS broker reads its certificate and private
+    /// key from `tls_directory`, where the harness puts them before the broker starts.
+    fn broker_args(&self, tls_directory: &Path) -> Vec<String> {
         let url = format!("tcp://127.0.0.1:{}", self.port.number());
 
         let mut args = vec![
@@ -105,6 +114,13 @@ impl LaunchOptions {
 
         if self.login.is_some() {
             args.push("--authentication".to_owned());
+        }
+
+        if self.tls.is_some() {
+            let certificate = tls_directory.join(files::TLS_CERTIFICATE_FILE);
+            let private_key = tls_directory.join(files::TLS_PRIVATE_KEY_FILE);
+            args.push(format!("--cert={}", certificate.display()));
+            args.push(format!("--key={}", private_key.display()));
         }
 
         args
@@ -256,6 +272,10 @@ impl Broker {
         let cli = match &options.login {
             Some(login) => KafkaCli::logged_in_as(&bootstrap, login),
             None => KafkaCli::new(&bootstrap),
+        };
+        let cli = match &options.tls {
+            Some(certificate) => cli.over_tls(certificate),
+            None => cli,
         };
 
         /// How long a launched broker has to answer after it starts.

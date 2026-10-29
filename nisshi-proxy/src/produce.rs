@@ -23,12 +23,12 @@ use std::{
     vec::IntoIter,
 };
 
+use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     Ack, ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::{
-        Record,
         deflated::{self, Frame},
         inflated,
     },
@@ -296,7 +296,7 @@ where
                 .iter()
                 .filter_map(|topic_name| {
                     self.resource_config
-                        .get(topic_name, "tansu.batch.timeout_ms")
+                        .get(topic_name, topic_config::BATCH_TIMEOUT_MS)
                         .and_then(|value| value.as_u64())
                 })
                 .min()
@@ -308,7 +308,7 @@ where
             .iter()
             .filter_map(|topic_name| {
                 self.resource_config
-                    .get(topic_name, "tansu.batch.max_records")
+                    .get(topic_name, topic_config::BATCH_MAX_RECORDS)
                     .and_then(|value| value.as_usize())
             })
             .min()
@@ -635,41 +635,33 @@ impl IntoIterator for PartitionBatch {
 fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error> {
     debug!(len = ?batches.len());
 
-    if batches.len() >= 2 {
-        let mut i = batches.into_iter();
-
-        if let Some(first) = i.next() {
-            let mut sink = inflated::Batch::try_from(first)?;
-
-            for batch in i {
-                let batch = inflated::Batch::try_from(batch)?;
-
-                sink.records.append(
-                    &mut batch
-                        .records
-                        .into_iter()
-                        .map(|record| Record {
-                            offset_delta: record.offset_delta + sink.last_offset_delta + 1,
-                            timestamp_delta: record.timestamp_delta
-                                + (batch.base_timestamp - sink.base_timestamp),
-                            ..record
-                        })
-                        .collect::<Vec<_>>(),
-                );
-
-                sink.last_offset_delta += batch.last_offset_delta + 1;
-                sink.max_timestamp = sink.max_timestamp.max(batch.max_timestamp);
-            }
-
-            deflated::Batch::try_from(sink)
-                .map(|batch| vec![batch])
-                .map_err(Into::into)
-        } else {
-            unreachable!()
-        }
-    } else {
-        Ok(batches)
+    if batches.len() < 2 {
+        return Ok(batches);
     }
+
+    // A clone of a batch shares its record bytes, so keeping the batches as sent costs no copy.
+    let batches_as_sent = batches.clone();
+
+    let mut i = batches.into_iter();
+
+    let Some(first) = i.next() else {
+        return Ok(Vec::new());
+    };
+
+    let mut sink = inflated::Batch::try_from(first)?;
+
+    for batch in i {
+        match sink.append_rebased(inflated::Batch::try_from(batch)?) {
+            // An offset delta of the merged batch overflows an `i32`. Kafka checks and stores each
+            // batch as sent, and each one may be valid, so we forward each one.
+            Err(nisshi_sans_io::Error::OffsetDeltaOverflow(_)) => return Ok(batches_as_sent),
+            appended => appended?,
+        }
+    }
+
+    deflated::Batch::try_from(sink)
+        .map(|batch| vec![batch])
+        .map_err(Into::into)
 }
 
 #[derive(Clone)]
@@ -915,6 +907,26 @@ mod tests {
         Ok(())
     }
 
+    /// A record offset delta of the second batch overflows once that batch is appended to the
+    /// first, so `combine` returns both batches as sent, for Kafka to check each one.
+    #[test]
+    fn combine_returns_the_batches_as_sent_when_an_offset_delta_overflows() -> Result<(), Error> {
+        let batch_with_maximum_offset_delta = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .offset_delta(i32::MAX)
+                    .value(Bytes::from_static(b"b").into()),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let batches = vec![record_data_batch(b"a")?, batch_with_maximum_offset_delta];
+
+        assert_eq!(batches, combine(batches.clone())?);
+
+        Ok(())
+    }
+
     /// The second batch's record is rebuilt with `offset_delta` 64, one byte
     /// longer as a varint than the 0 it was encoded with, so the combined
     /// batch must still decode record by record.
@@ -1121,6 +1133,46 @@ mod tests {
                 .into(),
             ))
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_timeout_key_and_its_alias_hold_a_batch_for_the_same_time() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        for timeout_key in ["tansu.batch.timeout_ms", "nisshi.batch.timeout_ms"] {
+            let mock = MockProduceService::default();
+
+            let configuration = ResourceConfig::default();
+            configuration.put("a", timeout_key, "5000")?;
+
+            let bp = (BatchProduceLayer::new(configuration)).into_layer(mock.clone());
+
+            let _batch = tokio::spawn({
+                let bp = bp.clone();
+
+                async move {
+                    bp.serve(produce_request("a", b"foo").map(Into::into)?)
+                        .await
+                }
+            });
+
+            yield_now().await;
+            advance(Duration::from_secs(1)).await;
+            yield_now().await;
+
+            let len = mock.reqs.lock().map(|guard| guard.len()).expect("poison");
+            assert_eq!(0, len, "{timeout_key} should hold the batch");
+
+            // The default batch timeout is 10 seconds, so a request sent after 6 seconds
+            // shows that the 5 second timeout applies.
+            advance(Duration::from_secs(5)).await;
+            yield_now().await;
+
+            let len = mock.reqs.lock().map(|guard| guard.len()).expect("poison");
+            assert_eq!(1, len, "{timeout_key} should release the batch");
+        }
+
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

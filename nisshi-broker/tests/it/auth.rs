@@ -35,8 +35,7 @@ use nisshi_sans_io::{
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated::Batch,
+    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated::Batch,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
@@ -980,10 +979,7 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(
-        &self,
-        _states_filter: Option<&[String]>,
-    ) -> nisshi_storage::Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> nisshi_storage::Result<Vec<NamedGroupDetail>> {
         unimplemented!()
     }
 

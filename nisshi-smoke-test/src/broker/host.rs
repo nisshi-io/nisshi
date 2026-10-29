@@ -49,6 +49,10 @@ impl Host {
         files: &BrokerFiles,
         log: &Path,
     ) -> Result<Self, String> {
+        if let Some(certificate) = &options.tls {
+            files.write_tls_certificate(certificate);
+        }
+
         match settings::broker_image() {
             Some(image) => BrokerContainer::launch(&image, options, files).map(Self::Container),
             None => BrokerProcess::launch(options, files.dir(), log).map(Self::Process),
@@ -79,6 +83,14 @@ impl Host {
         match self {
             Self::Process(process) => process.stop_after_failed_start(),
             Self::Container(container) => container.stop_after_failed_start(log),
+        }
+    }
+
+    /// Returns the directory where the broker reads its TLS certificate and private key.
+    pub(super) fn tls_directory(&self) -> &'static Path {
+        match self {
+            Self::Process(_) => BrokerProcess::tls_directory(),
+            Self::Container(_) => BrokerContainer::tls_directory(),
         }
     }
 

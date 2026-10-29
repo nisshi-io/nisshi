@@ -1,0 +1,38 @@
+version: 3
+
+project:
+  locator: nisshi-io_nisshi
+  id: nisshi-io_nisshi
+  name: nisshi
+  # FOSSA applies this only when it creates the project.
+  policy: Solace-Distributed-Standard
+  teams: []
+  labels: []
+
+vendoredDependencies:
+  forceRescans: false
+  scanMethod: CLILicenseScan
+  licenseScanPathFilters:
+    exclude:
+      - "./.git"
+      - "./.github"
+      - "./.devcontainer"
+      - "./compat"
+      - "./demo"
+      - "./docs"
+      - "./etc"
+      - "./fuzz"
+
+paths:
+  exclude:
+    - ./.git
+    - ./.github
+    - ./.devcontainer
+    - ./compat
+    - ./demo
+    - ./docs
+    - ./etc
+    - ./fuzz
+
+telemetry:
+  scope: full

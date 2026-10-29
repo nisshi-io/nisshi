@@ -1,0 +1,68 @@
+---
+# OpenSSF Scorecard: scores the repository's supply-chain practices (pinned
+# actions, token permissions, branch protection, and so on) and publishes the
+# result to the OpenSSF API, which backs the public Scorecard badge. Findings
+# also appear in the Security tab through the SARIF upload.
+#
+# Not a required check, and not part of `ci-gate`: it reports on the
+# repository, not on a change to it.
+#
+# Results are published only for public repositories, so the job skips itself
+# in a private one.
+#
+# The `Branch-Protection` check reports only partly without a personal access
+# token; this workflow uses none, so that check stays partial.
+name: Scorecard
+on:
+  # Re-run when a classic branch protection rule changes. Ruleset changes do
+  # not trigger this event; the weekly run picks them up.
+  branch_protection_rule:
+  schedule:
+    # Weekly, Sunday 10:23 UTC, which is 06:23 US Eastern while daylight saving
+    # time is in effect (05:23 after it ends). Weekend and before working hours,
+    # like the Dependabot schedule. Not on the hour, so the run does not queue
+    # with the many scheduled workflows that start at :00.
+    - cron: "23 10 * * 0"
+  push:
+    branches:
+      - main
+# Same grouping as codeql.yml: `ref@sha`, because a push run and a scheduled
+# run on main can share a sha.
+concurrency:
+  group: ${{ github.workflow }}-${{ format('{0}@{1}', github.ref, github.sha) }}
+  cancel-in-progress: false
+permissions: {}
+jobs:
+  analysis:
+    name: Scorecard analysis
+    # Skips when `github.event.repository` is missing, rather than running.
+    if: ${{ github.event.repository.visibility == 'public' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Upload the SARIF results to the Security tab.
+      security-events: write
+      # Publish the results and get the OIDC token the OpenSSF API requires.
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() }}
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: ${{ always() }}
+        with:
+          sarif_file: results.sarif
+          category: scorecard

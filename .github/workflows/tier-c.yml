@@ -12,10 +12,10 @@ name: tier-c
 # `nightly-failure` label. The next green run closes that issue.
 #
 # The `edge-gate` and `edge-publish` jobs push the multi-arch image of main's
-# tip as `ghcr.io/nisshi-io/nisshi:edge`, and as `main`, which stays for
-# external consumers and goes in a follow-up. They push only when the merge
-# queue passed the tip, and they reuse the binaries that the push run of ci.yml
-# built, so they compile nothing. `edge` can trail the tip until the next run
+# tip as `edge`, and as `main`, which stays for external consumers and goes in
+# a follow-up, to each image path that publish-image pushes. They push only
+# when the merge queue passed the tip, and they reuse the binaries that the
+# push run of ci.yml built, so they compile nothing. `edge` can trail the tip until the next run
 # when a merge lands during the scheduled run, or shortly before it while that
 # merge's push run is still in progress: the gate then skips the publish.
 #
@@ -77,7 +77,6 @@ jobs:
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
-      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
       NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
@@ -149,6 +148,18 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # the old version's leg does not open the nightly-failure issue until it
+    # has a record in CI
+    continue-on-error: ${{ matrix.client.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same client versions as compat-librdkafka in ci.yml.
+        client:
+          - suffix: ""
+          - suffix: -v2.3.0
+            version: v2.3.0
+            experimental: true
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -157,20 +168,20 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
-      RESULTS_FILE: results-s3.csv
+      LIBRDKAFKA_VERSION: ${{matrix.client.version}}
+      POSTGRES_IMAGE: postgres:18
+      RESULTS_FILE: results-s3${{matrix.client.suffix}}.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn
       STORAGE_ENGINE: s3://nisshi/
       STORAGE_FEATURES: dynostore
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -184,7 +195,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: compat-librdkafka-results-s3
+          name: compat-librdkafka-results-s3${{matrix.client.suffix}}
           path: ${{env.RESULTS_FILE}}
           if-no-files-found: warn
   compat-librdkafka-report:
@@ -229,20 +240,19 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
+      POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-s3.csv
       RUST_BACKTRACE: 1
       RUST_LOG: warn
       STORAGE_ENGINE: s3://nisshi/
       STORAGE_FEATURES: dynostore
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -310,7 +320,8 @@ jobs:
   macos-release:
     if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
-    timeout-minutes: 45
+    # The same timeout as the `macos` job in ci.yml, which builds the same release.
+    timeout-minutes: 75
     env:
       TARGET: aarch64-apple-darwin
     steps:

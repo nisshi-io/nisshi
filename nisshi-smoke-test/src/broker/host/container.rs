@@ -25,9 +25,9 @@ use crate::{
     common::{docker, timed_command, unique},
 };
 
-/// How long `docker run` has to start a broker container. `run.sh` pulls the image before the
-/// tests run, so this covers only creating and starting the container, and stays well under the
-/// time nextest gives a test before it kills it.
+/// How long each of `docker create` and `docker start` has to finish for a broker container.
+/// `run.sh` pulls the image before the tests run, so this covers only creating or starting the
+/// container, and stays well under the time nextest gives a test before it kills it.
 const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What `docker cp` prints when the file to copy isn't in the container.
@@ -44,7 +44,11 @@ pub(in crate::broker) struct BrokerContainer {
 
 impl BrokerContainer {
     /// Starts `image` in a container, with a SQLite broker's volume in `files` as its working
-    /// directory. Returns an error if the container can't start.
+    /// directory. A TLS broker reads its certificate and private key from a copy of `files`' TLS
+    /// directory in [`BrokerContainer::tls_directory`].
+    ///
+    /// Returns an error if the harness can't create the container, copy the TLS directory into it,
+    /// or start it.
     pub(super) fn launch(
         image: &str,
         options: &LaunchOptions,
@@ -55,8 +59,7 @@ impl BrokerContainer {
         let mut command = Command::new("docker");
 
         _ = command.args([
-            "run",
-            "--detach",
+            "create",
             "--name",
             &name,
             &docker::label(),
@@ -74,19 +77,56 @@ impl BrokerContainer {
             _ = command.args(["--volume", &format!("{volume}:/data"), "--workdir=/data"]);
         }
 
-        _ = command.arg(image).args(options.broker_args());
+        _ = command
+            .arg(image)
+            .args(options.broker_args(Self::tls_directory()));
 
-        let started = timed_command::run(&mut command, None, CONTAINER_START_TIMEOUT);
+        let created = timed_command::run(&mut command, None, CONTAINER_START_TIMEOUT);
+
+        if !matches!(&created, Ok(created) if created.code == Some(0)) {
+            remove_container(&name);
+            return Err(format!(
+                "could not create a container from {image}: {created:?}"
+            ));
+        }
+
+        // The harness copies the TLS directory in with `docker cp` instead of bind-mounting it,
+        // because the Docker daemon can run in a virtual machine that doesn't see this machine's
+        // files. `docker cp` creates `/tls` in the container.
+        if options.tls.is_some() {
+            let source = files.tls_directory().display().to_string();
+            let destination = format!("{name}:{}", Self::tls_directory().display());
+            let copied = docker::execute(&["cp", &source, &destination]);
+
+            if !matches!(&copied, Ok(copied) if copied.code == Some(0)) {
+                remove_container(&name);
+                return Err(format!(
+                    "could not copy {source} to {destination}: {copied:?}"
+                ));
+            }
+        }
+
+        let started = timed_command::run(
+            Command::new("docker").args(["start", &name]),
+            None,
+            CONTAINER_START_TIMEOUT,
+        );
 
         if !matches!(&started, Ok(started) if started.code == Some(0)) {
             remove_container(&name);
-            return Err(format!("could not start {image}: {started:?}"));
+            return Err(format!("could not start {name} from {image}: {started:?}"));
         }
 
         Ok(Self {
             name,
             dir: files.dir().to_owned(),
         })
+    }
+
+    /// Returns the directory in the container where the broker reads its TLS certificate and
+    /// private key, a copy of [`BrokerFiles::tls_directory`].
+    pub(super) fn tls_directory() -> &'static Path {
+        Path::new("/tls")
     }
 
     /// An error if the broker has exited.

@@ -196,7 +196,8 @@ impl<'cli> KafkaVerifiableProducer<'cli> {
     }
 
     /// Produces `max_messages` records timestamped about `create_time_millis`, so a test can
-    /// produce records that are already older than a topic's `retention.ms`.
+    /// choose how old a topic's retention finds them. The broker rejects a timestamp more than an
+    /// hour ahead of its clock.
     ///
     /// Record `n`'s value is `<value_prefix>.<n>`. With `repeating_keys` of 2, the keys are `0`,
     /// `1`, `0`, `1`, and so on; without it, the records have no keys.

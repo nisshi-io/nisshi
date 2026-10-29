@@ -65,6 +65,14 @@ impl StorageFactory for EngineFactory {
         }
     }
 
+    fn deprecation(&self) -> Option<&'static str> {
+        Some(
+            "the slatedb:// storage engine is deprecated and may be removed in a future release; \
+             it is not recommended for new deployments; \
+             use postgres:// for production, or sqlite:// or memory:// for development",
+        )
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
         reject_unrecognized_options(&configuration.storage, &[])?;
 

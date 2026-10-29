@@ -17,18 +17,22 @@
 -- bytes of its keys and values are within it, and always keep the newest record.
 with
 
-capped as (
+-- materialized makes SQLite choose the partitions that retention.bytes applies to before it reads
+-- record. Without it, SQLite merges this query into sized and joins the LEFT JOIN after the tables
+-- on its left, so it reads every record of a topic before it skips the topic for its
+-- cleanup.policy, and holds the write lock while it does.
+capped as materialized (
     select tp.id as topition, cast(tc.value as bigint) as cap
     from topition tp
     join topic t on t.id = tp.topic
     join cluster c on t.cluster = c.id
     join topic_configuration tc on tc.topic = t.id
-    join topic_configuration pol on pol.topic = t.id
+    left join topic_configuration pol on pol.topic = t.id and pol.name = 'cleanup.policy'
     where c.name = $1
     and tc.name = 'retention.bytes'
     and tc.value glob '[0-9]*' and tc.value not glob '*[^0-9]*'
-    and pol.name = 'cleanup.policy'
-    and pol.value like '%delete%'
+    -- A topic without a cleanup.policy has Kafka's default policy, delete.
+    and coalesce(pol.value, 'delete') like '%delete%'
 ),
 
 sized as (

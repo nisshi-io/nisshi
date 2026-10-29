@@ -40,7 +40,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated::Batch, inflated::Batch as InflatedBatch},
     ser::RecordBatchEncoder,
@@ -54,7 +53,7 @@ use nisshi_storage::{
     ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
-    producer_claim,
+    max_message_bytes, producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::sleep;
@@ -881,6 +880,19 @@ impl Storage for Engine {
         if topition.partition < 0 || topition.partition >= metadata.topic.num_partitions {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         }
+
+        let limit = max_message_bytes::limit(
+            topition.topic(),
+            metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|config| config.name == max_message_bytes::KEY)
+                .and_then(|config| config.value.as_deref()),
+        );
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
 
         // Schema validation (if schemas registry is configured)
         if let Some(ref schemas) = self.schemas
@@ -1763,11 +1775,7 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        // TODO: Implement states_filter - should filter groups by their state
-        if states_filter.is_some() {
-            tracing::warn!("list_groups state filtering is not implemented, returning all groups");
-        }
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let prefix = postcard::to_stdvec(&GroupKeyPrefix::new())?;
         let mut groups = vec![];
 
@@ -1779,13 +1787,9 @@ impl Storage for Engine {
             }
 
             if let Ok(key) = postcard::from_bytes::<GroupKey>(&kv.key) {
-                groups.push(
-                    ListedGroup::default()
-                        .group_id(key.group_id)
-                        .protocol_type("consumer".into())
-                        .group_state(Some("Unknown".into()))
-                        .group_type(Some("classic".into())),
-                );
+                let stored = GroupDetailVersion::decode(&kv.value).map(|gdv| gdv.detail);
+
+                groups.push(NamedGroupDetail::decoded(key.group_id, Some(stored)));
             }
         }
 

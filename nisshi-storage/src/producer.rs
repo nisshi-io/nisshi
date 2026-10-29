@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Rules that Apache Kafka applies to an InitProducerId request, shared by every
-//! [`Storage`](crate::Storage) backend.
+//! Rules that Apache Kafka applies to a producer's ID and epoch, in an InitProducerId
+//! request and in a produced batch, shared by every [`Storage`](crate::Storage) backend.
+
+use std::cmp::Ordering;
 
 use nisshi_sans_io::ErrorCode;
 
@@ -85,6 +87,90 @@ pub fn epoch_is_exhausted(epoch: i16) -> bool {
     epoch >= i16::MAX - 1
 }
 
+/// The epochs stored for a producer, which a produced batch's epoch is checked against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredEpochs {
+    /// Whether the producer is transactional: the request has a transactional ID, the batch
+    /// is transactional, or a transactional ID owns the producer ID.
+    pub transactional: bool,
+
+    /// The producer's newest epoch.
+    pub newest: i16,
+
+    /// The producer's newest epoch that holds a sequence on the batch's partition, or `None`
+    /// when the producer has not written to the partition.
+    pub partition: Option<i16>,
+}
+
+/// How a produced batch's epoch relates to the epochs stored for its producer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProduceEpoch {
+    /// The batch continues the epoch that the partition holds for the producer, or the
+    /// transactional producer's newest epoch.
+    Continue,
+
+    /// The batch starts its epoch on the partition, at sequence 0. The backend stores the
+    /// epoch for the producer when the producer does not have it yet.
+    Start,
+}
+
+impl StoredEpochs {
+    /// Checks a produced batch's epoch and first sequence against these epochs.
+    ///
+    /// An idempotent producer bumps its own epoch after an error ([KIP-360]): it keeps its
+    /// producer ID, adds one to its epoch, and restarts its sequence at 0. Kafka 3.9.1 keeps
+    /// the epoch for each partition. It accepts any epoch higher than the partition's whose
+    /// first sequence is 0, and answers
+    /// [`OutOfOrderSequenceNumber`](ErrorCode::OutOfOrderSequenceNumber) for any other
+    /// sequence ([ProducerAppendInfo.java]). We compare with the partition's epoch too,
+    /// because the Java client retries a batch at its old epoch on one partition after it
+    /// bumps the epoch for another ([RecordAccumulator.java]).
+    ///
+    /// A transactional producer's epoch moves only through InitProducerId, so its batch must
+    /// be at the producer's newest epoch. [`transactional`](Self::transactional) includes a
+    /// producer ID that a transactional ID owns, so that a non-transactional batch cannot
+    /// move a transactional producer's epoch.
+    ///
+    /// Returns [`ProducerFenced`](ErrorCode::ProducerFenced) for:
+    /// - an epoch lower than the partition's. Kafka answers
+    ///   [`InvalidProducerEpoch`](ErrorCode::InvalidProducerEpoch).
+    /// - a transactional producer's epoch other than its newest.
+    /// - an epoch that [`epoch_is_exhausted`], because `i16::MAX` stays free to fence a
+    ///   retired producer ID. Kafka's partition state accepts it.
+    ///
+    /// [KIP-360]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-360%3A+Improve+reliability+of+idempotent%2Ftransactional+producer
+    /// [ProducerAppendInfo.java]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+    /// [RecordAccumulator.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L920-L935
+    pub fn check_batch(
+        &self,
+        producer_epoch: i16,
+        base_sequence: i32,
+    ) -> Result<ProduceEpoch, ErrorCode> {
+        if self.transactional {
+            return if producer_epoch == self.newest {
+                Ok(ProduceEpoch::Continue)
+            } else {
+                Err(ErrorCode::ProducerFenced)
+            };
+        }
+
+        match self
+            .partition
+            .map(|partition| producer_epoch.cmp(&partition))
+        {
+            Some(Ordering::Equal) => Ok(ProduceEpoch::Continue),
+            Some(Ordering::Less) => Err(ErrorCode::ProducerFenced),
+            Some(Ordering::Greater) | None if epoch_is_exhausted(producer_epoch) => {
+                Err(ErrorCode::ProducerFenced)
+            }
+            Some(Ordering::Greater) | None if base_sequence != 0 => {
+                Err(ErrorCode::OutOfOrderSequenceNumber)
+            }
+            Some(Ordering::Greater) | None => Ok(ProduceEpoch::Start),
+        }
+    }
+}
+
 impl ProducerIdResponse {
     /// A failed InitProducerId, with no producer ID or epoch, as Kafka answers.
     pub fn failed(error: ErrorCode) -> Self {
@@ -144,5 +230,90 @@ mod tests {
         assert!(!epoch_is_exhausted(32765));
         assert!(epoch_is_exhausted(32766));
         assert!(epoch_is_exhausted(i16::MAX));
+    }
+
+    const IDEMPOTENT: StoredEpochs = StoredEpochs {
+        transactional: false,
+        newest: 5,
+        partition: Some(3),
+    };
+
+    const TRANSACTIONAL: StoredEpochs = StoredEpochs {
+        transactional: true,
+        newest: 3,
+        partition: Some(3),
+    };
+
+    #[test]
+    fn idempotent_continues_partition_epoch() {
+        assert_eq!(Ok(ProduceEpoch::Continue), IDEMPOTENT.check_batch(3, 7));
+    }
+
+    #[test]
+    fn idempotent_below_partition_epoch_is_fenced() {
+        assert_eq!(Err(ErrorCode::ProducerFenced), IDEMPOTENT.check_batch(2, 0));
+    }
+
+    #[test]
+    fn idempotent_bump_at_sequence_zero_starts_epoch() {
+        assert_eq!(Ok(ProduceEpoch::Start), IDEMPOTENT.check_batch(4, 0));
+        assert_eq!(Ok(ProduceEpoch::Start), IDEMPOTENT.check_batch(6, 0));
+        assert_eq!(Ok(ProduceEpoch::Start), IDEMPOTENT.check_batch(32765, 0));
+    }
+
+    #[test]
+    fn idempotent_bump_at_other_sequence_is_out_of_order() {
+        assert_eq!(
+            Err(ErrorCode::OutOfOrderSequenceNumber),
+            IDEMPOTENT.check_batch(4, 1)
+        );
+    }
+
+    #[test]
+    fn idempotent_bump_into_exhausted_epoch_is_fenced() {
+        assert_eq!(
+            Err(ErrorCode::ProducerFenced),
+            IDEMPOTENT.check_batch(32766, 0)
+        );
+        assert_eq!(
+            Err(ErrorCode::ProducerFenced),
+            IDEMPOTENT.check_batch(i16::MAX, 0)
+        );
+    }
+
+    #[test]
+    fn idempotent_first_batch_on_partition_starts_its_epoch() {
+        let unwritten = StoredEpochs {
+            partition: None,
+            ..IDEMPOTENT
+        };
+
+        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(5, 0));
+        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(4, 0));
+        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(6, 0));
+        assert_eq!(
+            Err(ErrorCode::OutOfOrderSequenceNumber),
+            unwritten.check_batch(5, 1)
+        );
+    }
+
+    #[test]
+    fn transactional_continues_newest_epoch_only() {
+        assert_eq!(Ok(ProduceEpoch::Continue), TRANSACTIONAL.check_batch(3, 7));
+        assert_eq!(
+            Err(ErrorCode::ProducerFenced),
+            TRANSACTIONAL.check_batch(2, 0)
+        );
+        assert_eq!(
+            Err(ErrorCode::ProducerFenced),
+            TRANSACTIONAL.check_batch(4, 0)
+        );
+
+        let unwritten = StoredEpochs {
+            partition: None,
+            ..TRANSACTIONAL
+        };
+        assert_eq!(Ok(ProduceEpoch::Continue), unwritten.check_batch(3, 0));
+        assert_eq!(Err(ErrorCode::ProducerFenced), unwritten.check_batch(4, 0));
     }
 }

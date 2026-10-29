@@ -29,6 +29,7 @@ nanoid.workspace = true
 nisshi-client.workspace = true
 nisshi-sans-io.workspace = true
 rand.workspace = true
+rcgen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

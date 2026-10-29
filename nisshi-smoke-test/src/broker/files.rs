@@ -19,17 +19,26 @@ use std::{
 };
 
 use crate::{
-    StorageUrl,
+    StorageUrl, TlsCertificate,
     common::{docker, unique},
     settings,
 };
+
+/// The directory, in the broker's own directory, that holds a TLS broker's
+/// [`TLS_CERTIFICATE_FILE`] and [`TLS_PRIVATE_KEY_FILE`].
+pub(super) const TLS_DIRECTORY: &str = "tls";
+/// The file that holds a TLS broker's certificate, in PEM.
+pub(super) const TLS_CERTIFICATE_FILE: &str = "certificate.pem";
+/// The file that holds a TLS broker's private key, in PEM.
+pub(super) const TLS_PRIVATE_KEY_FILE: &str = "private-key.pem";
 
 /// A launched broker's files, which it keeps when it restarts. Dropping them removes the volume,
 /// and also the directory unless [`BrokerFiles::keep_dir`] is set or the test is failing,
 /// because the directory then holds the logs that show why.
 #[derive(Debug)]
 pub(super) struct BrokerFiles {
-    /// The broker's own directory: a log per start, and a process's SQLite database.
+    /// The broker's own directory: a log per start, a process's SQLite database, and a TLS
+    /// broker's [`TLS_DIRECTORY`].
     dir: PathBuf,
     /// A container's SQLite database volume, mounted as its working directory.
     volume: Option<String>,
@@ -139,6 +148,33 @@ impl BrokerFiles {
 
             (None, Some(_)) => {}
         }
+    }
+
+    /// Writes `certificate` and its private key to [`TLS_CERTIFICATE_FILE`] and
+    /// [`TLS_PRIVATE_KEY_FILE`] in [`BrokerFiles::tls_directory`].
+    pub(super) fn write_tls_certificate(&self, certificate: &TlsCertificate) {
+        let tls_directory = self.tls_directory();
+
+        if let Err(err) = fs::create_dir_all(&tls_directory) {
+            panic!("{}: {err}", tls_directory.display());
+        }
+
+        for (file, pem) in [
+            (TLS_CERTIFICATE_FILE, &certificate.certificate_pem),
+            (TLS_PRIVATE_KEY_FILE, &certificate.private_key_pem),
+        ] {
+            let path = tls_directory.join(file);
+
+            if let Err(err) = fs::write(&path, pem) {
+                panic!("{}: {err}", path.display());
+            }
+        }
+    }
+
+    /// Returns the directory on this machine that holds a TLS broker's certificate and private
+    /// key: [`TLS_DIRECTORY`] in the broker's own directory.
+    pub(super) fn tls_directory(&self) -> PathBuf {
+        self.dir.join(TLS_DIRECTORY)
     }
 
     /// Returns the broker's own directory, which is also a broker process's working directory.

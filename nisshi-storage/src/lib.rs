@@ -111,7 +111,16 @@
 //! ```
 //!
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::todo, clippy::unimplemented)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use async_trait::async_trait;
 use bytes::{Bytes, TryGetError};
 
@@ -185,7 +194,7 @@ use std::{
 };
 use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
@@ -196,6 +205,8 @@ mod batch;
 pub mod config;
 mod inflate;
 mod latency;
+pub mod max_message_bytes;
+pub mod message_timestamp_type;
 mod producer;
 mod proxy;
 mod service;
@@ -204,24 +215,25 @@ pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replic
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
-pub use producer::{check_claim, epoch_is_exhausted, producer_claim};
+pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
     ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
-    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteGroupsService,
-    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
-    DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
-    DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
-    FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
+    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
+    DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
+    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
+    FetchValidationLayer, FetchValidationService, FindCoordinatorService,
+    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
     MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
     RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
     TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, bounded_channel, inflate_produced,
+    ValidatedFetchRequest, bounded_channel, describe_groups_response, inflate_produced,
+    list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -284,6 +296,14 @@ pub enum Error {
 
     Glob(Arc<GlobError>),
 
+    /// No storage factory registered with the builder accepts the `scheme` of the `storage` URL,
+    /// which has its credentials redacted. A build that leaves out the engine's feature has no
+    /// factory for it.
+    NoEngineForScheme {
+        scheme: String,
+        storage: String,
+    },
+
     /// The database records schema `recorded_version`, which a broker of `schema_version` can't
     /// use. Only a broker of `oldest_compatible_version` or later can use it.
     IncompatibleSchema {
@@ -324,6 +344,12 @@ pub enum Error {
     LessThanMinTime {
         time: i64,
         min_time: Option<i64>,
+    },
+    /// A produced batch of `size` bytes is larger than its topic's `max.message.bytes` of `limit`
+    /// bytes. Produce answers it with `MESSAGE_TOO_LARGE`.
+    MessageTooLarge {
+        size: usize,
+        limit: usize,
     },
     Message(String),
     NoSuchEntry {
@@ -404,6 +430,9 @@ pub enum Error {
     #[cfg(feature = "turso")]
     UnexpectedValue(turso::Value),
 
+    #[cfg(feature = "libsql")]
+    UnexpectedLibSqlValue(libsql::Value),
+
     UnknownCacheKey(String),
 
     /// A storage URL named a query option that scheme's engine does not
@@ -425,6 +454,23 @@ pub enum Error {
 
     UnableToSend,
     OneshotRecv,
+}
+
+impl Error {
+    /// Returns the error code that a group request, such as `ListGroups` or `DescribeGroups`,
+    /// reports when storage fails with this error.
+    ///
+    /// A storage error that carries a code keeps that code. Any other storage error is treated as
+    /// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
+    /// [retry].
+    ///
+    /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
+    pub fn group_request_error_code(&self) -> ErrorCode {
+        match self {
+            Self::Api(error_code) => *error_code,
+            _ => ErrorCode::CoordinatorNotAvailable,
+        }
+    }
 }
 
 impl Display for Error {
@@ -1006,6 +1052,15 @@ pub fn delete_records_cutoff(requested: i64, stage: &OffsetStage) -> Result<i64,
 pub struct GroupMember {
     pub join_response: JoinGroupResponseMember,
     pub last_contact: Option<SystemTime>,
+    /// The client id in the header of the member's last `JoinGroup`. It is empty for a member
+    /// whose stored group lacks the field, until the member joins again.
+    #[serde(default)]
+    pub client_id: String,
+    /// The address that the member's last `JoinGroup` came from, as Kafka writes it: `/` and the
+    /// IP address. It is empty for a member whose stored group lacks the field, until the member
+    /// joins again.
+    #[serde(default)]
+    pub client_host: String,
 }
 
 /// Group State
@@ -1179,49 +1234,92 @@ pub struct PendingSync {
     pub members: BTreeSet<String>,
 }
 
+impl ConsumerGroupState {
+    /// Returns whether `states_filter` matches this state. The filter is the list of state names
+    /// in a `ListGroups` request. As in Kafka, a missing or empty filter matches every state,
+    /// and each name in the filter matches without regard to case or surrounding white space.
+    pub fn matches(&self, states_filter: Option<&[String]>) -> bool {
+        states_filter.is_none_or(|states_filter| {
+            let state = self.to_string();
+
+            states_filter.is_empty()
+                || states_filter
+                    .iter()
+                    .any(|name| name.trim().eq_ignore_ascii_case(&state))
+        })
+    }
+}
+
+/// A classic group's state in Kafka, from the group's stored detail.
 impl From<&GroupDetail> for ConsumerGroupState {
     fn from(value: &GroupDetail) -> Self {
         match value {
-            GroupDetail { members, .. } if members.is_empty() => Self::Empty,
-
+            // A join phase continues after every member sends LeaveGroup during the initial delay,
+            // and the group stays in PreparingRebalance until the phase ends, as in Kafka.
             GroupDetail {
-                state: GroupState::Forming { leader: None, .. },
+                state: GroupState::Forming { .. },
+                rebalance,
                 ..
-            } => Self::Assigning,
+            } if rebalance.join_phase.is_some() => Self::PreparingRebalance,
+
+            GroupDetail { members, .. } if members.is_empty() => Self::Empty,
 
             GroupDetail {
                 state: GroupState::Formed { .. },
                 ..
             } => Self::Stable,
 
-            _ => {
-                debug!(unknown = ?value);
-                Self::Unknown
-            }
+            GroupDetail {
+                state: GroupState::Forming { .. },
+                rebalance,
+                ..
+            } if rebalance.pending_sync.is_some() => Self::CompletingRebalance,
+
+            // A broker that stored the group without its rebalance state held each request for a
+            // fixed time. The group coordinator gives such a group a join phase, so it is in
+            // PreparingRebalance.
+            GroupDetail {
+                state: GroupState::Forming { .. },
+                ..
+            } => Self::PreparingRebalance,
         }
     }
 }
 
-impl From<&GroupDetail> for consumer_group_describe_response::DescribedGroup {
-    fn from(value: &GroupDetail) -> Self {
-        let assignor_name = match value.state {
-            GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-            GroupState::Formed { ref leader, .. } => leader.clone(),
-        };
+/// Returns the `ConsumerGroupDescribe` row for the stored group `group_id`.
+///
+/// `ConsumerGroupDescribe` describes only a group of the KIP-848 consumer protocol, whose members
+/// send `ConsumerGroupHeartbeat`. Nisshi forms each group through `JoinGroup` and `SyncGroup`, so
+/// each group is a classic group. This function answers `GROUP_ID_NOT_FOUND` for it, as Kafka's
+/// group coordinator does for a classic group ([`GroupMetadataManager.consumerGroup`]), and an
+/// admin client then describes the group with `DescribeGroups`. If the broker answered `NONE`
+/// with an empty member list, the admin client would not fall back to `DescribeGroups`, and it
+/// would report the group without members.
+///
+/// [`GroupMetadataManager.consumerGroup`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+fn classic_group_consumer_group_describe_row(
+    group_id: String,
+) -> consumer_group_describe_response::DescribedGroup {
+    let error_message = format!("Group {group_id} is not a consumer group.");
+    consumer_group_describe_error_row(group_id, ErrorCode::GroupIdNotFound, error_message)
+}
 
-        let group_state = ConsumerGroupState::from(value).to_string();
-
-        Self::default()
-            .error_code(ErrorCode::None.into())
-            .error_message(Some(ErrorCode::None.to_string()))
-            .group_id(Default::default())
-            .group_state(group_state)
-            .group_epoch(-1)
-            .assignment_epoch(-1)
-            .assignor_name(assignor_name)
-            .members(Some([].into()))
-            .authorized_operations(authorized_operations::OMITTED)
-    }
+/// Returns the `ConsumerGroupDescribe` row that answers `error_code` for the group `group_id`.
+fn consumer_group_describe_error_row(
+    group_id: String,
+    error_code: ErrorCode,
+    error_message: String,
+) -> consumer_group_describe_response::DescribedGroup {
+    consumer_group_describe_response::DescribedGroup::default()
+        .error_code(error_code.into())
+        .error_message(Some(error_message))
+        .group_id(group_id)
+        .group_state(ConsumerGroupState::Unknown.to_string())
+        .group_epoch(-1)
+        .assignment_epoch(-1)
+        .assignor_name("".into())
+        .members(Some([].into()))
+        .authorized_operations(authorized_operations::OMITTED)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1254,47 +1352,38 @@ impl NamedGroupDetail {
             response: GroupDetailResponse::Found(found),
         }
     }
+
+    /// Returns a group from its stored detail, as the storage read and decoded it. A group
+    /// without a stored detail has only committed offsets, so it is empty. A group whose detail
+    /// can't be read or decoded has an error instead of a detail, so that a list of groups still
+    /// includes the other groups.
+    pub fn decoded<E>(name: String, stored: Option<Result<GroupDetail, E>>) -> Self
+    where
+        E: Debug,
+    {
+        match stored {
+            Some(Ok(detail)) => Self::found(name, detail),
+            Some(Err(err)) => {
+                error!(?err, name, "the stored group can't be read or decoded");
+                Self::error_code(name, ErrorCode::UnknownServerError)
+            }
+            None => Self::found(name, GroupDetail::default()),
+        }
+    }
 }
 
 impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGroup {
     fn from(value: &NamedGroupDetail) -> Self {
-        match value {
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::Found(group_detail),
-            } => {
-                let assignor_name = match group_detail.state {
-                    GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-                    GroupState::Formed { ref leader, .. } => leader.clone(),
-                };
-
-                let group_state = ConsumerGroupState::from(group_detail).to_string();
-
-                Self::default()
-                    .error_code(ErrorCode::None.into())
-                    .error_message(Some(ErrorCode::None.to_string()))
-                    .group_id(name.into())
-                    .group_state(group_state)
-                    .group_epoch(-1)
-                    .assignment_epoch(-1)
-                    .assignor_name(assignor_name)
-                    .members(Some([].into()))
-                    .authorized_operations(authorized_operations::OMITTED)
+        match &value.response {
+            GroupDetailResponse::Found(_) => {
+                classic_group_consumer_group_describe_row(value.name.clone())
             }
 
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::ErrorCode(error_code),
-            } => Self::default()
-                .error_code((*error_code).into())
-                .error_message(Some(error_code.to_string()))
-                .group_id(name.into())
-                .group_state("Unknown".into())
-                .group_epoch(-1)
-                .assignment_epoch(-1)
-                .assignor_name("".into())
-                .members(Some([].into()))
-                .authorized_operations(authorized_operations::OMITTED),
+            GroupDetailResponse::ErrorCode(error_code) => consumer_group_describe_error_row(
+                value.name.clone(),
+                *error_code,
+                error_code.to_string(),
+            ),
         }
     }
 }
@@ -1306,28 +1395,51 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                 name,
                 response: GroupDetailResponse::Found(group_detail),
             } => {
-                let group_state = ConsumerGroupState::from(group_detail).to_string();
+                let group_state = ConsumerGroupState::from(group_detail);
+
+                // Kafka reports the group's protocol, and each member's metadata and assignment,
+                // only for a Stable group ([`GroupMetadata.summary`]). In another state, the
+                // members' metadata may be for a protocol the group has not selected yet.
+                //
+                // [`GroupMetadata.summary`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupMetadata.scala
+                let is_stable = group_state == ConsumerGroupState::Stable;
+                let assignments = group_detail.state.assignments();
 
                 let members = group_detail
                     .members
-                    .keys()
-                    .map(|member_id| {
+                    .iter()
+                    .map(|(member_id, member)| {
+                        let (member_metadata, member_assignment) = if is_stable {
+                            (
+                                member.join_response.metadata.clone(),
+                                assignments.get(member_id).cloned().unwrap_or_default(),
+                            )
+                        } else {
+                            (Bytes::new(), Bytes::new())
+                        };
+
                         describe_groups_response::DescribedGroupMember::default()
                             .member_id(member_id.into())
-                            .group_instance_id(None)
-                            .client_id("".into())
-                            .client_host("".into())
-                            .member_metadata(Bytes::new())
-                            .member_assignment(Bytes::new())
+                            .group_instance_id(member.join_response.group_instance_id.clone())
+                            .client_id(member.client_id.clone())
+                            .client_host(member.client_host.clone())
+                            .member_metadata(member_metadata)
+                            .member_assignment(member_assignment)
                     })
                     .collect::<Vec<_>>();
+
+                let protocol_data = if is_stable {
+                    group_detail.state.protocol_name().unwrap_or_default()
+                } else {
+                    String::new()
+                };
 
                 Self::default()
                     .error_code(ErrorCode::None.into())
                     .group_id(name.clone())
-                    .group_state(group_state)
+                    .group_state(group_state.to_string())
                     .protocol_type(group_detail.state.protocol_type().unwrap_or_default())
-                    .protocol_data("".into())
+                    .protocol_data(protocol_data)
                     .members(Some(members))
                     .authorized_operations(Some(authorized_operations::OMITTED))
             }
@@ -1338,12 +1450,33 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
             } => Self::default()
                 .error_code((*error_code).into())
                 .group_id(name.clone())
-                .group_state("Unknown".into())
+                .group_state(ConsumerGroupState::from(value).to_string())
                 .protocol_type("".into())
                 .protocol_data("".into())
                 .members(Some(vec![]))
                 .authorized_operations(Some(authorized_operations::OMITTED)),
         }
+    }
+}
+
+/// A group's state from its stored detail. A group whose detail the storage could not read is in
+/// the `Unknown` state.
+impl From<&NamedGroupDetail> for ConsumerGroupState {
+    fn from(value: &NamedGroupDetail) -> Self {
+        match &value.response {
+            GroupDetailResponse::Found(group_detail) => Self::from(group_detail),
+            GroupDetailResponse::ErrorCode(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<&NamedGroupDetail> for ListedGroup {
+    fn from(value: &NamedGroupDetail) -> Self {
+        Self::default()
+            .group_id(value.name.clone())
+            .protocol_type("consumer".into())
+            .group_state(Some(ConsumerGroupState::from(value).to_string()))
+            .group_type(Some("classic".into()))
     }
 }
 
@@ -1583,6 +1716,15 @@ pub trait StorageFactory: Debug + Display + Send + Sync + 'static {
     /// What the engine can do. See [`StorageCapabilities`].
     fn capabilities(&self) -> StorageCapabilities;
 
+    /// Returns the notice that [`Builder::build`] logs as a warning when this factory is
+    /// selected, or `None` for an engine that is not deprecated.
+    ///
+    /// The notice is logged as it is written, so it must not hold a storage URL, which
+    /// can carry credentials.
+    fn deprecation(&self) -> Option<&'static str> {
+        None
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage>;
 }
 
@@ -1652,6 +1794,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// A backend that decodes the batch does so with [`inflate_produced`], so
     /// records that do not decode fail with `INVALID_RECORD`.
+    ///
+    /// A backend returns [`Error::MessageTooLarge`] when [`max_message_bytes::ensure_batch_fits`]
+    /// rejects the batch. The backend must return that error before it changes any state.
+    /// [`ProduceRequestBatcher`] then writes the same records again, one batch at a time.
     async fn produce(
         &self,
         transaction_id: Option<&str>,
@@ -1660,6 +1806,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<i64>;
 
     /// Fetch deflated batches from storage.
+    ///
+    /// The batches hold at most `max_bytes`, except that a read can exceed it by
+    /// one batch. A read returns the first batch at or after `offset` even when
+    /// that batch alone is larger than `max_bytes`, so that a consumer gets past
+    /// it (KIP-74). The fetch service relies on this: without it, a consumer
+    /// whose fetch limit is smaller than a record never reads past that record.
     ///
     /// For a topic or partition that does not exist, see
     /// [`Storage::offset_stage`].
@@ -1750,8 +1902,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
         keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult>;
 
-    /// Query available groups optionally with a state filter.
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>>;
+    /// Returns every group in this storage with its stored detail. A group without a stored
+    /// detail (e.g. a group with only committed offsets) has the default detail, which is empty.
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>>;
 
     /// Delete one or more groups from storage.
     async fn delete_groups(
@@ -1849,8 +2002,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()>;
 
     /// Aborted transactions overlapping `[offset, last_stable_offset)`, reporting which producer
-    /// ranges a `read_committed` Fetch client should discard. Postgres implements this; other
-    /// backends return `Ok(vec![])` or forward to an inner storage.
+    /// ranges a `read_committed` Fetch client should discard. No engine implements this yet:
+    /// every backend, Postgres included, returns `Ok(vec![])` (wrapper layers such as the proxy
+    /// forward to their inner storage), so a `read_committed` consumer would read aborted records.
     async fn aborted_transactions(
         &self,
         _topition: &Topition,
@@ -2009,8 +2163,8 @@ where
         self.as_ref().describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.as_ref().list_groups(states_filter).await
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+        self.as_ref().list_groups().await
     }
 
     async fn delete_groups(
@@ -2283,8 +2437,8 @@ where
         self.as_ref().describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.as_ref().list_groups(states_filter).await
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+        self.as_ref().list_groups().await
     }
 
     async fn delete_groups(
@@ -2651,9 +2805,9 @@ impl Builder<i32, String, Url, Url> {
             })
             .cloned()
         else {
-            return Err(Error::FeatureNotEnabled {
-                feature: self.storage.scheme().into(),
-                message: redact_url(&self.storage).to_string(),
+            return Err(Error::NoEngineForScheme {
+                scheme: self.storage.scheme().into(),
+                storage: redact_url(&self.storage).to_string(),
             });
         };
 
@@ -2667,6 +2821,10 @@ impl Builder<i32, String, Url, Url> {
                     .map(|factory| factory.to_string())
                     .collect(),
             });
+        }
+
+        if let Some(notice) = factory.deprecation() {
+            warn!("{notice}");
         }
 
         let silent = self.silent;
@@ -2850,6 +3008,171 @@ mod tests {
         assert!(debug.contains("iterations: 4096"), "{debug}");
     }
 
+    /// Every engine except SlateDB stores a group as JSON. After an upgrade, the broker reads
+    /// groups that an earlier version stored, whose members do not have a `client_id` or
+    /// `client_host` field. If the broker fails to decode such a group, `DescribeGroups` answers
+    /// `UNKNOWN_SERVER_ERROR` for it. Decoding must give such a member an empty client id and
+    /// host.
+    #[test]
+    fn member_stored_without_client_id_and_host_reads_with_empty_ones() -> serde_json::Result<()> {
+        let mut stored = serde_json::to_value(detail_with_one_member(
+            GroupState::default(),
+            GroupRebalance::default(),
+        ))?;
+        let member = stored["members"]["member"]
+            .as_object_mut()
+            .expect("a stored member is a JSON object");
+        assert!(member.remove("client_id").is_some());
+        assert!(member.remove("client_host").is_some());
+
+        let detail = serde_json::from_value::<GroupDetail>(stored)?;
+
+        let member = &detail.members["member"];
+        assert_eq!(
+            ("", ""),
+            (member.client_id.as_str(), member.client_host.as_str())
+        );
+        Ok(())
+    }
+
+    /// Returns a detail with one member, in the given group state and rebalance.
+    fn detail_with_one_member(state: GroupState, rebalance: GroupRebalance) -> GroupDetail {
+        GroupDetail {
+            members: [(
+                "member".into(),
+                GroupMember {
+                    join_response: JoinGroupResponseMember::default().member_id("member".into()),
+                    last_contact: None,
+                    ..GroupMember::default()
+                },
+            )]
+            .into(),
+            state,
+            rebalance: Box::new(rebalance),
+            ..GroupDetail::default()
+        }
+    }
+
+    /// Returns a forming group state with the `consumer` protocol type and `range` protocol.
+    fn forming_group_state(leader: Option<&str>) -> GroupState {
+        GroupState::Forming {
+            protocol_type: Some("consumer".into()),
+            protocol_name: Some("range".into()),
+            leader: leader.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn group_state_is_the_kafka_classic_group_state() {
+        let join_phase = JoinPhase {
+            deadline: SystemTime::now(),
+            joined: BTreeSet::new(),
+            initial_delay: None,
+        };
+
+        let formed = GroupState::Formed {
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            leader: "member".into(),
+            assignments: BTreeMap::new(),
+        };
+
+        let in_join_phase = GroupRebalance {
+            join_phase: Some(join_phase),
+            ..GroupRebalance::default()
+        };
+
+        let pending_sync = GroupRebalance {
+            pending_sync: Some(PendingSync {
+                deadline: SystemTime::now(),
+                members: ["member".into()].into(),
+            }),
+            ..GroupRebalance::default()
+        };
+
+        let without_members_in_join_phase = GroupDetail {
+            state: forming_group_state(None),
+            rebalance: Box::new(in_join_phase.clone()),
+            ..GroupDetail::default()
+        };
+
+        assert_eq!(
+            [
+                ConsumerGroupState::Empty,
+                ConsumerGroupState::PreparingRebalance,
+                ConsumerGroupState::PreparingRebalance,
+                ConsumerGroupState::CompletingRebalance,
+                ConsumerGroupState::PreparingRebalance,
+                ConsumerGroupState::Stable,
+            ],
+            [
+                GroupDetail::default(),
+                without_members_in_join_phase,
+                detail_with_one_member(forming_group_state(None), in_join_phase),
+                detail_with_one_member(forming_group_state(Some("member")), pending_sync),
+                detail_with_one_member(
+                    forming_group_state(Some("member")),
+                    GroupRebalance::default()
+                ),
+                detail_with_one_member(formed, GroupRebalance::default()),
+            ]
+            .each_ref()
+            .map(ConsumerGroupState::from)
+        );
+    }
+
+    #[test]
+    fn states_filter_ignores_case_and_surrounding_white_space() {
+        assert!(ConsumerGroupState::Stable.matches(Some(&[" stable ".into()])));
+    }
+
+    #[test]
+    fn states_filter_leaves_out_other_states() {
+        assert!(!ConsumerGroupState::Empty.matches(Some(&["Stable".into()])));
+    }
+
+    #[test]
+    fn states_filter_of_unknown_names_matches_no_state() {
+        assert!(!ConsumerGroupState::Empty.matches(Some(&["NoSuchState".into()])));
+    }
+
+    #[test]
+    fn missing_or_empty_states_filter_matches_every_state() {
+        assert_eq!(
+            (true, true),
+            (
+                ConsumerGroupState::Empty.matches(None),
+                ConsumerGroupState::Empty.matches(Some(&[]))
+            )
+        );
+    }
+
+    #[test]
+    fn storage_error_with_a_code_keeps_that_code() {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            Error::Api(ErrorCode::UnknownServerError).group_request_error_code()
+        );
+    }
+
+    #[test]
+    fn other_storage_error_answers_coordinator_not_available() {
+        assert_eq!(
+            ErrorCode::CoordinatorNotAvailable,
+            Error::Message("connection refused".into()).group_request_error_code()
+        );
+    }
+
+    #[test]
+    fn group_that_storage_could_not_read_is_listed_as_unknown() {
+        let listed = ListedGroup::from(&NamedGroupDetail::error_code(
+            "group".into(),
+            ErrorCode::UnknownServerError,
+        ));
+
+        assert_eq!(Some("Unknown".into()), listed.group_state);
+    }
+
     #[test]
     fn redact_url_strips_password_only() -> Result<()> {
         let url = Url::parse("postgres://user:secret@host/db")?;
@@ -3018,7 +3341,7 @@ mod tests {
         // No factories are registered on a bare `StorageContainer::builder()`
         // (those come from the storage backend crates, e.g.
         // `nisshi-storage-sql`), so this always falls into the
-        // `Error::FeatureNotEnabled` branch regardless of scheme, which used
+        // `Error::NoEngineForScheme` branch regardless of scheme, which used
         // to embed the raw, unredacted URL in its `message` field.
         let err = StorageContainer::builder()
             .node_id(1)

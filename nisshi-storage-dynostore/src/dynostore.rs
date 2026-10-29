@@ -28,9 +28,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
     StreamExt,
-    stream::{BoxStream, TryStreamExt},
+    stream::{self, BoxStream, TryStreamExt},
 };
 use metadata::Cache;
+use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -49,7 +50,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated, inflated},
     to_system_time, to_timestamp,
@@ -62,10 +62,10 @@ use nisshi_schema::{
 use nisshi_storage::{
     BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
-    inflate_produced, offload, producer_claim,
+    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff,
+    epoch_is_exhausted, inflate_produced, max_message_bytes, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -79,6 +79,7 @@ use opentelemetry::{
 };
 use opticon::OptiCon;
 use percent_encoding::percent_decode_str;
+use produced_batches::{ProducedBatches, SequenceCheck};
 use rand::{prelude::*, rng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time_index::TimeIndex;
@@ -89,6 +90,7 @@ use uuid::Uuid;
 
 mod metadata;
 mod opticon;
+mod produced_batches;
 mod time_index;
 
 #[cfg(test)]
@@ -149,6 +151,15 @@ const EMPTY_GROUP_SENTINEL: &str = "%empty";
 /// reports, the batch object's and the watermark document's, so the
 /// broker's clock does not enter into it.
 const BATCH_SETTLED_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How many group state objects a `ListGroups` reads from the object store at once.
+///
+/// A listing that reads the objects one after another waits one round trip per group. A listing
+/// that reads them all at once opens a connection per group: with thousands of groups, it can use
+/// up the broker's file descriptors, which every other request also needs, or exceed the object
+/// store's request rate. The limit is a small bound between the two. Its value is not measured:
+/// any small bound gives most of the speed-up.
+const CONCURRENT_GROUP_STATE_READS: usize = 16;
 
 /// A backfill of one partition's time index in progress (see
 /// [`DynoStore::begin_time_index_backfill`]).
@@ -259,6 +270,13 @@ impl OptiCon<Meta> {
 }
 
 impl Meta {
+    /// Whether a transactional ID owns the producer ID.
+    fn transactional_id_owns(&self, producer_id: ProducerId) -> bool {
+        self.transactions
+            .values()
+            .any(|txn| txn.producer == producer_id)
+    }
+
     fn produced(
         &self,
         transaction_id: &str,
@@ -396,6 +414,140 @@ impl Meta {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
+    /// The batches that the producer last wrote to each partition, at the partition's epoch.
+    ///
+    /// A partition's newest remembered batch ends just before its next sequence in
+    /// `sequences`. Only the advance that follows a record write changes either of them, and
+    /// it changes both. A partition has no entry when its sequence was stored before the broker
+    /// remembered batches.
+    #[serde(default)]
+    batches: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, ProducedBatches>>>,
+}
+
+impl ProducerDetail {
+    /// Returns the epochs that a batch from this producer to `topition` is checked against.
+    fn stored_epochs(&self, transactional: bool, topition: &Topition) -> Option<StoredEpochs> {
+        let newest = *self.sequences.keys().next_back()?;
+
+        let partition = self
+            .sequences
+            .iter()
+            .rev()
+            .find(|(_, topics)| {
+                topics
+                    .get(&topition.topic)
+                    .is_some_and(|partitions| partitions.contains_key(&topition.partition))
+            })
+            .map(|(epoch, _)| *epoch);
+
+        Some(StoredEpochs {
+            transactional,
+            newest,
+            partition,
+        })
+    }
+
+    /// Returns the sequence that the producer's next batch to the partition must start at, at
+    /// `epoch`, 0 when the partition has none.
+    fn next_sequence(&self, epoch: ProducerEpoch, topition: &Topition) -> Sequence {
+        self.sequences
+            .get(&epoch)
+            .and_then(|topics| topics.get(&topition.topic))
+            .and_then(|partitions| partitions.get(&topition.partition))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Returns the batches that the producer last wrote to the partition at `epoch`, or `None`
+    /// when the partition's sequence was stored before the broker remembered batches.
+    fn remembered_batches(
+        &self,
+        epoch: ProducerEpoch,
+        topition: &Topition,
+    ) -> Option<&ProducedBatches> {
+        self.batches
+            .get(&epoch)
+            .and_then(|topics| topics.get(&topition.topic))
+            .and_then(|partitions| partitions.get(&topition.partition))
+    }
+
+    /// Records a batch stored at `base_offset`: advances the partition's next sequence at
+    /// `epoch` past the batch, and remembers the batch. `produce_epoch` says whether the batch
+    /// starts `epoch` on the partition.
+    fn advance(
+        &mut self,
+        epoch: ProducerEpoch,
+        produce_epoch: ProduceEpoch,
+        topition: &Topition,
+        base_sequence: Sequence,
+        last_offset_delta: i32,
+        base_offset: i64,
+    ) {
+        let sequence = match produce_epoch {
+            ProduceEpoch::Continue => self.sequence(epoch, topition),
+            ProduceEpoch::Start => self.start_epoch(epoch, topition),
+        };
+
+        *sequence += last_offset_delta + 1;
+
+        self.batches
+            .entry(epoch)
+            .or_default()
+            .entry(topition.topic.clone())
+            .or_default()
+            .entry(topition.partition)
+            .or_default()
+            .remember(base_sequence, last_offset_delta, base_offset);
+    }
+
+    /// Returns the next sequence of `topition` at `epoch`, after the producer starts that
+    /// epoch on the partition.
+    ///
+    /// Starting an epoch removes the partition's sequences and remembered batches at older
+    /// epochs, and each older epoch that then holds none. A produce never reads them again,
+    /// because a batch at an older epoch than its partition's is fenced. Keeping them would
+    /// grow meta.json, which every idempotent produce rewrites, by an entry for each bump.
+    fn start_epoch(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
+        forget_older_epochs(&mut self.sequences, epoch, topition);
+        forget_older_epochs(&mut self.batches, epoch, topition);
+
+        self.sequence(epoch, topition)
+    }
+
+    /// Returns the next sequence of `topition` at `epoch`, 0 when the partition has none.
+    fn sequence(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
+        self.sequences
+            .entry(epoch)
+            .or_default()
+            .entry(topition.topic.clone())
+            .or_default()
+            .entry(topition.partition)
+            .or_default()
+    }
+}
+
+/// Removes `topition` from each epoch of `by_epoch` older than `epoch`, and each older epoch
+/// that then holds no partition.
+fn forget_older_epochs<T>(
+    by_epoch: &mut BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, T>>>,
+    epoch: ProducerEpoch,
+    topition: &Topition,
+) {
+    by_epoch.retain(|older, topics| {
+        if *older >= epoch {
+            return true;
+        }
+
+        if let Some(partitions) = topics.get_mut(&topition.topic) {
+            _ = partitions.remove(&topition.partition);
+
+            if partitions.is_empty() {
+                _ = topics.remove(&topition.topic);
+            }
+        }
+
+        !topics.is_empty()
+    });
 }
 
 /// Allocates a new producer ID, one more than the newest, and gives it epoch 0.
@@ -412,6 +564,7 @@ fn allocate_producer_id(
         id,
         ProducerDetail {
             sequences: BTreeMap::from([(0, BTreeMap::new())]),
+            batches: BTreeMap::new(),
         },
     );
 
@@ -479,6 +632,37 @@ struct TxnCommitOffset {
 struct TopicMetadata {
     id: Uuid,
     topic: CreatableTopic,
+}
+
+impl TopicMetadata {
+    /// Returns the `DescribeConfigs` result for this topic. The result holds each config that the
+    /// topic sets, and gives `name` as the resource name.
+    fn describe_configs_result(&self, name: &str) -> DescribeConfigsResult {
+        let error_code = ErrorCode::None;
+
+        DescribeConfigsResult::default()
+            .error_code(error_code.into())
+            .error_message(Some(error_code.to_string()))
+            .resource_type(i8::from(ConfigResource::Topic))
+            .resource_name(name.into())
+            .configs(self.topic.configs.as_ref().map(|configs| {
+                configs
+                    .iter()
+                    .map(|config| {
+                        DescribeConfigsResourceResult::default()
+                            .name(config.name.clone())
+                            .value(config.value.clone())
+                            .read_only(false)
+                            .is_default(None)
+                            .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
+                            .is_sensitive(false)
+                            .synonyms(Some([].into()))
+                            .config_type(Some(ConfigType::String.into()))
+                            .documentation(Some("".into()))
+                    })
+                    .collect()
+            }))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -651,17 +835,17 @@ impl DynoStore {
             .await
     }
 
-    /// Ensures that `topition` names an existing partition: its topic
-    /// exists, and its index is below the topic's partition count.
+    /// Ensures that `topition` names an existing partition: its topic exists, and its index is
+    /// below the topic's partition count. Returns the topic's metadata.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`]
-    /// for an unknown topic or an index outside the topic.
-    async fn ensure_partition_exists(&self, topition: &Topition) -> Result<()> {
+    /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic or an
+    /// index outside the topic, and with [`ErrorCode::KafkaStorageError`] for a failed read of
+    /// the object store.
+    async fn ensure_partition_exists(&self, topition: &Topition) -> Result<TopicMetadata> {
         let Some(metadata) = self
             .topic_metadata(&TopicId::Name(topition.topic.clone()))
-            .await?
+            .await
+            .map_err(metadata_read_error)?
         else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
@@ -670,7 +854,7 @@ impl DynoStore {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         }
 
-        Ok(())
+        Ok(metadata)
     }
 
     fn encode(&self, deflated: deflated::Batch) -> Result<PutPayload> {
@@ -794,7 +978,7 @@ impl DynoStore {
 
         let mut deleted = self
             .object_store
-            .delete_stream(futures::stream::iter(expired).boxed());
+            .delete_stream(stream::iter(expired).boxed());
 
         while let Some(outcome) = deleted.next().await {
             if let Err(error) = outcome {
@@ -899,7 +1083,7 @@ impl DynoStore {
             return Ok(watermark.to_owned());
         }
 
-        self.ensure_partition_exists(topition).await?;
+        _ = self.ensure_partition_exists(topition).await?;
 
         self.watermark_for(topition)
     }
@@ -1290,7 +1474,7 @@ impl DynoStore {
                     continue;
                 }
 
-                let timestamp = inflated.base_timestamp + record.timestamp_delta;
+                let timestamp = inflated.record_timestamp(record);
                 if timestamp >= target {
                     return Ok(Some((offset, timestamp)));
                 }
@@ -1827,6 +2011,27 @@ impl Storage for DynoStore {
         ])
     }
 
+    /// Appends `deflated` to `topition`, and returns the base offset of the batch.
+    ///
+    /// The produce takes its offsets in the watermark document of the
+    /// partition, before the writes that follow: the lake table, the
+    /// transaction metadata and the batch object. If one of those writes
+    /// fails, the client gets an error and the taken offsets hold no batch.
+    /// The produce does not move the high watermark back, because a rollback
+    /// is another conditional write that can fail in the same way, and a
+    /// concurrent produce can already hold the next offset. A fetch skips the
+    /// gap, and the time index backfill settles it as a failed produce after
+    /// `BATCH_SETTLED_AFTER`. `ListOffsets` reports a high watermark past the
+    /// gap.
+    ///
+    /// Kafka does not use an offset for an append that it rejects. After it
+    /// appends to the log, Kafka does not move the log end offset back, also
+    /// when the transaction index write that follows fails
+    /// ([`UnifiedLog.append`]). This engine takes its offsets earlier, at the
+    /// watermark write, so a failed batch write leaves a gap that Kafka does
+    /// not have.
+    ///
+    /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L905-L912
     async fn produce(
         &self,
         transaction_id: Option<&str>,
@@ -1835,29 +2040,39 @@ impl Storage for DynoStore {
     ) -> Result<i64> {
         // Checked before any key is built, so a produce to a topic or
         // partition that does not exist writes nothing, as in Kafka.
-        self.ensure_partition_exists(topition).await?;
+        let metadata = self.ensure_partition_exists(topition).await?;
 
-        let config = self
-            .describe_config(topition.topic(), ConfigResource::Topic, None)
-            .await
-            .inspect_err(|err| debug!(?err))?;
+        let limit = max_message_bytes::limit(
+            topition.topic(),
+            metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|config| config.name == max_message_bytes::KEY)
+                .and_then(|config| config.value.as_deref()),
+        );
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+
+        let config = metadata.describe_configs_result(topition.topic());
 
         if self.lake.is_some()
             && config
                 .configs
                 .as_ref()
                 .map(|configs| {
-                    configs
-                        .iter()
-                        .inspect(|config| debug!(?config))
-                        .any(|config| {
-                            config.name.as_str() == "tansu.lake.sink"
-                                && config
-                                    .value
-                                    .as_deref()
-                                    .and_then(|value| bool::from_str(value).ok())
-                                    .unwrap_or(false)
-                        })
+                    topic_config::lookup(
+                        configs
+                            .iter()
+                            .inspect(|config| debug!(?config))
+                            .filter_map(|config| {
+                                Some((config.name.as_str(), config.value.as_deref()?))
+                            }),
+                        topic_config::LAKE_SINK,
+                    )
+                    .and_then(|value| bool::from_str(value).ok())
+                    .unwrap_or(false)
                 })
                 .unwrap_or(false)
         {
@@ -1904,7 +2119,7 @@ impl Storage for DynoStore {
                         |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
                     );
 
-                    // Deliberately not touched: this branch (tansu.lake.sink)
+                    // Deliberately not touched: this branch (`nisshi.lake.sink`)
                     // never writes a `records/*.batch` object, so there is
                     // nothing for a `time_index` entry here to point at. A
                     // sequential scan starting from such an entry would list
@@ -1970,6 +2185,8 @@ impl Storage for DynoStore {
                 None
             };
 
+            let transactional = transaction_id.is_some() || deflated.is_transactional();
+
             // Idempotent sequence numbers are checked here but only
             // *advanced* after the record write below succeeds (see the
             // second check further down). Checking first, without
@@ -1980,57 +2197,96 @@ impl Storage for DynoStore {
             // client's mandatory retry, for a duplicate of a batch that
             // was never actually written.
             if deflated.is_idempotent() {
-                self.meta
+                let check = self
+                    .meta
                     .with(&self.object_store, |meta| {
                         let Some(pd) = meta.producers.get(&deflated.producer_id) else {
                             debug!(producer_id = deflated.producer_id, ?meta.producers);
                             return Err(Error::Api(ErrorCode::UnknownProducerId));
                         };
 
-                        let Some((current_epoch, sequences)) = pd.sequences.last_key_value() else {
-                            debug!(last_entry = ?pd.sequences.last_key_value());
+                        let Some(stored) = pd.stored_epochs(
+                            transactional || meta.transactional_id_owns(deflated.producer_id),
+                            topition,
+                        ) else {
+                            debug!(producer_id = deflated.producer_id, "no epoch");
                             return Err(Error::Api(ErrorCode::UnknownServerError));
                         };
 
-                        if current_epoch != &deflated.producer_epoch {
-                            debug!(?current_epoch, producer_epoch = deflated.producer_epoch);
-                            return Err(Error::Api(ErrorCode::ProducerFenced));
-                        }
+                        let (sequence, remembered_batches) = match stored
+                            .check_batch(deflated.producer_epoch, deflated.base_sequence)
+                            .inspect_err(|error| {
+                                debug!(?error, ?stored, producer_epoch = deflated.producer_epoch)
+                            })
+                            .map_err(Error::Api)?
+                        {
+                            ProduceEpoch::Continue => (
+                                pd.next_sequence(deflated.producer_epoch, topition),
+                                pd.remembered_batches(deflated.producer_epoch, topition),
+                            ),
 
-                        let sequence = sequences
-                            .get(&topition.topic)
-                            .and_then(|partitions| partitions.get(&topition.partition))
-                            .copied()
-                            .unwrap_or_default();
+                            ProduceEpoch::Start => (0, None),
+                        };
 
-                        match sequence {
-                            sequence if sequence < deflated.base_sequence => {
+                        produced_batches::check_sequence(
+                            sequence,
+                            remembered_batches,
+                            deflated.base_sequence,
+                            deflated.last_offset_delta,
+                        )
+                        .inspect_err(|err| {
+                            // A client treats this answer as fatal, and stops the producer.
+                            if matches!(err, Error::Api(ErrorCode::OutOfOrderSequenceNumber)) {
+                                warn!(
+                                    producer_id = deflated.producer_id,
+                                    producer_epoch = deflated.producer_epoch,
+                                    ?topition,
+                                    next_sequence = sequence,
+                                    base_sequence = deflated.base_sequence,
+                                    last_offset_delta = deflated.last_offset_delta,
+                                    ?remembered_batches,
+                                    "idempotent batch out of order: it does not start at the next \
+                                     sequence and does not repeat a recent batch"
+                                );
+                            } else {
                                 debug!(?sequence, base_sequence = deflated.base_sequence);
-
-                                Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
                             }
-
-                            sequence if sequence > deflated.base_sequence => {
-                                debug!(?sequence, base_sequence = deflated.base_sequence);
-
-                                Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-                            }
-
-                            _ => Ok(()),
-                        }
+                        })
                     })
                     .await
+                    .inspect(|check| {
+                        IDEMPOTENT_SEQUENCE_CHECK.add(
+                            1,
+                            &[
+                                KeyValue::new("cluster", self.cluster.clone()),
+                                KeyValue::new("outcome", check.outcome()),
+                            ],
+                        );
+                    })
                     .inspect_err(|err| {
-                        if matches!(
-                            err,
-                            Error::Api(ErrorCode::OutOfOrderSequenceNumber)
-                                | Error::Api(ErrorCode::DuplicateSequenceNumber)
-                        ) {
-                            return;
+                        if let Some(outcome) = produced_batches::rejected_outcome(err) {
+                            IDEMPOTENT_SEQUENCE_CHECK.add(
+                                1,
+                                &[
+                                    KeyValue::new("cluster", self.cluster.clone()),
+                                    KeyValue::new("outcome", outcome),
+                                ],
+                            );
+                        } else {
+                            error!(?err, transaction_id, ?topition);
                         }
-
-                        error!(?err, transaction_id, ?topition);
                     })?;
+
+                if let SequenceCheck::Duplicate { base_offset } = check {
+                    debug!(
+                        base_offset,
+                        producer_id = deflated.producer_id,
+                        base_sequence = deflated.base_sequence,
+                        transaction_id,
+                        ?topition
+                    );
+                    return Ok(base_offset);
+                }
             }
 
             let watermark = self.watermark_for(topition)?;
@@ -2176,49 +2432,62 @@ impl Storage for DynoStore {
             if is_idempotent {
                 self.meta
                     .with_mut(&self.object_store, |meta| {
+                        let transactional =
+                            transactional || meta.transactional_id_owns(producer_id);
+
                         let Some(pd) = meta.producers.get_mut(&producer_id) else {
                             debug!(producer_id, ?meta.producers);
                             return Err(Error::Api(ErrorCode::UnknownProducerId));
                         };
 
-                        let Some(mut current) = pd.sequences.last_entry() else {
-                            debug!(last_entry = ?pd.sequences.last_entry());
+                        let Some(stored) = pd.stored_epochs(transactional, topition) else {
+                            debug!(producer_id, "no epoch");
                             return Err(Error::Api(ErrorCode::UnknownServerError));
                         };
 
-                        if current.key() != &producer_epoch {
-                            debug!(current = ?current.key(), producer_epoch);
-                            return Err(Error::Api(ErrorCode::ProducerFenced));
-                        }
+                        // with_mut stores each change that this closure makes, also when it
+                        // then answers an error, so every check runs before any change.
+                        let produce_epoch = stored
+                            .check_batch(producer_epoch, base_sequence)
+                            .inspect_err(|error| debug!(?error, ?stored, producer_epoch))
+                            .map_err(Error::Api)?;
 
-                        let sequences = current.get_mut();
-                        debug!(?sequences);
+                        let (sequence, remembered_batches) = match produce_epoch {
+                            ProduceEpoch::Continue => (
+                                pd.next_sequence(producer_epoch, topition),
+                                pd.remembered_batches(producer_epoch, topition),
+                            ),
 
-                        match sequences
-                            .entry(topition.topic.clone())
-                            .or_default()
-                            .entry(topition.partition)
-                            .or_default()
+                            ProduceEpoch::Start => (0, None),
+                        };
+
+                        // A concurrent retry of the same batch can be stored and
+                        // advance the sequence first. This write is then a second
+                        // copy, and the client gets an error for it instead of
+                        // the duplicate's offset.
+                        if let SequenceCheck::Duplicate { .. } = produced_batches::check_sequence(
+                            sequence,
+                            remembered_batches,
+                            base_sequence,
+                            last_offset_delta,
+                        )
+                        .inspect_err(|_| debug!(sequence, base_sequence))?
                         {
-                            sequence if *sequence < base_sequence => {
-                                debug!(?sequence, base_sequence);
-
-                                Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
-                            }
-
-                            sequence if *sequence > base_sequence => {
-                                debug!(?sequence, base_sequence);
-
-                                Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-                            }
-
-                            sequence => {
-                                debug!(?sequence, delta = last_offset_delta + 1);
-
-                                *sequence += last_offset_delta + 1;
-                                Ok(())
-                            }
+                            debug!(sequence, base_sequence);
+                            return Err(Error::Api(ErrorCode::DuplicateSequenceNumber));
                         }
+
+                        debug!(sequence, delta = last_offset_delta + 1);
+                        pd.advance(
+                            producer_epoch,
+                            produce_epoch,
+                            topition,
+                            base_sequence,
+                            last_offset_delta,
+                            offset,
+                        );
+
+                        Ok(())
                     })
                     .await
                     .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
@@ -2409,7 +2678,7 @@ impl Storage for DynoStore {
 
                     continue;
                 }
-                checked => checked?,
+                checked => _ = checked?,
             }
 
             // A store failure answers `KAFKA_STORAGE_ERROR` in its own
@@ -2816,34 +3085,7 @@ impl Storage for DynoStore {
     ) -> Result<DescribeConfigsResult> {
         match resource {
             ConfigResource::Topic => match self.topic_metadata(&TopicId::Name(name.into())).await {
-                Ok(Some(topic_metadata)) => {
-                    let error_code = ErrorCode::None;
-
-                    Ok(DescribeConfigsResult::default()
-                        .error_code(error_code.into())
-                        .error_message(Some(error_code.to_string()))
-                        .resource_type(i8::from(resource))
-                        .resource_name(name.into())
-                        .configs(topic_metadata.topic.configs.map(|configs| {
-                            configs
-                                .iter()
-                                .map(|config| {
-                                    DescribeConfigsResourceResult::default()
-                                        .name(config.name.clone())
-                                        .value(config.value.clone())
-                                        .read_only(false)
-                                        .is_default(None)
-                                        .config_source(Some(
-                                            ConfigSource::DynamicTopicConfig.into(),
-                                        ))
-                                        .is_sensitive(false)
-                                        .synonyms(Some([].into()))
-                                        .config_type(Some(ConfigType::String.into()))
-                                        .documentation(Some("".into()))
-                                })
-                                .collect()
-                        })))
-                }
+                Ok(Some(topic_metadata)) => Ok(topic_metadata.describe_configs_result(name)),
 
                 Ok(None) => Ok(DescribeConfigsResult::default()
                     .error_code(ErrorCode::None.into())
@@ -2852,7 +3094,7 @@ impl Storage for DynoStore {
                     .resource_name(name.into())
                     .configs(Some(vec![]))),
 
-                Err(_) => todo!(),
+                Err(error) => Err(metadata_read_error(error)),
             },
 
             _ => Ok(DescribeConfigsResult::default()
@@ -2949,7 +3191,7 @@ impl Storage for DynoStore {
         Ok(responses)
     }
 
-    async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let location = self.group_consumers_prefix();
 
         // `list_with_delimiter` returns a group's committed offsets as a common prefix and its
@@ -2961,32 +3203,60 @@ impl Storage for DynoStore {
             .inspect(|list_result| debug!(?list_result))
             .inspect_err(|error| error!(?error, cluster = self.cluster))?;
 
-        let offsets_segments = list_result
-            .common_prefixes
-            .iter()
-            .filter_map(Path::filename);
-        let state_segments = list_result
+        // A group has a state object once a member joins it, and an offsets folder once it
+        // commits an offset. A group can have either one without the other.
+        let groups_with_state = list_result
             .objects
             .iter()
-            .filter_map(|object| object.location.filename()?.strip_suffix(".json"));
-
-        // The set holds each group that either list names. A group that has committed has both a
-        // common prefix and a state object, and the set keeps one entry for its id.
-        let group_ids = offsets_segments
-            .chain(state_segments)
-            .filter_map(decode_group_segment)
+            .filter_map(|object| {
+                object
+                    .location
+                    .filename()
+                    .and_then(|filename| filename.strip_suffix(".json"))
+                    .and_then(decode_group_segment)
+            })
             .collect::<BTreeSet<_>>();
 
-        Ok(group_ids
-            .into_iter()
-            .map(|group_id| {
-                ListedGroup::default()
-                    .group_id(group_id)
-                    .protocol_type("consumer".into())
-                    .group_state(Some("Unknown".into()))
-                    .group_type(Some("classic".into()))
+        let groups_with_offsets_only = list_result
+            .common_prefixes
+            .iter()
+            .filter_map(|prefix| {
+                prefix
+                    .parts()
+                    .next_back()
+                    .and_then(|segment| decode_group_segment(segment.as_ref()))
             })
-            .collect())
+            .filter(|group_id| !groups_with_state.contains(group_id))
+            .collect::<BTreeSet<_>>();
+
+        let mut listed_groups = groups_with_offsets_only
+            .into_iter()
+            .map(|group_id| NamedGroupDetail::found(group_id, GroupDetail::default()))
+            .collect::<Vec<_>>();
+
+        let stored_states = stream::iter(groups_with_state)
+            .map(|group_id| async move {
+                let stored = self.group_with_version(&group_id).await;
+                (group_id, stored)
+            })
+            .buffered(CONCURRENT_GROUP_STATE_READS)
+            .collect::<Vec<_>>()
+            .await;
+
+        listed_groups.extend(stored_states.into_iter().filter_map(
+            |(group_id, stored)| match stored {
+                Ok(Some((detail, _))) => Some(NamedGroupDetail::found(group_id, detail)),
+
+                // The group was deleted after the listing, so it is left out.
+                Ok(None) => None,
+
+                // A group whose state can't be read is listed in the `Unknown` state, so that
+                // one unreadable object does not hide every other group.
+                Err(err) => Some(NamedGroupDetail::decoded(group_id, Some(Err(err)))),
+            },
+        ));
+
+        Ok(listed_groups)
     }
 
     async fn delete_groups(
@@ -3273,6 +3543,7 @@ impl Storage for DynoStore {
                                 if let Some(previous) = meta.producers.get_mut(&previous_id) {
                                     previous.sequences =
                                         BTreeMap::from([(i16::MAX, BTreeMap::new())]);
+                                    previous.batches.clear();
                                 }
 
                                 info!(
@@ -4033,6 +4304,27 @@ impl Storage for DynoStore {
     }
 }
 
+/// Returns the error that a client gets for a failed read of the cluster's metadata: an object
+/// store error becomes [`Error::Api`] with [`ErrorCode::KafkaStorageError`], and any other error
+/// stays as it is.
+///
+/// A failed read of the object store is usually transient. Kafka answers a failed log read with
+/// `KAFKA_STORAGE_ERROR` ([`LocalLog.scala`]), and a producer retries that code, but fails on
+/// `UNKNOWN_SERVER_ERROR`. A retry does not fix metadata that can't be decoded, so that error
+/// keeps its type.
+///
+/// [`LocalLog.scala`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L709-L721
+fn metadata_read_error(error: Error) -> Error {
+    match error {
+        Error::ObjectStore(error) => {
+            error!(?error, "reading metadata");
+            Error::Api(ErrorCode::KafkaStorageError)
+        }
+
+        otherwise => otherwise,
+    }
+}
+
 fn object_store_error_name(error: &object_store::Error) -> &'static str {
     match error {
         object_store::Error::Precondition { .. } => "pre_condition",
@@ -4049,6 +4341,17 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
         }
     }
 }
+
+/// Counts the idempotent batches that a produce checks against the producer's sequence, by
+/// `outcome`: see [`SequenceCheck::outcome`] and [`produced_batches::rejected_outcome`].
+static IDEMPOTENT_SEQUENCE_CHECK: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_produce_idempotent_sequence_check")
+        .with_description(
+            "Idempotent produce batches checked against the producer's sequence, by outcome",
+        )
+        .build()
+});
 
 static POST_WRITE_ADVANCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER

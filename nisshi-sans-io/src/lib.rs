@@ -130,6 +130,7 @@ pub mod record;
 pub mod resource;
 pub mod ser;
 pub mod topic;
+pub mod topic_config;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 pub use de::Decoder;
@@ -363,6 +364,9 @@ pub enum Error {
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
     NotAuthenticated,
+    /// Appending a batch to another overflows an `i32` offset delta. The value names the sum that
+    /// overflows: `"record offset_delta"` or `"last_offset_delta"`.
+    OffsetDeltaOverflow(&'static str),
     Overflow,
     ParseFilter(Arc<ParseError>),
     ParseScram(String),
@@ -397,6 +401,9 @@ impl Display for Error {
             }
             Error::FromUtf8 { len, error } => {
                 write!(f, "string of {len} bytes is not valid UTF-8: {error}")
+            }
+            Error::OffsetDeltaOverflow(sum) => {
+                write!(f, "{sum} overflows i32 when a batch is appended")
             }
             e => write!(f, "{e:?}"),
         }
@@ -1701,7 +1708,9 @@ impl TryFrom<i16> for Ack {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
 /// The timestamp type.
 pub enum TimestampType {
     #[default]

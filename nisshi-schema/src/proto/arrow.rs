@@ -1046,15 +1046,17 @@ impl AsArrow for Schema {
                 self.message_by_package_relative_name(MessageKind::Meta),
                 self.encode_from_value(
                     MessageKind::Meta,
-                    &DateTime::from_timestamp_millis(batch.base_timestamp + record.timestamp_delta)
-                        .map_or(json!({"partition": partition}), |date_time| {
+                    &DateTime::from_timestamp_millis(batch.record_timestamp(record)).map_or(
+                        json!({"partition": partition}),
+                        |date_time| {
                             json!({
                             "partition": partition,
                             "timestamp": date_time.to_rfc3339(),
                             "year": date_time.date_naive().year(),
                             "month": date_time.date_naive().month(),
                             "day": date_time.date_naive().day()})
-                        }),
+                        },
+                    ),
                 )
                 .map(Some)?,
                 &mut record_builder.meta.iter_mut(),

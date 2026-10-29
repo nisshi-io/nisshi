@@ -64,9 +64,7 @@ rm -f "${results}/results-${leg}.csv" "${results}/nextest-${leg}.log" \
 export NISSHI_SMOKE_RUN=${engine}-$$
 
 # The run's own compose project, so a run never touches the services and
-# volumes of the default project or of another run. compose.yaml interpolates
-# these images for services this script doesn't start.
-export NISSHI_IMAGE=${NISSHI_IMAGE:-unused} LAKEKEEPER_IMAGE=${LAKEKEEPER_IMAGE:-unused}
+# volumes of the default project or of another run.
 project_prefix=nisshi-smoke-$(id -u)-
 project=${project_prefix}${NISSHI_SMOKE_RUN}
 compose=(docker compose --project-name "${project}" --ansi never)
@@ -196,7 +194,7 @@ cargo nextest run -p nisshi-smoke-test --features "${engine}" --no-run
 
 # The image of a PostgreSQL server that a test starts for itself. It is the
 # image of the db service.
-export NISSHI_SMOKE_POSTGRES_IMAGE=${POSTGRES_IMAGE:-postgres:17}
+export NISSHI_SMOKE_POSTGRES_IMAGE=${POSTGRES_IMAGE:-postgres:18}
 
 # The directory of the files that reserve ports for brokers and PostgreSQL
 # servers. Every run of the same user shares it. Each user has their own,
@@ -270,6 +268,13 @@ export KAFKA_IMAGE=${KAFKA_IMAGE:-apache/kafka:3.9.2}
 # JVM start faster and use less CPU: the JIT compiles only its fast first tier,
 # and one GC thread collects. They don't change what the Kafka client sends.
 jvm_options="-XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Djava.awt.headless=true"
+# The tool JVMs share one perf-data directory, and a JVM whose perf-data file is
+# locked prints a warning on stdout, among the tool output that the tests read.
+# The JVMs keep no perf data, which only jps, jcmd and jstat read.
+jvm_options+=" -XX:-UsePerfData"
+# The JVMs write every other warning to stderr. -Xlog:disable turns off the
+# default output to stdout first, or the JVM prints each warning on both.
+jvm_options+=" -Xlog:disable -Xlog:all=warning:stderr:uptime,level,tags"
 # Under a Docker VM whose host network is the VM's own, not this machine's
 # (colima: NISSHI_SMOKE_DOCKER_HOST_IP=192.168.5.2), the tools get a network of
 # their own, where each connection to 127.0.0.1 goes to that address, which

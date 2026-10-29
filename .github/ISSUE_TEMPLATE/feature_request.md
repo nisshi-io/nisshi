@@ -6,6 +6,9 @@ labels: enhancement
 assignees: ""
 ---
 
+Please open an issue like this and wait for approval from the Solace Nisshi
+team before you start a pull request. See CONTRIBUTING.md in the repository root.
+
 **What problem does this solve?**
 Describe the problem or limitation you're running into.
 

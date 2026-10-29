@@ -1,0 +1,142 @@
+name: Build Scan Image
+
+# Reusable build for the SCAN pipeline only: builds the image single-arch and
+# saves it as a tar artifact for a downstream job to load and scan. It never
+# pushes and needs only `contents: read`, so guardian-scan's build job doesn't
+# have to grant registry scopes it never uses. A reusable-workflow caller must
+# grant AT LEAST the permissions this workflow's jobs declare (under-granting
+# fails at run creation, it is not silently capped), so keeping this at
+# contents: read keeps every caller minimal.
+#
+# The Dockerfile packages a prebuilt static binary, so this repeats the
+# linux/amd64 leg of ci.yml's `release` job first. That build runs every
+# dependency's build script, which is why this job holds no secrets and no
+# write scope. The released multi-arch image is built and pushed by
+# tier-c.yml's `edge-publish` job (main) and release.yml's `publish-image` job
+# (tags).
+
+on:
+  workflow_call:
+    inputs:
+      git_ref:
+        required: true
+        type: string
+      image_name:
+        required: false
+        type: string
+        default: "ghcr.io/nisshi-io/nisshi"
+      scan_tag:
+        required: false
+        type: string
+        default: "scan"
+      artifact_name:
+        required: false
+        type: string
+        default: "guardian-scan-image"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build scan image
+    runs-on: ubuntu-latest
+    # Above ci.yml's `release` (45), which restores a cache: this build is
+    # always cold.
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      # cc-rs otherwise falls back to glibc gcc for the C deps (aws-lc-sys,
+      # ring, libsql-ffi, zstd-sys, ...); see ci.yml's `release` job.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      # The workflow's own commit, with full history, so the next step can test
+      # `git_ref` against main before this job runs any code from it.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This job builds only a commit that is on main. A dispatch from main
+      # runs in main's cache scope, and the build runs every build script of
+      # the checked-out tree, so a commit off main could write main's Actions
+      # cache. Main's own commits gain nothing from that. A release tag passes
+      # because release.yml's `on-main` job requires the tagged commit to be
+      # on main.
+      - name: Check out the commit to build
+        env:
+          GIT_REF: ${{ inputs.git_ref }}
+        run: |
+          sha=$(git rev-parse --verify "${GIT_REF}^{commit}")
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::$GIT_REF ($sha) is not on main, so this job does not build it"
+            exit 1
+          fi
+          git checkout --detach "$sha"
+
+      # No cache. This runs on trunk only, after the merge, where nobody
+      # waits on it, and a cache of its own would be a second musl release
+      # cache beside the one ci.yml's `release` saves (rust-cache keys on the
+      # job id, so the two can't share). It also keeps a restored cache out of
+      # a tag's scan, as `release` does.
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # Same settings as ci.yml's `release` job: don't deny warnings on a
+          # release build.
+          rustflags: ""
+          build-warnings: ""
+          cache: false
+
+      - name: Install musl target
+        run: |
+          rustup target add "$TARGET"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # Same as ci.yml's `release`. cargo-auditable embeds the crate list so an
+      # image scanner can read the binary's dependencies. The image carries no
+      # Cargo.lock (.dockerignore), so without it the scan sees no crates.
+      # cargo-about writes the licence list that the Dockerfile copies into the
+      # image.
+      - name: Install cargo-auditable and cargo-about
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-auditable@0.7.6,cargo-about@0.8.4
+          fallback: none
+
+      - name: Build static binary
+        run: |
+          # The Dockerfile copies the licence list into the image, so the scan
+          # image needs it too. wait returns cargo about's exit status, so a
+          # failed licence scan fails the step.
+          cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html &
+          about=$!
+          cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+          wait "$about"
+          bin=target/"${TARGET}"/release/nisshi
+          file "$bin" | grep -Eq 'static(-pie|ally) linked' || { echo "::error::$bin is not statically linked"; exit 1; }
+          mkdir -p dist/linux/amd64
+          cp "$bin" dist/linux/amd64/nisshi
+          cp THIRD-PARTY-LICENSE.html dist/linux/amd64/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and save for scanning
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          tags: ${{ inputs.image_name }}:${{ inputs.scan_tag }}
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Upload scan image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: /tmp/image.tar
+          retention-days: 1

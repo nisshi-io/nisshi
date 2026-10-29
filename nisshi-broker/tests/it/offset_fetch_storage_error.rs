@@ -38,7 +38,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     offset_fetch_request::{
         OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
     },
@@ -404,10 +403,7 @@ impl Storage for FailingOffsets {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(
-        &self,
-        _states_filter: Option<&[String]>,
-    ) -> nisshi_storage::Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> nisshi_storage::Result<Vec<NamedGroupDetail>> {
         unimplemented!()
     }
 

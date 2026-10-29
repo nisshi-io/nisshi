@@ -16,6 +16,7 @@
 use std::{collections::HashMap, env::vars, fmt, path::PathBuf, result, str::FromStr};
 
 mod cli;
+mod insecure_tls;
 
 pub use cli::{Cli, Outcome};
 use regex::{Regex, Replacer};

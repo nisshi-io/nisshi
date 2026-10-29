@@ -10,6 +10,9 @@ extend-exclude = [
 ]
 
 [default]
+# A GitHub handle, which typos reads as a misspelling of "across". Matching only the handle
+# keeps the real typo caught everywhere else.
+extend-ignore-re = ["solace-aross"]
 
 [default.extend-words]
 ser = "ser"

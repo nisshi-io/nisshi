@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse, RequestInput};
+use nisshi_sans_io::{
+    ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse, RequestInput,
+    list_groups_response::ListedGroup,
+};
 use rama::Service;
-use tracing::instrument;
+use tracing::{error, instrument};
 
-use crate::{Error, Result, Storage};
+use crate::{ConsumerGroupState, Error, NamedGroupDetail, Result, Storage};
 
 /// A [`Service`] using its [`Storage`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
 /// ```no_run
@@ -73,15 +76,43 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        self.storage
-            .list_groups(input.request.states_filter.as_deref())
-            .await
-            .map(Some)
-            .map(|groups| {
-                ListGroupsResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-                    .groups(groups)
-            })
+        Ok(list_groups_response(
+            self.storage.list_groups().await,
+            input.request.states_filter.as_deref(),
+        ))
+    }
+}
+
+/// Returns the `ListGroups` response that lists each group in `listed` whose state matches
+/// `states_filter`.
+///
+/// A storage error is answered with an error code instead of being returned, because the
+/// connection closes on a returned error, and the client gets no answer.
+pub fn list_groups_response(
+    listed: Result<Vec<NamedGroupDetail>>,
+    states_filter: Option<&[String]>,
+) -> ListGroupsResponse {
+    match listed {
+        Ok(groups) => {
+            let groups = groups
+                .iter()
+                .filter(|group| ConsumerGroupState::from(*group).matches(states_filter))
+                .map(ListedGroup::from)
+                .collect::<Vec<_>>();
+
+            ListGroupsResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::None.into())
+                .groups(Some(groups))
+        }
+
+        Err(err) => {
+            error!(?err, "the groups could not be listed");
+
+            ListGroupsResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(err.group_request_error_code().into())
+                .groups(Some([].into()))
+        }
     }
 }

@@ -258,11 +258,6 @@ fn reset_shift_by_moves_back_from_the_committed_offset() {
 /// A reset to a time must move the group to the first record at or after that time. The broker
 /// must find that record by the records' timestamps.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "a lookup by time compares the time at which the broker stored each batch, not the \
-              records' timestamps (#840)"
-)]
 fn reset_to_datetime_starts_at_first_record_after_that_time() {
     let consumer_group = ConsumerGroup::with_two_batches_an_hour_apart();
     let middle_of_gap = SystemTime::now() - GAP_BETWEEN_BATCHES * 3 / 2;
@@ -278,11 +273,6 @@ fn reset_to_datetime_starts_at_first_record_after_that_time() {
 /// A reset by duration must move the group to the first record produced within that duration
 /// before now. The broker must find that record by the records' timestamps.
 #[test]
-#[cfg_attr(
-    feature = "memory",
-    ignore = "a lookup by time compares the time at which the broker stored each batch, not the \
-              records' timestamps (#840)"
-)]
 fn reset_by_duration_starts_at_first_record_within_it() {
     let consumer_group = ConsumerGroup::with_two_batches_an_hour_apart();
     let back_to_middle_of_gap = format!("PT{}S", (GAP_BETWEEN_BATCHES * 3 / 2).as_secs());

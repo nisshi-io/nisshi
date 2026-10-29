@@ -424,7 +424,6 @@ mod tests {
         fetch_response::AbortedTransaction,
         incremental_alter_configs_request::AlterConfigsResource,
         incremental_alter_configs_response::AlterConfigsResourceResponse,
-        list_groups_response::ListedGroup,
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         list_offsets_response::ListOffsetsPartitionResponse,
         record::deflated,
@@ -663,7 +662,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+        async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
             unimplemented!()
         }
 

@@ -14,8 +14,7 @@
 -- limitations under the License.
 
 -- Kafka's retention.bytes is a per-partition limit: delete a partition's oldest records until the
--- bytes of its keys and values are within it, and always keep the newest record. Only a topic whose
--- cleanup.policy is set and contains delete is cleaned up, as with retention.ms.
+-- bytes of its keys and values are within it, and always keep the newest record.
 --
 -- The bytes kept from an offset up rise as the offset falls, so the records to delete are the ones
 -- at and below the first offset, counting down from the newest record, where they pass the limit.
@@ -34,12 +33,16 @@ capped as (
     join topic t on t.id = tp.topic
     join cluster c on t.cluster = c.id
     join topic_configuration tc on tc.topic = t.id
-    join topic_configuration pol on pol.topic = t.id
+    left join topic_configuration pol on pol.topic = t.id and pol.name = 'cleanup.policy'
     where c.name = $1
     and tc.name = 'retention.bytes'
-    and tc.value ~ '^[0-9]+$'
-    and pol.name = 'cleanup.policy'
-    and pol.value like '%delete%'
+    -- A negative retention.bytes is no limit. The pattern allows at most 18 digits, so the cast to
+    -- bigint never overflows and fails this statement for every topic. The broker rejects a value
+    -- that isn't a long, but a topic created before the broker checked the value can hold one, and
+    -- that topic keeps every record.
+    and tc.value ~ '^[0-9]{1,18}$'
+    -- A topic without a cleanup.policy has Kafka's default policy, delete.
+    and coalesce(pol.value, 'delete') like '%delete%'
 ),
 
 -- the highest offset to delete in each partition, absent when the partition is within its limit.

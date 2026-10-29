@@ -21,13 +21,12 @@ name: ci
 # cap; it keeps per-push runner time and queue time down. So:
 #
 # - Tier A runs on every pull_request push: fmt, clippy, typos, shellcheck,
-#   third-party-license, the single non-experimental leg of each compat
-#   suite, `test` on postgres:16 (the oldest version the project tests), and
-#   ci-gate.
+#   third-party-license, the memory leg of each compat suite, `test` on
+#   postgres:16 (the oldest version the project tests), and ci-gate.
 # - Tier B runs once per merge-queue entry (`merge_group`) and, trimmed, on
 #   push to main: the full build-storage/build-storage-lake matrix, `test` on
 #   postgres:16 again (Postgres 17, 18 and 19 run nightly in tier-c.yml), the
-#   experimental compat legs (postgres and sqlite; S3 compat runs nightly),
+#   postgres and sqlite compat legs (S3 compat runs nightly),
 #   cargo-publish-dry-run, src, release,
 #   macos, smoke, smoke-oldest-client, smoke-report.
 #
@@ -196,7 +195,6 @@ jobs:
       DATA_LAKE: s3://lake
       ICEBERG_CATALOG: http://localhost:8181/catalog
       ICEBERG_WAREHOUSE: nisshi
-      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
       NEXTEST_PROFILE: ci
       POSTGRES_IMAGE: ${{matrix.pg}}
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
@@ -387,21 +385,35 @@ jobs:
     if: needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
     needs: [changes]
     runs-on: ${{matrix.os}}
-    timeout-minutes: 30
-    continue-on-error: ${{ matrix.storage.experimental }}
+    # The job takes 10 to 16 minutes. A slow Ubuntu mirror can add 13 minutes to the apt-get
+    # step, which brought blocking legs within 5 minutes of a 30-minute limit.
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.storage.experimental || matrix.client.experimental == true }}
     strategy:
-      fail-fast: true
+      # A failed leg must not cancel the others: the report compares each
+      # engine's legs to tell a broker regression from an old-client one.
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
-        # Tier A runs the one non-experimental leg (memory); merge_group/push
+        # Tier A runs the memory leg; merge_group/push
         # run the three. compat-franz-go reuses this list as `*compat_storage`.
         storage: &compat_storage >-
           ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
           && '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false}]'
           || '[{"name": "memory", "engine": "memory://", "features": "dynostore", "experimental": false},
-          {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": true},
-          {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": true}]') }}
+          {"name": "postgres", "engine": "postgres://postgres:postgres@localhost", "features": "postgres", "experimental": false},
+          {"name": "sqlite", "engine": "sqlite://nisshi.db", "features": "libsql", "experimental": false}]') }}
+        # The version pinned in run.sh, and the newest release on or before
+        # Kafka 3.7.0: the oldest Kafka CLI tools that CI tests are 3.7, so
+        # both are tested back to the same date. Tier A runs only the
+        # pinned version, as smoke-oldest-client runs only in Tier B. The old
+        # version is experimental until its legs have a record in CI.
+        client: >-
+          ${{ fromJSON((github.event_name == 'pull_request' && (vars.MERGE_QUEUE == 'on' || github.event.pull_request.head.repo.full_name != github.repository))
+          && '[{"suffix": ""}]'
+          || '[{"suffix": ""},
+          {"suffix": "-v2.3.0", "version": "v2.3.0", "experimental": true}]') }}
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
@@ -410,17 +422,19 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
-      RESULTS_FILE: results-${{matrix.storage.name}}.csv
+      # run.sh falls back to its pinned version when this is empty, and picks
+      # the allowlist from the version
+      LIBRDKAFKA_VERSION: ${{matrix.client.version}}
+      POSTGRES_IMAGE: postgres:18
+      RESULTS_FILE: results-${{matrix.storage.name}}${{matrix.client.suffix}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -439,7 +453,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: compat-librdkafka-results-${{matrix.storage.name}}
+          name: compat-librdkafka-results-${{matrix.storage.name}}${{matrix.client.suffix}}
           path: ${{env.RESULTS_FILE}}
           if-no-files-found: warn
   compat-librdkafka-report:
@@ -469,7 +483,11 @@ jobs:
           mkdir -p "${DUCKDB_CLI}"
           gunzip -c duckdb_cli.gz >"${DUCKDB_CLI}/duckdb"
           chmod +x "${DUCKDB_CLI}/duckdb"
-      - run: echo "## librdkafka compatibility report card" >> "${GITHUB_STEP_SUMMARY}"
+      - run: |
+          {
+            echo "## librdkafka compatibility report card"
+            echo "A column named \`<engine>-<version>\` ran that librdkafka version; the others ran the version that \`compat/librdkafka/run.sh\` pins. A blank cell is a test that the column's allowlist does not name."
+          } >> "${GITHUB_STEP_SUMMARY}"
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   compat-franz-go:
@@ -479,7 +497,9 @@ jobs:
     timeout-minutes: 30
     continue-on-error: ${{ matrix.storage.experimental }}
     strategy:
-      fail-fast: true
+      # A failed leg must not cancel the others: the report compares each
+      # engine's legs to tell which engines a regression affects.
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -492,17 +512,16 @@ jobs:
       AWS_ENDPOINT: http://localhost:9000
       AWS_SECRET_ACCESS_KEY: minioadmin
       CLUSTER_ID: librdkafka-integration
-      LAKEKEEPER_IMAGE: unused
+      POSTGRES_IMAGE: postgres:18
       RESULTS_FILE: results-${{matrix.storage.name}}.csv
       STORAGE_ENGINE: ${{matrix.storage.engine}}
-      NISSHI_IMAGE: hello-world
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: postgres:18
+          ecr-fallback-images: ${{env.POSTGRES_IMAGE}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -558,7 +577,9 @@ jobs:
     if: &tier_b needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
     needs: [changes]
     runs-on: ${{matrix.os}}
-    timeout-minutes: 30
+    # The job takes 17 to 26 minutes. A slow Ubuntu mirror or cache download can add
+    # 15 minutes of setup, which made a 30-minute limit fail runs that would have passed.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -602,6 +623,28 @@ jobs:
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
+      - run: just compose-check
+  # Fails when the container image would trust a CA in distrusted-roots.txt.
+  # It builds only the Dockerfile's base stage, which needs no broker binary,
+  # so it runs on every pull request, and a Dependabot bump of the base image
+  # gets its own result.
+  image-ca-certificates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/docker-hub-mirror
+      # The final image copies the base stage's /image as its root, so
+      # /image/etc/ssl here is the image's /etc/ssl. The step checks every file
+      # there, not only the bundle, because the TLS stack also loads each
+      # certificate file in /etc/ssl/certs.
+      - name: Check the image's CA certificates
+        run: |
+          docker build --target base --output "type=local,dest=${RUNNER_TEMP}/base" .
+          find "${RUNNER_TEMP}/base/image/etc/ssl" -type f -exec cat {} + > "${RUNNER_TEMP}/image-ca-certificates.pem"
+          bash .github/scripts/check-ca-bundle.sh "${RUNNER_TEMP}/image-ca-certificates.pem"
   third-party-license:
     if: needs.changes.outputs.rust == 'true'
     needs: [changes]
@@ -617,7 +660,8 @@ jobs:
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-about@0.8.4
-      - run: cargo about generate about.hbs >THIRD-PARTY-LICENSE.html
+      # The release binary is built with --all-features, so the list is too.
+      - run: cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: third-party-license
@@ -663,13 +707,14 @@ jobs:
     timeout-minutes: 30
     env:
       KAFKA_IMAGE: ${{matrix.kafka}}
+      POSTGRES_IMAGE: postgres:18
       RUST_BACKTRACE: 1
       RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
       STORAGE: ${{matrix.storage}}
     steps:
       # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
+      # a later setup step fails. The report names the leg's column with the
+      # part of the results file name between `results-` and `.csv`.
       - run: |
           kafka=${KAFKA_IMAGE#*:}
           echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
@@ -678,7 +723,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && env.POSTGRES_IMAGE || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -746,13 +791,14 @@ jobs:
     timeout-minutes: 30
     env:
       KAFKA_IMAGE: apache/kafka:3.7.2
+      POSTGRES_IMAGE: postgres:18
       RUST_BACKTRACE: 1
       RUST_LOG: warn,nisshi_broker=debug,nisshi_storage=debug,nisshi_schema=debug
       STORAGE: ${{matrix.storage}}
     steps:
       # The leg name is set first, so the results upload has a name even when
-      # a later setup step fails. It is one word: the report reads the storage
-      # column from the results file name with `(\w+).csv`.
+      # a later setup step fails. The report names the leg's column with the
+      # part of the results file name between `results-` and `.csv`.
       - run: |
           kafka=${KAFKA_IMAGE#*:}
           echo "NISSHI_SMOKE_LEG=${STORAGE}_kafka${kafka//./}_${RUNNER_ARCH,,}" >> "$GITHUB_ENV"
@@ -761,7 +807,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/docker-hub-mirror
         with:
-          ecr-fallback-images: ${{matrix.storage == 'postgres' && 'postgres:18' || ''}}
+          ecr-fallback-images: ${{matrix.storage == 'postgres' && env.POSTGRES_IMAGE || ''}}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.58.0
@@ -893,14 +939,23 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      # Embeds the crate list so scanners can read the binary's dependencies.
+      # cargo-auditable embeds the crate list so scanners can read the binary's
+      # dependencies. cargo-about writes the licence list that the tarball and
+      # the image carry. This job generates it beside the build, instead of
+      # waiting on the third-party-license job, which takes minutes.
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
-          tool: cargo-auditable@0.7.6
+          tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
       - env:
           TARGET: ${{matrix.target}}
-        run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+        run: |
+          # The licence scan needs no build output, so it runs beside the build.
+          # wait returns the scan's exit status, so a failed scan fails the step.
+          cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html &
+          about=$!
+          cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+          wait "$about"
       - env:
           TARGET: ${{matrix.target}}
         run: |
@@ -913,7 +968,7 @@ jobs:
           dist=$(mktemp -d -p ${{runner.temp}})
           mkdir "$dist"/bin
           cp target/"${TARGET}"/release/nisshi "$dist"/bin
-          cp compose.yaml example.env LICENSE README.md "$dist"
+          cp compose.yaml example.env LICENSE NOTICE THIRD-PARTY-LICENSE.html README.md "$dist"
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       # release.yml attaches the tarballs to the GitHub release, on a tag.
@@ -922,14 +977,16 @@ jobs:
           name: nisshi-${{matrix.target}}
           path: nisshi-${{matrix.target}}.tar.gz
           if-no-files-found: error
-      # The Dockerfile copies dist/<platform>/nisshi into the image, in smoke
-      # and in the publish jobs of release.yml and tier-c.yml.
+      # The Dockerfile copies dist/<platform>/nisshi and the licence list into
+      # the image, in smoke and in the publish jobs of release.yml and
+      # tier-c.yml, which read only this artifact.
       - env:
           PLATFORM: ${{matrix.platform}}
           TARGET: ${{matrix.target}}
         run: |
           mkdir -p dist/"${PLATFORM}"
           cp target/"${TARGET}"/release/nisshi dist/"${PLATFORM}"/nisshi
+          cp THIRD-PARTY-LICENSE.html dist/"${PLATFORM}"/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{matrix.target}}
@@ -940,7 +997,7 @@ jobs:
           # it for smoke.
           retention-days: ${{ github.ref == 'refs/heads/main' && 30 || github.event_name == 'push' && 3 || 1 }}
           if-no-files-found: error
-  # The full release build (about 20 minutes) runs on a `v*` tag only. Every
+  # The full release build (about 40 minutes) runs on a `v*` tag only. Every
   # other run compiles the binary without optimizing or linking it, which
   # keeps the queue's critical path short. The nightly
   # macos-release job in tier-c.yml builds the release on main's tip, so a
@@ -949,7 +1006,9 @@ jobs:
     if: *tier_b
     needs: [changes, typos]
     runs-on: macos-latest
-    timeout-minutes: 45
+    # The timeout is well above the build's usual time, because a busy macOS
+    # runner adds several minutes, and a timeout on a tag cancels the release.
+    timeout-minutes: 75
     env:
       TARGET: aarch64-apple-darwin
     steps:
@@ -972,16 +1031,18 @@ jobs:
       - if: ${{github.ref_type == 'tag'}}
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
-          tool: cargo-auditable@0.7.6
+          tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
       - if: ${{github.ref_type == 'tag'}}
         run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+      - if: ${{github.ref_type == 'tag'}}
+        run: cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html
       - if: ${{github.ref_type == 'tag'}}
         run: |
           dist=$(mktemp -d -p ${{runner.temp}})
           mkdir "$dist"/bin
           cp target/"${TARGET}"/release/nisshi "$dist"/bin
-          cp compose.yaml example.env LICENSE README.md "$dist"
+          cp compose.yaml example.env LICENSE NOTICE THIRD-PARTY-LICENSE.html README.md "$dist"
           cp -r etc "$dist"
           tar --create --verbose --gzip --file=nisshi-"${TARGET}".tar.gz -C "$dist" .
       - if: ${{github.ref_type == 'tag'}}
@@ -1014,6 +1075,7 @@ jobs:
       - cargo-publish-dry-run
       - typos
       - shellcheck
+      - image-ca-certificates
       - third-party-license
       - src
       - smoke
@@ -1055,7 +1117,8 @@ jobs:
       # PR gate would stay green with no Tier A signal at all. The list names
       # the Tier B exemptions, so a newly added job defaults to must-not-skip.
       # Skipped when `changes` found no Rust-relevant path, since then
-      # every Tier A job but typos and shellcheck skips by design.
+      # every Tier A job but typos, shellcheck and image-ca-certificates skips
+      # by design.
       - name: Tier A ran on pull_request
         if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
         env:

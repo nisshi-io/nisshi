@@ -783,8 +783,19 @@ where
 
                 debug!(partition_bytes, is_first_non_empty);
 
-                *max_bytes =
-                    max_bytes.saturating_sub(partition_max_bytes.saturating_sub(partition_bytes));
+                // The partition spends the bytes that it returned, not only its
+                // own limit. A storage read can exceed its limit by one batch
+                // (`Storage::fetch`), so a partition can exceed
+                // `partition_max_bytes` by one batch. When the response spends
+                // that batch as well, the response holds at most `max_bytes` and
+                // one batch, however many partitions the request lists. Kafka
+                // lets only the first non-empty partition exceed a limit
+                // ([ReplicaManager.scala#L1733-L1739]). Storage cannot tell the
+                // first read of the first non-empty partition from any other
+                // read, so here every partition can.
+                //
+                // [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
+                *max_bytes = max_bytes.saturating_sub(u32::try_from(partition.byte_size())?);
 
                 partitions.push(partition);
             }
@@ -1094,7 +1105,6 @@ mod tests {
         fetch_response::{AbortedTransaction, PartitionData},
         incremental_alter_configs_request::AlterConfigsResource,
         incremental_alter_configs_response::AlterConfigsResourceResponse,
-        list_groups_response::ListedGroup,
         metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         record::{Record, deflated, inflated},
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
@@ -1236,7 +1246,7 @@ mod tests {
                     unimplemented!()
                 }
 
-                async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+                async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
                     unimplemented!()
                 }
 

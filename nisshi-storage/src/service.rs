@@ -17,6 +17,7 @@ mod consumer_group_describe;
 mod create_acls;
 mod create_topics;
 pub mod deadline;
+mod delete_acls;
 mod delete_groups;
 mod delete_records;
 mod delete_topics;
@@ -55,13 +56,14 @@ pub use create_topics::{
         ValidatedCreateTopicsRequest,
     },
 };
+pub use delete_acls::DeleteAclsService;
 pub use delete_groups::DeleteGroupsService;
 pub use delete_records::DeleteRecordsService;
 pub use delete_topics::DeleteTopicsService;
 pub use describe_acls::DescribeAclsService;
 pub use describe_cluster::DescribeClusterService;
 pub use describe_configs::DescribeConfigsService;
-pub use describe_groups::DescribeGroupsService;
+pub use describe_groups::{DescribeGroupsService, describe_groups_response};
 pub use describe_topic_partitions::DescribeTopicPartitionsService;
 pub use describe_user_scram_credentials::DescribeUserScramCredentialsService;
 pub use fetch::{
@@ -73,7 +75,7 @@ pub use fetch::{
 pub use find_coordinator::FindCoordinatorService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
 pub use init_producer_id::InitProducerIdService;
-pub use list_groups::ListGroupsService;
+pub use list_groups::{ListGroupsService, list_groups_response};
 pub use list_offsets::ListOffsetsService;
 pub use list_partition_reassignments::ListPartitionReassignmentsService;
 pub use metadata::MetadataService;
@@ -85,8 +87,7 @@ use nisshi_sans_io::{
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated,
+    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::{
@@ -166,7 +167,7 @@ pub enum Request {
         partition_limit: i32,
         cursor: Option<Topition>,
     },
-    ListGroups(Option<Vec<String>>),
+    ListGroups,
     DeleteGroups(Option<Vec<String>>),
     DescribeGroups {
         group_ids: Option<Vec<String>>,
@@ -242,7 +243,7 @@ impl Display for Request {
             Self::GroupWithVersion(_) => f.write_str("GroupWithVersion"),
             Self::IncrementalAlterResource(_) => f.write_str("IncrementalAlterResource"),
             Self::InitProducer { .. } => f.write_str("InitProducer"),
-            Self::ListGroups(_) => f.write_str("ListGroups"),
+            Self::ListGroups => f.write_str("ListGroups"),
             Self::ListOffsets { .. } => f.write_str("ListOffsets"),
             Self::Maintain(_) => f.write_str("Maintain"),
             Self::MaintainTransactions(_) => f.write_str("MaintainTransactions"),
@@ -285,7 +286,7 @@ pub enum Response {
     GroupWithVersion(Result<Option<(GroupDetail, Version)>>),
     IncrementalAlterResponse(Result<AlterConfigsResourceResponse>),
     InitProducer(Result<ProducerIdResponse>),
-    ListGroups(Result<Vec<ListedGroup>>),
+    ListGroups(Result<Vec<NamedGroupDetail>>),
     ListOffsets(Result<Vec<(Topition, ListOffsetResponse)>>),
     Maintain(Result<()>),
     MaintainTransactions(Result<()>),
@@ -733,10 +734,8 @@ impl Storage for RequestChannelService {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        let states_filter = states_filter.map(Vec::from);
-
-        serve_and_extract!(self, Request::ListGroups(states_filter), ListGroups)
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+        serve_and_extract!(self, Request::ListGroups, ListGroups)
     }
 
     #[instrument(skip_all)]
@@ -1255,9 +1254,7 @@ where
                     .describe_topic_partitions(topics.as_deref(), partition_limit, cursor)
                     .await,
             )),
-            Request::ListGroups(items) => Ok(Response::ListGroups(
-                self.storage.list_groups(items.as_deref()).await,
-            )),
+            Request::ListGroups => Ok(Response::ListGroups(self.storage.list_groups().await)),
             Request::DeleteGroups(items) => Ok(Response::DeleteGroups(
                 self.storage.delete_groups(items.as_deref()).await,
             )),

@@ -544,19 +544,17 @@ impl AsArrow for Schema {
                     .transpose()
                     .map_err(Into::into)
                     .and_then(|key| {
-                        let meta = DateTime::from_timestamp_millis(
-                            batch.base_timestamp + record.timestamp_delta,
-                        )
-                        .as_ref()
-                        .map(|date_time| {
-                            json!({
+                        let meta = DateTime::from_timestamp_millis(batch.record_timestamp(record))
+                            .as_ref()
+                            .map(|date_time| {
+                                json!({
                             "partition": partition,
                             "timestamp": date_time.to_rfc3339(),
                             "year": date_time.date_naive().year(),
                             "month": date_time.date_naive().month(),
                             "day": date_time.date_naive().day()})
-                        })
-                        .unwrap_or(json!({"partition": partition}));
+                            })
+                            .unwrap_or(json!({"partition": partition}));
 
                         record
                             .value

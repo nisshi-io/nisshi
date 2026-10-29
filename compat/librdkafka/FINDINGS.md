@@ -66,22 +66,32 @@ Sweeps of the librdkafka integration test suite against
    ConfigEntry rows where Kafka reports every config with its default
    (0092 via AlterConfigs read-modify-write).
 
-6. **InitProducerId does not validate `transaction.timeout.ms`** — Kafka
-   rejects values above `transaction.max.timeout.ms` with fatal
-   `INVALID_TRANSACTION_TIMEOUT`; nisshi accepts them (0103
-   `do_test_misuse_txn`; the rest of 0103 passes).
+6. **Transactions are refused** — nisshi answers InitProducerId with a
+   `transactional.id` with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, so
+   the transactional tests (0103, 0129) fail at `init_transactions`.
+   0061 and 0137 have transactional subtests that fail in a full run,
+   and 0055 fails outside CI. CI's `-Q` quick mode skips the first two.
+   Turning transactions back on needs these fixes first:
+   - Every storage engine returns an empty `aborted_transactions`, so a
+     `read_committed` consumer reads aborted records.
+   - InitProducerId accepts a `transaction.timeout.ms` above
+     `transaction.max.timeout.ms`; Kafka answers
+     `INVALID_TRANSACTION_TIMEOUT` (0103 `do_test_misuse_txn`).
+   - 0129's `abort_transaction` fails with `EndTxnRequest (KIP-98) not
+     supported`, so the advertised EndTxn versions may not cover what
+     librdkafka needs.
+   - The `old_versions_bump_a_transactional_producer` test is ignored on
+     each engine in `nisshi-broker/tests/it/init_producer_id.rs` (in
+     memory, lite, slatedb and pg), with a reason that points here; CI
+     never runs it, so remove those `#[ignore]`s when the refusal is
+     lifted. The Turso engine's ignore has its own reason.
 
-7. **EndTxn unsupported for abort from some clients** — 0129 fails with
-   `EndTxnRequest (KIP-98) not supported`, suggesting the advertised
-   ApiVersions range for EndTxn does not cover what librdkafka needs
-   for `abort_transaction`.
-
-8. **Consumer group edge cases** — one extra rebalance versus Kafka in
+7. **Consumer group edge cases** — one extra rebalance versus Kafka in
    max-poll-exceeded scenarios (0091, 0093); commit-during-rebalance
    error codes differ (0118); message expected after `offsets_store`
    of an unassigned partition (0130).
 
-9. **CreateTopics corner cases** — 0081 (admin) fails waiting for a
+8. **CreateTopics corner cases** — 0081 (admin) fails waiting for a
    metadata update after creating topics with mixed valid/invalid
    configs.
 

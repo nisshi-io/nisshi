@@ -16,135 +16,16 @@
 //! clients retry `COORDINATOR_NOT_AVAILABLE`, so an object store error answers that code, and a
 //! group that can't be decoded answers `UNKNOWN_SERVER_ERROR`, because a retry does not fix it.
 
-use std::fmt::{Debug, Display};
-
-use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
 use nisshi_sans_io::ErrorCode;
 use nisshi_storage::{Error, NamedGroupDetail, Result, Storage as _};
-use object_store::{
-    CopyOptions, GetOptions, GetResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
-    path::Path,
+use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory};
+
+use crate::dynostore::{
+    DynoStore,
+    tests::{failing_object_store::FailingObjectStore, init_tracing},
 };
 
-use crate::dynostore::{DynoStore, tests::init_tracing};
-
 const GROUP_ID: &str = "abc";
-
-/// Wraps an [`ObjectStore`] and makes each `get()` or each `list()` call fail.
-#[derive(Clone)]
-struct FailingObjectStore<O> {
-    object_store: O,
-    get_fails: bool,
-    list_fails: bool,
-}
-
-impl<O> FailingObjectStore<O> {
-    fn failing_get(object_store: O) -> Self {
-        Self {
-            object_store,
-            get_fails: true,
-            list_fails: false,
-        }
-    }
-
-    fn failing_list(object_store: O) -> Self {
-        Self {
-            object_store,
-            get_fails: false,
-            list_fails: true,
-        }
-    }
-}
-
-fn forced_failure() -> object_store::Error {
-    object_store::Error::Generic {
-        store: "test",
-        source: "forced failure".into(),
-    }
-}
-
-impl<O> Debug for FailingObjectStore<O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FailingObjectStore").finish()
-    }
-}
-
-impl<O> Display for FailingObjectStore<O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FailingObjectStore").finish()
-    }
-}
-
-#[async_trait]
-impl<O> ObjectStore for FailingObjectStore<O>
-where
-    O: ObjectStore,
-{
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> Result<PutResult, object_store::Error> {
-        self.object_store.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
-        self.object_store.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> Result<GetResult, object_store::Error> {
-        if self.get_fails {
-            return Err(forced_failure());
-        }
-
-        self.object_store.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, Result<Path, object_store::Error>>,
-    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
-        self.object_store.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
-        if self.list_fails {
-            return Box::pin(stream::once(async { Err(forced_failure()) }));
-        }
-
-        self.object_store.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> Result<object_store::ListResult, object_store::Error> {
-        self.object_store.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        opts: CopyOptions,
-    ) -> Result<(), object_store::Error> {
-        self.object_store.copy_opts(from, to, opts).await
-    }
-}
 
 async fn describe(storage: &DynoStore) -> Result<Vec<NamedGroupDetail>> {
     storage

@@ -13,11 +13,12 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-select cg.name
+select cg.name, cgd.detail
 
 from
 
 cluster c
 join consumer_group cg on cg.cluster = c.id
+left join consumer_group_detail cgd on cgd.consumer_group = cg.id
 
 where c.name = $1;

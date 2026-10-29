@@ -38,6 +38,7 @@ pub mod redact;
 pub mod response_length_bound;
 pub mod snappy;
 pub mod topic;
+pub mod topic_config;
 pub mod version;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a

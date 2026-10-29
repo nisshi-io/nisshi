@@ -1199,12 +1199,29 @@ where
     Ok(())
 }
 
-/// Fetch through [`FetchService`], one entry per `(partition, fetch_offset)`.
+/// Fetch through [`FetchService`], one entry per `(partition, fetch_offset)`,
+/// with a `max_bytes` and a `partition_max_bytes` of 50 KiB.
 async fn fetch_offsets<G>(
     sc: &G,
     topic: &str,
     partitions: &[(i32, i64)],
     max_wait_ms: i32,
+) -> Result<FetchResponse>
+where
+    G: Storage + Clone,
+{
+    fetch_offsets_within(sc, topic, partitions, max_wait_ms, 50 * 1024, 50 * 1024).await
+}
+
+/// Fetch through [`FetchService`], one entry per `(partition, fetch_offset)`,
+/// with the given `max_bytes` and `partition_max_bytes`.
+async fn fetch_offsets_within<G>(
+    sc: &G,
+    topic: &str,
+    partitions: &[(i32, i64)],
+    max_wait_ms: i32,
+    max_bytes: i32,
+    partition_max_bytes: i32,
 ) -> Result<FetchResponse>
 where
     G: Storage + Clone,
@@ -1217,7 +1234,7 @@ where
             request: FetchRequest::default()
                 .max_wait_ms(max_wait_ms)
                 .min_bytes(1)
-                .max_bytes(Some(50 * 1024))
+                .max_bytes(Some(max_bytes))
                 .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
                 .topics(Some(
                     [FetchTopic::default()
@@ -1233,7 +1250,7 @@ where
                                         .fetch_offset(*fetch_offset)
                                         .last_fetched_epoch(Some(-1))
                                         .log_start_offset(Some(-1))
-                                        .partition_max_bytes(50 * 1024)
+                                        .partition_max_bytes(partition_max_bytes)
                                 })
                                 .collect(),
                         ))]
@@ -1616,6 +1633,145 @@ where
     Ok(())
 }
 
+/// A record larger than the fetch's `max_bytes` is returned when it is the
+/// first record at the fetch offset, so that a consumer always makes progress
+/// (KIP-74). The record uses up the budget, so the fetch returns nothing after
+/// it.
+pub async fn oversized_first_record_is_returned_alone<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let topition = Topition::new(topic_name.clone(), 0);
+
+    // four times the 50 KiB that `fetch_offsets` allows
+    let oversized = inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from(vec![b'x'; 200 * 1024]))))
+        .build()
+        .and_then(TryInto::try_into)?;
+
+    _ = sc.produce(None, &topition, oversized).await?;
+    produce_single_record_batches(&sc, &topition, 1).await?;
+
+    for (fetch_offset, expected) in [(0, vec![0]), (1, vec![1])] {
+        let partitions =
+            partition_data(fetch_offsets(&sc, &topic_name, &[(0, fetch_offset)], 500).await?);
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?,
+            "fetch at {fetch_offset}"
+        );
+        assert_eq!(
+            expected,
+            record_offsets(&partitions[0])?,
+            "fetch at {fetch_offset}"
+        );
+    }
+
+    Ok(())
+}
+
+/// A response holds at most `max_bytes` and one batch, however many
+/// partitions it lists. A partition that returns a batch larger than its
+/// `partition_max_bytes` spends the batch's size from the response's
+/// `max_bytes`, not only its own limit.
+pub async fn oversized_records_spend_the_response_max_bytes<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(4)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    produce_single_record_batches(&sc, &Topition::new(topic_name.clone(), 0), 1).await?;
+
+    for partition in 1..4 {
+        let oversized = inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from(vec![b'x'; 200 * 1024]))))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = sc
+            .produce(
+                None,
+                &Topition::new(topic_name.clone(), partition),
+                oversized,
+            )
+            .await?;
+    }
+
+    let partitions = partition_data(
+        fetch_offsets_within(
+            &sc,
+            &topic_name,
+            &[(0, 0), (1, 0), (2, 0), (3, 0)],
+            500,
+            100 * 1024,
+            1024,
+        )
+        .await?,
+    );
+    assert_eq!(4, partitions.len());
+
+    // Partition 1 returns its record although the record is larger than its
+    // 1 KiB limit. Kafka returns nothing there, because only the first
+    // non-empty partition may exceed a limit. The record spends the rest of
+    // the 100 KiB, so partitions 2 and 3 return nothing.
+    let mut offsets = vec![];
+    for partition in &partitions {
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partition.error_code)?,
+            "partition {}",
+            partition.partition_index
+        );
+        offsets.push(record_offsets(partition)?);
+    }
+    assert_eq!(vec![vec![0], vec![0], vec![], vec![]], offsets);
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use super::*;
@@ -1778,6 +1934,36 @@ mod pg {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::unknown_topic_beside_idle_topic(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn oversized_first_record_is_returned_alone() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_first_record_is_returned_alone(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_records_spend_the_response_max_bytes(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1948,6 +2134,36 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::unknown_topic_beside_idle_topic(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn oversized_first_record_is_returned_alone() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_first_record_is_returned_alone(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_records_spend_the_response_max_bytes(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -2133,6 +2349,88 @@ mod lite {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::unknown_topic_beside_idle_topic(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn oversized_first_record_is_returned_alone() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_first_record_is_returned_alone(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_records_spend_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+    use nisshi_storage::ArcDynStorage;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(
+            StorageType::Turso,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn oversized_first_record_is_returned_alone() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_first_record_is_returned_alone(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::oversized_records_spend_the_response_max_bytes(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,

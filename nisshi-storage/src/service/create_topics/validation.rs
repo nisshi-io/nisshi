@@ -22,7 +22,9 @@ use nisshi_sans_io::{
 use rama::{Layer, Service, extensions::Extensions};
 use tracing::{debug, instrument, warn};
 
-use crate::{Error, MAX_REPLICATION_FACTOR, Result};
+use crate::{
+    Error, MAX_REPLICATION_FACTOR, Result, config::validate_topic_config, max_message_bytes,
+};
 
 /// Build the [`CreatableTopicResult`] for a topic that was rejected, either
 /// by storage or by validation performed before storage is ever consulted.
@@ -92,6 +94,34 @@ fn total_requested_partitions(topics: &[CreatableTopic]) -> i64 {
 pub(super) enum ValidatedTopic {
     Valid(CreatableTopic),
     Rejected(CreatableTopicResult),
+}
+
+impl ValidatedTopic {
+    /// Returns the topic's name, as the request gives it.
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Valid(topic) => &topic.name,
+            Self::Rejected(result) => &result.name,
+        }
+    }
+
+    /// Builds the [`CreatableTopicResult`] that answers this topic with `error_code`.
+    pub(super) fn error_result(&self, error_code: ErrorCode) -> CreatableTopicResult {
+        match self {
+            Self::Valid(topic) => error_result(
+                topic.name.clone(),
+                Some(topic.num_partitions),
+                Some(topic.replication_factor),
+                error_code,
+            ),
+            Self::Rejected(result) => error_result(
+                result.name.clone(),
+                result.num_partitions,
+                result.replication_factor,
+                error_code,
+            ),
+        }
+    }
 }
 
 /// A [`CreateTopicsRequest`] whose topics have each been validated.
@@ -219,6 +249,31 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
         return reject(ErrorCode::InvalidTopicException);
     }
 
+    // Check configs before the assignments, the replication factor and the partition count, like
+    // Kafka, and store each checked value as the number that it parses.
+    let mut rejection = None;
+    for config in topic.configs.iter_mut().flatten() {
+        match validate_topic_config(&config.name, config.value.as_deref()) {
+            Ok(value) => config.value = value,
+            Err(message) => {
+                rejection = Some(message);
+                break;
+            }
+        }
+    }
+
+    if let Some(message) = rejection {
+        return ValidatedTopic::Rejected(
+            error_result(
+                name,
+                num_partitions,
+                replication_factor,
+                ErrorCode::InvalidConfig,
+            )
+            .error_message(Some(message)),
+        );
+    }
+
     // Manual assignments fix the partitions and replicas, so the counts must be left at
     // `-1`. Storage creates `num_partitions` partitions, so an explicit count beside an
     // assignment would also bypass the partition cap, which counts the assignments instead.
@@ -290,6 +345,29 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
 
     if num_partitions.is_some_and(|partitions| partitions < 1) {
         return reject(ErrorCode::InvalidPartitions);
+    }
+
+    let max_message_bytes_rejection = topic
+        .configs
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|config| config.name == max_message_bytes::KEY)
+        .filter_map(|config| config.value.as_deref())
+        .find_map(|configured| max_message_bytes::parse(configured).err());
+
+    if let Some(reason) = max_message_bytes_rejection {
+        debug!(topic = %name, reason, "rejecting CreateTopics: invalid max.message.bytes");
+
+        return ValidatedTopic::Rejected(
+            error_result(
+                name,
+                num_partitions,
+                replication_factor,
+                ErrorCode::InvalidConfig,
+            )
+            .error_message(Some(reason)),
+        );
     }
 
     ValidatedTopic::Valid(topic)

@@ -100,7 +100,12 @@ impl Deployment {
         let exit_code = self.host.stop_after_failed_start(&self.log);
 
         FailedStart::from_log(
-            format!("nisshi {}", self.options.broker_args().join(" ")),
+            format!(
+                "nisshi {}",
+                self.options
+                    .broker_args(self.host.tls_directory())
+                    .join(" ")
+            ),
             exit_code,
             &self.log,
             reason,
