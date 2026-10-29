@@ -2414,8 +2414,8 @@ impl Storage for DynoStore {
     /// Appends `deflated` to `topition`, and returns the base offset of the batch.
     ///
     /// The produce takes its offsets in the watermark document of the
-    /// partition, before the writes that follow: the lake table, the
-    /// transaction metadata and the batch object. If one of those writes
+    /// partition, before the writes that follow: the transaction metadata,
+    /// the lake table and the batch object. If one of those writes
     /// fails, the client gets an error and the taken offsets hold no batch.
     /// The produce does not move the high watermark back, because a rollback
     /// is another conditional write that can fail in the same way, and a
@@ -2732,21 +2732,6 @@ impl Storage for DynoStore {
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
 
-            if let Some(ref lake) = self.lake
-                && let Some(ref inflated) = inflated
-            {
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    inflated,
-                    config,
-                )
-                .await
-                .inspect(|store| debug!(?store))
-                .inspect_err(|err| debug!(?err))?;
-            }
-
             if let Some(transaction_id) = transaction_id
                 && attributes.transaction
             {
@@ -2755,6 +2740,10 @@ impl Storage for DynoStore {
                         // The check before the write is a read that can go stale. This one
                         // runs on the version of `meta.json` that the write below replaces,
                         // so it decides, and the bookkeeping never adds a partition itself.
+                        //
+                        // A refusal here leaves the offset reserved above empty. The lake
+                        // write runs after this update, so a refused batch does not reach a
+                        // lake table.
                         if !deflated.is_control() {
                             meta.ensure_partition_in_transaction(
                                 transaction_id,
@@ -2796,6 +2785,21 @@ impl Storage for DynoStore {
                     .await
                     .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
                     .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+            }
+
+            if let Some(ref lake) = self.lake
+                && let Some(ref inflated) = inflated
+            {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                    inflated,
+                    config,
+                )
+                .await
+                .inspect(|store| debug!(?store))
+                .inspect_err(|err| debug!(?err))?;
             }
 
             let location = batch_path(&self.cluster, topition, offset);
