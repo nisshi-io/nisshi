@@ -99,6 +99,7 @@ A client connects to the address that the broker advertises. To connect from ano
 You now have a running broker that serves Kafka clients. To continue:
 
 - Connect your applications — Point your Kafka clients at the broker to start sending and receiving messages. For a client example, see [Sarama (Go)](https://docs.nisshi.io/docs/golang-sarama). For an example that uses Kafka Mirror Maker, see [Mirror Maker](https://docs.nisshi.io/docs/example-mirror-maker).
+- Read messages with a consumer group — Kafka consumers share a topic's partitions in a group, and the broker keeps the offset that each group has read up to. For more information, see [Consumer Groups and Offsets](https://github.com/nisshi-io/solace-nisshi/blob/main/docs/consumer-groups.md).
 - Explore the command-line options — Run `./bin/nisshi --help`, `./bin/nisshi topic --help`, and `./bin/nisshi cat --help`.
 - Learn how Nisshi works — Every broker is stateless and keeps its state in the storage engine (for example, PostgreSQL or S3). For more information, see [Stateless Brokers](https://docs.nisshi.io/docs/stateless-brokers).
 

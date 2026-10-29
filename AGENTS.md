@@ -26,6 +26,7 @@ just doc             # rustdoc, warnings denied, private items too; pass --open 
 just clippy          # cargo clippy --workspace --all-features --all-targets -- -D warnings
 just fmt             # cargo fmt --all --check
 just shellcheck      # shellcheck every tracked *.sh / *.bash script
+just lint-workflows  # actionlint, zizmor (as workflow-lint.yml runs them) and pinact over .github/workflows; not in `default`, see the recipe for install and token setup
 just check           # cargo check --workspace --all-features --all-targets
 just smoke <engine>  # Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3; starts and removes its own broker and services
 just ci              # (re)starts the docker compose services (postgres, minio, lakehouse) that integration tests depend on - safe to rerun if services are in a bad state

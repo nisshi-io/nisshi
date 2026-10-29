@@ -557,8 +557,9 @@ impl ProducerDetail {
     ///
     /// Starting an epoch removes the partition's sequences and remembered batches at older
     /// epochs, and each older epoch that then holds none. A produce never reads them again,
-    /// because a batch at an older epoch than its partition's is fenced. Keeping them would
-    /// grow meta.json, which every idempotent produce rewrites, by an entry for each bump.
+    /// because the broker refuses a batch at an older epoch than its partition's. Keeping
+    /// them would grow meta.json, which every idempotent produce rewrites, by an entry for
+    /// each bump.
     fn start_epoch(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
         forget_older_epochs(&mut self.sequences, epoch, topition);
         forget_older_epochs(&mut self.batches, epoch, topition);
@@ -1939,6 +1940,232 @@ impl DynoStore {
 
         Ok(responses)
     }
+
+    /// Checks `batch` against the producer's stored sequence for `topition`, and changes
+    /// nothing.
+    ///
+    /// Returns [`SequenceCheck::Duplicate`] with the stored base offset for a retry of a
+    /// remembered batch, and an error for a batch out of order or from a fenced producer. A
+    /// produce runs this check before it takes offsets, and advances the sequence with
+    /// [`DynoStore::advance_idempotent_sequence`] only after it stores the batch. A failed write
+    /// then leaves the sequence where it was, so the client's retry is stored, instead of
+    /// answered as a duplicate of a batch that was never stored.
+    async fn check_idempotent_sequence(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: &IdempotentBatch,
+        transactional: bool,
+    ) -> Result<SequenceCheck> {
+        let check = self
+            .meta
+            .with(&self.object_store, |meta| {
+                let Some(pd) = meta.producers.get(&batch.producer_id) else {
+                    debug!(producer_id = batch.producer_id, ?meta.producers);
+                    return Err(Error::Api(ErrorCode::UnknownProducerId));
+                };
+
+                let Some(stored) = pd.stored_epochs(
+                    transactional || meta.transactional_id_owns(batch.producer_id),
+                    topition,
+                ) else {
+                    debug!(producer_id = batch.producer_id, "no epoch");
+                    return Err(Error::Api(ErrorCode::UnknownServerError));
+                };
+
+                let (sequence, remembered_batches) = match stored
+                    .check_batch(batch.producer_epoch, batch.base_sequence)
+                    .inspect_err(|error| {
+                        debug!(?error, ?stored, producer_epoch = batch.producer_epoch)
+                    })
+                    .map_err(Error::Api)?
+                {
+                    ProduceEpoch::Continue => (
+                        pd.next_sequence(batch.producer_epoch, topition),
+                        pd.remembered_batches(batch.producer_epoch, topition),
+                    ),
+
+                    ProduceEpoch::Start => (0, None),
+                };
+
+                produced_batches::check_sequence(
+                    sequence,
+                    remembered_batches,
+                    batch.base_sequence,
+                    batch.last_offset_delta,
+                )
+                .inspect_err(|err| {
+                    // A client treats this answer as fatal, and stops the producer.
+                    if matches!(err, Error::Api(ErrorCode::OutOfOrderSequenceNumber)) {
+                        warn!(
+                            producer_id = batch.producer_id,
+                            producer_epoch = batch.producer_epoch,
+                            ?topition,
+                            next_sequence = sequence,
+                            base_sequence = batch.base_sequence,
+                            last_offset_delta = batch.last_offset_delta,
+                            ?remembered_batches,
+                            "idempotent batch out of order: it does not start at the next \
+                             sequence and does not repeat a recent batch"
+                        );
+                    } else {
+                        debug!(?sequence, base_sequence = batch.base_sequence);
+                    }
+                })
+            })
+            .await
+            .inspect(|check| {
+                IDEMPOTENT_SEQUENCE_CHECK.add(
+                    1,
+                    &[
+                        KeyValue::new("cluster", self.cluster.clone()),
+                        KeyValue::new("outcome", check.outcome()),
+                    ],
+                );
+            })
+            .inspect_err(|err| {
+                if let Some(outcome) = produced_batches::rejected_outcome(err) {
+                    IDEMPOTENT_SEQUENCE_CHECK.add(
+                        1,
+                        &[
+                            KeyValue::new("cluster", self.cluster.clone()),
+                            KeyValue::new("outcome", outcome),
+                        ],
+                    );
+                } else {
+                    error!(?err, transaction_id, ?topition);
+                }
+            })?;
+
+        if let SequenceCheck::Duplicate { base_offset } = check {
+            debug!(
+                base_offset,
+                producer_id = batch.producer_id,
+                base_sequence = batch.base_sequence,
+                transaction_id,
+                ?topition
+            );
+        }
+
+        Ok(check)
+    }
+
+    /// Advances the producer's stored sequence for `topition` past `batch`, which a produce
+    /// has just stored at `offset`.
+    ///
+    /// This checks the sequence again, instead of only applying it, because the check before
+    /// the write and this advance are not atomic: a concurrent request for the same producer,
+    /// epoch and partition can advance the sequence between them. `location` is the batch's
+    /// object, when the produce writes one, and appears only in the log.
+    ///
+    /// Known residual: if this advance fails (a transient object store error, or a shutdown
+    /// that aborts the request after the write), the batch is stored but the sequence does not
+    /// advance. The client's retry then passes the check and stores the batch a second time
+    /// at a new offset, also without a concurrent request. Closing this needs a dedupe against
+    /// the partition's tail batch, as Kafka does by rebuilding producer state from the log,
+    /// tracked as a follow-up.
+    async fn advance_idempotent_sequence(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: IdempotentBatch,
+        transactional: bool,
+        offset: i64,
+        location: Option<&Path>,
+    ) -> Result<()> {
+        let IdempotentBatch {
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            last_offset_delta,
+        } = batch;
+
+        self.meta
+            .with_mut(&self.object_store, |meta| {
+                let transactional = transactional || meta.transactional_id_owns(producer_id);
+
+                let Some(pd) = meta.producers.get_mut(&producer_id) else {
+                    debug!(producer_id, ?meta.producers);
+                    return Err(Error::Api(ErrorCode::UnknownProducerId));
+                };
+
+                let Some(stored) = pd.stored_epochs(transactional, topition) else {
+                    debug!(producer_id, "no epoch");
+                    return Err(Error::Api(ErrorCode::UnknownServerError));
+                };
+
+                // with_mut stores each change that this closure makes, also when it
+                // then answers an error, so every check runs before any change.
+                let produce_epoch = stored
+                    .check_batch(producer_epoch, base_sequence)
+                    .inspect_err(|error| debug!(?error, ?stored, producer_epoch))
+                    .map_err(Error::Api)?;
+
+                let (sequence, remembered_batches) = match produce_epoch {
+                    ProduceEpoch::Continue => (
+                        pd.next_sequence(producer_epoch, topition),
+                        pd.remembered_batches(producer_epoch, topition),
+                    ),
+
+                    ProduceEpoch::Start => (0, None),
+                };
+
+                // A concurrent retry of the same batch can be stored and
+                // advance the sequence first. This write is then a second
+                // copy, and the client gets an error for it instead of
+                // the duplicate's offset.
+                if let SequenceCheck::Duplicate { .. } = produced_batches::check_sequence(
+                    sequence,
+                    remembered_batches,
+                    base_sequence,
+                    last_offset_delta,
+                )
+                .inspect_err(|_| debug!(sequence, base_sequence))?
+                {
+                    debug!(sequence, base_sequence);
+                    return Err(Error::Api(ErrorCode::DuplicateSequenceNumber));
+                }
+
+                debug!(sequence, delta = last_offset_delta + 1);
+                pd.advance(
+                    producer_epoch,
+                    produce_epoch,
+                    topition,
+                    base_sequence,
+                    last_offset_delta,
+                    offset,
+                );
+
+                Ok(())
+            })
+            .await
+            .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
+            .inspect_err(|err| {
+                // The batch is already stored, so unlike the check before the
+                // write any failure here is not harmless: the client is told
+                // the batch failed while it is stored. That covers a rejected
+                // sequence, a fenced producer (the check before the write
+                // passed on stale metadata) and a transient object store
+                // error (the retry then stores the batch a second time).
+                POST_WRITE_ADVANCE_FAILED.add(
+                    1,
+                    &[
+                        KeyValue::new("cluster", self.cluster.clone()),
+                        KeyValue::new("reason", post_write_failure_reason(err)),
+                    ],
+                );
+
+                error!(
+                    ?err,
+                    transaction_id,
+                    ?topition,
+                    offset,
+                    ?location,
+                    producer_id,
+                    base_sequence,
+                );
+            })
+    }
 }
 
 #[async_trait]
@@ -2421,6 +2648,20 @@ impl Storage for DynoStore {
                 None
             };
 
+            let transactional = transaction_id.is_some() || deflated.is_transactional();
+            let idempotent = IdempotentBatch::of(&deflated);
+
+            // A client retries an idempotent batch that got no answer, so this branch checks
+            // the sequence as the other branch does. Without the check, the retry takes a new
+            // offset range and stores its rows in the lake a second time.
+            if let Some(ref idempotent) = idempotent
+                && let SequenceCheck::Duplicate { base_offset } = self
+                    .check_idempotent_sequence(transaction_id, topition, idempotent, transactional)
+                    .await?
+            {
+                return Ok(base_offset);
+            }
+
             // Get watermark to calculate proper offset for lake sink
             let watermark = self.watermark_for(topition)?;
 
@@ -2465,6 +2706,18 @@ impl Storage for DynoStore {
                 .inspect_err(|err| debug!(?err))?;
             }
 
+            if let Some(idempotent) = idempotent {
+                self.advance_idempotent_sequence(
+                    transaction_id,
+                    topition,
+                    idempotent,
+                    transactional,
+                    offset,
+                    None,
+                )
+                .await?;
+            }
+
             Ok(offset)
         } else {
             let attributes =
@@ -2501,107 +2754,14 @@ impl Storage for DynoStore {
             };
 
             let transactional = transaction_id.is_some() || deflated.is_transactional();
+            let idempotent = IdempotentBatch::of(&deflated);
 
-            // Idempotent sequence numbers are checked here but only
-            // *advanced* after the record write below succeeds (see the
-            // second check further down). Checking first, without
-            // mutating, still rejects a duplicate or out-of-order batch
-            // before any watermark bump or write happens below - but
-            // durably advancing the sequence only after the write means a
-            // failure writing the record can never be mistaken, on the
-            // client's mandatory retry, for a duplicate of a batch that
-            // was never actually written.
-            if deflated.is_idempotent() {
-                let check = self
-                    .meta
-                    .with(&self.object_store, |meta| {
-                        let Some(pd) = meta.producers.get(&deflated.producer_id) else {
-                            debug!(producer_id = deflated.producer_id, ?meta.producers);
-                            return Err(Error::Api(ErrorCode::UnknownProducerId));
-                        };
-
-                        let Some(stored) = pd.stored_epochs(
-                            transactional || meta.transactional_id_owns(deflated.producer_id),
-                            topition,
-                        ) else {
-                            debug!(producer_id = deflated.producer_id, "no epoch");
-                            return Err(Error::Api(ErrorCode::UnknownServerError));
-                        };
-
-                        let (sequence, remembered_batches) = match stored
-                            .check_batch(deflated.producer_epoch, deflated.base_sequence)
-                            .inspect_err(|error| {
-                                debug!(?error, ?stored, producer_epoch = deflated.producer_epoch)
-                            })
-                            .map_err(Error::Api)?
-                        {
-                            ProduceEpoch::Continue => (
-                                pd.next_sequence(deflated.producer_epoch, topition),
-                                pd.remembered_batches(deflated.producer_epoch, topition),
-                            ),
-
-                            ProduceEpoch::Start => (0, None),
-                        };
-
-                        produced_batches::check_sequence(
-                            sequence,
-                            remembered_batches,
-                            deflated.base_sequence,
-                            deflated.last_offset_delta,
-                        )
-                        .inspect_err(|err| {
-                            // A client treats this answer as fatal, and stops the producer.
-                            if matches!(err, Error::Api(ErrorCode::OutOfOrderSequenceNumber)) {
-                                warn!(
-                                    producer_id = deflated.producer_id,
-                                    producer_epoch = deflated.producer_epoch,
-                                    ?topition,
-                                    next_sequence = sequence,
-                                    base_sequence = deflated.base_sequence,
-                                    last_offset_delta = deflated.last_offset_delta,
-                                    ?remembered_batches,
-                                    "idempotent batch out of order: it does not start at the next \
-                                     sequence and does not repeat a recent batch"
-                                );
-                            } else {
-                                debug!(?sequence, base_sequence = deflated.base_sequence);
-                            }
-                        })
-                    })
-                    .await
-                    .inspect(|check| {
-                        IDEMPOTENT_SEQUENCE_CHECK.add(
-                            1,
-                            &[
-                                KeyValue::new("cluster", self.cluster.clone()),
-                                KeyValue::new("outcome", check.outcome()),
-                            ],
-                        );
-                    })
-                    .inspect_err(|err| {
-                        if let Some(outcome) = produced_batches::rejected_outcome(err) {
-                            IDEMPOTENT_SEQUENCE_CHECK.add(
-                                1,
-                                &[
-                                    KeyValue::new("cluster", self.cluster.clone()),
-                                    KeyValue::new("outcome", outcome),
-                                ],
-                            );
-                        } else {
-                            error!(?err, transaction_id, ?topition);
-                        }
-                    })?;
-
-                if let SequenceCheck::Duplicate { base_offset } = check {
-                    debug!(
-                        base_offset,
-                        producer_id = deflated.producer_id,
-                        base_sequence = deflated.base_sequence,
-                        transaction_id,
-                        ?topition
-                    );
-                    return Ok(base_offset);
-                }
+            if let Some(ref idempotent) = idempotent
+                && let SequenceCheck::Duplicate { base_offset } = self
+                    .check_idempotent_sequence(transaction_id, topition, idempotent, transactional)
+                    .await?
+            {
+                return Ok(base_offset);
             }
 
             let watermark = self.watermark_for(topition)?;
@@ -2701,15 +2861,6 @@ impl Storage for DynoStore {
 
             let location = batch_path(&self.cluster, topition, offset);
 
-            // `deflated` is moved into `encode`, so the fields the
-            // post-write sequence advance below needs are copied out
-            // first.
-            let is_idempotent = deflated.is_idempotent();
-            let producer_id = deflated.producer_id;
-            let producer_epoch = deflated.producer_epoch;
-            let base_sequence = deflated.base_sequence;
-            let last_offset_delta = deflated.last_offset_delta;
-
             let payload = self.encode(deflated).inspect_err(|err| debug!(?err))?;
 
             _ = self
@@ -2727,111 +2878,16 @@ impl Storage for DynoStore {
                 .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
                 .inspect_err(|error| error!(?error, transaction_id, ?topition))?;
 
-            // The record is now durably written; only now is it safe to
-            // durably advance the idempotent sequence number. This
-            // re-checks (not just re-applies) because the pre-check above
-            // and this commit are not atomic with each other, so a
-            // concurrent request for the same producer/epoch/partition
-            // could have advanced the sequence in between.
-            //
-            // Known residual: if this advance fails (a transient
-            // object-store error, or a shutdown aborting the request
-            // between the put above and here) the record is durable but
-            // the sequence is not advanced. The client's retry then passes
-            // the pre-check and the batch is written a second time at a new
-            // offset. This trades the silent loss the previous ordering
-            // allowed for a duplicate, and is not limited to concurrent
-            // requests. Closing it needs a dedupe against the partition's
-            // tail batch (as Kafka does by rebuilding producer state from
-            // the log), tracked as a follow-up.
-            if is_idempotent {
-                self.meta
-                    .with_mut(&self.object_store, |meta| {
-                        let transactional =
-                            transactional || meta.transactional_id_owns(producer_id);
-
-                        let Some(pd) = meta.producers.get_mut(&producer_id) else {
-                            debug!(producer_id, ?meta.producers);
-                            return Err(Error::Api(ErrorCode::UnknownProducerId));
-                        };
-
-                        let Some(stored) = pd.stored_epochs(transactional, topition) else {
-                            debug!(producer_id, "no epoch");
-                            return Err(Error::Api(ErrorCode::UnknownServerError));
-                        };
-
-                        // with_mut stores each change that this closure makes, also when it
-                        // then answers an error, so every check runs before any change.
-                        let produce_epoch = stored
-                            .check_batch(producer_epoch, base_sequence)
-                            .inspect_err(|error| debug!(?error, ?stored, producer_epoch))
-                            .map_err(Error::Api)?;
-
-                        let (sequence, remembered_batches) = match produce_epoch {
-                            ProduceEpoch::Continue => (
-                                pd.next_sequence(producer_epoch, topition),
-                                pd.remembered_batches(producer_epoch, topition),
-                            ),
-
-                            ProduceEpoch::Start => (0, None),
-                        };
-
-                        // A concurrent retry of the same batch can be stored and
-                        // advance the sequence first. This write is then a second
-                        // copy, and the client gets an error for it instead of
-                        // the duplicate's offset.
-                        if let SequenceCheck::Duplicate { .. } = produced_batches::check_sequence(
-                            sequence,
-                            remembered_batches,
-                            base_sequence,
-                            last_offset_delta,
-                        )
-                        .inspect_err(|_| debug!(sequence, base_sequence))?
-                        {
-                            debug!(sequence, base_sequence);
-                            return Err(Error::Api(ErrorCode::DuplicateSequenceNumber));
-                        }
-
-                        debug!(sequence, delta = last_offset_delta + 1);
-                        pd.advance(
-                            producer_epoch,
-                            produce_epoch,
-                            topition,
-                            base_sequence,
-                            last_offset_delta,
-                            offset,
-                        );
-
-                        Ok(())
-                    })
-                    .await
-                    .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
-                    .inspect_err(|err| {
-                        // The record is already in the log, so unlike the
-                        // pre-check any failure here is not harmless: the
-                        // client is told the batch failed while it is
-                        // stored. That covers a rejected sequence, a fenced
-                        // producer (the pre-check passed on stale metadata)
-                        // and a transient object store error (the retry
-                        // then writes the batch a second time).
-                        POST_WRITE_ADVANCE_FAILED.add(
-                            1,
-                            &[
-                                KeyValue::new("cluster", self.cluster.clone()),
-                                KeyValue::new("reason", post_write_failure_reason(err)),
-                            ],
-                        );
-
-                        error!(
-                            ?err,
-                            transaction_id,
-                            ?topition,
-                            offset,
-                            %location,
-                            producer_id,
-                            base_sequence,
-                        );
-                    })?;
+            if let Some(idempotent) = idempotent {
+                self.advance_idempotent_sequence(
+                    transaction_id,
+                    topition,
+                    idempotent,
+                    transactional,
+                    offset,
+                    Some(&location),
+                )
+                .await?;
             }
 
             Ok(offset)
@@ -4615,6 +4671,30 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
             debug!(?otherwise);
             "otherwise"
         }
+    }
+}
+
+/// The producer fields of an idempotent batch that its sequence check and advance read.
+///
+/// A produce copies them out of the batch, because it moves the batch into its encoding
+/// before it advances the sequence.
+#[derive(Clone, Copy, Debug)]
+struct IdempotentBatch {
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    last_offset_delta: i32,
+}
+
+impl IdempotentBatch {
+    /// Returns the producer fields of `deflated`, or `None` when it is not idempotent.
+    fn of(deflated: &deflated::Batch) -> Option<Self> {
+        deflated.is_idempotent().then_some(Self {
+            producer_id: deflated.producer_id,
+            producer_epoch: deflated.producer_epoch,
+            base_sequence: deflated.base_sequence,
+            last_offset_delta: deflated.last_offset_delta,
+        })
     }
 }
 
