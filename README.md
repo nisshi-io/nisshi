@@ -211,7 +211,7 @@ topics needs the `parquet`, `iceberg`, or `delta` feature.
 
 The engines differ in what they support. For example, only PostgreSQL and SQLite apply
 retention and compaction. [Compatibility and feature status](docs/compatibility.md) lists what
-each engine supports, which Kafka APIs the broker answers, and which Kafka clients CI tests.
+each engine supports.
 
 Switching storage engines does not move data: topics, messages, and consumer group offsets stay in the old engine, and the new one starts empty. The release binary starts on `memory://`, and Docker Compose runs on PostgreSQL unless you set `STORAGE_ENGINE`.
 
