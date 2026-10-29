@@ -21,6 +21,7 @@ pub(crate) mod result_columns;
 pub(crate) mod topic_configuration_select;
 pub(crate) mod topic_configuration_select_keys;
 pub(crate) mod topic_select;
+pub(crate) mod txn_produce_partition_select;
 pub(crate) mod watermark_select_for_write;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
@@ -421,6 +422,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/txn_produce_offset_insert.sql"),
         ),
         (
+            txn_produce_partition_select::QUERY,
+            include_sql!("sql/txn_produce_partition_select.sql"),
+        ),
+        (
             "txn_produce_offset_select_offset_range.sql",
             include_sql!("sql/txn_produce_offset_select_offset_range.sql"),
         ),
@@ -557,6 +562,43 @@ pub(crate) fn idempotent_epoch_check(
         .map_err(Error::Api)
 }
 
+/// Checks that a client's transactional batch goes to a partition in its producer's ongoing
+/// transaction, from the row that [`txn_produce_partition_select`] read: `None` when the
+/// transactional ID does not exist, otherwise the producer ID that owns it and whether the
+/// partition was added at the batch's producer ID and epoch (the query's `added` column).
+///
+/// Kafka's transaction coordinator answers an unknown transactional ID, or one that another
+/// producer ID owns, `INVALID_PRODUCER_ID_MAPPING`, a transaction that is preparing to commit
+/// or abort `CONCURRENT_TRANSACTIONS`, and a partition that is not in the transaction
+/// `TRANSACTION_ABORTABLE` ([TransactionCoordinator.scala#L357-L402]). A preparing transaction
+/// has its marker written and its partitions still listed, while it waits for an older
+/// overlapping transaction, so a batch stored then would land after the marker. Storing the
+/// batch anyway would leave records that no transaction marker ever closes, holding back the
+/// partition's last stable offset.
+///
+/// [TransactionCoordinator.scala#L357-L402]: https://github.com/apache/kafka/blob/4.1.0/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala#L357-L402
+pub(crate) fn txn_produce_partition_check(
+    row: Option<(Option<i64>, i32)>,
+    producer_id: i64,
+) -> Result<()> {
+    match row {
+        Some((Some(producer), txn_produce_partition_select::ADDED_IN_TRANSACTION))
+            if producer == producer_id =>
+        {
+            Ok(())
+        }
+        Some((Some(producer), txn_produce_partition_select::ADDED_IN_PREPARING_TRANSACTION))
+            if producer == producer_id =>
+        {
+            Err(Error::Api(ErrorCode::ConcurrentTransactions))
+        }
+        Some((Some(producer), _not_added)) if producer == producer_id => {
+            Err(Error::Api(ErrorCode::TransactionAbortable))
+        }
+        None | Some(_) => Err(Error::Api(ErrorCode::InvalidProducerIdMapping)),
+    }
+}
+
 /// Checks a batch's first sequence against `sequence`, the next sequence stored for its
 /// producer's epoch on the partition, and returns how far the batch advances it.
 ///
@@ -615,6 +657,41 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    #[test]
+    fn txn_produce_partition_check() {
+        use nisshi_sans_io::ErrorCode;
+        use std::assert_matches;
+
+        assert_matches!(
+            super::txn_produce_partition_check(Some((Some(7), 1)), 7),
+            Ok(())
+        );
+
+        assert_matches!(
+            super::txn_produce_partition_check(Some((Some(7), 0)), 7),
+            Err(Error::Api(ErrorCode::TransactionAbortable))
+        );
+
+        assert_matches!(
+            super::txn_produce_partition_check(Some((Some(7), 2)), 7),
+            Err(Error::Api(ErrorCode::ConcurrentTransactions))
+        );
+
+        for row in [
+            None,
+            Some((None, 1)),
+            Some((Some(8), 1)),
+            Some((Some(8), 0)),
+            Some((Some(8), 2)),
+        ] {
+            assert_matches!(
+                super::txn_produce_partition_check(row, 7),
+                Err(Error::Api(ErrorCode::InvalidProducerIdMapping)),
+                "{row:?}"
+            );
+        }
     }
 
     #[test]

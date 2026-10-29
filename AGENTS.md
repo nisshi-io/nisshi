@@ -30,6 +30,7 @@ just lint-workflows  # actionlint, zizmor (as workflow-lint.yml runs them) and p
 just check           # cargo check --workspace --all-features --all-targets
 just smoke <engine>  # Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3; starts and removes its own broker and services
 just ci              # (re)starts the docker compose services (postgres, minio, lakehouse) that integration tests depend on - safe to rerun if services are in a bad state
+just kafka-ref       # clone Apache Kafka at the version of nisshi-sans-io/message/ into kafka-ref/ (gitignored), to read as the reference; see Checking Against Apache Kafka
 ```
 
 Run a single test with nextest:
@@ -127,6 +128,16 @@ Selected at compile time via feature flags, dispatched at runtime through a `Sto
 - Group coordination in `nisshi-broker/src/coordinator/group/`
 - `EnvVarExp<T>` wrapper allows CLI args with `${VAR}` references expanded at parse time
 - All `Error` types implement `Clone` (non-Clone errors wrapped in `Arc`)
+
+## Checking Against Apache Kafka
+
+Kafka's Java broker is the reference implementation, and no other spec exists. Compare against it when you plan, implement or review anything that a Kafka client can observe: the wire format, API version ranges, error codes, limits and defaults, what a client may do before it authenticates, and when the broker closes a connection.
+
+- **Pin the version.** The message descriptors in `nisshi-sans-io/message/` are Kafka 3.9.1, and `ApiVersions` advertises their full ranges, so read Kafka at the `3.9.1` tag. `just kafka-ref` clones it into `kafka-ref/`: a blobless clone with full history, kept in the main checkout, and a linked worktree gets a symlink to it. Use `origin/trunk` in that clone only to ask whether something has changed since 3.9.1, and name the version you read.
+- **Trace to where Kafka enforces it,** not to where it defines the constant. Find what the client sees on failure: an error code, a response, or a closed connection, and any delay.
+- **Classify each difference** as one of: matches; stricter (check that no real client breaks); looser (needs a reason); or not applicable by design (node ID 111, a stateless broker, storage). Check Kafka's fix history in the same area (`git -C kafka-ref log -- <path>`) for bugs that Kafka already hit.
+- **Evidence order:** running both beats reading code, and code beats docs. Run Kafka from the `apache/kafka:3.9.1` image, and the compat and smoke tests run real clients against Nisshi. A KIP shows intent, not what shipped.
+- **Record it.** Cite permalinks pinned to the tag (`https://github.com/apache/kafka/blob/3.9.1/...`), never trunk, as `.claude/rules/comments.md` describes. `SaslHandshakeService::serve` in `nisshi-auth/src/handshake.rs` shows the link style. For a deliberate difference, comment at the code site with what Kafka does and why Nisshi differs.
 
 ## Feature Flags
 

@@ -24,13 +24,14 @@
 use std::process;
 
 use crate::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand};
 use nisshi_sans_io::ErrorCode;
 use tracing::debug;
 
 mod broker;
 mod cat;
 mod generator;
+mod missing_feature;
 mod perf;
 mod proxy;
 mod topic;
@@ -167,7 +168,14 @@ impl Cli {
             lakes = ?lakes()
         );
 
-        let cli = Cli::parse();
+        let cli = Cli::try_parse().unwrap_or_else(|error| {
+            missing_feature::explain(
+                error,
+                &missing_feature::built_features(),
+                &mut Cli::command(),
+            )
+            .exit()
+        });
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
             Command::Broker(arg) => arg.main().await.map(Outcome::from),
