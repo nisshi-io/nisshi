@@ -834,6 +834,9 @@ broker now flushes pending metrics before exiting.
 
 ## Compatibility
 
+[Compatibility and feature status](docs/compatibility.md) lists which Kafka APIs, topic
+configurations and clients Nisshi supports on each storage engine.
+
 Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Kafka 3.9.1
 message descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). Clients on
 Kafka 4.x negotiate down to those protocol versions. CI tests the broker with the librdkafka and
