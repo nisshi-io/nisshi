@@ -42,6 +42,7 @@ mod post_write_failure_reason;
 mod produce_topic_guard;
 mod producer_detail;
 mod stale_watermark;
+mod transaction_last_stable;
 mod unknown_partition_guard;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {

@@ -776,6 +776,43 @@ struct Watermark {
     time_index: TimeIndex,
 }
 
+/// Returns the last stable offset of a partition, from its high watermark,
+/// its log start and the first offset of its earliest open transaction.
+fn last_stable(
+    high_watermark: Offset,
+    log_start: Offset,
+    open_transaction_start: Option<Offset>,
+) -> Offset {
+    // A broker can pair a cached high watermark with open transactions that
+    // another broker recorded after it, so an open transaction can start
+    // past the high watermark read here. The last stable offset never passes
+    // the high watermark it is answered with.
+    //
+    // DeleteRecords can move the log start past the first offset of an open
+    // transaction. Kafka then raises the last stable offset to the log start
+    // ([UnifiedLog.scala#L964-L978]), so that it never names an offset below
+    // the log.
+    //
+    // [UnifiedLog.scala#L964-L978]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L964-L978
+    open_transaction_start
+        .unwrap_or(high_watermark)
+        .min(high_watermark)
+        .max(log_start)
+}
+
+/// Returns the [`OffsetStage`] of a partition (see [`last_stable`]).
+fn offset_stage_of(
+    high_watermark: Offset,
+    log_start: Offset,
+    open_transaction_start: Option<Offset>,
+) -> OffsetStage {
+    OffsetStage {
+        last_stable: last_stable(high_watermark, log_start, open_transaction_start),
+        high_watermark,
+        log_start,
+    }
+}
+
 /// `clusters/{cluster}/topics/{topic}`, the prefix every key of a topic's
 /// data is stored beneath.
 ///
@@ -1139,40 +1176,103 @@ impl DynoStore {
         Ok(starts)
     }
 
-    /// Returns the [`OffsetStage`] of `topition`, with its last stable offset
-    /// taken from `open_transaction_starts`, which a caller that reads many
-    /// partitions reads once (see [`Self::open_transaction_starts`]).
-    async fn offset_stage_with(
-        &self,
-        topition: &Topition,
-        open_transaction_starts: &BTreeMap<Topition, Offset>,
-    ) -> Result<OffsetStage> {
+    /// Returns the high watermark and the log start of `topition`.
+    ///
+    /// A reader of the last stable offset calls this before it reads the open
+    /// transactions (see [`Self::open_transaction_starts`]). A transactional
+    /// produce records its partition's open transaction before it raises the
+    /// high watermark, so a reader that sees the raised high watermark then
+    /// sees the open transaction too. Reading them the other way round could
+    /// pair the open transactions from before the produce with the high
+    /// watermark from after it.
+    ///
+    /// This holds within one broker process. Across brokers, each caches
+    /// `watermark.json` and `meta.json` separately for up to 5s, so a reader
+    /// can still pair a fresh high watermark with an older `meta.json`.
+    async fn watermark_offsets(&self, topition: &Topition) -> Result<(Offset, Offset)> {
         self.checked_watermark_for(topition)
             .await?
             .with(&self.object_store, |watermark| {
                 debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
-                let log_start = watermark.low.unwrap_or(0);
-
-                // DeleteRecords can move the log start past the first offset of
-                // an open transaction. Kafka then raises the last stable offset
-                // to the log start ([UnifiedLog.scala#L964-L978]), so that it
-                // never names an offset below the log.
-                //
-                // [UnifiedLog.scala#L964-L978]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L964-L978
-                let last_stable = open_transaction_starts
-                    .get(topition)
-                    .copied()
-                    .unwrap_or(high_watermark)
-                    .max(log_start);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                })
+                Ok((watermark.high.unwrap_or(0), watermark.low.unwrap_or(0)))
             })
             .await
+    }
+
+    /// Records a lower bound of the first offset of `transaction_id` in
+    /// `topition`, when the transaction has no offset recorded there yet: the
+    /// partition's high watermark before this produce raises it.
+    ///
+    /// A produce calls this before it raises the high watermark, so that the
+    /// last stable offset never passes the records of an open transaction
+    /// whose offsets are allocated but not yet recorded. The partition is
+    /// then also recorded when the produce fails after it raised the high
+    /// watermark, so the end of the transaction writes its marker there.
+    ///
+    /// The bound can be below the transaction's real first offset, when
+    /// another batch takes offsets between the read and the raise. It holds
+    /// the last stable offset back until the transaction ends.
+    async fn record_transaction_start(
+        &self,
+        transaction_id: &str,
+        producer_epoch: ProducerEpoch,
+        topition: &Topition,
+    ) -> Result<()> {
+        let recorded = |meta: &Meta| {
+            meta.transactions
+                .get(transaction_id)
+                .and_then(|transaction| transaction.epochs.get(&producer_epoch))
+                .is_none_or(|txn_detail| {
+                    txn_detail
+                        .produces
+                        .get(&topition.topic)
+                        .and_then(|partitions| partitions.get(&topition.partition))
+                        .is_some_and(Option::is_some)
+                })
+        };
+
+        // A later batch of the transaction finds its partition recorded, and
+        // writes nothing here.
+        if self
+            .meta
+            .with(&self.object_store, |meta| Ok(recorded(meta)))
+            .await?
+        {
+            return Ok(());
+        }
+
+        // The high watermark only rises while the topic exists, so a cached
+        // high watermark is at most the offset that the produce allocates.
+        let (high_watermark, _) = self.watermark_offsets(topition).await?;
+
+        self.meta
+            .with_mut(&self.object_store, |meta| {
+                if let Some(txn_detail) = meta
+                    .transactions
+                    .get_mut(transaction_id)
+                    .and_then(|transaction| transaction.epochs.get_mut(&producer_epoch))
+                {
+                    // The partition is already in the transaction: the check before
+                    // this call refused a batch for any other partition.
+                    if let Some(range) = txn_detail
+                        .produces
+                        .get_mut(&topition.topic)
+                        .and_then(|partitions| partitions.get_mut(&topition.partition))
+                        .filter(|range| range.is_none())
+                    {
+                        debug!(transaction_id, ?topition, high_watermark);
+
+                        *range = Some(TxnProduceOffset {
+                            offset_start: high_watermark,
+                            offset_end: high_watermark,
+                        });
+                    }
+                }
+
+                Ok(())
+            })
+            .await
+            .inspect_err(|err| error!(?err, transaction_id, ?topition))
     }
 
     async fn checked_watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
@@ -2856,6 +2956,13 @@ impl Storage for DynoStore {
             self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
                 .await?;
 
+            if let Some(transaction_id) = transaction_id
+                && attributes.transaction
+            {
+                self.record_transaction_start(transaction_id, deflated.producer_epoch, topition)
+                    .await?;
+            }
+
             let watermark = self.watermark_for(topition)?;
 
             let offset = watermark
@@ -2932,6 +3039,24 @@ impl Storage for DynoStore {
                                             offset_start: offset,
                                             offset_end,
                                         });
+
+                                        // The start only moves down (a defensive
+                                        // guard: the high watermark never falls, so
+                                        // the recorded bound is normally at or below
+                                        // every attempt's offset). It is not raised
+                                        // from the lower bound that
+                                        // `record_transaction_start` wrote: an attempt
+                                        // can hold a lower offset that it has not
+                                        // recorded yet. A concurrent retry of a batch
+                                        // can raise the high watermark after the first
+                                        // attempt did, and record its range first. The
+                                        // first attempt's records still go in the log
+                                        // (it then answers DUPLICATE_SEQUENCE_NUMBER),
+                                        // and raising the start to the retry's offset
+                                        // would let the last stable offset pass them.
+                                        if offset < range.offset_start {
+                                            range.offset_start = offset;
+                                        }
 
                                         if offset_end > range.offset_end {
                                             range.offset_end = offset_end;
@@ -3064,9 +3189,16 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        // The watermark first, then the open transactions (see
+        // `DynoStore::watermark_offsets`).
+        let (high_watermark, log_start) = self.watermark_offsets(topition).await?;
         let open_transaction_starts = self.open_transaction_starts().await?;
-        self.offset_stage_with(topition, &open_transaction_starts)
-            .await
+
+        Ok(offset_stage_of(
+            high_watermark,
+            log_start,
+            open_transaction_starts.get(topition).copied(),
+        ))
     }
 
     async fn list_offsets(
@@ -3074,6 +3206,48 @@ impl Storage for DynoStore {
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        // Every watermark of the request is read before the open transactions
+        // (see `DynoStore::watermark_offsets`). Each partition gets either its
+        // high watermark and log start, or the answer for a failed lookup.
+        let mut watermarks = Vec::with_capacity(offsets.len());
+
+        for (topition, _) in offsets {
+            // Kafka answers a partition that does not exist in the response,
+            // with no offset ([KafkaApis.scala#L1231-L1239]). The check
+            // comes before every lookup, because each one caches the
+            // partition's watermark.
+            //
+            // [KafkaApis.scala#L1231-L1239]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
+            match self.ensure_partition_exists(topition).await {
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                    watermarks.push(Err(ListOffsetResponse {
+                        error_code: ErrorCode::UnknownTopicOrPartition,
+                        offset: None,
+                        timestamp: None,
+                    }));
+
+                    continue;
+                }
+                checked => _ = checked?,
+            }
+
+            // A store failure answers `KAFKA_STORAGE_ERROR` in its own
+            // partition, which a client retries, so the other partitions of
+            // the request still get their answers.
+            watermarks.push(self.watermark_offsets(topition).await.map_err(|error| {
+                error!(?error, ?topition, "list offsets");
+
+                ListOffsetResponse {
+                    error_code: match error {
+                        Error::Api(error_code) => error_code,
+                        _ => ErrorCode::KafkaStorageError,
+                    },
+                    offset: None,
+                    timestamp: None,
+                }
+            }));
+        }
+
         // Only READ_COMMITTED reads a last stable offset, so only it reads the
         // open transactions, once for the whole request.
         let open_transaction_starts = if isolation_level == IsolationLevel::ReadCommitted {
@@ -3084,53 +3258,16 @@ impl Storage for DynoStore {
 
         let mut responses = vec![];
 
-        for (topition, offset_request) in offsets {
-            // Kafka answers a partition that does not exist in the response,
-            // with no offset ([KafkaApis.scala#L1231-L1239]). The check
-            // comes before every lookup, because each one caches the
-            // partition's watermark.
-            //
-            // [KafkaApis.scala#L1231-L1239]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
-            match self.ensure_partition_exists(topition).await {
-                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
-                    responses.push((
-                        topition.to_owned(),
-                        ListOffsetResponse {
-                            error_code: ErrorCode::UnknownTopicOrPartition,
-                            offset: None,
-                            timestamp: None,
-                        },
-                    ));
+        for ((topition, offset_request), watermark) in offsets.iter().zip(watermarks) {
+            let stage = match watermark {
+                Ok((high_watermark, log_start)) => offset_stage_of(
+                    high_watermark,
+                    log_start,
+                    open_transaction_starts.get(topition).copied(),
+                ),
 
-                    continue;
-                }
-                checked => _ = checked?,
-            }
-
-            // A store failure answers `KAFKA_STORAGE_ERROR` in its own
-            // partition, which a client retries, so the other partitions of
-            // the request still get their answers.
-            let stage = match self
-                .offset_stage_with(topition, &open_transaction_starts)
-                .await
-            {
-                Ok(stage) => stage,
-
-                Err(error) => {
-                    error!(?error, ?topition, "list offsets");
-
-                    responses.push((
-                        topition.to_owned(),
-                        ListOffsetResponse {
-                            error_code: match error {
-                                Error::Api(error_code) => error_code,
-                                _ => ErrorCode::KafkaStorageError,
-                            },
-                            offset: None,
-                            timestamp: None,
-                        },
-                    ));
-
+                Err(response) => {
+                    responses.push((topition.to_owned(), response));
                     continue;
                 }
             };
