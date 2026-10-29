@@ -557,8 +557,9 @@ impl ProducerDetail {
     ///
     /// Starting an epoch removes the partition's sequences and remembered batches at older
     /// epochs, and each older epoch that then holds none. A produce never reads them again,
-    /// because a batch at an older epoch than its partition's is fenced. Keeping them would
-    /// grow meta.json, which every idempotent produce rewrites, by an entry for each bump.
+    /// because the broker refuses a batch at an older epoch than its partition's. Keeping
+    /// them would grow meta.json, which every idempotent produce rewrites, by an entry for
+    /// each bump.
     fn start_epoch(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
         forget_older_epochs(&mut self.sequences, epoch, topition);
         forget_older_epochs(&mut self.batches, epoch, topition);
