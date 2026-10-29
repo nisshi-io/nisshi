@@ -14,7 +14,8 @@
 
 use nisshi_sans_io::{
     ApiKey, ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode,
-    RequestInput, describe_configs_response::DescribeConfigsResult,
+    RequestInput, describe_configs_request::DescribeConfigsResource,
+    describe_configs_response::DescribeConfigsResult,
 };
 use rama::Service;
 use tracing::{error, instrument};
@@ -112,11 +113,38 @@ where
                 }
             };
 
-            results.push(result.inspect_err(|err| error!(?err))?);
+            results.push(result.unwrap_or_else(|error| {
+                error!(?error, resource.resource_name);
+                error_result(&resource, &error)
+            }));
         }
 
         Ok(DescribeConfigsResponse::default().results(Some(results)))
     }
+}
+
+/// Returns the result for a `resource` whose describe failed with `error`, as Kafka 3.9.1 does
+/// ([ConfigHelper.scala#L156-L170]): the error's code, no error message, and an empty config
+/// list. The other resources in the request still get an answer.
+///
+/// [`Error::Api`] answers its own code, and any other error answers `UNKNOWN_SERVER_ERROR`.
+/// Kafka's [`ApiError.fromThrowable`] sends no message for `UNKNOWN_SERVER_ERROR`, so that it
+/// does not leak server details, or for an error whose message is the code's own description.
+///
+/// [ConfigHelper.scala#L156-L170]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigHelper.scala#L156-L170
+/// [`ApiError.fromThrowable`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiError.java#L38-L46
+fn error_result(resource: &DescribeConfigsResource, error: &Error) -> DescribeConfigsResult {
+    let error_code = match error {
+        Error::Api(error_code) => *error_code,
+        _ => ErrorCode::UnknownServerError,
+    };
+
+    DescribeConfigsResult::default()
+        .error_code(error_code.into())
+        .error_message(None)
+        .resource_name(resource.resource_name.clone())
+        .resource_type(resource.resource_type)
+        .configs(Some(vec![]))
 }
 
 impl<G> DescribeConfigsService<G>
@@ -187,5 +215,42 @@ where
         Ok(result
             .error_code(ErrorCode::InvalidRequest.into())
             .error_message(Some(error_message)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn topic_resource() -> DescribeConfigsResource {
+        DescribeConfigsResource::default()
+            .resource_name("abc".into())
+            .resource_type(ConfigResource::Topic.into())
+    }
+
+    #[test]
+    fn api_error_answers_its_code() {
+        assert_eq!(
+            DescribeConfigsResult::default()
+                .error_code(ErrorCode::KafkaStorageError.into())
+                .error_message(None)
+                .resource_name("abc".into())
+                .resource_type(ConfigResource::Topic.into())
+                .configs(Some(vec![])),
+            error_result(&topic_resource(), &Error::Api(ErrorCode::KafkaStorageError))
+        );
+    }
+
+    #[test]
+    fn other_error_answers_unknown_server_error() {
+        assert_eq!(
+            DescribeConfigsResult::default()
+                .error_code(ErrorCode::UnknownServerError.into())
+                .error_message(None)
+                .resource_name("abc".into())
+                .resource_type(ConfigResource::Topic.into())
+                .configs(Some(vec![])),
+            error_result(&topic_resource(), &Error::Message("broken".into()))
+        );
     }
 }

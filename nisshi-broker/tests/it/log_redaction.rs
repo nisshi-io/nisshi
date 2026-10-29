@@ -40,7 +40,7 @@ use nisshi_sans_io::{
     record::{self, Record, inflated},
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{ArcDynStorage, Storage};
+use nisshi_storage::{ArcDynStorage, Storage, TopicCreationConfig};
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -69,12 +69,16 @@ fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+    )
+    .and_then(auth::services)
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
+    })
 }
 
 #[derive(Clone, Default)]

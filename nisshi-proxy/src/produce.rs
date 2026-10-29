@@ -14,7 +14,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt::Debug,
+    fmt::{self, Debug, Display, Formatter},
     ops::DerefMut as _,
     pin::Pin,
     sync::{Arc, LazyLock, Mutex, MutexGuard},
@@ -25,16 +25,18 @@ use std::{
 
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
-    Ack, ProduceRequest, ProduceResponse, RequestInput,
+    Ack, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::{
-        Record,
         deflated::{self, Frame},
         inflated,
     },
 };
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Histogram},
+};
 use rama::{Layer, Service};
 use tokio::time::sleep;
 use tracing::{debug, error};
@@ -192,10 +194,24 @@ where
             return Ok(None);
         }
 
-        let owners = Owner::from(&requests[..]);
-        let produce_request = produce_request(requests);
+        let mut owners = Owner::from(&requests[..]);
+        let (produce_request, rejections) = produce_request(requests);
 
-        let produce_response = {
+        for rejection in rejections {
+            owners.reject(rejection);
+        }
+
+        let produce_response = if produce_request
+            .topic_data
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            ProduceResponse::default()
+                .responses(Some([].into()))
+                .throttle_time_ms(Some(0))
+                .node_endpoints(None)
+        } else {
             let start = SystemTime::now();
 
             self.service
@@ -260,6 +276,16 @@ static BATCH_OVERFLOW_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("batch_record_overflow")
         .with_description("The number of overflows while producing a batch")
+        .build()
+});
+
+static BATCH_REJECTED_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("batch_rejected")
+        .with_description(
+            "The number of partitions of a request that the proxy answers with an error, \
+             because their batches do not merge",
+        )
         .build()
 });
 
@@ -410,6 +436,16 @@ type Partition = i32;
 
 struct Owner {
     topition: BTreeMap<Topition, BTreeSet<Uuid>>,
+    rejections: Vec<Rejection>,
+}
+
+/// A partition of one request that the proxy answers itself, because the request's batches for it
+/// do not merge.
+#[derive(Clone, Debug)]
+struct Rejection {
+    owner: Uuid,
+    topition: Topition,
+    response: PartitionProduceResponse,
 }
 
 impl From<&[BatchRequest]> for Owner {
@@ -438,13 +474,37 @@ impl From<&[BatchRequest]> for Owner {
             }
         }
 
-        Self { topition }
+        Self {
+            topition,
+            rejections: Vec::new(),
+        }
     }
 }
 
 impl Owner {
-    fn split(&self, produce_response: ProduceResponse) -> BTreeMap<Uuid, ProduceResponse> {
+    /// Answers the rejected owner's partition with the rejection's response, in place of the
+    /// origin's response for that partition.
+    fn reject(&mut self, rejection: Rejection) {
+        if let Some(owners) = self.topition.get_mut(&rejection.topition) {
+            _ = owners.remove(&rejection.owner);
+        }
+
+        self.rejections.push(rejection);
+    }
+
+    fn split(self, produce_response: ProduceResponse) -> BTreeMap<Uuid, ProduceResponse> {
         let mut responses = BTreeMap::<Uuid, BatchTopicProduceResponse>::new();
+
+        for rejection in self.rejections {
+            _ = responses
+                .entry(rejection.owner)
+                .or_default()
+                .0
+                .entry(rejection.topition.topic)
+                .or_default()
+                .0
+                .insert(rejection.topition.partition, rejection.response);
+        }
 
         for topic in produce_response.responses.unwrap_or_default() {
             debug!(?topic);
@@ -536,7 +596,9 @@ impl IntoIterator for BatchPartitionProduceResponse {
     }
 }
 
-fn produce_request(requests: Vec<BatchRequest>) -> ProduceRequest {
+/// Returns the request that the proxy forwards to the origin for `requests`, and the partitions
+/// that it rejects and answers itself.
+fn produce_request(requests: Vec<BatchRequest>) -> (ProduceRequest, Vec<Rejection>) {
     debug!(?requests);
 
     let acks = batch_acks(&requests);
@@ -551,23 +613,31 @@ fn produce_request(requests: Vec<BatchRequest>) -> ProduceRequest {
             for partition in topic.partition_data.unwrap_or_default() {
                 debug!(?partition);
 
-                if let Some(mut records) = partition.records {
+                if let Some(records) = partition.records {
                     run.topics
                         .entry(topic.name.clone())
                         .or_default()
                         .partitions
                         .entry(partition.index)
                         .or_default()
-                        .append(&mut records.batches);
+                        .extend(records.batches.into_iter().map(|batch| OwnedBatch {
+                            owner: request.id,
+                            batch,
+                        }));
                 }
             }
         }
     }
 
-    ProduceRequest::default()
-        .acks(acks.into())
-        .topic_data(Some(run.into_iter().collect::<Vec<_>>()))
-        .timeout_ms(5_000)
+    let (topic_data, rejections) = run.into_topic_data();
+
+    (
+        ProduceRequest::default()
+            .acks(acks.into())
+            .topic_data(Some(topic_data))
+            .timeout_ms(5_000),
+        rejections,
+    )
 }
 
 /// Returns the `acks` for a batch: the strictest that any of its requests
@@ -592,85 +662,294 @@ struct TopicPartitionBatch {
     topics: BTreeMap<Topic, PartitionBatch>,
 }
 
-impl IntoIterator for TopicPartitionBatch {
-    type Item = TopicProduceData;
-    type IntoIter = IntoIter<Self::Item>;
+impl TopicPartitionBatch {
+    /// Returns the topics that the proxy forwards, with the batches of each partition combined,
+    /// and the partitions that it rejects. A topic or a partition with no batch left to forward
+    /// is left out.
+    fn into_topic_data(self) -> (Vec<TopicProduceData>, Vec<Rejection>) {
+        let mut topic_data = Vec::new();
+        let mut rejections = Vec::new();
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.topics
-            .into_iter()
-            .map(|(name, partitions)| {
-                TopicProduceData::default()
-                    .name(name)
-                    .partition_data(Some(partitions.into_iter().collect()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
+        for (name, partitions) in self.topics {
+            let mut partition_data = Vec::new();
+
+            for (index, batches) in partitions.partitions {
+                let combined = combine(batches);
+
+                for (owner, rejection) in combined.rejected {
+                    let error_code = rejection.error_code();
+                    debug!(
+                        topic = name,
+                        partition = index,
+                        %owner,
+                        %rejection,
+                        ?error_code,
+                        "produce batch rejected"
+                    );
+
+                    BATCH_REJECTED_COUNTER
+                        .add(1, &[KeyValue::new("error_code", format!("{error_code:?}"))]);
+
+                    rejections.push(Rejection {
+                        owner,
+                        topition: Topition {
+                            topic: name.clone(),
+                            partition: index,
+                        },
+                        response: rejected_partition_response(index, error_code),
+                    });
+                }
+
+                if !combined.forwarded.is_empty() {
+                    partition_data.push(PartitionProduceData::default().index(index).records(
+                        Some(Frame {
+                            batches: combined.forwarded,
+                        }),
+                    ));
+                }
+            }
+
+            if !partition_data.is_empty() {
+                topic_data.push(
+                    TopicProduceData::default()
+                        .name(name)
+                        .partition_data(Some(partition_data)),
+                );
+            }
+        }
+
+        (topic_data, rejections)
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct PartitionBatch {
-    partitions: BTreeMap<Partition, Vec<deflated::Batch>>,
+    partitions: BTreeMap<Partition, Vec<OwnedBatch>>,
 }
 
-impl IntoIterator for PartitionBatch {
-    type Item = PartitionProduceData;
-    type IntoIter = IntoIter<Self::Item>;
+/// A batch, with the id of the request that sent it.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct OwnedBatch {
+    owner: Uuid,
+    batch: deflated::Batch,
+}
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.partitions
-            .into_iter()
-            .map(|(index, batches)| {
-                PartitionProduceData::default()
-                    .index(index)
-                    .records(Some(Frame {
-                        batches: combine(batches).unwrap_or_default(),
-                    }))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
+/// The batches of one owner for one partition, as sent and merged into one decoded batch.
+struct OwnerBatches {
+    owner: Uuid,
+    as_sent: Vec<deflated::Batch>,
+    merged: inflated::Batch,
+}
+
+/// Why the proxy rejects an owner's batches for a partition.
+#[derive(Debug)]
+enum BatchRejection {
+    /// `last_offset_delta + 1` does not equal `record_count`.
+    OffsetRange {
+        last_offset_delta: i32,
+        record_count: u32,
+    },
+
+    /// The records do not decode.
+    Decode(nisshi_sans_io::Error),
+
+    /// An offset delta overflows an `i32` when the batch is appended to the other batches.
+    Append(nisshi_sans_io::Error),
+
+    /// The merged batch does not encode.
+    Encode(nisshi_sans_io::Error),
+}
+
+impl Display for BatchRejection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OffsetRange {
+                last_offset_delta,
+                record_count,
+            } => write!(
+                f,
+                "last_offset_delta {last_offset_delta} + 1 does not equal record_count {record_count}"
+            ),
+            Self::Decode(error) => write!(f, "records do not decode: {error}"),
+            Self::Append(error) => write!(f, "batch does not append: {error}"),
+            Self::Encode(error) => write!(f, "merged batch does not encode: {error}"),
+        }
     }
 }
 
-fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error> {
-    debug!(len = ?batches.len());
+impl BatchRejection {
+    /// Returns the error code that the proxy answers for the rejected partition.
+    ///
+    /// For a batch that does not decode, Kafka 3.9.1 answers INVALID_RECORD when the records do
+    /// not decode ([`DefaultRecordBatch`]), and UNKNOWN_SERVER_ERROR when they do not decompress.
+    /// The proxy answers as a Nisshi broker does: MESSAGE_TOO_LARGE for a batch over the decoded
+    /// size limit, and INVALID_RECORD for every other decode error.
+    ///
+    /// Kafka does not check a record's offset delta, so it stores a batch that the proxy rejects
+    /// with [`BatchRejection::Append`]. Only a malformed batch has an offset delta that overflows
+    /// when it is appended.
+    ///
+    /// [`DefaultRecordBatch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L633-L642
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Decode(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
+                ErrorCode::MessageTooLarge
+            }
+            Self::OffsetRange { .. } | Self::Decode(_) | Self::Append(_) => {
+                ErrorCode::InvalidRecord
+            }
+            Self::Encode(_) => ErrorCode::UnknownServerError,
+        }
+    }
+}
 
-    if batches.len() >= 2 {
-        let mut i = batches.into_iter();
+/// One partition's batches after [`combine`]: the batches that the proxy forwards, and the
+/// owners that it rejects.
+#[derive(Debug)]
+struct Combined {
+    forwarded: Vec<deflated::Batch>,
+    rejected: BTreeMap<Uuid, BatchRejection>,
+}
 
-        if let Some(first) = i.next() {
-            let mut sink = inflated::Batch::try_from(first)?;
+/// Merges one partition's batches into one batch, and rejects each owner with a batch that does
+/// not merge.
+///
+/// Kafka never merges two requests, so one owner's batch must not fail another owner's batch. The
+/// proxy forwards one batch for the partition, because Kafka rejects a Produce request with more
+/// than one batch for a partition ([`ProduceRequest.validateRecords`]). A partition with batches
+/// of one owner only is forwarded as sent, for the origin to check.
+///
+/// [`ProduceRequest.validateRecords`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
+fn combine(batches: Vec<OwnedBatch>) -> Combined {
+    debug!(len = batches.len());
 
-            for batch in i {
-                let batch = inflated::Batch::try_from(batch)?;
+    if batches
+        .windows(2)
+        .all(|pair| pair[0].owner == pair[1].owner)
+    {
+        return Combined {
+            forwarded: batches.into_iter().map(|owned| owned.batch).collect(),
+            rejected: BTreeMap::new(),
+        };
+    }
 
-                sink.records.append(
-                    &mut batch
-                        .records
-                        .into_iter()
-                        .map(|record| Record {
-                            offset_delta: record.offset_delta + sink.last_offset_delta + 1,
-                            timestamp_delta: record.timestamp_delta
-                                + (batch.base_timestamp - sink.base_timestamp),
-                            ..record
-                        })
-                        .collect::<Vec<_>>(),
-                );
+    let mut rejected = BTreeMap::new();
+    let mut owners = Vec::<OwnerBatches>::new();
 
-                sink.last_offset_delta += batch.last_offset_delta + 1;
-                sink.max_timestamp = sink.max_timestamp.max(batch.max_timestamp);
+    for OwnedBatch { owner, batch } in batches {
+        if rejected.contains_key(&owner) {
+            continue;
+        }
+
+        let decoded = match decode(&batch) {
+            Ok(decoded) => decoded,
+            Err(rejection) => {
+                _ = rejected.insert(owner, rejection);
+                continue;
+            }
+        };
+
+        if let Some(owner_batches) = owners
+            .iter_mut()
+            .find(|owner_batches| owner_batches.owner == owner)
+        {
+            if let Err(error) = owner_batches.merged.append_rebased(decoded) {
+                _ = rejected.insert(owner, BatchRejection::Append(error));
+            } else {
+                owner_batches.as_sent.push(batch);
+            }
+        } else {
+            owners.push(OwnerBatches {
+                owner,
+                as_sent: vec![batch],
+                merged: decoded,
+            });
+        }
+    }
+
+    owners.retain(|owner_batches| !rejected.contains_key(&owner_batches.owner));
+
+    let forwarded = merge(owners, &mut rejected);
+
+    Combined {
+        forwarded,
+        rejected,
+    }
+}
+
+/// Returns `batch` decoded, after the check of its offset range that a Kafka broker makes.
+fn decode(batch: &deflated::Batch) -> Result<inflated::Batch, BatchRejection> {
+    if i32::try_from(batch.record_count).ok() != batch.last_offset_delta.checked_add(1) {
+        return Err(BatchRejection::OffsetRange {
+            last_offset_delta: batch.last_offset_delta,
+            record_count: batch.record_count,
+        });
+    }
+
+    // A clone of a batch shares its record bytes, so it costs no copy.
+    inflated::Batch::try_from(batch.clone()).map_err(BatchRejection::Decode)
+}
+
+/// Returns the batches of `owners` merged into one batch, and adds each owner whose batches do
+/// not merge to `rejected`. The batches of a single owner are forwarded as sent.
+fn merge(
+    owners: Vec<OwnerBatches>,
+    rejected: &mut BTreeMap<Uuid, BatchRejection>,
+) -> Vec<deflated::Batch> {
+    let mut owners = owners.into_iter();
+
+    let Some(first) = owners.next() else {
+        return Vec::new();
+    };
+
+    let mut sink = first.merged;
+    let mut merged_owners = vec![first.owner];
+    let first_as_sent = first.as_sent;
+
+    for owner_batches in owners {
+        // `append_rebased` leaves the sink unchanged when it fails, so the batches of the owners
+        // merged before stay as they are.
+        match sink.append_rebased(owner_batches.merged) {
+            Ok(()) => merged_owners.push(owner_batches.owner),
+            Err(error) => {
+                _ = rejected.insert(owner_batches.owner, BatchRejection::Append(error));
+            }
+        }
+    }
+
+    if merged_owners.len() == 1 {
+        return first_as_sent;
+    }
+
+    match deflated::Batch::try_from(sink) {
+        Ok(merged) => vec![merged],
+        Err(error) => {
+            for owner in merged_owners {
+                _ = rejected.insert(owner, BatchRejection::Encode(error.clone()));
             }
 
-            deflated::Batch::try_from(sink)
-                .map(|batch| vec![batch])
-                .map_err(Into::into)
-        } else {
-            unreachable!()
+            Vec::new()
         }
-    } else {
-        Ok(batches)
     }
+}
+
+/// Returns the response for a rejected partition, with the values of Kafka's
+/// [`PartitionResponse(Errors)`]. Kafka does not set an error message.
+///
+/// [`PartitionResponse(Errors)`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceResponse.java#L168-L170
+fn rejected_partition_response(
+    index: Partition,
+    error_code: ErrorCode,
+) -> PartitionProduceResponse {
+    PartitionProduceResponse::default()
+        .index(index)
+        .error_code(error_code.into())
+        .base_offset(-1)
+        .log_append_time_ms(Some(-1))
+        .log_start_offset(Some(-1))
+        .record_errors(Some([].into()))
+        .error_message(None)
+        .current_leader(None)
 }
 
 #[derive(Clone)]
@@ -726,11 +1005,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, thread};
+    use std::{assert_matches, fs::File, thread};
 
     use bytes::Bytes;
     use nisshi_sans_io::{
-        ErrorCode,
+        BatchAttribute, Compression,
         produce_response::{LeaderIdAndEpoch, PartitionProduceResponse, TopicProduceResponse},
         record::Record,
     };
@@ -892,9 +1171,74 @@ mod tests {
             .map_err(Into::into)
     }
 
+    /// Returns `batches` with a different owner for each.
+    fn owned_by_separate_requests(batches: Vec<deflated::Batch>) -> Vec<OwnedBatch> {
+        batches
+            .into_iter()
+            .map(|batch| OwnedBatch {
+                owner: Uuid::now_v7(),
+                batch,
+            })
+            .collect()
+    }
+
+    /// Combines `batches`, each from a different request, and fails if `combine` rejects any.
+    fn combine_accepted(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error> {
+        let combined = combine(owned_by_separate_requests(batches));
+
+        if combined.rejected.is_empty() {
+            Ok(combined.forwarded)
+        } else {
+            Err(Error::Message(format!("rejected: {:?}", combined.rejected)))
+        }
+    }
+
+    #[test]
+    fn combine_rejects_every_batch_of_an_owner_with_a_batch_that_does_not_decode()
+    -> Result<(), Error> {
+        let rejected_owner = Uuid::now_v7();
+
+        let [first, second] =
+            owned_by_separate_requests(vec![record_data_batch(b"a")?, record_data_batch(b"d")?])
+                .try_into()
+                .expect("two owned batches");
+
+        let combined = combine(vec![
+            first,
+            OwnedBatch {
+                owner: rejected_owner,
+                batch: record_data_batch(b"b")?,
+            },
+            OwnedBatch {
+                owner: rejected_owner,
+                batch: undecodable_batch()?,
+            },
+            second,
+        ]);
+
+        assert_eq!(
+            vec![rejected_owner],
+            combined.rejected.into_keys().collect::<Vec<_>>()
+        );
+
+        assert_eq!(1, combined.forwarded.len());
+        assert_eq!(
+            vec![
+                Some(Bytes::from_static(b"a")),
+                Some(Bytes::from_static(b"d"))
+            ],
+            Vec::<Record>::try_from(combined.forwarded[0].clone())?
+                .into_iter()
+                .map(|record| record.value)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn combine_keeps_offset_deltas_contiguous() -> Result<(), Error> {
-        let combined = combine(vec![
+        let combined = combine_accepted(vec![
             multi_record_batch(&[b"a", b"b"])?,
             multi_record_batch(&[b"c", b"d", b"e"])?,
         ])?;
@@ -916,12 +1260,99 @@ mod tests {
         Ok(())
     }
 
+    /// A record offset delta of the second batch overflows once that batch is appended to the
+    /// first, so `combine` rejects the second batch's owner and forwards the first batch as sent.
+    #[test]
+    fn combine_rejects_the_owner_of_a_batch_whose_offset_delta_overflows() -> Result<(), Error> {
+        let batch_with_maximum_offset_delta = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .offset_delta(i32::MAX)
+                    .value(Bytes::from_static(b"b").into()),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let first = record_data_batch(b"a")?;
+
+        let owned =
+            owned_by_separate_requests(vec![first.clone(), batch_with_maximum_offset_delta]);
+        let overflowing_owner = owned[1].owner;
+
+        let combined = combine(owned);
+
+        assert_eq!(vec![first], combined.forwarded);
+        assert_eq!(1, combined.rejected.len());
+        assert_matches!(
+            combined.rejected.get(&overflowing_owner),
+            Some(BatchRejection::Append(
+                nisshi_sans_io::Error::OffsetDeltaOverflow(_)
+            ))
+        );
+
+        Ok(())
+    }
+
+    /// An owner's second batch overflows when it is appended to its first, so `combine` rejects
+    /// both of the owner's batches and leaves the other owners' merged batch as it was.
+    #[test]
+    fn combine_drops_the_batches_of_an_owner_whose_second_batch_does_not_append()
+    -> Result<(), Error> {
+        let rejected_owner = Uuid::now_v7();
+
+        let batch_with_maximum_offset_delta = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .offset_delta(i32::MAX)
+                    .value(Bytes::from_static(b"c").into()),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let [first, second] =
+            owned_by_separate_requests(vec![record_data_batch(b"a")?, record_data_batch(b"d")?])
+                .try_into()
+                .expect("two owned batches");
+
+        let combined = combine(vec![
+            first,
+            OwnedBatch {
+                owner: rejected_owner,
+                batch: record_data_batch(b"b")?,
+            },
+            OwnedBatch {
+                owner: rejected_owner,
+                batch: batch_with_maximum_offset_delta,
+            },
+            second,
+        ]);
+
+        assert_eq!(
+            vec![rejected_owner],
+            combined.rejected.into_keys().collect::<Vec<_>>()
+        );
+
+        assert_eq!(1, combined.forwarded.len());
+        assert_eq!(
+            vec![
+                Some(Bytes::from_static(b"a")),
+                Some(Bytes::from_static(b"d"))
+            ],
+            Vec::<Record>::try_from(combined.forwarded[0].clone())?
+                .into_iter()
+                .map(|record| record.value)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
     /// The second batch's record is rebuilt with `offset_delta` 64, one byte
     /// longer as a varint than the 0 it was encoded with, so the combined
     /// batch must still decode record by record.
     #[test]
     fn combine_offset_delta_crossing_varint_width_decodes_by_value() -> Result<(), Error> {
-        let combined = combine(vec![
+        let combined = combine_accepted(vec![
             multi_record_batch(&[b"a".as_slice(); 64])?,
             multi_record_batch(&[b"b"])?,
         ])?;
@@ -993,7 +1424,7 @@ mod tests {
             (&b"d"[..], 1_013),
         ]);
 
-        let combined = combine(vec![first, second])?;
+        let combined = combine_accepted(vec![first, second])?;
         assert_eq!(1, combined.len());
 
         let combined = inflated::Batch::try_from(combined[0].clone())?;
@@ -1074,7 +1505,7 @@ mod tests {
             (&b"d"[..], 993),
         ]);
 
-        let combined = combine(vec![first, second])?;
+        let combined = combine_accepted(vec![first, second])?;
         assert_eq!(1, combined.len());
 
         let combined = inflated::Batch::try_from(combined[0].clone())?;
@@ -1673,6 +2104,426 @@ mod tests {
                 )),
             response_b
         );
+
+        Ok(())
+    }
+
+    fn produce_request_to_partitions(
+        topic: &str,
+        batches: Vec<(i32, deflated::Batch)>,
+    ) -> ProduceRequest {
+        ProduceRequest::default().topic_data(Some(
+            [TopicProduceData::default()
+                .name(String::from(topic))
+                .partition_data(Some(
+                    batches
+                        .into_iter()
+                        .map(|(index, batch)| {
+                            PartitionProduceData::default()
+                                .index(index)
+                                .records(Some(Frame {
+                                    batches: vec![batch],
+                                }))
+                        })
+                        .collect(),
+                ))]
+            .into(),
+        ))
+    }
+
+    /// Returns a batch with a valid header whose records do not decode.
+    fn undecodable_batch() -> Result<deflated::Batch, Error> {
+        record_data_batch(b"bar").map(|batch| deflated::Batch {
+            record_data: batch.record_data.slice(..3),
+            ..batch
+        })
+    }
+
+    fn batching_service(
+        origin: MockProduceService,
+    ) -> Result<BatchProduceService<MockProduceService>, Error> {
+        let configuration = ResourceConfig::default();
+        configuration.put("a", "tansu.batch", "true")?;
+        configuration.put("a", "tansu.batch.timeout_ms", "5000")?;
+        Ok(BatchProduceLayer::new(configuration).into_layer(origin))
+    }
+
+    fn spawn_produce(
+        service: &BatchProduceService<MockProduceService>,
+        request: ProduceRequest,
+    ) -> tokio::task::JoinHandle<Result<ProduceResponse, Error>> {
+        let service = service.clone();
+        tokio::spawn(async move { service.serve(request.into()).await })
+    }
+
+    /// Queues `requests` in order, one second apart, then lets the batch timeout expire.
+    async fn produce_in_one_batch(
+        service: &BatchProduceService<MockProduceService>,
+        requests: Vec<ProduceRequest>,
+    ) -> Result<Vec<ProduceResponse>, Error> {
+        let mut handles = vec![];
+        for request in requests {
+            handles.push(spawn_produce(service, request));
+            advance(Duration::from_secs(1)).await;
+            yield_now().await;
+        }
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        let mut responses = vec![];
+        for handle in handles {
+            responses.push(handle.await??);
+        }
+        Ok(responses)
+    }
+
+    /// Returns the partition rows of `response`, keyed by topic and partition.
+    fn partition_responses(
+        response: &ProduceResponse,
+    ) -> BTreeMap<(String, i32), PartitionProduceResponse> {
+        response
+            .responses
+            .iter()
+            .flatten()
+            .flat_map(|topic| {
+                topic
+                    .partition_responses
+                    .iter()
+                    .flatten()
+                    .map(|partition| ((topic.name.clone(), partition.index), partition.clone()))
+            })
+            .collect()
+    }
+
+    /// The row that Kafka's `PartitionResponse(Errors)` writes for a partition that failed.
+    fn rejected_partition(index: i32, error_code: ErrorCode) -> PartitionProduceResponse {
+        PartitionProduceResponse::default()
+            .index(index)
+            .error_code(error_code.into())
+            .base_offset(-1)
+            .log_append_time_ms(Some(-1))
+            .log_start_offset(Some(-1))
+            .record_errors(Some([].into()))
+            .error_message(None)
+            .current_leader(None)
+    }
+
+    /// Returns the batches that the origin received for each topic and partition.
+    fn forwarded_batches(
+        origin: &MockProduceService,
+    ) -> Vec<BTreeMap<(String, i32), Vec<deflated::Batch>>> {
+        origin
+            .reqs
+            .lock()
+            .expect("poison")
+            .iter()
+            .map(|request| {
+                request
+                    .topic_data
+                    .iter()
+                    .flatten()
+                    .flat_map(|topic| {
+                        topic.partition_data.iter().flatten().map(|partition| {
+                            (
+                                (topic.name.clone(), partition.index),
+                                partition
+                                    .records
+                                    .as_ref()
+                                    .map(|frame| frame.batches.clone())
+                                    .unwrap_or_default(),
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undecodable_batch_fails_only_its_own_request() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let good = record_data_batch(b"foo")?;
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![
+                produce_request_to_partitions("a", vec![(0, good.clone())]),
+                produce_request_to_partitions("a", vec![(0, undecodable_batch()?)]),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![BTreeMap::from([((String::from("a"), 0), vec![good])])],
+            forwarded_batches(&origin)
+        );
+
+        let good_rows = partition_responses(&responses[0]);
+        assert_eq!(1, good_rows.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(good_rows[&("a".into(), 0)].error_code)?
+        );
+        assert_eq!(65456, good_rows[&("a".into(), 0)].base_offset);
+
+        assert_eq!(
+            BTreeMap::from([(
+                (String::from("a"), 0),
+                rejected_partition(0, ErrorCode::InvalidRecord)
+            )]),
+            partition_responses(&responses[1])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undecodable_batch_leaves_other_partitions_forwarded() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let good = record_data_batch(b"foo")?;
+        let other_partition = record_data_batch(b"baz")?;
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![
+                produce_request_to_partitions("a", vec![(0, good.clone())]),
+                produce_request_to_partitions(
+                    "a",
+                    vec![(0, undecodable_batch()?), (1, other_partition.clone())],
+                ),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![BTreeMap::from([
+                ((String::from("a"), 0), vec![good]),
+                ((String::from("a"), 1), vec![other_partition]),
+            ])],
+            forwarded_batches(&origin)
+        );
+
+        let rows = partition_responses(&responses[1]);
+        assert_eq!(2, rows.len());
+        assert_eq!(
+            rejected_partition(0, ErrorCode::InvalidRecord),
+            rows[&("a".into(), 0)]
+        );
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(rows[&("a".into(), 1)].error_code)?
+        );
+        assert_eq!(65456, rows[&("a".into(), 1)].base_offset);
+
+        assert_eq!(
+            vec![(String::from("a"), 0)],
+            partition_responses(&responses[0])
+                .into_keys()
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_over_the_decoded_size_limit_fails_only_its_own_request() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let good = record_data_batch(b"foo")?;
+
+        // The record count alone puts the decoded batch over the limit, so it fails before any
+        // decompression.
+        let too_large = record_data_batch(b"bar").map(|batch| deflated::Batch {
+            attributes: BatchAttribute::default()
+                .compression(Compression::Zstd)
+                .into(),
+            last_offset_delta: 99_999_999,
+            record_count: 100_000_000,
+            ..batch
+        })?;
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![
+                produce_request_to_partitions("a", vec![(0, good.clone())]),
+                produce_request_to_partitions("a", vec![(0, too_large)]),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![BTreeMap::from([((String::from("a"), 0), vec![good])])],
+            forwarded_batches(&origin)
+        );
+
+        assert_eq!(
+            BTreeMap::from([(
+                (String::from("a"), 0),
+                rejected_partition(0, ErrorCode::MessageTooLarge)
+            )]),
+            partition_responses(&responses[1])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_whose_offset_delta_overflows_fails_only_its_own_request() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let good = record_data_batch(b"foo")?;
+
+        // The record's offset delta overflows an `i32` when the batch is appended to another.
+        let overflowing = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .offset_delta(i32::MAX)
+                    .value(Bytes::from_static(b"bar").into()),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![
+                produce_request_to_partitions("a", vec![(0, good.clone())]),
+                produce_request_to_partitions("a", vec![(0, overflowing)]),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![BTreeMap::from([((String::from("a"), 0), vec![good])])],
+            forwarded_batches(&origin)
+        );
+
+        assert_eq!(
+            BTreeMap::from([(
+                (String::from("a"), 0),
+                rejected_partition(0, ErrorCode::InvalidRecord)
+            )]),
+            partition_responses(&responses[1])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_whose_offset_range_does_not_match_its_records_fails_only_its_own_request()
+    -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let good = record_data_batch(b"foo")?;
+
+        let inconsistent = record_data_batch(b"bar").map(|batch| deflated::Batch {
+            last_offset_delta: 1_000,
+            ..batch
+        })?;
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![
+                produce_request_to_partitions("a", vec![(0, good.clone())]),
+                produce_request_to_partitions("a", vec![(0, inconsistent)]),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![BTreeMap::from([((String::from("a"), 0), vec![good])])],
+            forwarded_batches(&origin)
+        );
+
+        assert_eq!(
+            BTreeMap::from([(
+                (String::from("a"), 0),
+                rejected_partition(0, ErrorCode::InvalidRecord)
+            )]),
+            partition_responses(&responses[1])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lone_undecodable_batch_is_forwarded_for_the_origin_to_answer() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let undecodable = undecodable_batch()?;
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![produce_request_to_partitions(
+                "a",
+                vec![(0, undecodable.clone())],
+            )],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![BTreeMap::from([(
+                (String::from("a"), 0),
+                vec![undecodable]
+            )])],
+            forwarded_batches(&origin)
+        );
+
+        assert_eq!(
+            65456,
+            partition_responses(&responses[0])[&("a".into(), 0)].base_offset
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_batch_rejected_answers_without_calling_the_origin() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![
+                produce_request_to_partitions("a", vec![(0, undecodable_batch()?)]),
+                produce_request_to_partitions("a", vec![(0, undecodable_batch()?)]),
+            ],
+        )
+        .await?;
+
+        assert!(forwarded_batches(&origin).is_empty());
+
+        for response in responses {
+            assert_eq!(
+                BTreeMap::from([(
+                    (String::from("a"), 0),
+                    rejected_partition(0, ErrorCode::InvalidRecord)
+                )]),
+                partition_responses(&response)
+            );
+        }
 
         Ok(())
     }

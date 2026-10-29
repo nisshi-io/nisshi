@@ -107,7 +107,7 @@ Nisshi also has capabilities beyond this quickstart:
 - Validate messages with a schema — The broker checks each message against an Avro, JSON Schema, or Protocol Buffers schema and rejects messages that do not conform. For more information, see [Schema Registry](https://docs.nisshi.io/docs/schema-registry).
 - Write topic data to a data lake — Nisshi can write a topic that has a schema as Apache Iceberg tables, Delta Lake tables, or Apache Parquet files. For more information, see [Data Lake](https://docs.nisshi.io/docs/data-lake).
 - Choose where Nisshi stores data — The storage options include memory, SQLite, PostgreSQL, and S3. For more information, see [Storage Engine](https://docs.nisshi.io/docs/storage-engine).
-- Secure the broker — The broker supports TLS, and it supports authentication with Simple Authentication and Security Layer (SASL). For more information about the options, see [TLS](https://github.com/nisshi-io/solace-nisshi#tls) in the README.
+- Secure the broker — The broker supports TLS, and it supports authentication with Simple Authentication and Security Layer (SASL). For more information about the options, see [TLS](https://github.com/nisshi-io/solace-nisshi#tls) and [Authentication](https://github.com/nisshi-io/solace-nisshi#authentication) in the README, which explains how to create the first user.
 - Run a proxy — The `nisshi proxy` command runs a Kafka API proxy in front of another broker. For more information, see [Proxy CLI](https://docs.nisshi.io/docs/cli-proxy).
 
 ## Build from Source

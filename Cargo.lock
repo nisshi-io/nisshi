@@ -5847,6 +5847,7 @@ dependencies = [
  "nisshi-storage",
  "nisshi-topic",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -5917,6 +5918,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-postgres",
  "tokio-rustls",
  "tokio-util",
  "traceforge",

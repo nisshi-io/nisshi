@@ -111,7 +111,16 @@
 //! ```
 //!
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::todo, clippy::unimplemented)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use async_trait::async_trait;
 use bytes::{Bytes, TryGetError};
 
@@ -201,6 +210,7 @@ pub mod message_timestamp_type;
 mod producer;
 mod proxy;
 mod service;
+mod topic_creation;
 mod topic_defaults;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
@@ -210,6 +220,7 @@ pub use latency::LatencyIntroducingStorage;
 pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
+pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
@@ -421,6 +432,9 @@ pub enum Error {
 
     #[cfg(feature = "turso")]
     UnexpectedValue(turso::Value),
+
+    #[cfg(feature = "libsql")]
+    UnexpectedLibSqlValue(libsql::Value),
 
     UnknownCacheKey(String),
 

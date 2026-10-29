@@ -175,6 +175,10 @@ struct Backfill {
     /// When the backfill began, on the store's clock: the write time the
     /// store reports for the watermark document after the begin CAS.
     began: SystemTime,
+    /// Whether the index was at an older version when the backfill began
+    /// (see [`TimeIndex::is_older_version`]), so that the logs say why the
+    /// partition is rebuilt.
+    older_version: bool,
 }
 
 /// Encode a Kafka group id as a single, opaque `object_store` path segment.
@@ -839,11 +843,13 @@ impl DynoStore {
     /// below the topic's partition count. Returns the topic's metadata.
     ///
     /// Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic or an
-    /// index outside the topic.
+    /// index outside the topic, and with [`ErrorCode::KafkaStorageError`] for a failed read of
+    /// the object store.
     async fn ensure_partition_exists(&self, topition: &Topition) -> Result<TopicMetadata> {
         let Some(metadata) = self
             .topic_metadata(&TopicId::Name(topition.topic.clone()))
-            .await?
+            .await
+            .map_err(metadata_read_error)?
         else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         };
@@ -1217,12 +1223,15 @@ impl DynoStore {
         let token = rng().random::<u64>();
         let watermark = self.watermark_for(topition)?;
 
-        let (token, low, high) = watermark
+        let (token, low, high, older_version) = watermark
             .with_mut(&self.object_store, |w| {
+                let older_version = w.time_index.is_older_version();
+
                 Ok((
                     w.time_index.begin_backfill(token),
                     w.low.unwrap_or(0),
                     w.high.unwrap_or(0),
+                    older_version,
                 ))
             })
             .await?;
@@ -1241,12 +1250,14 @@ impl DynoStore {
             low,
             high,
             began,
+            older_version,
         })
     }
 
     /// Lists every batch object of `topition` below the high watermark of
-    /// `backfill` and replays the time index's append rule over their
-    /// headers, in offset order, into a candidate index. Returns that index
+    /// `backfill` and replays the time index's append rule over each batch's
+    /// maximum record timestamp (see [`DynoStore::max_record_timestamp`]),
+    /// in offset order, into a candidate index. Returns that index
     /// and the number of batches listed. Pure read: never writes anything.
     ///
     /// The candidate is complete when the listed batches cover every offset
@@ -1271,7 +1282,12 @@ impl DynoStore {
         let listed = self.list_batches(topition, 0, backfill.high).await?;
         let batches = listed.len();
 
-        info!(?topition, batches, "time index backfill: starting");
+        info!(
+            ?topition,
+            batches,
+            older_version = backfill.older_version,
+            "time index backfill: starting"
+        );
 
         let mut candidate = TimeIndex::default();
 
@@ -1280,6 +1296,8 @@ impl DynoStore {
         // so the gap check is off for the batch after it.
         let mut next_offset = Some(backfill.low);
         let mut settled = true;
+        let mut headers_disagreeing = 0_usize;
+        let mut first_disagreeing_offset = None;
 
         for (base_offset, written) in listed {
             if settled
@@ -1309,14 +1327,28 @@ impl DynoStore {
                 continue;
             };
 
+            let max_timestamp = Self::max_record_timestamp(topition, base_offset, &batch).await?;
+            if max_timestamp != batch.max_timestamp {
+                debug!(
+                    ?topition,
+                    base_offset,
+                    header = batch.max_timestamp,
+                    records = max_timestamp,
+                    "time index backfill: header disagrees with its records"
+                );
+
+                headers_disagreeing += 1;
+                _ = first_disagreeing_offset.get_or_insert(base_offset);
+            }
+
             if settled {
                 candidate.append(
-                    batch.max_timestamp,
+                    max_timestamp,
                     base_offset,
                     u64::try_from(batch.batch_length).unwrap_or_default(),
                 );
             } else {
-                candidate.observe(batch.max_timestamp);
+                candidate.observe(max_timestamp);
             }
 
             next_offset = Some(base_offset + i64::from(batch.last_offset_delta) + 1);
@@ -1334,11 +1366,72 @@ impl DynoStore {
             settled = false;
         }
 
+        // A broker rewrites each header from its records at produce, so only
+        // a batch that an older broker stored can disagree.
+        if let Some(first_disagreeing_offset) = first_disagreeing_offset {
+            warn!(
+                ?topition,
+                batches,
+                headers_disagreeing,
+                first_disagreeing_offset,
+                "time index backfill: taking each batch's maximum timestamp from its records, not \
+                 from a header that disagrees with them, as an older broker stored it"
+            );
+        }
+
         if settled {
             candidate.mark_complete();
         }
 
         Ok((candidate, batches))
+    }
+
+    /// Returns the greatest timestamp that a consumer reads from `batch`
+    /// (see [`inflated::Batch::max_record_timestamp`]), for the time index.
+    ///
+    /// A batch that a broker stored before it rewrote `max_timestamp` from
+    /// the records carries the header that its client wrote, which can be
+    /// below a record (or -1) or far above every record. An index built from
+    /// such a header answers no match for a record that exists, or gives no
+    /// entry to the batches after it. Kafka's index reads the header, which
+    /// `LogValidator` has already rewritten from the records, so the values
+    /// here are the ones that Kafka's index holds ([`LogSegment.java`]).
+    ///
+    /// The function returns the header for a batch that does not decode,
+    /// instead of failing the backfill, so that one corrupt batch does not
+    /// fail every lookup on its partition. A scan that reaches the batch
+    /// still answers an error.
+    ///
+    /// The decode runs on the blocking pool, as a produce's does, because a
+    /// backfill decodes every batch of its partition.
+    ///
+    /// [`LogSegment.java`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L487-L495
+    async fn max_record_timestamp(
+        topition: &Topition,
+        base_offset: i64,
+        batch: &deflated::Batch,
+    ) -> Result<i64> {
+        let decoded = {
+            let batch = batch.clone();
+            offload(move || {
+                Ok(inflated::Batch::try_from(&batch)
+                    .map(|inflated| inflated.max_record_timestamp()))
+            })
+        }
+        .await?;
+
+        Ok(decoded
+            .inspect_err(|error| {
+                warn!(
+                    ?error,
+                    ?topition,
+                    base_offset,
+                    max_timestamp = batch.max_timestamp,
+                    "time index backfill: taking the header's maximum timestamp of a batch that \
+                     does not decode"
+                )
+            })
+            .unwrap_or(batch.max_timestamp))
     }
 
     /// Commits a backfill `candidate` (from
@@ -2009,6 +2102,27 @@ impl Storage for DynoStore {
         ])
     }
 
+    /// Appends `deflated` to `topition`, and returns the base offset of the batch.
+    ///
+    /// The produce takes its offsets in the watermark document of the
+    /// partition, before the writes that follow: the lake table, the
+    /// transaction metadata and the batch object. If one of those writes
+    /// fails, the client gets an error and the taken offsets hold no batch.
+    /// The produce does not move the high watermark back, because a rollback
+    /// is another conditional write that can fail in the same way, and a
+    /// concurrent produce can already hold the next offset. A fetch skips the
+    /// gap, and the time index backfill settles it as a failed produce after
+    /// `BATCH_SETTLED_AFTER`. `ListOffsets` reports a high watermark past the
+    /// gap.
+    ///
+    /// Kafka does not use an offset for an append that it rejects. After it
+    /// appends to the log, Kafka does not move the log end offset back, also
+    /// when the transaction index write that follows fails
+    /// ([`UnifiedLog.append`]). This engine takes its offsets earlier, at the
+    /// watermark write, so a failed batch write leaves a gap that Kafka does
+    /// not have.
+    ///
+    /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L905-L912
     async fn produce(
         &self,
         transaction_id: Option<&str>,
@@ -2762,35 +2876,41 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_commit) in offsets {
-            if self
-                .topic_metadata(&TopicId::from(topition))
-                .await?
-                .is_some()
-            {
-                let location = self.committed_offset_location(group_id, topition)?;
-
-                let payload = serde_json::to_vec(&offset_commit)
-                    .map(Bytes::from)
-                    .map(PutPayload::from)?;
-
-                let options = PutOptions {
-                    mode: PutMode::Overwrite,
-                    attributes: json_content_type(),
-                    ..Default::default()
-                };
-
-                let error_code = self
-                    .object_store
-                    .put_opts(&location, payload, options)
-                    .await
-                    .inspect_err(|err| error!(?err))
-                    .inspect(|outcome| debug!(?outcome))
-                    .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None);
-
-                responses.push((topition.to_owned(), error_code));
-            } else {
-                responses.push((topition.to_owned(), ErrorCode::UnknownTopicOrPartition));
+            // Kafka answers `UNKNOWN_TOPIC_OR_PARTITION` for each partition
+            // of an unknown topic, and for each index that a known topic does
+            // not have, and commits the other partitions of the request
+            // ([KafkaApis.scala#L476-L491]).
+            //
+            // [KafkaApis.scala#L476-L491]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L476-L491
+            match self.ensure_partition_exists(topition).await {
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                    responses.push((topition.to_owned(), ErrorCode::UnknownTopicOrPartition));
+                    continue;
+                }
+                checked => _ = checked?,
             }
+
+            let location = self.committed_offset_location(group_id, topition)?;
+
+            let payload = serde_json::to_vec(&offset_commit)
+                .map(Bytes::from)
+                .map(PutPayload::from)?;
+
+            let options = PutOptions {
+                mode: PutMode::Overwrite,
+                attributes: json_content_type(),
+                ..Default::default()
+            };
+
+            let error_code = self
+                .object_store
+                .put_opts(&location, payload, options)
+                .await
+                .inspect_err(|err| error!(?err))
+                .inspect(|outcome| debug!(?outcome))
+                .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None);
+
+            responses.push((topition.to_owned(), error_code));
         }
 
         Ok(responses)
@@ -3071,7 +3191,7 @@ impl Storage for DynoStore {
                     .resource_name(name.into())
                     .configs(Some(vec![]))),
 
-                Err(error) => Err(error),
+                Err(error) => Err(metadata_read_error(error)),
             },
 
             _ => Ok(DescribeConfigsResult::default()
@@ -4278,6 +4398,27 @@ impl Storage for DynoStore {
             .await
             .transpose()?;
         Ok(())
+    }
+}
+
+/// Returns the error that a client gets for a failed read of the cluster's metadata: an object
+/// store error becomes [`Error::Api`] with [`ErrorCode::KafkaStorageError`], and any other error
+/// stays as it is.
+///
+/// A failed read of the object store is usually transient. Kafka answers a failed log read with
+/// `KAFKA_STORAGE_ERROR` ([`LocalLog.scala`]), and a producer retries that code, but fails on
+/// `UNKNOWN_SERVER_ERROR`. A retry does not fix metadata that can't be decoded, so that error
+/// keeps its type.
+///
+/// [`LocalLog.scala`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L709-L721
+fn metadata_read_error(error: Error) -> Error {
+    match error {
+        Error::ObjectStore(error) => {
+            error!(?error, "reading metadata");
+            Error::Api(ErrorCode::KafkaStorageError)
+        }
+
+        otherwise => otherwise,
     }
 }
 
