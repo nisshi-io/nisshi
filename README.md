@@ -88,8 +88,11 @@ Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Ka
 message descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). Clients on
 Kafka 4.x negotiate down to those protocol versions. Idempotent producers work. Transactions are
 not supported, so Kafka Streams with `exactly_once_v2` fails.
-[Compatibility and feature status](docs/compatibility.md) lists the details and the Kafka clients CI tests.
-Please [raise an issue][nisshi-issues] if a client or Kafka version you rely on behaves differently.
+
+For the details, see [Compatibility and feature status](docs/compatibility.md). It lists which
+Kafka APIs and topic configurations each storage engine supports, and the client versions CI tests
+along with their known gaps. Please [raise an issue][nisshi-issues] if a client or Kafka version
+you rely on behaves differently.
 
 ## Feedback
 
