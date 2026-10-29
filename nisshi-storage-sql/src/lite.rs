@@ -16,13 +16,13 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        self, Cache, consumer_group_select, default_hash, header_fetch, idempotent_epoch_check,
-        idempotent_sequence_check, list_offset, producer_epoch_current_for_producer,
-        producer_epoch_for_current_txn, producer_epoch_insert, producer_epochs_select,
-        producer_insert, producer_select_for_update, record_fetch, remove_comments,
-        result_columns::ResultColumns, topic_by_cluster, topic_configuration_select,
-        topic_configuration_select_name, topic_configuration_upsert, topic_insert, topic_select,
-        topic_select_name, topic_select_uuid, topition_insert,
+        self, Cache, consumer_group_select, default_hash, driver::CopiedLibsqlRow, header_fetch,
+        idempotent_epoch_check, idempotent_sequence_check, list_offset,
+        producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
+        producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
+        remove_comments, result_columns::ResultColumns, topic_by_cluster,
+        topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
+        topic_insert, topic_select, topic_select_name, topic_select_uuid, topition_insert,
         txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
         txn_select_name, txn_select_produced_topitions, virtual_topic_upsert, watermark_insert,
         watermark_select, watermark_select_for_write,
@@ -441,12 +441,33 @@ impl PoolConnection {
     ///
     /// The function drops the result before it returns, because SQLite can't commit while a
     /// `returning` statement is still open.
-    #[instrument(skip_all)]
     async fn query_first<P>(
         &self,
         query: &'static str,
         params: P,
     ) -> result::Result<(ResultColumns, Option<Row>), libsql::Error>
+    where
+        P: IntoParams,
+    {
+        let (columns, mut rows) = self.query_leading_rows(query, params, 1, Ok).await?;
+        Ok((columns, rows.pop()))
+    }
+
+    /// Runs `query`, and returns the column names of its result with at most `limit` of its rows,
+    /// in order, each as `keep` returns it. It records the query's SQL metrics, and drops the
+    /// result before it returns.
+    ///
+    /// A libSQL [`Row`] reads its values from the statement's current row, so `keep` must copy a
+    /// row when `limit` is more than one: the next step replaces the values that a kept [`Row`]
+    /// reads.
+    #[instrument(skip_all)]
+    async fn query_leading_rows<P, T>(
+        &self,
+        query: &'static str,
+        params: P,
+        limit: usize,
+        keep: impl Fn(Row) -> result::Result<T, libsql::Error>,
+    ) -> result::Result<(ResultColumns, Vec<T>), libsql::Error>
     where
         P: IntoParams,
     {
@@ -465,20 +486,26 @@ impl PoolConnection {
 
         let columns = ResultColumns::libsql(query, &rows);
 
-        // libSQL reports an error of the statement's first step from this call, not from
+        let mut leading = Vec::with_capacity(limit);
+
+        // libSQL reports an error of the statement's first step from the first `next`, not from
         // `query`.
-        let row = rows
-            .next()
-            .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| self.record_query_error(query, start, err))?;
+        while leading.len() < limit
+            && let Some(row) = rows
+                .next()
+                .await
+                .inspect(|row| debug!(?row))
+                .inspect_err(|err| self.record_query_error(query, start, err))?
+        {
+            leading.push(keep(row)?);
+        }
 
         let attributes = [KeyValue::new("sql", query.to_owned())];
 
         SQL_DURATION.record(elapsed_millis(start), &attributes);
         SQL_REQUESTS.add(1, &attributes);
 
-        Ok((columns, row))
+        Ok((columns, leading))
     }
 
     /// Logs `err` from `query`, started at `start`, and counts it in `SQL_ERROR`.
@@ -552,21 +579,28 @@ impl PoolConnection {
         Ok(row)
     }
 
-    /// Runs `query`, and returns the column names of its result with its first row.
+    /// Runs `query`, and returns the column names of its result with its one row.
     ///
-    /// Returns [`libsql::Error::Misuse`] when the result has no rows.
+    /// Returns [`libsql::Error::Misuse`] when the result has no rows or more than one row.
     async fn query_one<P>(
         &self,
         query: &'static str,
         params: P,
-    ) -> result::Result<(ResultColumns, Row), libsql::Error>
+    ) -> result::Result<(ResultColumns, CopiedLibsqlRow), libsql::Error>
     where
         P: IntoParams,
     {
-        let (columns, row) = self.query_first(query, params).await?;
+        let (columns, mut rows) = self
+            .query_leading_rows(query, params, 2, |row| CopiedLibsqlRow::of(&row))
+            .await?;
 
-        row.map(|row| (columns, row))
-            .ok_or_else(|| libsql::Error::Misuse(format!("sql={query}")))
+        match (rows.pop(), rows.pop()) {
+            (Some(row), None) => Ok((columns, row)),
+            (None, _) => Err(libsql::Error::Misuse(format!("sql={query}: no rows"))),
+            (Some(_), Some(_)) => Err(libsql::Error::Misuse(format!(
+                "sql={query}: more than one row"
+            ))),
+        }
     }
 
     /// Returns the newest epoch of `producer` in `cluster`, or `None` when the producer does not

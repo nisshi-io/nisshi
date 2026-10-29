@@ -224,6 +224,9 @@ mod postgres {
 }
 
 #[cfg(feature = "libsql")]
+pub(crate) use self::libsql::CopiedLibsqlRow;
+
+#[cfg(feature = "libsql")]
 mod libsql {
     use super::{DriverRow, DriverRowCursor};
     use bytes::Bytes;
@@ -233,12 +236,52 @@ mod libsql {
     use std::time::SystemTime;
     use uuid::Uuid;
 
-    /// Returns the value at `index` of `row`, or `None` for a null.
+    /// A row whose values a [`DriverRow`] reads: libSQL's own [`Row`], or a [`CopiedLibsqlRow`].
+    trait LibsqlValues {
+        /// Returns the value at `index`.
+        fn value(&self, index: usize) -> Result<Value>;
+    }
+
+    impl LibsqlValues for Row {
+        // This reads the value with `get_value` and each caller matches its kind, instead of the
+        // typed `Row::get`, because libSQL 0.10's typed `get` panics on a value of another kind.
+        fn value(&self, index: usize) -> Result<Value> {
+            self.get_value(i32::try_from(index)?).map_err(Into::into)
+        }
+    }
+
+    /// The values of one libSQL row, copied out of its statement.
     ///
-    /// This reads the value with `get_value` and each caller matches its kind, instead of the
-    /// typed `Row::get`, because libSQL 0.10's typed `get` panics on a value of another kind.
-    fn nullable_value(row: &Row, index: usize) -> Result<Option<Value>> {
-        match row.get_value(i32::try_from(index)?)? {
+    /// A libSQL [`Row`] reads its values from the statement's current row, so a later step of the
+    /// statement replaces them. An engine copies a row when it steps the statement again before
+    /// it reads the row, as a one-row read does to check for a second row.
+    #[derive(Debug)]
+    pub(crate) struct CopiedLibsqlRow {
+        values: Vec<Value>,
+    }
+
+    impl CopiedLibsqlRow {
+        /// Returns a copy of the values of `row`.
+        pub(crate) fn of(row: &Row) -> libsql::Result<Self> {
+            (0..row.column_count())
+                .map(|index| row.get_value(index))
+                .collect::<libsql::Result<_>>()
+                .map(|values| Self { values })
+        }
+    }
+
+    impl LibsqlValues for CopiedLibsqlRow {
+        fn value(&self, index: usize) -> Result<Value> {
+            self.values
+                .get(index)
+                .cloned()
+                .ok_or(libsql::Error::InvalidColumnIndex.into())
+        }
+    }
+
+    /// Returns the value at `index` of `row`, or `None` for a null.
+    fn nullable_value<R: LibsqlValues>(row: &R, index: usize) -> Result<Option<Value>> {
+        match row.value(index)? {
             Value::Null => Ok(None),
             value => Ok(Some(value)),
         }
@@ -260,15 +303,7 @@ mod libsql {
         }
     }
 
-    impl DriverRowCursor for Rows {
-        type Row = Row;
-
-        async fn next(&mut self) -> Result<Option<Row>> {
-            Rows::next(self).await.map_err(Into::into)
-        }
-    }
-
-    impl DriverRow for Row {
+    impl<R: LibsqlValues> DriverRow for R {
         fn integer(&self, index: usize) -> Result<Option<i64>> {
             nullable_value(self, index)?.map(integer_of).transpose()
         }

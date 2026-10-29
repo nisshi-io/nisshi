@@ -380,6 +380,25 @@ impl Engine {
     where
         P: IntoParams,
     {
+        let (columns, mut rows) = self
+            .query_leading_rows(connection, query, params, 1)
+            .await?;
+        Ok((columns, rows.pop()))
+    }
+
+    /// Runs `query` on `connection`, and returns the column names of its result with at most
+    /// `limit` of its rows, in order. It records the query's SQL metrics, and drops the result
+    /// before it returns.
+    async fn query_leading_rows<P>(
+        &self,
+        connection: &Connection,
+        query: &'static str,
+        params: P,
+        limit: usize,
+    ) -> Result<(ResultColumns, Vec<Row>)>
+    where
+        P: IntoParams,
+    {
         let sql = sql_lookup(query)?;
 
         // The params hold record data, so we log only the SQL.
@@ -399,14 +418,20 @@ impl Engine {
 
         let columns = ResultColumns::turso(query, &rows);
 
-        let row = rows
-            .next()
-            .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| {
-                error!(?err, sql);
-                SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
-            })?;
+        let mut leading = Vec::with_capacity(limit);
+
+        while leading.len() < limit
+            && let Some(row) = rows
+                .next()
+                .await
+                .inspect(|row| debug!(?row))
+                .inspect_err(|err| {
+                    error!(?err, sql);
+                    SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
+                })?
+        {
+            leading.push(row);
+        }
 
         let attributes = [
             KeyValue::new("sql", sql),
@@ -422,14 +447,14 @@ impl Engine {
 
         SQL_REQUESTS.add(1, &attributes);
 
-        Ok((columns, row))
+        Ok((columns, leading))
     }
 
-    /// Runs `query` on `connection`, and returns the column names of its result with its first
-    /// row.
+    /// Runs `query` on `connection`, and returns the column names of its result with its one row.
     ///
     /// Returns [`Error::Turso`] with [`turso::Error::QueryReturnedNoRows`] when the result has no
-    /// rows.
+    /// rows, and [`Error::Turso`] with [`turso::Error::Misuse`] when it has more
+    /// than one.
     async fn query_one<P>(
         &self,
         connection: &Connection,
@@ -439,14 +464,21 @@ impl Engine {
     where
         P: IntoParams,
     {
-        let (columns, row) = self.query_first(connection, query, params).await?;
+        let (columns, mut rows) = self
+            .query_leading_rows(connection, query, params, 2)
+            .await?;
 
-        let Some(row) = row else {
-            error!(query, "query returned no rows");
-            return Err(turso::Error::QueryReturnedNoRows.into());
-        };
-
-        Ok((columns, row))
+        match (rows.pop(), rows.pop()) {
+            (Some(row), None) => Ok((columns, row)),
+            (None, _) => {
+                error!(query, "query returned no rows");
+                Err(turso::Error::QueryReturnedNoRows.into())
+            }
+            (Some(_), Some(_)) => {
+                error!(query, "query returned more than one row");
+                Err(turso::Error::Misuse(format!("{query} returned more than one row")).into())
+            }
+        }
     }
 
     /// Returns the newest epoch of `producer`, or `None` when the producer does not exist or has
