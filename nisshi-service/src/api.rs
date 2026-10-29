@@ -330,6 +330,23 @@ where
             .map_or(Ok(self), |_existing| Err(Error::DuplicateRoute(api_key)))
     }
 
+    /// Replaces the route of `api_key` with the service that `wrap` builds from it. The route
+    /// must be registered already: a wrapper that finds nothing to wrap is an error, not a
+    /// silent absence of what the wrapper adds.
+    pub fn wrap_route<F>(mut self, api_key: i16, wrap: F) -> Result<Self, Error>
+    where
+        F: FnOnce(BoxService<FrameInput, Frame, E>) -> BoxService<FrameInput, Frame, E>,
+    {
+        let route = self
+            .routes
+            .remove(&api_key)
+            .ok_or_else(|| Error::Message(format!("no route of API key {api_key} to wrap")))?;
+
+        _ = self.routes.insert(api_key, wrap(route));
+
+        Ok(self)
+    }
+
     /// The number of routes registered so far (`build` has not yet added `ApiVersions`).
     #[must_use]
     pub fn len(&self) -> usize {

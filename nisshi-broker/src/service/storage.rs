@@ -19,7 +19,7 @@ use nisshi_sans_io::{
     DescribeClusterRequest, DescribeConfigsRequest, DescribeTopicPartitionsRequest,
     DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
-    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest,
+    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
 use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, TransactionAbortableDowngradeLayer};
 use nisshi_storage::{
@@ -30,7 +30,7 @@ use nisshi_storage::{
     FetchService, FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
     ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService,
+    TxnEndService, TxnOffsetCommitService,
 };
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
@@ -67,6 +67,7 @@ where
         list_partition_reassignments,
         produce,
         end_txn,
+        txn_offset_commit,
     ]
     .iter()
     .try_fold(builder, |builder, service| {
@@ -526,6 +527,26 @@ where
                 FrameRequestLayer::<EndTxnRequest>::new(),
             )
                 .into_layer(TxnEndService { storage })
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn txn_offset_commit<S>(
+    builder: FrameRouteBuilder<Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    S: Storage,
+{
+    builder
+        .with_route(
+            TxnOffsetCommitRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
+            )
+                .into_layer(TxnOffsetCommitService { storage })
                 .boxed(),
         )
         .map_err(Into::into)

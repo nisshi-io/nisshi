@@ -16,90 +16,56 @@
 //! group coordinator, which holds the group. The storage checks the producer.
 
 use nisshi_sans_io::{
-    ApiKey as _, RequestInput, TxnOffsetCommitRequest, TxnOffsetCommitResponse,
+    ApiKey as _, Body, Frame, FrameInput, Header, TxnOffsetCommitRequest, TxnOffsetCommitResponse,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
-use nisshi_storage::{Storage, TxnOffsetCommitService};
-use rama::{Layer, Service, layer::MapErrLayer};
+use nisshi_service::FrameRouteBuilder;
+use rama::{Service, service::BoxService};
 
 use crate::{Error, Result, coordinator::group::Coordinator};
 
-/// Registers the route of `TxnOffsetCommit`: the group coordinator fences the commit, then the
-/// storage commits it.
-pub fn txn_offset_commit<C, S>(
+/// Wraps the registered route of `TxnOffsetCommit`: the group coordinator fences the commit, then
+/// the storage's route commits it. [`crate::service::storage::txn_offset_commit`] registers that
+/// route.
+pub fn fence_txn_offset_commit<C>(
     builder: FrameRouteBuilder<Error>,
     coordinator: C,
-    storage: S,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     C: Coordinator,
-    S: Storage,
 {
     builder
-        .with_route(
-            TxnOffsetCommitRequest::KEY,
-            (
-                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
-                TxnOffsetCommitFenceLayer { coordinator },
-                MapErrLayer::new(Error::from),
-            )
-                .into_layer(TxnOffsetCommitService { storage })
-                .boxed(),
-        )
+        .wrap_route(TxnOffsetCommitRequest::KEY, |inner| {
+            TxnOffsetCommitFenceService { coordinator, inner }.boxed()
+        })
         .map_err(Into::into)
 }
 
-/// A [`Layer`] that answers a `TxnOffsetCommit` that the group's coordinator fences, and passes
-/// any other to its inner service.
 #[derive(Clone, Debug)]
-pub struct TxnOffsetCommitFenceLayer<C> {
-    pub coordinator: C,
-}
-
-impl<C, S> Layer<S> for TxnOffsetCommitFenceLayer<C>
-where
-    C: Clone,
-{
-    type Service = TxnOffsetCommitFenceService<C, S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        TxnOffsetCommitFenceService {
-            coordinator: self.coordinator.clone(),
-            inner,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TxnOffsetCommitFenceService<C, S> {
+pub struct TxnOffsetCommitFenceService<C> {
     coordinator: C,
-    inner: S,
+    inner: BoxService<FrameInput, Frame, Error>,
 }
 
-impl<C, S> Service<RequestInput<TxnOffsetCommitRequest>> for TxnOffsetCommitFenceService<C, S>
+impl<C> Service<FrameInput> for TxnOffsetCommitFenceService<C>
 where
     C: Coordinator,
-    S: Service<
-            RequestInput<TxnOffsetCommitRequest>,
-            Output = TxnOffsetCommitResponse,
-            Error = Error,
-        >,
 {
-    type Output = TxnOffsetCommitResponse;
+    type Output = Frame;
     type Error = Error;
 
-    async fn serve(
-        &self,
-        input: RequestInput<TxnOffsetCommitRequest>,
-    ) -> Result<Self::Output, Self::Error> {
-        let request = &input.request;
+    async fn serve(&self, input: FrameInput) -> Result<Self::Output, Self::Error> {
+        let correlation_id = input.frame.correlation_id()?;
+
+        // The request is decoded here to read the group's fields, and again by the route.
+        let request = TxnOffsetCommitRequest::try_from(input.frame.body.clone())?;
+
         let generation_id = request.generation_id.unwrap_or(-1);
         let member_id = request.member_id.as_deref().unwrap_or_default();
 
-        // A commit without a generation, a member or a group instance ID (Produce versions
-        // before 3 have none) is not checked against the group, whatever its state, as in
-        // Kafka's `validateOffsetCommit` for a transactional commit.
+        // A commit without a generation, a member or a group instance ID (versions before 3
+        // have none) is not checked against the group, whatever its state, as in Kafka's
+        // `validateOffsetCommit` for a transactional commit.
         if generation_id < 0 && member_id.is_empty() && request.group_instance_id.is_none() {
             return self.inner.serve(input).await;
         }
@@ -116,31 +82,37 @@ where
         {
             None => self.inner.serve(input).await,
 
-            Some(error_code) => Ok(TxnOffsetCommitResponse::default()
-                .throttle_time_ms(0)
-                .topics(Some(
-                    request
-                        .topics
-                        .iter()
-                        .flatten()
-                        .map(|topic| {
-                            TxnOffsetCommitResponseTopic::default()
-                                .name(topic.name.clone())
-                                .partitions(Some(
-                                    topic
-                                        .partitions
-                                        .iter()
-                                        .flatten()
-                                        .map(|partition| {
-                                            TxnOffsetCommitResponsePartition::default()
-                                                .partition_index(partition.partition_index)
-                                                .error_code(i16::from(error_code))
-                                        })
-                                        .collect(),
-                                ))
-                        })
-                        .collect(),
-                ))),
+            Some(error_code) => Ok(Frame {
+                size: 0,
+                header: Header::Response { correlation_id },
+                body: Body::from(
+                    TxnOffsetCommitResponse::default()
+                        .throttle_time_ms(0)
+                        .topics(Some(
+                            request
+                                .topics
+                                .iter()
+                                .flatten()
+                                .map(|topic| {
+                                    TxnOffsetCommitResponseTopic::default()
+                                        .name(topic.name.clone())
+                                        .partitions(Some(
+                                            topic
+                                                .partitions
+                                                .iter()
+                                                .flatten()
+                                                .map(|partition| {
+                                                    TxnOffsetCommitResponsePartition::default()
+                                                        .partition_index(partition.partition_index)
+                                                        .error_code(i16::from(error_code))
+                                                })
+                                                .collect(),
+                                        ))
+                                })
+                                .collect(),
+                        )),
+                ),
+            }),
         }
     }
 }

@@ -22,7 +22,7 @@ use bytes::Bytes;
 use nisshi_broker::{
     Error, Result,
     coordinator::group::administrator::{Controller, GroupCoordinatorConfig},
-    service::txn_offset_commit::txn_offset_commit,
+    service::{storage, txn_offset_commit::fence_txn_offset_commit},
 };
 use nisshi_sans_io::{
     ApiKey as _, Body, ErrorCode, Frame, FrameInput, Header, TxnOffsetCommitRequest,
@@ -116,12 +116,10 @@ impl Fixture {
 
         let broker = Controller::new(storage.clone(), GROUP_COORDINATOR);
 
-        let route = txn_offset_commit(
-            FrameRouteService::<Error>::builder(),
-            broker.clone(),
-            storage.clone(),
-        )
-        .and_then(|builder| builder.build().map_err(Into::into))?;
+        let route =
+            storage::txn_offset_commit(FrameRouteService::<Error>::builder(), storage.clone())
+                .and_then(|builder| fence_txn_offset_commit(builder, broker.clone()))
+                .and_then(|builder| builder.build().map_err(Into::into))?;
 
         Ok(Self {
             storage,
