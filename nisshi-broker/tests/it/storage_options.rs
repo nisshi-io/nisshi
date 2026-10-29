@@ -126,6 +126,7 @@ mod postgres {
                 scheme,
                 option,
                 value,
+                ..
             }) if scheme == "postgres" && option == "pool_max_size" && value == "1"
         );
 

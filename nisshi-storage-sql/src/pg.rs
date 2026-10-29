@@ -71,7 +71,7 @@ use nisshi_storage::{
     OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
     TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     TxnState, UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option, producer_claim,
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -231,6 +231,9 @@ const POOL_MAX_SIZE: &str = "pool_max_size";
 /// [`Semaphore::new`] panics above [`Semaphore::MAX_PERMITS`], which is much
 /// larger.
 const POOL_MAX_SIZE_RANGE: RangeInclusive<usize> = 2..=262_143;
+
+/// The values that [`POOL_MAX_SIZE`] takes, as an error message gives them.
+const POOL_MAX_SIZE_EXPECTED: &str = "a whole number from 2 to 262143";
 
 /// How many partition reads of each kind this engine has in flight at once,
 /// across every request, counting an abandoned read until its statement has
@@ -417,41 +420,44 @@ fn statement_timeout_value(value: &str) -> Option<Duration> {
 /// and returns the pool size that the last one sets, or
 /// [`DEFAULT_POOL_MAX_SIZE`] when the URL sets none.
 ///
-/// Returns [`Error::InvalidStorageOptionValue`] for a size that is not a
-/// number in [`POOL_MAX_SIZE_RANGE`].
+/// Returns [`Error::InvalidStorageOptionValue`] when any of them is not a
+/// number in [`POOL_MAX_SIZE_RANGE`], as [`parse_storage_option`] does for
+/// every storage option.
 fn take_pool_max_size(config: &mut String) -> Result<usize> {
-    // tokio-postgres rejects an option that it does not read, so this option
-    // must go before it parses the URL.
-    let Some((base, query)) = config.split_once('?') else {
+    // A key/value connection string, such as `host=db user=nisshi`, is not a
+    // URL, and sets no storage URL options.
+    let Ok(storage) = Url::parse(config) else {
         return Ok(DEFAULT_POOL_MAX_SIZE);
     };
 
-    let mut value = None;
-    let mut retained = Vec::new();
+    let Some(pool_max_size) =
+        parse_storage_option(&storage, POOL_MAX_SIZE, POOL_MAX_SIZE_EXPECTED, |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
+        })?
+    else {
+        return Ok(DEFAULT_POOL_MAX_SIZE);
+    };
+
+    // tokio-postgres rejects an option that it does not read, so this option
+    // must go before it parses the URL.
+    let Some((base, query)) = config.split_once('?') else {
+        return Ok(pool_max_size);
+    };
 
     // The retained options keep their bytes, instead of going through
     // `Url::query_pairs_mut`, because that writes a space as `+`, and
     // tokio-postgres reads a `+` as itself.
-    for option in query.split('&') {
-        match form_urlencoded::parse(option.as_bytes()).next() {
-            Some((key, given)) if key == POOL_MAX_SIZE => value = Some(given.into_owned()),
-            _ => retained.push(option),
-        }
-    }
-
-    let Some(value) = value else {
-        return Ok(DEFAULT_POOL_MAX_SIZE);
-    };
-
-    let pool_max_size = value
-        .parse()
-        .ok()
-        .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
-        .ok_or_else(|| Error::InvalidStorageOptionValue {
-            scheme: "postgres".into(),
-            option: POOL_MAX_SIZE.into(),
-            value: value.clone(),
-        })?;
+    let retained = query
+        .split('&')
+        .filter(|option| {
+            form_urlencoded::parse(option.as_bytes())
+                .next()
+                .is_none_or(|(key, _)| key != POOL_MAX_SIZE)
+        })
+        .collect::<Vec<_>>();
 
     *config = if retained.is_empty() {
         base.to_owned()
@@ -5648,11 +5654,30 @@ mod tests {
 
             assert_matches!(
                 &error,
-                Error::InvalidStorageOptionValue { scheme, option, value: rejected }
-                    if scheme == "postgres" && option == POOL_MAX_SIZE && rejected == value,
+                Error::InvalidStorageOptionValue { scheme, option, value: rejected, expected }
+                    if scheme == "postgres"
+                        && option == POOL_MAX_SIZE
+                        && rejected == value
+                        && *expected == "a whole number from 2 to 262143",
                 "{value}"
             );
         }
+    }
+
+    /// An invalid `pool_max_size` stops the build wherever it is in the URL,
+    /// even when a later one is valid, as every storage option does.
+    #[test]
+    fn pool_max_size_rejects_an_invalid_earlier_occurrence() {
+        let error = Postgres::builder(&format!(
+            "{CONNECTION}?pool_max_size=banana&pool_max_size=4"
+        ))
+        .expect_err("an invalid pool_max_size must be rejected");
+
+        assert_matches!(
+            &error,
+            Error::InvalidStorageOptionValue { option, value, .. }
+                if option == POOL_MAX_SIZE && value == "banana"
+        );
     }
 
     /// [`take_pool_max_size`] removes every `pool_max_size` from the URL, and
