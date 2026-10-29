@@ -92,7 +92,7 @@ This README describes `main`, which can be ahead of the latest release. To read 
 To build and install Nisshi from [crates.io](https://crates.io/crates/nisshi), run:
 
 ```shell
-cargo install nisshi --locked --features dynostore,libsql,postgres
+cargo install nisshi --locked
 ```
 
 The build takes several minutes. It compiles some C libraries as well as the Rust code,
@@ -107,7 +107,7 @@ so it needs:
 `--locked` builds with the dependency versions in the release's `Cargo.lock`, instead of
 the newest compatible versions.
 
-The `--features` list adds the `memory://`, `s3://`, `gs://`, `sqlite://`, and `postgres://` storage engines.
+The default build includes the `memory://`, `s3://`, `gs://`, `sqlite://`, and `postgres://` storage engines.
 To add another storage engine or a data lake format, see [Storage options](#storage-options).
 
 To check the install, run `nisshi --help`. Its last lines list the storage engines in
@@ -205,8 +205,8 @@ Choose the engine with `--storage-engine` (or `STORAGE_ENGINE`) using the URL sc
 | Turso | `turso://` | `turso` | Experimental. |
 | SlateDB | `slatedb://` | `slatedb` | Deprecated. Not recommended for new deployments, because it allows a single writer. Only security fixes are accepted. The engine may be removed in a future release. Use PostgreSQL for production, or SQLite or in-memory for development. The broker logs a warning at startup. |
 
-A build contains only the storage engines whose features you enable. To add an engine, add its feature to the `--features` list, for example
-`--features dynostore,libsql,postgres,turso`. Apache Parquet, Apache Iceberg, and Delta Lake output for schema backed
+The default build enables the `dynostore`, `libsql`, and `postgres` features. To add an engine, add its feature to the `--features` list, for example
+`--features turso`. Apache Parquet, Apache Iceberg, and Delta Lake output for schema backed
 topics needs the `parquet`, `iceberg`, or `delta` feature.
 
 The engines differ in what they support. For example, only PostgreSQL and SQLite apply

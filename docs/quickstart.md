@@ -40,8 +40,8 @@ By default, other computers on your network can reach the broker on port 9092, a
 The broker prints its address and stays in the foreground. The following example shows the output. Press Ctrl-C to stop the broker.
 
 ```text
-nisshi broker 0.7.0
-listening on: tcp://127.0.0.1:9092 (advertised: tcp://127.0.0.1:9092)
+nisshi broker 0.8.0
+listener: tcp://127.0.0.1:9092 (advertised: tcp://127.0.0.1:9092)
 storage: memory://nisshi/ ["dynostore", "libsql", "postgres", "slatedb", "turso"]
 ready in 12ms
 ```
@@ -56,7 +56,7 @@ By default, the broker keeps topics and messages in memory, and loses them when 
 
 To start again with no data, stop the broker and delete `nisshi.db`, and the `nisshi.db-shm` and `nisshi.db-wal` files if they exist.
 
-If another program already uses port 9092, the broker stops with the error "Address already in use". To use a different port, set both the `--listener-url` and `--advertised-listener-url` options. For example, to use port 9093, run the following command:
+If another program already uses port 9092, the broker stops with an error that says the address is already in use. To use a different port, set both the `--listener-url` and `--advertised-listener-url` options. For example, to use port 9093, run the following command:
 
 ```shell
 ./bin/nisshi --listener-url tcp://127.0.0.1:9093 --advertised-listener-url tcp://127.0.0.1:9093
@@ -120,9 +120,9 @@ If there is no release for your operating system or architecture, for example Wi
 4. Run the following command:
 
    ```shell
-   cargo install nisshi --locked --features dynostore,libsql,postgres
+   cargo install nisshi --locked
    ```
 
-   The `--features` option adds the `memory://`, `s3://`, `gs://`, `sqlite://`, and `postgres://` storage engines. The build takes several minutes.
+   The build includes the `memory://`, `s3://`, `gs://`, `sqlite://`, and `postgres://` storage engines, and takes several minutes.
 
 The build installs the `nisshi` command on your `PATH`. In the other steps, run `nisshi` instead of `./bin/nisshi`.
