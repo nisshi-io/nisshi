@@ -131,26 +131,45 @@ impl StoredEpochs {
     /// producer ID that a transactional ID owns, so that a non-transactional batch cannot
     /// move a transactional producer's epoch.
     ///
-    /// Returns [`ProducerFenced`](ErrorCode::ProducerFenced) for:
-    /// - an epoch lower than the partition's. Kafka answers
-    ///   [`InvalidProducerEpoch`](ErrorCode::InvalidProducerEpoch).
-    /// - a transactional producer's epoch other than its newest.
-    /// - an epoch that [`epoch_is_exhausted`], because `i16::MAX` stays free to fence a
-    ///   retired producer ID. Kafka's partition state accepts it.
+    /// Returns [`InvalidProducerEpoch`](ErrorCode::InvalidProducerEpoch) for:
+    /// - an epoch lower than the partition's, as Kafka answers for a client's batch
+    ///   ([ProducerAppendInfo.java]).
+    /// - a transactional producer's epoch other than its newest. Kafka's coordinator answers
+    ///   PRODUCER_FENCED for that epoch, and the broker answers the Produce request with
+    ///   INVALID_PRODUCER_EPOCH instead ([AddPartitionsToTxnManager.scala]).
+    /// - an epoch that [`epoch_is_exhausted`]. Kafka's partition state accepts it, and we
+    ///   refuse it because `i16::MAX` stays free to fence a retired producer ID. The Java
+    ///   client bumps its epoch after this error, and at `i16::MAX` it asks for a new
+    ///   producer ID ([TransactionManager.java]).
+    ///
+    /// Returns [`ProducerFenced`](ErrorCode::ProducerFenced) for a batch from a producer ID
+    /// whose newest epoch is `i16::MAX`, because that epoch retires the producer ID.
+    ///
+    /// The Java client treats PRODUCER_FENCED as fatal. It answers INVALID_PRODUCER_EPOCH on
+    /// an idempotent producer by bumping its epoch, so these errors let it recover.
     ///
     /// [KIP-360]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-360%3A+Improve+reliability+of+idempotent%2Ftransactional+producer
     /// [ProducerAppendInfo.java]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+    /// [AddPartitionsToTxnManager.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AddPartitionsToTxnManager.scala#L225-L228
+    /// [TransactionManager.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java#L535-L542
     /// [RecordAccumulator.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L920-L935
     pub fn check_batch(
         &self,
         producer_epoch: i16,
         base_sequence: i32,
     ) -> Result<ProduceEpoch, ErrorCode> {
+        // Only a zombie producer sends from a retired producer ID, so the broker answers
+        // PRODUCER_FENCED, which the client treats as fatal. INVALID_PRODUCER_EPOCH makes
+        // the client bump its epoch and send again.
+        if self.newest == i16::MAX {
+            return Err(ErrorCode::ProducerFenced);
+        }
+
         if self.transactional {
             return if producer_epoch == self.newest {
                 Ok(ProduceEpoch::Continue)
             } else {
-                Err(ErrorCode::ProducerFenced)
+                Err(ErrorCode::InvalidProducerEpoch)
             };
         }
 
@@ -159,9 +178,9 @@ impl StoredEpochs {
             .map(|partition| producer_epoch.cmp(&partition))
         {
             Some(Ordering::Equal) => Ok(ProduceEpoch::Continue),
-            Some(Ordering::Less) => Err(ErrorCode::ProducerFenced),
+            Some(Ordering::Less) => Err(ErrorCode::InvalidProducerEpoch),
             Some(Ordering::Greater) | None if epoch_is_exhausted(producer_epoch) => {
-                Err(ErrorCode::ProducerFenced)
+                Err(ErrorCode::InvalidProducerEpoch)
             }
             Some(Ordering::Greater) | None if base_sequence != 0 => {
                 Err(ErrorCode::OutOfOrderSequenceNumber)
@@ -250,8 +269,11 @@ mod tests {
     }
 
     #[test]
-    fn idempotent_below_partition_epoch_is_fenced() {
-        assert_eq!(Err(ErrorCode::ProducerFenced), IDEMPOTENT.check_batch(2, 0));
+    fn idempotent_below_partition_epoch_is_invalid() {
+        assert_eq!(
+            Err(ErrorCode::InvalidProducerEpoch),
+            IDEMPOTENT.check_batch(2, 0)
+        );
     }
 
     #[test]
@@ -270,13 +292,13 @@ mod tests {
     }
 
     #[test]
-    fn idempotent_bump_into_exhausted_epoch_is_fenced() {
+    fn idempotent_bump_into_exhausted_epoch_is_invalid() {
         assert_eq!(
-            Err(ErrorCode::ProducerFenced),
+            Err(ErrorCode::InvalidProducerEpoch),
             IDEMPOTENT.check_batch(32766, 0)
         );
         assert_eq!(
-            Err(ErrorCode::ProducerFenced),
+            Err(ErrorCode::InvalidProducerEpoch),
             IDEMPOTENT.check_batch(i16::MAX, 0)
         );
     }
@@ -298,14 +320,32 @@ mod tests {
     }
 
     #[test]
-    fn transactional_continues_newest_epoch_only() {
-        assert_eq!(Ok(ProduceEpoch::Continue), TRANSACTIONAL.check_batch(3, 7));
+    fn retired_producer_id_is_fenced() {
+        let retired = StoredEpochs {
+            newest: i16::MAX,
+            partition: Some(32766),
+            ..TRANSACTIONAL
+        };
+
         assert_eq!(
             Err(ErrorCode::ProducerFenced),
-            TRANSACTIONAL.check_batch(2, 0)
+            retired.check_batch(32766, 1)
         );
         assert_eq!(
             Err(ErrorCode::ProducerFenced),
+            retired.check_batch(i16::MAX, 0)
+        );
+    }
+
+    #[test]
+    fn transactional_continues_newest_epoch_only() {
+        assert_eq!(Ok(ProduceEpoch::Continue), TRANSACTIONAL.check_batch(3, 7));
+        assert_eq!(
+            Err(ErrorCode::InvalidProducerEpoch),
+            TRANSACTIONAL.check_batch(2, 0)
+        );
+        assert_eq!(
+            Err(ErrorCode::InvalidProducerEpoch),
             TRANSACTIONAL.check_batch(4, 0)
         );
 
@@ -314,6 +354,9 @@ mod tests {
             ..TRANSACTIONAL
         };
         assert_eq!(Ok(ProduceEpoch::Continue), unwritten.check_batch(3, 0));
-        assert_eq!(Err(ErrorCode::ProducerFenced), unwritten.check_batch(4, 0));
+        assert_eq!(
+            Err(ErrorCode::InvalidProducerEpoch),
+            unwritten.check_batch(4, 0)
+        );
     }
 }
