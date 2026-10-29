@@ -4369,10 +4369,10 @@ impl Storage for Delegate {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                // The engine answers a group whose read fails with an error code, as Apache
-                // Kafka's [`GroupCoordinatorService`] does, instead of failing the request,
-                // because the broker closes the client's connection on a failed request and sends
-                // no response. Kafka clients retry `COORDINATOR_NOT_AVAILABLE`.
+                // The engine answers a group whose read fails with an error code, as Apache Kafka's
+                // [`GroupCoordinatorService`] does, instead of failing the request, because the
+                // broker closes the client's connection on a failed request and sends no response.
+                // Kafka clients retry `COORDINATOR_NOT_AVAILABLE`.
                 //
                 // [`GroupCoordinatorService`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1184
                 let Ok(c) = &c else {
@@ -4392,10 +4392,9 @@ impl Storage for Delegate {
                     .inspect_err(|err| error!(?err, group_id))
                 {
                     Ok(Some(row)) => {
-                        // A group row with no detail row (e.g. a group that only ever
-                        // committed offsets, never a JoinGroup) joins to a NULL
-                        // `detail` column here: that group exists and is empty, not
-                        // an error.
+                        // A group row with no detail row (e.g. a group that only ever committed
+                        // offsets, never a JoinGroup) joins to a NULL `detail` column here: that
+                        // group exists and is empty, not an error.
                         let stored = row
                             .get::<Option<String>>(1)
                             .map_err(Error::from)
@@ -7113,8 +7112,8 @@ mod tests {
         Ok(())
     }
 
-    /// Returns an engine on `db_file` with the groups `healthy` and `undecodable` stored, each
-    /// with the returned detail, and a connection to the same file, separate from the engine's own.
+    /// Returns an engine on `db_file` with the groups `healthy` and `undecodable` stored, each with
+    /// the returned detail, and a connection to the same file, separate from the engine's own.
     async fn engine_with_stored_groups(
         db_file: &'static str,
         cluster: &str,
@@ -7205,8 +7204,7 @@ mod tests {
         let cluster = "nisshi";
         let (engine, connection, stored) = engine_with_stored_groups(db_file, cluster).await?;
 
-        // `42` is valid JSON, so the database accepts it, but it doesn't decode to a
-        // `GroupDetail`.
+        // `42` is valid JSON, so the database accepts it, but it doesn't decode to a `GroupDetail`.
         let changed = connection
             .execute(
                 "update consumer_group_detail set detail = '42'
