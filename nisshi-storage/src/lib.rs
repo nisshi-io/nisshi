@@ -210,6 +210,7 @@ pub mod message_timestamp_type;
 mod producer;
 mod proxy;
 mod service;
+mod topic_creation;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
@@ -218,6 +219,7 @@ pub use latency::LatencyIntroducingStorage;
 pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
+pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
