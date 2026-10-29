@@ -10150,7 +10150,10 @@ mod tests {
             "one read must stop at the row limit, whatever its budget",
         );
 
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         Ok(())
     }

@@ -443,7 +443,7 @@ pub enum Error {
         option: String,
     },
 
-    /// A storage URL gave a query option that scheme's engine reads a value
+    /// A storage URL set an option that the scheme's engine reads to a value
     /// that the engine rejects, such as a number out of range.
     InvalidStorageOptionValue {
         scheme: String,
