@@ -2339,13 +2339,19 @@ impl Postgres {
         let topition_id = row.try_get::<_, i32>(0).inspect_err(|err| error!(?err))?;
         debug!(topition_id);
 
+        let watermarks = self.watermark_select_for_write(topition, tx).await?;
+
+        // The batch's producer epoch and sequence are checked under the partition's watermark
+        // lock, which every produce to the partition holds until it commits, as Kafka checks
+        // them under the partition's log lock. The check then sees every batch stored before
+        // this one. Checked before the lock, a retry of a batch still in flight passed and was
+        // stored a second time, and so did a batch at an older epoch than one stored meanwhile.
         if deflated.is_idempotent() {
             self.idempotent_message_check(transaction_id, topition, &deflated, tx)
                 .await
                 .inspect_err(|err| error!(?err))?;
         }
 
-        let watermarks = self.watermark_select_for_write(topition, tx).await?;
         let limit =
             max_message_bytes::limit(topition.topic(), watermarks.max_message_bytes.as_deref());
         max_message_bytes::ensure_batch_fits(&deflated, limit)?;
@@ -3819,7 +3825,17 @@ impl Storage for Postgres {
 
         let mut c = self.connection().await?;
 
-        let tx = c.transaction().await?;
+        // This transaction is READ COMMITTED, regardless of the server's default isolation level.
+        // `produce_in_tx` checks an idempotent batch after it waits for the partition's watermark
+        // lock, and the check must see the batch that the lock's previous holder committed during
+        // the wait. Each statement of a READ COMMITTED transaction sees every commit made before
+        // the statement started. A REPEATABLE READ transaction sees only the commits made before
+        // its first statement, which ran before the wait.
+        let tx = c
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
 
         let high = self
             .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)

@@ -70,6 +70,8 @@ pub mod produce_crc;
 pub mod produce_fetch;
 pub mod produce_idempotent_duplicate;
 pub mod produce_idempotent_epoch_bump;
+#[cfg(feature = "postgres")]
+pub mod produce_idempotent_race;
 pub mod produce_invalid_acks;
 pub mod produce_invalid_record;
 pub mod produce_max_message_bytes;
