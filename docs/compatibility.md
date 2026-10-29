@@ -50,7 +50,7 @@ client that reads the ApiVersions response first does not send such a request.
 | Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with `--num-partitions` partitions (default 1), if the client allows automatic topic creation and `--auto-create-topics-enable` is `true` (the default). If the missing topics of one request would need more than 10,000 partitions in total, the broker creates none of them, as Kafka does. Metadata does not list `__consumer_offsets`, because the broker keeps committed offsets in its storage engine, not in a topic. |
 | CreateTopics | 19 | 0-7 | Yes | Yes | Yes | Yes | A topic with `num_partitions` of -1 gets `--num-partitions` partitions (default 1). |
 | DeleteTopics | 20 | 0-6 | Yes | Yes | Yes | Yes | |
-| DescribeConfigs | 32 | 0-4 | Partial | Partial | Partial | Partial | Lists only the configs set on a topic, not the defaults. Describing a broker, for example with `kafka-configs --describe --entity-type brokers`, returns an empty list. |
+| DescribeConfigs | 32 | 0-4 | Partial | Partial | Partial | Partial | Lists every Kafka 3.9.1 topic config: each config set on the topic, and Kafka's default for each other config, as [Topic configuration](#topic-configuration) describes. The list does not include synonyms. Describing a broker, for example with `kafka-configs --describe --entity-type brokers`, returns an empty list. |
 | AlterConfigs | 33 | – | No | No | No | No | Use IncrementalAlterConfigs. |
 | CreatePartitions | 37 | – | No | No | No | No | You cannot add partitions to an existing topic. |
 | IncrementalAlterConfigs | 44 | 0-1 | Partial | Partial | Partial | Partial | Changes topic configs, including APPEND and SUBTRACT on list configs. The broker accepts a change to a broker config, for example with `kafka-configs --alter --entity-type brokers`, and ignores it. |
@@ -140,7 +140,11 @@ LeaderAndIsr, Vote and BrokerRegistration.
 ## Topic configuration
 
 The broker stores every topic config that a client sets, and returns it with DescribeConfigs.
-The broker applies only the configs that this table marks Yes. The broker applies
+For each Kafka topic config that a topic does not set, DescribeConfigs returns Kafka 3.9.1's
+default, such as `retention.ms=604800000`, as `kafka-configs --describe --all` shows.
+The broker applies only the configs that this table marks Yes. A default that DescribeConfigs
+lists for a config marked No is Kafka's value, not what the broker does: an in-memory topic lists
+`retention.ms=604800000`, and keeps every record. The broker applies
 `cleanup.policy`, `retention.ms` and `retention.bytes` in a maintenance run, every 10 minutes by
 default. The `maintenance_interval` option on the storage engine URL changes the interval.
 
