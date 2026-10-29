@@ -74,6 +74,7 @@ To learn more about Nisshi, see the full documentation at [docs.nisshi.io](https
   - [proxy](#proxy)
 - [Securing and monitoring](#securing-and-monitoring-a-broker)
 - [Compatibility](#compatibility)
+- [Getting help and feedback](#getting-help-and-feedback)
 
 ## Which release to use
 
@@ -838,9 +839,14 @@ behaves differently.
 
 Transactions are not supported: a producer that calls `initTransactions()`, including Kafka Streams with `exactly_once_v2`, fails with `TransactionalIdAuthorizationException`. Idempotent producers work.
 
-## Feedback
+## Getting help and feedback
 
-Please [raise an issue][nisshi-issues] if you encounter a problem.
+- Have a question, or want to discuss how to use Nisshi? Ask on the
+  [Solace Community forum][nisshi-community].
+- Found a bug or a client that misbehaves? Please [raise an issue][nisshi-issues].
+- To report a security vulnerability, see [SECURITY][nisshi-security] instead.
+
+See [SUPPORT](SUPPORT.md) for where each kind of request goes.
 
 ## Contributing
 
