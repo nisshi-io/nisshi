@@ -64,6 +64,9 @@ Nisshi does not implement them, because the storage engine holds all the state.
 
 ### Consumer groups
 
+[Consumer groups and offsets](consumer-groups.md) explains how groups and committed offsets work,
+with an example and the limits of this build.
+
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
 | OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | Answers OFFSET_METADATA_TOO_LARGE for a partition whose metadata is longer than 4096 characters, the default of Kafka's `offset.metadata.max.bytes`. Nisshi does not make the limit configurable. |
