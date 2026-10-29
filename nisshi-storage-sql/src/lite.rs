@@ -67,7 +67,8 @@ use nisshi_storage::{
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, bounded_channel, check_claim,
     config::{self, apply_op},
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
+    producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -2425,9 +2426,84 @@ impl FromStr for CommunicationMode {
     }
 }
 
+const BUSY_TIMEOUT: &str = "busy_timeout";
+const COMPACTION: &str = "compaction";
+const MODE: &str = "mode";
+
+/// What `busy_timeout` takes. Every example here must parse (see the tests).
+const BUSY_TIMEOUT_HINT: &str = "a duration, such as 5s or 500ms";
+
+/// What `compaction` takes. Every value here must parse (see the tests).
+const COMPACTION_HINT: &str = "single or multi";
+
+/// What `mode` takes. Every value here must parse (see the tests).
+const MODE_HINT: &str = "semaphore, mpsc or direct";
+
+/// The storage URL options of the SQLite engine that take a parsed value. An option
+/// that the URL doesn't give takes its default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiteOptions {
+    busy_timeout: Duration,
+    compaction: CompactionMode,
+    mode: CommunicationMode,
+}
+
+impl Default for LiteOptions {
+    fn default() -> Self {
+        Self {
+            busy_timeout: Duration::from_secs(5),
+            compaction: CompactionMode::default(),
+            mode: CommunicationMode::default(),
+        }
+    }
+}
+
+impl LiteOptions {
+    /// Reads the options from `storage`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidStorageOptionValue`] when an option's value doesn't parse.
+    fn parse(storage: &Url) -> Result<Self> {
+        let defaults = Self::default();
+
+        Ok(Self {
+            busy_timeout: parse_storage_option(
+                storage,
+                BUSY_TIMEOUT,
+                BUSY_TIMEOUT_HINT,
+                |value| {
+                    human_units::Duration::from_str(value)
+                        .ok()
+                        .map(|duration| duration.0)
+                },
+            )?
+            .unwrap_or(defaults.busy_timeout),
+
+            compaction: parse_storage_option(storage, COMPACTION, COMPACTION_HINT, |value| {
+                CompactionMode::from_str(value).ok()
+            })?
+            .unwrap_or(defaults.compaction),
+
+            mode: parse_storage_option(storage, MODE, MODE_HINT, |value| {
+                CommunicationMode::from_str(value).ok()
+            })?
+            .unwrap_or(defaults.mode),
+        })
+    }
+}
+
 impl Builder<String, i32, Url, Url> {
     pub(crate) async fn build(self) -> Result<ArcDynStorage> {
         debug!(domain = self.storage.domain(), path = self.storage.path());
+
+        // Read the options before the database file is opened, so that a value that
+        // doesn't parse stops startup before the file is created.
+        let LiteOptions {
+            busy_timeout,
+            compaction,
+            mode,
+        } = LiteOptions::parse(&self.storage)?;
 
         let path = env::current_dir()
             .inspect(|current_dir| debug!(?current_dir))
@@ -2443,35 +2519,6 @@ impl Builder<String, i32, Url, Url> {
             }
         });
 
-        let busy_timeout = self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "busy_timeout" {
-                    human_units::Duration::from_str(v.as_ref())
-                        .map(|duration| duration.0)
-                        .inspect_err(
-                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
-                        )
-                        .ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(Duration::from_secs(5));
-
-        let compaction = self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "compaction" {
-                    CompactionMode::from_str(v.as_ref()).ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
         let db = libsql::Builder::new_local(path).build().await?;
 
         ensure_schema(&db, busy_timeout)
@@ -2482,18 +2529,7 @@ impl Builder<String, i32, Url, Url> {
                 source: Arc::new(source),
             })?;
 
-        match self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "mode" {
-                    CommunicationMode::from_str(v.as_ref()).ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default()
-        {
+        match mode {
             CommunicationMode::Mpsc => {
                 let (sender, receiver) = bounded_channel(1);
                 let mut server = JoinSet::new();
@@ -5467,6 +5503,9 @@ impl TryFrom<Value> for LiteTimestamp {
         }
     }
 }
+
+#[cfg(test)]
+mod options_tests;
 
 #[cfg(test)]
 mod tests {

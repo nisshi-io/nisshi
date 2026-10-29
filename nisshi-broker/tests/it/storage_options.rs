@@ -57,6 +57,20 @@ fn is_unrecognized(error: &Error, expected_scheme: &str, expected_option: &str) 
     )
 }
 
+fn is_invalid_value(
+    error: &Error,
+    expected_scheme: &str,
+    expected_option: &str,
+    expected_value: &str,
+) -> bool {
+    matches!(
+        error,
+        Error::Storage(nisshi_storage::Error::InvalidStorageOptionValue {
+            scheme, option, value, ..
+        }) if scheme == expected_scheme && option == expected_option && value == expected_value
+    )
+}
+
 #[tokio::test]
 async fn memory_accepts_interval_options() -> Result<()> {
     let _guard = init_tracing()?;
@@ -137,6 +151,27 @@ mod sqlite {
             is_unrecognized(&error, "sqlite", "vacuum_onto"),
             "{error:?}"
         );
+
+        Ok(())
+    }
+
+    /// A value that the engine can't parse stops startup instead of the engine
+    /// running with the default.
+    #[tokio::test]
+    async fn rejects_unparsable_engine_options() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        for (option, value) in [
+            ("busy_timeout", "banana"),
+            ("compaction", "Single"),
+            ("mode", "Direct"),
+        ] {
+            let error = build(&url(&format!("{option}={value}"))).await.unwrap_err();
+            assert!(
+                is_invalid_value(&error, "sqlite", option, value),
+                "{option}={value}: {error:?}"
+            );
+        }
 
         Ok(())
     }
