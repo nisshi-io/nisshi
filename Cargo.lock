@@ -5847,6 +5847,7 @@ dependencies = [
  "nisshi-storage",
  "nisshi-topic",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

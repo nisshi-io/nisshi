@@ -96,6 +96,34 @@ pub(super) enum ValidatedTopic {
     Rejected(CreatableTopicResult),
 }
 
+impl ValidatedTopic {
+    /// Returns the topic's name, as the request gives it.
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Valid(topic) => &topic.name,
+            Self::Rejected(result) => &result.name,
+        }
+    }
+
+    /// Builds the [`CreatableTopicResult`] that answers this topic with `error_code`.
+    pub(super) fn error_result(&self, error_code: ErrorCode) -> CreatableTopicResult {
+        match self {
+            Self::Valid(topic) => error_result(
+                topic.name.clone(),
+                Some(topic.num_partitions),
+                Some(topic.replication_factor),
+                error_code,
+            ),
+            Self::Rejected(result) => error_result(
+                result.name.clone(),
+                result.num_partitions,
+                result.replication_factor,
+                error_code,
+            ),
+        }
+    }
+}
+
 /// A [`CreateTopicsRequest`] whose topics have each been validated.
 ///
 /// [`CreateTopicsService`](super::CreateTopicsService) takes this instead of a

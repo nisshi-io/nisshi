@@ -278,13 +278,11 @@ impl Engine {
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
         debug!(sql, ?error);
 
-        let _attributes = [
+        vec![
             KeyValue::new("sql", sql.to_owned()),
             KeyValue::new("cluster_id", self.cluster.clone()),
-        ];
-
-        debug!(?error);
-        todo!();
+            KeyValue::new("kind", error_kind(error)),
+        ]
     }
 
     async fn prepare_execute<P>(
@@ -1237,22 +1235,42 @@ fn epoch_value(row: &Row, index: usize) -> Result<i16> {
     integer_value(row, index).and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
 }
 
+/// Returns a mapper that turns a unique constraint failure into [`Error::Api`] with
+/// `error_code`, and passes any other error through.
+///
+/// turso reports a unique or primary key failure as [`turso::Error::Constraint`] with a
+/// message, and does not give its SQLite extended result code, so the mapper matches the
+/// message's prefix.
 fn unique_constraint(error_code: ErrorCode) -> impl Fn(turso::Error) -> Error {
-    let _ = error_code;
-    move |err| {
-        let _ = err;
-        todo!()
-        // if let turso::Error::SqliteFailure(code, ref reason) = err {
-        //     debug!(code, reason);
+    move |err| match err {
+        turso::Error::Constraint(ref reason) if reason.starts_with("UNIQUE constraint failed") => {
+            debug!(reason);
+            Error::Api(error_code)
+        }
 
-        //     if code == 2067 {
-        //         Error::Api(error_code)
-        //     } else {
-        //         err.into()
-        //     }
-        // } else {
-        //     err.into()
-        // }
+        otherwise => otherwise.into(),
+    }
+}
+
+/// Returns the name of `error`'s variant, as the `kind` attribute of the SQL error metric.
+fn error_kind(error: &turso::Error) -> &'static str {
+    match error {
+        turso::Error::ToSqlConversionFailure(_) => "to_sql_conversion_failure",
+        turso::Error::QueryReturnedNoRows => "query_returned_no_rows",
+        turso::Error::ConversionFailure(_) => "conversion_failure",
+        turso::Error::Busy(_) => "busy",
+        turso::Error::BusySnapshot(_) => "busy_snapshot",
+        turso::Error::Interrupt(_) => "interrupt",
+        turso::Error::Error(_) => "error",
+        turso::Error::Misuse(_) => "misuse",
+        turso::Error::Constraint(_) => "constraint",
+        turso::Error::Readonly(_) => "readonly",
+        turso::Error::DatabaseFull(_) => "database_full",
+        turso::Error::NotAdb(_) => "not_a_db",
+        turso::Error::Corrupt(_) => "corrupt",
+        turso::Error::IoError(..) => "io_error",
+        turso::Error::BatchStatementFailed { .. } => "batch_statement_failed",
+        turso::Error::BatchRollbackFailed { .. } => "batch_rollback_failed",
     }
 }
 
@@ -4090,7 +4108,7 @@ impl From<LiteTimestamp> for SystemTime {
 
 impl From<LiteTimestamp> for Value {
     fn from(value: LiteTimestamp) -> Self {
-        todo!("{value:?}")
+        Value::Integer(to_timestamp(&value.0).unwrap_or_default())
     }
 }
 
@@ -4110,20 +4128,90 @@ impl TryFrom<Value> for LiteTimestamp {
                 .map(LiteTimestamp::from)
                 .map_err(Into::into),
 
-            Value::Real(_) => unimplemented!("{value:?}"),
-            Value::Null => unimplemented!("{value:?}"),
-            Value::Blob(_) => unimplemented!("{value:?}"),
+            Value::Real(_) | Value::Null | Value::Blob(_) => Err(Error::UnexpectedValue(value)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use tempfile::{TempDir, tempdir, tempdir_in};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+
+    #[test]
+    fn timestamp_from_null_is_an_error() {
+        assert_matches!(
+            LiteTimestamp::try_from(Value::Null),
+            Err(Error::UnexpectedValue(Value::Null))
+        );
+    }
+
+    #[test]
+    fn timestamp_round_trips_through_a_value() -> Result<()> {
+        let timestamp = LiteTimestamp::from(SystemTime::UNIX_EPOCH + Duration::from_millis(1_234));
+
+        assert_eq!(timestamp, LiteTimestamp::try_from(Value::from(timestamp))?);
+
+        Ok(())
+    }
+
+    /// A unique constraint failure becomes the given error code, and any other constraint
+    /// failure stays a turso error.
+    #[tokio::test]
+    async fn unique_constraint_answers_its_error_code() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        _ = connection
+            .execute(
+                "create table xyz (
+                    cluster text not null,
+                    name text not null,
+                    unique (cluster, name)
+                )",
+                (),
+            )
+            .await?;
+
+        let insert = "insert into xyz (cluster, name) values (?1, ?2) returning name";
+
+        assert!(insert_returning(&connection, insert, ("nisshi", "abc")).await?);
+
+        assert_matches!(
+            insert_returning(&connection, insert, ("nisshi", "abc"))
+                .await
+                .map_err(unique_constraint(ErrorCode::TopicAlreadyExists)),
+            Err(Error::Api(ErrorCode::TopicAlreadyExists))
+        );
+
+        assert_matches!(
+            insert_returning(&connection, insert, ("nisshi", Value::Null))
+                .await
+                .map_err(unique_constraint(ErrorCode::TopicAlreadyExists)),
+            Err(Error::Turso(_))
+        );
+
+        Ok(())
+    }
+
+    /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the
+    /// first row. Returns whether it returned a row.
+    async fn insert_returning(
+        connection: &Connection,
+        sql: &str,
+        params: impl IntoParams,
+    ) -> result::Result<bool, turso::Error> {
+        let mut statement = connection.prepare(sql).await?;
+        let mut rows = statement.query(params).await?;
+        Ok(rows.next().await?.is_some())
+    }
 
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};

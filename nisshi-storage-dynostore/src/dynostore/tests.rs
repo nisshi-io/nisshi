@@ -33,6 +33,8 @@ mod init_producer;
 mod latency;
 mod list_groups;
 mod list_offsets;
+mod metadata_read_error;
+mod offset_commit_unknown_partition;
 mod ping;
 mod post_write_failure_reason;
 mod produce_topic_guard;

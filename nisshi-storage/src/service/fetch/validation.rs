@@ -129,6 +129,12 @@ impl TryFrom<FetchRequest> for ValidatedFetchRequest {
                 topics: topics.clone(),
             })?;
 
+        // Kafka waits for at most `max_bytes`, so that a round that fills
+        // `max_bytes` ends the wait ([KafkaApis.scala#L1043-L1044]).
+        //
+        // [KafkaApis.scala#L1043-L1044]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1043-L1044
+        let min_bytes = min_bytes.min(max_bytes);
+
         Ok(Self {
             isolation_level,
             max_wait,
@@ -298,6 +304,30 @@ mod tests {
 
         assert_eq!(Some(ErrorCode::None.into()), response.error_code);
         assert_eq!(1, inner.calls.load(std::sync::atomic::Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// `min_bytes` above `max_bytes` waits for no more than `max_bytes`, as
+    /// Kafka caps it, so that a round that fills `max_bytes` ends the wait.
+    #[test]
+    fn min_bytes_is_capped_at_max_bytes() -> Result<()> {
+        for (min_bytes, max_bytes, expected) in [
+            (i32::MAX, Some(1024), 1024),
+            (i32::MAX, None, super::DEFAULT_MAX_BYTES),
+            (100, Some(1024), 100),
+        ] {
+            let validated = super::ValidatedFetchRequest::try_from(
+                FetchRequest::default()
+                    .isolation_level(Some(0))
+                    .min_bytes(min_bytes)
+                    .max_bytes(max_bytes)
+                    .topics(Some([].into())),
+            )
+            .expect("a well-formed request");
+
+            assert_eq!(expected, validated.min_bytes, "{min_bytes}, {max_bytes:?}");
+        }
 
         Ok(())
     }
