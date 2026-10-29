@@ -29,6 +29,7 @@ use crate::{Error, Result, coordinator::group::Coordinator};
 pub mod auth;
 pub mod coordinator;
 pub mod storage;
+pub mod txn_offset_commit;
 
 type TcpRouteFrame =
     TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<Error>>>>;
@@ -47,11 +48,12 @@ where
 {
     storage::services(
         FrameRouteService::<Error>::builder(),
-        storage,
+        storage.clone(),
         topic_creation,
         auto_create_refusals,
     )
     .inspect(|builder| debug!(?builder))
+    .and_then(|builder| txn_offset_commit::txn_offset_commit(builder, coordinator.clone(), storage))
     .and_then(|builder| {
         coordinator::services(builder, coordinator).inspect(|builder| debug!(?builder))
     })

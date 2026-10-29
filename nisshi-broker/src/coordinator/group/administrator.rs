@@ -1352,6 +1352,49 @@ where
         }
     }
 
+    #[instrument(skip(self))]
+    async fn txn_offset_commit_fence(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Option<ErrorCode>> {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "txn_offset_commit_fence")]);
+
+        let detail = OffsetCommit {
+            group_id,
+            generation_id_or_member_epoch: Some(generation_id),
+            member_id: Some(member_id),
+            group_instance_id,
+            retention_time_ms: None,
+            topics: None,
+        };
+
+        loop {
+            // As `offset_commit` does: against the group in storage, and a member's accepted
+            // commit refreshes its contact. The offsets are not stored here, so a lost write
+            // only means the fence is checked again.
+            let (original, version) = self.stored_group(group_id).await?;
+            let now = SystemTime::now();
+
+            let (wrapper, error_code) = original
+                .clone()
+                .settle(group_id, now)
+                .check_offset_commit(now, &detail);
+
+            let is_unchanged = wrapper == original && version.is_some();
+
+            if is_unchanged
+                || self
+                    .store_group(group_id, &wrapper, version, "txn_offset_commit_fence")
+                    .await?
+            {
+                return Ok(error_code);
+            }
+        }
+    }
+
     #[instrument(skip_all)]
     async fn offset_fetch(
         &self,

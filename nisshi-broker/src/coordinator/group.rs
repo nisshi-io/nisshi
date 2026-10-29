@@ -87,6 +87,17 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
 
     async fn offset_commit(&self, detail: OffsetCommit<'_>) -> Result<Body>;
 
+    /// Fences a transactional offset commit as an `OffsetCommit` is fenced: the member, its
+    /// generation and its group instance ID must match the group. Returns the error code that
+    /// refuses the commit, or `None` when it may go ahead. Stores no offsets.
+    async fn txn_offset_commit_fence(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Option<nisshi_sans_io::ErrorCode>>;
+
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,
