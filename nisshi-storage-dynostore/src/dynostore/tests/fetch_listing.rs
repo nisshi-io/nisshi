@@ -546,6 +546,44 @@ async fn fetch_below_the_first_batch_returns_from_the_first_batch() -> Result<()
     Ok(())
 }
 
+/// A gap in a listing in key order, such as one that a failed produce
+/// leaves, makes the fetch list the whole partition, and the fetch still
+/// returns the batches around the gap: the batch that holds the fetch
+/// offset, or the first batch after the gap for an offset inside it.
+#[tokio::test]
+async fn gap_in_an_in_order_listing_falls_back_to_a_full_listing() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("gap_in_an_in_order_listing_falls_back_to_a_full_listing").await?;
+    produce(&storage, &topition, 3, 10).await?;
+    produce(&storage, &topition, 1, 1).await?;
+
+    storage
+        .object_store
+        .delete(&batch_path(&storage.cluster, &topition, 10))
+        .await?;
+
+    listing.reset_counts();
+
+    assert_eq!(
+        vec![0, 20, 30],
+        fetch_base_offsets(&storage, &topition, 5, MAX_BYTES, MAX_WAIT).await?
+    );
+    assert!(listing.full_lists() > 0, "{}", listing.full_lists());
+
+    assert_eq!(
+        vec![0],
+        fetch_base_offsets(&storage, &topition, 5, 1, MAX_WAIT).await?
+    );
+    assert_eq!(
+        vec![20, 30],
+        fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, MAX_WAIT).await?
+    );
+
+    Ok(())
+}
+
 /// A fetch returns first the batch that holds the fetch offset, for offsets
 /// at each end of a batch and on each side of the edge of each listing's
 /// window below the fetch offset.
