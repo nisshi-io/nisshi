@@ -14,4 +14,5 @@ is at [docs.nisshi.io](https://docs.nisshi.io/).
 - [Compatibility and feature status](compatibility.md) — the Kafka APIs, storage engine features and Kafka clients that are supported
 - [Sarama](sarama.md) — using the Sarama console tools with Nisshi
 
-Upgrade notes for each release are in [CHANGELOG.md](../CHANGELOG.md).
+For how the code is organised, see [ARCHITECTURE.md](../ARCHITECTURE.md). Upgrade notes for each
+release are in [CHANGELOG.md](../CHANGELOG.md).

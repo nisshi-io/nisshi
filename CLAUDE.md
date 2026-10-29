@@ -57,6 +57,8 @@ Note: when running nisshi directly (not via docker compose), set `AWS_ENDPOINT="
 
 ## Architecture
 
+`ARCHITECTURE.md` is the overview for human contributors; this section keeps the details an agent needs. Update both when the architecture changes.
+
 Cargo workspace (members, including the `fuzz` harness, are listed in the root `Cargo.toml`), producing a single binary (`nisshi`) with subcommands: `broker` (default), `cat`, `topic`, `user`, `generator`, `perf`, `proxy`.
 
 ### Key Crates

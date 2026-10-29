@@ -47,7 +47,6 @@ The license stays Apache 2.0, and what is open stays open.
 
 Nisshi OSS is provided as-is, with no warranty and no Solace Support commitment. Ask questions in the [Solace community][nisshi-community]. Report security issues through [SECURITY][nisshi-security].
 
-
 ## Get Started
 
 > [!NOTE]
@@ -80,6 +79,7 @@ Nisshi is a single statically linked binary containing the following, described 
 - [Securing a broker](docs/security.md) — TLS, outbound TLS, and SASL SCRAM authentication
 - [Metrics](docs/metrics.md) — exporting metrics over OTLP
 - [Compatibility and feature status](docs/compatibility.md) — the Kafka APIs, storage engine features and Kafka clients that are supported
+- [Architecture](ARCHITECTURE.md) — how the crates fit together, for contributors
 - [CHANGELOG](CHANGELOG.md) — what changed in each release, and the upgrade notes
 
 ## Compatibility
