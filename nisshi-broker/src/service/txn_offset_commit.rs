@@ -26,7 +26,8 @@ use crate::{Error, Result, coordinator::group::Coordinator};
 
 /// Wraps the registered route of `TxnOffsetCommit`: the group coordinator fences the commit, then
 /// the storage's route commits it. [`crate::service::storage::txn_offset_commit`] registers that
-/// route.
+/// route, before this call: a route table without it, or one that registers it later, is not
+/// fenced.
 pub fn fence_txn_offset_commit<C>(
     builder: FrameRouteBuilder<Error>,
     coordinator: C,
@@ -34,11 +35,9 @@ pub fn fence_txn_offset_commit<C>(
 where
     C: Coordinator,
 {
-    builder
-        .wrap_route(TxnOffsetCommitRequest::KEY, |inner| {
-            TxnOffsetCommitFenceService { coordinator, inner }.boxed()
-        })
-        .map_err(Into::into)
+    Ok(builder.wrap_route(TxnOffsetCommitRequest::KEY, |inner| {
+        TxnOffsetCommitFenceService { coordinator, inner }.boxed()
+    }))
 }
 
 #[derive(Clone, Debug)]
