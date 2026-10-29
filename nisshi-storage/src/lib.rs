@@ -210,6 +210,7 @@ pub mod message_timestamp_type;
 mod producer;
 mod proxy;
 mod service;
+mod topic_creation;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
@@ -218,6 +219,7 @@ pub use latency::LatencyIntroducingStorage;
 pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
+pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
@@ -435,20 +437,26 @@ pub enum Error {
 
     UnknownCacheKey(String),
 
+    /// A storage URL gave an option that the engine reads, with a value that the
+    /// engine cannot parse.
+    InvalidStorageOptionValue {
+        scheme: String,
+        option: String,
+        value: String,
+
+        /// The values that the option takes, for example `"single or multi"`.
+        /// The engine that defines the option writes this hint, so a message
+        /// can tell the user what to give without knowing every engine's
+        /// options.
+        expected: &'static str,
+    },
+
     /// A storage URL named a query option that scheme's engine does not
     /// recognise (for example a typo, or an option that belongs to a
     /// different engine).
     UnrecognizedStorageOption {
         scheme: String,
         option: String,
-    },
-
-    /// A storage URL set an option that the scheme's engine reads to a value
-    /// that the engine rejects, such as a number out of range.
-    InvalidStorageOptionValue {
-        scheme: String,
-        option: String,
-        value: String,
     },
 
     /// The v4+ (multi-transaction) field shape of `AddPartitionsToTxn` is not implemented on
@@ -2679,6 +2687,42 @@ pub fn reject_unrecognized_options(storage: &Url, recognized: &[&str]) -> Result
         })
 }
 
+/// Returns the value of the query option `option` in `storage`, parsed with `parse`, or
+/// `None` when the URL doesn't give the option.
+///
+/// Every occurrence of the option must parse, and the last one is used, as the broker
+/// does for its own options. A [`StorageFactory::build`] calls this for each option that
+/// its engine reads, so a value that doesn't parse stops startup instead of being
+/// replaced by the default.
+///
+/// # Errors
+///
+/// [`Error::InvalidStorageOptionValue`], with `expected` as its hint, for the first
+/// occurrence whose value `parse` rejects.
+pub fn parse_storage_option<T>(
+    storage: &Url,
+    option: &str,
+    expected: &'static str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>> {
+    let mut parsed = None;
+
+    for (key, value) in storage.query_pairs() {
+        if key == option {
+            parsed = Some(
+                parse(&value).ok_or_else(|| Error::InvalidStorageOptionValue {
+                    scheme: storage.scheme().to_owned(),
+                    option: option.to_owned(),
+                    value: value.into_owned(),
+                    expected,
+                })?,
+            );
+        }
+    }
+
+    Ok(parsed)
+}
+
 impl<N, C, A, S> Builder<N, C, A, S> {
     pub fn node_id(self, node_id: i32) -> Builder<i32, C, A, S> {
         Builder {
@@ -3447,5 +3491,64 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn parse_mode(storage: &str) -> Result<Option<String>> {
+        parse_storage_option(&Url::parse(storage)?, "mode", "fast or slow", |value| {
+            ["fast", "slow"].contains(&value).then(|| value.to_owned())
+        })
+    }
+
+    #[test]
+    fn parse_storage_option_without_the_option_returns_none() -> Result<()> {
+        assert_eq!(None, parse_mode("sqlite://nisshi.db")?);
+        assert_eq!(None, parse_mode("sqlite://nisshi.db?other=fast")?);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_returns_the_parsed_value() -> Result<()> {
+        assert_eq!(
+            Some("fast".to_owned()),
+            parse_mode("sqlite://nisshi.db?mode=fast")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_uses_the_last_occurrence() -> Result<()> {
+        assert_eq!(
+            Some("slow".to_owned()),
+            parse_mode("sqlite://nisshi.db?mode=fast&mode=slow")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_names_the_scheme_option_value_and_hint() {
+        assert_matches!(
+            parse_mode("sqlite://nisshi.db?mode=Fast"),
+            Err(Error::InvalidStorageOptionValue { scheme, option, value, expected })
+                if scheme == "sqlite"
+                    && option == "mode"
+                    && value == "Fast"
+                    && expected == "fast or slow"
+        );
+    }
+
+    /// A value that doesn't parse is an error wherever it is, even when another
+    /// occurrence of the option parses.
+    #[test]
+    fn parse_storage_option_rejects_any_occurrence_that_does_not_parse() {
+        for storage in [
+            "sqlite://nisshi.db?mode=Fast&mode=slow",
+            "sqlite://nisshi.db?mode=slow&mode=Fast",
+        ] {
+            assert_matches!(
+                parse_mode(storage),
+                Err(Error::InvalidStorageOptionValue { value, .. }) if value == "Fast",
+                "{storage}"
+            );
+        }
     }
 }

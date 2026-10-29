@@ -598,12 +598,13 @@ customer-duckdb-delta: (duckdb "\"select * from delta_scan('s3://lake/nisshi.cus
 
 broker-memory profile="profiling": (build profile "dynostore") (nisshi-broker profile "--storage-engine=memory://" "--advertised-listener-url=tcp://127.0.0.1:9092/" "--silent")
 
-# run the librdkafka integration test suite against the given storage engine
+# run the librdkafka integration test suite against the given storage engine; some of its tests
+# rely on auto-created topics having more than one partition, so the broker uses 4
 compat-librdkafka storage="memory://" features="dynostore": clean-nisshi-db (build "dev" features)
     #!/usr/bin/env bash
     set -euo pipefail
     ./target/debug/nisshi broker --storage-engine={{ storage }} \
-        --advertised-listener-url=tcp://127.0.0.1:9092 &
+        --advertised-listener-url=tcp://127.0.0.1:9092 --num-partitions=4 &
     broker=$!
     trap 'kill ${broker}' EXIT
     BROKER_PID=${broker} ./compat/librdkafka/run.sh

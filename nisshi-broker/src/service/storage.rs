@@ -29,8 +29,8 @@ use nisshi_storage::{
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService,
+    ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService,
 };
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
@@ -39,6 +39,7 @@ use crate::Error;
 pub fn services<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
@@ -49,7 +50,6 @@ where
         alter_user_scram_credentials,
         consumer_group_describe,
         create_acls,
-        create_topics,
         delete_acls,
         delete_records,
         delete_topics,
@@ -64,7 +64,6 @@ where
         init_producer_id,
         list_offsets,
         list_partition_reassignments,
-        metadata,
         produce,
         end_txn,
         txn_offset_commit,
@@ -73,6 +72,8 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
+    .and_then(|builder| metadata(builder, storage.clone(), topic_creation))
+    .and_then(|builder| create_topics(builder, storage, topic_creation))
 }
 
 pub fn alter_user_scram_credentials<S>(
@@ -198,6 +199,7 @@ where
 pub fn create_topics<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage,
@@ -208,7 +210,7 @@ where
             (
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<CreateTopicsRequest>::new(),
-                CreateTopicsValidationLayer::new(),
+                CreateTopicsValidationLayer::new().num_partitions(topic_creation.num_partitions),
             )
                 .into_layer(CreateTopicsService { storage })
                 .boxed(),
@@ -432,9 +434,10 @@ where
 pub fn metadata<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage,
+    S: Storage + Clone,
 {
     builder
         .with_route(
@@ -443,7 +446,10 @@ where
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<MetadataRequest>::new(),
             )
-                .into_layer(MetadataService { storage })
+                .into_layer(MetadataService {
+                    storage,
+                    topic_creation,
+                })
                 .boxed(),
         )
         .map_err(Into::into)
