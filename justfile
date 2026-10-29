@@ -53,6 +53,8 @@ seed-target:
     # and cargo reuses only dependency artifacts.
     cargo clean --workspace --quiet --target-dir target/.seed
     mv target/.seed/debug target/debug
+    rm -rf target/.seed
+    echo "seed-target: seeded target/debug from $main/target/debug" >&2
 
 # The Apache Kafka tag that `just kafka-ref` checks out. It must stay the Kafka
 # version that the message descriptors in nisshi-sans-io/message/ come from.
@@ -96,8 +98,6 @@ kafka-ref:
         ln -s "$clone" kafka-ref
     fi
     echo "kafka-ref: kafka-ref/ is Apache Kafka $version" >&2
-    rm -rf target/.seed
-    echo "seed-target: seeded target/debug from $main/target/debug" >&2
 
 license:
     cargo about generate about.hbs > license.html
