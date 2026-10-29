@@ -85,8 +85,9 @@ Nisshi does not implement them, because the storage engine holds all the state.
 Nisshi supports the idempotent producer, and does not support transactions. The broker answers
 TRANSACTIONAL_ID_AUTHORIZATION_FAILED to an InitProducerId request with a `transactional.id`, so
 a transactional producer fails at `initTransactions()` with
-TransactionalIdAuthorizationException. The broker still advertises the other transaction APIs,
-but a client cannot start a transaction to use them.
+TransactionalIdAuthorizationException. A Kafka Streams application with `processing.guarantee`
+set to `exactly_once_v2` uses a transactional producer, so it fails the same way. The broker still
+advertises the other transaction APIs, but a client cannot start a transaction to use them.
 
 An idempotent producer can bump its own epoch after an error and restart its sequence at 0
 (KIP-360), and the broker keeps the epoch for each partition, as Kafka does. A batch at an epoch

@@ -836,8 +836,8 @@ broker now flushes pending metrics before exiting.
 
 Nisshi implements the Apache Kafka® wire protocol, generated from the Apache Kafka 3.9.1
 message descriptors in [`nisshi-sans-io/message`](nisshi-sans-io/message). Clients on
-Kafka 4.x negotiate down to those protocol versions. Idempotent producers work, and transactions
-are not supported.
+Kafka 4.x negotiate down to those protocol versions. Idempotent producers work. Transactions are
+not supported, so Kafka Streams with `exactly_once_v2` fails.
 
 For the details, see [Compatibility and feature status](docs/compatibility.md). It lists which
 Kafka APIs and topic configurations each storage engine supports, and the client versions CI tests
