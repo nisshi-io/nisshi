@@ -19,7 +19,7 @@
 ///
 /// `RowReader::new` finds each column's index by its name once, before the first row, and
 /// `RowReader::read_row` reads each row by those indexes through any
-/// [`DriverRow`](driver::DriverRow). Each field's type implements [`Column`](driver::Column).
+/// [`DriverRow`](driver::DriverRow). Each field's type implements [`FromColumn`](driver::FromColumn).
 /// A read error names the query and the column.
 macro_rules! sql_row {
     (
@@ -59,7 +59,7 @@ macro_rules! sql_row {
                 })
             }
 
-            /// Reads `row`, or returns [`Error::Column`](nisshi_storage::Error::Column) for the
+            /// Reads `row`, or returns [`Error::UnreadableColumn`](nisshi_storage::Error::UnreadableColumn) for the
             /// first column that the reader can't read as its field's type.
             pub(crate) fn read_row<R>(&self, row: &R) -> ::nisshi_storage::Result<Row>
             where
@@ -67,8 +67,11 @@ macro_rules! sql_row {
             {
                 Ok(Row {
                     $(
-                        $field: <$type as $crate::sql::driver::Column>::read(row, self.$field)
-                            .map_err(|source| ::nisshi_storage::Error::Column {
+                        $field: <$type as $crate::sql::driver::FromColumn>::from_column(
+                            row,
+                            self.$field,
+                        )
+                            .map_err(|source| ::nisshi_storage::Error::UnreadableColumn {
                                 query: self.query,
                                 column: stringify!($field),
                                 source: Box::new(source),

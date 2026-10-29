@@ -1635,7 +1635,7 @@ impl Postgres {
         debug!(transaction_id, ?deflated);
 
         let (columns, row) = self
-            .prepare_query_opt_row(
+            .prepare_query_optional_row(
                 tx,
                 producer_epochs_select::QUERY,
                 &[
@@ -1744,7 +1744,7 @@ impl Postgres {
         tx: &Transaction<'_>,
     ) -> Result<watermark_select_for_write::Row> {
         let (columns, row) = self
-            .prepare_query_opt_row(
+            .prepare_query_optional_row(
                 tx,
                 watermark_select_for_write::QUERY,
                 &[&self.cluster, &topition.topic(), &topition.partition()],
@@ -2062,7 +2062,7 @@ impl Postgres {
     /// its result's columns, or with `None` when the result has no rows. A result with more than
     /// one row is an error.
     #[instrument(skip(self, client, params))]
-    async fn prepare_query_opt_row<C>(
+    async fn prepare_query_optional_row<C>(
         &self,
         client: &C,
         query: &'static str,

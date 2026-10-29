@@ -15,23 +15,20 @@
 //! Reads a column's value from a row of each SQL driver: the only driver-specific code that a
 //! query module's `RowReader` uses.
 
-use nisshi_storage::Result;
+use nisshi_storage::{Error, Result};
 use serde_json::Value;
 
 /// A row of one SQL driver's result, read by column index.
 ///
-/// Each method except [`is_null`](Self::is_null) reads one kind of value that the queries store,
-/// and returns an error for a value of another type or a null. [`Column`] builds each Rust type
-/// that a query module declares on these methods.
+/// Each method reads one kind of value that the queries store, and returns `None` for a null and
+/// an error for a value of another kind. Each method reads the value from the row once.
+/// [`FromColumn`] reads each Rust type that a query module declares through these methods.
 pub(crate) trait DriverRow {
-    /// Returns whether the value at `index` is null.
-    fn is_null(&self, index: usize) -> Result<bool>;
-
     /// Returns the integer at `index`, widened to `i64`.
-    fn integer(&self, index: usize) -> Result<i64>;
+    fn integer(&self, index: usize) -> Result<Option<i64>>;
 
     /// Returns the text at `index`.
-    fn text(&self, index: usize) -> Result<String>;
+    fn text(&self, index: usize) -> Result<Option<String>>;
 
     /// Returns the JSON document at `index`, or the error from parsing it.
     ///
@@ -39,52 +36,69 @@ pub(crate) trait DriverRow {
     /// read error, so that the engine decides what an undecodable document does to the rest of
     /// the result. PostgreSQL rejects an invalid `json` value when it is stored, and
     /// tokio-postgres decodes the document itself, so a decode failure there is a read error.
-    fn json(&self, index: usize) -> Result<serde_json::Result<Value>>;
+    fn json(&self, index: usize) -> Result<Option<serde_json::Result<Value>>>;
 }
 
-/// A Rust type that a query module declares for a column, read through any [`DriverRow`].
-pub(crate) trait Column: Sized {
-    /// Reads the value at `index` of `row`.
-    fn read<R: DriverRow>(row: &R, index: usize) -> Result<Self>;
+/// A Rust type that a query module declares for a column, read from a [`DriverRow`].
+///
+/// Each value type implements [`from_nullable_column`](Self::from_nullable_column). A field of
+/// the type reads its column with [`from_column`](Self::from_column), and `Option` of the type
+/// overrides it, so a null is an error for a field of the type and `None` for a field of
+/// `Option` of it.
+pub(crate) trait FromColumn: Sized {
+    /// Reads the value at `index` of `row`, or `None` for a null.
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>>;
+
+    /// Reads the value at `index` of `row` as a field of this type. Returns
+    /// [`Error::UnexpectedNull`] for a null.
+    fn from_column<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
+        Self::from_nullable_column(row, index)?.ok_or(Error::UnexpectedNull)
+    }
 }
 
-impl Column for i64 {
-    fn read<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
+impl<T: FromColumn> FromColumn for Option<T> {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        T::from_nullable_column(row, index).map(Some)
+    }
+
+    fn from_column<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
+        T::from_nullable_column(row, index)
+    }
+}
+
+impl FromColumn for i64 {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.integer(index)
     }
 }
 
-impl Column for i32 {
-    fn read<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
-        Self::try_from(row.integer(index)?).map_err(Into::into)
+impl FromColumn for i32 {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.integer(index)?
+            .map(Self::try_from)
+            .transpose()
+            .map_err(Into::into)
     }
 }
 
-impl Column for i16 {
-    fn read<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
-        Self::try_from(row.integer(index)?).map_err(Into::into)
+impl FromColumn for i16 {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.integer(index)?
+            .map(Self::try_from)
+            .transpose()
+            .map_err(Into::into)
     }
 }
 
-impl Column for String {
-    fn read<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
+impl FromColumn for String {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.text(index)
     }
 }
 
-impl Column for serde_json::Result<Value> {
-    fn read<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
+impl FromColumn for serde_json::Result<Value> {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.json(index)
-    }
-}
-
-impl<T: Column> Column for Option<T> {
-    fn read<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
-        if row.is_null(index)? {
-            Ok(None)
-        } else {
-            T::read(row, index).map(Some)
-        }
     }
 }
 
@@ -98,19 +112,6 @@ mod postgres {
         Row,
         types::{FromSql, Type},
     };
-
-    /// A value of any type, read only to find out whether it is null.
-    struct AnyValue;
-
-    impl<'a> FromSql<'a> for AnyValue {
-        fn from_sql(_: &Type, _: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
-            Ok(Self)
-        }
-
-        fn accepts(_: &Type) -> bool {
-            true
-        }
-    }
 
     /// A `smallint`, `integer` or `bigint`, widened to `i64`.
     ///
@@ -134,24 +135,20 @@ mod postgres {
     }
 
     impl DriverRow for Row {
-        fn is_null(&self, index: usize) -> Result<bool> {
-            self.try_get::<_, Option<AnyValue>>(index)
-                .map(|value| value.is_none())
+        fn integer(&self, index: usize) -> Result<Option<i64>> {
+            self.try_get::<_, Option<Integer>>(index)
+                .map(|integer| integer.map(|Integer(integer)| integer))
                 .map_err(Into::into)
         }
 
-        fn integer(&self, index: usize) -> Result<i64> {
-            self.try_get::<_, Integer>(index)
-                .map(|Integer(integer)| integer)
-                .map_err(Into::into)
-        }
-
-        fn text(&self, index: usize) -> Result<String> {
+        fn text(&self, index: usize) -> Result<Option<String>> {
             self.try_get(index).map_err(Into::into)
         }
 
-        fn json(&self, index: usize) -> Result<serde_json::Result<Value>> {
-            self.try_get(index).map(Ok).map_err(Into::into)
+        fn json(&self, index: usize) -> Result<Option<serde_json::Result<Value>>> {
+            self.try_get::<_, Option<Value>>(index)
+                .map(|json| json.map(Ok))
+                .map_err(Into::into)
         }
     }
 }
@@ -162,38 +159,39 @@ mod libsql {
     use libsql::{Row, Value};
     use nisshi_storage::Result;
 
-    /// Returns `index` as the `i32` that libSQL takes.
-    fn libsql_index(index: usize) -> Result<i32> {
-        i32::try_from(index).map_err(Into::into)
+    /// Returns the value at `index` of `row`, or `None` for a null.
+    ///
+    /// This reads the value with `get_value` and each caller matches its kind, instead of the
+    /// typed `Row::get`, because libSQL 0.10's typed `get` panics on a value of another kind.
+    fn nullable_value(row: &Row, index: usize) -> Result<Option<Value>> {
+        match row.get_value(i32::try_from(index)?)? {
+            Value::Null => Ok(None),
+            value => Ok(Some(value)),
+        }
     }
 
-    // This reads each value with `get_value` and matches its type, instead of the typed
-    // `Row::get`, because libSQL 0.10's typed `get` panics on a value of another type.
     impl DriverRow for Row {
-        fn is_null(&self, index: usize) -> Result<bool> {
-            self.get_value(libsql_index(index)?)
-                .map(|value| matches!(value, Value::Null))
-                .map_err(Into::into)
+        fn integer(&self, index: usize) -> Result<Option<i64>> {
+            nullable_value(self, index)?
+                .map(|value| match value {
+                    Value::Integer(integer) => Ok(integer),
+                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                })
+                .transpose()
         }
 
-        fn integer(&self, index: usize) -> Result<i64> {
-            match self.get_value(libsql_index(index)?)? {
-                Value::Integer(integer) => Ok(integer),
-                Value::Null => Err(libsql::Error::NullValue.into()),
-                _ => Err(libsql::Error::InvalidColumnType.into()),
-            }
+        fn text(&self, index: usize) -> Result<Option<String>> {
+            nullable_value(self, index)?
+                .map(|value| match value {
+                    Value::Text(text) => Ok(text),
+                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                })
+                .transpose()
         }
 
-        fn text(&self, index: usize) -> Result<String> {
-            match self.get_value(libsql_index(index)?)? {
-                Value::Text(text) => Ok(text),
-                Value::Null => Err(libsql::Error::NullValue.into()),
-                _ => Err(libsql::Error::InvalidColumnType.into()),
-            }
-        }
-
-        fn json(&self, index: usize) -> Result<serde_json::Result<serde_json::Value>> {
-            self.text(index).map(|text| serde_json::from_str(&text))
+        fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {
+            self.text(index)
+                .map(|text| text.map(|text| serde_json::from_str(&text)))
         }
     }
 }
@@ -205,22 +203,17 @@ mod turso {
     use turso::Row;
 
     impl DriverRow for Row {
-        fn is_null(&self, index: usize) -> Result<bool> {
-            self.get_value(index)
-                .map(|value| value.is_null())
-                .map_err(Into::into)
-        }
-
-        fn integer(&self, index: usize) -> Result<i64> {
+        fn integer(&self, index: usize) -> Result<Option<i64>> {
             self.get(index).map_err(Into::into)
         }
 
-        fn text(&self, index: usize) -> Result<String> {
+        fn text(&self, index: usize) -> Result<Option<String>> {
             self.get(index).map_err(Into::into)
         }
 
-        fn json(&self, index: usize) -> Result<serde_json::Result<serde_json::Value>> {
-            self.text(index).map(|text| serde_json::from_str(&text))
+        fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {
+            self.text(index)
+                .map(|text| text.map(|text| serde_json::from_str(&text)))
         }
     }
 }
@@ -425,7 +418,7 @@ mod tests {
         ] {
             assert_matches!(
                 D::probe_rows(query).await,
-                Err(Error::Column { query: probe::QUERY, column: found, .. }) if found == column,
+                Err(Error::UnreadableColumn { query: probe::QUERY, column: found, .. }) if found == column,
                 "{query}"
             );
         }

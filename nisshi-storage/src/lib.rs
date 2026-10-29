@@ -280,15 +280,6 @@ pub enum Error {
         column: &'static str,
     },
 
-    /// The reader of `query`'s result could not read the column `column` of a row as the column's
-    /// declared type. `source` is the error of that read: the driver's error, or an integer
-    /// overflow.
-    Column {
-        query: &'static str,
-        column: &'static str,
-        source: Box<Error>,
-    },
-
     #[cfg(any(feature = "postgres", feature = "libsql"))]
     DeadPoolBuild(#[from] deadpool::managed::BuildError),
 
@@ -442,6 +433,18 @@ pub enum Error {
     UnexpectedBody(Box<Body>),
 
     UnexpectedServiceResponse(Box<Response>),
+
+    /// A column that a query's row declares as not null held a null.
+    UnexpectedNull,
+
+    /// The reader of `query`'s result could not read the column `column` of a row as the column's
+    /// declared type. `source` is the error of that read: the driver's error, an integer overflow,
+    /// or [`Error::UnexpectedNull`].
+    UnreadableColumn {
+        query: &'static str,
+        column: &'static str,
+        source: Box<Error>,
+    },
 
     #[cfg(feature = "turso")]
     UnexpectedValue(turso::Value),

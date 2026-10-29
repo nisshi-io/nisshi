@@ -74,19 +74,21 @@ changes.
   ```
 
   For a result of at most one row, use the engine's one-row helper, which records the same SQL
-  metrics as a many-row query. PostgreSQL has `prepare_query_rows` and `prepare_query_opt_row`,
-  which fails on a second row. libSQL and Turso have `query_rows` and `query_first`. PostgreSQL
-  gets the column names from the prepared statement, so a result without rows has them too.
+  metrics as a many-row query. PostgreSQL has `prepare_query_rows` and
+  `prepare_query_optional_row`, which fails on a second row. libSQL and Turso have `query_rows` and
+  `query_first`. PostgreSQL gets the column names from the prepared statement, so a result without
+  rows has them too.
 - **Write the row type qualified, as `topic_select::Row`.** The module already names the query, so
   the type needs no other name. Each engine file also imports its driver's own `Row`, and the
   qualified name shows which of the two a line means.
 - **Declare each field as the driver reads it, and decode it in the engine.** A field's type
-  implements `Column` in `sql/driver.rs`, which reads it through the `DriverRow` of each driver. A
-  JSON column is `serde_json::Result<serde_json::Value>`. On libSQL and Turso the parse error is
-  then a value, and the engine decides what an undecodable document does to the rest of the
-  result. PostgreSQL rejects an invalid `json` value when it is stored. A new kind of column gets
-  one `Column` implementation, and a new kind of stored value gets one `DriverRow` method for each
-  driver. A query module has no driver-specific code.
+  implements `FromColumn` in `sql/driver.rs`, which reads it through the `DriverRow` of each
+  driver. A field of `Option` of a type reads a null as `None`, and a field of the type itself
+  returns `Error::UnexpectedNull` for one. A JSON column is `serde_json::Result<serde_json::Value>`.
+  On libSQL and Turso the parse error is then a value, and the engine decides what an undecodable
+  document does to the rest of the result. PostgreSQL rejects an invalid `json` value when it is
+  stored. A new kind of column gets one `FromColumn` implementation, and a new kind of stored value
+  gets one `DriverRow` method for each driver. A query module has no driver-specific code.
 - **Put what a row means in the query's module.** When a result has a row that is not data, such
   as a marker row for a topic that sets none of the requested keys, the module gives `Row` a method
   that returns `None` for it, and each engine calls that method instead of testing the field.
@@ -104,6 +106,6 @@ changes.
 
 Change the order of a query's `select` list. Every engine still reads the same values. Rename a
 column in the query. Every engine returns `Error::MissingColumn`, which names the column, even when
-the result has no rows. Store a value of the wrong type. Every engine returns `Error::Column`,
-which names the query and the column. Find two row types with the same columns and the same
-meaning. They should be one type in `sql/row.rs`.
+the result has no rows. Store a value of the wrong type. Every engine returns
+`Error::UnreadableColumn`, which names the query and the column. Find two row types with the same
+columns and the same meaning. They should be one type in `sql/row.rs`.
