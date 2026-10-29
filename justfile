@@ -178,6 +178,50 @@ fmt-fix:
 shellcheck:
     git ls-files -z '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
 
+# Not in `default`, because it needs these tools and a GitHub token for zizmor's online audits:
+#   brew install actionlint zizmor pinact jq
+#   gh auth login    (the recipe uses `gh auth token` when GITHUB_TOKEN and GH_TOKEN are unset)
+# `pinact run` fixes what pinact reports.
+#
+# lint .github/workflows as workflow-lint.yml does, and check each pin's version comment with pinact
+lint-workflows:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=()
+    for tool in actionlint zizmor pinact jq; do
+        command -v "$tool" >/dev/null || missing+=("$tool")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "lint-workflows: missing ${missing[*]}; install with: brew install actionlint zizmor pinact jq" >&2
+        exit 1
+    fi
+    # zizmor reads GH_TOKEN and pinact reads GITHUB_TOKEN, so the recipe sets both.
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}}"
+    if [[ -z "$token" ]]; then
+        echo "lint-workflows: set GITHUB_TOKEN, or run gh auth login" >&2
+        exit 1
+    fi
+    export GITHUB_TOKEN="$token" GH_TOKEN="$token"
+    # Each check runs even when an earlier one fails, so one run reports every failure.
+    status=0
+    echo "== actionlint"
+    actionlint || status=1
+    # Keep the zizmor arguments in step with workflow-lint.yml.
+    echo "== zizmor"
+    zizmor --min-confidence medium --min-severity medium .github/workflows/ || status=1
+    echo "== zizmor artipacked"
+    artipacked_findings=$(zizmor --offline --no-exit-codes --strict-collection --format json .github/workflows/ \
+        | jq -r '.[] | select(.ident == "artipacked" and (.ignored | not))
+            | .locations[0] as $l
+            | "\($l.symbolic.key.Local.verbatim_path):\($l.concrete.location.start_point.row + 1): artipacked: \($l.symbolic.annotation)"') || status=1
+    if [[ -n "$artipacked_findings" ]]; then
+        printf '%s\n' "$artipacked_findings" >&2
+        status=1
+    fi
+    echo "== pinact"
+    pinact run --check || status=1
+    exit "$status"
+
 # check that compose.yaml loads with no .env and no variables set, as on a fresh clone
 compose-check:
     #!/usr/bin/env bash
