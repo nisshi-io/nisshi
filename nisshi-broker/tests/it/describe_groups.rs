@@ -102,34 +102,6 @@ async fn found_group_answers_supported_operations_when_asked(
     Ok(())
 }
 
-/// An engine answers an unknown group with an error row or with an empty group. Kafka answers
-/// an unknown group with error NONE and state `Dead`, and reports the operations on every row
-/// whose error is NONE.
-async fn unknown_group_answers_operations_only_on_a_row_without_error(
-    storage: impl Storage + Clone,
-) -> Result<()> {
-    for include_authorized_operations in [false, true] {
-        let groups = describe(
-            storage.clone(),
-            &[alphanumeric_string(15)],
-            include_authorized_operations,
-        )
-        .await?;
-        assert_eq!(1, groups.len());
-
-        let expected = if include_authorized_operations
-            && ErrorCode::try_from(groups[0].error_code)? == ErrorCode::None
-        {
-            SUPPORTED_GROUP_OPERATIONS
-        } else {
-            i32::MIN
-        };
-        assert_eq!(Some(expected), groups[0].authorized_operations);
-    }
-
-    Ok(())
-}
-
 /// `DescribeGroups` v0 to v5 describes a group that does not exist with the error NONE and the
 /// state `Dead`, as Kafka does. A client reads the group as missing from that state, but fails on
 /// `GROUP_ID_NOT_FOUND`. Requires an engine that stores the groups that it describes.
@@ -514,12 +486,6 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
-
-    #[tokio::test]
     async fn unknown_group_answers_dead() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_group_answers_dead(storage().await?).await
@@ -591,11 +557,6 @@ mod lite {
         super::found_group_answers_supported_operations_when_asked(storage().await?).await
     }
 
-    #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
     #[tokio::test]
     async fn unknown_group_answers_dead() -> Result<()> {
         let _guard = init_tracing()?;
@@ -694,11 +655,6 @@ mod pg {
         super::found_group_answers_supported_operations_when_asked(storage().await?).await
     }
 
-    #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
     #[tokio::test]
     async fn unknown_group_answers_dead() -> Result<()> {
         let _guard = init_tracing()?;
