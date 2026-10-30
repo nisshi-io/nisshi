@@ -115,7 +115,7 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    Result, ScramCredential, Storage, StorageOperation, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 
@@ -229,46 +229,47 @@ pub enum Request {
     Ping,
 }
 
-impl Display for Request {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+impl Request {
+    /// Returns the [`Storage`] method that this request calls.
+    pub fn operation(&self) -> StorageOperation {
         match self {
-            Self::AdvertisedListener => f.write_str("AdvertisedListener"),
-            Self::Brokers => f.write_str("Brokers"),
-            Self::ClusterId => f.write_str("ClusterId"),
-            Self::CommittedOffsetTopitions(_) => f.write_str("CommittedOffsetTopitions"),
-            Self::CreateTopic { .. } => f.write_str("CreateTopic"),
-            Self::DeleteGroups(_) => f.write_str("DeleteGroups"),
-            Self::DeleteRecords(_) => f.write_str("DeleteRecords"),
-            Self::DeleteTopic(_) => f.write_str("DeleteTopic"),
-            Self::DescribeConfig { .. } => f.write_str("DescribeConfig"),
-            Self::DescribeGroups { .. } => f.write_str("DescribeGroups"),
-            Self::DescribeTopicPartitions { .. } => f.write_str("DescribeTopicPartitions"),
-            Self::Fetch { .. } => f.write_str("Fetch"),
-            Self::GroupWithVersion(_) => f.write_str("GroupWithVersion"),
-            Self::IncrementalAlterResource(_) => f.write_str("IncrementalAlterResource"),
-            Self::InitProducer { .. } => f.write_str("InitProducer"),
-            Self::ListGroups => f.write_str("ListGroups"),
-            Self::ListOffsets { .. } => f.write_str("ListOffsets"),
-            Self::Maintain(_) => f.write_str("Maintain"),
-            Self::MaintainTransactions(_) => f.write_str("MaintainTransactions"),
-            Self::AbortedTransactions { .. } => f.write_str("AbortedTransactions"),
-            Self::Metadata(_) => f.write_str("Metadata"),
-            Self::Node => f.write_str("Node"),
-            Self::OffsetCommit { .. } => f.write_str("OffsetCommit"),
-            Self::OffsetFetch { .. } => f.write_str("OffsetFetch"),
-            Self::OffsetStage(_) => f.write_str("OffsetStage"),
-            Self::PendingTxnOffsets(_) => f.write_str("PendingTxnOffsets"),
-            Self::Produce { .. } => f.write_str("Produce"),
-            Self::RegisterBroker(_) => f.write_str("RegisterBroker"),
-            Self::TxnAddOffsets { .. } => f.write_str("TxnAddOffsets"),
-            Self::TxnAddPartitions(_) => f.write_str("TxnAddPartitions"),
-            Self::TxnEnd { .. } => f.write_str("TxnEnd"),
-            Self::TxnOffsetCommit(_) => f.write_str("TxnOffsetCommit"),
-            Self::UpdateGroup { .. } => f.write_str("UpdateGroup"),
-            Self::DeleteUserScramCredential { .. } => f.write_str("DeleteUserScramCredential"),
-            Self::UpsertUserScramCredential { .. } => f.write_str("UpsertUserScramCredential"),
-            Self::UserScramCredential { .. } => f.write_str("UserScramCredential"),
-            Self::Ping => f.write_str("Ping"),
+            Self::AdvertisedListener => StorageOperation::AdvertisedListener,
+            Self::Brokers => StorageOperation::Brokers,
+            Self::ClusterId => StorageOperation::ClusterId,
+            Self::CommittedOffsetTopitions(_) => StorageOperation::CommittedOffsetTopitions,
+            Self::CreateTopic { .. } => StorageOperation::CreateTopic,
+            Self::DeleteGroups(_) => StorageOperation::DeleteGroups,
+            Self::DeleteRecords(_) => StorageOperation::DeleteRecords,
+            Self::DeleteTopic(_) => StorageOperation::DeleteTopic,
+            Self::DescribeConfig { .. } => StorageOperation::DescribeConfig,
+            Self::DescribeGroups { .. } => StorageOperation::DescribeGroups,
+            Self::DescribeTopicPartitions { .. } => StorageOperation::DescribeTopicPartitions,
+            Self::Fetch { .. } => StorageOperation::Fetch,
+            Self::GroupWithVersion(_) => StorageOperation::GroupWithVersion,
+            Self::IncrementalAlterResource(_) => StorageOperation::IncrementalAlterResource,
+            Self::InitProducer { .. } => StorageOperation::InitProducer,
+            Self::ListGroups => StorageOperation::ListGroups,
+            Self::ListOffsets { .. } => StorageOperation::ListOffsets,
+            Self::Maintain(_) => StorageOperation::Maintain,
+            Self::MaintainTransactions(_) => StorageOperation::MaintainTransactions,
+            Self::AbortedTransactions { .. } => StorageOperation::AbortedTransactions,
+            Self::Metadata(_) => StorageOperation::Metadata,
+            Self::Node => StorageOperation::Node,
+            Self::OffsetCommit { .. } => StorageOperation::OffsetCommit,
+            Self::OffsetFetch { .. } => StorageOperation::OffsetFetch,
+            Self::OffsetStage(_) => StorageOperation::OffsetStage,
+            Self::PendingTxnOffsets(_) => StorageOperation::PendingTxnOffsets,
+            Self::Produce { .. } => StorageOperation::Produce,
+            Self::RegisterBroker(_) => StorageOperation::RegisterBroker,
+            Self::TxnAddOffsets { .. } => StorageOperation::TxnAddOffsets,
+            Self::TxnAddPartitions(_) => StorageOperation::TxnAddPartitions,
+            Self::TxnEnd { .. } => StorageOperation::TxnEnd,
+            Self::TxnOffsetCommit(_) => StorageOperation::TxnOffsetCommit,
+            Self::UpdateGroup { .. } => StorageOperation::UpdateGroup,
+            Self::DeleteUserScramCredential { .. } => StorageOperation::DeleteUserScramCredential,
+            Self::UpsertUserScramCredential { .. } => StorageOperation::UpsertUserScramCredential,
+            Self::UserScramCredential { .. } => StorageOperation::UserScramCredential,
+            Self::Ping => StorageOperation::Ping,
         }
     }
 }
@@ -435,12 +436,12 @@ impl Service<Request> for RequestChannelService {
 
         let start = SystemTime::now();
 
-        let operation = input.to_string();
-        let attributes = [KeyValue::new("operation", operation.clone())];
+        let operation = input.operation();
+        let attributes = [operation.attribute()];
 
         let capacity = self.tx.capacity();
         STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &attributes);
-        debug!(operation, capacity);
+        debug!(%operation, capacity);
 
         deadline::queued(self.tx.reserve())
             .await
@@ -448,10 +449,10 @@ impl Service<Request> for RequestChannelService {
             .inspect(|_| {
                 let permit_elapsed = self.elapsed_millis(start);
                 STORAGE_CHANNEL_PERMIT_DURATION.record(permit_elapsed, &attributes);
-                debug!(operation, permit_elapsed);
+                debug!(%operation, permit_elapsed);
             })
             .inspect_err(|err| {
-                error!(operation, ?err);
+                error!(%operation, ?err);
                 STORAGE_CHANNEL_ERROR.add(1, &attributes);
             })?;
 
@@ -461,10 +462,10 @@ impl Service<Request> for RequestChannelService {
             .inspect(|_| {
                 let elapsed_millis = self.elapsed_millis(start);
                 STORAGE_CHANNEL_REQUEST_DURATION.record(elapsed_millis, &attributes);
-                debug!(operation, elapsed_millis);
+                debug!(%operation, elapsed_millis);
             })
             .inspect_err(|err| {
-                error!(operation, ?err);
+                error!(%operation, ?err);
                 STORAGE_CHANNEL_ERROR.add(1, &attributes);
             })
     }
@@ -1085,29 +1086,29 @@ where
                         break;
                     };
 
-                    let operation = request.to_string();
+                    let operation = request.operation();
                     let inner = self.inner.clone();
 
                     match tokio::spawn(async move { inner.serve(request).await }).await {
                         Ok(Ok(response)) => {
                             if tx.send(response).is_err() {
                                 debug!(
-                                    operation,
+                                    %operation,
                                     "requester dropped its response receiver; discarding response"
                                 );
 
                                 STORAGE_CHANNEL_RESPONSE_DISCARDED
-                                    .add(1, &[KeyValue::new("operation", operation)]);
+                                    .add(1, &[operation.attribute()]);
                             }
                         }
 
                         Ok(Err(error)) => {
-                            error!(operation, ?error, "storage request failed");
+                            error!(%operation, ?error, "storage request failed");
 
                             STORAGE_CHANNEL_SERVER_FAILURE.add(
                                 1,
                                 &[
-                                    KeyValue::new("operation", operation),
+                                    operation.attribute(),
                                     KeyValue::new("kind", "error"),
                                 ],
                             );
@@ -1116,14 +1117,14 @@ where
                         Err(join_error) => {
                             let kind = if join_error.is_panic() {
                                 error!(
-                                    operation,
+                                    %operation,
                                     ?join_error,
                                     "storage request task panicked; isolated, loop continues"
                                 );
                                 "panic"
                             } else {
                                 warn!(
-                                    operation,
+                                    %operation,
                                     ?join_error,
                                     "storage request task cancelled"
                                 );
@@ -1133,7 +1134,7 @@ where
                             STORAGE_CHANNEL_SERVER_FAILURE.add(
                                 1,
                                 &[
-                                    KeyValue::new("operation", operation),
+                                    operation.attribute(),
                                     KeyValue::new("kind", kind),
                                 ],
                             );
