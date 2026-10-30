@@ -412,9 +412,7 @@ async fn secrets_stay_out_of_logs(storage: ArcDynStorage) -> Result<()> {
         12,
         FetchRequest::default()
             .replica_id(Some(-1))
-            // The broker returns no records to a fetch with a zero wait. With
-            // `min_bytes(1)`, this fetch returns as soon as it has a batch.
-            .max_wait_ms(500)
+            .max_wait_ms(0)
             .min_bytes(1)
             .max_bytes(Some(1024 * 1024))
             .isolation_level(Some(0))
