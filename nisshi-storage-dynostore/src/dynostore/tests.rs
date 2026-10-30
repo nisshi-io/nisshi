@@ -43,6 +43,7 @@ mod offset_commit_unknown_partition;
 mod ping;
 mod post_write_failure_reason;
 mod produce_topic_guard;
+mod produce_write_failure;
 mod producer_detail;
 mod stale_watermark;
 mod transaction_last_stable;
