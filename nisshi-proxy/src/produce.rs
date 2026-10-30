@@ -877,7 +877,14 @@ struct Combined {
 /// answers it, and none of its batches is merged. A partition with batches of one owner only is
 /// forwarded as sent, for the origin to check.
 ///
+/// Two differences from Kafka are deliberate. The count does not look at the Produce version,
+/// although Kafka applies the rule only from version 3, because the proxy decodes magic v2
+/// batches only. A request that lists the same partition twice puts both entries' batches under
+/// one owner, so the proxy rejects it with INVALID_RECORD, where Kafka keeps the last entry for
+/// the partition ([`KafkaApis.handleProduceRequest`]). No known client repeats a partition.
+///
 /// [`ProduceRequest.validateRecords`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
+/// [`KafkaApis.handleProduceRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L626-L643
 fn combine(batches: Vec<OwnedBatch>) -> Combined {
     debug!(len = batches.len());
 
