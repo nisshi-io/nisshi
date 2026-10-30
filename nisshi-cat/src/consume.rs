@@ -304,8 +304,13 @@ impl Consume {
                     .partitions(Some(vec![
                         // Every field that the request's version has is set: the encoder
                         // leaves out a field that is `None`, which moves the fields after it.
-                        // A consumer knows no leader epoch and is not a follower, so it sends
-                        // -1 for both epochs and the log start offset, as Kafka's does.
+                        // `cat consume` tracks no leader epoch and is not a follower, so it
+                        // sends -1 for both epochs and the log start offset. Kafka's consumer
+                        // sends -1 for an epoch it doesn't know ([`FetchRequest.build`]) and
+                        // always for the log start offset ([`AbstractFetch.prepareFetchRequests`]).
+                        //
+                        // [`FetchRequest.build`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/FetchRequest.java#L296-L302
+                        // [`AbstractFetch.prepareFetchRequests`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractFetch.java#L447-L452
                         FetchPartition::default()
                             .partition(self.configuration.partition)
                             .current_leader_epoch(Some(-1))
@@ -327,9 +332,9 @@ impl Consume {
 /// The records of `batch` at or after `fetch_offset`, or `None` when it has none.
 ///
 /// Fetch answers with whole batches, so the first batch can start before `fetch_offset`. A Kafka
-/// consumer skips the records before it, as
-/// [`CompletedFetch`](https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CompletedFetch.java#L227-L228)
-/// does, and so does `cat consume`.
+/// consumer skips the records before it, as [`CompletedFetch`] does, and so does `cat consume`.
+///
+/// [`CompletedFetch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CompletedFetch.java#L227-L228
 fn from_offset(mut batch: inflated::Batch, fetch_offset: i64) -> Option<inflated::Batch> {
     let base_offset = batch.base_offset;
 
