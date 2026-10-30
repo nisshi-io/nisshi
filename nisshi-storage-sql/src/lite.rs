@@ -6853,6 +6853,73 @@ mod tests {
         Ok(())
     }
 
+    /// Returns a connection of its own on `db_file`, which holds the topics `t` and `u`.
+    async fn connection_with_two_topics(db_file: &str) -> Result<PoolConnection> {
+        let (engine, _) = engine_with_topic(db_file).await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("u".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let connection = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?;
+
+        Ok(PoolConnection { connection })
+    }
+
+    /// A one-row read of a result with two rows is an error, instead of the first row.
+    #[tokio::test]
+    async fn query_one_of_two_rows_is_an_error() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "query-one-of-two-rows-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let connection = connection_with_two_topics(db_file).await?;
+
+        assert_matches!(
+            connection
+                .query_one::<topic_by_cluster::Row>(topic_by_cluster::QUERY, ["nisshi"])
+                .await,
+            Err(Error::LibSql(err))
+                if matches!(&*err, libsql::Error::Misuse(message) if message.contains("more than one row"))
+        );
+
+        Ok(())
+    }
+
+    /// Each row that a read returns holds its own values. A libSQL `Row` reads from the
+    /// statement's current row, so a row read after the next step would hold the next row's
+    /// values.
+    #[tokio::test]
+    async fn query_leading_rows_keeps_each_rows_values() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "query-leading-rows-values-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let connection = connection_with_two_topics(db_file).await?;
+
+        let mut names: Vec<String> = connection
+            .query_leading_rows::<topic_by_cluster::Row>(topic_by_cluster::QUERY, ["nisshi"], 2)
+            .await?
+            .into_iter()
+            .map(|topic| topic.name)
+            .collect();
+        // The query does not order its rows.
+        names.sort();
+
+        assert_eq!(vec!["t".to_owned(), "u".to_owned()], names);
+
+        Ok(())
+    }
+
     fn transactional_batch(
         producer: &ProducerIdResponse,
         sequence: i32,

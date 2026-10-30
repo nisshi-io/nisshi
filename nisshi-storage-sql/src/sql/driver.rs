@@ -406,10 +406,15 @@ mod turso {
 
 #[cfg(test)]
 mod tests {
-    use super::super::result_columns::ResultColumns;
+    use super::super::{QueryRow, result_columns::ResultColumns};
+    use bytes::Bytes;
     use nisshi_storage::{Error, Result};
     use serde_json::json;
-    use std::assert_matches;
+    use std::{
+        assert_matches,
+        time::{Duration, SystemTime},
+    };
+    use uuid::Uuid;
 
     /// A query that reads one column of each kind that [`DriverRow`](super::DriverRow) reads.
     mod probe {
@@ -426,6 +431,41 @@ mod tests {
             }
         }
     }
+
+    /// A query that reads one column of each kind that SQLite stores in another form than
+    /// PostgreSQL does.
+    mod converted_probe {
+        sql_row! {
+            #[derive(Debug)]
+            pub(crate) struct Row {
+                flag: bool,
+                payload: bytes::Bytes,
+                id: uuid::Uuid,
+                time: std::time::SystemTime,
+            }
+        }
+    }
+
+    /// The UUID in the `id` column of each converted probe query.
+    const CONVERTED_PROBE_ID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+
+    /// The converted probe queries in one driver's SQL dialect.
+    struct ConvertedProbeSql {
+        /// Returns one row: true, the bytes 1 and 2, [`CONVERTED_PROBE_ID`], and 1.5 seconds after
+        /// the Unix epoch.
+        in_order: &'static str,
+    }
+
+    const SQLITE_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
+        in_order: "select 1 as flag, x'0102' as payload, \
+                   '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
+    };
+
+    const POSTGRES_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
+        in_order: r"select true as flag, '\x0102'::bytea as payload,
+                    '67e55044-10b1-426f-9247-bb680e5fe0c8'::uuid as id,
+                    '1970-01-01 00:00:01.5'::timestamp as time",
+    };
 
     /// The probe queries in one driver's SQL dialect.
     struct ProbeSql {
@@ -475,8 +515,8 @@ mod tests {
 
     /// Runs probe queries through one driver.
     trait ProbeDriver {
-        /// Runs `sql`, and reads each row of its result with [`probe::RowReader`].
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>>;
+        /// Runs `sql`, and reads each row of its result as `T`.
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>>;
     }
 
     #[cfg(feature = "postgres")]
@@ -484,7 +524,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     impl ProbeDriver for Postgres {
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>> {
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>> {
             let (client, connection) = tokio_postgres::connect(
                 "host=localhost user=postgres password=postgres",
                 tokio_postgres::NoTls,
@@ -493,12 +533,12 @@ mod tests {
             let connection = tokio::spawn(connection);
 
             let statement = client.prepare(sql).await?;
-            let reader = probe::RowReader::new(&ResultColumns::postgres(probe::QUERY, &statement))?;
+            let reader = T::reader(&ResultColumns::postgres(probe::QUERY, &statement))?;
             let rows = client
                 .query(&statement, &[])
                 .await?
                 .iter()
-                .map(|row| reader.read_row(row))
+                .map(|row| T::read(&reader, row))
                 .collect();
 
             drop(client);
@@ -512,17 +552,17 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     impl ProbeDriver for Libsql {
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>> {
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>> {
             let connection = libsql::Builder::new_local(":memory:")
                 .build()
                 .await?
                 .connect()?;
             let mut rows = connection.query(sql, ()).await?;
-            let reader = probe::RowReader::new(&ResultColumns::libsql(probe::QUERY, &rows))?;
+            let reader = T::reader(&ResultColumns::libsql(probe::QUERY, &rows))?;
 
             let mut probes = vec![];
             while let Some(row) = rows.next().await? {
-                probes.push(reader.read_row(&row)?);
+                probes.push(T::read(&reader, &row)?);
             }
             Ok(probes)
         }
@@ -533,25 +573,25 @@ mod tests {
 
     #[cfg(feature = "turso")]
     impl ProbeDriver for Turso {
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>> {
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>> {
             let connection = turso::Builder::new_local(":memory:")
                 .build()
                 .await?
                 .connect()?;
             let mut rows = connection.query(sql, ()).await?;
-            let reader = probe::RowReader::new(&ResultColumns::turso(probe::QUERY, &rows))?;
+            let reader = T::reader(&ResultColumns::turso(probe::QUERY, &rows))?;
 
             let mut probes = vec![];
             while let Some(row) = rows.next().await? {
-                probes.push(reader.read_row(&row)?);
+                probes.push(T::read(&reader, &row)?);
             }
             Ok(probes)
         }
     }
 
     /// Returns the one row of `sql`'s result.
-    async fn probe_row<D: ProbeDriver>(sql: &str) -> Result<probe::Row> {
-        let mut rows = D::probe_rows(sql).await?;
+    async fn probe_row<D: ProbeDriver, T: QueryRow>(sql: &str) -> Result<T> {
+        let mut rows = D::probe_rows::<T>(sql).await?;
         assert_eq!(1, rows.len(), "{sql}");
         Ok(rows.remove(0))
     }
@@ -560,7 +600,7 @@ mod tests {
     /// order gives the engine the same values.
     async fn reordered_select_reads_the_same_values<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
         for query in [sql.in_order, sql.reordered] {
-            let row = probe_row::<D>(query).await?;
+            let row = probe_row::<D, probe::Row>(query).await?;
 
             assert_eq!(3, row.epoch, "{query}");
             assert_eq!(Some(7), row.high, "{query}");
@@ -575,7 +615,7 @@ mod tests {
     /// found even when the result is empty.
     async fn renamed_column_is_missing_without_rows<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
         assert_matches!(
-            D::probe_rows(sql.renamed_without_rows).await,
+            D::probe_rows::<probe::Row>(sql.renamed_without_rows).await,
             Err(Error::MissingColumn { query: probe::QUERY, column: "name", found })
                 if found.contains(&"nom".to_owned())
         );
@@ -585,7 +625,7 @@ mod tests {
     /// A result with two columns of one name is an error, instead of a read of the first of them.
     async fn duplicate_column_is_an_error<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
         assert_matches!(
-            D::probe_rows(sql.name_twice).await,
+            D::probe_rows::<probe::Row>(sql.name_twice).await,
             Err(Error::DuplicateColumn {
                 query: probe::QUERY,
                 column: "name"
@@ -603,7 +643,7 @@ mod tests {
             (sql.epoch_overflows, "epoch"),
         ] {
             assert_matches!(
-                D::probe_rows(query).await,
+                D::probe_rows::<probe::Row>(query).await,
                 Err(Error::UnreadableColumn { query: probe::QUERY, column: found, .. }) if found == column,
                 "{query}"
             );
@@ -615,9 +655,83 @@ mod tests {
     /// what it does to the rest of the result.
     async fn invalid_json_is_kept_in_the_row<D: ProbeDriver>() -> Result<()> {
         let row =
-            probe_row::<D>("select 3 as epoch, 7 as high, 'a' as name, '{' as detail").await?;
+            probe_row::<D, probe::Row>("select 3 as epoch, 7 as high, 'a' as name, '{' as detail")
+                .await?;
         assert_matches!(row.detail, Some(Err(_)));
         Ok(())
+    }
+
+    /// Each driver reads a boolean, bytes, a UUID and a time from the form that its engine stores
+    /// them in, so a field has one Rust type on every engine.
+    async fn converted_columns_read_their_stored_forms<D: ProbeDriver>(
+        sql: &ConvertedProbeSql,
+    ) -> Result<()> {
+        let row = probe_row::<D, converted_probe::Row>(sql.in_order).await?;
+
+        assert!(row.flag);
+        assert_eq!(Bytes::from_static(&[1, 2]), row.payload);
+        assert_eq!(Uuid::parse_str(CONVERTED_PROBE_ID)?, row.id);
+        assert_eq!(
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1500),
+            row.time
+        );
+        Ok(())
+    }
+
+    /// On libSQL and Turso, a boolean other than 0 or 1, and a time stored as text, are errors
+    /// that name the column, instead of values read as some other boolean or time. The broker
+    /// stores only 0, 1 and integer milliseconds.
+    async fn sqlite_rejects_other_stored_forms<D: ProbeDriver>() -> Result<()> {
+        for (query, column) in [
+            (
+                "select 2 as flag, x'0102' as payload, \
+                 '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
+                "flag",
+            ),
+            (
+                "select 1 as flag, x'0102' as payload, \
+                 '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, \
+                 '1970-01-01 00:00:01.500' as time",
+                "time",
+            ),
+        ] {
+            assert_matches!(
+                D::probe_rows::<converted_probe::Row>(query).await,
+                Err(Error::UnreadableColumn { column: found, .. }) if found == column,
+                "{query}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_converted_columns_read_their_stored_forms() -> Result<()> {
+        converted_columns_read_their_stored_forms::<Postgres>(&POSTGRES_CONVERTED).await
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_converted_columns_read_their_stored_forms() -> Result<()> {
+        converted_columns_read_their_stored_forms::<Libsql>(&SQLITE_CONVERTED).await
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_rejects_other_stored_forms() -> Result<()> {
+        sqlite_rejects_other_stored_forms::<Libsql>().await
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_converted_columns_read_their_stored_forms() -> Result<()> {
+        converted_columns_read_their_stored_forms::<Turso>(&SQLITE_CONVERTED).await
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_rejects_other_stored_forms() -> Result<()> {
+        sqlite_rejects_other_stored_forms::<Turso>().await
     }
 
     #[cfg(feature = "postgres")]
