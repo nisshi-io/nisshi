@@ -512,26 +512,6 @@ where
         .map_err(Into::into)
 }
 
-pub fn txn_offset_commit<S>(
-    builder: FrameRouteBuilder<Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<Error>, Error>
-where
-    S: Storage,
-{
-    builder
-        .with_route(
-            TxnOffsetCommitRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
-            )
-                .into_layer(TxnOffsetCommitService { storage })
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
 pub fn end_txn<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
@@ -547,6 +527,26 @@ where
                 FrameRequestLayer::<EndTxnRequest>::new(),
             )
                 .into_layer(TxnEndService { storage })
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn txn_offset_commit<S>(
+    builder: FrameRouteBuilder<Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    S: Storage,
+{
+    builder
+        .with_route(
+            TxnOffsetCommitRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
+            )
+                .into_layer(TxnOffsetCommitService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
