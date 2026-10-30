@@ -68,8 +68,10 @@ fn storage_without_an_engine_prints_no_banner() {
     );
 }
 
+/// The banner moved from the CLI into the broker's listener. This checks that the move kept it,
+/// in order and before `ready in`; it passes with or without the fix that the tests above cover.
 #[test]
-fn banner_prints_once_the_broker_listens() {
+fn banner_still_prints_before_ready() {
     let mut broker = Broker::start_with_banner();
 
     // The broker prints its banner before it accepts a connection, so it has printed it by the
