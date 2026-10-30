@@ -41,11 +41,11 @@ use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
-type Broker = RequestFrameService<
+pub(crate) type Broker = RequestFrameService<
     FrameBytesService<BytesService<BytesFrameService<FrameRouteService<Error>>>>,
 >;
 
-fn broker<S>(storage: S) -> Result<Broker>
+pub(crate) fn broker<S>(storage: S) -> Result<Broker>
 where
     S: Storage + Clone,
 {
@@ -335,7 +335,7 @@ where
 /// Creates a topic with a ten minute `retention.ms`, and produces three records to it: `first`
 /// at `first_create_time`, one in a transaction that stays open, and one more at the current
 /// time. Returns the offset of the transaction's record.
-async fn create_topic_with_open_transaction<G>(
+pub(crate) async fn create_topic_with_open_transaction<G>(
     sc: &G,
     broker: &Broker,
     extensions: &Extensions,
