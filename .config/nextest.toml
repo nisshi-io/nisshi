@@ -1,3 +1,31 @@
+experimental = ["setup-scripts"]
+
+# A test still running after 5 minutes is killed, locally as in CI, so a test
+# that hangs doesn't hold its database and catalog connections until someone
+# stops the run.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# In a linked worktree, the tests that use PostgreSQL, MinIO or the lakehouse
+# catalog run against the worktree's own compose project, which this script
+# starts and writes to .env. In the main checkout and in CI, the script does
+# nothing, and the tests use the services that `just ci` started.
+[scripts.setup.worktree-services]
+command = "etc/worktree-services.sh up"
+# A cold start of the services on a loaded machine takes minutes, and a start
+# still running after 10 minutes is killed instead of holding the run.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.default.scripts]]
+filter = "package(nisshi-broker) | package(nisshi-storage-sql) | package(nisshi-schema)"
+setup = "worktree-services"
+
+# Each Iceberg test runs a query engine and opens connections to the catalog
+# and to MinIO, so a run starts at most 4 of them at once.
+[[profile.default.overrides]]
+filter = "package(nisshi-schema) & binary(berg)"
+test-group = "berg"
+
 # CI selects this profile with NEXTEST_PROFILE=ci; local runs keep the
 # default profile. A test still running after 5 minutes is killed rather
 # than holding the runner until the job times out. The slowest test,
@@ -17,6 +45,7 @@ path = "junit.xml"
 [test-groups]
 durability = { max-threads = 1 }
 consumer-group-members = { max-threads = 1 }
+berg = { max-threads = 4 }
 
 # The settings of the smoke suite (nisshi-smoke-test). Each Kafka CLI call has
 # its own timeout, and `slow-timeout` stops a test that hangs anywhere else.

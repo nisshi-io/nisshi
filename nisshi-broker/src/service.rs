@@ -19,7 +19,7 @@ use nisshi_service::{
     FrameRouteService, TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer,
     TcpContextService,
 };
-use nisshi_storage::{Storage, TopicCreationConfig};
+use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig};
 use rama::Layer;
 use rsasl::config::SASLConfig;
 use tracing::debug;
@@ -38,6 +38,7 @@ pub fn services<C, S>(
     coordinator: C,
     storage: S,
     topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
     sasl_config: Option<Arc<SASLConfig>>,
 ) -> Result<TcpRouteFrame, Error>
 where
@@ -48,6 +49,7 @@ where
         FrameRouteService::<Error>::builder(),
         storage,
         topic_creation,
+        auto_create_refusals,
     )
     .inspect(|builder| debug!(?builder))
     .and_then(|builder| {

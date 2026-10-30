@@ -49,7 +49,7 @@ fn protocols(metadata: &'static [u8]) -> Vec<JoinGroupRequestProtocol> {
     ]
 }
 
-async fn null_storage() -> Result<ArcDynStorage> {
+pub(super) async fn null_storage() -> Result<ArcDynStorage> {
     let mut builder = StorageContainer::builder();
     builder.with_factory(Arc::new(nisshi_storage_null::EngineFactory));
 

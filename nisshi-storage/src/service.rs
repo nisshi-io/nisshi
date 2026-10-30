@@ -14,6 +14,8 @@
 
 mod alter_user_scram_credentials;
 mod consumer_group_describe;
+#[cfg(test)]
+mod counting_storage;
 mod create_acls;
 mod create_topics;
 pub mod deadline;
@@ -79,7 +81,7 @@ pub use init_producer_id::InitProducerIdService;
 pub use list_groups::{ListGroupsService, list_groups_response};
 pub use list_offsets::{LIST_OFFSETS_CONCURRENCY, ListOffsetsService};
 pub use list_partition_reassignments::ListPartitionReassignmentsService;
-pub use metadata::MetadataService;
+pub use metadata::{AutoCreateRefusals, MetadataService};
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
     create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,

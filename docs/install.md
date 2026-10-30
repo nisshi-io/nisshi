@@ -53,6 +53,8 @@ To start a broker that only listens to your computer, run:
 nisshi --listener-url tcp://127.0.0.1:9092
 ```
 
+The broker prints `ready` when it starts, and after that logs only warnings and errors. To see each request, start it with `RUST_LOG=nisshi_service::frame=debug`. That setting is verbose: it logs each request's API key as a number, and the whole request and response. The `RUST_LOG` setting in [example.env](../example.env) adds debug logs from the broker, storage and schema crates, but not one for each request.
+
 To protect a broker that other computers connect to, see [Securing a broker](security.md) for TLS and authentication.
 
 The broker keeps topics and messages in memory, and loses them when it stops. To keep them, see [Storage options](storage.md).
@@ -70,6 +72,15 @@ The `cat consume` command prints the message:
 ```json
 [{"key":null,"value":"hello world"}]
 ```
+
+To see the broker's topics and their partition counts, run `nisshi topic list`:
+
+```text
+TOPIC  PARTITIONS
+hello  3
+```
+
+`nisshi topic list --output json` prints the broker's topic metadata as JSON, for scripts. Releases up to 0.8.1 print that JSON by default and don't accept `--output`.
 
 Releases before 0.8.0 print nothing for `topic create` and `cat produce`, so on those releases only the last command prints anything.
 
