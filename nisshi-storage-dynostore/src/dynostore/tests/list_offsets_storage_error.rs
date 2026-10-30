@@ -13,7 +13,9 @@
 // limitations under the License.
 
 //! The error code that `ListOffsets` by timestamp answers when the object store fails during the
-//! lookup. A consumer retries `KAFKA_STORAGE_ERROR`, but fails on `UNKNOWN_SERVER_ERROR`.
+//! lookup. The Java consumer retries `KAFKA_STORAGE_ERROR` and `UNKNOWN_SERVER_ERROR` alike. The
+//! admin client retries only a retriable error, which `KAFKA_STORAGE_ERROR` is and
+//! `UNKNOWN_SERVER_ERROR` is not, so it fails on the second.
 
 use std::sync::Arc;
 
