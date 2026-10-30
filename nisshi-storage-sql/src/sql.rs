@@ -12,11 +12,141 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Declares `Row`, one row of a query's result, and `RowReader`, which reads it, in the query's
+/// module. The macro takes one line for each column, such as `low: Option<i64>`: the field and its
+/// type. The field's name is the column's name in the query's result, so a query that needs another
+/// Rust name renames the column with `as`.
+///
+/// `RowReader::new` finds each column's index by its name once, before the first row, and
+/// `RowReader::read_row` reads each row by those indexes through any
+/// [`DriverRow`](driver::DriverRow). Each field's type implements [`FromColumn`](driver::FromColumn).
+/// A read error names the query and the column. The macro implements [`QueryRow`] for `Row`, so
+/// that an engine's query helpers read each row of a result as `Row`.
+macro_rules! sql_row {
+    (
+        $(#[$row_attribute:meta])*
+        pub(crate) struct Row {
+            $(
+                $(#[$field_attribute:meta])*
+                $field:ident: $type:ty
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$row_attribute])*
+        pub(crate) struct Row {
+            $(
+                $(#[$field_attribute])*
+                pub(crate) $field: $type,
+            )+
+        }
+
+        /// Reads each [`Row`] of the query's result by the index of each of its columns.
+        #[derive(Clone, Debug)]
+        pub(crate) struct RowReader {
+            query: &'static str,
+            $($field: usize,)+
+        }
+
+        impl RowReader {
+            /// Returns a reader for the result with `columns`, or
+            /// [`Error::MissingColumn`](nisshi_storage::Error::MissingColumn) for the first
+            /// column of [`Row`] that the result does not have.
+            pub(crate) fn new(
+                columns: &$crate::sql::result_columns::ResultColumns,
+            ) -> ::nisshi_storage::Result<Self> {
+                Ok(Self {
+                    query: columns.query(),
+                    $($field: columns.index(stringify!($field))?,)+
+                })
+            }
+
+            /// Reads `row`, or returns [`Error::UnreadableColumn`](nisshi_storage::Error::UnreadableColumn) for the
+            /// first column that the reader can't read as its field's type.
+            pub(crate) fn read_row<R>(&self, row: &R) -> ::nisshi_storage::Result<Row>
+            where
+                R: $crate::sql::driver::DriverRow,
+            {
+                Ok(Row {
+                    $(
+                        $field: <$type as $crate::sql::driver::FromColumn>::from_column(
+                            row,
+                            self.$field,
+                        )
+                            .map_err(|source| ::nisshi_storage::Error::UnreadableColumn {
+                                query: self.query,
+                                column: stringify!($field),
+                                source: Box::new(source),
+                            })?,
+                    )+
+                })
+            }
+        }
+
+        impl $crate::sql::QueryRow for Row {
+            type Reader = RowReader;
+
+            fn reader(
+                columns: &$crate::sql::result_columns::ResultColumns,
+            ) -> ::nisshi_storage::Result<RowReader> {
+                RowReader::new(columns)
+            }
+
+            fn read<R>(reader: &RowReader, row: &R) -> ::nisshi_storage::Result<Self>
+            where
+                R: $crate::sql::driver::DriverRow,
+            {
+                reader.read_row(row)
+            }
+        }
+    };
+}
+
+/// A row of one query's result, which [`sql_row!`] declares, read by column name. An engine's query
+/// helpers take the row type, as in `query_first::<topic_select_name::Row>`, and return each row
+/// read as it.
+pub(crate) trait QueryRow: Sized {
+    /// The reader that finds each column of a result by its name, before the first row.
+    type Reader;
+
+    /// Returns the reader for the result with `columns`.
+    fn reader(columns: &result_columns::ResultColumns) -> Result<Self::Reader>;
+
+    /// Reads `row` with `reader`.
+    fn read<R: driver::DriverRow>(reader: &Self::Reader, row: &R) -> Result<Self>;
+}
+
+/// A cursor over one query's result on libSQL or Turso, which returns each of its rows as a
+/// [`QueryRow`], in order. It reads a row only when the caller reaches it.
+pub(crate) struct QueryRowCursor<R: driver::DriverRowCursor, T: QueryRow> {
+    driver_cursor: R,
+    reader: T::Reader,
+}
+
+impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
+    /// Returns a cursor over the result with `columns`, which reads each row from
+    /// `driver_cursor`.
+    pub(crate) fn new(columns: &result_columns::ResultColumns, driver_cursor: R) -> Result<Self> {
+        T::reader(columns).map(|reader| Self {
+            driver_cursor,
+            reader,
+        })
+    }
+
+    /// Returns the next row as `T`, or `None` after the last row.
+    pub(crate) async fn next(&mut self) -> Result<Option<T>> {
+        self.driver_cursor
+            .next()
+            .await?
+            .map(|row| T::read(&self.reader, &row))
+            .transpose()
+    }
+}
+
 pub(crate) mod consumer_group_select;
 pub(crate) mod consumer_offset_select;
 pub(crate) mod consumer_offset_select_by_group;
+pub(crate) mod driver;
 pub(crate) mod producer_epochs_select;
-#[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
 pub(crate) mod topic_configuration_select;
 pub(crate) mod topic_configuration_select_keys;
