@@ -164,7 +164,7 @@ pub(crate) fn number_of_bytes(req: &ProduceRequest) -> usize {
 /// a transactional or control batch belongs to one transaction. Merging such a batch would give
 /// another owner's records that header, and fail an idempotent producer with
 /// `OUT_OF_ORDER_SEQUENCE_NUMBER` or pull the records into a transaction. The origin stores
-/// each such batch as sent, as the storage batcher does.
+/// each such batch as sent.
 fn mergeable(req: &ProduceRequest) -> bool {
     req.topic_data
         .as_deref()
@@ -2734,16 +2734,31 @@ mod tests {
         )?;
         let plain = record_data_batch(b"plain")?;
 
+        // The origin must receive this request whole, so it carries a transactional id and acks
+        // that a rebuilt request would lose.
+        let transactional_request =
+            produce_request_to_partitions("a", vec![(0, transactional.clone())])
+                .transactional_id(Some(String::from("transaction")))
+                .acks(Ack::FullIsr.into());
+
         let responses = produce_in_one_batch(
             &service,
             vec![
-                produce_request_to_partitions("a", vec![(0, transactional.clone())]),
+                transactional_request.clone(),
                 produce_request_to_partitions("a", vec![(0, plain.clone())]),
             ],
         )
         .await?;
 
         assert_eq!(2, responses.len());
+
+        assert!(
+            origin
+                .reqs
+                .lock()
+                .expect("poison")
+                .contains(&transactional_request)
+        );
 
         let mut forwarded = forwarded_batches(&origin)
             .into_iter()
@@ -2752,6 +2767,40 @@ mod tests {
         forwarded.sort_by_key(|batches| batches.first().map(|batch| batch.producer_id));
 
         assert_eq!(vec![vec![plain], vec![transactional]], forwarded);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_with_one_idempotent_partition_bypasses_whole() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let origin = MockProduceService::default();
+        let service = batching_service(origin.clone())?;
+
+        let idempotent = producer_batch(7, 0, 0, BatchAttribute::default(), b"idempotent")?;
+
+        // Partition 1 holds a plain batch that could merge on its own. It stays in this request
+        // because the request has an idempotent batch on partition 0.
+        let mixed = produce_request_to_partitions(
+            "a",
+            vec![(0, idempotent), (1, record_data_batch(b"plain one")?)],
+        );
+
+        let responses = produce_in_one_batch(
+            &service,
+            vec![
+                mixed.clone(),
+                produce_request_to_partitions("a", vec![(1, record_data_batch(b"plain two")?)]),
+            ],
+        )
+        .await?;
+
+        assert_eq!(2, responses.len());
+
+        let requests = origin.reqs.lock().expect("poison");
+        assert_eq!(2, requests.len());
+        assert!(requests.contains(&mixed));
 
         Ok(())
     }
