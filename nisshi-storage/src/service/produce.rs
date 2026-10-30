@@ -506,8 +506,11 @@ fn rewrite_create_time(
     // each record's timestamp, because it reads `max_timestamp` as the timestamp of every record
     // of a `LogAppendTime` batch ([`DefaultRecordBatch.java#L578`]). It then clears the bit, so a
     // consumer reads each record's own timestamp, which Kafka did not check. This function checks
-    // each record's own timestamp instead, which is stricter. A producer that Kafka accepts does
-    // not set the bit, so the stricter check does not reject it.
+    // each record's own timestamp instead. That is stricter when a record is outside the window
+    // and the header is inside it. It is looser in the opposite case: the function then stores
+    // the batch with `max_timestamp` rewritten to the records' maximum, so every stored timestamp
+    // has been checked. A producer that Kafka accepts does not set the bit, so the stricter check
+    // does not reject it.
     //
     // [`DefaultRecordBatch.java#L578`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L578
     if actual_max == batch.max_timestamp
