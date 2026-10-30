@@ -279,6 +279,7 @@ pub struct Broker<G, S> {
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
+    banner: Option<String>,
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
 
@@ -319,6 +320,7 @@ where
             tls_server_config: None,
 
             silent: false,
+            banner: None,
 
             maintenance_interval: None,
             transaction_maintenance_interval: None,
@@ -532,6 +534,10 @@ where
         let ls = if self.silent {
             None
         } else {
+            if let Some(banner) = &self.banner {
+                print!("{banner}");
+            }
+
             println!("ready in {}ms", started.elapsed().as_millis(),);
 
             let ls = m.add(ProgressBar::new_spinner());
@@ -800,6 +806,7 @@ pub struct Builder<N, C, I, A, S, L> {
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
     silent: bool,
+    banner: Option<String>,
     group_coordinator: GroupCoordinatorConfig,
     topic_creation: TopicCreationConfig,
 
@@ -830,6 +837,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
             cancellation: self.cancellation,
@@ -850,6 +858,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
@@ -871,6 +880,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
@@ -895,6 +905,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
@@ -918,6 +929,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
@@ -941,6 +953,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
@@ -985,6 +998,12 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    /// Text that the broker prints to stdout once its listener is bound, before `ready in`,
+    /// unless it is silent. A broker that fails to start prints none of it.
+    pub fn banner(self, banner: Option<String>) -> Self {
+        Self { banner, ..self }
     }
 
     pub fn group_coordinator(self, group_coordinator: GroupCoordinatorConfig) -> Self {
@@ -1083,6 +1102,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,
+            banner: self.banner,
             maintenance_interval: intervals.maintenance,
             transaction_maintenance_interval: intervals.transaction_maintenance,
             cancellation: self.cancellation,
