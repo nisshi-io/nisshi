@@ -470,14 +470,14 @@ where
 
     sc.maintain(SystemTime::now()).await?;
     assert_eq!(
-        Some(15),
+        Some(PRODUCED - KEPT),
         list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
     );
 
     // within the limit: nothing to delete
     sc.maintain(SystemTime::now()).await?;
     assert_eq!(
-        Some(15),
+        Some(PRODUCED - KEPT),
         list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
     );
 
@@ -489,7 +489,7 @@ where
 
     sc.maintain(SystemTime::now()).await?;
     assert_eq!(
-        Some(18),
+        Some(PRODUCED + 3 - KEPT),
         list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
     );
     assert_eq!(

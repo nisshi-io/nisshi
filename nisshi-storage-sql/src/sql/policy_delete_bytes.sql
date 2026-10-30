@@ -23,8 +23,7 @@
 -- partition. The delete is then a range of the primary key.
 --
 -- A lateral subquery per partition makes the planner start from the partitions that have a limit.
--- Joined, it read all of record before it tested the limit: with 45 million records and nothing to
--- delete, one sweep took 36 seconds.
+-- Joined, it read all of record before it tested the limit.
 with
 
 capped as (
