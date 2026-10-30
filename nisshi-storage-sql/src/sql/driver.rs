@@ -229,7 +229,7 @@ mod libsql {
     use bytes::Bytes;
     use libsql::{Row, Rows, Value};
     use nisshi_sans_io::to_system_time;
-    use nisshi_storage::{Error, Result};
+    use nisshi_storage::{Error, Result, SqliteValueSummary};
     use std::time::SystemTime;
     use uuid::Uuid;
 
@@ -244,11 +244,22 @@ mod libsql {
         }
     }
 
+    /// Returns the error for `value`, which has the wrong kind for its column.
+    fn unexpected_value(value: Value) -> Error {
+        Error::UnexpectedSqliteValue(match value {
+            Value::Null => SqliteValueSummary::Null,
+            Value::Integer(integer) => SqliteValueSummary::Integer(integer),
+            Value::Real(real) => SqliteValueSummary::Real(real),
+            Value::Text(text) => SqliteValueSummary::Text { length: text.len() },
+            Value::Blob(blob) => SqliteValueSummary::Blob { length: blob.len() },
+        })
+    }
+
     /// Returns the integer in `value`, or an error for a value of another kind.
     fn integer_of(value: Value) -> Result<i64> {
         match value {
             Value::Integer(integer) => Ok(integer),
-            value => Err(Error::UnexpectedLibsqlValue(value)),
+            value => Err(unexpected_value(value)),
         }
     }
 
@@ -256,7 +267,7 @@ mod libsql {
     fn text_of(value: Value) -> Result<String> {
         match value {
             Value::Text(text) => Ok(text),
-            value => Err(Error::UnexpectedLibsqlValue(value)),
+            value => Err(unexpected_value(value)),
         }
     }
 
@@ -278,7 +289,7 @@ mod libsql {
                 .map(|integer| match integer {
                     0 => Ok(false),
                     1 => Ok(true),
-                    integer => Err(Error::UnexpectedLibsqlValue(Value::Integer(integer))),
+                    integer => Err(unexpected_value(Value::Integer(integer))),
                 })
                 .transpose()
         }
@@ -291,7 +302,7 @@ mod libsql {
             nullable_value(self, index)?
                 .map(|value| match value {
                     Value::Blob(blob) => Ok(Bytes::from(blob)),
-                    value => Err(Error::UnexpectedLibsqlValue(value)),
+                    value => Err(unexpected_value(value)),
                 })
                 .transpose()
         }
@@ -320,7 +331,7 @@ mod turso {
     use super::{DriverRow, DriverRowCursor};
     use bytes::Bytes;
     use nisshi_sans_io::to_system_time;
-    use nisshi_storage::{Error, Result};
+    use nisshi_storage::{Error, Result, SqliteValueSummary};
     use std::time::SystemTime;
     use turso::{Row, Rows, Value};
     use uuid::Uuid;
@@ -333,11 +344,22 @@ mod turso {
         }
     }
 
+    /// Returns the error for `value`, which has the wrong kind for its column.
+    fn unexpected_value(value: Value) -> Error {
+        Error::UnexpectedSqliteValue(match value {
+            Value::Null => SqliteValueSummary::Null,
+            Value::Integer(integer) => SqliteValueSummary::Integer(integer),
+            Value::Real(real) => SqliteValueSummary::Real(real),
+            Value::Text(text) => SqliteValueSummary::Text { length: text.len() },
+            Value::Blob(blob) => SqliteValueSummary::Blob { length: blob.len() },
+        })
+    }
+
     /// Returns the integer in `value`, or an error for a value of another kind.
     fn integer_of(value: Value) -> Result<i64> {
         match value {
             Value::Integer(integer) => Ok(integer),
-            value => Err(Error::UnexpectedTursoValue(value)),
+            value => Err(unexpected_value(value)),
         }
     }
 
@@ -345,7 +367,7 @@ mod turso {
     fn text_of(value: Value) -> Result<String> {
         match value {
             Value::Text(text) => Ok(text),
-            value => Err(Error::UnexpectedTursoValue(value)),
+            value => Err(unexpected_value(value)),
         }
     }
 
@@ -367,7 +389,7 @@ mod turso {
                 .map(|integer| match integer {
                     0 => Ok(false),
                     1 => Ok(true),
-                    integer => Err(Error::UnexpectedTursoValue(Value::Integer(integer))),
+                    integer => Err(unexpected_value(Value::Integer(integer))),
                 })
                 .transpose()
         }
@@ -380,7 +402,7 @@ mod turso {
             nullable_value(self, index)?
                 .map(|value| match value {
                     Value::Blob(blob) => Ok(Bytes::from(blob)),
-                    value => Err(Error::UnexpectedTursoValue(value)),
+                    value => Err(unexpected_value(value)),
                 })
                 .transpose()
         }
@@ -408,7 +430,7 @@ mod turso {
 mod tests {
     use super::super::{QueryRow, result_columns::ResultColumns};
     use bytes::Bytes;
-    use nisshi_storage::{Error, Result};
+    use nisshi_storage::{Error, Result, SqliteValueSummary};
     use serde_json::json;
     use std::{
         assert_matches,
@@ -680,24 +702,30 @@ mod tests {
 
     /// On libSQL and Turso, a boolean other than 0 or 1, and a time stored as text, are errors
     /// that name the column, instead of values read as some other boolean or time. The broker
-    /// stores only 0, 1 and integer milliseconds.
+    /// stores only 0, 1 and integer milliseconds. The error keeps a text value's length, not the
+    /// text.
     async fn sqlite_rejects_other_stored_forms<D: ProbeDriver>() -> Result<()> {
-        for (query, column) in [
+        for (query, column, summary) in [
             (
                 "select 2 as flag, x'0102' as payload, \
                  '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
                 "flag",
+                SqliteValueSummary::Integer(2),
             ),
             (
                 "select 1 as flag, x'0102' as payload, \
                  '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, \
                  '1970-01-01 00:00:01.500' as time",
                 "time",
+                // The length of '1970-01-01 00:00:01.500'.
+                SqliteValueSummary::Text { length: 23 },
             ),
         ] {
             assert_matches!(
                 D::probe_rows::<converted_probe::Row>(query).await,
-                Err(Error::UnreadableColumn { column: found, .. }) if found == column,
+                Err(Error::UnreadableColumn { column: found, source, .. })
+                    if found == column
+                        && matches!(*source, Error::UnexpectedSqliteValue(found) if found == summary),
                 "{query}"
             );
         }
