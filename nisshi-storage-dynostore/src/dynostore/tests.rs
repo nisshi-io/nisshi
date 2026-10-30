@@ -35,6 +35,7 @@ mod lake_sink_idempotence;
 mod latency;
 mod list_groups;
 mod list_offsets;
+mod list_offsets_storage_error;
 mod metadata_read_error;
 mod offset_commit_unknown_partition;
 mod ping;

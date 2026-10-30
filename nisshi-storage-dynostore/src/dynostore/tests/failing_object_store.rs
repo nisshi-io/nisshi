@@ -23,12 +23,13 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 
-/// Wraps an [`ObjectStore`] and makes each `get()` or each `list()` call fail.
+/// Wraps an [`ObjectStore`] and makes each `get()`, each `list()` or each `put()` call fail.
 #[derive(Clone)]
 pub(crate) struct FailingObjectStore<O> {
     object_store: O,
     get_fails: bool,
     list_fails: bool,
+    put_fails: bool,
 }
 
 impl<O> FailingObjectStore<O> {
@@ -37,6 +38,7 @@ impl<O> FailingObjectStore<O> {
             object_store,
             get_fails: true,
             list_fails: false,
+            put_fails: false,
         }
     }
 
@@ -45,6 +47,16 @@ impl<O> FailingObjectStore<O> {
             object_store,
             get_fails: false,
             list_fails: true,
+            put_fails: false,
+        }
+    }
+
+    pub(crate) fn failing_put(object_store: O) -> Self {
+        Self {
+            object_store,
+            get_fails: false,
+            list_fails: false,
+            put_fails: true,
         }
     }
 }
@@ -79,6 +91,10 @@ where
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
+        if self.put_fails {
+            return Err(forced_failure());
+        }
+
         self.object_store.put_opts(location, payload, opts).await
     }
 

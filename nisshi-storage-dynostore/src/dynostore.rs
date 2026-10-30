@@ -3177,7 +3177,7 @@ impl Storage for DynoStore {
                             ListOffsetResponse {
                                 error_code: match error {
                                     Error::Api(error_code) => error_code,
-                                    _ => ErrorCode::UnknownServerError,
+                                    _ => ErrorCode::KafkaStorageError,
                                 },
                                 offset: None,
                                 ..Default::default()
