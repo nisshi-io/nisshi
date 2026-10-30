@@ -77,6 +77,10 @@ use crate::{Error, METER, Result};
 
 use super::{Coordinator, OffsetCommit};
 
+mod subscription;
+
+use subscription::{ChangeMap, Subscription};
+
 // Kafka's own `group.max.session.timeout.ms` default. There is no corresponding
 // nisshi config, so we hardcode it. We deliberately do NOT enforce Kafka's
 // `group.min.session.timeout.ms` default (6000): librdkafka's own compat test
@@ -783,7 +787,7 @@ pub struct Controller<O> {
     wrappers: WrapperMap<O>,
     /// Wakes the requests that this coordinator holds for a group, after each change that it
     /// stores for the group.
-    changes: Arc<Mutex<BTreeMap<String, Arc<Notify>>>>,
+    changes: ChangeMap,
 }
 
 impl<O> Controller<O>
@@ -803,14 +807,30 @@ where
         Ok(Self::new(storage, GroupCoordinatorConfig::default()))
     }
 
-    fn changes(&self, group_id: &str) -> Result<Arc<Notify>> {
+    /// Returns a hold on the group's notifier, for a request that waits for a change of the group.
+    fn subscribe(&self, group_id: &str) -> Result<Subscription> {
         self.changes
             .lock()
             .map(|mut changes| {
-                changes
+                let notify = changes
                     .entry(group_id.to_owned())
                     .or_insert_with(|| Arc::new(Notify::new()))
-                    .clone()
+                    .clone();
+
+                Subscription::new(&self.changes, group_id, notify)
+            })
+            .map_err(Into::into)
+    }
+
+    /// Wakes the requests that wait on the group. A group without an entry has no waiting request,
+    /// because each request adds the entry before it waits.
+    fn wake_waiters(&self, group_id: &str) -> Result<()> {
+        self.changes
+            .lock()
+            .map(|changes| {
+                if let Some(notify) = changes.get(group_id) {
+                    notify.notify_waiters();
+                }
             })
             .map_err(Into::into)
     }
@@ -848,7 +868,8 @@ where
             .map_err(Into::into)
     }
 
-    /// Returns the group as storage holds it, or an empty group if storage holds none.
+    /// Returns the group as storage holds it, or an empty group if storage holds none. The
+    /// coordinator caches only a group that storage holds, because a client chooses the group id.
     async fn stored_group(&self, group_id: &str) -> Result<(Wrapper<O>, Option<Version>)> {
         let stored = match self.storage.group_with_version(group_id).await? {
             Some((detail, version)) => (
@@ -856,7 +877,7 @@ where
                 Some(version),
             ),
 
-            None => (Wrapper::Forming(Inner::new(self.storage.clone())), None),
+            None => return Ok((Wrapper::Forming(Inner::new(self.storage.clone())), None)),
         };
 
         self.cache(group_id, stored.0.clone(), stored.1.clone())?;
@@ -896,7 +917,7 @@ where
             Ok(version) => {
                 debug!(group_id, ?version, method);
                 self.cache(group_id, wrapper.clone(), Some(version))?;
-                self.changes(group_id)?.notify_waiters();
+                self.wake_waiters(group_id)?;
                 Ok(true)
             }
 
@@ -1023,7 +1044,7 @@ where
 
         let mut member_id = member_id.to_owned();
         let mut held_since = None;
-        let changes = self.changes(group_id)?;
+        let subscription = self.subscribe(group_id)?;
         let mut max_age = Duration::ZERO;
 
         loop {
@@ -1031,7 +1052,7 @@ where
 
             // The request registers for a wake-up before it reads the group, so that it can't
             // miss a change stored between the read and the wait.
-            let changed = changes.notified();
+            let changed = subscription.notified();
             tokio::pin!(changed);
             _ = changed.as_mut().enable();
 
@@ -1183,14 +1204,14 @@ where
             assignments,
         };
 
-        let changes = self.changes(group_id)?;
+        let subscription = self.subscribe(group_id)?;
         let mut max_age = Duration::ZERO;
         let held_since = Instant::now();
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
 
-            let changed = changes.notified();
+            let changed = subscription.notified();
             tokio::pin!(changed);
             _ = changed.as_mut().enable();
 
@@ -1488,14 +1509,6 @@ where
                 for result in &deleted {
                     if result.error_code == i16::from(ErrorCode::None) {
                         _ = wrappers.remove(&result.group_id);
-                    }
-                }
-            })?;
-
-            _ = self.changes.lock().map(|mut changes| {
-                for result in &deleted {
-                    if result.error_code == i16::from(ErrorCode::None) {
-                        _ = changes.remove(&result.group_id);
                     }
                 }
             })?;
@@ -4016,6 +4029,9 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod cache_tests;
 
 #[cfg(test)]
 mod rebalance_tests;
