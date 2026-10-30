@@ -54,8 +54,8 @@ MinIO or Iceberg catalog, and `just test-doc` runs the doc tests. Run the full
 suite with `just ci` and `just test` before you ask for review; CI runs it on
 every pull request.
 
-See `AGENTS.md` at the repo root for the full command reference and
-architecture overview.
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how the crates fit together.
+See `AGENTS.md` at the repo root for the full command reference.
 
 ## Making a change
 
