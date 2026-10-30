@@ -59,20 +59,20 @@ grep -v '^nisshi v' "$WORK/libsql" > "$WORK/no-root"
 sed 's/ v/@/' "$WORK/libsql-and-postgres" > "$WORK/other-format"
 : > "$WORK/empty"
 
-expect "allowed client only" pass "$WORK/libsql" "compiles none of: tokio-postgres turso" libsql tokio-postgres turso
-expect "forbidden client" fail "$WORK/libsql-and-postgres" "compiles tokio-postgres v0.7.18" libsql tokio-postgres turso
-expect "forbidden client marked (*)" fail "$WORK/libsql-and-turso" "compiles turso v0.8.3" libsql tokio-postgres turso
-expect "forbidden client with CRLF" fail "$WORK/libsql-and-turso-crlf" "compiles turso v0.8.3" libsql tokio-postgres turso
-expect "every forbidden client is named" fail "$WORK/libsql-and-postgres" "compiles libsql v0.10.0" postgres libsql tokio-postgres
-expect "a longer crate name is not a match" pass "$WORK/postgres-rustls-only" "" postgres tokio-postgres
-expect "libsql-sys alone is not libsql" pass <(grep -v '^libsql v' "$WORK/libsql") "" dynostore libsql
-expect "last line without a newline" fail "$WORK/no-trailing-newline" "compiles libsql v0.10.0" postgres libsql
-expect "empty package list" fail "$WORK/empty" "is empty" libsql tokio-postgres
-expect "no root package" fail "$WORK/no-root" "has no 'nisshi v<version>' line" libsql tokio-postgres
-expect "another output format" fail "$WORK/other-format" "has no 'nisshi v<version>' line" libsql tokio-postgres
-expect "no forbidden crate" fail "$WORK/libsql" "No forbidden crate given" libsql
+expect "allowed client only" pass "$WORK/libsql" "compiles none of: tokio-postgres turso" libsql
+expect "forbidden client" fail "$WORK/libsql-and-postgres" "compiles tokio-postgres v0.7.18" libsql
+expect "forbidden client marked (*)" fail "$WORK/libsql-and-turso" "compiles turso v0.8.3" libsql
+expect "forbidden client with CRLF" fail "$WORK/libsql-and-turso-crlf" "compiles turso v0.8.3" libsql
+expect "every forbidden client is named" fail "$WORK/libsql-and-postgres" "compiles tokio-postgres v0.7.18" dynostore
+expect "a longer crate name is not a match" pass "$WORK/postgres-rustls-only" "" libsql
+expect "libsql-sys alone is not libsql" pass <(grep -v '^libsql v' "$WORK/libsql") "" dynostore
+expect "last line without a newline" fail "$WORK/no-trailing-newline" "compiles libsql v0.10.0" postgres
+expect "empty package list" fail "$WORK/empty" "is empty" libsql
+expect "no root package" fail "$WORK/no-root" "has no 'nisshi v<version>' line" libsql
+expect "another output format" fail "$WORK/other-format" "has no 'nisshi v<version>' line" libsql
+expect "an unknown feature" fail "$WORK/libsql" "is not a storage engine feature" no-such-engine
 expect "no feature" fail "$WORK/libsql" "usage:"
-expect "forbidden crate that is a pattern" fail "$WORK/libsql" "is not a crate name" libsql '.*'
+expect "a feature that is a pattern" fail "$WORK/libsql" "is not a storage engine feature" '.*'
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

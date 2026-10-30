@@ -12,30 +12,46 @@
 #     -e normal,build --prefix none -f '{p}'
 #
 # The script also fails when the list is empty or has no `nisshi` package,
-# or when no forbidden crate is given, because a check that compares nothing
-# would pass.
+# or when the feature is not a known engine, because a check that compares
+# nothing would pass.
 #
-# Usage: check-storage-deps.sh <feature> <forbidden-crate>...
+# The forbidden crates of a feature are every engine's database client but its
+# own, so a new engine is added to ENGINE_CLIENTS below and nowhere else.
+#
+# Usage: check-storage-deps.sh <feature>
 # Local: just check-storage-deps
 # Test:  .github/scripts/check-storage-deps.test.sh
 #
 set -euo pipefail
 
-FEATURE="${1:?usage: check-storage-deps.sh <feature> <forbidden-crate>...}"
-shift
+# Each storage engine's cargo feature and the database client it compiles, as
+# `feature=client`. An engine with no client of its own (an object store) has an
+# empty client.
+ENGINE_CLIENTS=(
+  dynostore=
+  libsql=libsql
+  postgres=tokio-postgres
+  slatedb=
+  turso=turso
+)
 
-if [ "$#" -eq 0 ]; then
-  echo "::error::No forbidden crate given for --features ${FEATURE}."
-  exit 1
-fi
-for crate in "$@"; do
-  # A crate name is matched as part of a regular expression below, so only
-  # characters that a crate name can hold are accepted.
-  if ! grep -q -x -E '[A-Za-z0-9_-]+' <<<"$crate"; then
-    echo "::error::'${crate}' is not a crate name."
-    exit 1
+FEATURE="${1:?usage: check-storage-deps.sh <feature>}"
+
+known=0
+FORBIDDEN=()
+for entry in "${ENGINE_CLIENTS[@]}"; do
+  feature="${entry%%=*}"
+  client="${entry#*=}"
+  if [ "$feature" = "$FEATURE" ]; then
+    known=1
+  elif [ -n "$client" ]; then
+    FORBIDDEN+=("$client")
   fi
 done
+if [ "$known" -eq 0 ]; then
+  echo "::error::'${FEATURE}' is not a storage engine feature known to check-storage-deps.sh."
+  exit 1
+fi
 
 # cargo tree prints LF, but a list saved on Windows can end lines in CRLF.
 PACKAGES=$(tr -d '\r')
@@ -53,7 +69,7 @@ fi
 # `^<name> v<digit>` so that tokio-postgres doesn't match
 # tokio-postgres-rustls, and libsql doesn't match libsql-sys.
 found=0
-for crate in "$@"; do
+for crate in "${FORBIDDEN[@]}"; do
   version=$(grep -m 1 -o -E "^${crate} v[0-9][^ ]*" <<<"$PACKAGES" || true)
   if [ -n "$version" ]; then
     echo "::error::--features ${FEATURE} compiles ${version}, which belongs to another storage engine."
@@ -65,4 +81,4 @@ if [ "$found" -gt 0 ]; then
   echo "::error::Find what pulls it in with: cargo tree -p nisshi --no-default-features --features ${FEATURE} -e normal,build -i <crate>"
   exit 1
 fi
-echo "--features ${FEATURE} compiles none of: $*"
+echo "--features ${FEATURE} compiles none of: ${FORBIDDEN[*]}"
