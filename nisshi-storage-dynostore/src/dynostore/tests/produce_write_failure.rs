@@ -29,9 +29,11 @@ use bytes::Bytes;
 use nisshi_sans_io::{
     BatchAttribute, IsolationLevel,
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
-    create_topics_request::CreatableTopic,
+    create_topics_request::{CreatableTopic, CreatableTopicConfig},
     record::{Record, deflated, inflated},
+    topic_config,
 };
+use nisshi_schema::lake::House;
 use nisshi_storage::{Error, Storage as _, Topition, TxnAddPartitionsRequest};
 use object_store::{PutPayload, memory::InMemory, path::Path};
 
@@ -43,7 +45,10 @@ use crate::dynostore::{
 const TOPIC: &str = "abc";
 const TRANSACTION: &str = "txn-1";
 
-async fn create_topic(storage: &DynoStore) -> Result<(), Error> {
+async fn create_topic(
+    storage: &DynoStore,
+    configs: Vec<CreatableTopicConfig>,
+) -> Result<(), Error> {
     _ = storage
         .create_topic(
             CreatableTopic::default()
@@ -51,7 +56,7 @@ async fn create_topic(storage: &DynoStore) -> Result<(), Error> {
                 .num_partitions(1)
                 .replication_factor(1)
                 .assignments(Some([].into()))
-                .configs(Some([].into())),
+                .configs(Some(configs)),
             false,
         )
         .await?;
@@ -118,7 +123,7 @@ async fn retry_after_failed_watermark_write_stores_the_batch() -> Result<(), Err
     let object_store = FailingObjectStore::failing_put_on_demand(InMemory::new());
     let storage = DynoStore::new("nisshi", 111, object_store.clone())?;
 
-    create_topic(&storage).await?;
+    create_topic(&storage, vec![]).await?;
 
     let topition = Topition::new(TOPIC, 0);
     let producer = storage.init_producer(None, 0, Some(-1), Some(-1)).await?;
@@ -168,7 +173,7 @@ async fn retry_after_failed_transaction_write_stores_the_batch() -> Result<(), E
     let object_store = FailingObjectStore::failing_put_on_demand(InMemory::new());
     let storage = DynoStore::new("nisshi", 111, object_store.clone())?;
 
-    create_topic(&storage).await?;
+    create_topic(&storage, vec![]).await?;
 
     let topition = Topition::new(TOPIC, 0);
     let producer = storage
@@ -224,6 +229,74 @@ async fn retry_after_failed_transaction_write_stores_the_batch() -> Result<(), E
             )
             .await?
     );
+
+    Ok(())
+}
+
+/// A topic with `nisshi.lake.sink=true` takes its own branch of the produce, which orders the
+/// watermark write, the lake write and the sequence advance separately from the other branch.
+#[tokio::test]
+async fn retry_after_failed_watermark_write_to_lake_sink_stores_the_batch() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let object_store = FailingObjectStore::failing_put_on_demand(InMemory::new());
+
+    // `House::None` sends the produce down the lake-sink path, and without a schema registry
+    // that path writes nothing to the lake, so the test needs no lake service.
+    let storage = DynoStore::new("nisshi", 111, object_store.clone())?.lake(Some(House::None));
+
+    create_topic(
+        &storage,
+        vec![
+            CreatableTopicConfig::default()
+                .name(topic_config::LAKE_SINK.into())
+                .value(Some("true".into())),
+        ],
+    )
+    .await?;
+
+    let topition = Topition::new(TOPIC, 0);
+    let producer = storage.init_producer(None, 0, Some(-1), Some(-1)).await?;
+
+    object_store.fail_next_put(is_watermark_write);
+
+    assert_matches!(
+        storage
+            .produce(
+                None,
+                &topition,
+                idempotent_batch(producer.id, producer.epoch, 0, false)?
+            )
+            .await,
+        Err(Error::ObjectStore(_))
+    );
+
+    // The retry is stored, not answered as a duplicate of a batch that was never stored.
+    assert_eq!(
+        0,
+        storage
+            .produce(
+                None,
+                &topition,
+                idempotent_batch(producer.id, producer.epoch, 0, false)?
+            )
+            .await?
+    );
+
+    // The watermark moved with the retry, so the next batch takes the next offset. If the
+    // sequence had advanced before the watermark write, this batch would share offset 0.
+    assert_eq!(
+        1,
+        storage
+            .produce(
+                None,
+                &topition,
+                idempotent_batch(producer.id, producer.epoch, 1, false)?
+            )
+            .await?
+    );
+
+    assert_eq!(2, storage.offset_stage(&topition).await?.high_watermark);
 
     Ok(())
 }
