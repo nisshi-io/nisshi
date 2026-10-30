@@ -23,11 +23,11 @@ use nisshi_sans_io::{
 };
 use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, TransactionAbortableDowngradeLayer};
 use nisshi_storage::{
-    AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService, DeleteRecordsService,
-    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ConsumerGroupDescribeService,
+    CreateAclsService, CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
+    DescribeConfigsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
+    FetchService, FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
     ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService, TxnAddPartitionService,
     TxnEndService, TxnOffsetCommitService,
@@ -40,6 +40,7 @@ pub fn services<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
     topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
@@ -72,7 +73,14 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
-    .and_then(|builder| metadata(builder, storage.clone(), topic_creation))
+    .and_then(|builder| {
+        metadata(
+            builder,
+            storage.clone(),
+            topic_creation,
+            auto_create_refusals,
+        )
+    })
     .and_then(|builder| create_topics(builder, storage, topic_creation))
 }
 
@@ -435,6 +443,7 @@ pub fn metadata<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
     topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
@@ -449,6 +458,7 @@ where
                 .into_layer(MetadataService {
                     storage,
                     topic_creation,
+                    auto_create_refusals,
                 })
                 .boxed(),
         )

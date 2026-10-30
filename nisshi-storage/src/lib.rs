@@ -225,8 +225,8 @@ pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
+    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
     CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
     DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,

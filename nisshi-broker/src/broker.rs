@@ -34,7 +34,8 @@ use nisshi_schema::{
 };
 use nisshi_service::{PeerAddressExtension, ProgressBarExtension};
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicCreationConfig,
+    ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
+    TopicCreationConfig,
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
@@ -273,6 +274,7 @@ pub struct Broker<G, S> {
     storage: S,
     groups: G,
     topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
@@ -311,6 +313,7 @@ where
             storage,
             groups,
             topic_creation: TopicCreationConfig::default(),
+            auto_create_refusals: AutoCreateRefusals::default(),
 
             sasl_config: None,
             tls_server_config: None,
@@ -622,6 +625,7 @@ where
                         self.groups.clone(),
                         self.storage.clone(),
                         self.topic_creation,
+                        self.auto_create_refusals.clone(),
                         self.sasl_config.clone()
                     )?;
 
@@ -1074,6 +1078,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             storage,
             groups,
             topic_creation: self.topic_creation,
+            auto_create_refusals: AutoCreateRefusals::default(),
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
