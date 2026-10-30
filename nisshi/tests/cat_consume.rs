@@ -60,3 +60,20 @@ fn fetch_offset_inside_a_batch_skips_the_records_before_it() {
         stdout(&broker.run(&["cat", "consume", "taxi", "--fetch-offset", "1"], ""))
     );
 }
+
+/// Fetch answers an offset below the log start with `OFFSET_OUT_OF_RANGE` and no records, and
+/// `-1` is below it. That must not look like a valid offset with nothing to read to the caller.
+/// An offset above the high watermark is answered with no error by design, so it is not covered
+/// here.
+#[test]
+fn fetch_offset_below_the_log_start_fails_with_the_error() {
+    let broker = taxi();
+
+    let output = broker.run(&["cat", "consume", "taxi", "--fetch-offset=-1"], "");
+
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!("", String::from_utf8(output.stdout.clone()).unwrap());
+
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(stderr.contains("OffsetOutOfRange"), "{stderr}");
+}

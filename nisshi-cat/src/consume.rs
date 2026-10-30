@@ -253,6 +253,19 @@ impl Consume {
             for partition in response.partitions.unwrap_or_default() {
                 debug!(?partition);
 
+                // A fetch offset outside the partition is answered with an error code and no
+                // records, which would otherwise look like a partition with nothing to read.
+                match ErrorCode::try_from(partition.error_code) {
+                    Ok(ErrorCode::None) => {}
+                    Ok(error_code) => return Err(Error::Api(error_code)),
+                    Err(_) => {
+                        return Err(Error::Message(format!(
+                            "unknown error code {}",
+                            partition.error_code
+                        )));
+                    }
+                }
+
                 if let Some(frame) = partition.records {
                     debug!(?frame);
 
