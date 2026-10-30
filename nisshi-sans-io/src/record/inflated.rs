@@ -330,12 +330,18 @@ impl Batch {
         Ok(())
     }
 
-    /// Returns the memory that decoding this batch takes, once it is encoded with `compression`.
+    /// Returns what the decoder charges to the decode budget for this batch once it is encoded
+    /// with `compression`.
     ///
     /// The size is what the decoder charges to a batch's decode budget, which
     /// [`MAX_DECODED_BATCH_BYTES`] limits: the `Record` and `Header` structures of every record,
     /// plus the inflated record data when `compression` is not [`Compression::None`]. A batch whose
     /// size is over the limit does not decode.
+    ///
+    /// The size is exact for the encoding that this crate writes. It is not a bound on a batch as
+    /// a client sent it, whose record data can be longer, for example with varints that are not
+    /// minimal, so measure the batch that you will encode. Decoding takes a small multiple of this
+    /// size in memory at its peak (see [`MAX_DECODED_BATCH_BYTES`]).
     ///
     /// [`MAX_DECODED_BATCH_BYTES`]: crate::record::MAX_DECODED_BATCH_BYTES
     pub fn decoded_size(&self, compression: &Compression) -> Result<usize> {

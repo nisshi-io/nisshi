@@ -2216,6 +2216,51 @@ mod tests {
         Ok(())
     }
 
+    /// A gzip batch whose `decoded_size` is exactly `MAX_DECODED_BATCH_BYTES` decodes through the
+    /// production conversion, and one a byte larger does not.
+    #[test]
+    fn gzip_batch_decodes_at_the_decoded_limit_and_not_a_byte_over() -> Result<()> {
+        let batch_of = |len: usize| -> Result<inflated::Batch> {
+            Ok(inflated::Batch {
+                attributes: BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+                records: vec![Record {
+                    value: Some(Bytes::from(vec![0u8; len])),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+
+        // The length varint of the value is the same width throughout, so each byte of value
+        // adds one byte of decoded size.
+        let mut len = MAX_DECODED_BATCH_BYTES - 1024;
+        len += MAX_DECODED_BATCH_BYTES - batch_of(len)?.decoded_size(&Compression::Gzip)?;
+
+        let at_the_limit = batch_of(len)?;
+        assert_eq!(
+            MAX_DECODED_BATCH_BYTES,
+            at_the_limit.decoded_size(&Compression::Gzip)?
+        );
+        assert_eq!(
+            1,
+            Vec::<Record>::try_from(Batch::try_from(at_the_limit)?)?.len()
+        );
+
+        let over_the_limit = batch_of(len + 1)?;
+        assert_eq!(
+            MAX_DECODED_BATCH_BYTES + 1,
+            over_the_limit.decoded_size(&Compression::Gzip)?
+        );
+        assert_matches!(
+            Vec::<Record>::try_from(Batch::try_from(over_the_limit)?),
+            Err(Error::MessageMaxSizeExceeded(_))
+        );
+
+        Ok(())
+    }
+
     /// `appended_decoded_size` is exactly how much `decoded_size` grows when `append_rebased`
     /// appends a batch, for every codec, including when the rebase widens the varints of the
     /// offset and timestamp deltas.
