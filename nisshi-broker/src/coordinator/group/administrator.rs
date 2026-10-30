@@ -1872,6 +1872,27 @@ where
     O: Storage,
     S: Debug,
 {
+    /// Returns the partitions that an `OffsetFetch` with `require_stable` answers with
+    /// `UNSTABLE_OFFSET_COMMIT`: those for which an open transaction holds an offset of the
+    /// group. Without `require_stable`, storage is not read and no partition is unstable.
+    ///
+    /// The caller reads the unstable partitions before the committed offsets. A transaction
+    /// that ends between the two reads is then answered as unstable, which the client
+    /// retries, and not as the offset from before its end. PostgreSQL, SQLite and Turso
+    /// commit a transaction's offsets and drop its pending ones in one database
+    /// transaction. DynoStore does not yet: its `txn_end` clears the pending offsets before
+    /// it writes the committed ones, so a read in between gets the earlier offset as stable.
+    async fn unstable_offsets(
+        &self,
+        group_id: Option<&str>,
+        require_stable: Option<bool>,
+    ) -> nisshi_storage::Result<BTreeSet<Topition>> {
+        match (group_id, require_stable) {
+            (Some(group_id), Some(true)) => self.storage.pending_txn_offsets(group_id).await,
+            _ => Ok(BTreeSet::new()),
+        }
+    }
+
     async fn fetch_offset(
         &mut self,
         group_id: Option<&str>,
@@ -1900,9 +1921,12 @@ where
                 })
                 .collect();
 
+            let unstable = self.unstable_offsets(group_id, require_stable).await?;
+
             self.storage
                 .offset_fetch(group_id, topics.deref(), require_stable)
                 .await
+                .map(|offsets| fetched_offsets(offsets, &unstable))
                 .map(|offsets| {
                     offsets
                         .iter()
@@ -1917,7 +1941,7 @@ where
                                 .partitions(Some(
                                     offsets
                                         .iter()
-                                        .filter_map(|(topition, committed)| {
+                                        .filter_map(|(topition, (committed, error_code))| {
                                             if topition.topic() == *topic_name {
                                                 Some(
                                                     OffsetFetchResponsePartition::default()
@@ -1927,7 +1951,7 @@ where
                                                             fetched_leader_epoch(committed),
                                                         ))
                                                         .metadata(Some(fetched_metadata(committed)))
-                                                        .error_code(ErrorCode::None.into()),
+                                                        .error_code((*error_code).into()),
                                                 )
                                             } else {
                                                 None
@@ -1949,7 +1973,7 @@ where
             for group in groups {
                 debug!(?group);
 
-                let response = if let Some(topics) = group.topics.as_ref().map(|topics| {
+                let topics = group.topics.as_ref().map(|topics| {
                     topics
                         .iter()
                         .flat_map(|topic| {
@@ -1967,23 +1991,31 @@ where
                                 .unwrap_or_default()
                         })
                         .collect::<Vec<_>>()
-                }) {
-                    self.storage
-                        .offset_fetch(
-                            Some(group.group_id.as_str()),
-                            topics.deref(),
-                            require_stable,
-                        )
-                        .await
-                        .inspect(|offsets| debug!(?offsets))
-                        .inspect_err(|err| error!(?err, ?group))
-                } else {
-                    self.storage
-                        .committed_offset_topitions(&group.group_id)
-                        .await
-                        .inspect(|offsets| debug!(?offsets))
-                        .inspect_err(|err| error!(?err, ?group))
+                });
+
+                let response = async {
+                    let unstable = self
+                        .unstable_offsets(Some(group.group_id.as_str()), require_stable)
+                        .await?;
+
+                    if let Some(topics) = topics {
+                        self.storage
+                            .offset_fetch(
+                                Some(group.group_id.as_str()),
+                                topics.deref(),
+                                require_stable,
+                            )
+                            .await
+                    } else {
+                        self.storage
+                            .committed_offset_topitions(&group.group_id)
+                            .await
+                    }
+                    .map(|offsets| fetched_offsets(offsets, &unstable))
                 }
+                .await
+                .inspect(|offsets| debug!(?offsets))
+                .inspect_err(|err| error!(?err, ?group))
                 .map(|offsets| {
                     OffsetFetchResponseGroup::default()
                         .group_id(group.group_id.clone())
@@ -2001,9 +2033,10 @@ where
                                         .partitions(Some(
                                             offsets
                                                 .iter()
-                                                .filter_map(|(topition, committed)| {
-                                                    if topition.topic() == *topic_name {
-                                                        Some(
+                                                .filter_map(
+                                                    |(topition, (committed, error_code))| {
+                                                        if topition.topic() == *topic_name {
+                                                            Some(
                                                             OffsetFetchResponsePartitions::default(
                                                             )
                                                             .partition_index(topition.partition())
@@ -2014,12 +2047,13 @@ where
                                                             .metadata(Some(fetched_metadata(
                                                                 committed,
                                                             )))
-                                                            .error_code(ErrorCode::None.into()),
+                                                            .error_code((*error_code).into()),
                                                         )
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
+                                                        } else {
+                                                            None
+                                                        }
+                                                    },
+                                                )
                                                 .collect(),
                                         ))
                                 })
@@ -3793,6 +3827,39 @@ fn fetched_leader_epoch(committed: &CommittedOffset) -> i32 {
 /// [`OffsetMetadataManager.fetchOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L769-L774
 fn fetched_metadata(committed: &CommittedOffset) -> String {
     committed.metadata.clone().unwrap_or_default()
+}
+
+/// Pairs each committed offset with the error code that `OffsetFetch` answers for its
+/// partition.
+///
+/// Kafka answers a partition in `unstable` with `UNSTABLE_OFFSET_COMMIT`, offset -1, leader
+/// epoch -1 and metadata `""`, in place of its committed offset ([`GroupMetadataManager.getOffsets`],
+/// [`OffsetMetadataManager.fetchOffsets`], [`OffsetMetadataManager.fetchAllOffsets`]). A
+/// request for every committed offset of the group lists only the partitions with a committed
+/// offset, so a partition that only an open transaction has an offset for is not listed.
+///
+/// [`GroupMetadataManager.getOffsets`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupMetadataManager.scala#L526-L531
+/// [`OffsetMetadataManager.fetchOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L762-L768
+/// [`OffsetMetadataManager.fetchAllOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L829-L835
+fn fetched_offsets(
+    offsets: BTreeMap<Topition, CommittedOffset>,
+    unstable: &BTreeSet<Topition>,
+) -> BTreeMap<Topition, (CommittedOffset, ErrorCode)> {
+    offsets
+        .into_iter()
+        .map(|(topition, committed)| {
+            let fetched = if unstable.contains(&topition) {
+                (
+                    CommittedOffset::uncommitted(),
+                    ErrorCode::UnstableOffsetCommit,
+                )
+            } else {
+                (committed, ErrorCode::None)
+            };
+
+            (topition, fetched)
+        })
+        .collect()
 }
 
 /// Returns the error code that an `OffsetFetch` reports when storage fails

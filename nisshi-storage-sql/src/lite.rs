@@ -18,8 +18,8 @@ use crate::{
     sql::{
         Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_produce_partition_check,
-        txn_produce_partition_select, watermark_select_for_write,
+        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -2049,6 +2049,17 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let start = SystemTime::now();
+        self.inner.pending_txn_offsets(group_id).await.inspect(|_| {
+            ENGINE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "pending_txn_offsets")],
+            )
+        })
+    }
+
+    #[instrument(skip_all)]
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,
@@ -3625,6 +3636,44 @@ impl Storage for Delegate {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
                 &[KeyValue::new("operation", "committed_offset_topitions")],
+            )
+        })
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let start = SystemTime::now();
+
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                txn_offset_commit_tp_select_pending::QUERY,
+                (self.cluster.as_str(), group_id),
+            )
+            .await
+            .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?;
+
+        let columns = ResultColumns::libsql(txn_offset_commit_tp_select_pending::QUERY, &rows);
+        let topic = columns.index(txn_offset_commit_tp_select_pending::TOPIC)? as i32;
+        let partition = columns.index(txn_offset_commit_tp_select_pending::PARTITION)? as i32;
+
+        let mut pending = BTreeSet::new();
+
+        while let Some(row) = rows.next().await? {
+            _ = pending.insert(Topition::new(
+                row.get_str(topic)?,
+                row.get::<i32>(partition)?,
+            ));
+        }
+
+        debug!(cluster = self.cluster, group_id, ?pending);
+
+        Ok(pending).inspect(|_| {
+            DELEGATE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "pending_txn_offsets")],
             )
         })
     }

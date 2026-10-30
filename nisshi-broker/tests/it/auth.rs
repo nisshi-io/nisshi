@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -934,6 +934,14 @@ impl Storage for Engine {
         &self,
         _group_id: &str,
     ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn pending_txn_offsets(
+        &self,
+        _group_id: &str,
+    ) -> nisshi_storage::Result<BTreeSet<Topition>> {
         unimplemented!()
     }
 

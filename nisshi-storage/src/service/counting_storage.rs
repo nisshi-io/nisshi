@@ -233,6 +233,10 @@ impl Storage for CountingStorage {
         unimplemented!()
     }
 
+    async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
+        unimplemented!()
+    }
+
     async fn offset_fetch(
         &self,
         _group_id: Option<&str>,

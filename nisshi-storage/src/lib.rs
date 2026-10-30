@@ -1917,6 +1917,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Vec<(Topition, ErrorCode)>>;
 
     /// Fetch committed offsets for one or more topic partitions in a consumer group.
+    ///
+    /// The group coordinator answers `require_stable` with
+    /// [`Storage::pending_txn_offsets`], so an engine may ignore it here.
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,
@@ -1929,6 +1932,20 @@ pub trait Storage: Debug + Send + Sync + 'static {
         &self,
         group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>>;
+
+    /// Returns the partitions for which an open transaction has committed an offset of the
+    /// consumer group with `TxnOffsetCommit`, and has not yet ended.
+    ///
+    /// The current epoch of each transactional producer counts, and an earlier epoch only
+    /// while its end is prepared and waits behind an older open transaction: an
+    /// `InitProducerId` that moves the producer to a new epoch ends its earlier open
+    /// transaction in Kafka. An `OffsetFetch` with `require_stable` answers
+    /// `UNSTABLE_OFFSET_COMMIT` for each of these partitions.
+    ///
+    /// A transaction that only commits offsets, with no `AddPartitionsToTxn`, is not timed
+    /// out: its partitions stay unstable until its `EndTxn`, or until an `InitProducerId`
+    /// moves its producer to a new epoch.
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
@@ -2189,6 +2206,10 @@ where
         group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
@@ -2466,6 +2487,10 @@ where
         group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
