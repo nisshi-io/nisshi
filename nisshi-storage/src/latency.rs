@@ -28,8 +28,7 @@ use nisshi_sans_io::{
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated,
+    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use rand::{prelude::*, rngs::SmallRng};
@@ -39,10 +38,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 #[derive(Clone, Debug)]
@@ -201,7 +200,7 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.introduce_latency().await?;
 
         self.storage
@@ -209,7 +208,10 @@ where
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.introduce_latency().await?;
 
         self.storage.committed_offset_topitions(group_id).await
@@ -267,10 +269,10 @@ where
         self.storage.describe_config(name, resource, keys).await
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         self.introduce_latency().await?;
 
-        self.storage.list_groups(states_filter).await
+        self.storage.list_groups().await
     }
 
     async fn delete_groups(

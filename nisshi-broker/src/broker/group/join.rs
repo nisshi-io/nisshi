@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use nisshi_sans_io::{ApiKey, Frame, FrameInput, Header, JoinGroupRequest};
+use nisshi_service::PeerAddressExtension;
 use rama::Service;
 use tracing::instrument;
 
@@ -44,12 +45,18 @@ where
             .client_id()
             .map(|client_id| client_id.map(|client_id| client_id.to_owned()))?;
 
+        let client_host = req
+            .extensions
+            .get_ref::<PeerAddressExtension>()
+            .map(PeerAddressExtension::client_host);
+
         let join_group = JoinGroupRequest::try_from(req.frame.body)?;
 
         self.coordinator
             .join(
                 api_version,
                 client_id.as_deref(),
+                client_host.as_deref(),
                 join_group.group_id.as_str(),
                 join_group.session_timeout_ms,
                 join_group.rebalance_timeout_ms,

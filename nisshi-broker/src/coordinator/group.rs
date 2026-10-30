@@ -40,12 +40,14 @@ pub struct OffsetCommit<'a> {
 pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
     /// Handles a `JoinGroup` of `api_version`, which decides whether a dynamic member without a
     /// member id gets `MEMBER_ID_REQUIRED`. A `rebalance_timeout_ms` of `None`, from version 0,
-    /// means the session timeout.
+    /// means the session timeout. `client_host` is the client's address as `DescribeGroups`
+    /// reports it, or `None` for a connection that the broker did not accept itself.
     #[allow(clippy::too_many_arguments)]
     async fn join(
         &self,
         api_version: i16,
         client_id: Option<&str>,
+        client_host: Option<&str>,
         group_id: &str,
         session_timeout_ms: i32,
         rebalance_timeout_ms: Option<i32>,
@@ -97,4 +99,14 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
     /// (`NON_EMPTY_GROUP`), and forgetting the in-memory state that this
     /// coordinator held for each group it deletes.
     async fn delete_groups(&self, group_ids: &[String]) -> Result<Body>;
+
+    /// Lists every group whose state matches `states_filter`, with its state at the current time.
+    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Body>;
+
+    /// Describes each group in `group_ids` as it is at the current time.
+    async fn describe_groups(
+        &self,
+        group_ids: Option<&[String]>,
+        include_authorized_operations: bool,
+    ) -> Result<Body>;
 }

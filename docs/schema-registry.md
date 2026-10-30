@@ -1,6 +1,6 @@
 # Schema Registry
 
-Tansu has a schema registry that supports [JSON schema](json-schema-org),
+Nisshi has a schema registry that supports [JSON schema](json-schema-org),
 [Apache Avro](https://avro.apache.org) and [Protocol buffers](protocol-buffers),
 that is embedded in the broker.
 
@@ -10,6 +10,9 @@ schemas used to validate messages.
 When a message is produced to a topic with an associated schema,
 the message is validated against the schema. If a message does not conform to its
 schema it is rejected by the broker with an `INVALID_RECORD` error.
+An Apache Avro key or value must be an Avro object container whose `avro.codec`
+is `null` or absent. The broker rejects a container with any other codec, such as
+`deflate`, `snappy` or `zstandard`, with `INVALID_RECORD`.
 
 Each schema is found in the root directory of the registry, named after the topic.
 A `.json` extension is used for JSON schema, `.avsc` for Apache Avro, and  `.proto` for Protocol buffers.
@@ -147,11 +150,11 @@ message Value {
 
 This example uses JSON schema as it is simpler to use with the Apache Kafka command line tools.
 
-The person schema can be found in the `etc/schema` directory of the Tansu GitHub
-repository. This directory is also used when starting Tansu using
+The person schema can be found in the `etc/schema` directory of the Nisshi GitHub
+repository. This directory is also used when starting Nisshi using
 the `just nisshi-broker` recipe or Docker compose.
 
-Starting Tansu with schema validation enabled:
+Starting Nisshi with schema validation enabled:
 
 ```shell
 target/debug/nisshi broker --schema-registry file://./etc/schema 2>&1 | tee nisshi.log
@@ -163,16 +166,34 @@ Create the person topic:
 target/debug/nisshi topic create person
 ```
 
+The command prints:
+
+```shell
+Created topic person with 3 partitions.
+```
+
 Produce a message that is valid for the person schema:
 
 ```shell
 echo '{"key": "345-67-6543", "value": {"firstName": "John", "lastName": "Doe", "age": 21}}' | target/debug/nisshi cat produce person
 ```
 
+The command prints:
+
+```shell
+Produced 1 message to person partition 0, offset 0.
+```
+
 Produce a message that is invalid for the person schema (the `age` must be greater to equal to 0):
 
 ```shell
 echo '{"key": "567-89-8765", "value":	{"firstName": "John", "lastName": "Doe", "age": -1}}' | ./target/debug/nisshi cat produce person
+```
+
+The command prints no confirmation, exits with status 1, and prints the error that the broker returned:
+
+```shell
+2024-12-19T11:51:28.408011Z ERROR nisshi: 57: This record has failed the validation on broker and hence will be rejected.
 ```
 
 The server log contains the reason for the message being rejected:

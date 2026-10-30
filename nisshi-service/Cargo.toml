@@ -1,6 +1,6 @@
 [package]
 name = "nisshi-service"
-description = "Tansu protocol services and layers"
+description = "Nisshi protocol services and layers"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

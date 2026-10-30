@@ -12,16 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::{self, Display, Formatter};
+
 use async_trait::async_trait;
 use nisshi_storage::{
-    ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration, reject_unrecognized_options,
+    ArcDynStorage, Result, StorageCapabilities, StorageFactory, StorageFactoryConfiguration,
+    reject_unrecognized_options,
 };
 use regex::Regex;
 
-use super::Engine;
+use super::{BUSY_TIMEOUT, COMPACTION, Engine, MODE};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LiteFactory;
+
+impl Display for LiteFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("SQLite (sqlite://)")
+    }
+}
 
 #[async_trait]
 impl StorageFactory for LiteFactory {
@@ -29,10 +38,16 @@ impl StorageFactory for LiteFactory {
         Regex::new(r"sqlite").map_err(Into::into)
     }
 
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities {
+            user_credentials: true,
+        }
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
         reject_unrecognized_options(
             &configuration.storage,
-            &["vacuum_into", "busy_timeout", "compaction", "mode"],
+            &["vacuum_into", BUSY_TIMEOUT, COMPACTION, MODE],
         )?;
 
         Engine::builder()

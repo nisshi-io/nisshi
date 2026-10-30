@@ -1,3 +1,5 @@
+<!-- Changes other than small fixes, typos and docs need an approved issue first. See CONTRIBUTING.md. -->
+
 ## What changes, and why?
 
 <!-- What a user or operator sees differently, and why. Link an issue if one exists. -->

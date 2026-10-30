@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use nisshi_schema::redact_url;
 use nisshi_storage::{
-    ArcDynStorage, Error, Result, StartupFailure, Storage as _, StorageFactory,
-    StorageFactoryConfiguration,
+    ArcDynStorage, Error, Result, StartupFailure, Storage as _, StorageCapabilities,
+    StorageFactory, StorageFactoryConfiguration,
 };
 use regex::Regex;
 
@@ -27,10 +30,22 @@ use super::Postgres;
 #[derive(Clone, Copy, Debug)]
 pub struct PostgresFactory;
 
+impl Display for PostgresFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("PostgreSQL (postgres://)")
+    }
+}
+
 #[async_trait]
 impl StorageFactory for PostgresFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"postgres|postgresql").map_err(Into::into)
+    }
+
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities {
+            user_credentials: true,
+        }
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {

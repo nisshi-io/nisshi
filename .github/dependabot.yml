@@ -167,3 +167,32 @@ updates:
           - "version-update:semver-minor"
     cooldown:
       default-days: 7
+  # compose.yaml pins each image by tag and digest. The `docker` ecosystem
+  # reads Dockerfiles only, so compose files need their own entry. Dependabot
+  # reads the default of a `${VAR:-default}` image, so this entry refreshes the
+  # `POSTGRES_IMAGE` and `LAKEKEEPER_IMAGE` defaults. It does not read the
+  # justfile recipes, so the maintainer bumps the images there by hand.
+  # The `POSTGRES_IMAGE: postgres:18` values in ci.yml (four jobs) and tier-c.yml
+  # (two jobs) and the fallback in nisshi-smoke-test/run.sh must keep the major
+  # version of the compose default. The mirror action rejects `@sha256`, so they
+  # stay unpinned.
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "saturday"
+      time: "06:00"
+      timezone: "America/Toronto"
+    target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    ignore:
+      # The compose default stays on the major that README.md documents and the
+      # nightly matrix tests. Dependabot refreshes its digest; a person moves
+      # the major.
+      - dependency-name: "postgres"
+        update-types:
+          - "version-update:semver-major"
+    cooldown:
+      default-days: 7

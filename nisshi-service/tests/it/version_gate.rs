@@ -15,15 +15,18 @@
 //! Tests for the version gate on each route registered through `with_capped_route`, and for
 //! the `ApiVersions` reply to a request outside the protocol range.
 
+use std::assert_matches;
+
 use bytes::Bytes;
 use nisshi_sans_io::{
     AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey as _, ApiVersionsRequest,
     ApiVersionsResponse, Body, BytesInput, ErrorCode, Frame, FrameInput, Header,
     ListOffsetsRequest, ListOffsetsResponse, ProduceRequest, ProduceResponse, RequestInput,
+    api_versions_response::ApiVersion,
 };
 use nisshi_service::{
     BytesFrameLayer, BytesTcpService, CAPPED_API_VERSIONS, FrameRouteService, ResponseService,
-    TcpListenerInput, TcpListenerLayer, TcpStreamLayer,
+    TcpBytesLayer, TcpListenerInput, TcpListenerLayer,
 };
 use rama::{
     Layer as _, Service,
@@ -37,8 +40,16 @@ use tracing::debug;
 use crate::common::Error;
 
 /// A `FrameRouteService` with a stub handler for each capped API.
-fn capped_frame_route() -> Result<FrameRouteService<Error>, Error> {
-    FrameRouteService::<Error>::builder()
+fn capped_frame_route<E>() -> Result<FrameRouteService<E>, Error>
+where
+    E: std::error::Error
+        + From<nisshi_sans_io::Error>
+        + From<nisshi_service::Error>
+        + Send
+        + Sync
+        + 'static,
+{
+    FrameRouteService::<E>::builder()
         .with_capped_route::<ListOffsetsRequest, _>(ResponseService::new(
             |_: RequestInput<ListOffsetsRequest>| {
                 Ok::<_, nisshi_service::Error>(ListOffsetsResponse::default())
@@ -137,17 +148,47 @@ async fn version_outside_the_cap_closes_the_connection() -> Result<(), Error> {
     Ok(())
 }
 
-// `ApiVersionsRequest` v5 adds `ClusterId` and `NodeId` as non-tagged fields
-// ([ApiVersionsRequest.json#L27-L42]). This build's decoder knows versions 0-4, so it fails
-// on a v5 body with `ClusterId` set. The broker answers without decoding the body, at v0,
-// with `UNSUPPORTED_VERSION` and the `ApiVersions` range that the client retries with.
-//
-// [ApiVersionsRequest.json#L27-L42]: https://github.com/apache/kafka/blob/e90d6f42c2957f2b970266e3c5b0ff2ebf972b59/clients/src/main/resources/common/message/ApiVersionsRequest.json#L27-L42
-#[tokio::test]
-async fn api_versions_above_the_protocol_range_is_answered_at_v0() -> Result<(), Error> {
+/// The correlation id of each `ApiVersions` request above the protocol range below.
+const UNSUPPORTED_CORRELATION_ID: i32 = 7;
+
+/// The correlation id of [`API_VERSIONS_V4`].
+const V4_CORRELATION_ID: i32 = 8;
+
+/// An `ApiVersions` v4 request, inside the protocol range.
+#[rustfmt::skip]
+const API_VERSIONS_V4: &[u8] = &[
+    0, 0, 0, 16,          // size
+    0, 18,                // api_key = ApiVersionsRequest::KEY
+    0, 4,                 // api_version = 4
+    0, 0, 0, 8,           // correlation_id = V4_CORRELATION_ID
+    0xff, 0xff,           // client_id = null
+    0x00,                 // header tag buffer: empty
+    0x02, b'a',           // client_software_name = "a" (compact string, length + 1)
+    0x02, b'1',           // client_software_version = "1"
+    0x00,                 // body tag buffer: empty
+];
+
+/// Sends `request`, an `ApiVersions` request above the protocol range, to a broker with the
+/// capped routes, and checks that the broker answers it as Kafka does
+/// ([ApiVersionsRequest.java#L112-L129]): at v0, with `UNSUPPORTED_VERSION`, and with only the
+/// `ApiVersions` range that the client retries with.
+///
+/// Then sends [`API_VERSIONS_V4`] on the same connection and checks that the reply lists every
+/// route. This shows that the broker kept the connection open.
+///
+/// The broker must skip the body of such a request, because a later version adds fields that
+/// this build's decoder does not know. `ApiVersionsRequest` v5 adds `ClusterId` and `NodeId` as
+/// non-tagged fields ([ApiVersionsRequest.json#L27-L42]).
+///
+/// [ApiVersionsRequest.java#L112-L129]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiVersionsRequest.java#L112-L129
+/// [ApiVersionsRequest.json#L27-L42]: https://github.com/apache/kafka/blob/e90d6f42c2957f2b970266e3c5b0ff2ebf972b59/clients/src/main/resources/common/message/ApiVersionsRequest.json#L27-L42
+async fn assert_answered_at_v0(request: &'static [u8]) -> Result<(), Error> {
     let _guard = crate::common::init_tracing()?;
 
-    let frame_route = FrameRouteService::<nisshi_service::Error>::builder().build()?;
+    // The capped routes make the full list longer than the `ApiVersions` entry alone.
+    let frame_route = capped_frame_route::<nisshi_service::Error>()?;
+    let mut route_keys = frame_route.api_keys().collect::<Vec<_>>();
+    route_keys.sort_unstable();
 
     let cancellation = CancellationToken::new();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -158,7 +199,7 @@ async fn api_versions_above_the_protocol_range_is_answered_at_v0() -> Result<(),
         let cancellation = cancellation.clone();
         let server = (
             TcpListenerLayer::new(cancellation),
-            TcpStreamLayer,
+            TcpBytesLayer,
             BytesFrameLayer::default(),
         )
             .into_layer(frame_route);
@@ -179,24 +220,15 @@ async fn api_versions_above_the_protocol_range_is_answered_at_v0() -> Result<(),
     );
     let client = BytesTcpService::new(stream);
 
-    #[rustfmt::skip]
-    let request_bytes = Bytes::from_static(&[
-        0, 0, 0, 22,          // size
-        0, 18,                // api_key = ApiVersionsRequest::KEY
-        0, 5,                 // api_version = 5
-        0, 0, 0, 7,           // correlation_id = 7
-        0xff, 0xff,           // client_id = null
-        0x00,                 // header tag buffer: empty
-        0x00,                 // client_software_name: compact null
-        0x00,                 // client_software_version: compact null
-        0x04, b'a', b'b', b'c', // cluster_id = "abc" (compact string, length + 1)
-        0, 0, 0, 111,         // node_id = 111
-        0x00,                 // body tag buffer: empty
-    ]);
-
-    let outcome = client
+    let unsupported = client
         .serve(BytesInput {
-            bytes: request_bytes,
+            bytes: Bytes::from_static(request),
+            extensions: Extensions::default(),
+        })
+        .await;
+    let in_range = client
+        .serve(BytesInput {
+            bytes: Bytes::from_static(API_VERSIONS_V4),
             extensions: Extensions::default(),
         })
         .await;
@@ -205,25 +237,184 @@ async fn api_versions_above_the_protocol_range_is_answered_at_v0() -> Result<(),
     let joined = join.join_all().await;
     debug!(?joined);
 
-    let response = Frame::response_from_bytes(outcome?, ApiVersionsRequest::KEY, 0)?;
-    assert!(matches!(
+    let response = Frame::response_from_bytes(unsupported?, ApiVersionsRequest::KEY, 0)?;
+    assert_matches!(
         response.header,
-        Header::Response { correlation_id: 7 }
-    ));
+        Header::Response {
+            correlation_id: UNSUPPORTED_CORRELATION_ID
+        }
+    );
 
     let response = ApiVersionsResponse::try_from(response.body)?;
     assert_eq!(
         ErrorCode::UnsupportedVersion,
         ErrorCode::try_from(response.error_code)?
     );
-
     let api_versions = response
         .api_keys
         .unwrap_or_default()
         .into_iter()
-        .find(|api| api.api_key == ApiVersionsRequest::KEY)
-        .expect("the reply lists ApiVersions");
-    assert_eq!((0, 4), (api_versions.min_version, api_versions.max_version));
+        .map(|api| (api.api_key, api.min_version, api.max_version))
+        .collect::<Vec<_>>();
+    assert_eq!(vec![(ApiVersionsRequest::KEY, 0, 4)], api_versions);
+
+    let response = Frame::response_from_bytes(in_range?, ApiVersionsRequest::KEY, 4)?;
+    assert_matches!(
+        response.header,
+        Header::Response {
+            correlation_id: V4_CORRELATION_ID
+        }
+    );
+
+    let response = ApiVersionsResponse::try_from(response.body)?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+    let mut listed_keys = response
+        .api_keys
+        .unwrap_or_default()
+        .into_iter()
+        .map(|api| api.api_key)
+        .collect::<Vec<_>>();
+    listed_keys.sort_unstable();
+    assert_eq!(route_keys, listed_keys);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn api_versions_v5_with_a_null_cluster_id_is_answered_at_v0() -> Result<(), Error> {
+    #[rustfmt::skip]
+    let request = &[
+        0, 0, 0, 19,          // size
+        0, 18,                // api_key = ApiVersionsRequest::KEY
+        0, 5,                 // api_version = 5
+        0, 0, 0, 7,           // correlation_id = UNSUPPORTED_CORRELATION_ID
+        0xff, 0xff,           // client_id = null
+        0x00,                 // header tag buffer: empty
+        0x00,                 // client_software_name: compact null
+        0x00,                 // client_software_version: compact null
+        0x00,                 // cluster_id: compact null
+        0xff, 0xff, 0xff, 0xff, // node_id = -1
+        0x00,                 // body tag buffer: empty
+    ];
+
+    assert_answered_at_v0(request).await
+}
+
+/// An `ApiVersions` v5 request with `ClusterId` set, as franz-go sends to a broker that it
+/// found in Metadata.
+#[rustfmt::skip]
+const API_VERSIONS_V5: &[u8] = &[
+    0, 0, 0, 22,          // size
+    0, 18,                // api_key = ApiVersionsRequest::KEY
+    0, 5,                 // api_version = 5
+    0, 0, 0, 7,           // correlation_id = UNSUPPORTED_CORRELATION_ID
+    0xff, 0xff,           // client_id = null
+    0x00,                 // header tag buffer: empty
+    0x00,                 // client_software_name: compact null
+    0x00,                 // client_software_version: compact null
+    0x04, b'a', b'b', b'c', // cluster_id = "abc" (compact string, length + 1)
+    0, 0, 0, 111,         // node_id = 111
+    0x00,                 // body tag buffer: empty
+];
+
+#[tokio::test]
+async fn api_versions_v5_with_a_cluster_id_is_answered_at_v0() -> Result<(), Error> {
+    assert_answered_at_v0(API_VERSIONS_V5).await
+}
+
+/// A frame service that answers like a Kafka origin with a newer `ApiVersions` range than
+/// this build's, as the origin behind the proxy can be.
+#[derive(Clone, Debug)]
+struct NewerOrigin;
+
+impl Service<FrameInput> for NewerOrigin {
+    type Output = Frame;
+    type Error = nisshi_service::Error;
+
+    async fn serve(&self, _req: FrameInput) -> Result<Self::Output, Self::Error> {
+        Ok(Frame {
+            size: 0,
+            header: Header::Response { correlation_id: 0 },
+            body: ApiVersionsResponse::default()
+                .error_code(ErrorCode::None.into())
+                .api_keys(Some(vec![
+                    ApiVersion::default()
+                        .api_key(ApiVersionsRequest::KEY)
+                        .min_version(0)
+                        .max_version(5),
+                    ApiVersion::default()
+                        .api_key(ProduceRequest::KEY)
+                        .min_version(3)
+                        .max_version(12),
+                ]))
+                .into(),
+        })
+    }
+}
+
+// The reply must offer a version that this build accepts. franz-go retries only at a version
+// lower than the one it sent, and fails the connection otherwise.
+#[tokio::test]
+async fn api_versions_reply_lists_this_builds_range_not_the_inner_services() -> Result<(), Error> {
+    let _guard = crate::common::init_tracing()?;
+
+    let service = BytesFrameLayer::default().into_layer(NewerOrigin);
+    let response = service
+        .serve(BytesInput {
+            bytes: Bytes::from_static(API_VERSIONS_V5),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let response = Frame::response_from_bytes(response, ApiVersionsRequest::KEY, 0)?;
+    let response = ApiVersionsResponse::try_from(response.body)?;
+    assert_eq!(
+        ErrorCode::UnsupportedVersion,
+        ErrorCode::try_from(response.error_code)?
+    );
+    let api_versions = response
+        .api_keys
+        .unwrap_or_default()
+        .into_iter()
+        .map(|api| (api.api_key, api.min_version, api.max_version))
+        .collect::<Vec<_>>();
+    assert_eq!(vec![(ApiVersionsRequest::KEY, 0, 4)], api_versions);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_versions_v6_with_unknown_fields_is_answered_at_v0() -> Result<(), Error> {
+    #[rustfmt::skip]
+    let request = &[
+        0, 0, 0, 26,          // size
+        0, 18,                // api_key = ApiVersionsRequest::KEY
+        0, 6,                 // api_version = 6
+        0, 0, 0, 7,           // correlation_id = UNSUPPORTED_CORRELATION_ID
+        0xff, 0xff,           // client_id = null
+        0x00,                 // header tag buffer: empty
+        0x00,                 // client_software_name: compact null
+        0x00,                 // client_software_version: compact null
+        0x04, b'a', b'b', b'c', // cluster_id = "abc" (compact string, length + 1)
+        0, 0, 0, 111,         // node_id = 111
+        0x00,                 // body tag buffer: empty
+        0xde, 0xad, 0xbe, 0xef, // fields that this build does not know
+    ];
+
+    assert_answered_at_v0(request).await
+}
+
+#[tokio::test]
+async fn api_versions_v32767_with_an_empty_body_is_answered_at_v0() -> Result<(), Error> {
+    #[rustfmt::skip]
+    let request = &[
+        0, 0, 0, 11,          // size: the header only
+        0, 18,                // api_key = ApiVersionsRequest::KEY
+        0x7f, 0xff,           // api_version = 32767
+        0, 0, 0, 7,           // correlation_id = UNSUPPORTED_CORRELATION_ID
+        0xff, 0xff,           // client_id = null
+        0x00,                 // header tag buffer: empty
+    ];
+
+    assert_answered_at_v0(request).await
 }

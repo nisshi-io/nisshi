@@ -38,7 +38,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     offset_fetch_request::{
         OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
     },
@@ -46,9 +45,9 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential,
-    Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, UpdateError, Version,
 };
 use tracing::instrument;
@@ -81,7 +80,7 @@ impl FailingOffsets {
         &self,
         group_id: &str,
         topics: &[Topition],
-    ) -> nisshi_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         if self.failing.contains(group_id) {
             Err(Error::Message(format!(
                 "offsets of {group_id} are unavailable"
@@ -91,7 +90,16 @@ impl FailingOffsets {
         } else {
             Ok(topics
                 .iter()
-                .map(|topition| (topition.clone(), OFFSET))
+                .map(|topition| {
+                    (
+                        topition.clone(),
+                        CommittedOffset {
+                            offset: OFFSET,
+                            leader_epoch: None,
+                            metadata: None,
+                        },
+                    )
+                })
                 .collect())
         }
     }
@@ -352,7 +360,7 @@ impl Storage for FailingOffsets {
     async fn committed_offset_topitions(
         &self,
         group_id: &str,
-    ) -> nisshi_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         self.offsets(group_id, &[Topition::new(TOPIC, 0)])
     }
 
@@ -362,7 +370,7 @@ impl Storage for FailingOffsets {
         group_id: Option<&str>,
         topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> nisshi_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         self.offsets(group_id.unwrap_or_default(), topics)
     }
 
@@ -404,10 +412,7 @@ impl Storage for FailingOffsets {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(
-        &self,
-        _states_filter: Option<&[String]>,
-    ) -> nisshi_storage::Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> nisshi_storage::Result<Vec<NamedGroupDetail>> {
         unimplemented!()
     }
 

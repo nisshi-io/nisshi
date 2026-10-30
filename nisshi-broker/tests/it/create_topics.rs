@@ -16,7 +16,8 @@ use crate::common::{alphanumeric_string, init_tracing};
 use nisshi_broker::Error;
 use nisshi_sans_io::{
     CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID, RequestInput,
-    create_topics_request::{CreatableReplicaAssignment, CreatableTopic},
+    create_topics_request::{CreatableReplicaAssignment, CreatableTopic, CreatableTopicConfig},
+    create_topics_response::CreatableTopicResult,
     describe_topic_partitions_request::TopicRequest,
 };
 use nisshi_storage::{
@@ -95,7 +96,7 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
     assert_eq!(1, topics.len());
     assert_eq!(name, topics[0].name.as_str());
     assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(3), topics[0].num_partitions);
+    assert_eq!(Some(1), topics[0].num_partitions);
     assert_eq!(Some(1), topics[0].replication_factor);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
@@ -117,7 +118,7 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
     let partitions = topics[0].partitions.as_deref().unwrap_or_default();
 
-    assert_eq!(3, partitions.len());
+    assert_eq!(1, partitions.len());
 
     for (index, partition) in partitions.iter().enumerate() {
         assert_eq!(index as i32, partition.partition_index);
@@ -373,7 +374,7 @@ async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<()
     assert_eq!(1, topics.len());
     assert_eq!(name, topics[0].name.as_str());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-    assert_eq!(Some(3), topics[0].num_partitions);
+    assert_eq!(Some(1), topics[0].num_partitions);
 
     Ok(())
 }
@@ -709,16 +710,16 @@ async fn total_partitions_cap_rejected(storage: impl Storage + Clone) -> Result<
     };
 
     let cases = [
-        // A `-1` topic counts as the broker default of 3 partitions.
+        // A `-1` topic counts as the broker default of 1 partition.
         (
-            "9,997 + default",
-            vec![topic(9_997, 0), topic(-1, 0)],
+            "9,999 + default",
+            vec![topic(9_999, 0), topic(-1, 0)],
             false,
             ErrorCode::InvalidTopicException,
         ),
         (
-            "9,998 + default",
-            vec![topic(9_998, 0), topic(-1, 0)],
+            "10,000 + default",
+            vec![topic(10_000, 0), topic(-1, 0)],
             false,
             ErrorCode::PolicyViolation,
         ),
@@ -817,6 +818,263 @@ async fn mixed_batch_partial_success_replication_factor(
     assert_eq!(valid_name, topics[1].name.as_str());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[1].error_code)?);
     assert_ne!(Some(NULL_TOPIC_ID), topics[1].topic_id);
+
+    Ok(())
+}
+
+/// A topic must not be created with a `retention.ms` or `retention.bytes` that Kafka rejects:
+/// maintenance reads the value, and a `retention.ms` below -1 or a value that isn't a long makes it
+/// delete every record or fail for every topic.
+async fn invalid_retention_config_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+        storage: storage.clone(),
+    });
+    let describe = DescribeTopicPartitionsService {
+        storage: storage.clone(),
+    };
+
+    for validate_only in [false, true] {
+        for (key, value, reason) in [
+            ("retention.ms", "-2", "Value must be at least -1"),
+            ("retention.ms", "abc", "Not a number of type LONG"),
+            (
+                "retention.bytes",
+                "99999999999999999999",
+                "Not a number of type LONG",
+            ),
+        ] {
+            let name = alphanumeric_string(15);
+
+            let response = service
+                .serve(RequestInput {
+                    request: CreateTopicsRequest::default()
+                        .topics(Some(vec![
+                            CreatableTopic::default()
+                                .name(name.clone())
+                                .num_partitions(1)
+                                .replication_factor(1)
+                                .assignments(Some([].into()))
+                                .configs(Some(vec![
+                                    CreatableTopicConfig::default()
+                                        .name(key.into())
+                                        .value(Some(value.into())),
+                                ])),
+                        ]))
+                        .validate_only(Some(validate_only)),
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            let topics = response.topics.unwrap_or_default();
+            assert_eq!(1, topics.len());
+            assert_eq!(
+                ErrorCode::InvalidConfig,
+                ErrorCode::try_from(topics[0].error_code)?,
+                "{key}={value}, validate_only = {validate_only}"
+            );
+            assert_eq!(
+                Some(format!("Invalid value {value} for configuration {key}: {reason}").as_str()),
+                topics[0].error_message.as_deref()
+            );
+
+            let describe_response = describe
+                .serve(RequestInput {
+                    request: DescribeTopicPartitionsRequest::default()
+                        .topics(Some([TopicRequest::default().name(name.clone())].into())),
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            let describe_topics = describe_response.topics.unwrap_or_default();
+            assert_eq!(
+                ErrorCode::UnknownTopicOrPartition,
+                ErrorCode::try_from(describe_topics[0].error_code)?,
+                "{key}={value}, validate_only = {validate_only} must never have reached storage"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Kafka answers `TOPIC_ALREADY_EXISTS` for an existing topic before it checks the topic's
+/// configs. A client that treats that answer as success, and repeats a create whose configs the
+/// broker rejects, must not fail.
+async fn existing_topic_with_invalid_config_already_exists(
+    storage: impl Storage + Clone,
+) -> Result<(), Error> {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
+    let name = alphanumeric_string(15);
+
+    for (configs, expected) in [
+        (vec![], ErrorCode::None),
+        (
+            vec![
+                CreatableTopicConfig::default()
+                    .name("retention.ms".into())
+                    .value(Some("-2".into())),
+            ],
+            ErrorCode::TopicAlreadyExists,
+        ),
+    ] {
+        let response = service
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .topics(Some(vec![
+                        CreatableTopic::default()
+                            .name(name.clone())
+                            .num_partitions(1)
+                            .replication_factor(1)
+                            .assignments(Some([].into()))
+                            .configs(Some(configs)),
+                    ]))
+                    .validate_only(Some(false)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(expected, ErrorCode::try_from(topics[0].error_code)?);
+    }
+
+    Ok(())
+}
+
+/// Serves one `CreateTopics` request for `topics`, each with one partition, one replica and the
+/// given configs, and returns the topic results.
+async fn create_topics(
+    storage: impl Storage + Clone,
+    topics: &[(&str, Vec<CreatableTopicConfig>)],
+    validate_only: bool,
+) -> Result<Vec<CreatableTopicResult>, Error> {
+    let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
+
+    let response = service
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(
+                    topics
+                        .iter()
+                        .map(|(name, configs)| {
+                            CreatableTopic::default()
+                                .name((*name).into())
+                                .num_partitions(1)
+                                .replication_factor(1)
+                                .assignments(Some([].into()))
+                                .configs(Some(configs.clone()))
+                        })
+                        .collect(),
+                ))
+                .validate_only(Some(validate_only)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    Ok(response.topics.unwrap_or_default())
+}
+
+/// Kafka refuses a topic whose name differs from an existing topic's only by '.' and '_',
+/// because its per-topic metric names map '.' to '_'. It checks the name against existing
+/// topics only, before it checks the configs, and an exact match is `TOPIC_ALREADY_EXISTS`.
+async fn colliding_name_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
+    let prefix = alphanumeric_string(15);
+    let period = format!("{prefix}.x");
+    let underscore = format!("{prefix}_x");
+
+    let topics = create_topics(storage.clone(), &[(&period, vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    for validate_only in [false, true] {
+        let topics =
+            create_topics(storage.clone(), &[(&underscore, vec![])], validate_only).await?;
+        assert_eq!(1, topics.len());
+        assert_eq!(
+            ErrorCode::InvalidTopicException,
+            ErrorCode::try_from(topics[0].error_code)?,
+            "validate_only = {validate_only}"
+        );
+        assert_eq!(
+            Some(format!("Topic '{underscore}' collides with existing topic: {period}").as_str()),
+            topics[0].error_message.as_deref()
+        );
+        assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
+    }
+
+    let topics = create_topics(storage.clone(), &[(&period, vec![])], false).await?;
+    assert_eq!(
+        ErrorCode::TopicAlreadyExists,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+
+    let hyphen = format!("{prefix}-x");
+    let topics = create_topics(storage.clone(), &[(&hyphen, vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let invalid_retention = vec![
+        CreatableTopicConfig::default()
+            .name("retention.ms".into())
+            .value(Some("-2".into())),
+    ];
+    let topics = create_topics(storage.clone(), &[(&underscore, invalid_retention)], false).await?;
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+
+    let prefix = alphanumeric_string(15);
+    let underscore = format!("{prefix}_x");
+    let period = format!("{prefix}.x");
+
+    let topics = create_topics(storage.clone(), &[(&underscore, vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let topics = create_topics(storage.clone(), &[(&period, vec![])], false).await?;
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(
+        Some(format!("Topic '{period}' collides with existing topic: {underscore}").as_str()),
+        topics[0].error_message.as_deref()
+    );
+
+    // Kafka checks a name against the topics that exist before the request, so two names in
+    // one request do not collide with each other.
+    let prefix = alphanumeric_string(15);
+    let period = format!("{prefix}.x");
+    let underscore = format!("{prefix}_x");
+
+    let topics = create_topics(
+        storage.clone(),
+        &[(&period, vec![]), (&underscore, vec![])],
+        false,
+    )
+    .await?;
+    assert_eq!(2, topics.len());
+    for topic in topics {
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(topic.error_code)?,
+            "{}",
+            topic.name
+        );
+    }
+
+    // Kafka checks an invalid name for a collision too, and the collision message replaces the
+    // invalid-name message.
+    let topics = create_topics(storage.clone(), &[("_", vec![])], false).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    let topics = create_topics(storage, &[(".", vec![])], false).await?;
+    assert_eq!(
+        ErrorCode::InvalidTopicException,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(
+        Some("Topic '.' collides with existing topic: _"),
+        topics[0].error_message.as_deref()
+    );
 
     Ok(())
 }
@@ -1031,6 +1289,48 @@ mod in_memory {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn colliding_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::colliding_name_rejected(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -1172,6 +1472,48 @@ mod lite {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success_replication_factor(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn colliding_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::colliding_name_rejected(storage).await?;
 
         Ok(())
     }
@@ -1319,6 +1661,34 @@ mod slatedb {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -1460,6 +1830,48 @@ mod pg {
         let storage = storage_container(cluster_id, broker_id).await?;
 
         super::mixed_batch_partial_success_replication_factor(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_retention_config_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_retention_config_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_topic_with_invalid_config_already_exists() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::existing_topic_with_invalid_config_already_exists(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn colliding_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::colliding_name_rejected(storage).await?;
 
         Ok(())
     }

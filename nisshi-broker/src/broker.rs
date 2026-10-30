@@ -32,8 +32,10 @@ use nisshi_schema::{
     lake::{House, LakeHouseType},
     redact_url,
 };
-use nisshi_service::ProgressBarExtension;
-use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
+use nisshi_service::{PeerAddressExtension, ProgressBarExtension};
+use nisshi_storage::{
+    ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicCreationConfig,
+};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
@@ -43,14 +45,13 @@ use std::{
     io::{self, ErrorKind},
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
-    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, lookup_host},
     task::{AbortHandle, JoinSet},
     time::{self, Instant, sleep, timeout},
 };
@@ -179,6 +180,89 @@ fn bind_listener(addr: SocketAddr) -> io::Result<StdTcpListener> {
         .map(StdTcpListener::from)
 }
 
+/// Binds the broker's listener to `addr`, as [`bind_listener`] does.
+///
+/// # Errors
+///
+/// Returns [`Error::ListenerInUse`] when another socket already listens on `addr`.
+fn bind(addr: SocketAddr) -> Result<TcpListener> {
+    bind_listener(addr)
+        .and_then(TcpListener::from_std)
+        .map_err(|err| {
+            if err.kind() == ErrorKind::AddrInUse {
+                Error::ListenerInUse { addr }
+            } else {
+                err.into()
+            }
+        })
+}
+
+/// Returns the address that the broker's listener binds for the `listener` URL.
+///
+/// A URL without a host listens on `[::]`, and the port defaults to 9092. An IP literal is
+/// used as it is: under a non-special scheme such as `tcp`, the `url` crate parses an IPv4
+/// literal as a domain, so a domain is parsed as an IP address before it is looked up. Any
+/// other host name is resolved, as Apache Kafka resolves the host of a listener, and the
+/// listener binds the address that [`preferred_listener_addr`] picks.
+///
+/// # Errors
+///
+/// Returns [`Error::ListenerHostUnresolved`] when the host name resolves to no address.
+async fn listener_addr(listener: &Url) -> Result<SocketAddr> {
+    let port = listener.port().unwrap_or(9092);
+
+    match listener.host() {
+        None => Ok(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))),
+        Some(url::Host::Ipv4(ip)) => Ok(SocketAddr::from((ip, port))),
+        Some(url::Host::Ipv6(ip)) => Ok(SocketAddr::from((ip, port))),
+        Some(url::Host::Domain(domain)) => {
+            if let Ok(ip) = domain.parse::<IpAddr>() {
+                return Ok(SocketAddr::from((ip, port)));
+            }
+
+            let unresolved = |source| Error::ListenerHostUnresolved {
+                host: domain.to_owned(),
+                port,
+                source: Arc::new(source),
+            };
+
+            let resolved = lookup_host((domain, port))
+                .await
+                .map_err(unresolved)?
+                .collect::<Vec<_>>();
+            debug!(domain, ?resolved);
+
+            preferred_listener_addr(resolved)
+                .inspect(|addr| info!(host = domain, %addr, "listener host resolved"))
+                .ok_or_else(|| {
+                    unresolved(io::Error::new(
+                        ErrorKind::NotFound,
+                        "the name resolved to no address",
+                    ))
+                })
+        }
+    }
+}
+
+/// Picks the address that the listener binds from the addresses that its host name resolved
+/// to: the first IPv4 address, or the first address when there is none.
+///
+/// The JDK does the same by default (`java.net.preferIPv6Addresses=false`), so a name such as
+/// `localhost`, which macOS resolves to `::1` first, binds `127.0.0.1` as Apache Kafka would.
+fn preferred_listener_addr(resolved: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut first = None;
+
+    for addr in resolved {
+        if addr.is_ipv4() {
+            return Some(addr);
+        }
+
+        _ = first.get_or_insert(addr);
+    }
+
+    first
+}
+
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
     node_id: i32,
@@ -188,6 +272,7 @@ pub struct Broker<G, S> {
     advertised_listener: Url,
     storage: S,
     groups: G,
+    topic_creation: TopicCreationConfig,
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
@@ -225,6 +310,7 @@ where
             advertised_listener,
             storage,
             groups,
+            topic_creation: TopicCreationConfig::default(),
 
             sasl_config: None,
             tls_server_config: None,
@@ -291,6 +377,14 @@ where
             v = set.join_next() => {
                 debug!(?v);
                 failure = match v {
+                    // The caller reports these errors with the fix, so they are logged
+                    // here only at debug, to avoid printing them twice.
+                    Some(Ok(Err(
+                        err @ (Error::ListenerInUse { .. } | Error::ListenerHostUnresolved { .. }),
+                    ))) => {
+                        debug!(?err);
+                        Some(err)
+                    }
                     Some(Ok(Err(err))) => {
                         error!(?err);
                         Some(err)
@@ -387,31 +481,12 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
-        let addr = self.listener.host().map_or_else(
-            || {
-                SocketAddr::from((
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    self.listener.port().unwrap_or(9092),
-                ))
-            },
-            |host| {
-                let port = self.listener.port().unwrap_or(9092);
-                debug!(?host, port);
+        let addr = listener_addr(&self.listener).await?;
 
-                match host {
-                    url::Host::Domain(domain) => SocketAddr::from_str(&format!("{domain}:{port}"))
-                        .unwrap_or(SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))),
-                    url::Host::Ipv4(ipv4_addr) => SocketAddr::from((IpAddr::V4(ipv4_addr), port)),
-                    url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
-                }
-            },
-        );
-
-        let listener = bind_listener(addr)
-            .and_then(TcpListener::from_std)
+        let listener = bind(addr)
             .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
-            .inspect_err(|err| {
-                if is_address_family_unsupported(err) {
+            .inspect_err(|err| match err {
+                Error::Io(err) if is_address_family_unsupported(err) => {
                     error!(
                         ?err,
                         %addr,
@@ -419,7 +494,9 @@ where
                          --kafka-listener-url (LISTENER_URL), set it to an address this host \
                          supports, such as tcp://0.0.0.0:9092"
                     );
-                } else {
+                }
+                Error::ListenerInUse { .. } => {}
+                _ => {
                     error!(?err, %addr, %self.advertised_listener, "failed to bind the listener");
                 }
             })?;
@@ -525,6 +602,7 @@ where
                     }
 
                     let extensions = Extensions::default();
+                    _ = extensions.insert(PeerAddressExtension::new(addr));
 
                     let pb = if self.silent {
                         None
@@ -543,6 +621,7 @@ where
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
+                        self.topic_creation,
                         self.sasl_config.clone()
                     )?;
 
@@ -718,6 +797,7 @@ pub struct Builder<N, C, I, A, S, L> {
     tls_server_config: Option<ServerConfig>,
     silent: bool,
     group_coordinator: GroupCoordinatorConfig,
+    topic_creation: TopicCreationConfig,
 
     cancellation: CancellationToken,
 }
@@ -747,6 +827,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
             cancellation: self.cancellation,
         }
     }
@@ -766,6 +847,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -786,6 +868,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -809,6 +892,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -831,6 +915,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -853,6 +938,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -900,6 +986,13 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     pub fn group_coordinator(self, group_coordinator: GroupCoordinatorConfig) -> Self {
         Self {
             group_coordinator,
+            ..self
+        }
+    }
+
+    pub fn topic_creation(self, topic_creation: TopicCreationConfig) -> Self {
+        Self {
+            topic_creation,
             ..self
         }
     }
@@ -959,6 +1052,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .storage(storage)
             .cancellation(self.cancellation.clone())
             .silent(self.silent)
+            .user_credentials_required(self.authentication)
             .build()
             .await
             .map(|storage| Arc::new(storage) as ArcDynStorage)?;
@@ -979,6 +1073,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            topic_creation: self.topic_creation,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
@@ -993,13 +1088,94 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{address_family_unsupported_os_error, arm, configure_listener, ipv4_fallback};
+    use super::{
+        address_family_unsupported_os_error, arm, bind, configure_listener, ipv4_fallback,
+        listener_addr, preferred_listener_addr,
+    };
+    use crate::Error;
     use socket2::{Domain, Protocol, Socket, Type};
     use std::{
-        io,
+        assert_matches, io,
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     };
     use tokio::net::{TcpListener, TcpStream};
+    use url::Url;
+
+    async fn listener_addr_of(listener: &str) -> crate::Result<SocketAddr> {
+        listener_addr(&Url::parse(listener).expect("listener URL")).await
+    }
+
+    /// The `url` crate parses an IPv4 literal under a non-special scheme such as `tcp` as
+    /// `Host::Domain`, so this covers the literal path of the domain arm.
+    #[tokio::test]
+    async fn ipv4_literal_under_tcp_scheme_keeps_its_address() {
+        for (listener, expected) in [
+            (
+                "tcp://127.0.0.1:9092",
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 9092)),
+            ),
+            (
+                "tcp://0.0.0.0:9092",
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9092)),
+            ),
+        ] {
+            assert_matches!(listener_addr_of(listener).await, Ok(addr) if addr == expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_and_missing_host_keep_their_address() {
+        assert_matches!(
+            listener_addr_of("tcp://[::1]:9092").await,
+            Ok(addr) if addr == SocketAddr::from((Ipv6Addr::LOCALHOST, 9092))
+        );
+        assert_matches!(
+            listener_addr_of("tcp:///").await,
+            Ok(addr) if addr == SocketAddr::from((Ipv6Addr::UNSPECIFIED, 9092))
+        );
+    }
+
+    /// `localhost` resolves to `::1` before `127.0.0.1` on macOS. The listener takes the IPv4
+    /// address, as the JDK does by default, so it accepts clients of the default advertised
+    /// listener, `tcp://127.0.0.1:9092`.
+    #[tokio::test]
+    async fn host_name_resolves_instead_of_binding_unspecified() {
+        assert_matches!(
+            listener_addr_of("tcp://localhost:9092").await,
+            Ok(addr) if addr == SocketAddr::from((Ipv4Addr::LOCALHOST, 9092))
+        );
+    }
+
+    /// RFC 6761 reserves `.invalid`, so the lookup goes through the system resolver and
+    /// never succeeds. The trailing dot makes the name fully qualified, so the resolver
+    /// does not append a search domain, which a wildcard record could resolve.
+    #[tokio::test]
+    async fn unresolvable_host_fails_naming_the_host_and_port() {
+        assert_matches!(
+            listener_addr_of("tcp://nisshi-listener.invalid.:9093").await,
+            Err(Error::ListenerHostUnresolved { host, port: 9093, .. })
+                if host == "nisshi-listener.invalid."
+        );
+    }
+
+    #[test]
+    fn preferred_listener_addr_takes_the_first_ipv4_address() {
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9092));
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 9092));
+        let other_v4 = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 9092));
+
+        assert_eq!(Some(v4), preferred_listener_addr([v6, v4, other_v4]));
+        assert_eq!(Some(v6), preferred_listener_addr([v6]));
+        assert_eq!(None, preferred_listener_addr([]));
+    }
+
+    #[tokio::test]
+    async fn binding_an_address_in_use_names_the_address() {
+        let first = bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind a free port");
+        let addr = first.local_addr().expect("local_addr");
+
+        assert_matches!(bind(addr), Err(Error::ListenerInUse { addr: in_use }) if in_use == addr);
+    }
 
     /// The socket starts out IPv6-only, as on a host that defaults new IPv6 sockets to
     /// v6-only, so this test fails on any host if [`arm`] stops clearing `IPV6_V6ONLY`.

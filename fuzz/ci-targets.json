@@ -14,6 +14,7 @@
     "fuzz_create_acls_storage": 900,
     "fuzz_create_topics_storage": 900,
     "fuzz_deflated_batch": 1800,
+    "fuzz_delete_acls_storage": 900,
     "fuzz_delete_groups_storage": 900,
     "fuzz_delete_records_storage": 900,
     "fuzz_delete_topics_storage": 900,

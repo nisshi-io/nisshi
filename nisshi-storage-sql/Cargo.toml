@@ -15,10 +15,11 @@ default = ["libsql", "postgres", "turso"]
 libsql = ["dep:libsql", "dep:deadpool"]
 postgres = ["dep:tokio-postgres", "dep:deadpool", "dep:deadpool-postgres", "dep:tokio-postgres-rustls"]
 turso = ["dep:turso", "nisshi-storage/turso"]
+test-support = []
 
 # docs.rs builds with nightly, where `branches` 0.4 (a dependency of turso) no longer
 # compiles. Remove this table once turso depends on `branches` 0.5.
-# https://github.com/nisshi-io/nisshi/issues/1045
+# https://github.com/nisshi-io/solace-nisshi/issues/1045
 [package.metadata.docs.rs]
 no-default-features = true
 features = ["libsql", "postgres"]

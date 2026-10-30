@@ -17,16 +17,17 @@ use bytes::{Bytes, BytesMut};
 use clap::{Subcommand, ValueEnum};
 use nisshi_client::{Client, ConnectionManager};
 use nisshi_sans_io::{
-    AlterUserScramCredentialsRequest, ErrorCode, ScramMechanism,
+    AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse, ErrorCode, ScramMechanism,
     alter_user_scram_credentials_request::{ScramCredentialDeletion, ScramCredentialUpsertion},
 };
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rand::{Rng as _, rng};
 use sha2::{Sha256, Sha512};
+use std::io::{self, Write};
 use tracing::debug;
 use url::Url;
 
-use super::DEFAULT_BROKER;
+use super::{DEFAULT_BROKER, Outcome};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -161,7 +162,7 @@ impl Command {
         }
     }
 
-    pub(super) async fn main(self) -> Result<ErrorCode> {
+    pub(super) async fn main(self) -> Result<Outcome> {
         let client = ConnectionManager::builder(self.broker())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
@@ -173,18 +174,98 @@ impl Command {
             .deletions(self.deletions())
             .upsertions(self.upsertions());
 
-        _ = client
+        let response = client
             .call(req)
             .await
             .inspect(|response| debug!(?response))?;
 
-        Ok(ErrorCode::None)
+        Ok(Outcome {
+            error_code: report(&response, &mut io::stderr()),
+            reported: true,
+        })
     }
+}
+
+/// Writes a line to `out` for each user that the broker failed to alter, with the broker's
+/// message, and returns the first failure's code, or [`ErrorCode::None`] when every user was
+/// altered.
+fn report(response: &AlterUserScramCredentialsResponse, out: &mut impl Write) -> ErrorCode {
+    let mut first = ErrorCode::None;
+
+    for result in response.results.as_deref().unwrap_or_default() {
+        let error_code =
+            ErrorCode::try_from(result.error_code).unwrap_or(ErrorCode::UnknownServerError);
+
+        if error_code == ErrorCode::None {
+            continue;
+        }
+
+        match result.error_message.as_deref() {
+            Some(message) if !message.is_empty() => {
+                _ = writeln!(out, "user {}: {message} ({error_code:?})", result.user);
+            }
+            _ => _ = writeln!(out, "user {}: {error_code} ({error_code:?})", result.user),
+        }
+
+        if first == ErrorCode::None {
+            first = error_code;
+        }
+    }
+
+    first
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nisshi_sans_io::alter_user_scram_credentials_response::AlterUserScramCredentialsResult;
+
+    fn result(user: &str, error_code: ErrorCode, message: &str) -> AlterUserScramCredentialsResult {
+        AlterUserScramCredentialsResult::default()
+            .user(user.into())
+            .error_code(error_code.into())
+            .error_message(Some(message.into()))
+    }
+
+    fn reported(results: Vec<AlterUserScramCredentialsResult>) -> (ErrorCode, String) {
+        let mut out = Vec::new();
+        let error_code = report(
+            &AlterUserScramCredentialsResponse::default().results(Some(results)),
+            &mut out,
+        );
+        (error_code, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    #[test]
+    fn report_success_writes_nothing() {
+        assert_eq!(
+            (ErrorCode::None, String::new()),
+            reported(vec![result("alice", ErrorCode::None, "")])
+        );
+    }
+
+    #[test]
+    fn report_writes_the_broker_message_and_returns_the_first_failure() {
+        let (error_code, out) = reported(vec![
+            result("alice", ErrorCode::None, ""),
+            result(
+                "bob",
+                ErrorCode::UnsupportedVersion,
+                "can't store SCRAM credentials",
+            ),
+            result("carol", ErrorCode::UnsupportedSaslMechanism, ""),
+        ]);
+
+        assert_eq!(ErrorCode::UnsupportedVersion, error_code);
+        assert_eq!(
+            format!(
+                "user bob: can't store SCRAM credentials (UnsupportedVersion)\n\
+                user carol: {} (UnsupportedSaslMechanism)\n",
+                ErrorCode::UnsupportedSaslMechanism
+            ),
+            out
+        );
+    }
 
     #[test]
     fn test_salted_password_256() -> Result<()> {

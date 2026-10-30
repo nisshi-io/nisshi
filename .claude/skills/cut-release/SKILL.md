@@ -12,7 +12,7 @@ A `v*` tag on a commit on `main` runs `.github/workflows/release.yml`. That work
 This skill gets the release commit onto `main` and tags it:
 
 - **Stable release (`X.Y.Z`):** the release PR bumps the version and adds the `## [X.Y.Z]` section to `CHANGELOG.md`. The section covers every commit since the previous stable tag, and it skips pre-release tags. After the tag, the skill drafts the GitHub release body from that section.
-- **Pre-release (`X.Y.Z-pre.N`):** the release PR only bumps the version. A pre-release has no changelog section, and its release body is one compare link.
+- **Pre-release (`X.Y.Z-pre.N`):** the release PR only bumps the version. A pre-release has no changelog section, and its release body is a fixed line saying what a pre-release is, then one compare link.
 
 The operator has three checkpoints: reviewing and merging the PR, confirming the tag, and approving the release body. Never merge the PR, add it to the merge queue, or push a tag without the operator's go-ahead.
 
@@ -69,7 +69,7 @@ The range can be hundreds of commits (`v0.7.0` had 236), so give the cleaned com
 - **Changed or Fixed:** an entry goes under Fixed when the old behavior was a bug, such as a crash, a closed connection, a wrong answer or lost data. It goes under Changed when the old behavior worked as designed and a client could depend on it, even if the new behavior matches Apache Kafka more closely. A change that can break such a client also gets an upgrade note.
 - Leave out `ci`, `test`, `refactor`, `chore` and `build(deps)` commits unless a user can see the change. Keep a dependency bump that fixes an advisory (RUSTSEC or GHSA) under Security, with the advisory linked.
 - Merge commits that fix the same thing into one entry, and drop a fix for a bug that no release had.
-- Link each PR as `([#N](https://github.com/nisshi-io/nisshi/pull/N))` at the end of its entry. Don't hard-wrap lines: each paragraph and each list item is one line. Nested lists and fenced code blocks are fine.
+- Link each PR as `([#N](https://github.com/nisshi-io/solace-nisshi/pull/N))` at the end of its entry. Don't hard-wrap lines: each paragraph and each list item is one line. Nested lists and fenced code blocks are fine.
 - Name flags, environment variables, metrics, error codes and config keys exactly as the code spells them, in backticks.
 - Return the section and, separately, a list of the commits it left out, each with a one-line reason.
 
@@ -101,7 +101,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 ### `CHANGELOG.md` (stable only)
 
 - Insert the section above the first `## [` heading.
-- Add `[VERSION]: https://github.com/nisshi-io/nisshi/compare/VPREV...TAG` above the first link reference at the end of the file.
+- Add `[VERSION]: https://github.com/nisshi-io/solace-nisshi/compare/VPREV...TAG` above the first link reference at the end of the file.
 - If the file has a section for a stable version newer than `VPREV` (a version whose run published nothing, see phase 1), the new section covers its commits. Remove that section and its link reference, and say so in the PR.
 - Change nothing else in the file.
 
@@ -116,13 +116,13 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 - `bash .github/scripts/check-release-tag.sh TAG > <scratch>/section.md` passes. That is the check `release.yml` runs on the tag. For a stable tag, its output after the first line is the new section.
 - Stable only: `grep -n -i -E '<!--|- \[ \]|- \[x\]|signed-off-by|co-authored-by|generated with' <scratch>/section.md` prints nothing.
-- Stable only: list every URL in the section (`grep -o -E 'https?://[^ )>]+' <scratch>/section.md | sort -u`). Show the operator each one that isn't under `github.com/nisshi-io/nisshi`, `cwiki.apache.org`, `issues.apache.org`, `rustsec.org`, `github.com/advisories` or `www.rfc-editor.org`, because a link in a contributor's text can point anywhere.
+- Stable only: list every URL in the section (`grep -o -E 'https?://[^ )>]+' <scratch>/section.md | sort -u`). Show the operator each one that isn't under `github.com/nisshi-io/solace-nisshi`, `cwiki.apache.org`, `issues.apache.org`, `rustsec.org`, `github.com/advisories` or `www.rfc-editor.org`, because a link in a contributor's text can point anywhere.
 - Read the section once more as an operator who upgrades from `VPREV`, and check that every upgrade note says what to do.
 
 ## 5. Open the PR
 
 - Commit only `Cargo.toml`, `Cargo.lock` and (stable) `CHANGELOG.md`, as `chore(release): prepare TAG`, signed off (`git commit -s`), ending with the session's `Co-Authored-By` trailer.
-- Push with `git push -u origin release/TAG` and open the PR against `main` with the title `chore(release): prepare TAG` and the three sections of `.github/PULL_REQUEST_TEMPLATE.md`, as in [#1004](https://github.com/nisshi-io/nisshi/pull/1004):
+- Push with `git push -u origin release/TAG` and open the PR against `main` with the title `chore(release): prepare TAG` and the three sections of `.github/PULL_REQUEST_TEMPLATE.md`, as in [#1004](https://github.com/nisshi-io/solace-nisshi/pull/1004):
   - **What changes, and why?** The version bump from the old to the new version, and (stable) the section: which range it covers, and the upgrade notes that no commit body mentioned. Say that after the merge, `/cut-release` tags the squash commit on `main`, which publishes the image, the GitHub release and the crates. Stable only: end the section with the line `Drafted from <DRAFT_BASE>.`, using the full SHA.
   - **Upgrade impact:** none from the PR itself. For a stable release, the changelog describes the impact of upgrading.
   - **How was this tested?** `cargo metadata --locked`, the release-tag check, and how the entries were checked.
@@ -157,6 +157,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
   - In a temporary worktree of `MERGE_SHA` (or with `git show "MERGE_SHA:Cargo.toml"` and `git show "MERGE_SHA:CHANGELOG.md"` written to a scratch directory), `check-release-tag.sh TAG` passes.
   - Stable: `git log --first-parent DRAFT_BASE..MERGE_SHA^` lists the commits that the merge queue landed ahead of the PR. Each one ships in this release. If any is visible to users, stop and ask the operator whether to tag anyway or to add it in a follow-up PR first. A follow-up PR is a new `docs(changelog): ...` PR from `origin/main`. Its squash commit becomes `MERGE_SHA`, its base becomes `DRAFT_BASE`, and this phase starts again.
   - The push run of `ci.yml` on `MERGE_SHA` is green: `gh run list --workflow ci.yml --commit MERGE_SHA --event push --json databaseId,status,conclusion`. If it is still running, wait with `gh run watch <id> --exit-status` in the background.
+  - The push run of `guardian-scan.yaml` on `MERGE_SHA` is green, checked and waited for the same way. The tag's `release-readiness` job repeats this scan, so a block found now keeps the version free, and a block found after tagging costs it unless an admin approves the override. If the run failed in its `FOSSA` job on a licensing conflict that is waived in FOSSA, the operator can set the `FOSSA_LICENSING_BLOCK` repository variable to `false` before the tag is pushed; a release run reads it only when it starts.
 - **Ask the operator** to confirm the tag, naming `TAG` and `MERGE_SHA`. Only after a yes:
 
   ```bash
@@ -170,26 +171,40 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 - Find the run: `gh run list --workflow release.yml --branch TAG --event push --json databaseId,status`. A queued run is normal. If no run shows up within two minutes of the push, stop and report it, because a tag ruleset or a disabled workflow stops the trigger.
 - Watch it in the background with `gh run watch <id> --exit-status`.
-- Pre-release: the body is one line, `**Full Changelog**: https://github.com/nisshi-io/nisshi/compare/<previous tag>...TAG`. The previous tag is the one just below `TAG` in phase 1's list, stable or pre-release. When `github-release` has succeeded, show the line to the operator and set it with `gh release edit TAG --notes-file <file>` after they approve.
+- If `release-readiness` fails, the run waits at the `override` job for a repo admin to approve it in the `release-override` environment. Report which scan job failed and why, and leave the decision to the operator. The environment prevents self-review and admin bypass, and the operator pushed the tag, so tell them a second admin has to approve it. Never approve or reject the deployment yourself.
+- Tell a verdict from an outage by the failed step, not the job, because the `FOSSA` job fails on a licensing block as well as on an outage. List the failed steps with `gh run view <id> --json jobs --jq '.jobs[] | select(.conclusion == "failure") | {name, databaseId, steps: [.steps[] | select(.conclusion == "failure") | .name]}'`. Read a failed job's log with `gh api repos/{owner}/{repo}/actions/jobs/<databaseId>/logs`, because `gh run view --log-failed` refuses while the run waits at `override`. Ignore the `Guardian scan gate` job: its `Aggregate verdict` step fails whenever any scan job fails. Classify the other failed steps in this order, and stop at the first rule that matches:
+  - A verdict: `FOSSA licensing guard` or `Guardian vulnerability gate` failed. This wins over every other failed step. Treat it as an outage only if the step's log shows that the FOSSA or Guardian API errored. Never offer the rerun for a verdict, because the rerun blocks again.
+  - An outage: every failed step is in this list: `Install FOSSA CLI`, `FOSSA analyze and upload`, `Download scan image`, `Load image`, `Prisma Cloud scan`, `Install Trivy`, `Guardian DB sync and Jira report`, or a step of the `Build image` job whose log shows a network or registry error. Say so and give the operator a third way forward besides approving and rejecting: reject the override, wait for the outage to end, then `gh run rerun <id> --failed`. That re-runs `release-readiness`, `override` is skipped once it passes, and the publish jobs run as usual with no new version. The override publishes with no verdict at all, so don't present it as the default for an outage.
+  - Anything else, such as `Verify trunk mode` or the self-test in `Resolve context`: report the step and its log to the operator and don't offer the rerun. These fail the same way on every attempt, and `--failed` doesn't re-run `setup`.
+- Tell the operator to approve or rerun within 3 days. The publish jobs of this run, and of a rerun of it, download the `image-*` and tarball artifacts of this run, which `ci.yml` keeps for 3 days on a tag push, while the waiting deployment can sit for 30. An approval or a rerun after the artifacts expire fails `publish-image`, and the only way back is a full re-run with a rebuild, a rescan and another approval. The operator should pass the 3 days on to whoever approves.
+- If the operator set `FOSSA_LICENSING_BLOCK=false` for this release, delete it with `gh variable delete FOSSA_LICENSING_BLOCK` once the `Resolve context` job of `release-readiness` has run. It turns off the licensing block for every trunk run until it is removed.
+- Pre-release: the body is two paragraphs. The first is fixed, with `X.Y.Z` being `VERSION` without its `-pre.N`:
+
+  ```markdown
+  Pre-release of X.Y.Z, for trying changes before it ships: behaviour and storage formats can still change, so use the [latest release](https://github.com/nisshi-io/solace-nisshi/releases/latest) for anything you keep. See [Which release to use](https://github.com/nisshi-io/solace-nisshi#which-release-to-use).
+  ```
+
+  The second is `**Full Changelog**: https://github.com/nisshi-io/solace-nisshi/compare/<previous tag>...TAG`. The previous tag is the one just below `TAG` in phase 1's list, stable or pre-release. When `github-release` has succeeded, show the body to the operator and set it with `gh release edit TAG --notes-file <file>` after they approve.
 - Stable: while the run builds, draft the body:
   - Use only the `[VERSION]` section of `CHANGELOG.md` at `MERGE_SHA`. Add no fact that the section doesn't state.
-  - Follow the shape of the previous stable release's body (`gh release view VPREV --json body --jq .body`): an intro paragraph, `## Highlights` (the most important changes, one line each), `## Upgrade notes` (a link to `https://github.com/nisshi-io/nisshi/blob/TAG/CHANGELOG.md` and a short list), and `## Install` (the `cargo install` command, the image `ghcr.io/nisshi-io/nisshi:VERSION`, and the attached binaries). Keep a caveat from the previous body only if it is still true.
+  - Follow the shape of the previous stable release's body (`gh release view VPREV --json body --jq .body`): an intro paragraph, `## Highlights` (the most important changes, one line each), `## Upgrade notes` (a link to `https://github.com/nisshi-io/solace-nisshi/blob/TAG/CHANGELOG.md` and a short list), and `## Install` (the `cargo install` command, the image `ghcr.io/nisshi-io/nisshi:VERSION`, and the attached binaries). Keep a caveat from the previous body only if it is still true.
   - Write it to a file in the scratchpad and show the operator the full text.
 - When the `github-release` job has succeeded (`gh run view <id> --json jobs --jq '.jobs[] | select(.name == "github-release") | .conclusion'`) and the operator approves the body: `gh release edit TAG --notes-file <file>`.
 
 ## 9. Report
 
-Report the run URL and its conclusion.
+Report the run URL and its conclusion, and whether the `FOSSA_LICENSING_BLOCK` variable is still set (`gh variable list`).
 
 - **On failure:** say which job failed and what it had already published. The jobs run in order:
-  - `ci`, `on-main` or `release-tag` failed: nothing was published. The tag stays, because a tag is never moved or deleted. Fix `main`, then cut the next version. Phase 1 skips this tag's version, because it has no GitHub release.
-  - `github-release` failed: the image is pushed. A flaky failure is `gh run rerun <id> --failed`. The rerun needs the `image-*` artifacts of the same run, which `ci.yml` keeps for 3 days.
+  - `ci`, `on-main` or `release-tag` failed, or `release-readiness` failed and the `override` deployment was rejected: nothing was published. The tag stays, because a tag is never moved or deleted. Fix `main`, then cut the next version. Phase 1 skips this tag's version, because it has no GitHub release. The exception is an override that the operator rejected to wait out a scanner outage: the version is not lost while the artifacts last, so go back to phase 8's rerun instead.
+  - `release-readiness` failed and the `override` was approved: the run still ends as a failure, so judge it by the publish jobs. If they all passed, run the success checks below. If `github-release` failed, re-run only that job and the ones after it with `gh run rerun <id> --job <job id>` (the job's `databaseId` from `gh run view <id> --json jobs`), never `--failed`, which would also re-run `release-readiness` and `publish-image` and push the image again.
+  - `github-release` failed: the image is pushed. A flaky failure is `gh run rerun <id> --failed` only when `release-readiness` passed. The rerun needs the `image-*` artifacts of the same run, which `ci.yml` keeps for 3 days.
   - `publish-crates` failed: the image and the GitHub release are out. Before any rerun, list which crates are on crates.io at `VERSION` (the check in the success list below). `cargo publish --workspace` fails on a crate version that crates.io already has, so a rerun after a partial upload fails. Stop and report the missing crates to the operator.
   - A real failure, not a flaky one, is fixed on `main` and released as the next version, never by moving the tag.
 - **On success,** run these checks and report each result:
   - Every publishable crate is on crates.io at `VERSION`. List the crates with `cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish == null) | .name'`, and for each one check `curl -sf -A nisshi-cut-release "https://crates.io/api/v1/crates/<name>/VERSION"`. For a stable release, `https://crates.io/api/v1/crates/nisshi` has `VERSION` as `crate.default_version`.
   - `cargo install nisshi --locked --features dynostore,postgres,libsql,slatedb --root "$(mktemp -d)"` installs `VERSION`, and `<root>/bin/nisshi --version` prints it. A pre-release needs `--version VERSION`.
-  - The GitHub release has its tarballs (`gh release view TAG --json assets,isPrerelease`). Stable: `gh api repos/nisshi-io/nisshi/releases/latest --jq .tag_name` is `TAG`. Pre-release: `isPrerelease` is `true`.
+  - The GitHub release has its tarballs (`gh release view TAG --json assets,isPrerelease`). Stable: `gh api repos/nisshi-io/solace-nisshi/releases/latest --jq .tag_name` is `TAG`. Pre-release: `isPrerelease` is `true`.
   - The image: `docker buildx imagetools inspect ghcr.io/nisshi-io/nisshi:VERSION`. Stable: the `X.Y` and `latest` tags have the same digest. Pre-release: `latest` still points to the previous stable release.
 - Offer to delete the local `release/TAG` branch, if it remains after the merge.
 

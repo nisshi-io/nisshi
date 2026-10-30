@@ -35,11 +35,16 @@ where
     type Output = DescribeAclsResponse;
     type Error = Error;
 
+    // The broker does not store ACLs, so it refuses the request with `SecurityDisabled` and an
+    // empty list of resources. Apache Kafka gives the same answer if it does not have an
+    // authorizer. An empty list with no error would tell an operator that ACLs are supported and
+    // that none exist.
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let _ = input;
         Ok(DescribeAclsResponse::default()
-            .error_code(i16::from(ErrorCode::None))
+            .error_code(i16::from(ErrorCode::SecurityDisabled))
+            .error_message(Some("No Authorizer is configured on the broker".into()))
             .resources(Some([].into())))
     }
 }

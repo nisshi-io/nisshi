@@ -20,11 +20,13 @@
 use std::{fmt, io, result, sync::Arc};
 
 use consume::Consume;
+pub use location::Location;
 use nisshi_sans_io::ErrorCode;
 use produce::Produce;
 use tokio_util::codec::LinesCodecError;
 
 mod consume;
+mod location;
 mod produce;
 
 pub type Result<T, E = Error> = result::Result<T, E>;
@@ -33,9 +35,31 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 pub enum Error {
     Api(ErrorCode),
     Client(#[from] nisshi_client::Error),
+    InvalidJson {
+        location: Location,
+        source: serde_json::Error,
+    },
+
     Io(Arc<io::Error>),
     LinesCodec(#[from] LinesCodecError),
     Message(String),
+
+    /// A message has neither a `key` nor a `value` field, so `cat produce` can't make a record
+    /// of it without a schema.
+    MessageWithoutKeyOrValue {
+        location: Location,
+        message: String,
+    },
+
+    NoMessages {
+        location: Location,
+    },
+
+    /// A file holds JSON that isn't an array, so `cat produce` can't read messages from it.
+    NotAnArray {
+        location: Location,
+    },
+
     Protocol(#[from] nisshi_sans_io::Error),
     Schema(#[from] nisshi_schema::Error),
     SerdeJson(#[from] serde_json::Error),
@@ -49,7 +73,31 @@ impl From<io::Error> for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::InvalidJson { location, source } => write!(
+                f,
+                "{location} is not valid JSON: {source}. {}",
+                location.message_format()
+            ),
+            Self::MessageWithoutKeyOrValue { location, message } => write!(
+                f,
+                r#"{location} has no "key" or "value" field: {message}. {}"#,
+                location.message_format()
+            ),
+            Self::NotAnArray { location } => write!(
+                f,
+                "{location} is not a JSON array of messages. {}",
+                location.message_format()
+            ),
+            Self::NoMessages { location } => {
+                write!(
+                    f,
+                    "{location} has no messages. {}",
+                    location.message_format()
+                )
+            }
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 

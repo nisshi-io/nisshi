@@ -32,7 +32,7 @@ use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
-use nisshi_storage::{Storage, Topition, TxnAddPartitionsRequest};
+use nisshi_storage::{Storage, TopicCreationConfig, Topition, TxnAddPartitionsRequest};
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
@@ -47,17 +47,21 @@ fn broker<S>(storage: S) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (
-                RequestFrameLayer,
-                FrameBytesLayer,
-                BytesLayer,
-                BytesFrameLayer::default(),
-            )
-                .into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+    )
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (
+            RequestFrameLayer,
+            FrameBytesLayer,
+            BytesLayer,
+            BytesFrameLayer::default(),
+        )
+            .into_layer(frame_route)
+    })
 }
 
 /// How many records a test produces before retention deletes them all, at offsets 0 to 4.

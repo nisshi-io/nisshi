@@ -15,18 +15,33 @@
 use crate::Engine;
 use async_trait::async_trait;
 use nisshi_storage::{
-    ArcDynStorage, Result, StorageFactory, StorageFactoryConfiguration, reject_unrecognized_options,
+    ArcDynStorage, Result, StorageCapabilities, StorageFactory, StorageFactoryConfiguration,
+    reject_unrecognized_options,
 };
 use regex::Regex;
-use std::sync::Arc;
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineFactory;
+
+impl Display for EngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(crate::NAME)
+    }
+}
 
 #[async_trait]
 impl StorageFactory for EngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"null").map_err(Into::into)
+    }
+
+    /// The null engine stores nothing, so it has no SCRAM credentials.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {

@@ -21,6 +21,12 @@ changes.
   value and a dot, and rustdoc lists it on the type's page. Write `partition.high_watermark()`,
   not `high_watermark(&partition)`. A function that makes a value is an associated function of
   the value's type, such as `Connection::open(address)`.
+- **Write a function, not a closure bound to a name.** A `let commit = |group| ...` that is
+  called more than once has no doc comment and no written signature, and it reads the enclosing
+  function's variables without saying which. Nothing outside that function can call it, so the
+  next test that needs it defines it again. Write a private `fn` that takes what it uses as
+  parameters. A closure passed straight to another function, as in `.map(|offset| offset + 1)`, is
+  fine.
 - **Give each file one cohesive unit.** Usually that is one type, with its `impl` blocks, its trait
   impls, its unit tests, and the private helpers and small types that only it uses. Put two types
   in one file only when neither is used without the other.

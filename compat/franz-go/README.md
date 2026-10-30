@@ -44,4 +44,10 @@ Some allowlisted tests self-skip against nisshi: the SCRAM tests
 (no `KGO_TEST_SCRAM` configured) and the share-group / KIP-848 tests
 (nisshi does not advertise ShareFetch v2 or ConsumerGroupHeartbeat v1).
 They are kept in the allowlist so they light up automatically when the
-broker grows support.
+broker grows support. Others never contact the broker at all: they are
+unit tests of the client, such as address parsing, compression and the
+group balancers.
+
+`run.sh` fails an allowlisted test that `go test` reports no result for,
+because `go test` passes when `-run` matches nothing. It also stops if
+the clone in `WORK_DIR` is at another version than `FRANZ_GO_VERSION`.

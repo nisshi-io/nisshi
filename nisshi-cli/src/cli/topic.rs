@@ -40,6 +40,10 @@ pub(super) enum Command {
 
         #[arg(long, value_parser = parse_key_val::<String, String>)]
         config: Vec<(String, String)>,
+
+        /// Print no confirmation on success (errors still print)
+        #[arg(long)]
+        silent: bool,
     },
 
     /// Delete an existing topic
@@ -69,11 +73,13 @@ impl From<Command> for Topic {
                 name,
                 partitions,
                 config,
+                silent,
             } => Topic::create()
                 .broker(broker)
                 .name(name)
                 .partitions(partitions)
                 .config(HashMap::from_iter(config))
+                .confirm(!silent)
                 .build(),
 
             Command::Delete { broker, name } => Topic::delete().broker(broker).name(name).build(),
@@ -101,4 +107,33 @@ where
         .find('=')
         .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{s}`"))?;
     Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    fn create_is_silent(args: &[&str]) -> bool {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("topic").chain(args.iter().copied()))
+                .expect("arguments parse");
+
+        match command {
+            Command::Create { silent, .. } => silent,
+            Command::Delete { .. } | Command::List { .. } => panic!("expected create: {args:?}"),
+        }
+    }
+
+    #[test]
+    fn create_prints_its_confirmation_unless_silent() {
+        assert!(!create_is_silent(&["create", "test"]));
+        assert!(create_is_silent(&["create", "test", "--silent"]));
+    }
 }

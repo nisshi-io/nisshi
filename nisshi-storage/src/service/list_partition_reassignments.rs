@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, Storage, TopicId};
+use crate::{Error, Result, Storage};
 use nisshi_sans_io::{
     ApiKey, ErrorCode, ListPartitionReassignmentsRequest, ListPartitionReassignmentsResponse,
     RequestInput,
-    list_partition_reassignments_response::{
-        OngoingPartitionReassignment, OngoingTopicReassignment,
-    },
 };
 use rama::Service;
 use tracing::instrument;
 
-/// A [`Service`] using its [`Storage`] taking [`ListPartitionReassignmentsRequest`] returning [`ListPartitionReassignmentsResponse`].
+/// A [`Service`] taking [`ListPartitionReassignmentsRequest`] and answering that no partition
+/// reassignment is in progress, for any request.
+///
+/// The answer has no error and an empty topics list, as Kafka answers when nothing is moving,
+/// whether the request lists every topic or names some, existing or not. The [`Storage`] is
+/// not read.
 #[derive(Clone, Debug)]
 pub struct ListPartitionReassignmentsService<G> {
     pub storage: G,
@@ -43,43 +45,69 @@ where
 
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
-        let input = input.into();
-        let topics = input.request.topics.map(|topics| {
-            topics
-                .iter()
-                .map(|topic| TopicId::Name(topic.name.as_str().into()))
-                .collect::<Vec<_>>()
-        });
+        let _ = input;
 
-        let metadata = self.storage.metadata(topics.as_deref()).await?;
-
-        let mut ongoing = vec![];
-
-        for topic in metadata.topics() {
-            let Some(ref name) = topic.name else { continue };
-
-            ongoing.push(
-                OngoingTopicReassignment::default()
-                    .name(name.into())
-                    .partitions(topic.partitions.as_ref().map(|partitions| {
-                        partitions
-                            .iter()
-                            .map(|partition| {
-                                OngoingPartitionReassignment::default()
-                                    .partition_index(partition.partition_index)
-                                    .replicas(partition.replica_nodes.clone())
-                                    .adding_replicas(Some(vec![]))
-                                    .removing_replicas(Some(vec![]))
-                            })
-                            .collect::<Vec<_>>()
-                    })),
-            );
-        }
-
+        // The broker is a single node and never moves a partition, so nothing is ever being
+        // reassigned. Deliberately narrow: answering from topic metadata would report every
+        // partition as reassigning and add a storage failure mode to a constant answer.
         Ok(ListPartitionReassignmentsResponse::default()
             .throttle_time_ms(0)
             .error_code(ErrorCode::None.into())
             .error_message(None)
-            .topics(Some(ongoing)))
+            .topics(Some(vec![])))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use nisshi_sans_io::{
+        ErrorCode, ListPartitionReassignmentsRequest, RequestInput,
+        list_partition_reassignments_request::ListPartitionReassignmentsTopics,
+    };
+    use rama::{Service as _, extensions::Extensions};
+
+    use super::ListPartitionReassignmentsService;
+    use crate::{
+        Result,
+        service::{RequestChannelService, bounded_channel},
+    };
+
+    /// Storage whose channel is closed fails every call, so any answer proves storage
+    /// was never read.
+    #[tokio::test]
+    async fn answers_without_reading_storage() -> Result<()> {
+        let (tx, rx) = bounded_channel(1);
+        drop(rx);
+
+        let service = ListPartitionReassignmentsService {
+            storage: RequestChannelService::new(tx),
+        };
+
+        let named = vec![
+            ListPartitionReassignmentsTopics::default()
+                .name("t".into())
+                .partition_indexes(Some(vec![0, 1])),
+        ];
+
+        for topics in [None, Some(named), Some(vec![])] {
+            let response = service
+                .serve(RequestInput {
+                    request: ListPartitionReassignmentsRequest::default().topics(topics.clone()),
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(response.error_code)?,
+                "{topics:?}"
+            );
+            assert_eq!(None, response.error_message, "{topics:?}");
+            assert_matches!(response.topics.as_deref(), Some([]), "{topics:?}");
+        }
+
+        Ok(())
     }
 }

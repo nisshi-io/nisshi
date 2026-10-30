@@ -29,6 +29,8 @@ use super::*;
 
 const GROUP: &str = "group";
 const PROTOCOL_TYPE: &str = "consumer";
+const CLIENT_ID: &str = "client";
+const CLIENT_HOST: &str = "/192.0.2.7";
 const SESSION_TIMEOUT_MS: i32 = 45_000;
 const REBALANCE_TIMEOUT_MS: i32 = 20_000;
 const INITIAL_REBALANCE_DELAY: Duration = Duration::from_secs(3);
@@ -127,7 +129,8 @@ impl Harness {
         let protocols = protocols(metadata);
         let request = JoinRequest {
             api_version,
-            client_id: Some("client"),
+            client_id: Some(CLIENT_ID),
+            client_host: Some(CLIENT_HOST),
             group_id: GROUP,
             session_timeout_ms: SESSION_TIMEOUT_MS,
             rebalance_timeout_ms: self.rebalance_timeout_ms,
@@ -787,6 +790,7 @@ async fn forming_group_stored_without_a_rebalance_waits_for_every_member_to_rejo
                     .member_id(member_id.to_owned())
                     .metadata(Bytes::from_static(b"m")),
                 last_contact: Some(at(1_000)),
+                ..GroupMember::default()
             },
         )
     };
@@ -1214,7 +1218,8 @@ async fn version_0_join_uses_the_session_timeout_as_the_rebalance_timeout() -> R
     let body = controller
         .join(
             0,
-            Some("client"),
+            Some(CLIENT_ID),
+            Some(CLIENT_HOST),
             GROUP,
             SESSION_TIMEOUT_MS,
             None,
@@ -1235,6 +1240,51 @@ async fn version_0_join_uses_the_session_timeout_as_the_rebalance_timeout() -> R
         .await?
         .expect("the stored group");
     assert_eq!(Some(SESSION_TIMEOUT_MS), detail.rebalance_timeout_ms);
+    Ok(())
+}
+
+/// `DescribeGroups` reports each member's client id and host from the stored group, so the
+/// coordinator must store them when the member joins.
+#[tokio::test]
+async fn join_stores_the_member_client_id_and_host() -> Result<()> {
+    let storage = null_storage().await?;
+    let controller = Controller::new(
+        storage.clone(),
+        GroupCoordinatorConfig {
+            initial_rebalance_delay: Duration::from_millis(10),
+            poll_interval: Duration::from_millis(10),
+        },
+    );
+
+    let protocols = protocols(b"m");
+    let body = controller
+        .join(
+            LATEST_JOIN_GROUP_VERSION,
+            Some(CLIENT_ID),
+            Some(CLIENT_HOST),
+            GROUP,
+            SESSION_TIMEOUT_MS,
+            Some(REBALANCE_TIMEOUT_MS),
+            "",
+            Some("instance"),
+            PROTOCOL_TYPE,
+            Some(&protocols),
+            None,
+        )
+        .await?;
+
+    let response = JoinGroupResponse::try_from(body)?;
+    assert_eq!(ErrorCode::None, error_code(response.error_code));
+
+    let (detail, _) = storage
+        .group_with_version(GROUP)
+        .await?
+        .expect("the stored group");
+    let member = &detail.members[&response.member_id];
+    assert_eq!(
+        (CLIENT_ID, CLIENT_HOST),
+        (member.client_id.as_str(), member.client_host.as_str())
+    );
     Ok(())
 }
 

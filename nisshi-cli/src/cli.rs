@@ -24,13 +24,14 @@
 use std::process;
 
 use crate::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand};
 use nisshi_sans_io::ErrorCode;
 use tracing::debug;
 
 mod broker;
 mod cat;
 mod generator;
+mod missing_feature;
 mod perf;
 mod proxy;
 mod topic;
@@ -68,7 +69,19 @@ fn lakes() -> Vec<&'static str> {
 
 fn after_help() -> String {
     [
-        format!("Storage engines: {}", storage_engines().join(", ")),
+        format!(
+            "Storage engines: {}",
+            storage_engines()
+                .into_iter()
+                .map(|engine| match engine {
+                    // This list is built from feature names and does not read the factories, so a
+                    // deprecation is also marked here by hand.
+                    "slatedb" => "slatedb (deprecated)",
+                    engine => engine,
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         format!("Data lakes: {}", lakes().join(", ")),
     ]
     .join("\n")
@@ -93,7 +106,7 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum Command {
-    /// Apache Kafka compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
+    /// Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
     Broker(Box<broker::Arg>),
 
     /// Easily consume or produce Avro, JSON or Protobuf messages to a topic
@@ -108,7 +121,7 @@ enum Command {
     /// Performance
     Perf(Box<perf::Arg>),
 
-    /// Apache Kafka compatible proxy
+    /// Apache Kafka®-compatible proxy
     Proxy(Box<proxy::Arg>),
 
     /// Create, list or delete topics managed by the broker
@@ -124,21 +137,51 @@ enum Command {
     },
 }
 
+/// How a subcommand finished.
+#[derive(Clone, Copy, Debug)]
+pub struct Outcome {
+    pub error_code: ErrorCode,
+
+    /// The subcommand already told the user what went wrong, so the caller does not log the
+    /// code again as an error.
+    pub reported: bool,
+}
+
+impl From<ErrorCode> for Outcome {
+    fn from(error_code: ErrorCode) -> Self {
+        Self {
+            error_code,
+            reported: false,
+        }
+    }
+}
+
 impl Cli {
     pub async fn main() -> Result<ErrorCode> {
+        Self::run().await.map(|outcome| outcome.error_code)
+    }
+
+    pub async fn run() -> Result<Outcome> {
         debug!(
             pid = process::id(),
             storage = ?storage_engines(),
             lakes = ?lakes()
         );
 
-        let cli = Cli::parse();
+        let cli = Cli::try_parse().unwrap_or_else(|error| {
+            missing_feature::explain(
+                error,
+                &missing_feature::built_features(),
+                &mut Cli::command(),
+            )
+            .exit()
+        });
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
-            Command::Broker(arg) => arg.main().await,
-            Command::Cat { command } => command.main().await,
-            Command::Generator(arg) => arg.main().await,
-            Command::Perf(arg) => arg.main().await,
+            Command::Broker(arg) => arg.main().await.map(Outcome::from),
+            Command::Cat { command } => command.main().await.map(Outcome::from),
+            Command::Generator(arg) => arg.main().await.map(Outcome::from),
+            Command::Perf(arg) => arg.main().await.map(Outcome::from),
             Command::Proxy(arg) => nisshi_proxy::Proxy::main(
                 arg.listener_url.into_inner(),
                 arg.advertised_listener_url.into_inner(),
@@ -147,8 +190,9 @@ impl Cli {
                     .map(|otlp_endpoint_url| otlp_endpoint_url.into_inner()),
             )
             .await
+            .map(Outcome::from)
             .map_err(Into::into),
-            Command::Topic { command } => command.main().await,
+            Command::Topic { command } => command.main().await.map(Outcome::from),
             Command::User { command } => command.main().await,
         }
     }

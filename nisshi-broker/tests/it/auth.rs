@@ -35,16 +35,15 @@ use nisshi_sans_io::{
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated::Batch,
+    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated::Batch,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use nisshi_storage::{
-    BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential,
+    Storage, TopicCreationConfig, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rsasl::{
@@ -61,12 +60,16 @@ fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+    )
+    .and_then(auth::services)
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
+    })
 }
 
 /// Asserts that a SaslHandshake response lists the mechanisms that the broker
@@ -928,7 +931,7 @@ impl Storage for Engine {
     async fn committed_offset_topitions(
         &self,
         _group_id: &str,
-    ) -> nisshi_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         unimplemented!()
     }
 
@@ -938,7 +941,7 @@ impl Storage for Engine {
         _group_id: Option<&str>,
         _topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> nisshi_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         unimplemented!()
     }
 
@@ -980,10 +983,7 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(
-        &self,
-        _states_filter: Option<&[String]>,
-    ) -> nisshi_storage::Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> nisshi_storage::Result<Vec<NamedGroupDetail>> {
         unimplemented!()
     }
 

@@ -12,16 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::todo, clippy::unimplemented)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use std::{
     collections::HashMap,
     env::vars,
     fmt, io,
-    net::AddrParseError,
+    net::{AddrParseError, SocketAddr},
     num::TryFromIntError,
     result,
     str::{FromStr, Utf8Error},
-    string::FromUtf8Error,
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTimeError},
 };
@@ -92,6 +100,18 @@ pub enum Error {
     Json(Arc<serde_json::Error>),
     KafkaProtocol(#[from] nisshi_sans_io::Error),
 
+    /// Another socket already listens on the address that the broker's listener binds.
+    ListenerInUse {
+        addr: SocketAddr,
+    },
+
+    /// The host of the broker's listener URL is a name that did not resolve to an address.
+    ListenerHostUnresolved {
+        host: String,
+        port: u16,
+        source: Arc<io::Error>,
+    },
+
     Message(String),
     Model(#[from] nisshi_model::Error),
 
@@ -109,7 +129,6 @@ pub enum Error {
     SchemaRegistry(Arc<nisshi_schema::Error>),
     Service(#[from] nisshi_service::Error),
     Storage(#[from] nisshi_storage::Error),
-    StringUtf8(#[from] FromUtf8Error),
     SystemTime(#[from] SystemTimeError),
 
     TryFromInt(#[from] TryFromIntError),

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tests of consumer groups: membership, rebalances, committed offsets and offset resets.
+//! Tests of consumer groups: membership, rebalances, partition assignors, committed offsets and
+//! offset resets.
 
+pub mod assignor_migration;
 pub mod consumer_groups;
 pub mod group_rebalance;
 pub mod offset_resets;

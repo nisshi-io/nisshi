@@ -23,7 +23,20 @@ BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-127.0.0.1:9092}"
 # started for this run: the readiness wait fails immediately if it exits
 BROKER_PID="${BROKER_PID:-}"
 COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# an older librdkafka has its own allowlist, tests-<version>.allow, because its
+# test numbers and the tests that pass differ
+if [[ -z "${TESTS_ALLOW:-}" ]]; then
+    TESTS_ALLOW="${COMPAT_DIR}/tests-${LIBRDKAFKA_VERSION}.allow"
+    if [[ ! -f "${TESTS_ALLOW}" ]]; then
+        TESTS_ALLOW="${COMPAT_DIR}/tests.allow"
+    fi
+fi
+echo "librdkafka ${LIBRDKAFKA_VERSION}, allowlist ${TESTS_ALLOW}"
+# resolved to an absolute path, because the test suite runs in another
+# working directory and loads librdkafka from here
 WORK_DIR="${WORK_DIR:-${COMPAT_DIR}/../../target/compat}"
+mkdir -p "${WORK_DIR}"
+WORK_DIR="$(cd "${WORK_DIR}" && pwd)"
 SRC_DIR="${WORK_DIR}/librdkafka"
 JOBS="$(getconf _NPROCESSORS_ONLN)"
 
@@ -35,11 +48,18 @@ if [[ -n "${RESULTS_FILE}" ]]; then
     : > "${RESULTS_FILE}"
 fi
 
-mkdir -p "${WORK_DIR}"
-
 if [[ ! -d "${SRC_DIR}" ]]; then
     git clone --depth 1 --branch "${LIBRDKAFKA_VERSION}" \
         https://github.com/confluentinc/librdkafka.git "${SRC_DIR}"
+fi
+
+# a clone that an earlier run left at another version would be reused silently
+cloned_tags="$(git -C "${SRC_DIR}" tag --points-at HEAD)"
+if ! grep -qxF "${LIBRDKAFKA_VERSION}" <<< "${cloned_tags}"; then
+    echo "${SRC_DIR} is at ${cloned_tags:-an untagged commit}," \
+         "not ${LIBRDKAFKA_VERSION}: remove it, or set" \
+         "WORK_DIR=\"\${PWD}/target/compat-${LIBRDKAFKA_VERSION}\"" >&2
+    exit 1
 fi
 
 if [[ ! -x "${SRC_DIR}/tests/test-runner" ]]; then
@@ -87,7 +107,7 @@ fi
 export DYLD_LIBRARY_PATH="${SRC_DIR}/src:${SRC_DIR}/src-cpp"
 export LD_LIBRARY_PATH="${DYLD_LIBRARY_PATH}"
 
-tests=$(grep -Ev '^[[:space:]]*(#|$)' "${COMPAT_DIR}/tests.allow" |
+tests=$(grep -Ev '^[[:space:]]*(#|$)' "${TESTS_ALLOW}" |
             awk '{print $1}')
 
 # timeout(1) is coreutils: present on Linux, optional on macOS
@@ -103,7 +123,14 @@ for test in ${tests}; do
     count=$((count + 1))
     echo "=== ${test} ==="
     status="PASS"
-    if ! (cd "${SRC_DIR}/tests" &&
+    # test-runner exits 0 for a test number that this version does not
+    # register, so an allowlist for another version would pass without
+    # running anything
+    if ! grep -qE "_TEST\(${test}_" "${SRC_DIR}/tests/test.c"; then
+        echo "librdkafka ${LIBRDKAFKA_VERSION} has no test ${test}" >&2
+        status="FAIL"
+        failed="${failed} ${test}"
+    elif ! (cd "${SRC_DIR}/tests" &&
               TESTS="${test}" ${timeout} ./test-runner -p1 -Q -E); then
         status="FAIL"
         failed="${failed} ${test}"

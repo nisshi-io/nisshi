@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+    io::{self, Write},
+};
 
 use nisshi_client::{Client, ConnectionManager};
 use nisshi_sans_io::{
@@ -33,6 +37,7 @@ pub struct Builder<B, N, P> {
     name: N,
     partitions: P,
     configs: HashMap<String, String>,
+    confirm: bool,
 }
 
 impl<B, N, P> Builder<B, N, P> {
@@ -42,6 +47,7 @@ impl<B, N, P> Builder<B, N, P> {
             name: self.name,
             partitions: self.partitions,
             configs: self.configs,
+            confirm: self.confirm,
         }
     }
 
@@ -51,6 +57,7 @@ impl<B, N, P> Builder<B, N, P> {
             name: name.into(),
             partitions: self.partitions,
             configs: self.configs,
+            confirm: self.confirm,
         }
     }
 
@@ -60,11 +67,17 @@ impl<B, N, P> Builder<B, N, P> {
             name: self.name,
             partitions,
             configs: self.configs,
+            confirm: self.confirm,
         }
     }
 
     pub fn config(self, configs: HashMap<String, String>) -> Builder<B, N, P> {
         Self { configs, ..self }
+    }
+
+    /// Print a confirmation line to stdout on success. Off by default, so a library caller gets no output.
+    pub fn confirm(self, confirm: bool) -> Builder<B, N, P> {
+        Self { confirm, ..self }
     }
 }
 
@@ -75,6 +88,7 @@ impl Builder<Url, String, i32> {
             name: self.name,
             partitions: self.partitions,
             configs: self.configs,
+            confirm: self.confirm,
         })
     }
 }
@@ -85,6 +99,7 @@ pub struct Configuration {
     name: String,
     partitions: i32,
     configs: HashMap<String, String>,
+    confirm: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,7 +130,7 @@ impl Create {
         let req = CreateTopicsRequest::default()
             .topics(Some(
                 [CreatableTopic::default()
-                    .name(self.configuration.name)
+                    .name(self.configuration.name.clone())
                     .num_partitions(self.configuration.partitions)
                     .replication_factor(-1)
                     .assignments(Some([].into()))
@@ -143,10 +158,87 @@ impl Create {
         let topics = topics.unwrap_or_default();
         assert_eq!(1, topics.len());
 
-        let CreatableTopicResult { error_code, .. } = topics
+        let CreatableTopicResult {
+            error_code,
+            num_partitions,
+            ..
+        } = topics
             .first()
             .ok_or_else(|| Error::Message(format!("expected exactly one response: {topics:?}")))?;
 
-        ErrorCode::try_from(error_code).map_err(Into::into)
+        let error_code = ErrorCode::try_from(error_code)?;
+
+        if error_code == ErrorCode::None && self.configuration.confirm {
+            // A response before version 5 omits the partition count, and a request may leave the
+            // count to the broker with -1, so the line names the count only when one is positive.
+            let partitions = num_partitions
+                .filter(|partitions| *partitions > 0)
+                .or(Some(self.configuration.partitions).filter(|partitions| *partitions > 0));
+
+            // The line names the topic that the user asked for, not the name in the response,
+            // because the response comes from the network and could carry terminal escape
+            // sequences.
+            let created = Created {
+                name: self.configuration.name,
+                partitions,
+            };
+
+            // The broker has already created the topic. A failure to print the line, such as a
+            // closed pipe, is ignored instead of panicking in `println!`, because a non-zero exit
+            // would send a caller that retries into "topic already exists".
+            _ = writeln!(io::stdout(), "{created}").inspect_err(|error| debug!(?error));
+        }
+
+        Ok(error_code)
+    }
+}
+
+/// The line `topic create` prints when the broker has created the topic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Created {
+    name: String,
+    /// The topic's partition count, `None` when neither the response nor the request gives one.
+    partitions: Option<i32>,
+}
+
+impl Display for Created {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.partitions {
+            Some(1) => write!(f, "Created topic {} with 1 partition.", self.name),
+            Some(partitions) => write!(
+                f,
+                "Created topic {} with {partitions} partitions.",
+                self.name
+            ),
+            None => write!(f, "Created topic {}.", self.name),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Created;
+
+    fn created(partitions: Option<i32>) -> String {
+        Created {
+            name: "taxi".into(),
+            partitions,
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn created_names_the_topic_and_its_partitions() {
+        assert_eq!("Created topic taxi with 3 partitions.", created(Some(3)));
+    }
+
+    #[test]
+    fn created_with_one_partition_is_singular() {
+        assert_eq!("Created topic taxi with 1 partition.", created(Some(1)));
+    }
+
+    #[test]
+    fn created_without_a_partition_count_names_only_the_topic() {
+        assert_eq!("Created topic taxi.", created(None));
     }
 }

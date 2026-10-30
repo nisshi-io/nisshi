@@ -18,13 +18,17 @@
 
 set -euo pipefail
 
-FRANZ_GO_VERSION="${FRANZ_GO_VERSION:-v1.21.3}"
+FRANZ_GO_VERSION="${FRANZ_GO_VERSION:-v1.22.2}"
 BOOTSTRAP_SERVERS="${BOOTSTRAP_SERVERS:-127.0.0.1:9092}"
 # when set (the compat-franz-go justfile recipe does), the PID of the broker
 # started for this run: the readiness wait fails immediately if it exits
 BROKER_PID="${BROKER_PID:-}"
 COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# resolved to an absolute path, because the test suite runs in another
+# working directory and writes its log here
 WORK_DIR="${WORK_DIR:-${COMPAT_DIR}/../../target/compat}"
+mkdir -p "${WORK_DIR}"
+WORK_DIR="$(cd "${WORK_DIR}" && pwd)"
 SRC_DIR="${WORK_DIR}/franz-go"
 
 # when set, a "test,PASS|FAIL" line is appended for every top-level test,
@@ -38,11 +42,18 @@ if [[ -n "${RESULTS_FILE}" ]]; then
     RESULTS_FILE="$(cd "$(dirname "${RESULTS_FILE}")" && pwd)/$(basename "${RESULTS_FILE}")"
 fi
 
-mkdir -p "${WORK_DIR}"
-
 if [[ ! -d "${SRC_DIR}" ]]; then
     git clone --depth 1 --branch "${FRANZ_GO_VERSION}" \
         https://github.com/twmb/franz-go.git "${SRC_DIR}"
+fi
+
+# a clone that an earlier run left at another version would be reused silently
+cloned_tags="$(git -C "${SRC_DIR}" tag --points-at HEAD)"
+if ! grep -qxF "${FRANZ_GO_VERSION}" <<< "${cloned_tags}"; then
+    echo "${SRC_DIR} is at ${cloned_tags:-an untagged commit}," \
+         "not ${FRANZ_GO_VERSION}: remove it, or set" \
+         "WORK_DIR=\"\${PWD}/target/compat-${FRANZ_GO_VERSION}\"" >&2
+    exit 1
 fi
 
 # wait for the broker to listen, failing fast if it never does: falling
@@ -100,5 +111,19 @@ if [[ -n "${RESULTS_FILE}" ]]; then
     grep -E '^--- (PASS|FAIL): ' "${output}" |
         sed -E 's/^--- (PASS|FAIL): ([^ ]+).*/\2,\1/' >> "${RESULTS_FILE}"
 fi
+
+# go test passes when -run matches no test, so an allowlisted name that this
+# version does not have, or a test that a crash cut short, would pass unseen
+reported=$(grep -E '^--- (PASS|FAIL|SKIP): ' "${output}" |
+               sed -E 's/^--- [A-Z]+: ([^ ]+).*/\1/' || true)
+for test in ${tests//|/ }; do
+    if ! grep -qxF "${test}" <<< "${reported}"; then
+        echo "franz-go ${FRANZ_GO_VERSION} reported no result for ${test}" >&2
+        if [[ -n "${RESULTS_FILE}" ]]; then
+            printf '%s,FAIL\n' "${test}" >> "${RESULTS_FILE}"
+        fi
+        status=1
+    fi
+done
 
 exit "${status}"

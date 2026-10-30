@@ -141,7 +141,35 @@ A doc comment (a language's own doc-comment convention — Rust's `///`, a Pytho
   - No: `/// Returns a pool that closes a connection after it has been unused for a while.` above `fn with_idle_timeout(&self, timeout: Duration)`. The summary never says "idle timeout", and it doesn't say how long "a while" is.
   - Yes: `/// Returns a pool with the given idle timeout: how long the pool keeps an unused connection open before closing it.`
 - Longer form only when there is a real invariant, unit, or failure mode to state — see "Function-Header Scope vs. Inline Detail" above for where the line falls.
-- **No boilerplate that restates the signature with no new information.** "Returns a `Result`" adds nothing the signature doesn't already show. Rust's `# Errors` and `# Panics` sections are the right place for the load-bearing facts a signature can't carry — *which* condition produces *which* error variant, or under what non-obvious condition the function panics — but only when they say that, not just that errors or panics are possible (Rust API Guidelines [C-FAILURE](https://rust-lang.github.io/api-guidelines/documentation.html#c-failure)).
+- **No boilerplate that restates the signature with no new information.** "Returns a `Result`" adds nothing the signature doesn't already show. Say which condition gives which error, or when the function panics, only when the signature can't show it, and then in a plain sentence after the summary: "Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic." Don't use a `# Errors` or `# Panics` header. A header and its blank lines take three lines before the one sentence that matters.
+
+## Tests
+
+A reader who did not write a test has to work out two things before they can review it: the
+situation that its setup creates, and the outcome that it expects. When the code does not show
+either one clearly, the reader has to rebuild the test in their head first. A test therefore gets
+a comment on each line that the reader can't follow without help, and on no other line.
+
+- **Make the setup and the expectation clear to a reader who did not write the test.** Write a
+  comment above each line that the reader can't follow without help. Such a line is usually one
+  of these:
+  - a setup step whose purpose the code does not show, such as a port that nothing listens on or
+    a table that the test drops to make a query fail
+  - a value chosen for its effect, such as stored data that is valid JSON but not a valid record
+  - an expected value that is not the obvious one, such as a saved value that the test compares
+    with because building the value again gives a different result
+  - an assertion on the test's own setup, which stops the test from failing, or passing, for a
+    reason other than the code under test
+- **Say what the line does for the test, and why the test needs it.** The test's name, and its
+  doc comment if it has one, state the behaviour that the test checks. A comment in the body says
+  only how its line serves that check, so the body and the doc comment never say the same thing.
+- **Leave every other line uncommented.** A line that builds the input that the test's name
+  describes, or whose purpose its code shows, needs no comment. A comment there gives the reader
+  one more thing to read and tells them nothing new.
+- **Comment a helper on its own terms.** A helper that tests call is a function like any other.
+  Its comments explain what the helper does and why, and they do not say what a calling test does
+  with the result. A comment about a caller becomes wrong when that caller changes, and the next
+  test may use the helper differently.
 
 ## Rust
 

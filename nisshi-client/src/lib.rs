@@ -169,6 +169,27 @@ pub enum Error {
     UnknownHost(Url),
 }
 
+impl Error {
+    /// Returns whether the client failed to open a connection to the broker, as opposed to
+    /// failing after it connected. A pool error that comes from a refused, failed or timed out
+    /// connection attempt is a connect failure, and a pool error that comes from waiting for a
+    /// free connection is not.
+    pub fn is_connect_failure(&self) -> bool {
+        match self {
+            Self::Pool(cause) => !matches!(
+                cause.downcast_ref::<PoolError<Error>>(),
+                Some(
+                    PoolError::Timeout(TimeoutType::Wait | TimeoutType::Recycle)
+                        | PoolError::Closed
+                        | PoolError::NoRuntimeSpecified
+                )
+            ),
+            Self::UnknownHost(_) => true,
+            _ => false,
+        }
+    }
+}
+
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
@@ -1158,6 +1179,37 @@ static POOL_WAITING: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .with_description("The number of waiting objects in the pool")
         .build()
 });
+
+#[cfg(test)]
+mod connect_failure_tests {
+    use super::{Error, PoolError, TimeoutType};
+    use std::{io, sync::Arc};
+
+    fn pool_error(error: PoolError<Error>) -> Error {
+        Error::from(error)
+    }
+
+    #[test]
+    fn create_timeout_and_backend_errors_are_connect_failures() {
+        assert!(pool_error(PoolError::Timeout(TimeoutType::Create)).is_connect_failure());
+        assert!(
+            pool_error(PoolError::Backend(Error::Io(Arc::new(io::Error::from(
+                io::ErrorKind::ConnectionRefused
+            )))))
+            .is_connect_failure()
+        );
+    }
+
+    #[test]
+    fn wait_timeout_is_not_a_connect_failure() {
+        assert!(!pool_error(PoolError::Timeout(TimeoutType::Wait)).is_connect_failure());
+    }
+
+    #[test]
+    fn errors_after_connecting_are_not_connect_failures() {
+        assert!(!Error::Timeout(std::time::Duration::from_secs(30)).is_connect_failure());
+    }
+}
 
 #[cfg(test)]
 mod tests {
