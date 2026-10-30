@@ -1429,9 +1429,6 @@ where
     /// A known race remains: a concurrent request for the same group can
     /// write the group's detail again after the delete, because the
     /// `Storage` delete does not check the version of the group's detail.
-    ///
-    /// A join or sync that this broker holds for a deleted group does not hear the group's
-    /// next change, and it resumes after at most the poll interval.
     #[instrument(skip(self))]
     async fn delete_groups(&self, group_ids: &[String]) -> Result<Body> {
         debug!(?group_ids);
@@ -1512,14 +1509,6 @@ where
                 for result in &deleted {
                     if result.error_code == i16::from(ErrorCode::None) {
                         _ = wrappers.remove(&result.group_id);
-                    }
-                }
-            })?;
-
-            _ = self.changes.lock().map(|mut changes| {
-                for result in &deleted {
-                    if result.error_code == i16::from(ErrorCode::None) {
-                        _ = changes.remove(&result.group_id);
                     }
                 }
             })?;
