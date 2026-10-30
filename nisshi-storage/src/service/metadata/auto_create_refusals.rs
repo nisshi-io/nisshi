@@ -42,9 +42,8 @@ const REFUSAL_CAPACITY: usize = 1_000;
 ///
 /// Kafka trunk caches auto-creation errors the same way in [`ExpiringErrorCache`], with room for
 /// 1,000 names, evicting the entry that expires soonest. It has used the cache to back off
-/// Streams internal topic creation since [apache/kafka@2f260d79], keeping an error for the create
-/// request's `timeoutMs` (`request.timeout.ms`, 30 s by default). Nisshi's 5 s is the stricter
-/// choice.
+/// Streams internal topic creation since [apache/kafka@2f260d79], keeping an error for twice the
+/// Streams group heartbeat interval (10 s by default). Nisshi's 5 s is the stricter choice.
 ///
 /// [`replay`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L442-L449
 /// [`deleteTopic`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L552-L561

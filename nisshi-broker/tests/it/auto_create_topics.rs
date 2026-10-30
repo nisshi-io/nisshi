@@ -411,6 +411,12 @@ mod lite {
         let _guard = init_tracing()?;
         super::num_partitions_sets_the_partition_count(storage().await?).await
     }
+
+    #[tokio::test]
+    async fn colliding_name_is_not_created() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::colliding_name_is_not_created(storage().await?).await
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -440,5 +446,11 @@ mod pg {
     async fn num_partitions_sets_the_partition_count() -> Result<()> {
         let _guard = init_tracing()?;
         super::num_partitions_sets_the_partition_count(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn colliding_name_is_not_created() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::colliding_name_is_not_created(storage().await?).await
     }
 }
