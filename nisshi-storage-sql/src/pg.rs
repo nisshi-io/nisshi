@@ -7560,7 +7560,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "delete_records_past_open_transaction_raises_last_stable_to_log_start",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
