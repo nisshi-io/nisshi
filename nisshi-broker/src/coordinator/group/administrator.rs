@@ -1876,10 +1876,12 @@ where
     /// `UNSTABLE_OFFSET_COMMIT`: those for which an open transaction holds an offset of the
     /// group. Without `require_stable`, storage is not read and no partition is unstable.
     ///
-    /// The caller reads the unstable partitions before the committed offsets. On an engine
-    /// that commits a transaction's offsets and drops them from the pending ones atomically,
-    /// a transaction that ends between the two reads is then answered as unstable, which the
-    /// client retries, and never as the offset from before its end.
+    /// The caller reads the unstable partitions before the committed offsets. A transaction
+    /// that ends between the two reads is then answered as unstable, which the client
+    /// retries, and not as the offset from before its end. PostgreSQL, SQLite and Turso
+    /// commit a transaction's offsets and drop its pending ones in one database
+    /// transaction. DynoStore does not yet: its `txn_end` clears the pending offsets before
+    /// it writes the committed ones, so a read in between gets the earlier offset as stable.
     async fn unstable_offsets(
         &self,
         group_id: Option<&str>,

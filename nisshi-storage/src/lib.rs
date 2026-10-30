@@ -1941,6 +1941,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// `InitProducerId` that moves the producer to a new epoch ends its earlier open
     /// transaction in Kafka. An `OffsetFetch` with `require_stable` answers
     /// `UNSTABLE_OFFSET_COMMIT` for each of these partitions.
+    ///
+    /// A transaction that only commits offsets, with no `AddPartitionsToTxn`, is not timed
+    /// out: its partitions stay unstable until its `EndTxn`, or until an `InitProducerId`
+    /// moves its producer to a new epoch.
     async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
