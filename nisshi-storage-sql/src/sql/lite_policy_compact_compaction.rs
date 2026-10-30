@@ -22,4 +22,4 @@
 pub(crate) const QUERY: &str = "lite/policy_compact_compaction.sql";
 
 /// One record that compaction deletes.
-pub(crate) use super::row::record_offset::{Row, RowReader};
+pub(crate) use super::row::record_offset::Row;

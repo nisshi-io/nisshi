@@ -22,4 +22,4 @@
 pub(crate) const QUERY: &str = "topic_by_cluster.sql";
 
 /// One row of the query's result.
-pub(crate) use super::row::topic::{Row, RowReader};
+pub(crate) use super::row::topic::Row;

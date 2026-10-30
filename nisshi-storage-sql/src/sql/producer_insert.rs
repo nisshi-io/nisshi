@@ -19,5 +19,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "producer_insert.sql";
 
-/// Reads each row of the query's result.
-pub(crate) use super::row::written_id::RowReader;
+/// One row of the query's result.
+pub(crate) use super::row::written_id::Row;

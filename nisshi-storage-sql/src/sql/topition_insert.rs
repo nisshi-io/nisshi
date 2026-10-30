@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! The `topition_insert.sql` query, which creates one partition of a topic, and
-//! [`Row`](super::row::written_id::Row), the row that it returns. A change to the query's
-//! `returning` list must keep the column names that [`Row`](super::row::written_id::Row) declares.
+//! [`Row`], the row that it returns. A change to the query's
+//! `returning` list must keep the column names that [`Row`] declares.
 //!
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the partition's index.
@@ -22,5 +22,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topition_insert.sql";
 
-/// Reads each row of the query's result.
-pub(crate) use super::row::written_id::RowReader;
+/// One row of the query's result.
+pub(crate) use super::row::written_id::Row;

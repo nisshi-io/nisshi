@@ -22,4 +22,4 @@
 pub(crate) const QUERY: &str = "topic_insert.sql";
 
 /// One row of the query's result.
-pub(crate) use super::row::topic_id::{Row, RowReader};
+pub(crate) use super::row::topic_id::Row;

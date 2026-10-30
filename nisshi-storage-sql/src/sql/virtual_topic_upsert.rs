@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! The `virtual_topic_upsert.sql` query, which stores a virtual topic, and
-//! [`Row`](super::row::topic_id::Row), the row that it returns. A change to the query's `returning`
-//! list must keep the column names that [`Row`](super::row::topic_id::Row) declares.
+//! [`Row`], the row that it returns. A change to the query's `returning`
+//! list must keep the column names that [`Row`] declares.
 //!
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! virtual topic's key, and `$4` its ID. The query keeps the stored ID of a virtual topic that
@@ -23,5 +23,5 @@
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "virtual_topic_upsert.sql";
 
-/// Reads each row of the query's result.
-pub(crate) use super::row::topic_id::RowReader;
+/// One row of the query's result.
+pub(crate) use super::row::topic_id::Row;

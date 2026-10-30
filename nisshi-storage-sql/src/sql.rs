@@ -330,7 +330,9 @@ macro_rules! queries {
                 RowQuery {
                     query: $module::$module_constant,
                     engines: &[$(SqlEngine::$row_engine),+],
-                    check_columns: |columns| $module::RowReader::new(columns).map(|_| ()),
+                    check_columns: |columns| {
+                        <$module::Row as QueryRow>::reader(columns).map(|_| ())
+                    },
                 },
             )+
             $(
