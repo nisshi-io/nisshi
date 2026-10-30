@@ -65,7 +65,7 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OLDER_EPOCH_ERROR,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
     Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
@@ -518,6 +518,14 @@ struct ProducerDetail {
     /// remembered batches.
     #[serde(default)]
     batches: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, ProducedBatches>>>,
+    /// The base offset of the first batch that the producer wrote to each partition at the
+    /// partition's epoch, for an epoch above 0.
+    ///
+    /// The advance after a record write uses it to tell whether a batch at the previous epoch
+    /// is in the log ahead of every batch at this epoch. The key is left out while the map is
+    /// empty, so a producer that never bumps its epoch adds nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    epoch_starts: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, i64>>>,
 }
 
 impl ProducerDetail {
@@ -567,6 +575,26 @@ impl ProducerDetail {
             .and_then(|partitions| partitions.get(&topition.partition))
     }
 
+    /// Whether a batch at `epoch`, stored at `offset`, is in the log ahead of every batch at a
+    /// newer epoch on the partition.
+    ///
+    /// It is when the partition's epoch is the one after `epoch`, and that epoch's first batch
+    /// on the partition is at a higher offset. When the partition's epoch is further ahead, the
+    /// partition no longer holds where the epochs in between started, so this answers false.
+    fn is_ahead_of_next_epoch(
+        &self,
+        epoch: ProducerEpoch,
+        topition: &Topition,
+        offset: i64,
+    ) -> bool {
+        epoch
+            .checked_add(1)
+            .and_then(|next| self.epoch_starts.get(&next))
+            .and_then(|topics| topics.get(&topition.topic))
+            .and_then(|partitions| partitions.get(&topition.partition))
+            .is_some_and(|&start| offset < start)
+    }
+
     /// Records a batch stored at `base_offset`: advances the partition's next sequence at
     /// `epoch` past the batch, and remembers the batch. `produce_epoch` says whether the batch
     /// starts `epoch` on the partition.
@@ -581,7 +609,7 @@ impl ProducerDetail {
     ) {
         let sequence = match produce_epoch {
             ProduceEpoch::Continue => self.sequence(epoch, topition),
-            ProduceEpoch::Start => self.start_epoch(epoch, topition),
+            ProduceEpoch::Start => self.start_epoch(epoch, topition, base_offset),
         };
 
         *sequence += last_offset_delta + 1;
@@ -597,16 +625,32 @@ impl ProducerDetail {
     }
 
     /// Returns the next sequence of `topition` at `epoch`, after the producer starts that
-    /// epoch on the partition.
+    /// epoch on the partition with a batch at `base_offset`.
     ///
-    /// Starting an epoch removes the partition's sequences and remembered batches at older
-    /// epochs, and each older epoch that then holds none. A produce never reads them again,
-    /// because the broker refuses a batch at an older epoch than its partition's. Keeping
-    /// them would grow meta.json, which every idempotent produce rewrites, by an entry for
-    /// each bump.
-    fn start_epoch(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
+    /// Starting an epoch removes the partition's sequences, remembered batches and epoch
+    /// starts at older epochs, and each older epoch that then holds none. A produce never reads
+    /// them again, because the broker refuses a batch at an older epoch than its partition's.
+    /// Keeping them would grow meta.json, which every idempotent produce rewrites, by an entry
+    /// for each bump.
+    fn start_epoch(
+        &mut self,
+        epoch: ProducerEpoch,
+        topition: &Topition,
+        base_offset: i64,
+    ) -> &mut Sequence {
         forget_older_epochs(&mut self.sequences, epoch, topition);
         forget_older_epochs(&mut self.batches, epoch, topition);
+        forget_older_epochs(&mut self.epoch_starts, epoch, topition);
+
+        if epoch > 0 {
+            _ = self
+                .epoch_starts
+                .entry(epoch)
+                .or_default()
+                .entry(topition.topic.clone())
+                .or_default()
+                .insert(topition.partition, base_offset);
+        }
 
         self.sequence(epoch, topition)
     }
@@ -662,6 +706,7 @@ fn allocate_producer_id(
         ProducerDetail {
             sequences: BTreeMap::from([(0, BTreeMap::new())]),
             batches: BTreeMap::new(),
+            epoch_starts: BTreeMap::new(),
         },
     );
 
@@ -774,6 +819,72 @@ struct Watermark {
     /// this type ignores it.
     #[serde(default)]
     time_index: TimeIndex,
+    /// The newest epoch above 0 of each idempotent producer that wrote to this partition.
+    ///
+    /// The produce path checks and records it in the compare-and-swap that gives a batch its
+    /// offset, so a batch at an older epoch is refused before it gets an offset. The sequence
+    /// check in `meta.json` runs in separate steps, before the offset and after the record
+    /// write, so it cannot refuse a batch that passed it before the producer's epoch moved.
+    ///
+    /// The key is left out while the map is empty, so a producer that never bumps its epoch
+    /// adds nothing. A document written before the key existed decodes to an empty map, and
+    /// a broker that does not know the key drops it when it writes the document.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    producer_epochs: BTreeMap<ProducerId, ProducerEpoch>,
+}
+
+impl Watermark {
+    /// The most producers whose epoch [`Watermark::producer_epochs`] holds for one partition.
+    ///
+    /// When a new producer goes over this limit, the partition forgets the producer with the
+    /// smallest ID. Producer IDs only go up, so that is the producer whose ID the broker
+    /// allocated first, which is not always the one that wrote last. A forgotten producer's
+    /// older-epoch batch is checked only against `meta.json` again, which refuses it after its
+    /// record write if it is behind the newer epoch's batches. Kafka 3.9.1
+    /// limits the producers it keeps by idle time (`producer.id.expiration.ms`) and not by
+    /// count ([`ProducerStateManager.removeExpiredProducers`]). We limit by count instead,
+    /// because every produce to the partition reads and writes this document, and a count
+    /// keeps it small without a clock.
+    ///
+    /// [`ProducerStateManager.removeExpiredProducers`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerStateManager.java#L359-L374
+    const MAX_FENCED_PRODUCERS: usize = 1024;
+
+    /// Refuses a batch whose epoch is older than the newest epoch this partition holds for its
+    /// producer, with [`OLDER_EPOCH_ERROR`], as the sequence check does.
+    fn fence_producer_epoch(
+        &self,
+        producer_id: ProducerId,
+        producer_epoch: ProducerEpoch,
+    ) -> Result<()> {
+        if self
+            .producer_epochs
+            .get(&producer_id)
+            .is_some_and(|&newest| newest > producer_epoch)
+        {
+            Err(Error::Api(OLDER_EPOCH_ERROR))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Records a batch's epoch as its producer's newest on this partition, when it is above 0
+    /// and above the epoch already recorded.
+    fn record_producer_epoch(&mut self, producer_id: ProducerId, producer_epoch: ProducerEpoch) {
+        if producer_epoch <= 0
+            || self
+                .producer_epochs
+                .get(&producer_id)
+                .is_some_and(|&newest| newest >= producer_epoch)
+        {
+            return;
+        }
+
+        _ = self.producer_epochs.insert(producer_id, producer_epoch);
+
+        if self.producer_epochs.len() > Self::MAX_FENCED_PRODUCERS {
+            _ = self.producer_epochs.pop_first();
+        }
+    }
 }
 
 /// Returns the last stable offset of a partition, from its high watermark,
@@ -2281,10 +2392,37 @@ impl DynoStore {
 
                 // with_mut stores each change that this closure makes, also when it
                 // then answers an error, so every check runs before any change.
-                let produce_epoch = stored
-                    .check_batch(producer_epoch, base_sequence)
-                    .inspect_err(|error| debug!(?error, ?stored, producer_epoch))
-                    .map_err(Error::Api)?;
+                let produce_epoch = match stored.check_batch(producer_epoch, base_sequence) {
+                    Ok(produce_epoch) => produce_epoch,
+
+                    // A batch that the producer's next epoch superseded after it got its
+                    // offset is in the log ahead of that epoch's batches, and Kafka
+                    // acknowledges such a batch too. Its sequence belongs to the older epoch,
+                    // so nothing advances. This compares offsets instead of relying on the
+                    // watermark fence, because the fence does not cover a producer that the
+                    // watermark has forgotten.
+                    Err(error)
+                        if stored.is_superseded(producer_epoch)
+                            && pd.is_ahead_of_next_epoch(producer_epoch, topition, offset) =>
+                    {
+                        info!(
+                            ?error,
+                            ?stored,
+                            producer_id,
+                            producer_epoch,
+                            offset,
+                            ?topition,
+                            "acknowledged a batch that a newer epoch superseded after it was \
+                             given its offset"
+                        );
+                        return Ok(());
+                    }
+
+                    Err(error) => {
+                        debug!(?error, ?stored, producer_epoch);
+                        return Err(Error::Api(error));
+                    }
+                };
 
                 let (sequence, remembered_batches) = match produce_epoch {
                     ProduceEpoch::Continue => (
@@ -2330,8 +2468,9 @@ impl DynoStore {
                 // write any failure here is not harmless: the client is told
                 // the batch failed while it is stored. That covers a rejected
                 // sequence, a fenced producer (the check before the write
-                // passed on stale metadata) and a transient object store
-                // error (the retry then stores the batch a second time).
+                // passed on stale metadata, and the watermark fence did not
+                // hold the producer) and a transient object store error
+                // (the retry then stores the batch a second time).
                 POST_WRITE_ADVANCE_FAILED.add(
                     1,
                     &[
@@ -2858,11 +2997,27 @@ impl Storage for DynoStore {
                 .with_mut(&self.object_store, |watermark| {
                     debug!(?watermark);
 
+                    // with_mut stores each change that this closure makes, also when it then
+                    // answers an error, so the fence runs before any change.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.fence_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        )?;
+                    }
+
                     let offset = watermark.high.unwrap_or_default();
                     watermark.high = watermark.high.map_or_else(
                         || Some(deflated.last_offset_delta as i64 + 1i64),
                         |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
                     );
+
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.record_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        );
+                    }
 
                     // Deliberately not touched: this branch (`nisshi.lake.sink`)
                     // never writes a `records/*.batch` object, so there is
@@ -2974,6 +3129,16 @@ impl Storage for DynoStore {
                 .with_mut(&self.object_store, |watermark| {
                     debug!(?watermark);
 
+                    // with_mut stores each change that this closure makes, also when it then
+                    // answers an error, so the fence runs before any change. A refused batch
+                    // still costs one get and one put of an unchanged watermark.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.fence_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        )?;
+                    }
+
                     let offset = watermark.high.unwrap_or_default();
                     let is_new_partition = watermark.high.is_none();
 
@@ -2995,6 +3160,17 @@ impl Storage for DynoStore {
                         offset,
                         u64::try_from(deflated.batch_length).unwrap_or_default(),
                     );
+
+                    // The epoch is recorded before the record write. When that write fails,
+                    // the partition refuses the older epoch although it stores nothing at the
+                    // newer one. The client has already moved to the newer epoch, so it does
+                    // not send the older one again.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.record_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        );
+                    }
 
                     debug!(?watermark);
 
