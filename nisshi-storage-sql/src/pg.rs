@@ -110,7 +110,7 @@ use crate::{
         consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
         topic_configuration_select, topic_configuration_select_keys, topic_select,
-        watermark_select_for_write,
+        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
 
@@ -2531,6 +2531,44 @@ impl Postgres {
             .map_err(Into::into)
     }
 
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction (see [`txn_produce_partition_check`]). EndTxn deletes a transaction's
+    /// `txn_topition` rows, so a row is present only while the transaction is ongoing.
+    async fn txn_produce_partition_check(
+        &self,
+        transaction_id: &str,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+        tx: &Transaction<'_>,
+    ) -> Result<()> {
+        let row = self
+            .tx_prepare_query_opt(
+                tx,
+                txn_produce_partition_select::QUERY,
+                &[
+                    &self.cluster,
+                    &transaction_id,
+                    &deflated.producer_id,
+                    &deflated.producer_epoch,
+                    &topition.topic(),
+                    &topition.partition(),
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+            .map(|row| {
+                Ok::<_, Error>((
+                    row.try_get::<_, Option<i64>>(txn_produce_partition_select::PRODUCER)?,
+                    row.try_get::<_, i32>(txn_produce_partition_select::ADDED)?,
+                ))
+            })
+            .transpose()
+            .inspect_err(|err| error!(?err))?;
+
+        txn_produce_partition_check(row, deflated.producer_id)
+            .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
+    }
+
     #[instrument(skip_all)]
     async fn produce_in_tx(
         &self,
@@ -2571,6 +2609,14 @@ impl Postgres {
             self.idempotent_message_check(transaction_id, topition, &deflated, tx)
                 .await
                 .inspect_err(|err| error!(?err))?;
+        }
+
+        if let Some(transaction_id) = transaction_id
+            && deflated.is_transactional()
+            && !deflated.is_control()
+        {
+            self.txn_produce_partition_check(transaction_id, topition, &deflated, tx)
+                .await?;
         }
 
         let limit =
@@ -8683,9 +8729,12 @@ mod tests {
             .await;
 
         assert!(
-            matches!(zombie_result, Err(Error::Api(ErrorCode::ProducerFenced))),
-            "a zombie produce under the pre-sweep epoch must be rejected as ProducerFenced, \
-             got {zombie_result:?}",
+            matches!(
+                zombie_result,
+                Err(Error::Api(ErrorCode::InvalidProducerEpoch))
+            ),
+            "a zombie produce under the pre-sweep epoch must be rejected as \
+             InvalidProducerEpoch, got {zombie_result:?}",
         );
 
         let stage_after_zombie_write = storage.offset_stage(&topition).await?;

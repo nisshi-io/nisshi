@@ -49,8 +49,8 @@ just ci                # start postgres, minio, and lakehouse via docker compose
 just                   # fmt, build, test, clippy
 ```
 
-See `CLAUDE.md` at the repo root for the full command reference and
-architecture overview.
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how the crates fit together.
+See `CLAUDE.md` at the repo root for the full command reference.
 
 ## Making a change
 

@@ -21,7 +21,7 @@ use nisshi_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
+use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, TransactionAbortableDowngradeLayer};
 use nisshi_storage::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
     CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService, DeleteRecordsService,
@@ -463,7 +463,10 @@ where
     S: Storage,
 {
     builder
-        .with_capped_route::<ProduceRequest, _>(ProduceService { storage })
+        .with_capped_route_layer::<ProduceRequest, _, _>(
+            TransactionAbortableDowngradeLayer,
+            ProduceService { storage },
+        )
         .map_err(Into::into)
 }
 

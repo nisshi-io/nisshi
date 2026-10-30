@@ -31,6 +31,7 @@ mod describe_groups;
 mod failing_object_store;
 mod fetch_listing;
 mod init_producer;
+mod lake_sink_idempotence;
 mod latency;
 mod list_groups;
 mod list_offsets;

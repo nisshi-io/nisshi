@@ -12,7 +12,7 @@ The tables compare the PostgreSQL, SQLite, in-memory and S3 storage engines. The
 engines share one implementation, so their columns are the same. The tables do not cover Turso,
 which is experimental, or SlateDB, which is deprecated.
 
-The [storage engine table](../README.md#storage-options) in the README gives each engine's status, and
+The [storage engine table](storage.md) gives each engine's status, and
 [What CI tests on each storage engine](../CONTRIBUTING.md#what-ci-tests-on-each-storage-engine)
 gives the checks that CI runs on each engine.
 
@@ -64,6 +64,9 @@ Nisshi does not implement them, because the storage engine holds all the state.
 
 ### Consumer groups
 
+[Consumer groups and offsets](consumer-groups.md) explains how groups and committed offsets work,
+with an example and the limits of this build.
+
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
 | OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | Answers OFFSET_METADATA_TOO_LARGE for a partition whose metadata is longer than 4096 characters, the default of Kafka's `offset.metadata.max.bytes`. Nisshi does not make the limit configurable. |
@@ -85,13 +88,15 @@ Nisshi does not implement them, because the storage engine holds all the state.
 Nisshi supports the idempotent producer, and does not support transactions. The broker answers
 TRANSACTIONAL_ID_AUTHORIZATION_FAILED to an InitProducerId request with a `transactional.id`, so
 a transactional producer fails at `initTransactions()` with
-TransactionalIdAuthorizationException. The broker still advertises the other transaction APIs,
-but a client cannot start a transaction to use them.
+TransactionalIdAuthorizationException. A Kafka Streams application with `processing.guarantee`
+set to `exactly_once_v2` uses a transactional producer, so it fails the same way. The broker still
+advertises the other transaction APIs, but a client cannot start a transaction to use them.
 
 An idempotent producer can bump its own epoch after an error and restart its sequence at 0
 (KIP-360), and the broker keeps the epoch for each partition, as Kafka does. A batch at an epoch
-older than its partition's gets PRODUCER_FENCED, where Kafka answers INVALID_PRODUCER_EPOCH. The
-broker refuses a bump to epoch 32766 or above with PRODUCER_FENCED, and Kafka accepts it.
+older than its partition's gets INVALID_PRODUCER_EPOCH, as in Kafka. The broker refuses a bump to
+epoch 32766 or above with INVALID_PRODUCER_EPOCH, and Kafka accepts it. The Java producer then
+moves to a new producer ID and continues.
 
 The in-memory and S3 engines answer a retry of one of an idempotent producer's last 5 batches to
 a partition as Kafka does: with no error and the offset of the stored batch. They answer any

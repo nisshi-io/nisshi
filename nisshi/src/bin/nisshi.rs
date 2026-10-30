@@ -279,7 +279,7 @@ fn report_error(err: &nisshi_cli::Error) {
                                 the broker must change the schema, and its role isn't allowed \
                                 to. Start one broker once with the credentials of the role that \
                                 owns Nisshi's tables, then start the others with this role. See \
-                                the PostgreSQL section of README.md."
+                                the PostgreSQL section of docs/storage.md."
                         )
                     }
                     _ => report_failure!("storage {storage} failed its schema setup: {source}"),

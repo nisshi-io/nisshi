@@ -20,6 +20,9 @@ cargo-flamegraph.trace
 /dist
 debug
 dhat.*
+# `just kafka-ref`: a clone of Apache Kafka, or a symlink to one, and its partial clone
+/kafka-ref
+/kafka-ref.tmp
 flamegraph*.svg
 license.html
 perf.data*
@@ -27,10 +30,10 @@ profile.json*
 target
 tmp
 
-# understand-anything: keep the committed graph, ignore its local scratch
-.ua/intermediate/
-.ua/diff-overlay.json
-.ua/.trash-*/
+# understand-anything's knowledge graph and scratch. The committed graph went
+# stale (last refreshed in #893) and nothing in the repo reads it, so it stays
+# local; re-add it if it becomes something the project maintains.
+.ua/
 fuzz/artifacts/fuzz_alter_user_scram_credentials_storage/
 /benchmark/openmessaging/.omb/
 /benchmark/openmessaging/results/
