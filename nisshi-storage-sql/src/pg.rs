@@ -16,7 +16,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     hash::Hash,
     io,
@@ -110,7 +110,8 @@ use crate::{
         consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
         topic_configuration_select, topic_configuration_select_keys, topic_select,
-        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
+        txn_offset_commit_tp_select_pending, txn_produce_partition_check,
+        txn_produce_partition_select, watermark_select_for_write,
     },
 };
 
@@ -4295,6 +4296,30 @@ impl Storage for Postgres {
         }
 
         Ok(results)
+    }
+
+    #[instrument(skip_all)]
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        self.prepare_query(
+            &c,
+            txn_offset_commit_tp_select_pending::QUERY,
+            &[&self.cluster, &group_id],
+        )
+        .await
+        .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?
+        .into_iter()
+        .map(|row| {
+            Ok(Topition::new(
+                row.try_get::<_, String>(txn_offset_commit_tp_select_pending::TOPIC)?,
+                row.try_get::<_, i32>(txn_offset_commit_tp_select_pending::PARTITION)?,
+            ))
+        })
+        .collect::<Result<BTreeSet<_>>>()
+        .inspect(|pending| debug!(cluster = self.cluster, group_id, ?pending))
     }
 
     #[instrument(skip_all)]

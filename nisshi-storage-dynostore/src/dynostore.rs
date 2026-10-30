@@ -3671,6 +3671,40 @@ impl Storage for DynoStore {
         Ok(responses)
     }
 
+    /// A `TxnOffsetCommit` holds its offsets in the detail of the producer's current epoch,
+    /// and the completed end of the transaction clears them. A new epoch leaves the earlier
+    /// epoch's detail in place, so an earlier epoch counts only while its end is prepared
+    /// and waits behind an older open transaction.
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.meta
+            .with(&self.object_store, |meta| {
+                Ok(meta
+                    .transactions
+                    .values()
+                    .flat_map(|txn| {
+                        let current = txn.epochs.last_key_value().map(|(epoch, _)| *epoch);
+
+                        txn.epochs.iter().filter_map(move |(epoch, txn_detail)| {
+                            (Some(*epoch) == current
+                                || txn_detail.state.is_some_and(|state| state.is_prepared()))
+                            .then_some(txn_detail)
+                        })
+                    })
+                    .filter_map(|txn_detail| txn_detail.offsets.get(group_id))
+                    .flat_map(|topics| {
+                        topics.iter().flat_map(|(topic, partitions)| {
+                            partitions
+                                .keys()
+                                .map(|partition| Topition::new(topic.to_owned(), *partition))
+                        })
+                    })
+                    .collect())
+            })
+            .await
+            .inspect(|pending| debug!(group_id, ?pending))
+            .inspect_err(|error| error!(?error, group_id))
+    }
+
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         let brokers = vec![
             MetadataResponseBroker::default()

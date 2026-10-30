@@ -42,7 +42,7 @@ pub mod read_share;
 mod txn;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Debug, Display, Formatter},
     sync::LazyLock,
     time::{Duration, SystemTime},
@@ -159,6 +159,7 @@ pub enum Request {
         topics: Vec<Topition>,
         require_stable: Option<bool>,
     },
+    PendingTxnOffsets(String),
     Metadata(Option<Vec<TopicId>>),
     DescribeConfig {
         name: String,
@@ -256,6 +257,7 @@ impl Display for Request {
             Self::OffsetCommit { .. } => f.write_str("OffsetCommit"),
             Self::OffsetFetch { .. } => f.write_str("OffsetFetch"),
             Self::OffsetStage(_) => f.write_str("OffsetStage"),
+            Self::PendingTxnOffsets(_) => f.write_str("PendingTxnOffsets"),
             Self::Produce { .. } => f.write_str("Produce"),
             Self::RegisterBroker(_) => f.write_str("RegisterBroker"),
             Self::TxnAddOffsets { .. } => f.write_str("TxnAddOffsets"),
@@ -299,6 +301,7 @@ pub enum Response {
     OffsetCommit(Result<Vec<(Topition, ErrorCode)>>),
     OffsetFetch(Result<BTreeMap<Topition, CommittedOffset>>),
     OffsetStage(Result<OffsetStage>),
+    PendingTxnOffsets(Result<BTreeSet<Topition>>),
     Ping(Result<()>),
     Produce(Result<i64>),
     RegisterBroker(Result<()>),
@@ -688,6 +691,17 @@ impl Storage for RequestChannelService {
                 require_stable,
             },
             OffsetFetch
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let group_id = group_id.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::PendingTxnOffsets(group_id),
+            PendingTxnOffsets
         )
     }
 
@@ -1238,6 +1252,9 @@ where
                 self.storage
                     .offset_fetch(group_id.as_deref(), &topics[..], require_stable)
                     .await,
+            )),
+            Request::PendingTxnOffsets(group_id) => Ok(Response::PendingTxnOffsets(
+                self.storage.pending_txn_offsets(&group_id).await,
             )),
             Request::Metadata(topic_ids) => Ok(Response::Metadata(
                 self.storage.metadata(topic_ids.as_deref()).await,

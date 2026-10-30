@@ -58,6 +58,7 @@ pub mod new_cg;
 pub mod offset_commit_fence;
 pub mod offset_commit_unknown_partition;
 pub mod offset_fetch_commit_metadata;
+pub mod offset_fetch_require_stable;
 pub mod offset_fetch_storage_error;
 pub mod offset_metadata_max_size;
 pub mod person;
