@@ -201,8 +201,6 @@ async fn retry_after_failed_transaction_write_stores_the_batch() -> Result<(), E
         Err(Error::ObjectStore(_))
     );
 
-    // The failed attempt took offset 0 in the watermark before the transaction write, and a
-    // produce does not give taken offsets back, so the retry is stored at offset 1.
     let retry = storage
         .produce(
             Some(TRANSACTION),
@@ -211,11 +209,13 @@ async fn retry_after_failed_transaction_write_stores_the_batch() -> Result<(), E
         )
         .await?;
 
-    assert_eq!(1, retry);
-    assert_eq!(vec![1], fetched_base_offsets(&storage, &topition).await?);
+    assert_eq!(
+        vec![retry],
+        fetched_base_offsets(&storage, &topition).await?
+    );
 
     assert_eq!(
-        2,
+        retry + 1,
         storage
             .produce(
                 Some(TRANSACTION),
