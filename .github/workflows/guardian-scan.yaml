@@ -239,7 +239,7 @@ jobs:
           "${RUNNER_TEMP}/fossa-bin/fossa" --version
       - name: FOSSA analyze and upload
         id: analyze
-        uses: SolaceDev/solace-public-workflows/.github/actions/sca/sca-scan@d07aa7fb57d0e352316223e016a5177ddc487086 # main 2026-10-28, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/sca/sca-scan@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-28, untagged
         with:
           scanners: "fossa"
           additional_scan_params: |
