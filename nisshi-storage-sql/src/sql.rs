@@ -76,7 +76,12 @@ macro_rules! sql_row {
                                 query: self.query,
                                 column: stringify!($field),
                                 source: Box::new(source),
-                            })?,
+                            })
+                            // The reader logs the error at error level, because the error means
+                            // that the row is corrupt or that the query does not match its row,
+                            // and a caller can answer it with a Kafka error code that does not
+                            // show it.
+                            .inspect_err(|err| ::tracing::error!(?err))?,
                     )+
                 })
             }
