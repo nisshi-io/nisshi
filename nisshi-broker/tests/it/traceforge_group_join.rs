@@ -121,6 +121,7 @@ fn join_member(
             let request = JoinRequest {
                 api_version: 9,
                 client_id: Some(CLIENT_ID),
+                client_host: None,
                 group_id,
                 session_timeout_ms: 45_000,
                 rebalance_timeout_ms: 300_000,

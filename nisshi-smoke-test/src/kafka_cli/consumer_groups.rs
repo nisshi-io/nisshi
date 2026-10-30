@@ -227,6 +227,17 @@ pub struct GroupOffsets {
     pub end: u64,
 }
 
+/// A member of a consumer group, from `kafka-consumer-groups --describe --members`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescribedMember {
+    /// The address that the member connected from, as the broker reports it.
+    pub host: String,
+    /// The client id that the member sent when it joined.
+    pub client_id: String,
+    /// The number of partitions that the group's assignment gives the member.
+    pub partition_count: u32,
+}
+
 /// The heading of the table that [`KafkaConsumerGroups::describe_state`] prints, split at
 /// whitespace.
 const GROUP_STATE_HEADING: &[&str] = &[
@@ -283,15 +294,18 @@ impl Output<ListGroupsInState> {
 }
 
 impl Output<DescribeGroupMembers> {
-    /// Returns the number of partitions that each of `group`'s members reads, in the order of the
-    /// table's rows.
+    /// Returns each of `group`'s members, in the order of the table's rows.
     #[track_caller]
-    pub fn member_partition_counts(&self, group: &str) -> Vec<u32> {
+    pub fn members(&self, group: &str) -> Vec<DescribedMember> {
         group_table_rows(self, GROUP_MEMBERS_HEADING)
             .into_iter()
             .filter_map(|columns| match columns[..] {
-                [row_group, _, _, _, partition_count, ..] if row_group == group => {
-                    partition_count.parse().ok()
+                [row_group, _, host, client_id, partition_count, ..] if row_group == group => {
+                    Some(DescribedMember {
+                        host: host.to_owned(),
+                        client_id: client_id.to_owned(),
+                        partition_count: partition_count.parse().ok()?,
+                    })
                 }
                 _ => None,
             })

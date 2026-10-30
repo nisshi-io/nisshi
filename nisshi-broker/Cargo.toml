@@ -83,10 +83,12 @@ rcgen.workspace = true
 sha2.workspace = true
 snap.workspace = true
 tempfile.workspace = true
+tokio-postgres.workspace = true
 pretty_assertions.workspace = true
 slatedb.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage.workspace = true
 crc-fast.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
+nisshi-storage-sql = { workspace = true, features = ["test-support"] }
 traceforge.workspace = true

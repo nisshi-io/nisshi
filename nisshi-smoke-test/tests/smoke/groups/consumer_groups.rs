@@ -18,11 +18,11 @@
 //! a group or its offsets to make its consumers start over. A wrong answer makes the operator look
 //! for a problem that does not exist, or hides a problem that does.
 
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use nisshi_smoke_test::{
-    BackgroundTool, GROUP_ID_NOT_FOUND_EXCEPTION, GROUP_NOT_EMPTY_EXCEPTION, GroupOffsets,
-    GroupState, KafkaCli, VerifiableConsume, unique,
+    BackgroundTool, GROUP_NOT_EMPTY_EXCEPTION, GroupOffsets, GroupState, KafkaCli,
+    VerifiableConsume, unique,
 };
 
 /// How long a consumer has to join its group and get its partitions.
@@ -128,11 +128,10 @@ fn describe_shows_committed_and_end_offsets() {
     );
 }
 
-/// Describing the members of a running group must show each member and how many partitions it
-/// reads, so an operator sees who reads what. The broker must answer `DescribeGroups` with each
-/// member and its assignment.
+/// Describing the members of a running group must show each member, the host it connects from,
+/// its client id and how many partitions it reads, so an operator sees who reads what. The broker
+/// must answer `DescribeGroups` with each member's host, client id and assignment.
 #[test]
-#[ignore = "DescribeGroups answers no members for a group that has them (#962)"]
 fn describe_members_shows_each_member_and_its_partitions() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(2, &[]);
@@ -164,10 +163,24 @@ fn describe_members_shows_each_member_and_its_partitions() {
     ]
     .map(|count| u32::try_from(count).expect("a partition count fits in a u32"));
     reported_counts.sort_unstable();
-    let mut described_counts = described.succeeded().member_partition_counts(&group);
+    let described_members = described.succeeded().members(&group);
+    let mut described_counts = described_members
+        .iter()
+        .map(|member| member.partition_count)
+        .collect::<Vec<_>>();
     described_counts.sort_unstable();
 
     assert_eq!(described_counts, reported_counts, "{described}");
+    assert!(
+        described_members.iter().all(|member| {
+            member
+                .host
+                .strip_prefix('/')
+                .is_some_and(|address| address.parse::<IpAddr>().is_ok())
+                && !member.client_id.is_empty()
+        }),
+        "a member's host is not `/` and an IP address, or its client id is empty: {described}"
+    );
 }
 
 /// A group with a running consumer must be `Stable`, and `Empty` once the consumer has left, so
@@ -197,15 +210,18 @@ fn state_is_stable_while_consuming_and_empty_after() {
 
 /// Describing a group that never existed must say that it doesn't exist. Showing an empty group
 /// instead hides a mistyped group name. The broker must answer `DescribeGroups` for an unknown
-/// group with `GROUP_ID_NOT_FOUND`.
+/// group with the error NONE and the state `Dead`, as Kafka does up to v5, and the tool then
+/// reports the group as missing. An answer of `GROUP_ID_NOT_FOUND` fails the tool with an
+/// unexpected error.
 #[test]
 fn describe_of_unknown_group_says_it_does_not_exist() {
     let cli = KafkaCli::shared();
 
     let described = cli.consumer_groups().describe(&unique::name("never-used"));
 
+    assert!(described.mentions("does not exist"), "{described}");
     assert!(
-        described.mentions(GROUP_ID_NOT_FOUND_EXCEPTION),
+        !described.mentions("GroupIdNotFoundException"),
         "{described}"
     );
 }

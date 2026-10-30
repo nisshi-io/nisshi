@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fmt::Debug,
     marker::PhantomData,
@@ -27,10 +27,12 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, QueryRow, QueryRowCursor, consumer_group_select, default_hash,
-        idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select, remove_comments,
+        Cache, QueryRow, QueryRowCursor, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
-        watermark_select_for_write,
+        txn_offset_commit_tp_select_pending, txn_produce_partition_check,
+        txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -65,8 +67,8 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
     Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
@@ -279,13 +281,11 @@ impl Engine {
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
         debug!(sql, ?error);
 
-        let _attributes = [
+        vec![
             KeyValue::new("sql", sql.to_owned()),
             KeyValue::new("cluster_id", self.cluster.clone()),
-        ];
-
-        debug!(?error);
-        todo!();
+            KeyValue::new("kind", error_kind(error)),
+        ]
     }
 
     async fn prepare_execute<P>(
@@ -638,6 +638,50 @@ impl Engine {
         .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
     }
 
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction (see [`txn_produce_partition_check`]). EndTxn deletes a transaction's
+    /// `txn_topition` rows, so a row is present only while the transaction is ongoing.
+    async fn txn_produce_partition_check(
+        &self,
+        transaction_id: &str,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+        connection: &Connection,
+    ) -> Result<()> {
+        let mut rows = connection
+            .query(
+                &sql_lookup(txn_produce_partition_select::QUERY)?,
+                (
+                    self.cluster.as_str(),
+                    transaction_id,
+                    deflated.producer_id,
+                    deflated.producer_epoch,
+                    topition.topic(),
+                    topition.partition(),
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        let columns = ResultColumns::turso(txn_produce_partition_select::QUERY, &rows);
+        let producer = columns.index(txn_produce_partition_select::PRODUCER)?;
+        let added = columns.index(txn_produce_partition_select::ADDED)?;
+
+        let row = match rows.next().await.inspect_err(|err| error!(?err))? {
+            Some(row) => Some((
+                match row.get_value(producer)? {
+                    Value::Null => None,
+                    _ => Some(integer_value(&row, producer).inspect_err(|err| error!(?err))?),
+                },
+                integer_value(&row, added).inspect_err(|err| error!(?err))? as i32,
+            )),
+            None => None,
+        };
+
+        txn_produce_partition_check(row, deflated.producer_id)
+            .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
+    }
+
     async fn produce_in_tx<'conn>(
         &self,
         transaction_id: Option<&str>,
@@ -655,6 +699,14 @@ impl Engine {
             self.idempotent_message_check(transaction_id, topition, &deflated, tx.deref())
                 .await
                 .inspect_err(|err| error!(?err))?;
+        }
+
+        if let Some(transaction_id) = transaction_id
+            && deflated.is_transactional()
+            && !deflated.is_control()
+        {
+            self.txn_produce_partition_check(transaction_id, topition, &deflated, tx.deref())
+                .await?;
         }
 
         let watermarks = self.watermark_select_for_write(topition, tx).await?;
@@ -1274,22 +1326,73 @@ fn epoch_value(row: &Row, index: usize) -> Result<i16> {
     integer_value(row, index).and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
 }
 
-fn unique_constraint(error_code: ErrorCode) -> impl Fn(turso::Error) -> Error {
-    let _ = error_code;
-    move |err| {
-        let _ = err;
-        todo!()
-        // if let turso::Error::SqliteFailure(code, ref reason) = err {
-        //     debug!(code, reason);
+/// Returns the leader epoch in column `index` of `row`, or `None` when the column is null.
+/// Returns an error when the stored integer is outside `i32`.
+fn leader_epoch_value(row: &Row, index: usize) -> Result<Option<i32>> {
+    row.get_value(index).map_err(Error::from).and_then(|value| {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value
+                .as_integer()
+                .copied()
+                .ok_or(Error::UnexpectedValue(value))
+                .and_then(|epoch| i32::try_from(epoch).map(Some).map_err(Error::from))
+        }
+    })
+}
 
-        //     if code == 2067 {
-        //         Error::Api(error_code)
-        //     } else {
-        //         err.into()
-        //     }
-        // } else {
-        //     err.into()
-        // }
+/// Returns the text in column `index` of `row`, or `None` when the column is null.
+fn optional_text_value(row: &Row, index: usize) -> Result<Option<String>> {
+    row.get_value(index).map_err(Error::from).and_then(|value| {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value
+                .as_text()
+                .cloned()
+                .map(Some)
+                .ok_or(Error::UnexpectedValue(value))
+        }
+    })
+}
+
+/// Returns a mapper that turns a unique constraint failure into [`Error::Api`] with
+/// `error_code`, and passes any other error through.
+///
+/// turso reports a unique or primary key failure as [`turso::Error::Constraint`] with a
+/// message, and does not give its SQLite extended result code, so the mapper matches the
+/// message's prefix.
+fn unique_constraint(error_code: ErrorCode) -> impl Fn(turso::Error) -> Error {
+    move |err| match err {
+        turso::Error::Constraint(ref reason) if reason.starts_with("UNIQUE constraint failed") => {
+            debug!(reason);
+            Error::Api(error_code)
+        }
+
+        otherwise => otherwise.into(),
+    }
+}
+
+/// Returns the name of `error`'s variant, as the `kind` attribute of the SQL error metric.
+fn error_kind(error: &turso::Error) -> &'static str {
+    match error {
+        turso::Error::ToSqlConversionFailure(_) => "to_sql_conversion_failure",
+        turso::Error::QueryReturnedNoRows => "query_returned_no_rows",
+        turso::Error::ConversionFailure(_) => "conversion_failure",
+        turso::Error::Busy(_) => "busy",
+        turso::Error::BusySnapshot(_) => "busy_snapshot",
+        turso::Error::Interrupt(_) => "interrupt",
+        turso::Error::Error(_) => "error",
+        turso::Error::Misuse(_) => "misuse",
+        turso::Error::Constraint(_) => "constraint",
+        turso::Error::Readonly(_) => "readonly",
+        turso::Error::DatabaseFull(_) => "database_full",
+        turso::Error::NotAdb(_) => "not_a_db",
+        turso::Error::Corrupt(_) => "corrupt",
+        turso::Error::IoError(..) => "io_error",
+        turso::Error::BatchStatementFailed { .. } => "batch_statement_failed",
+        turso::Error::BatchRollbackFailed { .. } => "batch_rollback_failed",
     }
 }
 
@@ -2123,7 +2226,10 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(group_id);
 
         let mut results = BTreeMap::new();
@@ -2132,43 +2238,98 @@ impl Storage for Engine {
 
         let mut rows = c
             .query(
-                &sql_lookup("consumer_offset_select_by_group.sql")?,
+                &sql_lookup(consumer_offset_select_by_group::QUERY)?,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
+        let columns = ResultColumns::turso(consumer_offset_select_by_group::QUERY, &rows);
+        let topic = columns.index(consumer_offset_select_by_group::TOPIC)?;
+        let partition = columns.index(consumer_offset_select_by_group::PARTITION)?;
+        let committed_offset = columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)?;
+        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)?;
+        let metadata = columns.index(consumer_offset_select_by_group::METADATA)?;
+
         while let Some(row) = rows.next().await? {
-            let topic = row.get_value(0).map_err(Into::into).and_then(|value| {
+            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
                 value
                     .as_text()
                     .cloned()
                     .ok_or(Error::UnexpectedValue(value))
             })?;
 
-            let partition = row.get_value(1).map_err(Into::into).and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .map(|partition| partition as i32)
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
+            let partition = row
+                .get_value(partition)
+                .map_err(Into::into)
+                .and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .map(|partition| partition as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
 
-            let offset = row.get_value(2).map_err(Into::into).and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
+            let committed = CommittedOffset {
+                offset: integer_value(&row, committed_offset)?,
+                leader_epoch: leader_epoch_value(&row, leader_epoch)?,
+                metadata: optional_text_value(&row, metadata)?,
+            };
 
-            debug!(group_id, topic, partition, offset);
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
         Ok(results)
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                &sql_lookup(txn_offset_commit_tp_select_pending::QUERY)?,
+                (self.cluster.as_str(), group_id),
+            )
+            .await
+            .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?;
+
+        let columns = ResultColumns::turso(txn_offset_commit_tp_select_pending::QUERY, &rows);
+        let topic = columns.index(txn_offset_commit_tp_select_pending::TOPIC)?;
+        let partition = columns.index(txn_offset_commit_tp_select_pending::PARTITION)?;
+
+        let mut pending = BTreeSet::new();
+
+        while let Some(row) = rows.next().await? {
+            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
+                value
+                    .as_text()
+                    .cloned()
+                    .ok_or(Error::UnexpectedValue(value))
+            })?;
+
+            let partition = row
+                .get_value(partition)
+                .map_err(Into::into)
+                .and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .map(|partition| partition as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
+
+            _ = pending.insert(Topition::new(topic, partition));
+        }
+
+        debug!(cluster = self.cluster, group_id, ?pending);
+
+        Ok(pending)
     }
 
     async fn offset_fetch(
@@ -2176,7 +2337,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
         let c = self.connection().await?;
 
@@ -2185,7 +2346,7 @@ impl Storage for Engine {
         for topic in topics {
             let mut rows = c
                 .query(
-                    &sql_lookup("consumer_offset_select.sql")?,
+                    &sql_lookup(consumer_offset_select::QUERY)?,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -2204,24 +2365,31 @@ impl Storage for Engine {
                     )
                 })?;
 
-            let offset = rows
+            let columns = ResultColumns::turso(consumer_offset_select::QUERY, &rows);
+            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)?;
+            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)?;
+            let metadata = columns.index(consumer_offset_select::METADATA)?;
+
+            let committed = rows
                 .next()
                 .await
+                .map_err(Error::from)
                 .and_then(|row| {
-                    row.and_then(|row| {
-                        row.get_value(0)
-                            .map(|value| value.as_integer().copied())
-                            .transpose()
+                    row.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: integer_value(&row, committed_offset)?,
+                            leader_epoch: leader_epoch_value(&row, leader_epoch)?,
+                            metadata: optional_text_value(&row, metadata)?,
+                        })
                     })
-                    .unwrap_or(Ok(-1))
                 })
-                .inspect(|offset| {
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -2234,7 +2402,7 @@ impl Storage for Engine {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets)
@@ -4094,7 +4262,7 @@ impl From<LiteTimestamp> for SystemTime {
 
 impl From<LiteTimestamp> for Value {
     fn from(value: LiteTimestamp) -> Self {
-        todo!("{value:?}")
+        Value::Integer(to_timestamp(&value.0).unwrap_or_default())
     }
 }
 
@@ -4114,20 +4282,90 @@ impl TryFrom<Value> for LiteTimestamp {
                 .map(LiteTimestamp::from)
                 .map_err(Into::into),
 
-            Value::Real(_) => unimplemented!("{value:?}"),
-            Value::Null => unimplemented!("{value:?}"),
-            Value::Blob(_) => unimplemented!("{value:?}"),
+            Value::Real(_) | Value::Null | Value::Blob(_) => Err(Error::UnexpectedValue(value)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use tempfile::{TempDir, tempdir, tempdir_in};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+
+    #[test]
+    fn timestamp_from_null_is_an_error() {
+        assert_matches!(
+            LiteTimestamp::try_from(Value::Null),
+            Err(Error::UnexpectedValue(Value::Null))
+        );
+    }
+
+    #[test]
+    fn timestamp_round_trips_through_a_value() -> Result<()> {
+        let timestamp = LiteTimestamp::from(SystemTime::UNIX_EPOCH + Duration::from_millis(1_234));
+
+        assert_eq!(timestamp, LiteTimestamp::try_from(Value::from(timestamp))?);
+
+        Ok(())
+    }
+
+    /// A unique constraint failure becomes the given error code, and any other constraint
+    /// failure stays a turso error.
+    #[tokio::test]
+    async fn unique_constraint_answers_its_error_code() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        _ = connection
+            .execute(
+                "create table xyz (
+                    cluster text not null,
+                    name text not null,
+                    unique (cluster, name)
+                )",
+                (),
+            )
+            .await?;
+
+        let insert = "insert into xyz (cluster, name) values (?1, ?2) returning name";
+
+        assert!(insert_returning(&connection, insert, ("nisshi", "abc")).await?);
+
+        assert_matches!(
+            insert_returning(&connection, insert, ("nisshi", "abc"))
+                .await
+                .map_err(unique_constraint(ErrorCode::TopicAlreadyExists)),
+            Err(Error::Api(ErrorCode::TopicAlreadyExists))
+        );
+
+        assert_matches!(
+            insert_returning(&connection, insert, ("nisshi", Value::Null))
+                .await
+                .map_err(unique_constraint(ErrorCode::TopicAlreadyExists)),
+            Err(Error::Turso(_))
+        );
+
+        Ok(())
+    }
+
+    /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the
+    /// first row. Returns whether it returned a row.
+    async fn insert_returning(
+        connection: &Connection,
+        sql: &str,
+        params: impl IntoParams,
+    ) -> result::Result<bool, turso::Error> {
+        let mut statement = connection.prepare(sql).await?;
+        let mut rows = statement.query(params).await?;
+        Ok(rows.next().await?.is_some())
+    }
 
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};

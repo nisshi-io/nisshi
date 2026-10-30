@@ -242,12 +242,26 @@ impl Iceberg {
             .inspect(|namespace| debug!(?namespace))
             .inspect_err(|err| debug!(?err))?
         {
-            _ = self
+            match self
                 .catalog
                 .create_namespace(&namespace_ident, HashMap::new())
                 .await
-                .inspect(|namespace| debug!(?namespace))
-                .inspect_err(|err| debug!(?err))?;
+            {
+                Ok(namespace) => debug!(?namespace),
+
+                Err(err) => {
+                    // The create error is logged before the check below, because a failed
+                    // check returns its own error instead.
+                    debug!(?err);
+
+                    // Produces to different partitions store concurrently, so the first
+                    // produces each try to create the namespace. A produce that loses that race
+                    // uses the namespace that the winner created, instead of failing.
+                    if !self.catalog.namespace_exists(&namespace_ident).await? {
+                        return Err(err.into());
+                    }
+                }
+            }
         }
 
         Ok(namespace_ident)
@@ -289,7 +303,8 @@ impl Iceberg {
 
             table
         } else {
-            self.catalog
+            match self
+                .catalog
                 .create_table(
                     &namespace_ident,
                     TableCreation::builder()
@@ -298,8 +313,31 @@ impl Iceberg {
                         .build(),
                 )
                 .await
-                .inspect(|table| debug!(?table))
-                .inspect_err(|err| debug!(?err))?
+            {
+                Ok(table) => {
+                    debug!(?table);
+                    table
+                }
+
+                Err(err) => {
+                    // The create error is logged before the check below, because a failed
+                    // check returns its own error instead.
+                    debug!(?err);
+
+                    // Produces to different partitions of a topic store concurrently, so the
+                    // first produces to a new topic each try to create its table. A produce that
+                    // loses that race loads the table that the winner created, instead of
+                    // failing.
+                    if !self.catalog.table_exists(&table_ident).await? {
+                        return Err(err.into());
+                    }
+
+                    self.catalog
+                        .load_table(&table_ident)
+                        .await
+                        .inspect_err(|err| debug!(?err))?
+                }
+            }
         };
 
         _ = self
@@ -415,8 +453,23 @@ mod tests {
     use super::*;
     use dotenv::dotenv;
     use iceberg::spec::{NestedField, PrimitiveType, Type};
+    use iceberg::{
+        ErrorKind, Namespace, TableCommit,
+        memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog},
+    };
     use rand::{distr::Alphanumeric, prelude::*, rng};
-    use std::{env::var, fs::File, marker::PhantomData, str::FromStr as _, sync::Arc, thread};
+    use std::{
+        assert_matches,
+        env::var,
+        fs::File,
+        marker::PhantomData,
+        str::FromStr as _,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -452,6 +505,21 @@ mod tests {
         ))
     }
 
+    impl Iceberg {
+        /// Removes the lake's namespace and purges each of its tables, so that
+        /// a test leaves no namespace in the catalog.
+        async fn drop_namespace(&self) -> Result<()> {
+            let namespace = NamespaceIdent::new(self.namespace.clone());
+            for table in self.catalog.list_tables(&namespace).await? {
+                self.catalog.purge_table(&table).await?;
+            }
+            self.catalog
+                .drop_namespace(&namespace)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
     #[tokio::test]
     async fn create_namespace() -> Result<()> {
         _ = dotenv().ok();
@@ -476,6 +544,7 @@ mod tests {
         .await?;
 
         let ident = lake.create_namespace().await?;
+        lake.drop_namespace().await?;
         assert_eq!(namespace, ident.to_url_string());
 
         Ok(())
@@ -521,6 +590,7 @@ mod tests {
             .await?;
 
             let ident = lake.create_namespace().await?;
+            lake.drop_namespace().await?;
             assert_eq!(namespace, ident.to_url_string());
         }
 
@@ -564,6 +634,7 @@ mod tests {
         let table_name = alphanumeric_string(5);
 
         let table = lake_house.load_or_create_table(&table_name, schema).await?;
+        lake_house.drop_namespace().await?;
         assert_eq!(table_name, table.identifier().name());
         assert_eq!(namespace, table.identifier().namespace().to_url_string());
 
@@ -625,6 +696,7 @@ mod tests {
             .await?;
 
             let table = lake_house.load_or_create_table(&table_name, schema).await?;
+            lake_house.drop_namespace().await?;
             assert_eq!(table_name, table.identifier().name());
             assert_eq!(namespace, table.identifier().namespace().to_url_string());
         }
@@ -649,6 +721,237 @@ mod tests {
         assert_eq!(Some("localhost"), uri.host_str());
         assert_eq!(Some(8181), uri.port());
         assert_eq!("/catalog", uri.path());
+
+        Ok(())
+    }
+
+    /// A catalog whose existence checks answer `false` for a set number of calls, and then ask
+    /// its memory catalog. A missed check acts as a check that runs just before another produce
+    /// creates the namespace or the table, so a test can lose a create race on demand.
+    #[derive(Debug)]
+    struct CatalogWithMissedChecks {
+        memory: MemoryCatalog,
+        namespace_checks_to_miss: AtomicUsize,
+        table_checks_to_miss: AtomicUsize,
+    }
+
+    impl CatalogWithMissedChecks {
+        async fn new(namespace_checks_to_miss: usize, table_checks_to_miss: usize) -> Result<Self> {
+            let memory = MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                        String::from("memory://warehouse"),
+                    )]),
+                )
+                .await?;
+
+            Ok(Self {
+                memory,
+                namespace_checks_to_miss: AtomicUsize::new(namespace_checks_to_miss),
+                table_checks_to_miss: AtomicUsize::new(table_checks_to_miss),
+            })
+        }
+    }
+
+    /// Returns whether the next check misses, and counts it against `checks_to_miss`.
+    fn check_misses(checks_to_miss: &AtomicUsize) -> bool {
+        checks_to_miss
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    #[async_trait]
+    impl Catalog for CatalogWithMissedChecks {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            self.memory.list_namespaces(parent).await
+        }
+
+        async fn create_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<Namespace> {
+            self.memory.create_namespace(namespace, properties).await
+        }
+
+        async fn get_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<Namespace> {
+            self.memory.get_namespace(namespace).await
+        }
+
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            if check_misses(&self.namespace_checks_to_miss) {
+                Ok(false)
+            } else {
+                self.memory.namespace_exists(namespace).await
+            }
+        }
+
+        async fn update_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            self.memory.update_namespace(namespace, properties).await
+        }
+
+        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            self.memory.drop_namespace(namespace).await
+        }
+
+        async fn list_tables(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<TableIdent>> {
+            self.memory.list_tables(namespace).await
+        }
+
+        async fn create_table(
+            &self,
+            namespace: &NamespaceIdent,
+            creation: TableCreation,
+        ) -> iceberg::Result<Table> {
+            self.memory.create_table(namespace, creation).await
+        }
+
+        async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+            self.memory.load_table(table).await
+        }
+
+        async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.memory.drop_table(table).await
+        }
+
+        async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.memory.purge_table(table).await
+        }
+
+        async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+            if check_misses(&self.table_checks_to_miss) {
+                Ok(false)
+            } else {
+                self.memory.table_exists(table).await
+            }
+        }
+
+        async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+            self.memory.rename_table(src, dest).await
+        }
+
+        async fn register_table(
+            &self,
+            table: &TableIdent,
+            metadata_location: String,
+        ) -> iceberg::Result<Table> {
+            self.memory.register_table(table, metadata_location).await
+        }
+
+        async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+            self.memory.update_table(commit).await
+        }
+    }
+
+    fn race_lake(catalog: CatalogWithMissedChecks, namespace: &str) -> Result<Iceberg> {
+        Ok(Iceberg {
+            catalog: Arc::new(catalog),
+            namespace: namespace.to_owned(),
+            tables: Arc::default(),
+            schema_registry: Registry::from_str("memory://")?,
+        })
+    }
+
+    fn race_table_creation(name: &str) -> Result<TableCreation> {
+        Ok(TableCreation::builder()
+            .name(name.to_owned())
+            .schema(race_schema()?)
+            .build())
+    }
+
+    fn race_schema() -> Result<Schema> {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "bar", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .with_schema_id(1)
+            .build()
+            .map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn create_namespace_uses_the_namespace_that_won_a_create_race() -> Result<()> {
+        let namespace = alphanumeric_string(5);
+        let namespace_ident = NamespaceIdent::new(namespace.clone());
+
+        let catalog = CatalogWithMissedChecks::new(1, 0).await?;
+        _ = catalog
+            .memory
+            .create_namespace(&namespace_ident, HashMap::new())
+            .await?;
+
+        let lake = race_lake(catalog, &namespace)?;
+
+        assert_eq!(namespace_ident, lake.create_namespace().await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_or_create_table_loads_the_table_that_won_a_create_race() -> Result<()> {
+        let namespace = alphanumeric_string(5);
+        let namespace_ident = NamespaceIdent::new(namespace.clone());
+        let table_name = alphanumeric_string(5);
+
+        let catalog = CatalogWithMissedChecks::new(0, 1).await?;
+        _ = catalog
+            .memory
+            .create_namespace(&namespace_ident, HashMap::new())
+            .await?;
+        let winner = catalog
+            .memory
+            .create_table(&namespace_ident, race_table_creation(&table_name)?)
+            .await?;
+
+        let lake = race_lake(catalog, &namespace)?;
+
+        let table = lake
+            .load_or_create_table(&table_name, race_schema()?)
+            .await?;
+        assert_eq!(winner.identifier(), table.identifier());
+        assert_eq!(winner.metadata_location(), table.metadata_location());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_or_create_table_returns_the_create_error_when_the_table_is_missing() -> Result<()>
+    {
+        let namespace = alphanumeric_string(5);
+        let namespace_ident = NamespaceIdent::new(namespace.clone());
+        let table_name = alphanumeric_string(5);
+
+        // Both table checks miss, so the table that makes the create fail stays hidden.
+        let catalog = CatalogWithMissedChecks::new(0, 2).await?;
+        _ = catalog
+            .memory
+            .create_namespace(&namespace_ident, HashMap::new())
+            .await?;
+        _ = catalog
+            .memory
+            .create_table(&namespace_ident, race_table_creation(&table_name)?)
+            .await?;
+
+        let lake = race_lake(catalog, &namespace)?;
+
+        assert_matches!(
+            lake.load_or_create_table(&table_name, race_schema()?).await,
+            Err(Error::Iceberg(err)) if err.kind() == ErrorKind::TableAlreadyExists
+        );
 
         Ok(())
     }

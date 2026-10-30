@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::todo, clippy::unimplemented)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 mod schema;
@@ -38,3 +47,11 @@ pub use limbo::factory::LimboFactory as LimboEngineFactory;
 
 #[cfg(feature = "postgres")]
 pub use pg::factory::PostgresFactory as PostgresEngineFactory;
+
+/// Returns the PostgreSQL query that locks a partition's watermark row before a write, as the
+/// engine runs it, so that a test can hold the lock from its own connection while a produce runs.
+#[cfg(all(feature = "test-support", feature = "postgres"))]
+#[doc(hidden)]
+pub fn watermark_select_for_write() -> nisshi_storage::Result<&'static str> {
+    sql::SQL.get(sql::watermark_select_for_write::QUERY)
+}
