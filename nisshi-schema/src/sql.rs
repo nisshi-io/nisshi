@@ -25,7 +25,7 @@ use regex::Regex;
 use tracing::debug;
 
 /// A safe, unquoted SQL identifier: this is the entire allowlist for what
-/// may appear as a path segment inside a `tansu.lake.generate.*` value, or
+/// may appear as a path segment inside a `nisshi.lake.generate.*` value, or
 /// as the generated column name taken from the config key itself. Neither
 /// of these ever originates from us: topic configuration can currently be
 /// set by any connected client (a separate, known authorization gap), so
@@ -35,7 +35,7 @@ static SAFE_IDENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
 
 /// Validates that `name` is safe to use verbatim as a generated column
-/// name (the suffix of a `tansu.lake.generate.<name>` config key).
+/// name (the suffix of a `nisshi.lake.generate.<name>` config key).
 pub(crate) fn validate_generated_column_name(name: &str) -> Result<()> {
     if SAFE_IDENT.is_match(name) {
         Ok(())
@@ -46,7 +46,7 @@ pub(crate) fn validate_generated_column_name(name: &str) -> Result<()> {
     }
 }
 
-/// A `tansu.lake.generate.<name>` value, once validated: a target Arrow
+/// A `nisshi.lake.generate.<name>` value, once validated: a target Arrow
 /// type and the dotted path of the (existing) column it is derived from.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GeneratedExpr {
@@ -54,7 +54,7 @@ pub(crate) struct GeneratedExpr {
     pub(crate) path: Vec<String>,
 }
 
-/// Parses and validates a `tansu.lake.generate.<name>` value.
+/// Parses and validates a `nisshi.lake.generate.<name>` value.
 ///
 /// The only expression shape ever used by (or documented for) this
 /// feature is `CAST(<column path> AS DATE|INT|INTEGER)`, where `<column

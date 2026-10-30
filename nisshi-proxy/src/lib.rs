@@ -22,7 +22,7 @@ use nisshi_sans_io::{
     ApiKey, DescribeConfigsRequest, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse,
     MetadataRequest, MetadataResponse, NULL_TOPIC_ID, ProduceRequest, RequestInput,
     find_coordinator_response::Coordinator, metadata_request::MetadataRequestTopic,
-    metadata_response::MetadataResponseBroker,
+    metadata_response::MetadataResponseBroker, topic_config,
 };
 use nisshi_service::{
     BytesFrameLayer, FrameApiKeyMatcher, FrameRequestLayer, TcpBytesLayer, TcpContextLayer,
@@ -332,7 +332,7 @@ impl Proxy {
                     HijackLayer::new(
                         ResourceConfigValueMatcher::new(
                             configuration.clone(),
-                            "tansu.batch",
+                            topic_config::BATCH,
                             "true",
                         ),
                         BatchProduceLayer::new(configuration.clone())

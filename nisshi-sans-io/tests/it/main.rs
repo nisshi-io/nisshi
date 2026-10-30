@@ -23,6 +23,7 @@ pub mod codec;
 pub mod consumer;
 pub mod create_topics;
 pub mod decode;
+pub mod decode_error_log;
 pub mod describe_configs;
 pub mod describe_topic_partitions;
 pub mod doctest;
@@ -37,6 +38,7 @@ pub mod redact;
 pub mod response_length_bound;
 pub mod snappy;
 pub mod topic;
+pub mod topic_config;
 pub mod version;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a

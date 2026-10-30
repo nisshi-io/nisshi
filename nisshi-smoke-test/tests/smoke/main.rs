@@ -16,11 +16,13 @@
 
 use std::{fs, path::Path};
 
+pub mod acls;
 pub mod broker_lifecycle;
 pub mod groups;
 pub mod log_cleanup;
 pub mod produce_consume;
 pub mod scram;
+pub mod tls;
 pub mod topic_admin;
 
 // Cargo only builds the modules that a `pub mod` line declares, so a file in `tests/smoke/` without

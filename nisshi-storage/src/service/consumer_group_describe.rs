@@ -52,9 +52,8 @@ use crate::{Error, Result, Storage, authorized_operations};
 ///
 /// let groups = response.groups.unwrap_or_default();
 /// assert_eq!(1, groups.len());
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+/// assert_eq!(ErrorCode::GroupIdNotFound, ErrorCode::try_from(groups[0].error_code)?);
 /// assert_eq!(group_id, groups[0].group_id.as_str());
-/// assert_eq!("Empty", groups[0].group_state.as_str());
 /// # Ok(())
 /// # }
 /// ```

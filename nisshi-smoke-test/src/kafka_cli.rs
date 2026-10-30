@@ -45,10 +45,12 @@ use std::{
 };
 
 use crate::{
+    TlsCertificate,
     common::{docker, timed_command, unique},
     settings,
 };
 
+mod acls;
 mod background_tool;
 mod broker_api_versions;
 mod cluster;
@@ -59,6 +61,7 @@ mod consumer_groups;
 mod delete_records;
 mod get_offsets;
 mod output;
+mod producer_perf_test;
 mod reassign_partitions;
 mod record;
 mod scram_login;
@@ -69,6 +72,8 @@ mod verifiable_producer;
 
 /// The name the tools print for the broker's `TOPIC_ALREADY_EXISTS` error.
 pub const TOPIC_EXISTS_EXCEPTION: &str = "TopicExistsException";
+/// The name the tools print for the broker's `SECURITY_DISABLED` error.
+pub const SECURITY_DISABLED_EXCEPTION: &str = "SecurityDisabledException";
 /// The name the tools print for the broker's `MESSAGE_TOO_LARGE` error.
 pub const RECORD_TOO_LARGE_EXCEPTION: &str = "RecordTooLargeException";
 /// The name the tools print when the broker doesn't list a version of an API that a tool needs.
@@ -82,7 +87,10 @@ pub const SASL_MECHANISM_NOT_ENABLED: &str = "not enabled in the server, enabled
 pub const GROUP_ID_NOT_FOUND_EXCEPTION: &str = "GroupIdNotFoundException";
 /// The name the tools print for the broker's `NON_EMPTY_GROUP` error.
 pub const GROUP_NOT_EMPTY_EXCEPTION: &str = "GroupNotEmptyException";
+/// The name the tools print for the broker's `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` error.
+pub const TRANSACTIONAL_ID_AUTHORIZATION_EXCEPTION: &str = "TransactionalIdAuthorizationException";
 
+pub use acls::KafkaAcls;
 pub use background_tool::{BackgroundTool, PrintedLine, StdoutLines};
 pub use broker_api_versions::{ApiVersions, KafkaBrokerApiVersions};
 pub use cluster::{ClusterId, KafkaCluster};
@@ -93,20 +101,21 @@ pub use console_consumer::{
 };
 pub use console_producer::KafkaConsoleProducer;
 pub use consumer_groups::{
-    DescribeGroup, DescribeGroupMembers, DescribeGroupState, GroupOffsets, GroupState,
-    KafkaConsumerGroups, ListGroups, ListGroupsInState,
+    DescribeGroup, DescribeGroupMembers, DescribeGroupState, DescribedMember, GroupOffsets,
+    GroupState, KafkaConsumerGroups, ListGroups, ListGroupsInState,
 };
 pub use delete_records::{DeleteRecords, KafkaDeleteRecords};
 pub use get_offsets::{GetOffsets, KafkaGetOffsets};
 pub use output::{AnyCommand, Output};
-pub use reassign_partitions::KafkaReassignPartitions;
+pub use producer_perf_test::KafkaProducerPerfTest;
+pub use reassign_partitions::{KafkaReassignPartitions, NO_REASSIGNMENTS};
 pub use record::Record;
 pub use scram_login::{ScramLogin, ScramMechanism};
 use tool::Tool;
 pub use topics::{CreateTopic, DescribeTopic, KafkaTopics, ListTopics, PartitionReplicas};
 pub use verifiable_consumer::{
-    CommittedOffset, ConsumedOffsets, ConsumerEvent, KafkaVerifiableConsumer, TopicPartition,
-    VerifiableConsume,
+    CommittedOffset, ConsumedOffsets, ConsumerEvent, KafkaVerifiableConsumer, PartitionAssignor,
+    TopicPartition, VerifiableConsume,
 };
 pub use verifiable_producer::{
     Acks, KafkaVerifiableProducer, SendResult, StoredRecord, VerifiableProduce,
@@ -137,6 +146,10 @@ pub struct KafkaCli {
     /// The path in the container of the file that holds `client_properties`, or `None` when
     /// `client_properties` is empty.
     client_config: Option<String>,
+    /// Whether every tool logs in with SASL. [`KafkaCli::over_tls`] reads it to choose `SASL_SSL`
+    /// or `SSL`. It must be true exactly when `client_properties` sets a `SASL_*` security
+    /// protocol.
+    logs_in_with_sasl: bool,
 }
 
 impl KafkaCli {
@@ -148,6 +161,7 @@ impl KafkaCli {
             bootstrap: bootstrap.to_owned(),
             client_properties: String::new(),
             client_config: None,
+            logs_in_with_sasl: false,
         }
     }
 
@@ -161,7 +175,7 @@ impl KafkaCli {
     /// Each tool sends `SaslHandshake` and `SaslAuthenticate` before its other requests.
     #[track_caller]
     pub fn logged_in_as(bootstrap: &str, login: &ScramLogin) -> Self {
-        Self::new(bootstrap).with_client_properties(&format!(
+        Self::marked_as_logging_in_with_sasl(bootstrap).with_client_properties(&format!(
             "security.protocol=SASL_PLAINTEXT\n\
              sasl.mechanism={}\n\
              sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \
@@ -175,12 +189,49 @@ impl KafkaCli {
     /// Like [`KafkaCli::logged_in_as`], but every tool logs in with SASL PLAIN as `user`.
     #[track_caller]
     pub fn logged_in_with_plain(bootstrap: &str, user: &str, password: &str) -> Self {
-        Self::new(bootstrap).with_client_properties(&format!(
+        Self::marked_as_logging_in_with_sasl(bootstrap).with_client_properties(&format!(
             "security.protocol=SASL_PLAINTEXT\n\
              sasl.mechanism=PLAIN\n\
              sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
              username=\"{user}\" password=\"{password}\";\n"
         ))
+    }
+
+    /// Like [`KafkaCli::new`], but marked as logging in with SASL. The caller adds the login's
+    /// client properties.
+    fn marked_as_logging_in_with_sasl(bootstrap: &str) -> Self {
+        Self {
+            logs_in_with_sasl: true,
+            ..Self::new(bootstrap)
+        }
+    }
+
+    /// Returns a copy of this `KafkaCli` whose tools connect to the broker with TLS and trust
+    /// `certificate` as the broker's certificate. A tool that logs in sends its login over TLS.
+    #[track_caller]
+    pub fn over_tls(&self, certificate: &TlsCertificate) -> Self {
+        let truststore =
+            self.write_file_in_container("tls-certificate", "pem", &certificate.certificate_pem);
+
+        // The tools load the client config file with `java.util.Properties`, which keeps the last
+        // value of a repeated key. This `security.protocol` therefore replaces the
+        // `security.protocol=SASL_PLAINTEXT` that a login sets.
+        let security_protocol = if self.logs_in_with_sasl {
+            "SASL_SSL"
+        } else {
+            "SSL"
+        };
+
+        self.with_client_properties(&format!(
+            "security.protocol={security_protocol}\n\
+             ssl.truststore.type=PEM\n\
+             ssl.truststore.location={truststore}\n"
+        ))
+    }
+
+    /// Returns `kafka-acls`, run against this broker.
+    pub fn acls(&self) -> KafkaAcls<'_> {
+        KafkaAcls::new(self)
     }
 
     /// Returns `kafka-broker-api-versions`, run against this broker.
@@ -221,6 +272,11 @@ impl KafkaCli {
     /// Returns `kafka-get-offsets`, run against this broker.
     pub fn get_offsets(&self) -> KafkaGetOffsets<'_> {
         KafkaGetOffsets::new(self)
+    }
+
+    /// Returns `kafka-producer-perf-test`, run against this broker.
+    pub fn producer_perf_test(&self) -> KafkaProducerPerfTest<'_> {
+        KafkaProducerPerfTest::new(self)
     }
 
     /// Returns `kafka-reassign-partitions`, run against this broker.
@@ -285,6 +341,7 @@ impl KafkaCli {
             bootstrap: self.bootstrap.clone(),
             client_properties,
             client_config: Some(path),
+            logs_in_with_sasl: self.logs_in_with_sasl,
         }
     }
 
@@ -321,8 +378,10 @@ impl KafkaCli {
         path
     }
 
-    /// Runs `/opt/kafka/bin/<tool>.sh <args> --bootstrap-server <broker>`. The address comes last,
-    /// after a subcommand such as `kafka-cluster.sh cluster-id`, which takes it as its own option.
+    /// Runs `/opt/kafka/bin/<tool>.sh <args>`, followed by the broker's address in the arguments
+    /// that [`Tool::bootstrap_arguments`] returns. The address follows `<args>`, so that a
+    /// subcommand such as `kafka-cluster.sh cluster-id` comes before the address and reads it as
+    /// the subcommand's own option.
     ///
     /// Panics if the tool does not finish within `TOOL_TIMEOUT`.
     #[track_caller]
@@ -530,7 +589,7 @@ impl KafkaCli {
             .arg(format!("{}s", timeout.as_secs()))
             .arg(format!("/opt/kafka/bin/{}.sh", tool.name()))
             .args(args)
-            .args(["--bootstrap-server", &self.bootstrap]);
+            .args(tool.bootstrap_arguments(&self.bootstrap));
 
         if let Some(client_config) = &self.client_config {
             _ = command.args([tool.client_config_option(), client_config]);

@@ -20,16 +20,16 @@
 //! records field. Every malformed batch here carries a valid CRC as sent, so
 //! the tests still exercise decoding if produce starts enforcing the CRC.
 //!
-//! Every malformed batch here uses `LogAppendTime`. A `CreateTime` batch can
-//! be decoded in `ProduceService` before it reaches storage, and these tests
-//! cover the decode that each storage backend does.
+//! These tests check the error code that a client gets on each backend. `ProduceService` decodes
+//! every batch before a storage backend gets it, so a batch that does not decode never reaches a
+//! backend.
 
 use crate::common::{StorageType, alphanumeric_string, init_tracing};
 use bytes::Bytes;
 use nisshi_broker::{Error, Result};
 use nisshi_sans_io::{
     Ack, BatchAttribute, Compression, CreateTopicsRequest, ErrorCode, InitProducerIdRequest,
-    IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest, RequestInput, TimestampType,
+    IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest, RequestInput,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -205,10 +205,6 @@ fn from_builder(builder: inflated::Builder, value: &'static [u8]) -> Result<defl
         .map_err(Into::into)
 }
 
-fn log_append_time() -> BatchAttribute {
-    BatchAttribute::default().timestamp(TimestampType::LogAppendTime)
-}
-
 /// `batch` with its attributes and record data replaced, and its batch length
 /// and CRC recomputed to match.
 fn rebuilt(mut batch: deflated::Batch, attributes: i16, record_data: Bytes) -> deflated::Batch {
@@ -235,13 +231,19 @@ fn truncated_record() -> Result<deflated::Batch> {
 fn truncated(batch: deflated::Batch) -> Result<deflated::Batch> {
     let record_data = batch.record_data.slice(..batch.record_data.len() - 10);
 
-    Ok(rebuilt(batch, log_append_time().into(), record_data))
+    Ok(rebuilt(
+        batch,
+        BatchAttribute::default().into(),
+        record_data,
+    ))
 }
 
 /// A batch flagged as gzip whose record data is not a gzip stream.
 fn garbage_gzip() -> Result<deflated::Batch> {
     let batch = well_formed(b"Lorem ipsum dolor sit amet")?;
-    let attributes = log_append_time().compression(Compression::Gzip).into();
+    let attributes = BatchAttribute::default()
+        .compression(Compression::Gzip)
+        .into();
 
     Ok(rebuilt(
         batch,
@@ -254,7 +256,7 @@ fn garbage_gzip() -> Result<deflated::Batch> {
 /// no Kafka codec uses.
 fn unknown_codec() -> Result<deflated::Batch> {
     let batch = well_formed(b"Lorem ipsum dolor sit amet")?;
-    let attributes = i16::from(log_append_time()) | 0b111;
+    let attributes = i16::from(BatchAttribute::default()) | 0b111;
     let record_data = batch.record_data.clone();
 
     Ok(rebuilt(batch, attributes, record_data))
@@ -399,21 +401,6 @@ async fn rejected_idempotent_batch_keeps_its_sequence(storage: impl Storage + Cl
     Ok(())
 }
 
-/// Without a schema registry or lake, dynostore and slatedb store a produced
-/// batch without decoding its records, so records that do not decode are
-/// accepted and stored as sent. This pins that existing behaviour: it is not
-/// changed here, and a change to it should be deliberate.
-async fn undecoded_records_are_stored(storage: impl Storage + Clone) -> Result<()> {
-    let name = &alphanumeric_string(15)[..];
-    create_topic(&storage, name).await?;
-
-    let response = produce(&storage, name, vec![truncated_record()?]).await?;
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-    assert_eq!(0, response.base_offset);
-
-    Ok(())
-}
-
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -431,9 +418,9 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn undecoded_records_are_stored() -> Result<()> {
+    async fn undecodable_records() -> Result<()> {
         let _guard = init_tracing()?;
-        super::undecoded_records_are_stored(storage(StorageType::InMemory, false).await?).await
+        super::undecodable_records(storage(StorageType::InMemory, false).await?).await
     }
 
     /// With a registry, dynostore decodes by reference, through a different
@@ -441,7 +428,7 @@ mod in_memory {
     #[tokio::test]
     async fn undecodable_records_with_registry() -> Result<()> {
         let _guard = init_tracing()?;
-        undecodable_records(storage(StorageType::InMemory, true).await?).await
+        super::undecodable_records(storage(StorageType::InMemory, true).await?).await
     }
 
     #[tokio::test]
@@ -530,15 +517,15 @@ mod slate {
     }
 
     #[tokio::test]
-    async fn undecoded_records_are_stored() -> Result<()> {
+    async fn undecodable_records() -> Result<()> {
         let _guard = init_tracing()?;
-        super::undecoded_records_are_stored(storage(StorageType::SlateDb, false).await?).await
+        super::undecodable_records(storage(StorageType::SlateDb, false).await?).await
     }
 
     #[tokio::test]
     async fn undecodable_records_with_registry() -> Result<()> {
         let _guard = init_tracing()?;
-        undecodable_records(storage(StorageType::SlateDb, true).await?).await
+        super::undecodable_records(storage(StorageType::SlateDb, true).await?).await
     }
 
     #[tokio::test]

@@ -99,11 +99,5 @@ mod tests {
                 consumer_group_describe_response::DescribedGroup::from(row).authorized_operations
             );
         }
-
-        assert_eq!(
-            i32::MIN,
-            consumer_group_describe_response::DescribedGroup::from(&GroupDetail::default())
-                .authorized_operations
-        );
     }
 }

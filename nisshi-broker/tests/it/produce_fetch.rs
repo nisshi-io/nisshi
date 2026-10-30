@@ -25,6 +25,7 @@ use nisshi_sans_io::{
     },
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     record::{Record, inflated},
+    topic_config,
 };
 use nisshi_storage::{Storage, Topition, TxnAddPartitionsRequest};
 use rand::{prelude::*, rng};
@@ -757,6 +758,94 @@ where
     Ok(())
 }
 
+/// A keyed fetch of a virtual topic returns the first record with its key
+/// even when that record is larger than `max_bytes` (KIP-74), and nothing
+/// after it.
+pub async fn virtual_keyed_topic_fetch_returns_oversized_first_record<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some(
+                    [CreatableTopicConfig::default()
+                        .name(topic_config::VIRTUAL.into())
+                        .value(Some("true".into()))]
+                    .into(),
+                )),
+            false,
+        )
+        .await?;
+
+    let topition = Topition::new(topic_name.clone(), 0);
+
+    const KEY_A: &[u8] = b"CC54 RYD";
+    const KEY_B: &[u8] = b"NN03 RYB";
+
+    let max_bytes = 50 * 1_024;
+
+    for (key, value) in [
+        (KEY_A, vec![b'x'; 4 * max_bytes as usize]),
+        (KEY_B, b"telemetry b1".to_vec()),
+        (KEY_A, b"telemetry a2".to_vec()),
+    ] {
+        let batch = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Some(Bytes::copy_from_slice(key)))
+                    .value(Some(Bytes::from(value))),
+            )
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = sc.produce(None, &topition, batch).await?;
+    }
+
+    let keyed_topition = Topition::new(format!("{topic_name}/CC54 RYD"), 0);
+
+    for (offset, expected) in [(0, vec![0]), (1, vec![2])] {
+        let mut offsets = vec![];
+
+        for batch in sc
+            .fetch(
+                &keyed_topition,
+                offset,
+                1,
+                max_bytes,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(500),
+            )
+            .await?
+        {
+            let batch = inflated::Batch::try_from(batch)?;
+            offsets.extend(
+                batch
+                    .records
+                    .iter()
+                    .map(|record| batch.base_offset + i64::from(record.offset_delta)),
+            );
+        }
+
+        assert_eq!(expected, offsets, "keyed fetch at {offset}");
+    }
+
+    Ok(())
+}
+
 pub async fn non_virtual_topic_with_slash_streams_all<G>(
     cluster_id: impl Into<String>,
     broker_id: i32,
@@ -767,7 +856,7 @@ where
 {
     register_broker(cluster_id, broker_id, &sc).await?;
 
-    // Topic name contains "/" but tansu.virtual is NOT set — the slash is just
+    // Topic name contains "/" but nisshi.virtual is NOT set — the slash is just
     // part of the topic name, not a key filter.
     let topic_name: String = format!("{}/{}", alphanumeric_string(10), alphanumeric_string(5));
     debug!(?topic_name);
@@ -835,7 +924,7 @@ where
         })
     };
 
-    // All six records are returned — tansu.virtual is not set so the "/" is
+    // All six records are returned — nisshi.virtual is not set so the "/" is
     // treated as part of the topic name with no key filtering applied.
     let all_records = sc
         .fetch(&topition, offset, min_bytes, max_bytes, isolation, max_wait)
@@ -920,6 +1009,21 @@ mod pg {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::virtual_keyed_topic_fetch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn virtual_keyed_topic_fetch_returns_oversized_first_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::virtual_keyed_topic_fetch_returns_oversized_first_record(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -1082,6 +1186,21 @@ mod lite {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::virtual_keyed_topic_fetch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn virtual_keyed_topic_fetch_returns_oversized_first_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::virtual_keyed_topic_fetch_returns_oversized_first_record(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,

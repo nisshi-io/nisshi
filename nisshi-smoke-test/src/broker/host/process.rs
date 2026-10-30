@@ -21,7 +21,11 @@ use std::{
 };
 
 use super::{STOP_TIMEOUT, Shutdown};
-use crate::{broker::LaunchOptions, common::timed_command, settings};
+use crate::{
+    broker::{LaunchOptions, files::TLS_DIRECTORY},
+    common::timed_command,
+    settings,
+};
 
 /// The file in a process broker's directory that holds its process id until the harness has
 /// stopped it. nextest kills a test that runs too long with SIGKILL, which skips `Drop` and leaves
@@ -56,7 +60,7 @@ impl BrokerProcess {
         let mut command = Command::new(&binary);
 
         _ = command
-            .args(options.broker_args())
+            .args(options.broker_args(Self::tls_directory()))
             // The broker resolves a relative sqlite:// path against its working
             // directory, and loads `.env` from it; there is none here.
             .current_dir(dir)
@@ -80,6 +84,14 @@ impl BrokerProcess {
         }
 
         Ok(process)
+    }
+
+    /// Returns the directory where the broker reads its TLS certificate and private key:
+    /// [`BrokerFiles::tls_directory`], relative to the broker's working directory.
+    ///
+    /// [`BrokerFiles::tls_directory`]: crate::broker::files::BrokerFiles::tls_directory
+    pub(super) fn tls_directory() -> &'static Path {
+        Path::new(TLS_DIRECTORY)
     }
 
     /// An error if the broker has exited.

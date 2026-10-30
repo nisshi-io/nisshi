@@ -3,11 +3,28 @@ name: release
 # The only workflow a `v*` tag runs. It calls ci.yml for the build and every
 # test, then publishes in order: the version tags on the image, the tarballs
 # on the GitHub release, then the crates. Each step needs the one before, and
-# the first needs `ci`, `on-main` and `release-tag`, so a red run publishes
+# the first needs `ci`, `on-main`, `release-tag` and `release-readiness` (the
+# Guardian scan of the tag), so a red run or a Guardian block publishes
 # nothing. A check that must also pass before a release goes in
 # publish-image's `needs`. This workflow creates the GitHub release without a
 # body. The /cut-release skill drafts the body from CHANGELOG.md after the run
 # and sets it with `gh release edit`.
+#
+# Publishing over a failed release-readiness check: when it fails and the
+# other three pass, the `override` job waits in the `release-override`
+# environment, whose required reviewers are repo admins. Approving it
+# publishes from this run, over a Guardian block or a scanner or Guardian
+# outage alike; rejecting it ends the run with nothing published. The
+# environment prevents self-review and admin bypass, so another admin has to
+# approve: whoever pushed the tag or started the re-run can't. The job refuses
+# to run if either setting is off, or if the run records no approval of
+# release-override from another user. GitHub asks for approval again on a re-run,
+# and the deployment log records who approved.
+#
+# To skip only the FOSSA licensing block, set the FOSSA_LICENSING_BLOCK
+# repository variable to false (see guardian-scan.yaml) before pushing the
+# tag. A run reads it when it starts, and "Re-run failed jobs" keeps the
+# value it read, so after the tag is pushed the override is the way through.
 #
 # The file name stays release.yml: the crates.io trusted publisher is bound
 # to it.
@@ -67,11 +84,100 @@ jobs:
           persist-credentials: false
       - run: bash .github/scripts/check-release-tag.sh "${GITHUB_REF_NAME}"
 
+  # The Guardian scan of the tag, in trunk mode: FOSSA and Prisma upload under
+  # the tag's version, then the Guardian gate blocks on its verdict. It waits
+  # for on-main and release-tag, which take seconds, so a tag that can never
+  # publish is never filed in FOSSA or Guardian as trunk.
+  release-readiness:
+    needs: [on-main, release-tag]
+    permissions:
+      contents: read
+      packages: read        # ceiling for guardian-scan's FOSSA job (private scan container)
+      pull-requests: write
+      checks: write
+      statuses: write
+      # Same ceiling as release-readiness-check.yaml: the subset rule applies at
+      # every workflow_call hop. Not a capability this path uses.
+      id-token: write
+    uses: ./.github/workflows/release-readiness-check.yaml # zizmor: ignore[secrets-inherit]
+    # `secrets: inherit` is load-bearing on both hops of this chain. A workflow
+    # reached via `workflow_call` starts with an empty `secrets` context, and
+    # that extends to the called workflow's own `environment:` layer; `inherit`
+    # is what opens it. Without it guardian-scan.yaml's `guardian-trunk` jobs
+    # read every secret as an empty string and every scan job fails. Naming
+    # the secrets instead is not possible: they live in that environment,
+    # which a `uses:` job cannot enter. Nothing on PR CI exercises this path;
+    # only a tag run does.
+    secrets: inherit
+    with:
+      # The qualified ref, not the bare name: actions/checkout resolves a bare
+      # name to a branch before a tag, so a branch named after the version
+      # would be scanned in the tag's place.
+      ref: ${{ github.ref }}
+      version: ${{ github.ref_name }}
+
+  # Runs only when release-readiness failed and everything else passed, and
+  # waits for a repo admin to approve it in the `release-override`
+  # environment. See the header.
+  override:
+    needs: [ci, on-main, release-tag, release-readiness]
+    if: >-
+      ${{ !cancelled() && needs.ci.result == 'success' && needs.on-main.result == 'success'
+      && needs.release-tag.result == 'success' && needs.release-readiness.result == 'failure' }}
+    environment: release-override
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      # A missing environment is created on first use with no reviewers, and
+      # this job then starts without waiting for anyone. Refuse to pass the
+      # publish jobs unless the environment still has its protection. Admin
+      # bypass is on by default and lets any admin start a waiting job without
+      # the reviewers, which looks the same as an approval once the job runs, so
+      # the setting itself is refused.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          env_json=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-override")
+          rules=$(jq '[.protection_rules[]? | select(.type == "required_reviewers")]' <<<"$env_json")
+          if [ "$(jq length <<<"$rules")" -eq 0 ]; then
+            echo "::error::release-override has no required reviewers; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          if [ "$(jq '[.[] | select(.prevent_self_review == true)] | length' <<<"$rules")" -eq 0 ]; then
+            echo "::error::release-override allows self-review; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          if [ "$(jq '.can_admins_bypass' <<<"$env_json")" != "false" ]; then
+            echo "::error::release-override lets admins bypass its reviewers; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          # The settings checks read the environment as it is now, after GitHub
+          # released this job, so they can't prove that a second person
+          # approved it. This check reads the approvals that the run recorded,
+          # and requires one for release-override from someone other than
+          # whoever pushed the tag or started this attempt.
+          approvals=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals")
+          others=$(jq --arg actor "$GITHUB_ACTOR" --arg trigger "$GITHUB_TRIGGERING_ACTOR" '
+            [.[] | select(.state == "approved" and any(.environments[]; .name == "release-override"))
+              | .user.login | select(. != $actor and . != $trigger)] | length' <<<"$approvals")
+          if [ "$others" -eq 0 ]; then
+            echo "::error::release-override has no approval from anyone but ${GITHUB_ACTOR} or ${GITHUB_TRIGGERING_ACTOR}; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          echo "::warning::publishing ${GITHUB_REF_NAME} over a failed release-readiness check"
+
   # The multi-arch image, built from the binaries smoke tested by the same
   # action as tier-c.yml's `edge-publish`, tagged with the version. `latest` comes with the
   # semver tags, for a tag that isn't a prerelease.
   publish-image:
-    needs: [ci, on-main, release-tag]
+    needs: [ci, on-main, release-tag, release-readiness, override]
+    if: >-
+      ${{ !cancelled() && needs.ci.result == 'success' && needs.on-main.result == 'success'
+      && needs.release-tag.result == 'success'
+      && (needs.release-readiness.result == 'success' || needs.override.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -93,8 +199,11 @@ jobs:
   # environment's deployment policy (`v*` tags) is a second, server-side check
   # on the ref. The image is pushed first, so a failed upload leaves an image
   # without a release page until this job is re-run.
+  # Explicit conditions on this job and the next: `override` is skipped on a
+  # passing run, and without them the skip would carry down the chain.
   github-release:
     needs: [publish-image]
+    if: ${{ !cancelled() && needs.publish-image.result == 'success' }}
     environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -119,6 +228,7 @@ jobs:
   # Last, because a crates.io publish can't be undone.
   publish-crates:
     needs: [github-release]
+    if: ${{ !cancelled() && needs.github-release.result == 'success' }}
     environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -128,7 +238,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
       # --no-verify skips cargo's pre-upload build, so no build script runs
       # while this job holds the crates.io token. The verify step is ci.yml's

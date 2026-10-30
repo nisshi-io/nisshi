@@ -47,7 +47,8 @@ DYLD_LIBRARY_PATH=../src:../src-cpp TESTS=0019 TEST_DEBUG=broker,protocol \
     ./test-runner -p1 -Q -E
 ```
 
-(`LD_LIBRARY_PATH` on Linux.)
+(`LD_LIBRARY_PATH` on Linux.) For an older version, `cd` into the
+`tests` directory of its `WORK_DIR` instead (see below).
 
 ## The allowlist
 
@@ -56,3 +57,22 @@ improves, re-sweep the excluded tests and grow the allowlist.
 `FINDINGS.md` records the gaps behind the tests that are still excluded,
 and the ones already fixed (automatic topic creation on MetadataRequest,
 which most of the suite assumes, was implemented 2026-06-11).
+
+CI also tests librdkafka v2.3.0, the newest release on or before Kafka
+3.7.0, because applications upgrade librdkafka slowly and many link the
+version their distribution packages. Its test numbers and passing tests
+differ, so it has its own allowlist, `tests-v2.3.0.allow`, which
+`run.sh` picks from `LIBRDKAFKA_VERSION`. To run it locally:
+
+```shell
+LIBRDKAFKA_VERSION=v2.3.0 WORK_DIR=target/compat-v2.3.0 just compat-librdkafka
+```
+
+`run.sh` stops if the clone in `WORK_DIR` is at another version, so give
+each version its own `WORK_DIR`. It also fails a test number that the
+version does not register, because `test-runner` passes when `TESTS`
+matches nothing.
+
+Some allowlisted tests never contact the broker: librdkafka registers
+them as local tests (`TEST_F_LOCAL` in `tests/test.c`), and they run
+against no broker or librdkafka's own mock cluster.

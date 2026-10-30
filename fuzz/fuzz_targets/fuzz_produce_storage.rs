@@ -61,6 +61,14 @@ fuzz_target!(|request: ProduceRequest| {
                 .for_each(|batch| batch.crc = batch.computed_crc());
         }
 
+        // A fuzzed `acks` is almost never -1, 0 or 1, and `ProduceService` refuses the whole
+        // request before any other check. Map `acks` onto those three values, so that the batch
+        // checks and storage are fuzzed too. When the second bit of `timeout_ms` is set, keep the
+        // fuzzed `acks`, so that the refusal is fuzzed as well.
+        if request.timeout_ms & 0b10 == 0 {
+            request.acks = request.acks.rem_euclid(3) - 1;
+        }
+
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")
             .node_id(111)

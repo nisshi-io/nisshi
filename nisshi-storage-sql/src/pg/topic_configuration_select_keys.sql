@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -13,21 +13,22 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-select
-
-w.low, w.high
+-- prepare topic_configuration_select_keys (text, text, text[]) as
+--
+-- $1 is the cluster's name, $2 the topic's name, and $3 the config keys to read.
+--
+-- Returns one row for each key in $3 that the topic sets. For a topic that sets none of these keys,
+-- it returns one row with a null name. So the query returns zero rows only when the topic does not
+-- exist.
+select tc.name, tc.value
 
 from
 
 cluster c
 join topic t on t.cluster = c.id
-join topition tp on tp.topic = t.id
-join watermark w on w.topition = tp.id
+left join topic_configuration tc on tc.topic = t.id and tc.name = any($3)
 
 where
 
 c.name = $1
-and t.name = $2
-and tp.partition = $3
-
-for no key update;
+and t.name = $2;

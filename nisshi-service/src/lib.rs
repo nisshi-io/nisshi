@@ -254,7 +254,9 @@ mod channel;
 mod consumer;
 mod frame;
 mod input;
+mod peer_address;
 mod stream;
+mod transaction_abortable;
 mod version_gate;
 
 pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
@@ -265,12 +267,18 @@ pub use version_gate::{
 
 pub use input::TcpListenerInput;
 
+pub use transaction_abortable::{
+    TransactionAbortableDowngradeLayer, TransactionAbortableDowngradeService,
+};
+
 pub use channel::{
     ChannelFrameLayer, ChannelFrameService, FrameChannelService, FrameReceiver, FrameSender,
     bounded_channel,
 };
 
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
+
+pub use peer_address::PeerAddressExtension;
 
 pub use frame::{
     BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,
@@ -333,7 +341,17 @@ pub enum Error {
     UncappedApi(i16),
     UnknownHost(Url),
     UnknownServiceBody(Box<Body>),
-    UnknownServiceFrame(Box<Frame>),
+    /// No route handles `api_key`. The error names the request, not its
+    /// decoded body: the body comes from the client, and this error is logged.
+    /// `api_name` is the API's fixed name, so the line identifies the API
+    /// without growing with the request.
+    UnknownServiceFrame {
+        api_key: i16,
+        api_name: &'static str,
+        api_version: i16,
+        correlation_id: i32,
+        size: i32,
+    },
     /// The broker does not route `api_version` for `api_key`, because the version is outside
     /// the protocol's valid range or outside the range the broker advertises for that API.
     /// The caller closes the connection on this error, as Kafka does for a version it has not

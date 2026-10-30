@@ -16,7 +16,12 @@ use self::header_cursor::HeaderCursor;
 use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
-    sql::{Cache, default_hash, idempotent_sequence_check, remove_comments},
+    sql::{
+        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        remove_comments, result_columns::ResultColumns, txn_produce_partition_check,
+        txn_produce_partition_select, watermark_select_for_write,
+    },
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,9 +31,10 @@ use libsql::{
     Connection, Database, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
     ffi::SQLITE_CONSTRAINT_UNIQUE, params::IntoParams,
 };
+use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -44,7 +50,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
     to_system_time, to_timestamp,
@@ -56,13 +61,16 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer,
+    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, CommittedOffset,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    RequestChannelService, RequestStorageService, Result, ScramCredential, SemaphoreProxy,
-    StartupFailure, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
-    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, producer_claim,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
+    ProducerIdResponse, RequestChannelService, RequestStorageService, Result, ScramCredential,
+    SemaphoreProxy, StartupFailure, Storage, StoredEpochs, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, bounded_channel, check_claim,
+    config::{self, apply_op},
+    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
+    producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -644,23 +652,58 @@ impl Delegate {
     #[instrument(skip_all)]
     async fn idempotent_message_check(
         &self,
-        _transaction_id: Option<&str>,
+        transaction_id: Option<&str>,
         topition: &Topition,
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
         let mut rows = connection
             .query(
-                "producer_epoch_current_for_producer.sql",
-                (self.cluster.as_str(), deflated.producer_id),
+                producer_epochs_select::QUERY,
+                (
+                    self.cluster.as_str(),
+                    deflated.producer_id,
+                    topition.topic(),
+                    topition.partition(),
+                ),
             )
             .await?;
 
+        let columns = ResultColumns::libsql(producer_epochs_select::QUERY, &rows);
+        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)? as i32;
+        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)? as i32;
+        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)? as i32;
+
         if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
-            let current_epoch = i16::try_from(
-                row.get::<i32>(0)
-                    .inspect_err(|err| error!(self.cluster, deflated.producer_id, ?err))?,
-            )?;
+            let stored = StoredEpochs {
+                transactional: row
+                    .get::<i32>(transactional)
+                    .inspect_err(|err| error!(?err))?
+                    != 0,
+                newest: i16::try_from(
+                    row.get::<i32>(newest_epoch)
+                        .inspect_err(|err| error!(?err))?,
+                )?,
+                partition: row
+                    .get::<Option<i32>>(partition_epoch)
+                    .inspect_err(|err| error!(?err))?
+                    .map(i16::try_from)
+                    .transpose()?,
+            };
+
+            if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
+                _ = connection
+                    .execute(
+                        "producer_epoch_insert_given.sql",
+                        (
+                            self.cluster.as_str(),
+                            deflated.producer_id,
+                            deflated.producer_epoch,
+                        ),
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+            }
 
             let row = connection
                 .query_one(
@@ -691,11 +734,11 @@ impl Delegate {
                 ?topition,
                 deflated.producer_id,
                 deflated.producer_epoch,
-                current_epoch,
+                ?stored,
                 sequence,
             );
 
-            let increment = idempotent_sequence_check(&current_epoch, &sequence, deflated)?;
+            let increment = idempotent_sequence_check(sequence, deflated)?;
 
             debug!(increment);
 
@@ -722,17 +765,20 @@ impl Delegate {
         }
     }
 
+    /// Returns what a write to the partition reads first: the partition's low and high watermarks,
+    /// and its topic's stored `max.message.bytes`. Fails with `UNKNOWN_TOPIC_OR_PARTITION` when the
+    /// partition does not exist.
     #[instrument(skip_all)]
-    async fn watermark_select_for_update(
+    async fn watermark_select_for_write(
         &self,
         topition: &Topition,
         connection: &PoolConnection,
-    ) -> Result<(Option<i64>, Option<i64>)> {
+    ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition);
 
         let mut rows = connection
             .query(
-                "watermark_select_no_update.sql",
+                watermark_select_for_write::LITE_QUERY,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -741,18 +787,67 @@ impl Delegate {
             )
             .await?;
 
-        if let Some(row) = rows
+        let columns = ResultColumns::libsql(watermark_select_for_write::LITE_QUERY, &rows);
+        let low = columns.index(watermark_select_for_write::LOW)? as i32;
+        let high = columns.index(watermark_select_for_write::HIGH)? as i32;
+        let max_message_bytes =
+            columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)? as i32;
+
+        let Some(row) = rows
             .next()
             .await
             .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        {
-            Ok((
-                row.get::<Option<i64>>(0).inspect_err(|err| error!(?err))?,
-                row.get::<Option<i64>>(1).inspect_err(|err| error!(?err))?,
-            ))
-        } else {
-            Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
-        }
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        Ok(watermark_select_for_write::Row {
+            low: row.get(low).inspect_err(|err| error!(?err))?,
+            high: row.get(high).inspect_err(|err| error!(?err))?,
+            max_message_bytes: row.get(max_message_bytes).inspect_err(|err| error!(?err))?,
+        })
+    }
+
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction (see [`txn_produce_partition_check`]). EndTxn deletes a transaction's
+    /// `txn_topition` rows, so a row is present only while the transaction is ongoing.
+    async fn txn_produce_partition_check(
+        &self,
+        transaction_id: &str,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+        connection: &PoolConnection,
+    ) -> Result<()> {
+        let mut rows = connection
+            .query(
+                txn_produce_partition_select::QUERY,
+                (
+                    self.cluster.as_str(),
+                    transaction_id,
+                    deflated.producer_id,
+                    deflated.producer_epoch,
+                    topition.topic(),
+                    topition.partition(),
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        let columns = ResultColumns::libsql(txn_produce_partition_select::QUERY, &rows);
+        let producer = columns.index(txn_produce_partition_select::PRODUCER)? as i32;
+        let added = columns.index(txn_produce_partition_select::ADDED)? as i32;
+
+        let row = match rows.next().await.inspect_err(|err| error!(?err))? {
+            Some(row) => Some((
+                row.get::<Option<i64>>(producer)
+                    .inspect_err(|err| error!(?err))?,
+                row.get::<i32>(added).inspect_err(|err| error!(?err))?,
+            )),
+            None => None,
+        };
+
+        txn_produce_partition_check(row, deflated.producer_id)
+            .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
     }
 
     #[instrument(skip_all)]
@@ -775,14 +870,27 @@ impl Delegate {
                 .inspect_err(|err| error!(?err))?;
         }
 
+        if let Some(transaction_id) = transaction_id
+            && deflated.is_transactional()
+            && !deflated.is_control()
+        {
+            self.txn_produce_partition_check(transaction_id, topition, &deflated, connection)
+                .await?;
+        }
+
         debug!(after_idempotent_check = elapsed_millis(start));
 
-        let (low, high) = self
-            .watermark_select_for_update(topition, connection)
+        let watermarks = self
+            .watermark_select_for_write(topition, connection)
             .await
-            .inspect_err(|err| error!(?err))?;
+            .inspect_err(|err| debug!(?err))?;
 
-        debug!(after_watermark_select_for_update = elapsed_millis(start));
+        debug!(after_watermark_select_for_write = elapsed_millis(start));
+
+        let limit =
+            max_message_bytes::limit(topition.topic(), watermarks.max_message_bytes.as_deref());
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+        let watermark_select_for_write::Row { low, high, .. } = watermarks;
 
         debug!(?low, ?high);
 
@@ -807,12 +915,13 @@ impl Delegate {
                         .configs
                         .as_ref()
                         .and_then(|configs| {
-                            configs
-                                .iter()
-                                .inspect(|config| debug!(?config))
-                                .find(|config| config.name.as_str() == "tansu.schema.validation")
-                                .and_then(|config| config.value.as_deref())
-                                .and_then(|value| bool::from_str(value).ok())
+                            topic_config::lookup(
+                                configs.iter().inspect(|config| debug!(?config)).filter_map(
+                                    |config| Some((config.name.as_str(), config.value.as_deref()?)),
+                                ),
+                                topic_config::SCHEMA_VALIDATION,
+                            )
+                            .and_then(|value| bool::from_str(value).ok())
                         })
                         .unwrap_or(true)
                 })
@@ -837,12 +946,15 @@ impl Delegate {
                             .configs
                             .as_ref()
                             .and_then(|configs| {
-                                configs
-                                    .iter()
-                                    .inspect(|config| debug!(?config))
-                                    .find(|config| config.name.as_str() == "tansu.lake.sink")
-                                    .and_then(|config| config.value.as_deref())
-                                    .and_then(|value| bool::from_str(value).ok())
+                                topic_config::lookup(
+                                    configs.iter().inspect(|config| debug!(?config)).filter_map(
+                                        |config| {
+                                            Some((config.name.as_str(), config.value.as_deref()?))
+                                        },
+                                    ),
+                                    topic_config::LAKE_SINK,
+                                )
+                                .and_then(|value| bool::from_str(value).ok())
                             })
                             .unwrap_or_default()
                     })
@@ -877,7 +989,7 @@ impl Delegate {
                             } else {
                                 Some(inflated.producer_epoch)
                             },
-                            inflated.base_timestamp + record.timestamp_delta,
+                            inflated.record_timestamp(record),
                             key,
                             value,
                         ),
@@ -1416,7 +1528,7 @@ impl Delegate {
         let start = SystemTime::now();
 
         let now = to_timestamp(&now)?;
-        let retention_ms = u64::try_from(Duration::from_hours(7 * 24).as_millis())?;
+        let retention_ms = u64::try_from(config::DEFAULT_RETENTION.as_millis())?;
 
         let pc = self.connection().await?;
 
@@ -1445,22 +1557,19 @@ impl Delegate {
                 .describe_config(base, ConfigResource::Topic, None)
                 .await
                 .map(|configs| {
-                    configs
-                        .configs
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .find_map(|config| {
-                            if config.name == "tansu.virtual" {
-                                config
-                                    .value
-                                    .as_deref()
-                                    .and_then(|config| bool::from_str(config).ok())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default()
+                    topic_config::lookup(
+                        configs
+                            .configs
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|config| {
+                                Some((config.name.as_str(), config.value.as_deref()?))
+                            }),
+                        topic_config::VIRTUAL,
+                    )
+                    .and_then(|value| bool::from_str(value).ok())
+                    .unwrap_or_default()
                 })?
         {
             Ok((base, Some(key)))
@@ -1925,7 +2034,10 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         self.inner
             .committed_offset_topitions(group_id)
@@ -1944,7 +2056,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         self.inner
             .offset_fetch(group_id, topics, require_stable)
@@ -2025,9 +2137,9 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let start = SystemTime::now();
-        self.inner.list_groups(states_filter).await.inspect(|_| {
+        self.inner.list_groups().await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
                 &[KeyValue::new("operation", "list_groups")],
@@ -2370,9 +2482,84 @@ impl FromStr for CommunicationMode {
     }
 }
 
+const BUSY_TIMEOUT: &str = "busy_timeout";
+const COMPACTION: &str = "compaction";
+const MODE: &str = "mode";
+
+/// What `busy_timeout` takes. Every example here must parse (see the tests).
+const BUSY_TIMEOUT_HINT: &str = "a duration, such as 5s or 500ms";
+
+/// What `compaction` takes. Every value here must parse (see the tests).
+const COMPACTION_HINT: &str = "single or multi";
+
+/// What `mode` takes. Every value here must parse (see the tests).
+const MODE_HINT: &str = "semaphore, mpsc or direct";
+
+/// The storage URL options of the SQLite engine that take a parsed value. An option
+/// that the URL doesn't give takes its default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiteOptions {
+    busy_timeout: Duration,
+    compaction: CompactionMode,
+    mode: CommunicationMode,
+}
+
+impl Default for LiteOptions {
+    fn default() -> Self {
+        Self {
+            busy_timeout: Duration::from_secs(5),
+            compaction: CompactionMode::default(),
+            mode: CommunicationMode::default(),
+        }
+    }
+}
+
+impl LiteOptions {
+    /// Reads the options from `storage`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidStorageOptionValue`] when an option's value doesn't parse.
+    fn parse(storage: &Url) -> Result<Self> {
+        let defaults = Self::default();
+
+        Ok(Self {
+            busy_timeout: parse_storage_option(
+                storage,
+                BUSY_TIMEOUT,
+                BUSY_TIMEOUT_HINT,
+                |value| {
+                    human_units::Duration::from_str(value)
+                        .ok()
+                        .map(|duration| duration.0)
+                },
+            )?
+            .unwrap_or(defaults.busy_timeout),
+
+            compaction: parse_storage_option(storage, COMPACTION, COMPACTION_HINT, |value| {
+                CompactionMode::from_str(value).ok()
+            })?
+            .unwrap_or(defaults.compaction),
+
+            mode: parse_storage_option(storage, MODE, MODE_HINT, |value| {
+                CommunicationMode::from_str(value).ok()
+            })?
+            .unwrap_or(defaults.mode),
+        })
+    }
+}
+
 impl Builder<String, i32, Url, Url> {
     pub(crate) async fn build(self) -> Result<ArcDynStorage> {
         debug!(domain = self.storage.domain(), path = self.storage.path());
+
+        // Read the options before the database file is opened, so that a value that
+        // doesn't parse stops startup before the file is created.
+        let LiteOptions {
+            busy_timeout,
+            compaction,
+            mode,
+        } = LiteOptions::parse(&self.storage)?;
 
         let path = env::current_dir()
             .inspect(|current_dir| debug!(?current_dir))
@@ -2388,35 +2575,6 @@ impl Builder<String, i32, Url, Url> {
             }
         });
 
-        let busy_timeout = self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "busy_timeout" {
-                    human_units::Duration::from_str(v.as_ref())
-                        .map(|duration| duration.0)
-                        .inspect_err(
-                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
-                        )
-                        .ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(Duration::from_secs(5));
-
-        let compaction = self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "compaction" {
-                    CompactionMode::from_str(v.as_ref()).ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
         let db = libsql::Builder::new_local(path).build().await?;
 
         ensure_schema(&db, busy_timeout)
@@ -2427,18 +2585,7 @@ impl Builder<String, i32, Url, Url> {
                 source: Arc::new(source),
             })?;
 
-        match self
-            .storage
-            .query_pairs()
-            .find_map(|(k, v)| {
-                if k == "mode" {
-                    CommunicationMode::from_str(v.as_ref()).ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default()
-        {
+        match mode {
             CommunicationMode::Mpsc => {
                 let (sender, receiver) = bounded_channel(1);
                 let mut server = JoinSet::new();
@@ -2733,7 +2880,7 @@ impl Storage for Delegate {
                     let topition = Topition::new(topic.name.as_str(), partition.partition_index);
 
                     let (error_code, low_watermark) = match self
-                        .watermark_select_for_update(&topition, &pc)
+                        .watermark_select_for_write(&topition, &pc)
                         .await
                     {
                         Err(Error::Api(error_code)) => {
@@ -2741,7 +2888,7 @@ impl Storage for Delegate {
                         }
                         Err(err) => return Err(err),
 
-                        Ok((low, high)) => {
+                        Ok(watermark_select_for_write::Row { low, high, .. }) => {
                             let stage = OffsetStage {
                                 last_stable: high.unwrap_or_default(),
                                 high_watermark: high.unwrap_or_default(),
@@ -2959,7 +3106,9 @@ impl Storage for Delegate {
             .inspect_err(|err| match err {
                 // A rejection the client caused: ProduceService logs it once,
                 // at warn, with the topic and partition.
-                Error::Api(_) | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
+                Error::Api(_)
+                | Error::MessageTooLarge { .. }
+                | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
                     debug!(?err)
                 }
                 err => error!(?err),
@@ -3168,11 +3317,30 @@ impl Storage for Delegate {
                         .inspect_err(|err| error!(?err))?,
                 )?;
 
+                let timestamp = row
+                    .get_value(2)
+                    .map_err(Error::from)
+                    .and_then(LiteTimestamp::try_from)
+                    .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?;
+
+                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
+                // produce request, so one batch cannot hold two such times.
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id
                     || batch_builder.producer_epoch != producer_epoch
+                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
+                        && timestamp != batch_builder.base_timestamp)
                 {
-                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+                    batches.push(
+                        batch_builder
+                            .max_timestamp_of_records()
+                            .build()
+                            .and_then(TryInto::try_into)?,
+                    );
 
                     batch_builder = inflated::Batch::builder()
                         .base_offset(
@@ -3180,15 +3348,7 @@ impl Storage for Delegate {
                                 .inspect(|base_offset| debug!(base_offset))
                                 .inspect_err(|err| error!(?err))?,
                         )
-                        .base_timestamp(
-                            row.get_value(2)
-                                .map_err(Error::from)
-                                .and_then(LiteTimestamp::try_from)
-                                .and_then(|system_time| {
-                                    to_timestamp(&system_time.0).map_err(Into::into)
-                                })
-                                .inspect_err(|err| error!(?err))?,
-                        )
+                        .base_timestamp(timestamp)
                         .attributes(attributes)
                         .producer_id(producer_id)
                         .producer_epoch(producer_epoch);
@@ -3200,17 +3360,7 @@ impl Storage for Delegate {
                     .inspect_err(|err| error!(?err))?;
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
-                let timestamp_delta = row
-                    .get_value(2)
-                    .map_err(Error::from)
-                    .and_then(LiteTimestamp::try_from)
-                    .and_then(|system_time| {
-                        to_timestamp(&system_time.0)
-                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
-                            .map_err(Into::into)
-                    })
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
+                let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
                 let record_builder = {
                     let mut record_builder = Record::builder()
@@ -3251,7 +3401,12 @@ impl Storage for Delegate {
                     .last_offset_delta(offset_delta);
             }
 
-            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+            batches.push(
+                batch_builder
+                    .max_timestamp_of_records()
+                    .build()
+                    .and_then(TryInto::try_into)?,
+            );
         } else {
             batches.push(
                 inflated::Batch::builder()
@@ -3404,7 +3559,10 @@ impl Storage for Delegate {
         })
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
 
         debug!(group_id);
@@ -3415,21 +3573,33 @@ impl Storage for Delegate {
 
         let mut rows = c
             .query(
-                "consumer_offset_select_by_group.sql",
+                consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
-        while let Some(row) = rows.next().await? {
-            let topic = row.get_str(0)?;
-            let partition = row.get::<i32>(1)?;
-            let offset = row.get::<i64>(2)?;
+        let columns = ResultColumns::libsql(consumer_offset_select_by_group::QUERY, &rows);
+        let topic = columns.index(consumer_offset_select_by_group::TOPIC)? as i32;
+        let partition = columns.index(consumer_offset_select_by_group::PARTITION)? as i32;
+        let committed_offset =
+            columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)? as i32;
+        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)? as i32;
+        let metadata = columns.index(consumer_offset_select_by_group::METADATA)? as i32;
 
-            debug!(group_id, topic, partition, offset);
+        while let Some(row) = rows.next().await? {
+            let topic = row.get_str(topic)?;
+            let partition = row.get::<i32>(partition)?;
+            let committed = CommittedOffset {
+                offset: row.get::<i64>(committed_offset)?,
+                leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
+                metadata: row.get::<Option<String>>(metadata)?,
+            };
+
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
@@ -3446,7 +3616,7 @@ impl Storage for Delegate {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
 
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
@@ -3458,7 +3628,7 @@ impl Storage for Delegate {
         for topic in topics {
             let mut rows = c
                 .query(
-                    "consumer_offset_select.sql",
+                    consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -3477,17 +3647,30 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            let offset = rows
+            let columns = ResultColumns::libsql(consumer_offset_select::QUERY, &rows);
+            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)? as i32;
+            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)? as i32;
+            let metadata = columns.index(consumer_offset_select::METADATA)? as i32;
+
+            let committed = rows
                 .next()
                 .await
-                .and_then(|maybe| maybe.map_or(Ok(-1), |row| row.get::<i64>(0)))
-                .inspect(|offset| {
+                .and_then(|maybe| {
+                    maybe.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: row.get::<i64>(committed_offset)?,
+                            leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
+                            metadata: row.get::<Option<String>>(metadata)?,
+                        })
+                    })
+                })
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -3500,7 +3683,7 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets).inspect(|_| {
@@ -4178,29 +4361,30 @@ impl Storage for Delegate {
         })
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let start = SystemTime::now();
-
-        debug!(?states_filter);
 
         let c = self.connection().await?;
 
         let mut listed_groups = vec![];
 
         let mut rows = c
-            .query("consumer_group_select.sql", &[self.cluster.as_str()])
+            .query(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        while let Some(row) = rows.next().await? {
-            let group_id = row.get_str(0)?;
+        let columns = ResultColumns::libsql(consumer_group_select::QUERY, &rows);
+        let name = columns.index(consumer_group_select::NAME)? as i32;
+        let detail = columns.index(consumer_group_select::DETAIL)? as i32;
 
-            listed_groups.push(
-                ListedGroup::default()
-                    .group_id(group_id.to_owned())
-                    .protocol_type("consumer".into())
-                    .group_state(Some("unknown".into()))
-                    .group_type(Some("classic".into())),
-            );
+        while let Some(row) = rows.next().await? {
+            let group_id = row.get_str(name)?.to_owned();
+
+            let stored = row
+                .get::<Option<String>>(detail)
+                .map_err(Error::from)?
+                .map(|detail| serde_json::from_str::<GroupDetail>(&detail));
+
+            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
         }
 
         Ok(listed_groups).inspect(|_| {
@@ -4282,40 +4466,60 @@ impl Storage for Delegate {
         debug!(?group_ids, include_authorized_operations);
 
         let mut results = vec![];
-        let c = self.connection().await?;
+        let c = self.connection().await.inspect_err(|err| error!(?err));
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                if let Some(row) = c
+                // The engine answers a group whose read fails with an error code, as Apache Kafka's
+                // [`GroupCoordinatorService`] does, instead of failing the request, because the
+                // broker closes the client's connection on a failed request and sends no response.
+                // Kafka clients retry `COORDINATOR_NOT_AVAILABLE`.
+                //
+                // [`GroupCoordinatorService`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1184
+                let Ok(c) = &c else {
+                    results.push(NamedGroupDetail::error_code(
+                        group_id.into(),
+                        ErrorCode::CoordinatorNotAvailable,
+                    ));
+                    continue;
+                };
+
+                match c
                     .query_opt(
                         "consumer_group_select_by_name.sql",
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
-                    .inspect_err(|err| error!(?err, group_id))?
+                    .inspect_err(|err| error!(?err, group_id))
                 {
-                    // A group row with no detail row (e.g. a group that only ever
-                    // committed offsets, never a JoinGroup) joins to a NULL
-                    // `detail` column here: that group exists and is empty, not
-                    // an error.
-                    let current = match row
-                        .get::<Option<String>>(1)
-                        .map_err(Error::from)
-                        .inspect_err(|err| error!(?err, group_id))?
-                    {
-                        Some(s) => serde_json::from_str::<GroupDetail>(&s)
+                    Ok(Some(row)) => {
+                        // A group row with no detail row (e.g. a group that only ever committed
+                        // offsets, never a JoinGroup) joins to a NULL `detail` column here: that
+                        // group exists and is empty, not an error.
+                        let stored = row
+                            .get::<Option<String>>(1)
                             .map_err(Error::from)
-                            .inspect(|current| debug!(?current))
-                            .inspect_err(|err| error!(?err, group_id))?,
-                        None => GroupDetail::default(),
-                    };
+                            .transpose()
+                            .map(|stored| {
+                                stored.and_then(|detail| {
+                                    serde_json::from_str::<GroupDetail>(&detail)
+                                        .map_err(Error::from)
+                                        .inspect(|current| debug!(?current))
+                                })
+                            });
 
-                    results.push(NamedGroupDetail::found(group_id.into(), current));
-                } else {
-                    results.push(NamedGroupDetail::error_code(
+                        results.push(NamedGroupDetail::decoded(group_id.into(), stored));
+                    }
+
+                    Ok(None) => results.push(NamedGroupDetail::error_code(
                         group_id.into(),
                         ErrorCode::GroupIdNotFound,
-                    ));
+                    )),
+
+                    Err(_) => results.push(NamedGroupDetail::error_code(
+                        group_id.into(),
+                        ErrorCode::CoordinatorNotAvailable,
+                    )),
                 }
             }
         }
@@ -5377,12 +5581,15 @@ impl TryFrom<Value> for LiteTimestamp {
                 .map(LiteTimestamp::from)
                 .map_err(Into::into),
 
-            Value::Real(_) => unimplemented!("{value:?}"),
-            Value::Null => unimplemented!("{value:?}"),
-            Value::Blob(_) => unimplemented!("{value:?}"),
+            Value::Real(_) | Value::Null | Value::Blob(_) => {
+                Err(Error::UnexpectedLibSqlValue(value))
+            }
         }
     }
 }
+
+#[cfg(test)]
+mod options_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5397,6 +5604,14 @@ mod tests {
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+
+    #[test]
+    fn timestamp_from_null_is_an_error() {
+        assert_matches!(
+            LiteTimestamp::try_from(Value::Null),
+            Err(Error::UnexpectedLibSqlValue(Value::Null))
+        );
+    }
 
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};
@@ -7144,6 +7359,127 @@ mod tests {
 
         let stage = engine.offset_stage(&topition).await?;
         assert_eq!(stage.high_watermark, stage.last_stable);
+
+        Ok(())
+    }
+
+    /// Returns an engine on `db_file` with the groups `healthy` and `undecodable` stored, each with
+    /// the returned detail, and a connection to the same file, separate from the engine's own.
+    async fn engine_with_stored_groups(
+        db_file: &'static str,
+        cluster: &str,
+    ) -> Result<(ArcDynStorage, Connection, GroupDetail)> {
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(Url::parse(&format!("file:///{db_file}"))?)
+            .node(111)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        // `GroupDetail::default` records the current time as the group's inception, so a second
+        // call returns a different detail. The helper therefore returns the detail that it stored.
+        let stored = GroupDetail::default();
+
+        for group_id in ["healthy", "undecodable"] {
+            _ = engine
+                .update_group(group_id, stored.clone(), None)
+                .await
+                .map_err(|err| Error::Message(format!("{err:?}")))?;
+        }
+
+        // the engine opened `file:///{db_file}` as `{cwd}/{db_file}`
+        let connection = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?;
+
+        Ok((engine, connection, stored))
+    }
+
+    /// A DescribeGroups whose query fails must answer each group with `COORDINATOR_NOT_AVAILABLE`,
+    /// which clients retry. A failed request instead closes the client's connection without a
+    /// response.
+    #[tokio::test]
+    async fn describe_groups_answers_coordinator_not_available_when_the_query_fails() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        let db_file = "describe-groups-query-fails-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let (engine, connection, _) = engine_with_stored_groups(db_file, "nisshi").await?;
+
+        // The test drops the table that the engine reads, so the engine's query fails. A local
+        // SQLite file can't be made to refuse a connection, so the test makes the query fail
+        // instead.
+        _ = connection
+            .execute("drop table consumer_group_detail", ())
+            .await?;
+
+        let group_ids = ["healthy", "undecodable"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::error_code("healthy".into(), ErrorCode::CoordinatorNotAvailable),
+                NamedGroupDetail::error_code(
+                    "undecodable".into(),
+                    ErrorCode::CoordinatorNotAvailable
+                ),
+            ],
+            engine.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
+    }
+
+    /// A DescribeGroups must answer a stored group that can't be decoded with
+    /// `UNKNOWN_SERVER_ERROR`, which clients report at once, and answer the other groups in the
+    /// request as usual.
+    #[tokio::test]
+    async fn describe_groups_answers_unknown_server_error_for_an_undecodable_group() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db_file = "describe-groups-undecodable-group-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let cluster = "nisshi";
+        let (engine, connection, stored) = engine_with_stored_groups(db_file, cluster).await?;
+
+        // `42` is valid JSON, so the database accepts it, but it doesn't decode to a `GroupDetail`.
+        let changed = connection
+            .execute(
+                "update consumer_group_detail set detail = '42'
+                where consumer_group = (
+                    select cg.id from consumer_group cg join cluster c on c.id = cg.cluster
+                    where c.name = ?1 and cg.name = ?2
+                )",
+                (cluster, "undecodable"),
+            )
+            .await?;
+        // The update must change the group's row. An update that changes no row leaves the group
+        // decodable, and the test then fails for that reason instead of testing the engine.
+        assert_eq!(1, changed);
+
+        let group_ids = ["healthy", "undecodable", "missing"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+                NamedGroupDetail::error_code("missing".into(), ErrorCode::GroupIdNotFound),
+            ],
+            engine.describe_groups(Some(&group_ids), false).await?
+        );
 
         Ok(())
     }

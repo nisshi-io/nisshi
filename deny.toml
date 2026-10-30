@@ -1,6 +1,6 @@
 # cargo-deny configuration: RustSec advisories, license compatibility, banned
 # crates, and trusted sources for the full dependency graph.
-# Run locally with: cargo deny --all-features check --allow unmaintained
+# Run locally with: cargo deny --all-features --locked check --warn unmaintained
 # https://embarkstudios.github.io/cargo-deny/
 
 # Matches the `--all-features` flag CI passes, so a local `cargo deny check`
@@ -10,18 +10,26 @@ all-features = true
 no-default-features = false
 
 [advisories]
-# Pre-existing debt found when this gate was introduced (2026-09-17), not
-# caused by any single PR. Tracked for follow-up; remove each entry once the
-# fix lands. New advisories are NOT covered by this list and will fail CI.
+# A yanked version in Cargo.lock fails CI, like an advisory, because its author
+# pulled it, often for a bug or a security fix. The cost is that an upstream
+# yank turns every PR red until Cargo.lock moves off it. To unblock PRs while
+# the replacement lands, add the version to `ignore` below as
+# `{ crate = "name@version", reason = "..." }`.
+yanked = "deny"
+# Each entry is an advisory, or a yanked version, whose fix we can't take yet,
+# because a dependency still requires the affected version. Remove each entry
+# once the fix lands. Every advisory and yanked version not on this list fails
+# CI.
 # `unmaintained` findings are downgraded to non-blocking separately, via
 # `--warn unmaintained` on the command line (see .github/workflows/
 # dependencies.yml) - being unmaintained isn't the same as being vulnerable,
 # and they stay visible in the job log rather than being silenced outright.
 ignore = [
-    { id = "RUSTSEC-2026-0118", reason = "hickory-resolver NSEC3 unbounded loop; pulled in transitively via rama-dns, fix needs hickory-proto 0.26.x" },
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto O(n^2) name compression; pulled in transitively via rama-dns, fix needs hickory-proto 0.26.x" },
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic start-tag check; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation; pulled in transitively via AWS SDK deps, fix needs quick-xml 0.41" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 quadratic start-tag check; fixed in quick-xml 0.41. Two paths pull in 0.39.4: object_store 0.13.2 (datafusion, parquet and deltalake) and opendal 0.57 (iceberg-storage-opendal). Blocked until datafusion, deltalake and iceberg have releases on arrow and parquet 60 (the first to use object_store 0.14) and the workspace's own `arrow` and `parquet` requirements move to 60 with them, and iceberg-storage-opendal moves to opendal 0.58 or later" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 unbounded namespace-declaration allocation; same paths and blocker as RUSTSEC-2026-0194" },
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 has no fixed release, and apache-avro, iceberg, datafusion and foyer require it; none of them calls the affected with_context constructors" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 (via zstd 0.13) has no fixed release; the affected code needs the seekable feature, which nothing enables" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7 (via zstd 0.13) has no fixed release, and apache-avro, iceberg, datafusion and foyer require zstd 0.13" },
 ]
 # RUSTSEC-2026-0258 (h2) and RUSTSEC-2026-0285 (rustls) were on this list too,
 # but both had semver-compatible fixed versions available (h2 0.4.15->0.4.19,

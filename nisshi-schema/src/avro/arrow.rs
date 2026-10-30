@@ -41,7 +41,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     ARROW_LIST_FIELD_NAME, AsArrow, Error, Result,
-    avro::{Schema, r, schema_write},
+    avro::{Schema, container, r, schema_write},
     lake::LakeHouseType,
 };
 
@@ -1086,6 +1086,10 @@ where
             .and_then(|builder| {
                 encoded
                     .map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
+                        // apache_avro decompresses a block without a limit on its size, so we
+                        // refuse every codec except `null` before the reader reads a block.
+                        container::require_null_codec(&encoded)?;
+
                         Reader::with_schema(schema, &encoded[..])
                             .and_then(|mut reader| reader.next().transpose())
                             .map_err(|_| Error::AvroRecord)
@@ -1131,45 +1135,41 @@ impl AsArrow for Schema {
                             schema,
                             r(
                                 schema,
-                                DateTime::from_timestamp_millis(
-                                    batch.base_timestamp + record.timestamp_delta,
-                                )
-                                .map_or(
-                                    [
-                                        ("partition", Value::Int(partition)),
-                                        (
-                                            "timestamp",
-                                            Value::Long(
-                                                (batch.base_timestamp + record.timestamp_delta)
-                                                    * 1_000,
-                                            ),
-                                        ),
-                                        ("year", Value::Int(0)),
-                                        ("month", Value::Int(0)),
-                                        ("day", Value::Int(0)),
-                                    ],
-                                    |date_time| {
+                                DateTime::from_timestamp_millis(batch.record_timestamp(record))
+                                    .map_or(
                                         [
                                             ("partition", Value::Int(partition)),
                                             (
                                                 "timestamp",
-                                                Value::Long(
-                                                    (batch.base_timestamp + record.timestamp_delta)
-                                                        * 1_000,
+                                                Value::Long(batch.record_timestamp(record) * 1_000),
+                                            ),
+                                            ("year", Value::Int(0)),
+                                            ("month", Value::Int(0)),
+                                            ("day", Value::Int(0)),
+                                        ],
+                                        |date_time| {
+                                            [
+                                                ("partition", Value::Int(partition)),
+                                                (
+                                                    "timestamp",
+                                                    Value::Long(
+                                                        batch.record_timestamp(record) * 1_000,
+                                                    ),
                                                 ),
-                                            ),
-                                            ("year", Value::Int(date_time.date_naive().year())),
-                                            (
-                                                "month",
-                                                Value::Int(date_time.date_naive().month() as i32),
-                                            ),
-                                            (
-                                                "day",
-                                                Value::Int(date_time.date_naive().day() as i32),
-                                            ),
-                                        ]
-                                    },
-                                ),
+                                                ("year", Value::Int(date_time.date_naive().year())),
+                                                (
+                                                    "month",
+                                                    Value::Int(
+                                                        date_time.date_naive().month() as i32
+                                                    ),
+                                                ),
+                                                (
+                                                    "day",
+                                                    Value::Int(date_time.date_naive().day() as i32),
+                                                ),
+                                            ]
+                                        },
+                                    ),
                             )?
                             .into(),
                         )
@@ -1230,7 +1230,7 @@ impl TryFrom<&Schema> for ArrowSchema {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, sync::Arc, thread};
+    use std::{assert_matches, fs::File, sync::Arc, thread};
 
     use super::*;
     use apache_avro::{Decimal, types::Value};
@@ -3596,6 +3596,44 @@ mod tests {
         ];
 
         assert_eq!(pretty_results.trim().lines().collect::<Vec<_>>(), expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "parquet", feature = "iceberg"))]
+    async fn deflate_key_as_arrow_is_invalid_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let schema = Schema::from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "key", "type": "int"}
+            ]
+        }));
+
+        let key = {
+            let mut writer = apache_avro::Writer::with_codec(
+                schema.key.as_ref().unwrap(),
+                vec![],
+                apache_avro::Codec::Deflate(apache_avro::DeflateSettings::default()),
+            );
+            _ = writer.append(Value::Int(32123))?;
+            writer.into_inner().map(Bytes::from)?
+        };
+
+        let batch = Batch::builder()
+            .base_timestamp(1_234_567_890 * 1_000)
+            .record(Record::builder().key(key.into()))
+            .build()?;
+
+        assert_matches!(
+            schema
+                .as_arrow("t", 0, &batch, LakeHouseType::Parquet)
+                .await,
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
 
         Ok(())
     }

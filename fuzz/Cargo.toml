@@ -94,6 +94,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_delete_acls_storage"
+path = "fuzz_targets/fuzz_delete_acls_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_describe_acls_storage"
 path = "fuzz_targets/fuzz_describe_acls_storage.rs"
 test = false

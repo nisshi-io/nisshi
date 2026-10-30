@@ -17,3 +17,4 @@
 pub mod consume;
 pub mod offsets;
 pub mod produce;
+pub mod transactional_producer;

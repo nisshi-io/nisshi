@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey as _, DeleteGroupsRequest, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
-    OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
+    ApiKey as _, DeleteGroupsRequest, DescribeGroupsRequest, HeartbeatRequest, JoinGroupRequest,
+    LeaveGroupRequest, ListGroupsRequest, OffsetCommitRequest, OffsetFetchRequest,
+    SyncGroupRequest,
 };
 use nisshi_service::FrameRouteBuilder;
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
@@ -22,9 +23,10 @@ use rama::{Layer as _, Service as _, layer::MapErrLayer};
 use crate::{
     Error,
     broker::group::{
-        delete::DeleteGroupsService, heartbeat::HeartbeatService, join::JoinGroupService,
-        leave::LeaveGroupService, offset_commit::OffsetCommitService,
-        offset_fetch::OffsetFetchService, sync::SyncGroupService,
+        delete::DeleteGroupsService, describe::DescribeGroupsService, heartbeat::HeartbeatService,
+        join::JoinGroupService, leave::LeaveGroupService, list::ListGroupsService,
+        offset_commit::OffsetCommitService, offset_fetch::OffsetFetchService,
+        sync::SyncGroupService,
     },
     coordinator::group::Coordinator,
 };
@@ -38,9 +40,11 @@ where
 {
     [
         delete_groups,
+        describe_groups,
         heartbeat,
         join_group,
         leave_group,
+        list_groups,
         offset_commit,
         offset_fetch,
         sync_group,
@@ -63,6 +67,23 @@ where
             DeleteGroupsRequest::KEY,
             (MapErrLayer::new(Error::from),)
                 .into_layer(DeleteGroupsService { coordinator })
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn describe_groups<C>(
+    builder: FrameRouteBuilder<Error>,
+    coordinator: C,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    C: Coordinator,
+{
+    builder
+        .with_route(
+            DescribeGroupsRequest::KEY,
+            (MapErrLayer::new(Error::from),)
+                .into_layer(DescribeGroupsService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)
@@ -114,6 +135,23 @@ where
             LeaveGroupRequest::KEY,
             (MapErrLayer::new(Error::from),)
                 .into_layer(LeaveGroupService { coordinator })
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn list_groups<C>(
+    builder: FrameRouteBuilder<Error>,
+    coordinator: C,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    C: Coordinator,
+{
+    builder
+        .with_route(
+            ListGroupsRequest::KEY,
+            (MapErrLayer::new(Error::from),)
+                .into_layer(ListGroupsService { coordinator })
                 .boxed(),
         )
         .map_err(Into::into)

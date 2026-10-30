@@ -81,10 +81,10 @@ async fn no_txn_init_producer_id(storage: impl Storage + Clone) -> Result<()> {
 
 const TRANSACTION_TIMEOUT_MS: i32 = 10_000;
 
-/// Serves an InitProducerId request with this producer ID and epoch.
-async fn init_producer_id(
+/// Serves the `InitProducerId` request that an idempotent producer sends, which does not carry a
+/// transactional ID, with this producer ID and epoch.
+async fn init_idempotent_producer(
     storage: &(impl Storage + Clone),
-    transactional_id: Option<&str>,
     producer_id: i64,
     producer_epoch: i16,
 ) -> Result<InitProducerIdResponse> {
@@ -93,7 +93,7 @@ async fn init_producer_id(
     }
     .serve(RequestInput {
         request: InitProducerIdRequest::default()
-            .transactional_id(transactional_id.map(String::from))
+            .transactional_id(None)
             .transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
             .producer_id(Some(producer_id))
             .producer_epoch(Some(producer_epoch)),
@@ -101,6 +101,32 @@ async fn init_producer_id(
     })
     .await
     .map_err(Into::into)
+}
+
+/// Initializes a transactional producer for `transactional_id` in the storage, with this producer
+/// ID and epoch.
+///
+/// Calls the storage directly, because [`InitProducerIdService`] refuses every request that carries
+/// a transactional ID.
+async fn init_transactional_producer(
+    storage: &impl Storage,
+    transactional_id: &str,
+    producer_id: i64,
+    producer_epoch: i16,
+) -> Result<InitProducerIdResponse> {
+    let response = storage
+        .init_producer(
+            Some(transactional_id),
+            TRANSACTION_TIMEOUT_MS,
+            Some(producer_id),
+            Some(producer_epoch),
+        )
+        .await?;
+
+    Ok(InitProducerIdResponse::default()
+        .error_code(response.error.into())
+        .producer_id(response.id)
+        .producer_epoch(response.epoch))
 }
 
 fn assert_ok(response: &InitProducerIdResponse) {
@@ -117,63 +143,141 @@ fn assert_failed(error: ErrorCode, response: &InitProducerIdResponse) {
     assert_eq!(-1, response.producer_epoch, "{response:?}");
 }
 
-/// v0-2 have no ProducerId or ProducerEpoch, so a fresh request decodes with neither
-/// set. Each request goes through the wire encoding of its version, as a client sends it.
+/// Returns `request` as the broker decodes it after a client sends it at `api_version`.
+fn request_decoded_at_version(
+    request: InitProducerIdRequest,
+    api_version: i16,
+) -> Result<InitProducerIdRequest> {
+    let encoded = Frame::request(
+        Header::Request {
+            api_key: InitProducerIdRequest::KEY,
+            api_version,
+            correlation_id: api_version.into(),
+            client_id: None,
+        },
+        Body::InitProducerIdRequest(request),
+    )?;
+
+    InitProducerIdRequest::try_from(Frame::request_from_bytes(encoded)?.body).map_err(Into::into)
+}
+
+/// v0-2 have no ProducerId or ProducerEpoch, so a fresh request decodes with neither set.
 async fn old_versions_are_fresh(storage: impl Storage + Clone) -> Result<()> {
     let service = InitProducerIdService { storage };
 
-    for transactional_id in [None, Some(Uuid::now_v7().to_string())] {
-        let mut previous: Option<InitProducerIdResponse> = None;
+    let mut previous: Option<InitProducerIdResponse> = None;
 
-        for api_version in 0..=5 {
-            let encoded = Frame::request(
-                Header::Request {
-                    api_key: InitProducerIdRequest::KEY,
-                    api_version,
-                    correlation_id: api_version.into(),
-                    client_id: None,
-                },
-                Body::InitProducerIdRequest(
-                    InitProducerIdRequest::default()
-                        .transactional_id(transactional_id.clone())
-                        .transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
-                        .producer_id(Some(-1))
-                        .producer_epoch(Some(-1)),
-                ),
-            )?;
+    for api_version in 0..=5 {
+        let request = request_decoded_at_version(
+            InitProducerIdRequest::default()
+                .transactional_id(None)
+                .transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
+                .producer_id(Some(-1))
+                .producer_epoch(Some(-1)),
+            api_version,
+        )?;
 
-            let request =
-                InitProducerIdRequest::try_from(Frame::request_from_bytes(encoded)?.body)?;
-
-            if api_version < 3 {
-                assert_eq!((None, None), (request.producer_id, request.producer_epoch));
-            }
-
-            let response = service
-                .serve(RequestInput {
-                    request,
-                    extensions: Extensions::default(),
-                })
-                .await?;
-
-            assert_ok(&response);
-
-            match previous {
-                Some(previous) if transactional_id.is_some() => {
-                    assert_eq!(previous.producer_id, response.producer_id);
-                    assert_eq!(previous.producer_epoch + 1, response.producer_epoch);
-                }
-
-                Some(previous) => {
-                    assert!(response.producer_id > previous.producer_id);
-                    assert_eq!(0, response.producer_epoch);
-                }
-
-                None => assert_eq!(0, response.producer_epoch),
-            }
-
-            previous = Some(response);
+        if api_version < 3 {
+            assert_eq!((None, None), (request.producer_id, request.producer_epoch));
         }
+
+        let response = service
+            .serve(RequestInput {
+                request,
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        assert_ok(&response);
+        assert_eq!(0, response.producer_epoch);
+
+        if let Some(previous) = previous {
+            assert!(response.producer_id > previous.producer_id);
+        }
+
+        previous = Some(response);
+    }
+
+    Ok(())
+}
+
+/// The broker must answer a transactional ID with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` at every
+/// version, before it calls the storage.
+async fn transactional_id_is_refused(storage: impl Storage + Clone) -> Result<()> {
+    let service = InitProducerIdService {
+        storage: storage.clone(),
+    };
+    let txn = Uuid::now_v7().to_string();
+
+    for api_version in 0..=5 {
+        let request = request_decoded_at_version(
+            InitProducerIdRequest::default()
+                .transactional_id(Some(txn.clone()))
+                .transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
+                .producer_id(Some(-1))
+                .producer_epoch(Some(-1)),
+            api_version,
+        )?;
+
+        let response = service
+            .serve(RequestInput {
+                request,
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        assert_failed(ErrorCode::TransactionalIdAuthorizationFailed, &response);
+    }
+
+    // This call checks that no refused request reached the storage. The storage still serves a
+    // transactional ID when the test calls it directly. The storage registers an ID on its first
+    // request and answers it with epoch 0, and answers each later request for the ID with the
+    // next epoch. Epoch 0 here shows that the storage had not seen the ID before this call.
+    let direct_storage_response = init_transactional_producer(&storage, &txn, -1, -1).await?;
+    assert_ok(&direct_storage_response);
+    assert_eq!(0, direct_storage_response.producer_epoch);
+
+    Ok(())
+}
+
+/// v0-2 have no ProducerId or ProducerEpoch, so a fresh request for a transactional ID decodes
+/// with neither set. The broker must then give the request the producer ID that holds the
+/// transactional ID, with the next epoch.
+async fn old_versions_bump_a_transactional_producer(storage: impl Storage + Clone) -> Result<()> {
+    let service = InitProducerIdService { storage };
+    let txn = Uuid::now_v7().to_string();
+
+    let mut previous: Option<InitProducerIdResponse> = None;
+
+    for api_version in 0..=5 {
+        let request = request_decoded_at_version(
+            InitProducerIdRequest::default()
+                .transactional_id(Some(txn.clone()))
+                .transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
+                .producer_id(Some(-1))
+                .producer_epoch(Some(-1)),
+            api_version,
+        )?;
+
+        let response = service
+            .serve(RequestInput {
+                request,
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        assert_ok(&response);
+
+        match previous {
+            Some(previous) => {
+                assert_eq!(previous.producer_id, response.producer_id);
+                assert_eq!(previous.producer_epoch + 1, response.producer_epoch);
+            }
+
+            None => assert_eq!(0, response.producer_epoch),
+        }
+
+        previous = Some(response);
     }
 
     Ok(())
@@ -181,15 +285,16 @@ async fn old_versions_are_fresh(storage: impl Storage + Clone) -> Result<()> {
 
 /// Without a transactional ID, the storage ignores a claim and grants a new ID.
 async fn no_txn_claim_gets_new_id(storage: impl Storage + Clone) -> Result<()> {
-    let first = init_producer_id(&storage, None, -1, -1).await?;
+    let first = init_idempotent_producer(&storage, -1, -1).await?;
     assert_ok(&first);
 
-    let claimed = init_producer_id(&storage, None, first.producer_id, first.producer_epoch).await?;
+    let claimed =
+        init_idempotent_producer(&storage, first.producer_id, first.producer_epoch).await?;
     assert_ok(&claimed);
     assert!(claimed.producer_id > first.producer_id);
     assert_eq!(0, claimed.producer_epoch);
 
-    let unknown = init_producer_id(&storage, None, claimed.producer_id + 1_000, 7).await?;
+    let unknown = init_idempotent_producer(&storage, claimed.producer_id + 1_000, 7).await?;
     assert_ok(&unknown);
     assert!(unknown.producer_id > claimed.producer_id);
     assert_eq!(0, unknown.producer_epoch);
@@ -200,13 +305,13 @@ async fn no_txn_claim_gets_new_id(storage: impl Storage + Clone) -> Result<()> {
 async fn txn_claim_current_epoch_bumps(storage: impl Storage + Clone) -> Result<()> {
     let txn = Uuid::now_v7().to_string();
 
-    let mut current = init_producer_id(&storage, Some(&txn), -1, -1).await?;
+    let mut current = init_transactional_producer(&storage, &txn, -1, -1).await?;
     assert_ok(&current);
 
     for _ in 0..2 {
-        let bumped = init_producer_id(
+        let bumped = init_transactional_producer(
             &storage,
-            Some(&txn),
+            &txn,
             current.producer_id,
             current.producer_epoch,
         )
@@ -226,27 +331,24 @@ async fn txn_claim_current_epoch_bumps(storage: impl Storage + Clone) -> Result<
 async fn txn_claim_stale_epoch_is_fenced(storage: impl Storage + Clone) -> Result<()> {
     let txn = Uuid::now_v7().to_string();
 
-    let stale = init_producer_id(&storage, Some(&txn), -1, -1).await?;
+    let stale = init_transactional_producer(&storage, &txn, -1, -1).await?;
     assert_ok(&stale);
 
-    let current = init_producer_id(&storage, Some(&txn), -1, -1).await?;
+    let current = init_transactional_producer(&storage, &txn, -1, -1).await?;
     assert_ok(&current);
+    assert_eq!(stale.producer_id, current.producer_id);
     assert_eq!(stale.producer_epoch + 1, current.producer_epoch);
 
     for epoch in [stale.producer_epoch, current.producer_epoch + 1] {
         assert_failed(
             ErrorCode::ProducerFenced,
-            &init_producer_id(&storage, Some(&txn), current.producer_id, epoch).await?,
+            &init_transactional_producer(&storage, &txn, current.producer_id, epoch).await?,
         );
     }
 
-    let bumped = init_producer_id(
-        &storage,
-        Some(&txn),
-        current.producer_id,
-        current.producer_epoch,
-    )
-    .await?;
+    let bumped =
+        init_transactional_producer(&storage, &txn, current.producer_id, current.producer_epoch)
+            .await?;
     assert_ok(&bumped);
     assert_eq!(current.producer_epoch + 1, bumped.producer_epoch);
 
@@ -257,23 +359,18 @@ async fn txn_claim_other_id_is_fenced(storage: impl Storage + Clone) -> Result<(
     let txn = Uuid::now_v7().to_string();
     let other_txn = Uuid::now_v7().to_string();
 
-    let producer = init_producer_id(&storage, Some(&txn), -1, -1).await?;
+    let producer = init_transactional_producer(&storage, &txn, -1, -1).await?;
     assert_ok(&producer);
 
-    let other = init_producer_id(&storage, Some(&other_txn), -1, -1).await?;
+    let other = init_transactional_producer(&storage, &other_txn, -1, -1).await?;
     assert_ok(&other);
     assert_ne!(producer.producer_id, other.producer_id);
     assert_eq!(producer.producer_epoch, other.producer_epoch);
 
     assert_failed(
         ErrorCode::ProducerFenced,
-        &init_producer_id(
-            &storage,
-            Some(&txn),
-            other.producer_id,
-            other.producer_epoch,
-        )
-        .await?,
+        &init_transactional_producer(&storage, &txn, other.producer_id, other.producer_epoch)
+            .await?,
     );
 
     Ok(())
@@ -283,7 +380,7 @@ async fn txn_claim_other_id_is_fenced(storage: impl Storage + Clone) -> Result<(
 async fn txn_claim_unknown_txn_is_fresh(storage: impl Storage + Clone) -> Result<()> {
     let txn = Uuid::now_v7().to_string();
 
-    let response = init_producer_id(&storage, Some(&txn), 4_242, 3).await?;
+    let response = init_transactional_producer(&storage, &txn, 4_242, 3).await?;
     assert_ok(&response);
     assert!(response.producer_id > 0);
     assert_eq!(0, response.producer_epoch);
@@ -296,14 +393,18 @@ async fn txn_claim_unknown_txn_is_fresh(storage: impl Storage + Clone) -> Result
 async fn mixed_shape_is_invalid_request(storage: impl Storage + Clone) -> Result<()> {
     let txn = Uuid::now_v7().to_string();
 
-    for transactional_id in [None, Some(txn.as_str())] {
-        for (producer_id, producer_epoch) in [(-1, 0), (5, -1)] {
-            assert_failed(
-                ErrorCode::InvalidRequest,
-                &init_producer_id(&storage, transactional_id, producer_id, producer_epoch).await?,
-            );
-        }
+    for (producer_id, producer_epoch) in [(-1, 0), (5, -1)] {
+        assert_failed(
+            ErrorCode::InvalidRequest,
+            &init_idempotent_producer(&storage, producer_id, producer_epoch).await?,
+        );
+        assert_failed(
+            ErrorCode::InvalidRequest,
+            &init_transactional_producer(&storage, &txn, producer_id, producer_epoch).await?,
+        );
+    }
 
+    for transactional_id in [None, Some(txn.as_str())] {
         for (producer_id, producer_epoch) in
             [(Some(-1), None), (None, Some(0)), (Some(5), Some(-1))]
         {
@@ -427,7 +528,7 @@ async fn txn_claim_ongoing_txn_aborts_and_bumps(storage: impl Storage + Clone) -
     let txn = Uuid::now_v7().to_string();
     let topition = create_topition(&storage).await?;
 
-    let producer = init_producer_id(&storage, Some(&txn), -1, -1).await?;
+    let producer = init_transactional_producer(&storage, &txn, -1, -1).await?;
     assert_ok(&producer);
 
     produce_in_txn(&storage, &txn, &producer, &topition).await?;
@@ -437,9 +538,9 @@ async fn txn_claim_ongoing_txn_aborts_and_bumps(storage: impl Storage + Clone) -
         latest(&storage, &topition, IsolationLevel::ReadCommitted).await?
     );
 
-    let bumped = init_producer_id(
+    let bumped = init_transactional_producer(
         &storage,
-        Some(&txn),
+        &txn,
         producer.producer_id,
         producer.producer_epoch,
     )
@@ -472,23 +573,18 @@ async fn txn_fenced_claim_leaves_ongoing_txn(storage: impl Storage + Clone) -> R
     let txn = Uuid::now_v7().to_string();
     let topition = create_topition(&storage).await?;
 
-    let fenced = init_producer_id(&storage, Some(&txn), -1, -1).await?;
+    let fenced = init_transactional_producer(&storage, &txn, -1, -1).await?;
     assert_ok(&fenced);
 
-    let current = init_producer_id(&storage, Some(&txn), -1, -1).await?;
+    let current = init_transactional_producer(&storage, &txn, -1, -1).await?;
     assert_ok(&current);
 
     produce_in_txn(&storage, &txn, &current, &topition).await?;
 
     assert_failed(
         ErrorCode::ProducerFenced,
-        &init_producer_id(
-            &storage,
-            Some(&txn),
-            fenced.producer_id,
-            fenced.producer_epoch,
-        )
-        .await?,
+        &init_transactional_producer(&storage, &txn, fenced.producer_id, fenced.producer_epoch)
+            .await?,
     );
 
     assert_eq!(
@@ -555,6 +651,21 @@ mod in_memory {
         let _guard = init_tracing()?;
 
         super::old_versions_are_fresh(registered_storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn transactional_id_is_refused() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::transactional_id_is_refused(registered_storage().await?).await
+    }
+
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
+    #[tokio::test]
+    async fn old_versions_bump_a_transactional_producer() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::old_versions_bump_a_transactional_producer(registered_storage().await?).await
     }
 
     #[tokio::test]
@@ -657,6 +768,21 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn transactional_id_is_refused() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::transactional_id_is_refused(registered_storage().await?).await
+    }
+
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
+    #[tokio::test]
+    async fn old_versions_bump_a_transactional_producer() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::old_versions_bump_a_transactional_producer(registered_storage().await?).await
+    }
+
+    #[tokio::test]
     async fn no_txn_claim_gets_new_id() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -756,6 +882,21 @@ mod slatedb {
     }
 
     #[tokio::test]
+    async fn transactional_id_is_refused() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::transactional_id_is_refused(registered_storage().await?).await
+    }
+
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
+    #[tokio::test]
+    async fn old_versions_bump_a_transactional_producer() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::old_versions_bump_a_transactional_producer(registered_storage().await?).await
+    }
+
+    #[tokio::test]
     async fn no_txn_claim_gets_new_id() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -852,6 +993,21 @@ mod pg {
         let _guard = init_tracing()?;
 
         super::old_versions_are_fresh(registered_storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn transactional_id_is_refused() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::transactional_id_is_refused(registered_storage().await?).await
+    }
+
+    #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
+    #[tokio::test]
+    async fn old_versions_bump_a_transactional_producer() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::old_versions_bump_a_transactional_producer(registered_storage().await?).await
     }
 
     #[tokio::test]
@@ -962,6 +1118,22 @@ mod turso {
         let _guard = init_tracing()?;
 
         super::old_versions_are_fresh(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn transactional_id_is_refused() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::transactional_id_is_refused(registered_storage().await?).await
+    }
+
+    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn old_versions_bump_a_transactional_producer() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        super::old_versions_bump_a_transactional_producer(registered_storage().await?).await
     }
 
     #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]

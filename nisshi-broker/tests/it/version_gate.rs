@@ -30,6 +30,7 @@ use nisshi_sans_io::{
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
 };
 use nisshi_service::{BytesFrameLayer, CAPPED_API_VERSIONS, FrameRouteService};
+use nisshi_storage::TopicCreationConfig;
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use uuid::Uuid;
 
@@ -48,7 +49,11 @@ async fn route_table() -> Result<FrameRouteService<Error>> {
 
     let coordinator = Controller::with_storage(storage.clone())?;
 
-    let builder = storage::services(FrameRouteService::<Error>::builder(), storage)?;
+    let builder = storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+    )?;
     let builder = coordinator::services(builder, coordinator)?;
     let builder = auth::services(builder)?;
 
@@ -138,20 +143,24 @@ async fn full_route_table_has_the_expected_route_count() -> Result<()> {
 
     let coordinator = Controller::with_storage(storage.clone())?;
 
-    let with_storage_routes = storage::services(FrameRouteService::<Error>::builder(), storage)?;
+    let with_storage_routes = storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+    )?;
     // The broker does not register a route for GetTelemetrySubscriptions, so it does not
     // advertise the client telemetry APIs.
-    assert_eq!(25, with_storage_routes.len());
+    assert_eq!(24, with_storage_routes.len());
 
     let with_coordinator_routes = coordinator::services(with_storage_routes, coordinator)?;
-    assert_eq!(25 + 7, with_coordinator_routes.len());
+    assert_eq!(24 + 9, with_coordinator_routes.len());
 
     let with_auth_routes = auth::services(with_coordinator_routes)?;
-    assert_eq!(25 + 7 + 2, with_auth_routes.len());
+    assert_eq!(24 + 9 + 2, with_auth_routes.len());
 
     let route_table = with_auth_routes.build().map_err(Error::from)?;
     // `build` adds the `ApiVersions` route itself.
-    assert_eq!(25 + 7 + 2 + 1, route_table.len());
+    assert_eq!(24 + 9 + 2 + 1, route_table.len());
 
     Ok(())
 }
@@ -247,6 +256,7 @@ async fn api_versions_advertises_the_expected_table() -> Result<()> {
         (28, 0, 4), // TxnOffsetCommit
         (29, 0, 3), // DescribeAcls
         (30, 0, 3), // CreateAcls
+        (31, 0, 3), // DeleteAcls
         (32, 0, 4), // DescribeConfigs
         (36, 0, 2), // SaslAuthenticate
         (42, 0, 2), // DeleteGroups

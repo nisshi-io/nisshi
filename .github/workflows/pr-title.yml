@@ -54,3 +54,13 @@ jobs:
             chore
             revert
           requireScope: false
+          # The pattern is the conventionalcommits preset's header pattern
+          # with an optional Jira key in front, as in
+          # `SOL-123: fix(sql): summary`. Solace's autobots service reads the
+          # key from the title to check the ticket and to move it on when the
+          # PR merges. The scope group stays `(.*)`, as in the preset, because
+          # the action splits it on `,` for a title with more than one scope.
+          # The type stays required, because the changelog is drafted from
+          # these commit subjects.
+          headerPattern: '^(?:[A-Z][A-Z0-9]+-[0-9]+: )?(\w*)(?:\((.*)\))?!?: (.*)$'
+          headerPatternCorrespondence: type, scope, subject

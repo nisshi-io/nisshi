@@ -25,6 +25,7 @@ use serde::{
 use std::{
     fmt::{self, Formatter},
     marker::PhantomData,
+    slice,
 };
 use tracing::{debug, instrument};
 
@@ -494,6 +495,13 @@ impl<T: Serialize> Serialize for VarIntSequence<T> {
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Sequence<T>(pub Vec<T>);
+
+impl<T> Sequence<T> {
+    /// Returns an iterator over the sequence's items.
+    pub(crate) fn iter(&self) -> slice::Iter<'_, T> {
+        self.0.iter()
+    }
+}
 
 impl<T> IntoIterator for Sequence<T> {
     type Item = T;

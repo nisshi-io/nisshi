@@ -18,15 +18,25 @@
 
 # CA certs are architecture-independent, so this stage runs on the build
 # host for every target platform and a multi-platform build needs no QEMU.
-FROM --platform=$BUILDPLATFORM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS base
+FROM --platform=$BUILDPLATFORM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS base
 RUN mkdir -p /image/schema /image/data /image/tmp /image/etc && cp -r /etc/ssl /image/etc/
 
 FROM scratch
 ARG TARGETPLATFORM
+# docker/metadata-action generates title, description, url, source, version, created, revision
+# and licenses at publish time, and its labels override these. The labels input of
+# .github/actions/publish-image therefore sets url and description again, and those two
+# must stay equal to the values here.
+LABEL org.opencontainers.image.url="https://nisshi.io" \
+      org.opencontainers.image.documentation="https://docs.nisshi.io" \
+      org.opencontainers.image.description="A stateless Apache Kafka(R)-compatible broker with pluggable storage." \
+      org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=base /image /
 # --chmod: the binary arrives via an Actions artifact, which drops the exec bit.
 COPY --chmod=755 dist/${TARGETPLATFORM}/nisshi /nisshi
 COPY LICENSE /LICENSE
+COPY NOTICE /NOTICE
+COPY dist/${TARGETPLATFORM}/THIRD-PARTY-LICENSE.html /THIRD-PARTY-LICENSE.html
 ENV TMP=/tmp
 ENTRYPOINT ["/nisshi"]
 CMD ["broker"]

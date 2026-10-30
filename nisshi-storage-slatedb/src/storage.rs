@@ -40,7 +40,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated::Batch, inflated::Batch as InflatedBatch},
     ser::RecordBatchEncoder,
@@ -49,12 +48,12 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
-    producer_claim,
+    max_message_bytes, producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::sleep;
@@ -882,6 +881,19 @@ impl Storage for Engine {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         }
 
+        let limit = max_message_bytes::limit(
+            topition.topic(),
+            metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|config| config.name == max_message_bytes::KEY)
+                .and_then(|config| config.value.as_deref()),
+        );
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+
         // Schema validation (if schemas registry is configured)
         if let Some(ref schemas) = self.schemas
             && let Some(ref inflated) = inflated
@@ -1294,7 +1306,10 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let prefix = postcard::to_stdvec(&OffsetCommitKeyPrefix::new(group_id))?;
 
         let mut topitions = BTreeMap::new();
@@ -1309,7 +1324,14 @@ impl Storage for Engine {
             let key: OffsetCommitKey = decode_offset(&kv.key)?;
             let value: OffsetCommitValue = decode_offset(&kv.value)?;
 
-            _ = topitions.insert(Topition::new(key.topic, key.partition), value.offset);
+            _ = topitions.insert(
+                Topition::new(key.topic, key.partition),
+                CommittedOffset {
+                    offset: value.offset,
+                    leader_epoch: None,
+                    metadata: None,
+                },
+            );
         }
 
         Ok(topitions)
@@ -1320,7 +1342,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         // TODO: Implement require_stable
         // When true, we must return the Last Stable Offset instead of High Watermark.
         // Current implementation violates READ_COMMITTED isolation by returning potentially unstable offsets.
@@ -1338,7 +1360,7 @@ impl Storage for Engine {
             for topition in topics {
                 // If the topic doesn't exist, return -1 (mimics PG behavior with JOINs)
                 if !existing_topics.contains_key(&topition.topic[..]) {
-                    _ = responses.insert(topition.clone(), -1);
+                    _ = responses.insert(topition.clone(), CommittedOffset::uncommitted());
                     continue;
                 }
 
@@ -1351,9 +1373,13 @@ impl Storage for Engine {
                 let offset = match self.db.get(&key).await {
                     Ok(Some(encoded)) => {
                         let value: OffsetCommitValue = decode_offset(&encoded)?;
-                        value.offset
+                        CommittedOffset {
+                            offset: value.offset,
+                            leader_epoch: None,
+                            metadata: None,
+                        }
                     }
-                    Ok(None) => -1, // No committed offset
+                    Ok(None) => CommittedOffset::uncommitted(), // No committed offset
                     Err(err) => {
                         debug!(?err, ?group_id, ?topition);
                         return Err(Error::Slate(Arc::new(err)));
@@ -1763,11 +1789,7 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        // TODO: Implement states_filter - should filter groups by their state
-        if states_filter.is_some() {
-            tracing::warn!("list_groups state filtering is not implemented, returning all groups");
-        }
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let prefix = postcard::to_stdvec(&GroupKeyPrefix::new())?;
         let mut groups = vec![];
 
@@ -1779,13 +1801,9 @@ impl Storage for Engine {
             }
 
             if let Ok(key) = postcard::from_bytes::<GroupKey>(&kv.key) {
-                groups.push(
-                    ListedGroup::default()
-                        .group_id(key.group_id)
-                        .protocol_type("consumer".into())
-                        .group_state(Some("Unknown".into()))
-                        .group_type(Some("classic".into())),
-                );
+                let stored = GroupDetailVersion::decode(&kv.value).map(|gdv| gdv.detail);
+
+                groups.push(NamedGroupDetail::decoded(key.group_id, Some(stored)));
             }
         }
 

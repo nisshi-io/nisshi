@@ -15,22 +15,22 @@
 use nisshi_sans_io::{
     AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, AlterUserScramCredentialsRequest,
     ApiKey as _, ConsumerGroupDescribeRequest, CreateAclsRequest, CreateTopicsRequest,
-    DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest, DescribeClusterRequest,
-    DescribeConfigsRequest, DescribeGroupsRequest, DescribeTopicPartitionsRequest,
+    DeleteAclsRequest, DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest,
+    DescribeClusterRequest, DescribeConfigsRequest, DescribeTopicPartitionsRequest,
     DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
-    IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
+    IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
+use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, TransactionAbortableDowngradeLayer};
 use nisshi_storage::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, CreateTopicsValidationLayer, DeleteRecordsService, DeleteTopicsService,
-    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService, DeleteRecordsService,
+    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
+    InitProducerIdService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
+    ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService,
 };
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
@@ -39,6 +39,7 @@ use crate::Error;
 pub fn services<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
@@ -49,23 +50,20 @@ where
         alter_user_scram_credentials,
         consumer_group_describe,
         create_acls,
-        create_topics,
+        delete_acls,
         delete_records,
         delete_topics,
         describe_acls,
         describe_cluster,
         describe_configs,
-        describe_groups,
         describe_topic_partitions,
         describe_user_scram_credentials,
         fetch,
         find_coordinator,
         incremental_alter_configs,
         init_producer_id,
-        list_groups,
         list_offsets,
         list_partition_reassignments,
-        metadata,
         produce,
         end_txn,
         txn_offset_commit,
@@ -74,6 +72,8 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
+    .and_then(|builder| metadata(builder, storage.clone(), topic_creation))
+    .and_then(|builder| create_topics(builder, storage, topic_creation))
 }
 
 pub fn alter_user_scram_credentials<S>(
@@ -136,6 +136,26 @@ where
         .map_err(Into::into)
 }
 
+pub fn delete_acls<S>(
+    builder: FrameRouteBuilder<Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    S: Storage,
+{
+    builder
+        .with_route(
+            DeleteAclsRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                FrameRequestLayer::<DeleteAclsRequest>::new(),
+            )
+                .into_layer(DeleteAclsService { storage })
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
 pub fn describe_acls<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
@@ -179,6 +199,7 @@ where
 pub fn create_topics<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage,
@@ -189,7 +210,7 @@ where
             (
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<CreateTopicsRequest>::new(),
-                CreateTopicsValidationLayer::new(),
+                CreateTopicsValidationLayer::new().num_partitions(topic_creation.num_partitions),
             )
                 .into_layer(CreateTopicsService { storage })
                 .boxed(),
@@ -272,26 +293,6 @@ where
                 FrameRequestLayer::<DescribeConfigsRequest>::new(),
             )
                 .into_layer(DescribeConfigsService { storage })
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
-pub fn describe_groups<S>(
-    builder: FrameRouteBuilder<Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<Error>, Error>
-where
-    S: Storage,
-{
-    builder
-        .with_route(
-            DescribeGroupsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<DescribeGroupsRequest>::new(),
-            )
-                .into_layer(DescribeGroupsService { storage })
                 .boxed(),
         )
         .map_err(Into::into)
@@ -398,26 +399,6 @@ where
         .map_err(Into::into)
 }
 
-pub fn list_groups<S>(
-    builder: FrameRouteBuilder<Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<Error>, Error>
-where
-    S: Storage,
-{
-    builder
-        .with_route(
-            ListGroupsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<ListGroupsRequest>::new(),
-            )
-                .into_layer(ListGroupsService { storage })
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
 pub fn list_offsets<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
@@ -453,9 +434,10 @@ where
 pub fn metadata<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage,
+    S: Storage + Clone,
 {
     builder
         .with_route(
@@ -464,7 +446,10 @@ where
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<MetadataRequest>::new(),
             )
-                .into_layer(MetadataService { storage })
+                .into_layer(MetadataService {
+                    storage,
+                    topic_creation,
+                })
                 .boxed(),
         )
         .map_err(Into::into)
@@ -478,7 +463,10 @@ where
     S: Storage,
 {
     builder
-        .with_capped_route::<ProduceRequest, _>(ProduceService { storage })
+        .with_capped_route_layer::<ProduceRequest, _, _>(
+            TransactionAbortableDowngradeLayer,
+            ProduceService { storage },
+        )
         .map_err(Into::into)
 }
 

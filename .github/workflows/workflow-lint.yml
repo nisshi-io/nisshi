@@ -39,16 +39,34 @@ jobs:
       # Installed directly (not via a reporting wrapper action) so the job's
       # own exit code is what gates the merge; a wrapper that posts to the
       # Checks API would need `checks: write`, which this workflow doesn't
-      # grant and shouldn't need to just run a linter.
-      - run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      # grant and shouldn't need to just run a linter. The release archive
+      # is pinned by version and by the SHA-256 recorded below (copied from
+      # the release's actionlint_<version>_checksums.txt), so a moved tag or
+      # a replaced asset fails the job instead of changing what runs. Update
+      # both values together.
+      - name: Install actionlint (pinned version, checksum-verified)
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
       - run: |
-          "$(go env GOPATH)/bin/actionlint"
+          "$RUNNER_TEMP/actionlint/actionlint"
       # The `changes` jobs run the base branch's copy of ci-changes.sh, so a
       # PR's edit to it is only tested here.
       - run: bash .github/scripts/ci-changes.test.sh
       # release.yml runs check-release-tag.sh only on a `v*` tag, so a PR's
       # edit to it is only tested here, before a release depends on it.
       - run: bash .github/scripts/check-release-tag.test.sh
+      # ci.yml runs check-ca-bundle.sh only on the image's real certificates,
+      # so its failure paths are tested here.
+      - run: bash .github/scripts/check-ca-bundle.test.sh
 
   zizmor:
     runs-on: ubuntu-latest
@@ -56,7 +74,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: zizmor@1.30.1
       # GH_TOKEN enables zizmor's online audits (e.g. known-vulnerable-actions,
@@ -67,6 +85,9 @@ jobs:
       # The medium/medium thresholds below also hide the open
       # `cache-poisoning` findings. zizmor applies the thresholds globally,
       # so this step cannot show one audit without the other.
+      #
+      # `just lint-workflows` runs both zizmor steps locally. Keep its zizmor
+      # arguments in step with these.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor --min-confidence medium --min-severity medium .github/workflows/

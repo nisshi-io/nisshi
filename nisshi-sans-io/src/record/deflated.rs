@@ -28,7 +28,7 @@ use serde::{
 use tracing::{debug, error, instrument};
 
 use crate::{
-    ByteSize, Compression, Decode as _, Encode, Error, ErrorCode, Result,
+    ByteSize, Compression, Decode as _, Encode, Error, ErrorCode, Result, TimestampType,
     record::{
         Header, Record,
         codec::{
@@ -46,19 +46,24 @@ pub struct Frame {
 impl ByteSize for Frame {
     #[instrument(skip_all, ret)]
     fn size_in_bytes(&self) -> Result<usize> {
-        Ok(size_of::<i32>()
-            + self
-                .batches
-                .iter()
-                .map(|batch| {
-                    // base_offset
-                    size_of::<i64>()
-                // batch length
-                + size_of::<i32>()
-                + FIXED_BATCH_LENGTH
-                + batch.record_data.len()
-                })
-                .sum::<usize>())
+        self.batches
+            .iter()
+            .map(ByteSize::size_in_bytes)
+            .sum::<Result<usize>>()
+            .map(|batches| size_of::<i32>() + batches)
+    }
+}
+
+/// The encoded size of the batch, from `base_offset` to the end of `record_data`. Kafka's
+/// `RecordBatch.sizeInBytes` measures the same span.
+impl ByteSize for Batch {
+    fn size_in_bytes(&self) -> Result<usize> {
+        // base_offset
+        Ok(size_of::<i64>()
+            // batch_length
+            + size_of::<i32>()
+            + FIXED_BATCH_LENGTH
+            + self.record_data.len())
     }
 }
 
@@ -285,24 +290,34 @@ impl Batch {
         CrcData::from(self).crc()
     }
 
-    /// Sets `base_timestamp` and `max_timestamp`, and recomputes `crc` so
-    /// that it covers the new values.
+    /// Sets the timestamp type, `base_timestamp` and `max_timestamp`, and recomputes `crc` so that
+    /// it covers the new values.
+    ///
+    /// The timestamp type is a bit of `attributes`. A consumer reads each record's timestamp from
+    /// these fields, by the rule of [`inflated::Batch::record_timestamp`].
     ///
     /// The method verifies `crc` against the current contents first, because
     /// a new `crc` would make a batch that was damaged in transit look intact
     /// to every consumer. Kafka rejects such a batch with `CORRUPT_MESSAGE`
     /// before it validates timestamps.
     ///
-    /// # Errors
-    ///
     /// Returns [`Error::ApiError`] with [`ErrorCode::CorruptMessage`] when
     /// `crc` does not match the current contents. The batch is then
     /// unchanged.
-    pub fn set_timestamps(&mut self, base_timestamp: i64, max_timestamp: i64) -> Result<()> {
+    ///
+    /// [`inflated::Batch::record_timestamp`]: crate::record::inflated::Batch::record_timestamp
+    pub fn set_timestamps(
+        &mut self,
+        timestamp_type: TimestampType,
+        base_timestamp: i64,
+        max_timestamp: i64,
+    ) -> Result<()> {
         if self.computed_crc() != self.crc {
             return Err(Error::ApiError(ErrorCode::CorruptMessage));
         }
 
+        self.attributes =
+            (self.attributes & !TimestampType::TIMESTAMP_TYPE_BITMASK) | i16::from(timestamp_type);
         self.base_timestamp = base_timestamp;
         self.max_timestamp = max_timestamp;
         self.crc = self.computed_crc();
@@ -2040,9 +2055,42 @@ mod tests {
 
         let original_crc = batch.crc;
 
-        batch.set_timestamps(batch.base_timestamp + 1, batch.max_timestamp + 2)?;
+        batch.set_timestamps(
+            TimestampType::CreateTime,
+            batch.base_timestamp + 1,
+            batch.max_timestamp + 2,
+        )?;
 
         assert_ne!(original_crc, batch.crc);
+        assert_eq!(batch.computed_crc(), batch.crc);
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_timestamps_sets_and_clears_the_timestamp_type() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let mut batch: Batch = inflated::Batch::builder()
+            .attributes(Compression::Gzip.into())
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        batch.set_timestamps(TimestampType::LogAppendTime, 7, 7)?;
+        assert_eq!(
+            BatchAttribute::default()
+                .compression(Compression::Gzip)
+                .timestamp(TimestampType::LogAppendTime),
+            BatchAttribute::try_from(batch.attributes)?
+        );
+        assert_eq!(batch.computed_crc(), batch.crc);
+
+        batch.set_timestamps(TimestampType::CreateTime, 7, 7)?;
+        assert_eq!(
+            BatchAttribute::default().compression(Compression::Gzip),
+            BatchAttribute::try_from(batch.attributes)?
+        );
         assert_eq!(batch.computed_crc(), batch.crc);
 
         Ok(())
@@ -2061,7 +2109,11 @@ mod tests {
         let damaged = batch.clone();
 
         let err = batch
-            .set_timestamps(batch.base_timestamp, batch.max_timestamp + 1)
+            .set_timestamps(
+                TimestampType::LogAppendTime,
+                batch.base_timestamp,
+                batch.max_timestamp + 1,
+            )
             .expect_err("a batch whose crc does not match must be rejected");
 
         assert!(matches!(err, Error::ApiError(ErrorCode::CorruptMessage)));

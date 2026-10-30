@@ -28,7 +28,10 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     Error, METER, OffsetStage, Result, Storage, Topition,
-    service::deadline::{self, Missed},
+    service::{
+        deadline::{self, Missed},
+        read_share::FetchReadShare,
+    },
 };
 use validation::ValidatedFetchRequest;
 
@@ -143,21 +146,16 @@ fn missed(
     started_at: Instant,
 ) {
     let stage = missed.stage();
+    let limit = missed.limit();
 
-    READ_DEADLINE_EXCEEDED.add(
-        1,
-        &[
-            KeyValue::new("operation", operation),
-            KeyValue::new("stage", stage),
-        ],
-    );
+    READ_DEADLINE_EXCEEDED.add(1, &missed.attributes(operation));
 
     match missed {
         Missed::NotStarted => {
             debug!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
         }
-        Missed::Queued | Missed::Reading => {
-            warn!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
+        Missed::Queued | Missed::QueuedForConnectionShare | Missed::Reading => {
+            warn!(?tp, operation, offset, stage, limit, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
         }
     }
 }
@@ -783,8 +781,19 @@ where
 
                 debug!(partition_bytes, is_first_non_empty);
 
-                *max_bytes =
-                    max_bytes.saturating_sub(partition_max_bytes.saturating_sub(partition_bytes));
+                // The partition spends the bytes that it returned, not only its
+                // own limit. A storage read can exceed its limit by one batch
+                // (`Storage::fetch`), so a partition can exceed
+                // `partition_max_bytes` by one batch. When the response spends
+                // that batch as well, the response holds at most `max_bytes` and
+                // one batch, however many partitions the request lists. Kafka
+                // lets only the first non-empty partition exceed a limit
+                // ([ReplicaManager.scala#L1733-L1739]). Storage cannot tell the
+                // first read of the first non-empty partition from any other
+                // read, so here every partition can.
+                //
+                // [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
+                *max_bytes = max_bytes.saturating_sub(u32::try_from(partition.byte_size())?);
 
                 partitions.push(partition);
             }
@@ -834,7 +843,7 @@ where
         &self,
         max_wait: Duration,
         min_bytes: u32,
-        max_bytes: &mut u32,
+        max_bytes: u32,
         isolation: IsolationLevel,
         topics: &[FetchTopic],
     ) -> Result<Vec<FetchableTopicResponse>> {
@@ -850,14 +859,23 @@ where
             let mut responses = vec![];
             let mut iteration = 0;
             let mut bytes = 0;
-            let mut is_first_non_empty = true;
 
-            while !max_wait.saturating_sub(started_at.elapsed()).is_zero() && bytes <= min_bytes {
+            while !max_wait.saturating_sub(started_at.elapsed()).is_zero() {
                 debug!(?bytes, remaining = ?max_wait.saturating_sub(started_at.elapsed()));
 
                 responses.clear();
 
-                // Every round reads every partition again
+                // Every round reads every partition again from its fetch
+                // offset, and answers with only its own records. So each
+                // round starts with the whole `max_bytes`, and only its own
+                // bytes count toward `min_bytes`. Kafka also counts the bytes
+                // available at each check, not a sum over the checks
+                // ([DelayedFetch.scala]).
+                //
+                // [DelayedFetch.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L74-L148
+                let mut round_max_bytes = max_bytes;
+                let mut is_first_non_empty = true;
+
                 let mut left = topics
                     .iter()
                     .map(|topic| topic.partitions.as_ref().map_or(0, Vec::len))
@@ -870,7 +888,7 @@ where
                             deadlines,
                             &mut left,
                             min_bytes,
-                            max_bytes,
+                            &mut round_max_bytes,
                             isolation,
                             fetch,
                             &mut is_first_non_empty,
@@ -880,13 +898,17 @@ where
                     responses.push(fetch_response);
                 }
 
-                bytes += u32::try_from(responses.byte_size())?;
+                bytes = u32::try_from(responses.byte_size())?;
 
                 let remaining = max_wait.saturating_sub(started_at.elapsed());
 
                 debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
 
-                if bytes > min_bytes {
+                // Kafka answers once the bytes reach `min_bytes`
+                // ([DelayedFetch.scala#L147]).
+                //
+                // [DelayedFetch.scala#L147]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L147
+                if bytes >= min_bytes {
                     break;
                 }
 
@@ -960,26 +982,27 @@ where
     type Error = Error;
 
     #[instrument(skip(self, request))]
-    async fn serve(&self, mut request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
+    async fn serve(&self, request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
         let started_at = Instant::now();
 
-        self.fetch(
-            request.max_wait,
-            request.min_bytes,
-            &mut request.max_bytes,
-            request.isolation_level,
-            &request.topics,
-        )
-        .await
-        .map(|responses| {
-            FetchResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(Some(ErrorCode::None.into()))
-                .session_id(Some(0))
-                .node_endpoints(Some([].into()))
-                .responses(Some(responses))
-        })
-        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+        FetchReadShare::of(&request.extensions)
+            .scope(self.fetch(
+                request.max_wait,
+                request.min_bytes,
+                request.max_bytes,
+                request.isolation_level,
+                &request.topics,
+            ))
+            .await
+            .map(|responses| {
+                FetchResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(Some(ErrorCode::None.into()))
+                    .session_id(Some(0))
+                    .node_endpoints(Some([].into()))
+                    .responses(Some(responses))
+            })
+            .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 }
 
@@ -1082,7 +1105,8 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use nisshi_sans_io::{
-        ConfigResource, ErrorCode, FetchRequest, IsolationLevel, ListOffset, ScramMechanism,
+        ConfigResource, ErrorCode, FetchRequest, IsolationLevel, ListOffset, RequestInput,
+        ScramMechanism,
         create_topics_request::CreatableTopic,
         delete_groups_response::DeletableGroupResult,
         delete_records_request::DeleteRecordsTopic,
@@ -1094,13 +1118,15 @@ mod tests {
         fetch_response::{AbortedTransaction, PartitionData},
         incremental_alter_configs_request::AlterConfigsResource,
         incremental_alter_configs_response::AlterConfigsResourceResponse,
-        list_groups_response::ListedGroup,
         metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         record::{Record, deflated, inflated},
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
-    use rama::{Layer as _, Service as _};
-    use tokio::time::{Duration, Instant, advance};
+    use rama::{Layer as _, Service as _, extensions::Extensions};
+    use tokio::{
+        sync::OwnedSemaphorePermit,
+        time::{Duration, Instant, advance},
+    };
     use url::Url;
     use uuid::Uuid;
 
@@ -1108,10 +1134,11 @@ mod tests {
         Deadlines, FetchService, MIN_BUDGET_MARGIN, Missed, READ_DEADLINE_OVERHEAD, before,
     };
     use crate::{
-        BrokerRegistrationRequest, Error, FetchValidationLayer, GroupDetail, ListOffsetResponse,
-        MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-        Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-        TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+        BrokerRegistrationRequest, CommittedOffset, Error, FetchValidationLayer, GroupDetail,
+        ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+        ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+        TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+        Version, read_share::FetchReadShare,
     };
 
     /// A batch at `base_offset` holding one record per entry in `deltas`,
@@ -1197,7 +1224,7 @@ mod tests {
                 async fn committed_offset_topitions(
                     &self,
                     _group_id: &str,
-                ) -> Result<BTreeMap<Topition, i64>> {
+                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
                     unimplemented!()
                 }
 
@@ -1206,7 +1233,7 @@ mod tests {
                     _group_id: Option<&str>,
                     _topics: &[Topition],
                     _require_stable: Option<bool>,
-                ) -> Result<BTreeMap<Topition, i64>> {
+                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
                     unimplemented!()
                 }
 
@@ -1236,7 +1263,7 @@ mod tests {
                     unimplemented!()
                 }
 
-                async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+                async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
                     unimplemented!()
                 }
 
@@ -1968,6 +1995,11 @@ mod tests {
         /// offset stage read answers [`ErrorCode::UnknownTopicOrPartition`].
         deleted: Arc<Mutex<BTreeSet<i32>>>,
         calls: Arc<Mutex<Vec<Call>>>,
+        /// Whether each offset stage read takes a permit from its read
+        /// share and keeps it in `kept_read_shares`, as an abandoned read
+        /// keeps its permit until its statement ends.
+        keeps_read_share: bool,
+        kept_read_shares: Arc<Mutex<Vec<OwnedSemaphorePermit>>>,
     }
 
     impl Partitions {
@@ -2024,6 +2056,23 @@ mod tests {
                 .filter(|call| call.topic == TOPIC && call.partition == partition)
                 .cloned()
                 .collect()
+        }
+
+        /// Makes each offset stage read take a permit from a read share of
+        /// one permit, and keep it.
+        fn keep_read_share(self) -> Self {
+            Self {
+                keeps_read_share: true,
+                ..self
+            }
+        }
+
+        /// How many permits offset stage reads took from their read share.
+        fn kept_read_shares(&self) -> usize {
+            self.kept_read_shares
+                .lock()
+                .expect("kept read shares")
+                .len()
         }
 
         /// How many times the offset stage of `partition` of [`TOPIC`] was
@@ -2084,6 +2133,13 @@ mod tests {
         }
 
         async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+            if self.keeps_read_share {
+                let permit = FetchReadShare::acquire(1)
+                    .await?
+                    .ok_or_else(|| Error::Message("the read ran outside a read share".into()))?;
+                self.kept_read_shares.lock()?.push(permit);
+            }
+
             let key = (topition.topic().to_owned(), topition.partition());
 
             let read = {
@@ -2198,37 +2254,52 @@ mod tests {
         isolation: IsolationLevel,
         topics: &[(&str, &[i32])],
     ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
+        fetch_on_connection(storage, max_wait, isolation, topics, Extensions::default()).await
+    }
+
+    /// As [`fetch_isolated`], on the connection that `extensions` belongs
+    /// to.
+    async fn fetch_on_connection(
+        storage: Partitions,
+        max_wait: Duration,
+        isolation: IsolationLevel,
+        topics: &[(&str, &[i32])],
+        extensions: Extensions,
+    ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
         let started_at = Instant::now();
+
+        let request = FetchRequest::default()
+            .max_wait_ms(i32::try_from(max_wait.as_millis())?)
+            .isolation_level(Some(isolation.into()))
+            .min_bytes(1)
+            .max_bytes(Some(MAX_BYTES))
+            .topics(Some(
+                topics
+                    .iter()
+                    .map(|(topic, partitions)| {
+                        FetchTopic::default()
+                            .topic(Some((*topic).into()))
+                            .partitions(Some(
+                                partitions
+                                    .iter()
+                                    .map(|partition| {
+                                        FetchPartition::default()
+                                            .partition(*partition)
+                                            .fetch_offset(0)
+                                            .partition_max_bytes(MAX_BYTES)
+                                    })
+                                    .collect(),
+                            ))
+                    })
+                    .collect(),
+            ));
 
         let response = FetchValidationLayer::new()
             .layer(FetchService { storage })
-            .serve(
-                FetchRequest::default()
-                    .max_wait_ms(i32::try_from(max_wait.as_millis())?)
-                    .isolation_level(Some(isolation.into()))
-                    .min_bytes(1)
-                    .max_bytes(Some(MAX_BYTES))
-                    .topics(Some(
-                        topics
-                            .iter()
-                            .map(|(topic, partitions)| {
-                                FetchTopic::default()
-                                    .topic(Some((*topic).into()))
-                                    .partitions(Some(
-                                        partitions
-                                            .iter()
-                                            .map(|partition| {
-                                                FetchPartition::default()
-                                                    .partition(*partition)
-                                                    .fetch_offset(0)
-                                                    .partition_max_bytes(MAX_BYTES)
-                                            })
-                                            .collect(),
-                                    ))
-                            })
-                            .collect(),
-                    )),
-            )
+            .serve(RequestInput {
+                request,
+                extensions,
+            })
             .await?;
 
         let elapsed = started_at.elapsed();
@@ -2242,6 +2313,43 @@ mod tests {
                 .collect(),
             elapsed,
         ))
+    }
+
+    /// A Fetch's reads take their permits from the read share of the
+    /// request's connection. A permit that one request's read keeps then
+    /// holds back the reads of the connection's next request, which answers
+    /// no records and no error by its read deadline, and not those of
+    /// another connection.
+    #[tokio::test(start_paused = true)]
+    async fn requests_on_a_connection_share_its_read_share() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)])]).keep_read_share();
+        let listener = Extensions::default();
+        let connection = listener.fork();
+
+        let fetch = |extensions: Extensions| {
+            fetch_on_connection(
+                storage.clone(),
+                MAX_WAIT,
+                IsolationLevel::ReadUncommitted,
+                &[(TOPIC, &[0])],
+                extensions,
+            )
+        };
+
+        let (topics, _) = fetch(connection.clone()).await?;
+        assert_eq!(1, batches(&topics[0][0]));
+        assert_eq!(1, storage.kept_read_shares());
+
+        let (topics, elapsed) = fetch(connection).await?;
+        assert_eq!(0, batches(&topics[0][0]));
+        assert_eq!(i16::from(ErrorCode::None), topics[0][0].error_code);
+        assert!(elapsed <= READ_DEADLINE, "{elapsed:?}");
+        assert_eq!(1, storage.kept_read_shares());
+
+        _ = fetch(listener.fork()).await?;
+        assert_eq!(2, storage.kept_read_shares());
+
+        Ok(())
     }
 
     fn batches(partition: &PartitionData) -> usize {
@@ -2393,6 +2501,78 @@ mod tests {
         assert_eq!(second_round + (READ_DEADLINE - second_round) / 2, elapsed);
 
         assert_eq!(0, batches(&partitions[0]));
+        assert_eq!(1, batches(&partitions[1]));
+
+        Ok(())
+    }
+
+    /// Every round of the long poll reads the partitions again as the first
+    /// round does: the first partition with the whole `max_bytes`, and the
+    /// others with their `partition_max_bytes`. Only the round's own bytes
+    /// count toward `min_bytes`. Each round reads the same records again, so
+    /// `max_bytes` spent by the rounds before would leave the last round with
+    /// nothing to return, and a sum over the rounds would meet `min_bytes`
+    /// with the same records counted more than once.
+    #[tokio::test(start_paused = true)]
+    async fn every_round_reads_as_the_first() -> Result<()> {
+        const PARTITION_MAX_BYTES: i32 = 1024;
+
+        let record_batch = batch(0, &[0])?;
+        let round_bytes = 2 * u32::try_from(record_batch.record_data.len())?;
+
+        // Each round reads a batch from each partition, then reads nothing
+        // from the next offset. The script holds more rounds than the long
+        // poll can take within `MAX_WAIT`.
+        let script = (0..64)
+            .flat_map(|_| [Read::Batch(record_batch.clone()), Read::Empty])
+            .collect::<Vec<_>>();
+        let storage = Partitions::new([(0, script.clone()), (1, script)]);
+
+        let responses = FetchService {
+            storage: storage.clone(),
+        }
+        .fetch(
+            MAX_WAIT,
+            round_bytes + 1,
+            u32::try_from(MAX_BYTES)?,
+            IsolationLevel::ReadUncommitted,
+            &[FetchTopic::default()
+                .topic(Some(TOPIC.into()))
+                .partitions(Some(
+                    (0..2)
+                        .map(|partition| {
+                            FetchPartition::default()
+                                .partition(partition)
+                                .fetch_offset(0)
+                                .partition_max_bytes(PARTITION_MAX_BYTES)
+                        })
+                        .collect(),
+                ))],
+        )
+        .await?;
+
+        for (partition, round_max_bytes) in [(0, MAX_BYTES), (1, PARTITION_MAX_BYTES)] {
+            let calls = storage.calls(partition);
+            assert!(
+                calls.len() > 4,
+                "the long poll stopped after two rounds: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .step_by(2)
+                    .all(|call| i64::from(call.max_bytes) == i64::from(round_max_bytes)),
+                "a round read partition {partition} with other than {round_max_bytes} bytes: \
+                 {calls:?}"
+            );
+        }
+
+        let partitions = responses
+            .into_iter()
+            .flat_map(|topic| topic.partitions.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(2, partitions.len());
+        assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1, batches(&partitions[1]));
 
         Ok(())

@@ -45,7 +45,9 @@ use governor::{
     DefaultDirectRateLimiter, Jitter, Quota, RateLimiter, clock::QuantaInstant,
     middleware::NoOpMiddleware,
 };
-use nisshi_sans_io::{describe_configs_response::DescribeConfigsResult, record::inflated::Batch};
+use nisshi_sans_io::{
+    describe_configs_response::DescribeConfigsResult, record::inflated::Batch, topic_config,
+};
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
@@ -203,10 +205,14 @@ struct Config(Vec<(String, String)>);
 impl From<DescribeConfigsResult> for Config {
     fn from(config: DescribeConfigsResult) -> Self {
         Self(config.configs.map_or(vec![], |configs| {
-            configs
-                .into_iter()
-                .filter_map(|config| config.value.map(|value| (config.name, value)))
-                .collect::<Vec<(String, String)>>()
+            topic_config::resolve(
+                configs
+                    .iter()
+                    .filter_map(|config| Some((config.name.as_str(), config.value.as_deref()?))),
+            )
+            .into_iter()
+            .map(|(name, value)| (name.into_owned(), value.to_owned()))
+            .collect::<Vec<(String, String)>>()
         }))
     }
 }
@@ -231,14 +237,14 @@ impl Config {
     }
 
     fn partition(&self) -> Vec<String> {
-        self.as_columns("tansu.lake.partition")
+        self.as_columns(topic_config::LAKE_PARTITION)
     }
 
     fn z_order(&self) -> Vec<String> {
-        self.as_columns("tansu.lake.z_order")
+        self.as_columns(topic_config::LAKE_Z_ORDER)
     }
 
-    /// Returns the validated set of `tansu.lake.generate.*` entries: each
+    /// Returns the validated set of `nisshi.lake.generate.*` entries: each
     /// pairs a safe column name (the config key suffix) with its parsed
     /// target type and source column path (the config value).
     ///
@@ -258,7 +264,7 @@ impl Config {
         self.0
             .iter()
             .filter_map(|(name, value)| {
-                name.strip_prefix("tansu.lake.generate.")
+                name.strip_prefix(topic_config::LAKE_GENERATE_PREFIX)
                     .and_then(|suffix| {
                         validate_generated_column_name(suffix)
                             .and_then(|()| parse_generated_expr(value))
@@ -292,7 +298,8 @@ impl Config {
         self.0
             .iter()
             .find_map(|(name, value)| {
-                (name == "tansu.lake.normalize").then(|| value.parse().ok().unwrap_or_default())
+                (name == topic_config::LAKE_NORMALIZE)
+                    .then(|| value.parse().ok().unwrap_or_default())
             })
             .unwrap_or(false)
     }
@@ -300,7 +307,7 @@ impl Config {
     fn normalize_separator(&self) -> &str {
         self.0
             .iter()
-            .find(|(name, _)| name == "tansu.lake.normalize.separator")
+            .find(|(name, _)| name == topic_config::LAKE_NORMALIZE_SEPARATOR)
             .map(|(_, value)| value.as_str())
             .unwrap_or(".")
     }
@@ -414,7 +421,7 @@ impl Delta {
         // Compute generated columns using DataFusion's programmatic
         // expression builder rather than building and executing SQL
         // text: `generated_entries()` has already validated every
-        // "tansu.lake.generate.*" name and value (topic configuration is
+        // "nisshi.lake.generate.*" name and value (topic configuration is
         // untrusted input - see `Config::generated_entries`), and the
         // expressions below are assembled only from those validated
         // atoms (column path segments and a fixed `cast` target type),
@@ -431,7 +438,7 @@ impl Delta {
                 // rather than `col`, which parses its argument as a
                 // qualified SQL name: it would split a field name
                 // containing a literal `.` (e.g. produced by
-                // `tansu.lake.normalize` with the default separator)
+                // `nisshi.lake.normalize` with the default separator)
                 // into a spurious table-qualified reference, and it
                 // lower-cases unquoted names, silently corrupting any
                 // mixed-case field name.
@@ -2638,6 +2645,92 @@ mod tests {
             assert_eq!(pretty_results.trim().lines().collect::<Vec<_>>(), expected);
 
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_aliases {
+    use std::assert_matches;
+
+    use nisshi_sans_io::{
+        ConfigResource, ErrorCode, describe_configs_response::DescribeConfigsResourceResult,
+    };
+
+    use super::*;
+
+    fn config(entries: &[(&str, &str)]) -> Config {
+        Config::from(
+            DescribeConfigsResult::default()
+                .error_code(ErrorCode::None.into())
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name("t".into())
+                .configs(Some(
+                    entries
+                        .iter()
+                        .map(|(name, value)| {
+                            DescribeConfigsResourceResult::default()
+                                .name((*name).into())
+                                .value(Some((*value).into()))
+                        })
+                        .collect(),
+                )),
+        )
+    }
+
+    #[test]
+    fn partition_columns_follow_the_alias_like_the_key() {
+        let from_key = config(&[("nisshi.lake.partition", "a, b")]);
+        let from_alias = config(&[("tansu.lake.partition", "a, b")]);
+
+        assert_eq!(vec!["a", "b"], from_key.partition());
+        assert_eq!(from_key.partition(), from_alias.partition());
+    }
+
+    #[test]
+    fn z_order_columns_follow_the_alias_like_the_key() {
+        let from_key = config(&[("nisshi.lake.z_order", "a, b")]);
+        let from_alias = config(&[("tansu.lake.z_order", "a, b")]);
+
+        assert_eq!(vec!["a", "b"], from_key.z_order());
+        assert_eq!(from_key.z_order(), from_alias.z_order());
+    }
+
+    #[test]
+    fn normalization_follows_the_alias_like_the_key() {
+        for (normalize, separator) in [
+            ("tansu.lake.normalize", "tansu.lake.normalize.separator"),
+            ("nisshi.lake.normalize", "nisshi.lake.normalize.separator"),
+        ] {
+            let config = config(&[(normalize, "true"), (separator, "_")]);
+
+            assert!(config.is_normalized(), "{normalize}");
+            assert_eq!("_", config.normalize_separator(), "{separator}");
+        }
+    }
+
+    #[test]
+    fn generated_columns_follow_the_alias_like_the_key() {
+        for prefix in ["tansu.lake.generate.", "nisshi.lake.generate."] {
+            let config = config(&[(&format!("{prefix}day"), "CAST(meta.day AS DATE)")]);
+
+            assert_matches!(config.generated_entries().as_slice(), [(name, _)] if name == "day");
+        }
+    }
+
+    #[test]
+    fn key_wins_over_alias_in_either_order() {
+        for entries in [
+            [
+                ("tansu.lake.normalize", "false"),
+                ("nisshi.lake.normalize", "true"),
+            ],
+            [
+                ("nisshi.lake.normalize", "true"),
+                ("tansu.lake.normalize", "false"),
+            ],
+        ] {
+            assert!(config(&entries).is_normalized());
         }
     }
 }

@@ -15,12 +15,11 @@
 //! Tests that `kafka-reassign-partitions --list` does not list a new topic's partition as being
 //! reassigned. Nisshi has one broker, so it never moves a partition, and an operator who sees a
 //! reassignment in progress waits for one that never ends. The broker must answer
-//! `ListPartitionReassignments` without the topic's partition.
+//! `ListPartitionReassignments` with no reassignment in progress.
 
-use nisshi_smoke_test::KafkaCli;
+use nisshi_smoke_test::{KafkaCli, NO_REASSIGNMENTS};
 
 #[test]
-#[ignore = "ListPartitionReassignments answers every partition as being reassigned (#965)"]
 fn list_does_not_report_a_new_partition_as_reassigned() {
     let cli = KafkaCli::shared();
     let topic = cli.topics().create_unique(1, &[]);
@@ -30,5 +29,9 @@ fn list_does_not_report_a_new_partition_as_reassigned() {
     assert!(
         !listed.succeeded().mentions(&format!("{topic}-0")),
         "the broker lists a partition as being reassigned: {listed}"
+    );
+    assert!(
+        listed.mentions(NO_REASSIGNMENTS),
+        "the broker reports a reassignment in progress: {listed}"
     );
 }

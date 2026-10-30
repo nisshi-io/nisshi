@@ -21,6 +21,7 @@ use std::{
     hash::Hash,
     io,
     marker::PhantomData,
+    ops::RangeInclusive,
     pin::Pin,
     str::FromStr,
     sync::{Arc, LazyLock},
@@ -36,9 +37,10 @@ use deadpool_postgres::{
     Transaction,
 };
 use futures::pin_mut;
+use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -54,7 +56,6 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated::Batch},
     to_system_time, to_timestamp,
@@ -65,12 +66,15 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, deadline, delete_records_cutoff,
-    epoch_is_exhausted, inflate, producer_claim,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
+    ScramCredential, Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    config::{self, apply_op},
+    deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
+    parse_storage_option, producer_claim,
+    read_share::{FetchReadShare, ListOffsetsReadShare},
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -82,7 +86,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
     runtime::Handle,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{AcquireError, OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout, timeout_at},
 };
 use tokio_postgres::{
@@ -97,12 +101,17 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(unix)]
 use tokio_util::either::Either;
 use tracing::{Instrument as _, debug, error, info, instrument, warn};
-use url::Url;
+use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{
     schema::{RecordedSchema, should_create_schema},
-    sql::{default_hash, idempotent_sequence_check},
+    sql::{
+        consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        topic_configuration_select, topic_configuration_select_keys, topic_select,
+        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
+    },
 };
 
 pub mod factory;
@@ -116,10 +125,17 @@ pub struct Postgres {
     pool: Pool,
     cancel: Option<CancelRequests>,
     /// Permits for the ListOffsets partition reads in flight, see
-    /// [`LIST_OFFSETS_READS`].
+    /// [`ReadLimits::list_offsets`].
     list_offsets_reads: Arc<Semaphore>,
-    /// Permits for the Fetch partition reads in flight, see [`FETCH_READS`].
+    /// Permits for the Fetch partition reads in flight, see
+    /// [`ReadLimits::fetch`].
     fetch_reads: Arc<Semaphore>,
+    /// How many of `list_offsets_reads` one connection may hold, see
+    /// [`ReadLimits::list_offsets_per_connection`].
+    list_offsets_reads_per_connection: usize,
+    /// How many of `fetch_reads` one connection may hold, see
+    /// [`ReadLimits::fetch_per_connection`].
+    fetch_reads_per_connection: usize,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
@@ -134,6 +150,7 @@ pub struct Builder<C, N, L, P> {
     node: N,
     advertised_listener: L,
     pool: P,
+    read_limits: ReadLimits,
     cancel: Option<CancelRequests>,
     abandoned_statement_bound: Duration,
     schemas: Option<Registry>,
@@ -147,6 +164,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
@@ -160,6 +178,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node,
             advertised_listener: self.advertised_listener,
             pool: self.pool,
+            read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
@@ -173,6 +192,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             node: self.node,
             advertised_listener,
             pool: self.pool,
+            read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
@@ -197,8 +217,10 @@ impl Builder<String, i32, Url, Pool> {
             advertised_listener: self.advertised_listener,
             pool: self.pool,
             cancel: self.cancel,
-            list_offsets_reads: Arc::new(Semaphore::new(LIST_OFFSETS_READS)),
-            fetch_reads: Arc::new(Semaphore::new(FETCH_READS)),
+            list_offsets_reads: Arc::new(Semaphore::new(self.read_limits.list_offsets)),
+            fetch_reads: Arc::new(Semaphore::new(self.read_limits.fetch)),
+            list_offsets_reads_per_connection: self.read_limits.list_offsets_per_connection(),
+            fetch_reads_per_connection: self.read_limits.fetch_per_connection(),
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -206,41 +228,125 @@ impl Builder<String, i32, Url, Pool> {
     }
 }
 
-/// How many connections the pool opens at most.
-const POOL_MAX_SIZE: usize = 16;
+/// How many connections the pool opens at most when the storage URL does not
+/// set [`POOL_MAX_SIZE`].
+const DEFAULT_POOL_MAX_SIZE: usize = 16;
 
-/// How many ListOffsets partition reads this engine has in flight at once,
-/// across every request, counting an abandoned read until its statement
-/// has ended, its connection has failed, or the bound on it has passed,
-/// see [`cancel_and_return`].
-///
-/// Each read holds a pooled connection, so ListOffsets reads alone take at
-/// most half the pool. Together with [`FETCH_READS`], they can take all of
-/// it, see [`FETCH_READS`]. A read past this limit waits for a permit, and
-/// [`ListOffsetsService`]'s deadline drops it if the wait lasts too long.
-///
-/// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
-const LIST_OFFSETS_READS: usize = POOL_MAX_SIZE / 2;
+/// The storage URL option that sets how many connections the pool opens at
+/// most.
+const POOL_MAX_SIZE: &str = "pool_max_size";
 
-/// How many Fetch partition reads, of records or of an offset stage, this
-/// engine has in flight at once, across every request, counting an
-/// abandoned read until its statement has ended, its connection has failed,
-/// or the bound on it has passed, see [`cancel_and_return`].
-///
-/// Each read holds a pooled connection, so Fetch reads alone take at most
-/// half the pool. Fetch reads have their own limit instead of sharing
-/// [`LIST_OFFSETS_READS`], so slow fetches cannot hold up the ListOffsets
-/// reads that a consumer needs to start or reset. The two limits together
-/// equal the pool, so when slow reads use up both, other requests wait for
-/// a connection. A smaller limit would slow down healthy consumers, because
-/// a fetch read holds its connection for its whole storage budget. A read
-/// past this limit waits for a permit, and [`FetchService`]'s deadline drops
-/// it if the wait lasts too long.
-///
-/// [`FetchService`]: nisshi_storage::FetchService
-const FETCH_READS: usize = POOL_MAX_SIZE / 2;
+/// The range of [`POOL_MAX_SIZE`]. Below 2, [`ReadLimits::for_pool`] gives a
+/// limit of 0, and no read of that kind ever runs. 262143 is PostgreSQL's
+/// `MAX_BACKENDS`, the most connections that a server accepts. The pool and
+/// the read limits each make a [`Semaphore`] of this size, and
+/// [`Semaphore::new`] panics above [`Semaphore::MAX_PERMITS`], which is much
+/// larger.
+const POOL_MAX_SIZE_RANGE: RangeInclusive<usize> = 2..=262_143;
 
-const _: () = assert!(LIST_OFFSETS_READS + FETCH_READS <= POOL_MAX_SIZE);
+/// The values that [`POOL_MAX_SIZE`] takes, as an error message gives them.
+const POOL_MAX_SIZE_EXPECTED: &str = "a whole number from 2 to 262143";
+
+/// How many partition reads of each kind this engine has in flight at once,
+/// across every request, counting an abandoned read until its statement has
+/// ended, its connection has failed, or the bound on it has passed, see
+/// [`cancel_and_return`].
+#[derive(Clone, Copy, Debug)]
+struct ReadLimits {
+    /// How many ListOffsets partition reads are in flight at once.
+    ///
+    /// Each read holds a pooled connection, so ListOffsets reads alone take
+    /// at most half the pool. Together with the Fetch reads, they can take
+    /// all of it, see [`ReadLimits::fetch`]. A read past this limit waits for
+    /// a permit, and [`ListOffsetsService`]'s deadline drops it if the wait
+    /// lasts too long. One connection holds at most
+    /// [`ReadLimits::list_offsets_per_connection`] of these permits.
+    ///
+    /// [`ListOffsetsService`]: nisshi_storage::ListOffsetsService
+    list_offsets: usize,
+
+    /// How many Fetch partition reads, of records or of an offset stage, are
+    /// in flight at once.
+    ///
+    /// Each read holds a pooled connection, so Fetch reads alone take at most
+    /// half the pool. Fetch reads have their own limit instead of sharing
+    /// [`ReadLimits::list_offsets`], so slow fetches cannot hold up the
+    /// ListOffsets reads that a consumer needs to start or reset. The two
+    /// limits together equal the pool, so when slow reads use up both, other
+    /// requests wait for a connection. A smaller limit would slow down
+    /// healthy consumers, because a fetch read holds its connection for its
+    /// whole storage budget. A read past this limit waits for a permit, and
+    /// [`FetchService`]'s deadline drops it if the wait lasts too long. One
+    /// connection holds at most [`ReadLimits::fetch_per_connection`] of these
+    /// permits.
+    ///
+    /// [`FetchService`]: nisshi_storage::FetchService
+    fetch: usize,
+}
+
+impl ReadLimits {
+    /// Returns the read limits for a pool of `max_size` connections: half
+    /// the pool for each kind of read.
+    fn for_pool(max_size: usize) -> Self {
+        let limits = Self {
+            list_offsets: max_size / 2,
+            fetch: max_size / 2,
+        };
+        debug_assert!(limits.list_offsets + limits.fetch <= max_size);
+        limits
+    }
+
+    /// Returns how many of the [`ReadLimits::list_offsets`] permits one client
+    /// connection holds at once: [`LIST_OFFSETS_READS_PER_CONNECTION`], or the
+    /// whole limit when the pool is too small for that.
+    fn list_offsets_per_connection(self) -> usize {
+        LIST_OFFSETS_READS_PER_CONNECTION.min(self.list_offsets)
+    }
+
+    /// Returns how many of the [`ReadLimits::fetch`] permits one client
+    /// connection holds at once: [`FETCH_READS_PER_CONNECTION`], or the whole
+    /// limit when the pool is too small for that.
+    fn fetch_per_connection(self) -> usize {
+        FETCH_READS_PER_CONNECTION.min(self.fetch)
+    }
+}
+
+impl Default for ReadLimits {
+    fn default() -> Self {
+        Self::for_pool(DEFAULT_POOL_MAX_SIZE)
+    }
+}
+
+/// How many ListOffsets reads one client connection holds at once when the
+/// pool allows it, see [`read_share`](nisshi_storage::read_share) and
+/// [`ReadLimits::list_offsets_per_connection`].
+///
+/// The share equals [`LIST_OFFSETS_CONCURRENCY`], the number of partitions
+/// that one ListOffsets request reads at once, so a single request is not
+/// slowed. A client retries a `REQUEST_TIMED_OUT` partition at once, and the
+/// retry's reads wait for the share while the abandoned reads of the request
+/// before it still run, so one connection cannot take the whole limit. The
+/// share follows the request, not the pool, so a larger pool does not let
+/// one connection hold more.
+const LIST_OFFSETS_READS_PER_CONNECTION: usize = LIST_OFFSETS_CONCURRENCY;
+
+/// How many Fetch reads, of records or of an offset stage, one client
+/// connection holds at once when the pool allows it, see
+/// [`read_share`](nisshi_storage::read_share) and
+/// [`ReadLimits::fetch_per_connection`].
+///
+/// A Fetch gives each partition half of the time left, so one wide Fetch
+/// can abandon several partitions in a row, and each abandoned read holds
+/// its permit until its statement ends. Without a share, one connection
+/// could hold most of the limit that way, and every other consumer's reads
+/// would wait and come back empty.
+///
+/// A Fetch reads its partitions one after another, so a connection holds
+/// one live read at a time. The second permit lets that read run while one
+/// abandoned read of the connection still holds its permit. The share
+/// follows how a Fetch reads, not the pool, so a larger pool does not let
+/// one connection hold more.
+const FETCH_READS_PER_CONNECTION: usize = 2;
 
 /// How much longer than its connection's `statement_timeout` an abandoned
 /// statement is waited for before its connection is closed, see
@@ -278,6 +384,23 @@ const SCHEMA_LOCK: i64 = i64::from_be_bytes(*b"\0\0nisshi");
 /// sweeps (`policy_compact`, `policy_delete`) explicitly opt out via `SET LOCAL` since their
 /// full-table scans can legitimately run longer than a request-path query should.
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
+/// Settings that leave an ordered scan of the `record` primary key as the only plan for a
+/// fetch. The fetch queries read at most 10000 rows because the limit stops that scan. When
+/// the planner estimates that the offset range holds few rows, it instead reads the whole range
+/// with a bitmap scan and sorts it before the limit applies. `record` grows by tens of
+/// megabytes a second and is analyzed after the fact, so the estimate is often wrong, and one
+/// fetch then reads and sorts every record between its offset and the high watermark. A prepared
+/// statement keeps such a plan after it is built, so the plan can outlive the stale statistics
+/// that produced it.
+const FETCH_PLAN_SETTINGS: &str =
+    "SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = off";
+
+/// The most rows that one fetch reads from `record`, bound as the limit of the fetch queries. The
+/// fetch service reads again from the last offset it received, so a limit that ends a read early
+/// costs one more query. Without it, one fetch costs as much as the whole backlog between the fetch
+/// offset and the high watermark.
+const ROWS_PER_FETCH: i64 = 10_000;
 
 /// How long a caller waits for a free pooled connection before failing fast with a retriable
 /// error, rather than queuing indefinitely while the pool is exhausted.
@@ -353,6 +476,58 @@ fn statement_timeout_value(value: &str) -> Option<Duration> {
     Duration::try_from_secs_f64(seconds).ok()
 }
 
+/// Removes every [`POOL_MAX_SIZE`] option from `config`, a connection URL,
+/// and returns the pool size that the last one sets, or
+/// [`DEFAULT_POOL_MAX_SIZE`] when the URL sets none.
+///
+/// Returns [`Error::InvalidStorageOptionValue`] when any of them is not a
+/// number in [`POOL_MAX_SIZE_RANGE`], as [`parse_storage_option`] does for
+/// every storage option.
+fn take_pool_max_size(config: &mut String) -> Result<usize> {
+    // A key/value connection string, such as `host=db user=nisshi`, is not a
+    // URL, and sets no storage URL options.
+    let Ok(storage) = Url::parse(config) else {
+        return Ok(DEFAULT_POOL_MAX_SIZE);
+    };
+
+    let Some(pool_max_size) =
+        parse_storage_option(&storage, POOL_MAX_SIZE, POOL_MAX_SIZE_EXPECTED, |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
+        })?
+    else {
+        return Ok(DEFAULT_POOL_MAX_SIZE);
+    };
+
+    // tokio-postgres rejects an option that it does not read, so this option
+    // must go before it parses the URL.
+    let Some((base, query)) = config.split_once('?') else {
+        return Ok(pool_max_size);
+    };
+
+    // The retained options keep their bytes, instead of going through
+    // `Url::query_pairs_mut`, because that writes a space as `+`, and
+    // tokio-postgres reads a `+` as itself.
+    let retained = query
+        .split('&')
+        .filter(|option| {
+            form_urlencoded::parse(option.as_bytes())
+                .next()
+                .is_none_or(|(key, _)| key != POOL_MAX_SIZE)
+        })
+        .collect::<Vec<_>>();
+
+    *config = if retained.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", retained.join("&"))
+    };
+
+    Ok(pool_max_size)
+}
+
 impl<C, N> FromStr for Builder<C, N, Url, Pool>
 where
     C: Default,
@@ -361,7 +536,16 @@ where
     type Err = Error;
 
     fn from_str(config: &str) -> Result<Self, Self::Err> {
-        let mut pg_config = Config::from_str(config).inspect(|pg_config| debug!(?pg_config))?;
+        let mut config = config.to_owned();
+        let pool_max_size = take_pool_max_size(&mut config)?;
+        let read_limits = ReadLimits::for_pool(pool_max_size);
+        info!(
+            pool_max_size,
+            list_offsets_reads = read_limits.list_offsets,
+            fetch_reads = read_limits.fetch
+        );
+
+        let mut pg_config = Config::from_str(&config).inspect(|pg_config| debug!(?pg_config))?;
 
         let options =
             merge_statement_timeout_option(pg_config.get_options(), DEFAULT_STATEMENT_TIMEOUT_MS);
@@ -400,13 +584,14 @@ where
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
 
         Pool::builder(mgr)
-            .max_size(POOL_MAX_SIZE)
+            .max_size(pool_max_size)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
             .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
             .build()
             .map(|pool| Self {
                 pool,
+                read_limits,
                 cancel,
                 abandoned_statement_bound,
                 advertised_listener,
@@ -781,6 +966,44 @@ where
 /// read that left no block open.
 const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp()";
 
+/// The permits that a read holds while it is in flight: one from its
+/// connection's share, see [`read_share`](nisshi_storage::read_share), and
+/// one from the engine's limit on reads in flight ([`ReadLimits::list_offsets`]
+/// or [`ReadLimits::fetch`]).
+///
+/// An abandoned read keeps both until its statement ends, see
+/// [`cancel_and_return`].
+#[derive(Debug)]
+// Nothing reads the permits: holding them is the point, and dropping
+// `ReadPermits` returns them.
+#[allow(dead_code)]
+struct ReadPermits {
+    /// `None` for a read that runs outside a connection's read share.
+    connection_share: Option<OwnedSemaphorePermit>,
+    limit: OwnedSemaphorePermit,
+}
+
+impl ReadPermits {
+    /// Waits for `connection_share`, a permit from the connection's share,
+    /// and then for a permit from `limit`.
+    ///
+    /// The share comes first, so a connection never waits on `limit` for
+    /// more reads than its share. `limit` is a FIFO queue, and those reads
+    /// would hold places in it ahead of other connections' reads.
+    async fn acquire(
+        connection_share: impl Future<Output = Result<Option<OwnedSemaphorePermit>, AcquireError>>,
+        limit: &Arc<Semaphore>,
+    ) -> Result<Self> {
+        let connection_share = connection_share.await?;
+        let limit = deadline::queued(limit.clone().acquire_owned()).await?;
+
+        Ok(Self {
+            connection_share,
+            limit,
+        })
+    }
+}
+
 /// Waits for the statement on `connection` to end, then returns whether the
 /// connection is outside any transaction block, see [`SETTLE_QUERY`].
 async fn settled_outside_a_transaction(connection: &Object) -> Result<bool, tokio_postgres::Error> {
@@ -793,16 +1016,18 @@ async fn settled_outside_a_transaction(connection: &Object) -> Result<bool, toki
 
 /// Cancels the statement running on an abandoned `connection`, and returns
 /// the connection to its pool once that statement has ended, so the pool
-/// stays within its [`POOL_MAX_SIZE`] server connections.
+/// opens no more server connections than its maximum size.
 ///
-/// The connection and `permit` are held until the statement has ended,
+/// The connection and `permits` are held until the statement has ended,
 /// whether or not the cancel request reached the server, so the statement
-/// counts against the limit that `permit` comes from ([`LIST_OFFSETS_READS`]
-/// or [`FETCH_READS`]) meanwhile. A cancel request that misses its
-/// statement (a host other than the one running the statement, or a proxy
-/// that does not forward it) then shows as reads that wait for a permit,
-/// under the `queued` stage, rather than as server connections beyond the
-/// pool.
+/// counts against the limit that `permits` come from
+/// ([`ReadLimits::list_offsets`] or [`ReadLimits::fetch`]), and against its
+/// connection's share of that limit, meanwhile. The share keeps a connection
+/// whose reads are abandoned in a row from holding the whole limit. A cancel
+/// request that misses its statement (a host other than the one running the
+/// statement, or a proxy that does not forward it) then shows as reads that
+/// wait for a permit, under the `queued` stage, rather than as server
+/// connections beyond the pool.
 ///
 /// The connection goes back to the pool only when [`SETTLE_QUERY`] shows it
 /// outside any transaction block. The connection is closed and taken out of
@@ -820,9 +1045,9 @@ async fn cancel_and_return(
     connection: Object,
     cancel: Option<CancelRequests>,
     bound: Duration,
-    permit: OwnedSemaphorePermit,
+    permits: ReadPermits,
 ) {
-    let _permit = permit;
+    let _permits = permits;
     let settle_by = Instant::now() + bound;
 
     let host = match cancel {
@@ -910,6 +1135,21 @@ impl TryFrom<Row> for Txn {
             status,
         })
     }
+}
+
+/// Returns the `DescribeConfigs` entry for a config that a topic sets: a dynamic topic config of
+/// type `STRING`. A null stored value is described as an empty string.
+fn dynamic_topic_config(name: String, value: Option<String>) -> DescribeConfigsResourceResult {
+    DescribeConfigsResourceResult::default()
+        .name(name)
+        .value(Some(value.unwrap_or_default()))
+        .read_only(false)
+        .is_default(None)
+        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
+        .is_sensitive(false)
+        .synonyms(Some([].into()))
+        .config_type(Some(ConfigType::String.into()))
+        .documentation(Some("".into()))
 }
 
 impl Postgres {
@@ -1017,16 +1257,15 @@ impl Postgres {
     }
 
     /// Checks out a connection for a read that a caller may drop
-    /// mid-statement, holding `permit` from the read's limit on reads in
-    /// flight.
+    /// mid-statement, holding the read's `permits`.
     ///
     /// Dropping the guard before [`Abandonable::release`] asks the server to
     /// cancel the statement, so it stops instead of running until
-    /// `statement_timeout`, and keeps the connection and the permit until
+    /// `statement_timeout`, and keeps the connection and the permits until
     /// the statement has ended, see [`cancel_and_return`].
     async fn abandonable_connection(
         &self,
-        permit: OwnedSemaphorePermit,
+        permits: ReadPermits,
     ) -> Result<Abandonable<Manager, impl FnOnce(Object) + use<>>> {
         let cancel = self.cancel.clone();
         let bound = self.abandoned_statement_bound;
@@ -1038,7 +1277,7 @@ impl Postgres {
                     // name the peer, the correlation id and the partition.
                     Ok(runtime) => {
                         _ = runtime.spawn(
-                            cancel_and_return(connection, cancel, bound, permit).in_current_span(),
+                            cancel_and_return(connection, cancel, bound, permits).in_current_span(),
                         );
                     }
 
@@ -1049,6 +1288,26 @@ impl Postgres {
                 }
             })
         })
+    }
+
+    /// Waits for the permits of a Fetch read, of records or of an offset
+    /// stage, see [`ReadLimits::fetch`].
+    async fn fetch_read_permits(&self) -> Result<ReadPermits> {
+        ReadPermits::acquire(
+            FetchReadShare::acquire(self.fetch_reads_per_connection),
+            &self.fetch_reads,
+        )
+        .await
+    }
+
+    /// Waits for the permits of a ListOffsets read, see
+    /// [`ReadLimits::list_offsets`].
+    async fn list_offsets_read_permits(&self) -> Result<ReadPermits> {
+        ReadPermits::acquire(
+            ListOffsetsReadShare::acquire(self.list_offsets_reads_per_connection),
+            &self.list_offsets_reads,
+        )
+        .await
     }
 
     /// Reads the records of `topition` from `offset` on `c`, in one
@@ -1090,6 +1349,10 @@ impl Postgres {
 
         let tx = c.transaction().await?;
 
+        tx.batch_execute(FETCH_PLAN_SETTINGS)
+            .await
+            .inspect_err(|err| error!(?err))?;
+
         let records = if let Some(key) = key_filter {
             self.tx_prepare_query(
                 &tx,
@@ -1102,6 +1365,7 @@ impl Postgres {
                     &(max_bytes as i64),
                     &high_watermark,
                     &key,
+                    &ROWS_PER_FETCH,
                 ],
             )
             .await
@@ -1117,6 +1381,7 @@ impl Postgres {
                     &offset,
                     &(max_bytes as i64),
                     &high_watermark,
+                    &ROWS_PER_FETCH,
                 ],
             )
             .await
@@ -1159,6 +1424,30 @@ impl Postgres {
                         .inspect_err(|err| error!(?err))?,
                 );
 
+            // One query for the headers of the returned records. A query per record costs a
+            // round trip each, which capped a consumer at a few thousand records a second.
+            // The topic is the base topic: a keyed fetch has a name that is not a topic.
+            let mut headers: BTreeMap<i64, Vec<Row>> = BTreeMap::new();
+            let offsets = records
+                .iter()
+                .map(|record| record.try_get::<_, i64>(0))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            for header in self
+                .tx_prepare_query(
+                    &tx,
+                    "header_fetch_range.sql",
+                    &[&self.cluster, &base_topic, &topition.partition(), &offsets],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                headers
+                    .entry(header.try_get::<_, i64>(0)?)
+                    .or_default()
+                    .push(header);
+            }
+
             for record in records.iter() {
                 let attributes = record
                     .try_get::<_, Option<i16>>(1)
@@ -1174,11 +1463,29 @@ impl Postgres {
                     .map(|producer_epoch| producer_epoch.unwrap_or(-1))
                     .inspect_err(|err| error!(?err))?;
 
+                let timestamp = record
+                    .try_get::<_, SystemTime>(2)
+                    .map_err(Error::from)
+                    .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?;
+
+                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
+                // produce request, so one batch cannot hold two such times.
                 if batch_builder.attributes != attributes
                     || batch_builder.producer_id != producer_id
                     || batch_builder.producer_epoch != producer_epoch
+                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
+                        && timestamp != batch_builder.base_timestamp)
                 {
-                    batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+                    batches.push(
+                        batch_builder
+                            .max_timestamp_of_records()
+                            .build()
+                            .and_then(TryInto::try_into)?,
+                    );
 
                     batch_builder = Batch::builder()
                         .base_offset(
@@ -1187,15 +1494,7 @@ impl Postgres {
                                 .inspect(|base_offset| debug!(base_offset))
                                 .inspect_err(|err| error!(?err))?,
                         )
-                        .base_timestamp(
-                            record
-                                .try_get::<_, SystemTime>(2)
-                                .map_err(Error::from)
-                                .and_then(|system_time| {
-                                    to_timestamp(&system_time).map_err(Into::into)
-                                })
-                                .inspect_err(|err| error!(?err))?,
-                        )
+                        .base_timestamp(timestamp)
                         .attributes(attributes)
                         .producer_id(producer_id)
                         .producer_epoch(producer_epoch);
@@ -1208,16 +1507,7 @@ impl Postgres {
 
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
-                let timestamp_delta = record
-                    .try_get::<_, SystemTime>(2)
-                    .map_err(Error::from)
-                    .and_then(|system_time| {
-                        to_timestamp(&system_time)
-                            .map(|timestamp| timestamp - batch_builder.base_timestamp)
-                            .map_err(Into::into)
-                    })
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
+                let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
                 let k = record
                     .try_get::<_, Option<&[u8]>>(3)
@@ -1237,32 +1527,18 @@ impl Postgres {
                     .key(k)
                     .value(v);
 
-                for header in self
-                    .tx_prepare_query(
-                        &tx,
-                        "header_fetch.sql",
-                        &[
-                            &self.cluster,
-                            &topition.topic(),
-                            &topition.partition(),
-                            &offset,
-                        ],
-                    )
-                    .await
-                    .inspect(|row| debug!(?row))
-                    .inspect_err(|err| error!(?err))?
-                {
+                for header in headers.remove(&offset).unwrap_or_default() {
                     let mut header_builder = Header::builder();
 
                     if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(0)
+                        .try_get::<_, Option<&[u8]>>(1)
                         .inspect_err(|err| error!(?err))?
                     {
                         header_builder = header_builder.key(Bytes::copy_from_slice(k));
                     }
 
                     if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(1)
+                        .try_get::<_, Option<&[u8]>>(2)
                         .inspect_err(|err| error!(?err))?
                     {
                         header_builder = header_builder.value(Bytes::copy_from_slice(v));
@@ -1280,7 +1556,12 @@ impl Postgres {
                 }
             }
 
-            batches.push(batch_builder.build().and_then(TryInto::try_into)?);
+            batches.push(
+                batch_builder
+                    .max_timestamp_of_records()
+                    .build()
+                    .and_then(TryInto::try_into)?,
+            );
         } else {
             batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
         }
@@ -1579,15 +1860,44 @@ impl Postgres {
         if let Some(row) = self
             .tx_prepare_query_opt(
                 tx,
-                "producer_epoch_current_for_producer.sql",
-                &[&self.cluster, &deflated.producer_id],
+                producer_epochs_select::QUERY,
+                &[
+                    &self.cluster,
+                    &deflated.producer_id,
+                    &topition.topic(),
+                    &topition.partition(),
+                ],
             )
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let current_epoch = row
-                .try_get::<_, i16>(0)
-                .inspect_err(|err| error!(self.cluster, deflated.producer_id, ?err))?;
+            let stored = StoredEpochs {
+                transactional: row
+                    .try_get::<_, i32>(producer_epochs_select::TRANSACTIONAL)
+                    .inspect_err(|err| error!(?err))?
+                    != 0,
+                newest: row
+                    .try_get(producer_epochs_select::NEWEST_EPOCH)
+                    .inspect_err(|err| error!(?err))?,
+                partition: row
+                    .try_get(producer_epochs_select::PARTITION_EPOCH)
+                    .inspect_err(|err| error!(?err))?,
+            };
+
+            if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
+                _ = self
+                    .tx_prepare_execute(
+                        tx,
+                        "producer_epoch_insert_given.sql",
+                        &[
+                            &self.cluster,
+                            &deflated.producer_id,
+                            &deflated.producer_epoch,
+                        ],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+            }
 
             let row = self
                 .tx_prepare_query_one(
@@ -1619,11 +1929,11 @@ impl Postgres {
                 ?topition,
                 deflated.producer_id,
                 deflated.producer_epoch,
-                current_epoch,
+                ?stored,
                 sequence,
             );
 
-            let increment = idempotent_sequence_check(&current_epoch, &sequence, deflated)?;
+            let increment = idempotent_sequence_check(sequence, deflated)?;
 
             debug!(increment);
 
@@ -1650,29 +1960,37 @@ impl Postgres {
         }
     }
 
-    async fn watermark_select_for_update(
+    /// Locks the partition's watermark row until `tx` ends. Returns the partition's low and high
+    /// watermarks and its topic's stored `max.message.bytes`. Fails with
+    /// `UNKNOWN_TOPIC_OR_PARTITION` when the partition does not exist.
+    async fn watermark_select_for_write(
         &self,
         topition: &Topition,
         tx: &Transaction<'_>,
-    ) -> Result<(Option<i64>, Option<i64>)> {
-        if let Some(row) = self
+    ) -> Result<watermark_select_for_write::Row> {
+        let Some(row) = self
             .tx_prepare_query_opt(
                 tx,
-                "watermark_select_for_update.sql",
+                watermark_select_for_write::QUERY,
                 &[&self.cluster, &topition.topic(), &topition.partition()],
             )
             .await
             .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        {
-            Ok((
-                row.try_get::<_, Option<i64>>(0)
-                    .inspect_err(|err| error!(?err))?,
-                row.try_get::<_, Option<i64>>(1)
-                    .inspect_err(|err| error!(?err))?,
-            ))
-        } else {
-            Err(Error::Api(ErrorCode::UnknownTopicOrPartition))
-        }
+        else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        Ok(watermark_select_for_write::Row {
+            low: row
+                .try_get(watermark_select_for_write::LOW)
+                .inspect_err(|err| error!(?err))?,
+            high: row
+                .try_get(watermark_select_for_write::HIGH)
+                .inspect_err(|err| error!(?err))?,
+            max_message_bytes: row
+                .try_get(watermark_select_for_write::MAX_MESSAGE_BYTES)
+                .inspect_err(|err| error!(?err))?,
+        })
     }
 
     /// Advances one partition's log start for DeleteRecords, answering the
@@ -1691,7 +2009,8 @@ impl Postgres {
     ) -> Result<(ErrorCode, i64)> {
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
-        let (low, high) = self.watermark_select_for_update(topition, &tx).await?;
+        let watermark_select_for_write::Row { low, high, .. } =
+            self.watermark_select_for_write(topition, &tx).await?;
 
         let stage = OffsetStage {
             last_stable: high.unwrap_or_default(),
@@ -1829,6 +2148,88 @@ impl Postgres {
                 SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
             })
             .map_err(Into::into)
+    }
+
+    /// Returns the configs among `keys` that the topic `name` sets, or `None` when the topic does
+    /// not exist.
+    async fn topic_configs_by_key(
+        &self,
+        c: &Object,
+        name: &str,
+        keys: &[String],
+    ) -> Result<Option<Vec<DescribeConfigsResourceResult>>> {
+        // This function runs one query instead of the two that `all_topic_configs` runs, because
+        // the broker reads `message.timestamp.type` through here for each topic of each produce
+        // request.
+        let rows = self
+            .prepare_query(
+                c,
+                topic_configuration_select_keys::QUERY,
+                &[&self.cluster.as_str(), &name, &keys],
+            )
+            .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let mut configs = vec![];
+
+        for row in rows {
+            // The query returns a row with a null name for a topic that sets none of `keys`, and
+            // that row is not a config.
+            let Some(name) = row
+                .try_get::<_, Option<String>>(topic_configuration_select_keys::NAME)
+                .inspect_err(|err| error!(?err))?
+            else {
+                continue;
+            };
+            let value = row
+                .try_get::<_, Option<String>>(topic_configuration_select_keys::VALUE)
+                .inspect_err(|err| error!(?err))?;
+
+            configs.push(dynamic_topic_config(name, value));
+        }
+
+        Ok(Some(configs))
+    }
+
+    /// Returns every config that the topic `name` sets, or `None` when the topic does not exist.
+    async fn all_topic_configs(
+        &self,
+        c: &Object,
+        name: &str,
+    ) -> Result<Option<Vec<DescribeConfigsResourceResult>>> {
+        if self
+            .prepare_query(c, topic_select::QUERY, &[&self.cluster.as_str(), &name])
+            .await?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let rows = self
+            .prepare_query(
+                c,
+                topic_configuration_select::QUERY,
+                &[&self.cluster.as_str(), &name],
+            )
+            .await?;
+
+        let mut configs = vec![];
+
+        for row in rows {
+            let name = row
+                .try_get::<_, String>(topic_configuration_select::NAME)
+                .inspect_err(|err| error!(?err))?;
+            let value = row
+                .try_get::<_, Option<String>>(topic_configuration_select::VALUE)
+                .inspect_err(|err| error!(?err))?;
+
+            configs.push(dynamic_topic_config(name, value));
+        }
+
+        Ok(Some(configs))
     }
 
     #[instrument(skip(self, c, params))]
@@ -2130,6 +2531,44 @@ impl Postgres {
             .map_err(Into::into)
     }
 
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction (see [`txn_produce_partition_check`]). EndTxn deletes a transaction's
+    /// `txn_topition` rows, so a row is present only while the transaction is ongoing.
+    async fn txn_produce_partition_check(
+        &self,
+        transaction_id: &str,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+        tx: &Transaction<'_>,
+    ) -> Result<()> {
+        let row = self
+            .tx_prepare_query_opt(
+                tx,
+                txn_produce_partition_select::QUERY,
+                &[
+                    &self.cluster,
+                    &transaction_id,
+                    &deflated.producer_id,
+                    &deflated.producer_epoch,
+                    &topition.topic(),
+                    &topition.partition(),
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+            .map(|row| {
+                Ok::<_, Error>((
+                    row.try_get::<_, Option<i64>>(txn_produce_partition_select::PRODUCER)?,
+                    row.try_get::<_, i32>(txn_produce_partition_select::ADDED)?,
+                ))
+            })
+            .transpose()
+            .inspect_err(|err| error!(?err))?;
+
+        txn_produce_partition_check(row, deflated.producer_id)
+            .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
+    }
+
     #[instrument(skip_all)]
     async fn produce_in_tx(
         &self,
@@ -2159,13 +2598,31 @@ impl Postgres {
         let topition_id = row.try_get::<_, i32>(0).inspect_err(|err| error!(?err))?;
         debug!(topition_id);
 
+        let watermarks = self.watermark_select_for_write(topition, tx).await?;
+
+        // The batch's producer epoch and sequence are checked under the partition's watermark
+        // lock, which every produce to the partition holds until it commits, as Kafka checks
+        // them under the partition's log lock. The check then sees every batch stored before
+        // this one. Checked before the lock, a retry of a batch still in flight passed and was
+        // stored a second time, and so did a batch at an older epoch than one stored meanwhile.
         if deflated.is_idempotent() {
             self.idempotent_message_check(transaction_id, topition, &deflated, tx)
                 .await
                 .inspect_err(|err| error!(?err))?;
         }
 
-        let (low, high) = self.watermark_select_for_update(topition, tx).await?;
+        if let Some(transaction_id) = transaction_id
+            && deflated.is_transactional()
+            && !deflated.is_control()
+        {
+            self.txn_produce_partition_check(transaction_id, topition, &deflated, tx)
+                .await?;
+        }
+
+        let limit =
+            max_message_bytes::limit(topition.topic(), watermarks.max_message_bytes.as_deref());
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+        let watermark_select_for_write::Row { low, high, .. } = watermarks;
 
         debug!(?low, ?high);
 
@@ -2188,12 +2645,13 @@ impl Postgres {
                         .configs
                         .as_ref()
                         .and_then(|configs| {
-                            configs
-                                .iter()
-                                .inspect(|config| debug!(?config))
-                                .find(|config| config.name.as_str() == "tansu.schema.validation")
-                                .and_then(|config| config.value.as_deref())
-                                .and_then(|value| bool::from_str(value).ok())
+                            topic_config::lookup(
+                                configs.iter().inspect(|config| debug!(?config)).filter_map(
+                                    |config| Some((config.name.as_str(), config.value.as_deref()?)),
+                                ),
+                                topic_config::SCHEMA_VALIDATION,
+                            )
+                            .and_then(|value| bool::from_str(value).ok())
                         })
                         .unwrap_or(true)
                 })
@@ -2216,12 +2674,15 @@ impl Postgres {
                             .configs
                             .as_ref()
                             .and_then(|configs| {
-                                configs
-                                    .iter()
-                                    .inspect(|config| debug!(?config))
-                                    .find(|config| config.name.as_str() == "tansu.lake.sink")
-                                    .and_then(|config| config.value.as_deref())
-                                    .and_then(|value| bool::from_str(value).ok())
+                                topic_config::lookup(
+                                    configs.iter().inspect(|config| debug!(?config)).filter_map(
+                                        |config| {
+                                            Some((config.name.as_str(), config.value.as_deref()?))
+                                        },
+                                    ),
+                                    topic_config::LAKE_SINK,
+                                )
+                                .and_then(|value| bool::from_str(value).ok())
                             })
                             .unwrap_or_default()
                     })
@@ -2253,7 +2714,7 @@ impl Postgres {
 
                     let producer_id = transaction_id.and(Some(inflated.producer_id));
                     let producer_epoch = transaction_id.and(Some(inflated.producer_epoch));
-                    let ts = to_system_time(inflated.base_timestamp + record.timestamp_delta)?;
+                    let ts = to_system_time(inflated.record_timestamp(record))?;
 
                     let mut row: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(record_column_types.len());
@@ -2480,7 +2941,7 @@ impl Postgres {
         // clean up this transaction's own bookkeeping: the producer might still be alive
         // and about to send more data under this same epoch. Bump it now, before doing any
         // of the actual abort work below (which can be deferred behind an older still-open
-        // transaction) -- idempotent_sequence_check already rejects a stale epoch with
+        // transaction) -- check_produce_epoch already rejects a stale epoch with
         // ProducerFenced, this just needs to make the current one stale. Only on the first
         // call that actually touches this transaction (write_marker), not a matching retry.
         //
@@ -3192,7 +3653,7 @@ impl Postgres {
 
     #[instrument(skip(self), ret)]
     async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
-        let retention_secs = i32::try_from(Duration::from_hours(7 * 24).as_secs())?;
+        let retention_secs = i64::try_from(config::DEFAULT_RETENTION.as_secs())?;
 
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
@@ -3245,22 +3706,19 @@ impl Postgres {
                 .describe_config(base, ConfigResource::Topic, None)
                 .await
                 .map(|configs| {
-                    configs
-                        .configs
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .find_map(|config| {
-                            if config.name == "tansu.virtual" {
-                                config
-                                    .value
-                                    .as_deref()
-                                    .and_then(|config| bool::from_str(config).ok())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default()
+                    topic_config::lookup(
+                        configs
+                            .configs
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|config| {
+                                Some((config.name.as_str(), config.value.as_deref()?))
+                            }),
+                        topic_config::VIRTUAL,
+                    )
+                    .and_then(|value| bool::from_str(value).ok())
+                    .unwrap_or_default()
                 })?
         {
             Ok((base, Some(key)))
@@ -3634,7 +4092,17 @@ impl Storage for Postgres {
 
         let mut c = self.connection().await?;
 
-        let tx = c.transaction().await?;
+        // This transaction is READ COMMITTED, regardless of the server's default isolation level.
+        // `produce_in_tx` checks an idempotent batch after it waits for the partition's watermark
+        // lock, and the check must see the batch that the lock's previous holder committed during
+        // the wait. Each statement of a READ COMMITTED transaction sees every commit made before
+        // the statement started. A REPEATABLE READ transaction sees only the commits made before
+        // its first statement, which ran before the wait.
+        let tx = c
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
 
         let high = self
             .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
@@ -3670,8 +4138,8 @@ impl Storage for Postgres {
         let (base_topic, key_filter): (&str, Option<&str>) =
             self.topic_with_key(topition.topic()).await?;
 
-        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
-        let mut connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let permits = self.fetch_read_permits().await?;
+        let mut connection = deadline::queued(self.abandonable_connection(permits)).await?;
         let batches = self
             .fetch_on(
                 connection.object_mut()?,
@@ -3696,8 +4164,8 @@ impl Storage for Postgres {
 
         let base_topic = self.base_topic(topition.topic()).await?;
 
-        let permit = deadline::queued(self.fetch_reads.clone().acquire_owned()).await?;
-        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let permits = self.fetch_read_permits().await?;
+        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
         let offset_stage = self
             .offset_stage_on(connection.object()?, base_topic, topition.partition())
             .await;
@@ -3791,7 +4259,10 @@ impl Storage for Postgres {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(group_id);
 
         let mut results = BTreeMap::new();
@@ -3801,21 +4272,25 @@ impl Storage for Postgres {
         for row in self
             .prepare_query(
                 &c,
-                "consumer_offset_select_by_group.sql",
+                consumer_offset_select_by_group::QUERY,
                 &[&self.cluster, &group_id],
             )
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let topic = row.try_get::<_, String>(0)?;
-            let partition = row.try_get::<_, i32>(1)?;
-            let offset = row.try_get::<_, i64>(2)?;
+            let topic = row.try_get::<_, String>(consumer_offset_select_by_group::TOPIC)?;
+            let partition = row.try_get::<_, i32>(consumer_offset_select_by_group::PARTITION)?;
+            let committed = CommittedOffset {
+                offset: row.try_get(consumer_offset_select_by_group::COMMITTED_OFFSET)?,
+                leader_epoch: row.try_get(consumer_offset_select_by_group::LEADER_EPOCH)?,
+                metadata: row.try_get(consumer_offset_select_by_group::METADATA)?,
+            };
 
-            debug!(group_id, topic, partition, offset);
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
@@ -3828,7 +4303,7 @@ impl Storage for Postgres {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
 
         let c = self.connection().await?;
@@ -3836,10 +4311,10 @@ impl Storage for Postgres {
         let mut offsets = BTreeMap::new();
 
         for topic in topics {
-            let offset = self
+            let committed = self
                 .prepare_query_opt(
                     &c,
-                    "consumer_offset_select.sql",
+                    consumer_offset_select::QUERY,
                     &[
                         &self.cluster,
                         &group_id,
@@ -3849,15 +4324,21 @@ impl Storage for Postgres {
                 )
                 .await
                 .and_then(|maybe| {
-                    maybe.map_or(Ok(-1), |row| row.try_get::<_, i64>(0).map_err(Into::into))
+                    maybe.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: row.try_get(consumer_offset_select::COMMITTED_OFFSET)?,
+                            leader_epoch: row.try_get(consumer_offset_select::LEADER_EPOCH)?,
+                            metadata: row.try_get(consumer_offset_select::METADATA)?,
+                        })
+                    })
                 })
-                .inspect(|offset| {
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -3870,7 +4351,7 @@ impl Storage for Postgres {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets)
@@ -3884,8 +4365,8 @@ impl Storage for Postgres {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         debug!(cluster = self.cluster, ?isolation_level);
 
-        let permit = deadline::queued(self.list_offsets_reads.clone().acquire_owned()).await?;
-        let connection = deadline::queued(self.abandonable_connection(permit)).await?;
+        let permits = self.list_offsets_read_permits().await?;
+        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
         let responses = self
             .list_offsets_on(connection.object()?, isolation_level, offsets)
             .await;
@@ -4167,52 +4648,12 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let prepared = c
-            .prepare_cached(self.sql_lookup("topic_select.sql")?)
-            .await
-            .inspect_err(|err| error!(?err))?;
+        let configs = match keys.filter(|keys| !keys.is_empty()) {
+            Some(keys) => self.topic_configs_by_key(&c, name, keys).await?,
+            None => self.all_topic_configs(&c, name).await?,
+        };
 
-        if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
-            .await
-            .inspect_err(|err| error!(?err))?
-            .is_some()
-        {
-            let prepared = c
-                .prepare_cached(self.sql_lookup("topic_configuration_select.sql")?)
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            let rows = c
-                .query(&prepared, &[&self.cluster.as_str(), &name])
-                .await
-                .inspect_err(|err| error!(?err))?;
-
-            let mut configs = vec![];
-
-            for row in rows {
-                let name = row
-                    .try_get::<_, String>(0)
-                    .inspect_err(|err| error!(?err))?;
-                let value = row
-                    .try_get::<_, Option<String>>(1)
-                    .map(|value| value.unwrap_or_default())
-                    .map(Some)
-                    .inspect_err(|err| error!(?err))?;
-
-                configs.push(
-                    DescribeConfigsResourceResult::default()
-                        .name(name)
-                        .value(value)
-                        .read_only(false)
-                        .is_default(None)
-                        .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
-                        .is_sensitive(false)
-                        .synonyms(Some([].into()))
-                        .config_type(Some(ConfigType::String.into()))
-                        .documentation(Some("".into())),
-                );
-            }
-
+        if let Some(configs) = configs {
             let error_code = ErrorCode::None;
 
             Ok(DescribeConfigsResult::default()
@@ -4424,27 +4865,23 @@ impl Storage for Postgres {
     }
 
     #[instrument(skip_all)]
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        debug!(?states_filter);
-
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
         let mut listed_groups = vec![];
 
         for row in self
-            .prepare_query(&c, "consumer_group_select.sql", &[&self.cluster])
+            .prepare_query(&c, consumer_group_select::QUERY, &[&self.cluster])
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let group_id = row.try_get::<_, String>(0)?;
+            let group_id = row.try_get::<_, String>(consumer_group_select::NAME)?;
 
-            listed_groups.push(
-                ListedGroup::default()
-                    .group_id(group_id)
-                    .protocol_type("consumer".into())
-                    .group_state(Some("unknown".into()))
-                    .group_type(Some("classic".into())),
-            );
+            let stored = row
+                .try_get::<_, Option<Value>>(consumer_group_select::DETAIL)?
+                .map(serde_json::from_value::<GroupDetail>);
+
+            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
         }
 
         Ok(listed_groups)
@@ -4520,38 +4957,61 @@ impl Storage for Postgres {
         debug!(?group_ids, include_authorized_operations);
 
         let mut results = vec![];
-        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+        let c = self.connection().await.inspect_err(|err| error!(?err));
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                if let Some(row) = self
+                // The engine answers a group whose read fails with an error code, as Apache Kafka's
+                // [`GroupCoordinatorService`] does, instead of failing the request, because the
+                // broker closes the client's connection on a failed request and sends no response.
+                // Kafka clients retry `COORDINATOR_NOT_AVAILABLE`.
+                //
+                // [`GroupCoordinatorService`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1184
+                let Ok(c) = &c else {
+                    results.push(NamedGroupDetail::error_code(
+                        group_id.into(),
+                        ErrorCode::CoordinatorNotAvailable,
+                    ));
+                    continue;
+                };
+
+                match self
                     .prepare_query_opt(
-                        &c,
+                        c,
                         "consumer_group_select_by_name.sql",
                         &[&self.cluster, group_id],
                     )
                     .await
-                    .inspect_err(|err| error!(?err, group_id))?
+                    .inspect_err(|err| error!(?err, group_id))
                 {
-                    // A group row with no detail row (e.g. a group that only ever
-                    // committed offsets, never a JoinGroup) joins to a NULL
-                    // `detail` column here: that group exists and is empty, not
-                    // an error.
-                    let current = match row
-                        .try_get::<_, Option<Value>>(1)
-                        .inspect_err(|err| error!(?err, group_id))?
-                    {
-                        Some(value) => serde_json::from_value::<GroupDetail>(value)
-                            .inspect(|current| debug!(?current))?,
-                        None => GroupDetail::default(),
-                    };
+                    Ok(Some(row)) => {
+                        // A group row with no detail row (e.g. a group that only ever committed
+                        // offsets, never a JoinGroup) joins to a NULL `detail` column here: that
+                        // group exists and is empty, not an error.
+                        let stored = row
+                            .try_get::<_, Option<Value>>(1)
+                            .map_err(Error::from)
+                            .transpose()
+                            .map(|stored| {
+                                stored.and_then(|value| {
+                                    serde_json::from_value::<GroupDetail>(value)
+                                        .map_err(Error::from)
+                                        .inspect(|current| debug!(?current))
+                                })
+                            });
 
-                    results.push(NamedGroupDetail::found(group_id.into(), current));
-                } else {
-                    results.push(NamedGroupDetail::error_code(
+                        results.push(NamedGroupDetail::decoded(group_id.into(), stored));
+                    }
+
+                    Ok(None) => results.push(NamedGroupDetail::error_code(
                         group_id.into(),
                         ErrorCode::GroupIdNotFound,
-                    ));
+                    )),
+
+                    Err(_) => results.push(NamedGroupDetail::error_code(
+                        group_id.into(),
+                        ErrorCode::CoordinatorNotAvailable,
+                    )),
                 }
             }
         }
@@ -5161,6 +5621,7 @@ mod tests {
     };
     use rand::distr::Alphanumeric;
     use std::assert_matches;
+    use tokio::task::JoinHandle;
 
     // mirrors nisshi-broker/tests/it/common/mod.rs storage_container(StorageType::Postgres)
     const CONNECTION: &str = "postgres://postgres:postgres@localhost";
@@ -5351,6 +5812,196 @@ mod tests {
         assert!(error.to_string().contains("vacuum_into"), "{error}");
     }
 
+    /// Without `pool_max_size`, the pool opens at most 16 connections, and
+    /// each kind of read takes half of them.
+    #[test]
+    fn pool_max_size_defaults_to_sixteen() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster("default")
+            .node(0)
+            .build();
+
+        assert_eq!(16, storage.pool.status().max_size);
+        assert_eq!(8, storage.list_offsets_reads.available_permits());
+        assert_eq!(8, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// `pool_max_size` sets how many connections the pool opens at most, and
+    /// each kind of read takes half of them, rounded down. The other options
+    /// in the URL still reach tokio-postgres.
+    #[test]
+    fn pool_max_size_sets_the_pool_and_its_read_limits() -> Result<()> {
+        for (pool_max_size, read_limit) in [(32, 16), (33, 16), (2, 1)] {
+            let storage = Postgres::builder(&format!(
+                "{CONNECTION}?options=-c%20statement_timeout%3D120000&pool_max_size={pool_max_size}"
+            ))?
+            .cluster("sized")
+            .node(0)
+            .build();
+
+            assert_eq!(pool_max_size, storage.pool.status().max_size);
+            assert_eq!(read_limit, storage.list_offsets_reads.available_permits());
+            assert_eq!(read_limit, storage.fetch_reads.available_permits());
+            assert_eq!(
+                Duration::from_secs(120) + ABANDONED_STATEMENT_MARGIN,
+                storage.abandoned_statement_bound
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Each connection's share of each kind of read is at least one read and
+    /// at most the engine's limit, whatever `pool_max_size` is. A pool too
+    /// small for the usual share gives each connection the whole limit, and
+    /// a larger pool does not give a connection more than its usual share.
+    #[test]
+    fn pool_max_size_clamps_each_connection_share_to_its_read_limit() -> Result<()> {
+        for (pool_max_size, list_offsets_share, fetch_share) in [
+            (2, 1, 1),
+            (4, 2, 2),
+            (8, LIST_OFFSETS_CONCURRENCY, 2),
+            (64, LIST_OFFSETS_CONCURRENCY, 2),
+        ] {
+            let storage =
+                Postgres::builder(&format!("{CONNECTION}?pool_max_size={pool_max_size}"))?
+                    .cluster("shared")
+                    .node(0)
+                    .build();
+
+            assert_eq!(
+                list_offsets_share, storage.list_offsets_reads_per_connection,
+                "pool_max_size={pool_max_size}"
+            );
+            assert_eq!(
+                fetch_share, storage.fetch_reads_per_connection,
+                "pool_max_size={pool_max_size}"
+            );
+            assert!(
+                (1..=storage.list_offsets_reads.available_permits())
+                    .contains(&storage.list_offsets_reads_per_connection),
+                "pool_max_size={pool_max_size}"
+            );
+            assert!(
+                (1..=storage.fetch_reads.available_permits())
+                    .contains(&storage.fetch_reads_per_connection),
+                "pool_max_size={pool_max_size}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A `pool_max_size` that is not a number in [`POOL_MAX_SIZE_RANGE`]
+    /// stops the build before any connection, and the error names the option
+    /// and its value.
+    #[test]
+    fn pool_max_size_rejects_invalid_values() {
+        for value in [
+            "banana",
+            "",
+            "-1",
+            "0",
+            "1",
+            "262144",
+            "18446744073709551616",
+        ] {
+            let error =
+                Postgres::builder(&format!("{CONNECTION}?pool_max_size={value}")).expect_err(value);
+
+            assert_matches!(
+                &error,
+                Error::InvalidStorageOptionValue { scheme, option, value: rejected, expected }
+                    if scheme == "postgres"
+                        && option == POOL_MAX_SIZE
+                        && rejected == value
+                        && *expected == "a whole number from 2 to 262143",
+                "{value}"
+            );
+        }
+    }
+
+    /// An invalid `pool_max_size` stops the build wherever it is in the URL,
+    /// even when a later one is valid, as every storage option does.
+    #[test]
+    fn pool_max_size_rejects_an_invalid_earlier_occurrence() {
+        let error = Postgres::builder(&format!(
+            "{CONNECTION}?pool_max_size=banana&pool_max_size=4"
+        ))
+        .expect_err("an invalid pool_max_size must be rejected");
+
+        assert_matches!(
+            &error,
+            Error::InvalidStorageOptionValue { option, value, .. }
+                if option == POOL_MAX_SIZE && value == "banana"
+        );
+    }
+
+    /// [`take_pool_max_size`] removes every `pool_max_size` from the URL, and
+    /// keeps the bytes of every other option: a re-encoded `%20` would reach
+    /// tokio-postgres as a `+`. The last `pool_max_size` wins.
+    #[test]
+    fn take_pool_max_size_removes_only_its_option() -> Result<()> {
+        for (config, expected) in [
+            ("postgres://h/db?pool_max_size=4", "postgres://h/db"),
+            (
+                "postgres://h/db?pool_max_size=4&sslmode=require",
+                "postgres://h/db?sslmode=require",
+            ),
+            (
+                "postgres://h/db?sslmode=require&pool_max_size=4&options=-c%20search_path%3Dfoo",
+                "postgres://h/db?sslmode=require&options=-c%20search_path%3Dfoo",
+            ),
+            (
+                "postgres://h/db?options=-c%20search_path%3Dfoo&pool_max_size=4",
+                "postgres://h/db?options=-c%20search_path%3Dfoo",
+            ),
+            (
+                "postgres://h/db?pool_max_size=8&sslmode=require&pool_max_size=4",
+                "postgres://h/db?sslmode=require",
+            ),
+        ] {
+            let mut stripped = config.to_owned();
+            assert_eq!(4, take_pool_max_size(&mut stripped)?, "{config}");
+            assert_eq!(expected, stripped, "{config}");
+        }
+
+        Ok(())
+    }
+
+    /// A URL without `pool_max_size` keeps every byte, and the pool gets
+    /// [`DEFAULT_POOL_MAX_SIZE`].
+    #[test]
+    fn take_pool_max_size_defaults_without_its_option() -> Result<()> {
+        for config in [
+            "postgres://h/db",
+            "postgres://h/db?sslmode=require&options=-c%20search_path%3Dfoo",
+        ] {
+            let mut stripped = config.to_owned();
+            assert_eq!(
+                DEFAULT_POOL_MAX_SIZE,
+                take_pool_max_size(&mut stripped)?,
+                "{config}"
+            );
+            assert_eq!(config, stripped);
+        }
+
+        Ok(())
+    }
+
+    /// Both ends of [`POOL_MAX_SIZE_RANGE`] are accepted.
+    #[test]
+    fn take_pool_max_size_accepts_its_range() -> Result<()> {
+        for size in [*POOL_MAX_SIZE_RANGE.start(), *POOL_MAX_SIZE_RANGE.end()] {
+            let mut config = format!("postgres://h/db?pool_max_size={size}");
+            assert_eq!(size, take_pool_max_size(&mut config)?);
+        }
+
+        Ok(())
+    }
+
     /// Hands out numbered objects, so a test can tell a fresh object from a
     /// recycled one.
     #[derive(Debug, Default)]
@@ -5468,14 +6119,10 @@ mod tests {
         Ok(())
     }
 
-    /// At most `LIST_OFFSETS_READS` ListOffsets reads reach the pool at
-    /// once; the rest wait for a permit, and the permits come back when the
-    /// reads are dropped.
-    ///
-    /// The pool has no permits at all, so each read that has a ListOffsets
-    /// permit waits in the pool, where the pool counts it, without a server.
-    #[tokio::test]
-    async fn list_offsets_reads_are_limited_before_the_pool() -> Result<()> {
+    /// Returns a storage whose pool has no permits at all, so each read that
+    /// has its read permits waits in the pool, where the pool counts it,
+    /// without a server.
+    fn storage_without_connections() -> Result<Postgres> {
         let pool = Pool::builder(Manager::new(
             Config::from_str(CONNECTION)?,
             tokio_postgres::NoTls,
@@ -5485,16 +6132,246 @@ mod tests {
         .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
         .build()?;
 
-        let storage = Postgres {
+        Ok(Postgres {
             pool,
             ..Postgres::builder(CONNECTION)?
                 .cluster(alphanumeric_string(15).as_str())
                 .node(rng().random_range(0..i32::MAX))
                 .build()
+        })
+    }
+
+    /// Waits until at least `waiting` reads wait in `storage`'s pool, gives
+    /// other reads time to reach it too, and returns how many wait.
+    async fn reads_waiting_in_the_pool(storage: &Postgres, waiting: usize) -> usize {
+        let settled = Instant::now() + Duration::from_secs(5);
+        while storage.pool.status().waiting < waiting {
+            assert!(Instant::now() < settled, "{:?}", storage.pool.status());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        storage.pool.status().waiting
+    }
+
+    /// Aborts each of `reads` and waits for it to end.
+    async fn abort_reads<T: Debug>(reads: Vec<JoinHandle<T>>) {
+        for read in &reads {
+            read.abort();
+        }
+        for read in reads {
+            let outcome = read.await;
+            assert!(
+                outcome.as_ref().is_err_and(|err| err.is_cancelled()),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// Spawns a ListOffsets read of `topition` on a connection with `share`.
+    fn spawn_list_offsets(
+        storage: &Postgres,
+        topition: &Topition,
+        share: ListOffsetsReadShare,
+    ) -> JoinHandle<Result<Vec<(Topition, ListOffsetResponse)>>> {
+        let storage = storage.clone();
+        let offsets = [(topition.clone(), ListOffset::Latest)];
+
+        tokio::spawn(share.scope(async move {
+            storage
+                .list_offsets(IsolationLevel::ReadUncommitted, &offsets)
+                .await
+        }))
+    }
+
+    /// Spawns a read of `topition`'s offset stage on a connection with
+    /// `share`.
+    fn spawn_offset_stage(
+        storage: &Postgres,
+        topition: &Topition,
+        share: FetchReadShare,
+    ) -> JoinHandle<Result<OffsetStage>> {
+        let storage = storage.clone();
+        let topition = topition.clone();
+
+        tokio::spawn(share.scope(async move { storage.offset_stage(&topition).await }))
+    }
+
+    /// One connection's ListOffsets reads reach the pool only up to its
+    /// share, `ReadLimits::list_offsets_per_connection`, and leave the rest of
+    /// `ReadLimits::list_offsets` to other connections.
+    #[tokio::test]
+    async fn one_connection_holds_at_most_its_share_of_list_offsets_reads() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+
+        let connection = ListOffsetsReadShare::default();
+        let mut reads = (0..ReadLimits::default().list_offsets)
+            .map(|_| spawn_list_offsets(&storage, &topition, connection.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ReadLimits::default().list_offsets_per_connection(),
+            reads_waiting_in_the_pool(
+                &storage,
+                ReadLimits::default().list_offsets_per_connection()
+            )
+            .await
+        );
+
+        reads.push(spawn_list_offsets(
+            &storage,
+            &topition,
+            ListOffsetsReadShare::default(),
+        ));
+
+        assert_eq!(
+            ReadLimits::default().list_offsets_per_connection() + 1,
+            reads_waiting_in_the_pool(
+                &storage,
+                ReadLimits::default().list_offsets_per_connection() + 1
+            )
+            .await
+        );
+
+        abort_reads(reads).await;
+        assert_eq!(
+            ReadLimits::default().list_offsets,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// One connection's Fetch reads reach the pool only up to its share,
+    /// `ReadLimits::fetch_per_connection`, and leave the rest of `ReadLimits::fetch` to
+    /// other connections.
+    #[tokio::test]
+    async fn one_connection_holds_at_most_its_share_of_fetch_reads() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+
+        let connection = FetchReadShare::default();
+        let mut reads = (0..ReadLimits::default().fetch)
+            .map(|_| spawn_offset_stage(&storage, &topition, connection.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ReadLimits::default().fetch_per_connection(),
+            reads_waiting_in_the_pool(&storage, ReadLimits::default().fetch_per_connection()).await
+        );
+
+        reads.push(spawn_offset_stage(
+            &storage,
+            &topition,
+            FetchReadShare::default(),
+        ));
+
+        assert_eq!(
+            ReadLimits::default().fetch_per_connection() + 1,
+            reads_waiting_in_the_pool(&storage, ReadLimits::default().fetch_per_connection() + 1)
+                .await
+        );
+
+        abort_reads(reads).await;
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// A connection's abandoned Fetch reads keep their permits from its
+    /// share, as well as from `ReadLimits::fetch`, until their statements end. The
+    /// connection's next read waits meanwhile, and another connection's
+    /// read goes ahead.
+    #[tokio::test]
+    async fn abandoned_fetch_reads_count_against_their_connection() -> Result<()> {
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!("skipping abandoned_fetch_reads_count_against_their_connection: {err:?}");
+                return Ok(());
+            }
         };
 
+        let storage = with_cancel_requests_refused(storage).await?;
+        let marker = alphanumeric_string(15);
+        let connection = FetchReadShare::default();
+
+        for _ in 0..ReadLimits::default().fetch_per_connection() {
+            let permits = connection
+                .clone()
+                .scope(storage.fetch_read_permits())
+                .await?;
+            abandon_sleeping_statement(&storage, permits, &marker).await?;
+        }
+
+        assert_eq!(
+            i64::try_from(ReadLimits::default().fetch_per_connection())?,
+            backends_running(&monitor, &marker).await?
+        );
+        assert_eq!(
+            ReadLimits::default().fetch - ReadLimits::default().fetch_per_connection(),
+            storage.fetch_reads.available_permits()
+        );
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                connection.clone().scope(storage.fetch_read_permits())
+            )
+            .await
+            .is_err(),
+            "the connection read beyond its share while its abandoned reads ran"
+        );
+
+        let other_connection = timeout(
+            Duration::from_millis(200),
+            FetchReadShare::default().scope(storage.fetch_read_permits()),
+        )
+        .await
+        .map_err(|_| Error::Message("another connection's read waited".into()))??;
+        drop(other_connection);
+
+        assert_eq!(
+            ReadLimits::default().fetch_per_connection(),
+            cancel_backends(&monitor, &marker).await?
+        );
+
+        wait_until(&storage, |storage| {
+            storage.fetch_reads.available_permits() == ReadLimits::default().fetch
+        })
+        .await;
+
+        _ = timeout(
+            Duration::from_secs(1),
+            connection.scope(storage.fetch_read_permits()),
+        )
+        .await
+        .map_err(|_| Error::Message("the connection's share did not come back".into()))??;
+
+        Ok(())
+    }
+
+    /// At most `ReadLimits::list_offsets` ListOffsets reads reach the pool at
+    /// once; the rest wait for a permit, and the permits come back when the
+    /// reads are dropped.
+    ///
+    /// The pool has no permits at all, so each read that has a ListOffsets
+    /// permit waits in the pool, where the pool counts it, without a server.
+    #[tokio::test]
+    async fn list_offsets_reads_are_limited_before_the_pool() -> Result<()> {
+        let storage = storage_without_connections()?;
+
         let topition = Topition::new("limited", 0);
-        let reads = (0..LIST_OFFSETS_READS + 3)
+        let reads = (0..ReadLimits::default().list_offsets + 3)
             .map(|_| {
                 let storage = storage.clone();
                 let topition = topition.clone();
@@ -5511,12 +6388,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         let settled = Instant::now() + Duration::from_secs(5);
-        while storage.pool.status().waiting < LIST_OFFSETS_READS {
+        while storage.pool.status().waiting < ReadLimits::default().list_offsets {
             assert!(Instant::now() < settled, "{:?}", storage.pool.status());
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(LIST_OFFSETS_READS, storage.pool.status().waiting);
+        assert_eq!(
+            ReadLimits::default().list_offsets,
+            storage.pool.status().waiting
+        );
         assert_eq!(0, storage.list_offsets_reads.available_permits());
 
         for read in &reads {
@@ -5532,7 +6412,7 @@ mod tests {
 
         assert_eq!(0, storage.pool.status().waiting);
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5562,10 +6442,10 @@ mod tests {
         let marker = alphanumeric_string(15);
         let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
 
-        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
-        let connection = storage.abandonable_connection(permit).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        let connection = storage.abandonable_connection(permits).await?;
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5583,7 +6463,7 @@ mod tests {
         // The cancel task holds the permit, so the statement still counts
         // against the limit while it runs.
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5611,7 +6491,7 @@ mod tests {
 
         assert_eq!(2, storage.pool.status().size);
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5670,13 +6550,17 @@ mod tests {
     }
 
     /// Runs `SELECT pg_sleep(30)` marked `marker` on an abandonable
-    /// connection and drops the connection mid-statement, returning once the
-    /// cancel task has had time to send its cancel request.
-    async fn abandon_sleeping_statement(storage: &Postgres, marker: &str) -> Result<()> {
+    /// connection holding `permits` and drops the connection mid-statement,
+    /// returning once the cancel task has had time to send its cancel
+    /// request.
+    async fn abandon_sleeping_statement(
+        storage: &Postgres,
+        permits: ReadPermits,
+        marker: &str,
+    ) -> Result<()> {
         let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
 
-        let permit = storage.list_offsets_reads.clone().acquire_owned().await?;
-        let connection = storage.abandonable_connection(permit).await?;
+        let connection = storage.abandonable_connection(permits).await?;
 
         assert!(
             timeout(
@@ -5734,11 +6618,12 @@ mod tests {
         let storage = with_cancel_requests_refused(storage).await?;
         let marker = alphanumeric_string(15);
 
-        abandon_sleeping_statement(&storage, &marker).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        abandon_sleeping_statement(&storage, permits, &marker).await?;
 
         assert_eq!(1, backends_running(&monitor, &marker).await?);
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
         assert_eq!(0, storage.pool.status().available);
@@ -5751,7 +6636,7 @@ mod tests {
         assert_eq!(0, backends_running(&monitor, &marker).await?);
         assert_eq!(2, storage.pool.status().size);
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5784,16 +6669,17 @@ mod tests {
         };
         let marker = alphanumeric_string(15);
 
-        abandon_sleeping_statement(&storage, &marker).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        abandon_sleeping_statement(&storage, permits, &marker).await?;
 
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
         assert_eq!(2, storage.pool.status().size);
 
         wait_until(&storage, |storage| {
-            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+            storage.list_offsets_reads.available_permits() == ReadLimits::default().list_offsets
         })
         .await;
 
@@ -5826,10 +6712,11 @@ mod tests {
         let storage = with_cancel_requests_refused(storage).await?;
         let marker = alphanumeric_string(15);
 
-        abandon_sleeping_statement(&storage, &marker).await?;
+        let permits = storage.list_offsets_read_permits().await?;
+        abandon_sleeping_statement(&storage, permits, &marker).await?;
 
         assert_eq!(
-            LIST_OFFSETS_READS - 1,
+            ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5843,7 +6730,7 @@ mod tests {
         assert_eq!(1, terminated);
 
         wait_until(&storage, |storage| {
-            storage.list_offsets_reads.available_permits() == LIST_OFFSETS_READS
+            storage.list_offsets_reads.available_permits() == ReadLimits::default().list_offsets
         })
         .await;
 
@@ -5854,7 +6741,7 @@ mod tests {
         Ok(())
     }
 
-    /// At most `FETCH_READS` Fetch reads, of records and of offset stages
+    /// At most `ReadLimits::fetch` Fetch reads, of records and of offset stages
     /// alike, reach the pool at once; the rest wait for a permit, and the
     /// permits come back when the reads are dropped.
     ///
@@ -5862,25 +6749,10 @@ mod tests {
     /// permit waits in the pool, where the pool counts it, without a server.
     #[tokio::test]
     async fn fetch_reads_are_limited_before_the_pool() -> Result<()> {
-        let pool = Pool::builder(Manager::new(
-            Config::from_str(CONNECTION)?,
-            tokio_postgres::NoTls,
-        ))
-        .max_size(0)
-        .runtime(Runtime::Tokio1)
-        .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
-        .build()?;
-
-        let storage = Postgres {
-            pool,
-            ..Postgres::builder(CONNECTION)?
-                .cluster(alphanumeric_string(15).as_str())
-                .node(rng().random_range(0..i32::MAX))
-                .build()
-        };
+        let storage = storage_without_connections()?;
 
         let topition = Topition::new("limited", 0);
-        let reads = (0..FETCH_READS + 3)
+        let reads = (0..ReadLimits::default().fetch + 3)
             .map(|read| {
                 let storage = storage.clone();
                 let topition = topition.clone();
@@ -5906,15 +6778,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         let settled = Instant::now() + Duration::from_secs(5);
-        while storage.pool.status().waiting < FETCH_READS {
+        while storage.pool.status().waiting < ReadLimits::default().fetch {
             assert!(Instant::now() < settled, "{:?}", storage.pool.status());
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(FETCH_READS, storage.pool.status().waiting);
+        assert_eq!(ReadLimits::default().fetch, storage.pool.status().waiting);
         assert_eq!(0, storage.fetch_reads.available_permits());
         assert_eq!(
-            LIST_OFFSETS_READS,
+            ReadLimits::default().list_offsets,
             storage.list_offsets_reads.available_permits()
         );
 
@@ -5930,7 +6802,10 @@ mod tests {
         }
 
         assert_eq!(0, storage.pool.status().waiting);
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         Ok(())
     }
@@ -5962,8 +6837,8 @@ mod tests {
         let failed = format!("BEGIN; SELECT pg_sleep(30) /* {marker} */");
 
         for read in [open, failed] {
-            let permit = storage.fetch_reads.clone().acquire_owned().await?;
-            let connection = storage.abandonable_connection(permit).await?;
+            let permits = storage.fetch_read_permits().await?;
+            let connection = storage.abandonable_connection(permits).await?;
             let backend = connection
                 .object()?
                 .query_one("SELECT pg_backend_pid()", &[])
@@ -5982,7 +6857,7 @@ mod tests {
 
             wait_until(&storage, |storage| {
                 storage.pool.status().size == 0
-                    && storage.fetch_reads.available_permits() == FETCH_READS
+                    && storage.fetch_reads.available_permits() == ReadLimits::default().fetch
             })
             .await;
 
@@ -6069,7 +6944,7 @@ mod tests {
             .map(drop)
     }
 
-    /// More fetches than `FETCH_READS` at once all finish: each fetch reads
+    /// More fetches than `ReadLimits::fetch` at once all finish: each fetch reads
     /// its watermark on the connection it already holds, so no fetch waits
     /// for a second permit while it holds one.
     #[tokio::test]
@@ -6087,7 +6962,7 @@ mod tests {
 
         let topition = topic_with_one_record(&storage, &cluster).await?;
 
-        let fetches = (0..FETCH_READS + 2)
+        let fetches = (0..ReadLimits::default().fetch + 2)
             .map(|_| {
                 let storage = storage.clone();
                 let topition = topition.clone();
@@ -6102,7 +6977,10 @@ mod tests {
                 .map_err(|err| Error::Message(err.to_string()))??;
         }
 
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         Ok(())
     }
@@ -6190,7 +7068,10 @@ mod tests {
         };
 
         assert_eq!(Some(SETTLE_QUERY), last_query.as_deref());
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         lock.rollback().await?;
 
@@ -6250,11 +7131,17 @@ mod tests {
         // instead would not have it back yet.
         fetch_from_start(&storage, &topition).await?;
         assert_eq!(1, storage.pool.status().available);
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         _ = storage.offset_stage(&topition).await?;
         assert_eq!(1, storage.pool.status().available);
-        assert_eq!(FETCH_READS, storage.fetch_reads.available_permits());
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         let fetching = {
             let storage = storage.clone();
@@ -7842,9 +8729,12 @@ mod tests {
             .await;
 
         assert!(
-            matches!(zombie_result, Err(Error::Api(ErrorCode::ProducerFenced))),
-            "a zombie produce under the pre-sweep epoch must be rejected as ProducerFenced, \
-             got {zombie_result:?}",
+            matches!(
+                zombie_result,
+                Err(Error::Api(ErrorCode::InvalidProducerEpoch))
+            ),
+            "a zombie produce under the pre-sweep epoch must be rejected as \
+             InvalidProducerEpoch, got {zombie_result:?}",
         );
 
         let stage_after_zombie_write = storage.offset_stage(&topition).await?;
@@ -9593,6 +10483,663 @@ mod tests {
         Ok(())
     }
 
+    /// A storage on a new cluster holding one empty single-partition topic, or `None` when
+    /// there is no postgres to connect to.
+    async fn storage_with_empty_topic() -> Result<Option<(Postgres, Topition)>> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping: {err:?}");
+            return Ok(None);
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster,
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        Ok(Some((storage, Topition::new(topic_name, 0))))
+    }
+
+    /// The records of every batch, as `(offset, record)`.
+    fn records_with_offsets(batches: Vec<deflated::Batch>) -> Result<Vec<(i64, Record)>> {
+        batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            let inflated = Batch::try_from(batch)?;
+
+            acc.extend(inflated.records.into_iter().map(|record| {
+                (
+                    inflated.base_offset + i64::from(record.offset_delta),
+                    record,
+                )
+            }));
+
+            Ok(acc)
+        })
+    }
+
+    /// The fetch query reads at most 10,000 rows per call. Without that bound each fetch
+    /// reads every row between the fetch offset and the high watermark, so a consumer behind
+    /// a fast producer slows down as its backlog grows. The fetch service reads again from
+    /// the last offset it received, so a bounded read must neither skip nor repeat a record.
+    #[tokio::test]
+    async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let batch = (0..RECORDS)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                )
+            })
+            .last_offset_delta(i32::try_from(RECORDS - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let fetch_from = |offset| {
+            storage.fetch(
+                &topition,
+                offset,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+        };
+
+        let first = records_with_offsets(fetch_from(0).await?)?;
+
+        assert_eq!(
+            (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+            first.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            "one fetch must stop at the row limit",
+        );
+
+        let rest = records_with_offsets(fetch_from(ROWS_PER_FETCH).await?)?;
+
+        assert_eq!(
+            (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
+            rest.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            "reading on from the last offset must return the rest, with no gap or repeat",
+        );
+
+        Ok(())
+    }
+
+    /// A read with the largest `max_wait` that a client can send still reads at most
+    /// `ROWS_PER_FETCH` rows, and then returns its connection and its Fetch permit. The
+    /// budget only stops the assembly of records, so the row limit is the bound that keeps
+    /// one read over a large backlog from holding a permit for minutes.
+    #[tokio::test]
+    async fn fetch_with_the_largest_max_wait_returns_its_permit_within_a_bounded_read() -> Result<()>
+    {
+        const RECORDS: i64 = 3 * ROWS_PER_FETCH;
+
+        // Measured reads of `ROWS_PER_FETCH` rows take about 300 ms.
+        const READ_BOUND: Duration = Duration::from_secs(10);
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let batch = (0..RECORDS)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                )
+            })
+            .last_offset_delta(i32::try_from(RECORDS - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let largest_max_wait = Duration::from_millis(u64::try_from(i32::MAX)?);
+
+        let batches = timeout(
+            READ_BOUND,
+            storage.fetch(
+                &topition,
+                0,
+                1,
+                5 * 1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                largest_max_wait,
+            ),
+        )
+        .await
+        .map_err(|_elapsed| {
+            Error::Message(format!("the read took longer than {READ_BOUND:?}"))
+        })??;
+
+        assert_eq!(
+            (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+            records_with_offsets(batches)?
+                .iter()
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>(),
+            "one read must stop at the row limit, whatever its budget",
+        );
+
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// Gives the topic a delete policy with a retention of one minute.
+    async fn retain_for_one_minute(storage: &Postgres, topition: &Topition) -> Result<()> {
+        let c = storage.connection().await?;
+
+        _ = c
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, v.name, v.value \
+                 from topic t \
+                 join cluster c on c.id = t.cluster, \
+                 (values ('cleanup.policy', 'delete'), ('retention.ms', '60000')) v(name, value) \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Produces one record per timestamp, in milliseconds since the epoch, at consecutive offsets.
+    async fn produce_at(storage: &Postgres, topition: &Topition, timestamps: &[i64]) -> Result<()> {
+        let base = timestamps.iter().copied().min().unwrap_or_default();
+
+        let batch = timestamps
+            .iter()
+            .enumerate()
+            .fold(Batch::builder(), |builder, (offset, timestamp)| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(offset).unwrap_or(i32::MAX))
+                        .timestamp_delta(timestamp - base),
+                )
+            })
+            .base_timestamp(base)
+            .max_timestamp(timestamps.iter().copied().max().unwrap_or_default())
+            .last_offset_delta(i32::try_from(timestamps.len() - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, topition, batch).await?;
+
+        Ok(())
+    }
+
+    /// Sets when each record was appended, in milliseconds since the epoch, for the records at
+    /// consecutive offsets from `first_offset`. Records are appended now, and retention reads
+    /// the append time to find where the expired records end.
+    async fn append_times(
+        storage: &Postgres,
+        topition: &Topition,
+        first_offset: i64,
+        appended: &[i64],
+    ) -> Result<()> {
+        let c = storage.connection().await?;
+
+        let updated = c
+            .execute(
+                "update record r \
+                 set created_at = cast(to_timestamp(a.ms / 1000.0) as timestamp) \
+                 from unnest($4::bigint[]) with ordinality as a(ms, n) \
+                 where r.topition = ( \
+                     select tp.id \
+                     from cluster c \
+                     join topic t on t.cluster = c.id \
+                     join topition tp on tp.topic = t.id \
+                     where c.name = $1 and t.name = $2 and tp.partition = $3) \
+                 and r.offset_id = $5 + a.n - 1",
+                &[
+                    &storage.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &appended,
+                    &first_offset,
+                ],
+            )
+            .await?;
+
+        assert_eq!(u64::try_from(appended.len())?, updated);
+
+        Ok(())
+    }
+
+    /// Removes the records at the offsets, as compaction leaves a gap.
+    async fn remove_offsets(
+        storage: &Postgres,
+        topition: &Topition,
+        offsets: std::ops::Range<i64>,
+    ) -> Result<()> {
+        let c = storage.connection().await?;
+
+        _ = c
+            .execute(
+                "delete from record r \
+                 where r.topition = ( \
+                     select tp.id \
+                     from cluster c \
+                     join topic t on t.cluster = c.id \
+                     join topition tp on tp.topic = t.id \
+                     where c.name = $1 and t.name = $2 and tp.partition = $3) \
+                 and r.offset_id >= $4 and r.offset_id < $5",
+                &[
+                    &storage.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &offsets.start,
+                    &offsets.end,
+                ],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// The offsets that are still stored for the partition, in order.
+    async fn stored_offsets(storage: &Postgres, topition: &Topition) -> Result<Vec<i64>> {
+        let c = storage.connection().await?;
+
+        c.query(
+            "select r.offset_id \
+             from record r \
+             join topition tp on tp.id = r.topition \
+             join topic t on t.id = tp.topic \
+             join cluster c on c.id = t.cluster \
+             where c.name = $1 and t.name = $2 and tp.partition = $3 \
+             order by r.offset_id",
+            &[&storage.cluster, &topition.topic(), &topition.partition()],
+        )
+        .await?
+        .iter()
+        .map(|row| row.try_get::<_, i64>(0).map_err(Into::into))
+        .collect()
+    }
+
+    fn now_ms() -> Result<i64> {
+        Ok(i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_millis(),
+        )?)
+    }
+
+    /// Retention deletes the records below an offset that a search over the append times finds,
+    /// in place of testing every record. When the append times rise with offsets, that must
+    /// delete every expired record and no other.
+    #[tokio::test]
+    async fn retention_deletes_every_expired_record_when_timestamps_rise_with_offsets() -> Result<()>
+    {
+        const EXPIRED: i64 = 1_200;
+        const RECORDS: i64 = 2_000;
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if offset < EXPIRED {
+                    now - 600_000 + offset
+                } else {
+                    now - 10_000 + (offset - EXPIRED)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+        append_times(&storage, &topition, 0, &timestamps).await?;
+
+        let deleted = storage.policy_delete(SystemTime::now()).await?;
+
+        assert_eq!(u64::try_from(EXPIRED)?, deleted);
+        assert_eq!(
+            (EXPIRED..RECORDS).collect::<Vec<_>>(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        Ok(())
+    }
+
+    /// A record with a timestamp ahead of the records around it, from a producer clock that is
+    /// wrong, has not expired and is kept. It must not hold back the deletion of the records after
+    /// it.
+    #[tokio::test]
+    async fn retention_keeps_a_record_that_has_not_expired_and_deletes_the_rest() -> Result<()> {
+        const RECORDS: i64 = 1_000;
+        const AHEAD: [i64; 2] = [100, 500];
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if AHEAD.contains(&offset) {
+                    now + 86_400_000
+                } else {
+                    now - 600_000 + offset
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+        append_times(
+            &storage,
+            &topition,
+            0,
+            &(0..RECORDS)
+                .map(|offset| now - 600_000 + offset)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+        let deleted = storage.policy_delete(SystemTime::now()).await?;
+
+        assert_eq!(u64::try_from(RECORDS - 2)?, deleted);
+        assert_eq!(AHEAD.to_vec(), stored_offsets(&storage, &topition).await?);
+
+        Ok(())
+    }
+
+    /// Retention does not advance the low watermark, so a sweep after the first searches a range
+    /// that starts with offsets that are no longer stored. It must end, and delete exactly the
+    /// records that have expired since.
+    #[tokio::test]
+    async fn retention_sweeps_again_after_more_records_arrive() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let first = (0..600)
+            .map(|offset| now - 600_000 + offset)
+            .collect::<Vec<_>>();
+        produce_at(&storage, &topition, &first).await?;
+        append_times(&storage, &topition, 0, &first).await?;
+
+        assert_eq!(600, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            Vec::<i64>::new(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        let second = (0..400)
+            .map(|offset| {
+                if offset < 200 {
+                    now - 300_000 + offset
+                } else {
+                    now - 10_000 + offset
+                }
+            })
+            .collect::<Vec<_>>();
+        produce_at(&storage, &topition, &second).await?;
+        append_times(&storage, &topition, 600, &second).await?;
+
+        assert_eq!(200, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            (800..1_000).collect::<Vec<_>>(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        assert_eq!(0, storage.policy_delete(SystemTime::now()).await?);
+
+        Ok(())
+    }
+
+    /// Compaction leaves gaps in the offsets of a partition. A search whose probes land in a gap
+    /// must still find the boundary and delete every expired record on both sides of the gap.
+    #[tokio::test]
+    async fn retention_deletes_expired_records_on_both_sides_of_a_gap() -> Result<()> {
+        const EXPIRED: i64 = 800;
+        const RECORDS: i64 = 1_000;
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if offset < EXPIRED {
+                    now - 600_000 + offset
+                } else {
+                    now - 10_000 + offset
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+        append_times(&storage, &topition, 0, &timestamps).await?;
+        remove_offsets(&storage, &topition, 300..700).await?;
+
+        assert_eq!(400, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            (EXPIRED..RECORDS).collect::<Vec<_>>(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        Ok(())
+    }
+
+    /// A keyed fetch of a virtual topic names the topic as `base/key`, and that name has no row in
+    /// `topic`. Its records still carry their headers, and the headers read are those of the
+    /// records returned, not of the records in between.
+    #[tokio::test]
+    async fn keyed_fetch_attaches_headers_of_the_records_it_returns() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let c = storage.connection().await?;
+        _ = c
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, 'tansu.virtual', 'true' \
+                 from topic t join cluster c on c.id = t.cluster \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        let batch = (0..6)
+            .fold(Batch::builder(), |builder, delta| {
+                let key = if delta % 2 == 0 { "key-a" } else { "key-b" };
+                let header = format!("header-{delta}");
+
+                builder.record(
+                    Record::builder()
+                        .key(Bytes::copy_from_slice(key.as_bytes()).into())
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(delta)
+                        .header(
+                            Header::builder()
+                                .key(Bytes::copy_from_slice(header.as_bytes()))
+                                .value(Bytes::copy_from_slice(header.as_bytes())),
+                        ),
+                )
+            })
+            .last_offset_delta(5)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let records = records_with_offsets(
+            storage
+                .fetch(
+                    &Topition::new(format!("{}/key-a", topition.topic()), 0),
+                    0,
+                    1,
+                    8 * 1024,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(5),
+                )
+                .await?,
+        )?;
+
+        let fetched = records
+            .iter()
+            .map(|(offset, record)| {
+                (
+                    *offset,
+                    record
+                        .headers
+                        .iter()
+                        .filter_map(|header| header.key.as_deref())
+                        .map(|key| String::from_utf8_lossy(key).into_owned())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![
+                (0, vec!["header-0".to_string()]),
+                (2, vec!["header-2".to_string()]),
+                (4, vec!["header-4".to_string()]),
+            ],
+            fetched
+        );
+
+        Ok(())
+    }
+
+    /// Headers are read for the whole range of a fetch at once, and each must end up on the
+    /// record at its own offset: records without headers stay without, the first and last record of
+    /// the range get theirs, and a record keeps its headers in produce order.
+    #[tokio::test]
+    async fn fetch_attaches_each_header_to_its_own_record() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let headers: [&[&str]; 5] = [&["zero"], &["one"], &[], &["two-a", "two-b"], &["four"]];
+
+        let batch = headers
+            .iter()
+            .enumerate()
+            .fold(Batch::builder(), |builder, (delta, keys)| {
+                builder.record(
+                    keys.iter().fold(
+                        Record::builder()
+                            .value(Bytes::from_static(b"a").into())
+                            .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                        |record, key| {
+                            record.header(
+                                Header::builder()
+                                    .key(Bytes::copy_from_slice(key.as_bytes()))
+                                    .value(Bytes::copy_from_slice(key.as_bytes())),
+                            )
+                        },
+                    ),
+                )
+            })
+            .last_offset_delta(i32::try_from(headers.len() - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let records = records_with_offsets(
+            storage
+                .fetch(
+                    &topition,
+                    0,
+                    1,
+                    8 * 1024,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(5),
+                )
+                .await?,
+        )?;
+
+        let fetched = records
+            .iter()
+            .map(|(_, record)| {
+                record
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        header
+                            .key
+                            .as_deref()
+                            .map(|key| String::from_utf8_lossy(key).into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            headers
+                .iter()
+                .map(|keys| keys.iter().map(|key| key.to_string()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            fetched,
+        );
+
+        Ok(())
+    }
+
     /// An empty database that one test creates on the server at [`CONNECTION`].
     struct EmptyDatabase {
         name: String,
@@ -10112,5 +11659,104 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// A DescribeGroups whose storage can't get a connection must answer each group with
+    /// `COORDINATOR_NOT_AVAILABLE`, which clients retry. A failed request instead closes the
+    /// client's connection without a response.
+    #[tokio::test]
+    async fn describe_groups_answers_coordinator_not_available_without_a_connection() -> Result<()>
+    {
+        // The listener closes when this statement ends, so the engine's connection attempt to its
+        // port fails at once. The test then runs without a PostgreSQL server.
+        let closed_port = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await?
+            .local_addr()?
+            .port();
+
+        let storage = Postgres::builder(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{closed_port}"
+        ))?
+        .cluster(alphanumeric_string(15))
+        .node(111)
+        .build();
+
+        let group_ids = ["abc", "pqr"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::error_code("abc".into(), ErrorCode::CoordinatorNotAvailable),
+                NamedGroupDetail::error_code("pqr".into(), ErrorCode::CoordinatorNotAvailable),
+            ],
+            storage.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
+    }
+
+    /// A DescribeGroups must answer a stored group that can't be decoded with
+    /// `UNKNOWN_SERVER_ERROR`, which clients report at once, and answer the other groups in the
+    /// request as usual.
+    #[tokio::test]
+    async fn describe_groups_answers_unknown_server_error_for_an_undecodable_group() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "describe_groups_answers_unknown_server_error_for_an_undecodable_group",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        // `GroupDetail::default` records the current time as the group's inception, so a second
+        // call returns a different detail. The test compares the answer with this value.
+        let stored = GroupDetail::default();
+
+        for group_id in ["healthy", "undecodable"] {
+            _ = storage
+                .update_group(group_id, stored.clone(), None)
+                .await
+                .map_err(|err| Error::Message(format!("{err:?}")))?;
+        }
+
+        // `42` is valid JSON, so the database accepts it, but it doesn't decode to a `GroupDetail`.
+        let changed = storage
+            .connection()
+            .await?
+            .execute(
+                "update consumer_group_detail cgd set detail = '42'
+                from consumer_group cg join cluster c on c.id = cg.cluster
+                where cgd.consumer_group = cg.id and c.name = $1 and cg.name = $2",
+                &[&cluster, &"undecodable"],
+            )
+            .await?;
+        // The update must change the group's row. An update that changes no row leaves the group
+        // decodable, and the test then fails for that reason instead of testing the engine.
+        assert_eq!(1, changed);
+
+        let group_ids = ["healthy", "undecodable", "missing"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+                NamedGroupDetail::error_code("missing".into(), ErrorCode::GroupIdNotFound),
+            ],
+            storage.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "nisshi-otel"
-description = "Tansu OTEL common configuration"
+description = "Nisshi OTEL common configuration"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

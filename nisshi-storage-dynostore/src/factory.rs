@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{num::NonZeroU32, str::FromStr as _, sync::Arc, time::Duration};
+use std::{
+    fmt::{self, Display, Formatter},
+    num::NonZeroU32,
+    str::FromStr as _,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use nisshi_schema::redact_url;
 use nisshi_storage::{
-    ArcDynStorage, ProduceRequestBatcher, Result, StorageFactory, StorageFactoryConfiguration,
-    reject_unrecognized_options,
+    ArcDynStorage, ProduceRequestBatcher, Result, StorageCapabilities, StorageFactory,
+    StorageFactoryConfiguration, parse_storage_option, reject_unrecognized_options,
 };
 use object_store::{
     aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
@@ -26,17 +31,33 @@ use object_store::{
     memory::InMemory,
 };
 use regex::Regex;
-use tracing::{debug, warn};
+use tracing::debug;
+use url::Url;
 
 use crate::{dynostore::DynoStore, gcs::limit::PutRateLimiter};
 
+const MEMORY: &str = "in-memory (memory://)";
+const S3: &str = "S3 (s3://)";
+const GCS: &str = "Google Cloud Storage (gs://)";
+
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryEngineFactory;
+
+impl Display for MemoryEngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(MEMORY)
+    }
+}
 
 #[async_trait]
 impl StorageFactory for MemoryEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"memory").map_err(Into::into)
+    }
+
+    /// No SCRAM credentials yet: DynoStore keeps none.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
@@ -48,6 +69,7 @@ impl StorageFactory for MemoryEngineFactory {
                 configuration.node_id,
                 InMemory::new(),
             )?
+            .engine(MEMORY)
             .advertised_listener(configuration.advertised_listener.clone())
             .schemas(configuration.schema_registry)
             .lake(configuration.lake_house.clone()),
@@ -58,46 +80,32 @@ impl StorageFactory for MemoryEngineFactory {
 #[derive(Clone, Copy, Debug)]
 pub struct S3OptimisticConcurrencyEngineFactory;
 
+impl Display for S3OptimisticConcurrencyEngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(S3)
+    }
+}
+
 #[async_trait]
 impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"s3").map_err(Into::into)
     }
 
+    /// No SCRAM credentials yet: DynoStore keeps none.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
-        reject_unrecognized_options(
-            &configuration.storage,
-            &["batch_min_size", "batch_max_delay"],
-        )?;
+        reject_unrecognized_options(&configuration.storage, BatchOptions::OPTIONS)?;
 
         let bucket_name = configuration.storage.host_str().unwrap_or("nisshi");
 
-        let minimum_size = configuration.storage.query_pairs().find_map(|(k, v)| {
-            if k == "batch_min_size" {
-                human_units::Size::from_str(v.as_ref())
-                    .map(|size| size.0)
-                    .inspect_err(|err| {
-                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
-                    })
-                    .ok()
-                    .and_then(|size| usize::try_from(size).ok())
-            } else {
-                None
-            }
-        });
-
-        let maximum_delay = configuration.storage.query_pairs().find_map(|(k, v)| {
-            if k == "batch_max_delay" {
-                human_units::Duration::from_str(v.as_ref())
-                    .map(|duration| duration.0)
-                    .inspect_err(|err| {
-                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
-                    })
-                    .ok()
-            } else {
-                None
-            }
-        });
+        let BatchOptions {
+            minimum_size,
+            maximum_delay,
+        } = BatchOptions::parse(&configuration.storage)?;
 
         debug!(?minimum_size, ?maximum_delay);
 
@@ -132,6 +140,7 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
             configuration.node_id,
             object_store,
         )?
+        .engine(S3)
         .advertised_listener(configuration.advertised_listener.clone())
         .schemas(configuration.schema_registry)
         .lake(configuration.lake_house.clone());
@@ -162,46 +171,32 @@ fn skip_signature(value: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct GoogleCloudStorageEngineFactory;
 
+impl Display for GoogleCloudStorageEngineFactory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(GCS)
+    }
+}
+
 #[async_trait]
 impl StorageFactory for GoogleCloudStorageEngineFactory {
     fn scheme(&self) -> Result<Regex> {
         Regex::new(r"gs").map_err(Into::into)
     }
 
+    /// No SCRAM credentials yet: DynoStore keeps none.
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::default()
+    }
+
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
-        reject_unrecognized_options(
-            &configuration.storage,
-            &["batch_min_size", "batch_max_delay"],
-        )?;
+        reject_unrecognized_options(&configuration.storage, BatchOptions::OPTIONS)?;
 
         let bucket_name = configuration.storage.host_str().unwrap_or("nisshi");
 
-        let minimum_size = configuration.storage.query_pairs().find_map(|(k, v)| {
-            if k == "batch_min_size" {
-                human_units::Size::from_str(v.as_ref())
-                    .map(|size| size.0)
-                    .inspect_err(|err| {
-                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
-                    })
-                    .ok()
-                    .and_then(|size| usize::try_from(size).ok())
-            } else {
-                None
-            }
-        });
-
-        let maximum_delay = configuration.storage.query_pairs().find_map(|(k, v)| {
-            if k == "batch_max_delay" {
-                human_units::Duration::from_str(v.as_ref())
-                    .map(|duration| duration.0)
-                    .inspect_err(|err| {
-                        warn!(storage = %redact_url(&configuration.storage), v = v.as_ref(), ?err)
-                    })
-                    .ok()
-            } else {
-                None
-            }
-        });
+        let BatchOptions {
+            minimum_size,
+            maximum_delay,
+        } = BatchOptions::parse(&configuration.storage)?;
 
         GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket_name)
@@ -222,6 +217,7 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
                 )
                 .map(|storage| {
                     storage
+                        .engine(GCS)
                         .advertised_listener(configuration.advertised_listener.clone())
                         .schemas(configuration.schema_registry)
                         .lake(configuration.lake_house.clone())
@@ -237,5 +233,55 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
     }
 }
 
+/// The produce batching options that the S3 and Google Cloud Storage engines read from
+/// the storage URL.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BatchOptions {
+    minimum_size: Option<usize>,
+    maximum_delay: Option<Duration>,
+}
+
+impl BatchOptions {
+    const OPTIONS: &[&str] = &[BATCH_MIN_SIZE, BATCH_MAX_DELAY];
+
+    /// Reads the options from `storage`. An option that the URL doesn't give is `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`nisshi_storage::Error::InvalidStorageOptionValue`] when an option's value
+    /// doesn't parse, or is a size too large for this platform's `usize`.
+    fn parse(storage: &Url) -> Result<Self> {
+        Ok(Self {
+            minimum_size: parse_storage_option(storage, BATCH_MIN_SIZE, SIZE_HINT, |value| {
+                human_units::Size::from_str(value)
+                    .ok()
+                    .and_then(|size| usize::try_from(size.0).ok())
+            })?,
+            maximum_delay: parse_storage_option(
+                storage,
+                BATCH_MAX_DELAY,
+                DURATION_HINT,
+                |value| {
+                    human_units::Duration::from_str(value)
+                        .ok()
+                        .map(|duration| duration.0)
+                },
+            )?,
+        })
+    }
+}
+
+const BATCH_MIN_SIZE: &str = "batch_min_size";
+const BATCH_MAX_DELAY: &str = "batch_max_delay";
+
+/// What `batch_min_size` takes. Every example here must parse (see the tests).
+const SIZE_HINT: &str = "a size in bytes, such as 512, 64k or 1m";
+
+/// What `batch_max_delay` takes. Every example here must parse (see the tests).
+const DURATION_HINT: &str = "a duration, such as 5s or 500ms";
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod batch_options_tests;
