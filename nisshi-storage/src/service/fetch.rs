@@ -2103,7 +2103,7 @@ mod tests {
             if self.keeps_read_share {
                 let permit = FetchReadShare::acquire(1)
                     .await?
-                    .ok_or_else(|| Error::Message("the read ran outside a read time_left".into()))?;
+                    .ok_or_else(|| Error::Message("the read ran outside a read share".into()))?;
                 self.kept_read_shares.lock()?.push(permit);
             }
 
