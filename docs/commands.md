@@ -18,7 +18,7 @@ Usage: nisshi [OPTIONS]
 Commands:
   broker  Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
   cat     Easily consume or produce Avro, JSON or Protobuf messages to a topic
-  topic   Create or delete topics managed by the broker
+  topic   Create, list or delete topics managed by the broker
   proxy   Apache Kafka®-compatible proxy
   help    Print this message or the help of the given subcommand(s)
 

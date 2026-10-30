@@ -64,7 +64,7 @@ To see Nisshi write topics to a data lake, try the examples for [pyiceberg](http
 Nisshi is a single statically linked binary containing the following, described in [Commands](docs/commands.md):
 
 - [broker](docs/commands.md#broker) — an Apache Kafka®-compatible broker and schema registry
-- [topic](docs/commands.md#topic) — a command line interface to create or delete topics
+- [topic](docs/commands.md#topic) — a command line interface to create, list or delete topics
 - [cat](docs/commands.md#cat) — a command line interface to consume or produce Avro, JSON, or Protobuf messages to a topic
 - [proxy](docs/commands.md#proxy) — an Apache Kafka®-compatible proxy
 

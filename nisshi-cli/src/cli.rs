@@ -32,6 +32,7 @@ mod broker;
 mod cat;
 mod generator;
 mod missing_feature;
+mod output;
 mod perf;
 mod proxy;
 mod topic;
