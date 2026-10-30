@@ -255,7 +255,7 @@ jobs:
       #   gh variable set FOSSA_LICENSING_BLOCK --body false
       # and `gh variable delete FOSSA_LICENSING_BLOCK` to block again.
       - name: FOSSA licensing guard
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-13, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
@@ -273,7 +273,7 @@ jobs:
       # but not when there is no fresh analysis to read.
       - name: FOSSA vulnerability guard
         if: ${{ !cancelled() && steps.analyze.outcome == 'success' }}
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-13, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
