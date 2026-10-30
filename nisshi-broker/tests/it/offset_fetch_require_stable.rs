@@ -27,20 +27,24 @@
 use std::collections::BTreeMap;
 
 use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
+use bytes::Bytes;
 use nisshi_broker::{
     Result,
     coordinator::group::{Coordinator as _, administrator::Controller},
 };
 use nisshi_sans_io::{
-    ErrorCode, OffsetFetchResponse,
+    BatchAttribute, ErrorCode, OffsetFetchResponse,
+    add_partitions_to_txn_request::AddPartitionsToTxnTopic,
     create_topics_request::CreatableTopic,
     offset_fetch_request::{
         OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
     },
+    record::{Record, deflated, inflated},
     txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
 };
 use nisshi_storage::{
-    OffsetCommitRequest, ProducerIdResponse, Storage, Topition, TxnOffsetCommitRequest,
+    OffsetCommitRequest, ProducerIdResponse, Storage, Topition, TxnAddPartitionsRequest,
+    TxnOffsetCommitRequest,
 };
 use rand::{RngExt as _, rng};
 use url::Url;
@@ -593,6 +597,133 @@ where
     .await
 }
 
+impl OpenTransaction {
+    /// Adds the `PENDING` partition to the transaction and produces one transactional record
+    /// to it, so that the transaction holds the partition's last stable offset.
+    async fn produce_to_pending<G>(&self, storage: &G, topic: &str) -> Result<()>
+    where
+        G: Storage,
+    {
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: self.transaction_id.clone(),
+                producer_id: self.producer.id,
+                producer_epoch: self.producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic.to_owned())
+                        .partitions(Some(vec![PENDING])),
+                ],
+            })
+            .await?;
+
+        let batch: deflated::Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from_static(b"Lorem ipsum"))))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(self.producer.id)
+            .producer_epoch(self.producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(
+                Some(self.transaction_id.as_str()),
+                &Topition::new(topic.to_owned(), PENDING),
+                batch,
+            )
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// A transaction whose commit waits behind an older open transaction on the same partition
+/// stays prepared with its offset rows. An `InitProducerId` then moves its producer to a new
+/// epoch, so the rows belong to an earlier epoch, and they keep the offset pending until the
+/// deferred commit applies. Answering the group's older committed offset as stable meanwhile
+/// would let a consumer start from it and process the transaction's records twice.
+pub async fn deferred_commit_of_reinitialized_producer_keeps_offset_pending<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let topic = create_topic(cluster_id, broker_id, &storage).await?;
+    let group_id = alphanumeric_string(15);
+
+    offset_commit(&storage, &group_id, &topic, PENDING, COMMITTED).await?;
+    offset_commit(&storage, &group_id, &topic, OTHER, OTHER_COMMITTED).await?;
+
+    // The older transaction produces to the partition, and stays open.
+    let older = alphanumeric_string(15);
+    let older_producer = storage
+        .init_producer(Some(older.as_str()), 10_000, Some(-1), Some(-1))
+        .await?;
+    assert_eq!(ErrorCode::None, older_producer.error);
+
+    let older = OpenTransaction {
+        transaction_id: older,
+        producer: older_producer,
+    };
+    older.produce_to_pending(&storage, &topic).await?;
+
+    // The group's transaction commits an offset and produces to the same partition. Its commit
+    // waits for the older transaction.
+    let transaction = OpenTransaction::begin(&storage, &group_id, &topic).await?;
+    transaction.produce_to_pending(&storage, &topic).await?;
+
+    assert_eq!(
+        ErrorCode::None,
+        storage
+            .txn_end(
+                &transaction.transaction_id,
+                transaction.producer.id,
+                transaction.producer.epoch,
+                true,
+            )
+            .await?
+    );
+
+    let producer = storage
+        .init_producer(
+            Some(transaction.transaction_id.as_str()),
+            10_000,
+            Some(transaction.producer.id),
+            Some(transaction.producer.epoch),
+        )
+        .await?;
+    assert_eq!(ErrorCode::None, producer.error);
+
+    assert_fetched(
+        &storage,
+        &group_id,
+        &topic,
+        Some(true),
+        &BTreeMap::from([
+            (PENDING, Fetched::unstable()),
+            (OTHER, Fetched::stable(OTHER_COMMITTED)),
+        ]),
+    )
+    .await?;
+
+    older.end(&storage, true).await?;
+
+    assert_fetched(
+        &storage,
+        &group_id,
+        &topic,
+        Some(true),
+        &BTreeMap::from([
+            (PENDING, Fetched::stable(IN_TRANSACTION)),
+            (OTHER, Fetched::stable(OTHER_COMMITTED)),
+        ]),
+    )
+    .await
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr $(, #[$attribute:meta])*) => {
         #[cfg(feature = $feature)]
@@ -619,6 +750,7 @@ macro_rules! backend {
             backend!(@test pending_offset_of_another_group_is_stable $(, #[$attribute])*);
             backend!(@test pending_offset_without_commit_is_unstable $(, #[$attribute])*);
             backend!(@test reinitialized_producer_ends_pending_offset $(, #[$attribute])*);
+            backend!(@test deferred_commit_of_reinitialized_producer_keeps_offset_pending $(, #[$attribute])*);
         }
     };
 
