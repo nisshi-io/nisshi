@@ -31,7 +31,7 @@ use nisshi_sans_io::{
     txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
 };
 use nisshi_service::FrameRouteService;
-use nisshi_storage::{ArcDynStorage, Storage, TopicCreationConfig, Topition};
+use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, Storage, TopicCreationConfig, Topition};
 use rama::{Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use url::Url;
@@ -123,6 +123,7 @@ impl Fixture {
             broker.clone(),
             storage.clone(),
             TopicCreationConfig::default(),
+            AutoCreateRefusals::default(),
         )
         .and_then(|builder| builder.build().map_err(Into::into))?;
 
