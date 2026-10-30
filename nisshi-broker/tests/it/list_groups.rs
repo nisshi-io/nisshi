@@ -137,6 +137,7 @@ fn detail_with_one_member(
             GroupMember {
                 join_response: JoinGroupResponseMember::default().member_id(member_id.into()),
                 last_contact: Some(SystemTime::now()),
+                ..GroupMember::default()
             },
         )]
         .into(),

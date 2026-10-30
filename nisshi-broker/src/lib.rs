@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::todo, clippy::unimplemented)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use std::{
     collections::HashMap,
     env::vars,
@@ -94,6 +103,13 @@ pub enum Error {
     /// Another socket already listens on the address that the broker's listener binds.
     ListenerInUse {
         addr: SocketAddr,
+    },
+
+    /// The host of the broker's listener URL is a name that did not resolve to an address.
+    ListenerHostUnresolved {
+        host: String,
+        port: u16,
+        source: Arc<io::Error>,
     },
 
     Message(String),

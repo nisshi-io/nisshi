@@ -254,7 +254,9 @@ mod channel;
 mod consumer;
 mod frame;
 mod input;
+mod peer_address;
 mod stream;
+mod transaction_abortable;
 mod version_gate;
 
 pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
@@ -265,12 +267,18 @@ pub use version_gate::{
 
 pub use input::TcpListenerInput;
 
+pub use transaction_abortable::{
+    TransactionAbortableDowngradeLayer, TransactionAbortableDowngradeService,
+};
+
 pub use channel::{
     ChannelFrameLayer, ChannelFrameService, FrameChannelService, FrameReceiver, FrameSender,
     bounded_channel,
 };
 
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
+
+pub use peer_address::PeerAddressExtension;
 
 pub use frame::{
     BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,

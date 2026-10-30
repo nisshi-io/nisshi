@@ -364,6 +364,9 @@ pub enum Error {
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
     NotAuthenticated,
+    /// Appending a batch to another overflows an `i32` offset delta. The value names the sum that
+    /// overflows: `"record offset_delta"` or `"last_offset_delta"`.
+    OffsetDeltaOverflow(&'static str),
     Overflow,
     ParseFilter(Arc<ParseError>),
     ParseScram(String),
@@ -398,6 +401,9 @@ impl Display for Error {
             }
             Error::FromUtf8 { len, error } => {
                 write!(f, "string of {len} bytes is not valid UTF-8: {error}")
+            }
+            Error::OffsetDeltaOverflow(sum) => {
+                write!(f, "{sum} overflows i32 when a batch is appended")
             }
             e => write!(f, "{e:?}"),
         }
@@ -1002,6 +1008,7 @@ impl TryFrom<&i16> for ErrorCode {
             117 => Ok(Self::UnknownSubscriptionId),
             118 => Ok(Self::TelemetryTooLarge),
             119 => Ok(Self::InvalidRegistration),
+            120 => Ok(Self::TransactionAbortable),
             otherwise => Err(Error::UnknownApiErrorCode(*otherwise)),
         }
     }
@@ -1138,6 +1145,7 @@ impl From<&ErrorCode> for i16 {
             ErrorCode::UnknownSubscriptionId => 117,
             ErrorCode::TelemetryTooLarge => 118,
             ErrorCode::InvalidRegistration => 119,
+            ErrorCode::TransactionAbortable => 120,
         }
     }
 }
@@ -1494,6 +1502,10 @@ impl Display for ErrorCode {
             ErrorCode::InvalidRegistration => {
                 f.write_str("The controller has considered the broker registration to be invalid.")
             }
+            ErrorCode::TransactionAbortable => f.write_str(
+                "The server encountered an error with the transaction. The client can abort the \
+                 transaction to continue using this transactional ID.",
+            ),
         }
     }
 }
@@ -1626,6 +1638,7 @@ pub enum ErrorCode {
     UnknownSubscriptionId,
     TelemetryTooLarge,
     InvalidRegistration,
+    TransactionAbortable,
 }
 
 #[derive(
@@ -2471,6 +2484,13 @@ mod tests {
     use std::{io::Write, thread::sleep};
 
     use super::*;
+
+    #[test]
+    fn transaction_abortable_is_error_code_120() -> Result<()> {
+        assert_eq!(ErrorCode::TransactionAbortable, ErrorCode::try_from(120)?);
+        assert_eq!(120, i16::from(ErrorCode::TransactionAbortable));
+        Ok(())
+    }
 
     // cargo-nextest runs each test as its own process, so this tracks
     // allocations for exactly one test at a time (plus negligible runtime

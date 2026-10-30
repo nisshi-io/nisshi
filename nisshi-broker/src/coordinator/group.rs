@@ -40,12 +40,14 @@ pub struct OffsetCommit<'a> {
 pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
     /// Handles a `JoinGroup` of `api_version`, which decides whether a dynamic member without a
     /// member id gets `MEMBER_ID_REQUIRED`. A `rebalance_timeout_ms` of `None`, from version 0,
-    /// means the session timeout.
+    /// means the session timeout. `client_host` is the client's address as `DescribeGroups`
+    /// reports it, or `None` for a connection that the broker did not accept itself.
     #[allow(clippy::too_many_arguments)]
     async fn join(
         &self,
         api_version: i16,
         client_id: Option<&str>,
+        client_host: Option<&str>,
         group_id: &str,
         session_timeout_ms: i32,
         rebalance_timeout_ms: Option<i32>,

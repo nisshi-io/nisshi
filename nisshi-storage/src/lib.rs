@@ -111,7 +111,16 @@
 //! ```
 //!
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::todo, clippy::unimplemented)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use async_trait::async_trait;
 use bytes::{Bytes, TryGetError};
 
@@ -198,33 +207,40 @@ mod inflate;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
+pub mod offset_metadata;
 mod producer;
 mod proxy;
 mod service;
+mod topic_creation;
+mod topic_defaults;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
-pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
+pub use producer::{
+    OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim,
+};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
+pub use service::read_share;
+pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
+    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
     CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
     DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FetchValidationLayer, FetchValidationService, FindCoordinatorService,
-    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
-    MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
-    RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, bounded_channel, describe_groups_response, inflate_produced,
-    list_groups_response,
+    IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
+    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, ProduceService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -464,6 +480,20 @@ pub enum Error {
     UnexpectedSqliteValue(SqliteValueSummary),
 
     UnknownCacheKey(String),
+
+    /// A storage URL gave an option that the engine reads, with a value that the
+    /// engine cannot parse.
+    InvalidStorageOptionValue {
+        scheme: String,
+        option: String,
+        value: String,
+
+        /// The values that the option takes, for example `"single or multi"`.
+        /// The engine that defines the option writes this hint, so a message
+        /// can tell the user what to give without knowing every engine's
+        /// options.
+        expected: &'static str,
+    },
 
     /// A storage URL named a query option that scheme's engine does not
     /// recognise (for example a typo, or an option that belongs to a
@@ -870,6 +900,43 @@ impl TryFrom<&OffsetCommitRequestPartition> for OffsetCommitRequest {
     }
 }
 
+/// Committed Offset
+///
+/// The offset that a consumer group committed for a partition, with the leader
+/// epoch and the metadata of that commit.
+///
+/// The type does not implement `Default`, because an offset of 0 tells a consumer to
+/// read the partition from its start. [`CommittedOffset::uncommitted`] is the value for
+/// a partition without a committed offset.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct CommittedOffset {
+    pub offset: i64,
+    pub leader_epoch: Option<i32>,
+    pub metadata: Option<String>,
+}
+
+impl CommittedOffset {
+    /// Returns the committed offset of a partition that the group has not
+    /// committed: offset -1, with no leader epoch and no metadata.
+    pub fn uncommitted() -> Self {
+        Self {
+            offset: -1,
+            leader_epoch: None,
+            metadata: None,
+        }
+    }
+}
+
+impl From<OffsetCommitRequest> for CommittedOffset {
+    fn from(value: OffsetCommitRequest) -> Self {
+        Self {
+            offset: value.offset,
+            leader_epoch: value.leader_epoch,
+            metadata: value.metadata,
+        }
+    }
+}
+
 /// Topic Id
 ///
 /// An enumeration of either the name or UUID of a topic.
@@ -1082,6 +1149,15 @@ pub fn delete_records_cutoff(requested: i64, stage: &OffsetStage) -> Result<i64,
 pub struct GroupMember {
     pub join_response: JoinGroupResponseMember,
     pub last_contact: Option<SystemTime>,
+    /// The client id in the header of the member's last `JoinGroup`. It is empty for a member
+    /// whose stored group lacks the field, until the member joins again.
+    #[serde(default)]
+    pub client_id: String,
+    /// The address that the member's last `JoinGroup` came from, as Kafka writes it: `/` and the
+    /// IP address. It is empty for a member whose stored group lacks the field, until the member
+    /// joins again.
+    #[serde(default)]
+    pub client_host: String,
 }
 
 /// Group State
@@ -1307,26 +1383,40 @@ impl From<&GroupDetail> for ConsumerGroupState {
     }
 }
 
-impl From<&GroupDetail> for consumer_group_describe_response::DescribedGroup {
-    fn from(value: &GroupDetail) -> Self {
-        let assignor_name = match value.state {
-            GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-            GroupState::Formed { ref leader, .. } => leader.clone(),
-        };
+/// Returns the `ConsumerGroupDescribe` row for the stored group `group_id`.
+///
+/// `ConsumerGroupDescribe` describes only a group of the KIP-848 consumer protocol, whose members
+/// send `ConsumerGroupHeartbeat`. Nisshi forms each group through `JoinGroup` and `SyncGroup`, so
+/// each group is a classic group. This function answers `GROUP_ID_NOT_FOUND` for it, as Kafka's
+/// group coordinator does for a classic group ([`GroupMetadataManager.consumerGroup`]), and an
+/// admin client then describes the group with `DescribeGroups`. If the broker answered `NONE`
+/// with an empty member list, the admin client would not fall back to `DescribeGroups`, and it
+/// would report the group without members.
+///
+/// [`GroupMetadataManager.consumerGroup`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+fn classic_group_consumer_group_describe_row(
+    group_id: String,
+) -> consumer_group_describe_response::DescribedGroup {
+    let error_message = format!("Group {group_id} is not a consumer group.");
+    consumer_group_describe_error_row(group_id, ErrorCode::GroupIdNotFound, error_message)
+}
 
-        let group_state = ConsumerGroupState::from(value).to_string();
-
-        Self::default()
-            .error_code(ErrorCode::None.into())
-            .error_message(Some(ErrorCode::None.to_string()))
-            .group_id(Default::default())
-            .group_state(group_state)
-            .group_epoch(-1)
-            .assignment_epoch(-1)
-            .assignor_name(assignor_name)
-            .members(Some([].into()))
-            .authorized_operations(authorized_operations::OMITTED)
-    }
+/// Returns the `ConsumerGroupDescribe` row that answers `error_code` for the group `group_id`.
+fn consumer_group_describe_error_row(
+    group_id: String,
+    error_code: ErrorCode,
+    error_message: String,
+) -> consumer_group_describe_response::DescribedGroup {
+    consumer_group_describe_response::DescribedGroup::default()
+        .error_code(error_code.into())
+        .error_message(Some(error_message))
+        .group_id(group_id)
+        .group_state(ConsumerGroupState::Unknown.to_string())
+        .group_epoch(-1)
+        .assignment_epoch(-1)
+        .assignor_name("".into())
+        .members(Some([].into()))
+        .authorized_operations(authorized_operations::OMITTED)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1381,43 +1471,16 @@ impl NamedGroupDetail {
 
 impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGroup {
     fn from(value: &NamedGroupDetail) -> Self {
-        match value {
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::Found(group_detail),
-            } => {
-                let assignor_name = match group_detail.state {
-                    GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-                    GroupState::Formed { ref leader, .. } => leader.clone(),
-                };
-
-                let group_state = ConsumerGroupState::from(group_detail).to_string();
-
-                Self::default()
-                    .error_code(ErrorCode::None.into())
-                    .error_message(Some(ErrorCode::None.to_string()))
-                    .group_id(name.into())
-                    .group_state(group_state)
-                    .group_epoch(-1)
-                    .assignment_epoch(-1)
-                    .assignor_name(assignor_name)
-                    .members(Some([].into()))
-                    .authorized_operations(authorized_operations::OMITTED)
+        match &value.response {
+            GroupDetailResponse::Found(_) => {
+                classic_group_consumer_group_describe_row(value.name.clone())
             }
 
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::ErrorCode(error_code),
-            } => Self::default()
-                .error_code((*error_code).into())
-                .error_message(Some(error_code.to_string()))
-                .group_id(name.into())
-                .group_state(ConsumerGroupState::from(value).to_string())
-                .group_epoch(-1)
-                .assignment_epoch(-1)
-                .assignor_name("".into())
-                .members(Some([].into()))
-                .authorized_operations(authorized_operations::OMITTED),
+            GroupDetailResponse::ErrorCode(error_code) => consumer_group_describe_error_row(
+                value.name.clone(),
+                *error_code,
+                error_code.to_string(),
+            ),
         }
     }
 }
@@ -1429,31 +1492,74 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                 name,
                 response: GroupDetailResponse::Found(group_detail),
             } => {
-                let group_state = ConsumerGroupState::from(group_detail).to_string();
+                let group_state = ConsumerGroupState::from(group_detail);
+
+                // Kafka reports the group's protocol, and each member's metadata and assignment,
+                // only for a Stable group ([`GroupMetadata.summary`]). In another state, the
+                // members' metadata may be for a protocol the group has not selected yet.
+                //
+                // [`GroupMetadata.summary`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupMetadata.scala
+                let is_stable = group_state == ConsumerGroupState::Stable;
+                let assignments = group_detail.state.assignments();
 
                 let members = group_detail
                     .members
-                    .keys()
-                    .map(|member_id| {
+                    .iter()
+                    .map(|(member_id, member)| {
+                        let (member_metadata, member_assignment) = if is_stable {
+                            (
+                                member.join_response.metadata.clone(),
+                                assignments.get(member_id).cloned().unwrap_or_default(),
+                            )
+                        } else {
+                            (Bytes::new(), Bytes::new())
+                        };
+
                         describe_groups_response::DescribedGroupMember::default()
                             .member_id(member_id.into())
-                            .group_instance_id(None)
-                            .client_id("".into())
-                            .client_host("".into())
-                            .member_metadata(Bytes::new())
-                            .member_assignment(Bytes::new())
+                            .group_instance_id(member.join_response.group_instance_id.clone())
+                            .client_id(member.client_id.clone())
+                            .client_host(member.client_host.clone())
+                            .member_metadata(member_metadata)
+                            .member_assignment(member_assignment)
                     })
                     .collect::<Vec<_>>();
+
+                let protocol_data = if is_stable {
+                    group_detail.state.protocol_name().unwrap_or_default()
+                } else {
+                    String::new()
+                };
 
                 Self::default()
                     .error_code(ErrorCode::None.into())
                     .group_id(name.clone())
-                    .group_state(group_state)
+                    .group_state(group_state.to_string())
                     .protocol_type(group_detail.state.protocol_type().unwrap_or_default())
-                    .protocol_data("".into())
+                    .protocol_data(protocol_data)
                     .members(Some(members))
                     .authorized_operations(Some(authorized_operations::OMITTED))
             }
+
+            // `DescribeGroups` v0 to v5 describes a group that does not exist with the error
+            // NONE and the state `Dead`. Kafka adds `GROUP_ID_NOT_FOUND` to `DescribeGroups` from
+            // v6 ([KIP-1043]), and Nisshi supports v5 at most. An admin client reads the group
+            // as missing from `Dead`, but fails on `GROUP_ID_NOT_FOUND` as an unexpected error
+            // ([`GroupCoordinator.handleDescribeGroup`]).
+            //
+            // [KIP-1043]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
+            // [`GroupCoordinator.handleDescribeGroup`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
+            NamedGroupDetail {
+                name,
+                response: GroupDetailResponse::ErrorCode(ErrorCode::GroupIdNotFound),
+            } => Self::default()
+                .error_code(ErrorCode::None.into())
+                .group_id(name.clone())
+                .group_state(ConsumerGroupState::Dead.to_string())
+                .protocol_type("".into())
+                .protocol_data("".into())
+                .members(Some(vec![]))
+                .authorized_operations(Some(authorized_operations::OMITTED)),
 
             NamedGroupDetail {
                 name,
@@ -1870,15 +1976,35 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Vec<(Topition, ErrorCode)>>;
 
     /// Fetch committed offsets for one or more topic partitions in a consumer group.
+    ///
+    /// The group coordinator answers `require_stable` with
+    /// [`Storage::pending_txn_offsets`], so an engine may ignore it here.
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>>;
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
     /// Fetch all committed offsets in a consumer group.
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>>;
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
+
+    /// Returns the partitions for which an open transaction has committed an offset of the
+    /// consumer group with `TxnOffsetCommit`, and has not yet ended.
+    ///
+    /// The current epoch of each transactional producer counts, and an earlier epoch only
+    /// while its end is prepared and waits behind an older open transaction: an
+    /// `InitProducerId` that moves the producer to a new epoch ends its earlier open
+    /// transaction in Kafka. An `OffsetFetch` with `require_stable` answers
+    /// `UNSTABLE_OFFSET_COMMIT` for each of these partitions.
+    ///
+    /// A transaction that only commits offsets, with no `AddPartitionsToTxn`, is not timed
+    /// out: its partitions stay unstable until its `EndTxn`, or until an `InitProducerId`
+    /// moves its producer to a new epoch.
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
@@ -1906,6 +2032,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// [`DescribeConfigsService`] answers a [`ConfigResource::Broker`] resource itself, so an
     /// implementation needs to answer only the other resource types.
+    ///
+    /// For a topic, an implementation returns only the configs that the topic sets, and answers
+    /// [`ErrorCode::UnknownTopicOrPartition`] for a topic that it doesn't store.
+    /// [`DescribeConfigsService`] adds Kafka's default for each other topic config when the error
+    /// code is [`ErrorCode::None`]. The broker also calls this method, and reads a config that the
+    /// topic doesn't set as Nisshi's own default.
     async fn describe_config(
         &self,
         name: &str,
@@ -2122,14 +2254,21 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
@@ -2396,14 +2535,21 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
@@ -2680,6 +2826,42 @@ pub fn reject_unrecognized_options(storage: &Url, recognized: &[&str]) -> Result
                 option: k.into_owned(),
             })
         })
+}
+
+/// Returns the value of the query option `option` in `storage`, parsed with `parse`, or
+/// `None` when the URL doesn't give the option.
+///
+/// Every occurrence of the option must parse, and the last one is used, as the broker
+/// does for its own options. A [`StorageFactory::build`] calls this for each option that
+/// its engine reads, so a value that doesn't parse stops startup instead of being
+/// replaced by the default.
+///
+/// # Errors
+///
+/// [`Error::InvalidStorageOptionValue`], with `expected` as its hint, for the first
+/// occurrence whose value `parse` rejects.
+pub fn parse_storage_option<T>(
+    storage: &Url,
+    option: &str,
+    expected: &'static str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>> {
+    let mut parsed = None;
+
+    for (key, value) in storage.query_pairs() {
+        if key == option {
+            parsed = Some(
+                parse(&value).ok_or_else(|| Error::InvalidStorageOptionValue {
+                    scheme: storage.scheme().to_owned(),
+                    option: option.to_owned(),
+                    value: value.into_owned(),
+                    expected,
+                })?,
+            );
+        }
+    }
+
+    Ok(parsed)
 }
 
 impl<N, C, A, S> Builder<N, C, A, S> {
@@ -3019,6 +3201,33 @@ mod tests {
         assert!(debug.contains("iterations: 4096"), "{debug}");
     }
 
+    /// Every engine except SlateDB stores a group as JSON. After an upgrade, the broker reads
+    /// groups that an earlier version stored, whose members do not have a `client_id` or
+    /// `client_host` field. If the broker fails to decode such a group, `DescribeGroups` answers
+    /// `UNKNOWN_SERVER_ERROR` for it. Decoding must give such a member an empty client id and
+    /// host.
+    #[test]
+    fn member_stored_without_client_id_and_host_reads_with_empty_ones() -> serde_json::Result<()> {
+        let mut stored = serde_json::to_value(detail_with_one_member(
+            GroupState::default(),
+            GroupRebalance::default(),
+        ))?;
+        let member = stored["members"]["member"]
+            .as_object_mut()
+            .expect("a stored member is a JSON object");
+        assert!(member.remove("client_id").is_some());
+        assert!(member.remove("client_host").is_some());
+
+        let detail = serde_json::from_value::<GroupDetail>(stored)?;
+
+        let member = &detail.members["member"];
+        assert_eq!(
+            ("", ""),
+            (member.client_id.as_str(), member.client_host.as_str())
+        );
+        Ok(())
+    }
+
     /// Returns a detail with one member, in the given group state and rebalance.
     fn detail_with_one_member(state: GroupState, rebalance: GroupRebalance) -> GroupDetail {
         GroupDetail {
@@ -3027,6 +3236,7 @@ mod tests {
                 GroupMember {
                     join_response: JoinGroupResponseMember::default().member_id("member".into()),
                     last_contact: None,
+                    ..GroupMember::default()
                 },
             )]
             .into(),
@@ -3422,5 +3632,64 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn parse_mode(storage: &str) -> Result<Option<String>> {
+        parse_storage_option(&Url::parse(storage)?, "mode", "fast or slow", |value| {
+            ["fast", "slow"].contains(&value).then(|| value.to_owned())
+        })
+    }
+
+    #[test]
+    fn parse_storage_option_without_the_option_returns_none() -> Result<()> {
+        assert_eq!(None, parse_mode("sqlite://nisshi.db")?);
+        assert_eq!(None, parse_mode("sqlite://nisshi.db?other=fast")?);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_returns_the_parsed_value() -> Result<()> {
+        assert_eq!(
+            Some("fast".to_owned()),
+            parse_mode("sqlite://nisshi.db?mode=fast")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_uses_the_last_occurrence() -> Result<()> {
+        assert_eq!(
+            Some("slow".to_owned()),
+            parse_mode("sqlite://nisshi.db?mode=fast&mode=slow")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_names_the_scheme_option_value_and_hint() {
+        assert_matches!(
+            parse_mode("sqlite://nisshi.db?mode=Fast"),
+            Err(Error::InvalidStorageOptionValue { scheme, option, value, expected })
+                if scheme == "sqlite"
+                    && option == "mode"
+                    && value == "Fast"
+                    && expected == "fast or slow"
+        );
+    }
+
+    /// A value that doesn't parse is an error wherever it is, even when another
+    /// occurrence of the option parses.
+    #[test]
+    fn parse_storage_option_rejects_any_occurrence_that_does_not_parse() {
+        for storage in [
+            "sqlite://nisshi.db?mode=Fast&mode=slow",
+            "sqlite://nisshi.db?mode=slow&mode=Fast",
+        ] {
+            assert_matches!(
+                parse_mode(storage),
+                Err(Error::InvalidStorageOptionValue { value, .. }) if value == "Fast",
+                "{storage}"
+            );
+        }
     }
 }

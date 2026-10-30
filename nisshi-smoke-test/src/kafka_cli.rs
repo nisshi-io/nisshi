@@ -83,8 +83,6 @@ pub const SASL_AUTHENTICATION_EXCEPTION: &str = "SaslAuthenticationException";
 /// What the tools print when the broker answers a SaslHandshake with
 /// `UNSUPPORTED_SASL_MECHANISM`, ahead of the broker's list of enabled mechanisms.
 pub const SASL_MECHANISM_NOT_ENABLED: &str = "not enabled in the server, enabled mechanisms are";
-/// The name the tools print for the broker's `GROUP_ID_NOT_FOUND` error.
-pub const GROUP_ID_NOT_FOUND_EXCEPTION: &str = "GroupIdNotFoundException";
 /// The name the tools print for the broker's `NON_EMPTY_GROUP` error.
 pub const GROUP_NOT_EMPTY_EXCEPTION: &str = "GroupNotEmptyException";
 /// The name the tools print for the broker's `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` error.
@@ -101,8 +99,8 @@ pub use console_consumer::{
 };
 pub use console_producer::KafkaConsoleProducer;
 pub use consumer_groups::{
-    DescribeGroup, DescribeGroupMembers, DescribeGroupState, GroupOffsets, GroupState,
-    KafkaConsumerGroups, ListGroups, ListGroupsInState,
+    DescribeGroup, DescribeGroupMembers, DescribeGroupState, DescribedMember, GroupOffsets,
+    GroupState, KafkaConsumerGroups, ListGroups, ListGroupsInState,
 };
 pub use delete_records::{DeleteRecords, KafkaDeleteRecords};
 pub use get_offsets::{GetOffsets, KafkaGetOffsets};

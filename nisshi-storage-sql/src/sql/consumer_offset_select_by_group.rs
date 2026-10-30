@@ -29,5 +29,9 @@ sql_row! {
         partition: i32,
         /// The committed offset.
         committed_offset: i64,
+        /// The leader epoch of the commit, or `None` when the commit did not give one.
+        leader_epoch: Option<i32>,
+        /// The metadata of the commit, or `None` when the commit did not give any.
+        metadata: Option<String>,
     }
 }

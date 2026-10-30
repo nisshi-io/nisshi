@@ -34,6 +34,9 @@ c.name = $1
 and t.name = $2
 and tp.partition = $3
 
--- The lock leaves out topic_configuration, because PostgreSQL cannot lock the
--- nullable side of an outer join.
-for no key update of c, t, tp, w;
+-- The query locks the watermark row, so that the writes to one partition assign
+-- their offsets one after the other. The query locks only that row. It joins
+-- every partition of a cluster to the same cluster row, and every partition of
+-- a topic to the same topic row. If the query locked either of those rows, each
+-- produce would wait for the produces to other partitions.
+for no key update of w;
