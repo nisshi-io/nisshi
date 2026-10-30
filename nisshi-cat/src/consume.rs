@@ -261,7 +261,7 @@ impl Consume {
                                 FetchPartition::default()
                                     .partition(self.configuration.partition)
                                     .log_start_offset(Some(self.configuration.fetch_offset))
-                                    .partition_max_bytes(self.configuration.partition_max_bytes),
+                                    .partition_max_bytes(4096),
                             ])),
                     ]))
                     .forgotten_topics_data(Some([].into()))
