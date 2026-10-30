@@ -1171,10 +1171,13 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
         ("010-cluster.sql", include_sql!("ddl/010-cluster.sql")),
         (
             "020-consumer-group.sql",
-            include_sql!("ddl/020-consumer-group.sql"),
+            include_sql!("limbo/ddl/020-consumer-group.sql"),
         ),
-        ("020-producer.sql", include_sql!("ddl/020-producer.sql")),
-        ("020-topic.sql", include_sql!("ddl/020-topic.sql")),
+        (
+            "020-producer.sql",
+            include_sql!("limbo/ddl/020-producer.sql"),
+        ),
+        ("020-topic.sql", include_sql!("limbo/ddl/020-topic.sql")),
         (
             "030-consumer-group-detail.sql",
             include_sql!("ddl/030-consumer-group-detail.sql"),
@@ -1258,7 +1261,8 @@ impl Builder<String, i32, Url, Url> {
                 .execute(ddl.as_str(), ())
                 .await
                 .inspect(|rows| debug!(name, rows))
-                .inspect_err(|err| error!(name, ?err));
+                .inspect_err(|err| error!(name, ?err))
+                .map_err(|err| Error::Message(format!("{name}: {err}")))?;
         }
 
         Ok(Engine {
@@ -4175,7 +4179,7 @@ impl Storage for Engine {
 
     async fn ping(&self) -> Result<()> {
         let c = self.connection().await?;
-        let _ = c.query("ping.sql", ()).await?;
+        let _ = c.query(&sql_lookup("ping.sql")?, ()).await?;
         Ok(())
     }
 }
@@ -4510,7 +4514,7 @@ mod tests {
         assert_eq!(
             0,
             connection
-                .execute(&include_sql!("ddl/020-topic.sql"), ())
+                .execute(&include_sql!("limbo/ddl/020-topic.sql"), ())
                 .await?
         );
 
@@ -4564,7 +4568,11 @@ mod tests {
             tx.execute(&include_sql!("ddl/010-cluster.sql"), ()).await?
         );
 
-        assert_eq!(0, tx.execute(&include_sql!("ddl/020-topic.sql"), ()).await?);
+        assert_eq!(
+            0,
+            tx.execute(&include_sql!("limbo/ddl/020-topic.sql"), ())
+                .await?
+        );
 
         let cluster = "nisshi";
 
