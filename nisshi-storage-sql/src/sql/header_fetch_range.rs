@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The query that reads the headers of several records of a partition, ordered by the record's
-//! offset and then by the header's order in the record, and [`Row`], one header of its result.
+//! offset and then by the header's order in the record.
 //!
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! partition's index, and `$4` the array of the records' offsets.

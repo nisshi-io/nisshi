@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The query that adds the next epoch to a producer, and returns it. It returns no row when the
+//! The query that adds the next epoch to a producer and returns it. It returns no row when the
 //! producer does not exist, or when its newest epoch is `i16::MAX`.
 //!
 //! The query takes two parameters: `$1` is the cluster's name, and `$2` the producer ID.

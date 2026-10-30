@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The queries that answer a ListOffsets request for one partition, and [`Row`], their result.
-//! An engine runs one of the four versions and reads its row the same way, so a change to one
-//! version's `select` list must keep the column names that [`Row`] declares.
+//! The queries that answer a ListOffsets request for one partition. An engine runs one of the four
+//! versions, and every version returns the same columns.
 //!
 //! Each version takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the partition's index. The timestamp version also takes the timestamp as `$4`. The earliest and

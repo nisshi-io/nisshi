@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `watermark_insert.sql` query, which creates the watermarks of one partition of a topic, and
-//! [`Row`], the row that it returns. A change to the query's
-//! `returning` list must keep the column names that [`Row`] declares.
+//! The query that creates the watermarks of one partition of a topic and returns their row ID.
 //!
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the partition's index.

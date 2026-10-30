@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The queries that read the records of a fetch, in offset order, and [`Row`], one record of their
-//! result. The four versions return the same columns, so a change to one version's `select` list
-//! must keep the column names that [`Row`] declares.
+//! The queries that read the records of a fetch, in offset order. The four versions return the same
+//! columns.
 //!
 //! Each version takes at least six parameters: `$1` is the cluster's name, `$2` the topic's name,
 //! `$3` the partition's index, `$4` the fetch offset, `$5` the fetch's byte limit, and `$6` the

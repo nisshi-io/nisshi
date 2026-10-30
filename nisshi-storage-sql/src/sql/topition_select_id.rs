@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topition_select_id.sql` query, which finds the row ID of one partition of a topic, and
-//! [`Row`], one row of its result. A change to the query's `select` list must keep the column names
-//! that [`Row`] declares.
+//! The query that finds the row ID of one partition of a topic. It returns no row when the
+//! partition does not exist.
 //!
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
-//! the partition's index. It returns one row for a partition that exists, and none for a partition
-//! that does not.
+//! the partition's index.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topition_select_id.sql";

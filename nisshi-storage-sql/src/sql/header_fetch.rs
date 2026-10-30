@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The query that reads the headers of one record, in their order in the record, and [`Row`], one
-//! header of its result.
+//! The query that reads the headers of one record, in their order in the record.
 //!
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! partition's index, and `$4` the record's offset.

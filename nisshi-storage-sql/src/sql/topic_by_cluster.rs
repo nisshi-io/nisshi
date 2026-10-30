@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_by_cluster.sql` query, which returns a [`row::topic`](super::row::topic) row. A
-//! change to the query's `select` list must keep the column names that [`Row`] declares.
+//! The query that reads each topic of a cluster.
 //!
-//! The query takes one parameter, `$1`: the cluster's name. It returns one row for each topic of
-//! the cluster.
+//! The query takes one parameter, `$1`: the cluster's name.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_by_cluster.sql";

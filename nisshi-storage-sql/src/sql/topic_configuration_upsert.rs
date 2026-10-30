@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_configuration_upsert.sql` query, which sets one config of a topic, and
-//! [`Row`], the row that it returns. A change to the query's
-//! `returning` list must keep the column names that [`Row`] declares.
+//! The query that sets one config of a topic and returns the config's row ID.
 //!
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! config's key, and `$4` its value.

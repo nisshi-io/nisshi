@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_select_name.sql` query, which returns a [`row::topic`](super::row::topic) row. A
-//! change to the query's `select` list must keep the column names that [`Row`] declares.
+//! The query that finds a topic by its name. It returns no row when the topic does not exist.
 //!
-//! The query takes two parameters: `$1` is the cluster's name, and `$2` the topic's name. It
-//! returns one row for a topic that exists, and none for a topic that does not.
+//! The query takes two parameters: `$1` is the cluster's name, and `$2` the topic's name.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_select_name.sql";

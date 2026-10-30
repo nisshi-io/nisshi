@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `virtual_topic_upsert.sql` query, which stores a virtual topic, and
-//! [`Row`], the row that it returns. A change to the query's `returning`
-//! list must keep the column names that [`Row`] declares.
+//! The query that stores a virtual topic and returns its ID. It keeps the stored ID of a virtual
+//! topic that exists.
 //!
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
-//! virtual topic's key, and `$4` its ID. The query keeps the stored ID of a virtual topic that
-//! exists.
+//! virtual topic's key, and `$4` its ID.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "virtual_topic_upsert.sql";

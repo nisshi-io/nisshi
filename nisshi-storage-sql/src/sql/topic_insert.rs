@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_insert.sql` query, which creates a topic, and [`Row`], the row that it returns. A
-//! change to the query's `returning` list must keep the column names that [`Row`] declares.
+//! The query that creates a topic and returns the topic's ID.
 //!
-//! The query takes five parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` its
-//! ID, `$4` its partition count, and `$5` its replication factor.
+//! The query takes five parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` its ID,
+//! `$4` its partition count, and `$5` its replication factor.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_insert.sql";

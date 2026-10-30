@@ -12,13 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The query that finds a topic or a virtual topic by its ID, which returns a
-//! [`row::topic`](super::row::topic) row. A change to either version's `select` list must keep the
-//! column names that [`Row`] declares.
+//! The query that finds a topic or a virtual topic by its ID. It returns no row when the cluster
+//! does not hold the ID. A virtual topic's name is its topic's name, a `/`, and its key.
 //!
-//! The query takes two parameters: `$1` is the cluster's name, and `$2` the ID. It returns one row
-//! for a topic or a virtual topic that exists, and none for an ID that the cluster does not hold.
-//! A virtual topic's name is its topic's name, a `/`, and its key.
+//! The query takes two parameters: `$1` is the cluster's name, and `$2` the ID.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_select_uuid.sql";

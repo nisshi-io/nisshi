@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The query that adds a producer to a cluster, and returns the producer's ID.
+//! The query that adds a producer to a cluster and returns the producer's ID.
 //!
 //! The query takes one parameter: `$1` is the cluster's name.
 

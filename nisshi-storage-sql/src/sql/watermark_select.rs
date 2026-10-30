@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `watermark_select.sql` query and [`Row`], one row of its result. A change to the query's
-//! `select` list must keep the column names that [`Row`] declares.
+//! The query that reads a partition's low and high watermarks, and the first offset of its oldest
+//! unfinished transaction. That offset is null when the partition has no unfinished transaction. It
+//! returns no row when the partition does not exist.
 //!
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
-//! the partition's index. It returns one row for a partition that exists, and none for a partition
-//! that does not.
+//! the partition's index.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "watermark_select.sql";
