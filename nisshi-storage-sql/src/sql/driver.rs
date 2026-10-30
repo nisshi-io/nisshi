@@ -333,6 +333,22 @@ mod turso {
         }
     }
 
+    /// Returns the integer in `value`, or an error for a value of another kind.
+    fn integer_of(value: Value) -> Result<i64> {
+        match value {
+            Value::Integer(integer) => Ok(integer),
+            value => Err(Error::UnexpectedTursoValue(value)),
+        }
+    }
+
+    /// Returns the text in `value`, or an error for a value of another kind.
+    fn text_of(value: Value) -> Result<String> {
+        match value {
+            Value::Text(text) => Ok(text),
+            value => Err(Error::UnexpectedTursoValue(value)),
+        }
+    }
+
     impl DriverRowCursor for Rows {
         type Row = Row;
 
@@ -343,38 +359,28 @@ mod turso {
 
     impl DriverRow for Row {
         fn integer(&self, index: usize) -> Result<Option<i64>> {
-            nullable_value(self, index)?
-                .map(|value| match value {
-                    Value::Integer(integer) => Ok(integer),
-                    value => Err(Error::UnexpectedValue(value)),
-                })
-                .transpose()
+            nullable_value(self, index)?.map(integer_of).transpose()
         }
 
         fn boolean(&self, index: usize) -> Result<Option<bool>> {
-            nullable_value(self, index)?
-                .map(|value| match value {
-                    Value::Integer(0) => Ok(false),
-                    Value::Integer(1) => Ok(true),
-                    value => Err(Error::UnexpectedValue(value)),
+            self.integer(index)?
+                .map(|integer| match integer {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    integer => Err(Error::UnexpectedTursoValue(Value::Integer(integer))),
                 })
                 .transpose()
         }
 
         fn text(&self, index: usize) -> Result<Option<String>> {
-            nullable_value(self, index)?
-                .map(|value| match value {
-                    Value::Text(text) => Ok(text),
-                    value => Err(Error::UnexpectedValue(value)),
-                })
-                .transpose()
+            nullable_value(self, index)?.map(text_of).transpose()
         }
 
         fn bytes(&self, index: usize) -> Result<Option<Bytes>> {
             nullable_value(self, index)?
                 .map(|value| match value {
                     Value::Blob(blob) => Ok(Bytes::from(blob)),
-                    value => Err(Error::UnexpectedValue(value)),
+                    value => Err(Error::UnexpectedTursoValue(value)),
                 })
                 .transpose()
         }

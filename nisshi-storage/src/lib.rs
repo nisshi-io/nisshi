@@ -450,8 +450,9 @@ pub enum Error {
     #[cfg(feature = "libsql")]
     UnexpectedLibsqlValue(libsql::Value),
 
+    /// Turso returned this value for a column whose declared type can't hold it.
     #[cfg(feature = "turso")]
-    UnexpectedValue(turso::Value),
+    UnexpectedTursoValue(turso::Value),
 
     UnknownCacheKey(String),
 
