@@ -337,6 +337,19 @@ jobs:
           - postgres
           - slatedb
           - turso
+        # The database clients this leg must not compile: every engine's
+        # client but its own. `just check-storage-deps` holds the same list.
+        include:
+          - storage: dynostore
+            forbid: libsql tokio-postgres turso
+          - storage: libsql
+            forbid: tokio-postgres turso
+          - storage: postgres
+            forbid: libsql turso
+          - storage: slatedb
+            forbid: libsql tokio-postgres turso
+          - storage: turso
+            forbid: libsql tokio-postgres
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -350,6 +363,16 @@ jobs:
       # This leg only proves the feature compiles, so check skips codegen
       # and linking.
       - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}}
+      # cargo tree resolves features without compiling anything.
+      - name: Check the build compiles no other engine's database client
+        env:
+          STORAGE: ${{matrix.storage}}
+          FORBID: ${{matrix.forbid}}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # FORBID is a list of crate names
+          cargo tree -p nisshi --no-default-features --features "$STORAGE" -e normal,build --prefix none -f '{p}' \
+            | bash .github/scripts/check-storage-deps.sh "$STORAGE" $FORBID
   build-storage-lake:
     if: *tier_b_off_main
     needs: [changes]
