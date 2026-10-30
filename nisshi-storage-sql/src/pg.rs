@@ -5125,15 +5125,38 @@ mod tests {
 
         let mut failures = Vec::new();
         for row_query in sql::row_queries(sql::SqlEngine::Postgres) {
-            let checked = match connection.prepare(sql::SQL.get(row_query.query)?).await {
-                Ok(statement) => {
-                    (row_query.check_columns)(&ResultColumns::postgres(row_query.query, &statement))
+            let statement = match connection.prepare(sql::SQL.get(row_query.query)?).await {
+                Ok(statement) => statement,
+                Err(error) => {
+                    failures.push(format!("{}: {error:?}", row_query.query));
+                    continue;
                 }
-                Err(error) => Err(error.into()),
             };
 
-            if let Err(error) = checked {
+            if let Err(error) =
+                (row_query.check_columns)(&ResultColumns::postgres(row_query.query, &statement))
+            {
                 failures.push(format!("{}: {error:?}", row_query.query));
+            }
+
+            // PostgreSQL reports each column's type when it prepares the statement, so a column
+            // whose type its field can't read fails here, and not only on the path that runs the
+            // query.
+            for declared in row_query.columns {
+                if let Some(column) = statement
+                    .columns()
+                    .iter()
+                    .find(|column| column.name() == declared.name)
+                    && !declared.kind.postgres_accepts(column.type_())
+                {
+                    failures.push(format!(
+                        "{}: column {} is {}, which a field of kind {:?} can't read",
+                        row_query.query,
+                        declared.name,
+                        column.type_(),
+                        declared.kind
+                    ));
+                }
             }
         }
 

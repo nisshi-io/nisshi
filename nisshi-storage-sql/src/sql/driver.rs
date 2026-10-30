@@ -80,6 +80,39 @@ pub(crate) trait FromColumn: Sized {
     fn from_column<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
         Self::from_nullable_column(row, index)?.ok_or(Error::UnexpectedNull)
     }
+
+    /// The kind of stored value that this type reads.
+    #[cfg(test)]
+    const KIND: ColumnKind;
+}
+
+/// A kind of stored value, which one [`DriverRow`] method reads.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColumnKind {
+    Integer,
+    Boolean,
+    Text,
+    Bytes,
+    Uuid,
+    Timestamp,
+    Json,
+}
+
+/// A column of a row that [`sql_row!`] declares: the column's name, and the kind of value that
+/// its field reads.
+#[cfg(test)]
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(
+        dead_code,
+        reason = "only the PostgreSQL test reads a column's declared kind"
+    )
+)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeclaredColumn {
+    pub(crate) name: &'static str,
+    pub(crate) kind: ColumnKind,
 }
 
 impl<T: FromColumn> FromColumn for Option<T> {
@@ -90,12 +123,18 @@ impl<T: FromColumn> FromColumn for Option<T> {
     fn from_column<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
         T::from_nullable_column(row, index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = T::KIND;
 }
 
 impl FromColumn for i64 {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.integer(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Integer;
 }
 
 impl FromColumn for i32 {
@@ -105,6 +144,9 @@ impl FromColumn for i32 {
             .transpose()
             .map_err(Into::into)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Integer;
 }
 
 impl FromColumn for i16 {
@@ -114,42 +156,63 @@ impl FromColumn for i16 {
             .transpose()
             .map_err(Into::into)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Integer;
 }
 
 impl FromColumn for bool {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.boolean(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Boolean;
 }
 
 impl FromColumn for String {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.text(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Text;
 }
 
 impl FromColumn for Bytes {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.bytes(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Bytes;
 }
 
 impl FromColumn for Uuid {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.uuid(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Uuid;
 }
 
 impl FromColumn for SystemTime {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.timestamp(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Timestamp;
 }
 
 impl FromColumn for serde_json::Result<Value> {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.json(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Json;
 }
 
 #[cfg(feature = "postgres")]
@@ -183,6 +246,22 @@ mod postgres {
 
         fn accepts(ty: &Type) -> bool {
             matches!(*ty, Type::INT2 | Type::INT4 | Type::INT8)
+        }
+    }
+
+    #[cfg(test)]
+    impl super::ColumnKind {
+        /// Returns whether the [`DriverRow`] method for this kind reads a column of type `ty`.
+        pub(crate) fn postgres_accepts(self, ty: &Type) -> bool {
+            match self {
+                Self::Integer => Integer::accepts(ty),
+                Self::Boolean => bool::accepts(ty),
+                Self::Text => String::accepts(ty),
+                Self::Bytes => <&[u8]>::accepts(ty),
+                Self::Uuid => Uuid::accepts(ty),
+                Self::Timestamp => SystemTime::accepts(ty),
+                Self::Json => Value::accepts(ty),
+            }
         }
     }
 
@@ -478,11 +557,13 @@ mod tests {
         in_order: &'static str,
     }
 
+    #[cfg(any(feature = "libsql", feature = "turso"))]
     const SQLITE_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
         in_order: "select 1 as flag, x'0102' as payload, \
                    '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
     };
 
+    #[cfg(feature = "postgres")]
     const POSTGRES_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
         in_order: r"select true as flag, '\x0102'::bytea as payload,
                     '67e55044-10b1-426f-9247-bb680e5fe0c8'::uuid as id,
