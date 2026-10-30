@@ -7549,6 +7549,119 @@ mod tests {
         Ok(())
     }
 
+    /// DeleteRecords can move the log start past the first offset of an open transaction. The
+    /// last stable offset then answers the log start, as Kafka raises it, and not the
+    /// transaction's first offset below it.
+    #[tokio::test]
+    async fn delete_records_past_open_transaction_raises_last_stable_to_log_start() -> Result<()> {
+        use nisshi_sans_io::delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic};
+
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "delete_records_past_open_transaction_raises_last_stable_to_log_start",
+            CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // a transaction opens at offset 0 and stays open
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"uncommitted").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        assert_eq!(
+            0,
+            storage
+                .produce(Some(transaction_id.as_str()), &topition, batch)
+                .await?
+        );
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"after").into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+        assert_eq!(1, storage.produce(None, &topition, batch).await?);
+
+        let log_start = 1;
+
+        let results = storage
+            .delete_records(&[DeleteRecordsTopic::default()
+                .name(topic_name.clone())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(log_start),
+                ]))])
+            .await?;
+        assert_eq!(
+            log_start,
+            results[0].partitions.as_deref().unwrap_or_default()[0].low_watermark
+        );
+
+        assert_eq!(
+            OffsetStage {
+                last_stable: log_start,
+                high_watermark: 2,
+                log_start,
+            },
+            storage.offset_stage(&topition).await?
+        );
+
+        Ok(())
+    }
+
     /// A transaction whose timeout has elapsed without the client calling `EndTxn` (a crashed
     /// or abandoned producer) must be aborted by `maintain_transactions`, releasing the
     /// `read_committed` last stable offset it was pinning.
