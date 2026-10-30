@@ -353,45 +353,50 @@ where
 
         debug!(runs = runs.len());
 
-        let mut responses_by_owner = Vec::with_capacity(queued_as_sent.len());
-
         // Each run is one write, in queue order, so the offsets of the owners stay in queue order.
         for Run { batch, owners } in runs {
             let record_count = i64::from(batch.last_offset_delta) + 1;
 
-            match self.storage.produce(transaction_id, topition, batch).await {
-                // The merged batch is over `max.message.bytes`. Kafka checks and stores each batch
-                // as sent, and each one may be valid, so we write each one on its own.
-                Err(Error::MessageTooLarge { .. }) => {
-                    responses_by_owner.extend(
+            let responses_by_owner =
+                match self.storage.produce(transaction_id, topition, batch).await {
+                    // The merged batch is over `max.message.bytes`. Kafka checks and stores each batch
+                    // as sent, and each one may be valid, so we write each one on its own.
+                    Err(Error::MessageTooLarge { .. }) => {
                         self.write_each_as_sent(transaction_id, topition, owners, &attributes)
-                            .await,
-                    );
-                }
-
-                outcome => {
-                    if let Ok(base_offset) = outcome {
-                        debug!(base_offset);
-                        SEND_QUEUED_PRODUCED_RECORDS_COUNTER.add(record_count as u64, &attributes);
+                            .await
                     }
 
-                    let mut cumulative = 0;
+                    outcome => {
+                        if let Ok(base_offset) = outcome {
+                            debug!(base_offset);
+                            SEND_QUEUED_PRODUCED_RECORDS_COUNTER
+                                .add(record_count as u64, &attributes);
+                        }
 
-                    for owner in owners {
-                        let response = outcome
-                            .as_ref()
-                            .map(|base_offset| base_offset + cumulative)
-                            .map_err(Clone::clone);
+                        let mut cumulative = 0;
 
-                        cumulative += owner.record_count();
+                        owners
+                            .into_iter()
+                            .map(|owner| {
+                                let response = outcome
+                                    .as_ref()
+                                    .map(|base_offset| base_offset + cumulative)
+                                    .map_err(Clone::clone);
 
-                        responses_by_owner.push((owner.id, response));
+                                cumulative += owner.record_count();
+
+                                (owner.id, response)
+                            })
+                            .collect()
                     }
-                }
-            }
+                };
+
+            // The owners of this run are answered when their own write is done, so they do not
+            // wait for the writes of the runs after it.
+            self.respond(responses_by_owner, &attributes)?;
         }
 
-        self.respond(responses_by_owner, &attributes)
+        Ok(())
     }
 
     /// Writes the batch of each of `owners` on its own, in queue order, and returns each owner's
@@ -2740,6 +2745,128 @@ mod tests {
         for batch in stored {
             assert!(batch.decoded_size(&Compression::Gzip)? <= limit);
         }
+
+        Ok(())
+    }
+
+    /// When the write of one run fails, only that run's producers receive the error, and the later
+    /// runs are still written. The runs are `[first, second]` and `[third]`.
+    #[tokio::test(start_paused = true)]
+    async fn failed_run_fails_only_its_own_producers() -> Result<()> {
+        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
+        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
+
+        let first = gzip_batch_of(&values_of(b'a', 1_000, 2))?;
+        let second = gzip_batch_of(&values_of(b'b', 1_000, 3))?;
+        let third = gzip_batch_of(&values_of(b'c', 1_000, 1))?;
+
+        let limit = merged_decoded_size(&[&first, &second])?;
+
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(MINIMUM_DELAY))
+            .with_decoded_limit(limit);
+        let topition = Topition::new("abc", 0);
+
+        // The first write of the flush is the write of the first run.
+        recorder.fail_next_produce();
+
+        // Each request joins the queue before the next, so their order in it is fixed.
+        let first_produce = spawn_produce(&batcher, &topition, first);
+        yield_now().await;
+        let second_produce = spawn_produce(&batcher, &topition, second);
+        yield_now().await;
+        let third_produce = spawn_produce(&batcher, &topition, third);
+
+        advance(ADVANCE_DELAY).await;
+        yield_now().await;
+
+        for produce in [first_produce, second_produce] {
+            assert_matches!(
+                tokio::time::timeout(Duration::from_secs(60), produce).await,
+                Ok(Ok(Err(_)))
+            );
+        }
+
+        assert_matches!(
+            tokio::time::timeout(Duration::from_secs(60), third_produce).await,
+            Ok(Ok(Ok(0)))
+        );
+
+        // Only the run of the third request is stored.
+        let stored = recorder.produced(&topition)?.unwrap_or_default();
+        assert_eq!(
+            vec![1],
+            stored
+                .iter()
+                .map(|batch| batch.records.len())
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// When the merged batch of one run is over `max.message.bytes`, only that run is written as
+    /// sent, and the later run is still written as its own batch. The runs are `[first, second]`
+    /// and `[third]`.
+    #[tokio::test(start_paused = true)]
+    async fn run_over_max_message_bytes_is_written_as_sent_and_the_next_run_is_written()
+    -> Result<()> {
+        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
+        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
+
+        let gzip_attributes: i16 = BatchAttribute::default()
+            .compression(Compression::Gzip)
+            .into();
+        let mut seed = 0x2545_f491_u32;
+        let first_value = pseudo_random_bytes(&mut seed, MAX_MESSAGE_BYTES * 6 / 10);
+        let second_value = pseudo_random_bytes(&mut seed, MAX_MESSAGE_BYTES * 6 / 10);
+        let third_value = pseudo_random_bytes(&mut seed, MAX_MESSAGE_BYTES * 6 / 10);
+
+        let first = batch_of(PRODUCER_ID, gzip_attributes, &first_value)?;
+        let second = batch_of(PRODUCER_ID, gzip_attributes, &second_value)?;
+        let third = batch_of(PRODUCER_ID, gzip_attributes, &third_value)?;
+
+        // Each batch fits on its own, and the first two together do not, so only the first run is
+        // over the limit.
+        for batch in [&first, &second, &third] {
+            assert!(batch.size_in_bytes()? <= MAX_MESSAGE_BYTES);
+        }
+        assert!(first.size_in_bytes()? + second.size_in_bytes()? > MAX_MESSAGE_BYTES);
+
+        let limit = merged_decoded_size(&[&first, &second])?;
+
+        let recorder = FlightRecorder::with_max_message_bytes(MAX_MESSAGE_BYTES);
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(MINIMUM_DELAY))
+            .with_decoded_limit(limit);
+        let topition = Topition::new("abc", 0);
+
+        // Each request joins the queue before the next, so their order in it is fixed.
+        let first_produce = spawn_produce(&batcher, &topition, first);
+        yield_now().await;
+        let second_produce = spawn_produce(&batcher, &topition, second);
+        yield_now().await;
+        let third_produce = spawn_produce(&batcher, &topition, third);
+
+        advance(ADVANCE_DELAY).await;
+        yield_now().await;
+
+        for (produce, offset) in [(first_produce, 0), (second_produce, 1), (third_produce, 2)] {
+            assert_matches!(
+                tokio::time::timeout(Duration::from_secs(60), produce).await,
+                Ok(Ok(Ok(base_offset))) if base_offset == offset
+            );
+        }
+
+        let stored = recorder.produced(&topition)?.unwrap_or_default();
+        assert_eq!(
+            vec![Some(first_value), Some(second_value), Some(third_value)],
+            stored
+                .iter()
+                .map(|batch| batch.records[0].value())
+                .collect::<Vec<_>>()
+        );
 
         Ok(())
     }
