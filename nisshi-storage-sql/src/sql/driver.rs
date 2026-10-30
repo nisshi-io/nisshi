@@ -39,12 +39,22 @@ pub(crate) trait DriverRow {
     fn json(&self, index: usize) -> Result<Option<serde_json::Result<Value>>>;
 }
 
-/// A Rust type that a query module declares for a column, read from a [`DriverRow`].
+/// A cursor over one SQL driver's result, which returns each of its rows as a [`DriverRow`], in
+/// order.
+pub(crate) trait DriverRowCursor {
+    /// A row of the result.
+    type Row: DriverRow;
+
+    /// Returns the next row, or `None` after the last row.
+    async fn next(&mut self) -> Result<Option<Self::Row>>;
+}
+
+/// A type that a field of a query's row can have, read from one column of a [`DriverRow`].
 ///
-/// Each value type implements [`from_nullable_column`](Self::from_nullable_column). A field of
-/// the type reads its column with [`from_column`](Self::from_column), and `Option` of the type
-/// overrides it, so a null is an error for a field of the type and `None` for a field of
-/// `Option` of it.
+/// A field of type `T` returns [`Error::UnexpectedNull`] for a null, and a field of type
+/// `Option<T>` reads a null as `None`. A row's reader calls [`from_column`](Self::from_column) for
+/// each field. Each kind of value, such as `i64`, implements only
+/// [`from_nullable_column`](Self::from_nullable_column), and `Option<T>` overrides `from_column`.
 pub(crate) trait FromColumn: Sized {
     /// Reads the value at `index` of `row`, or `None` for a null.
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>>;
@@ -155,8 +165,8 @@ mod postgres {
 
 #[cfg(feature = "libsql")]
 mod libsql {
-    use super::DriverRow;
-    use libsql::{Row, Value};
+    use super::{DriverRow, DriverRowCursor};
+    use libsql::{Row, Rows, Value};
     use nisshi_storage::Result;
 
     /// Returns the value at `index` of `row`, or `None` for a null.
@@ -167,6 +177,14 @@ mod libsql {
         match row.get_value(i32::try_from(index)?)? {
             Value::Null => Ok(None),
             value => Ok(Some(value)),
+        }
+    }
+
+    impl DriverRowCursor for Rows {
+        type Row = Row;
+
+        async fn next(&mut self) -> Result<Option<Row>> {
+            Rows::next(self).await.map_err(Into::into)
         }
     }
 
@@ -198,9 +216,17 @@ mod libsql {
 
 #[cfg(feature = "turso")]
 mod turso {
-    use super::DriverRow;
+    use super::{DriverRow, DriverRowCursor};
     use nisshi_storage::Result;
-    use turso::Row;
+    use turso::{Row, Rows};
+
+    impl DriverRowCursor for Rows {
+        type Row = Row;
+
+        async fn next(&mut self) -> Result<Option<Row>> {
+            Rows::next(self).await.map_err(Into::into)
+        }
+    }
 
     impl DriverRow for Row {
         fn integer(&self, index: usize) -> Result<Option<i64>> {

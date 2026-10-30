@@ -13,8 +13,7 @@
 // limitations under the License.
 
 //! The query that reads a partition's watermarks and its topic's `max.message.bytes` before a write
-//! to the partition. A change to either version's `select` list must keep the column names that
-//! [`Row`] declares.
+//! to the partition.
 //!
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the partition's index.

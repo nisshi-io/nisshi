@@ -16,8 +16,8 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        Cache, QueryRow, QueryRowCursor, consumer_group_select, default_hash,
+        idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
         watermark_select_for_write,
     },
@@ -416,34 +416,27 @@ impl PoolConnection {
             })
     }
 
-    /// Runs `query`, and returns the column names of its result with its rows, which a query
-    /// module's `RowReader` reads.
-    async fn query_rows<P>(
+    /// Runs `query`, and returns its rows, each read as `T` when the caller reaches it.
+    async fn query_rows<T: QueryRow>(
         &self,
         query: &'static str,
-        params: P,
-    ) -> result::Result<(ResultColumns, Rows), libsql::Error>
-    where
-        P: IntoParams,
-    {
+        params: impl IntoParams,
+    ) -> Result<QueryRowCursor<Rows, T>> {
         let rows = self.query(query, params).await?;
-        Ok((ResultColumns::libsql(query, &rows), rows))
+        QueryRowCursor::new(&ResultColumns::libsql(query, &rows), rows)
     }
 
-    /// Runs `query`, and returns the column names of its result with its first row, or with
-    /// `None` when the result has no rows.
+    /// Runs `query`, and returns the first row of its result as `T`, or `None` when the result
+    /// has no rows.
     ///
     /// The function drops the result before it returns, because SQLite can't commit while a
     /// `returning` statement is still open.
     #[instrument(skip_all)]
-    async fn query_first<P>(
+    async fn query_first<T: QueryRow>(
         &self,
         query: &'static str,
-        params: P,
-    ) -> result::Result<(ResultColumns, Option<Row>), libsql::Error>
-    where
-        P: IntoParams,
-    {
+        params: impl IntoParams,
+    ) -> Result<Option<T>> {
         // The params hold record data and SCRAM credentials, so we log only the SQL.
         debug!(sql = query);
 
@@ -457,7 +450,7 @@ impl PoolConnection {
             .inspect(|rows| debug!(?rows))
             .inspect_err(|err| self.record_query_error(query, start, err))?;
 
-        let columns = ResultColumns::libsql(query, &rows);
+        let reader = T::reader(&ResultColumns::libsql(query, &rows))?;
 
         // libSQL reports an error of the statement's first step from this call, not from
         // `query`.
@@ -465,14 +458,16 @@ impl PoolConnection {
             .next()
             .await
             .inspect(|row| debug!(?row))
-            .inspect_err(|err| self.record_query_error(query, start, err))?;
+            .inspect_err(|err| self.record_query_error(query, start, err))?
+            .map(|row| T::read(&reader, &row))
+            .transpose()?;
 
         let attributes = [KeyValue::new("sql", query.to_owned())];
 
         SQL_DURATION.record(elapsed_millis(start), &attributes);
         SQL_REQUESTS.add(1, &attributes);
 
-        Ok((columns, row))
+        Ok(row)
     }
 
     /// Logs `err` from `query`, started at `start`, and counts it in `SQL_ERROR`.
@@ -725,8 +720,8 @@ impl Delegate {
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
-        let (columns, row) = connection
-            .query_first(
+        let epochs = connection
+            .query_first::<producer_epochs_select::Row>(
                 producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -735,13 +730,10 @@ impl Delegate {
                     topition.partition(),
                 ),
             )
-            .await?;
+            .await
+            .inspect_err(|err| error!(?err))?;
 
-        let reader = producer_epochs_select::RowReader::new(&columns)?;
-
-        if let Some(row) = row {
-            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
-
+        if let Some(epochs) = epochs {
             let stored = StoredEpochs {
                 transactional: epochs.transactional != 0,
                 newest: epochs.newest_epoch,
@@ -833,7 +825,7 @@ impl Delegate {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition);
 
-        let (columns, row) = connection
+        connection
             .query_first(
                 watermark_select_for_write::LITE_QUERY,
                 (
@@ -843,15 +835,8 @@ impl Delegate {
                 ),
             )
             .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
-
-        let reader = watermark_select_for_write::RowReader::new(&columns)?;
-
-        let Some(row) = row else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        reader.read_row(&row).inspect_err(|err| error!(?err))
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
     }
 
     #[instrument(skip_all)]
@@ -4046,21 +4031,18 @@ impl Storage for Delegate {
             .await?;
 
         if rows.next().await?.is_some() {
-            let (columns, mut rows) = c
-                .query_rows(
+            let mut rows = c
+                .query_rows::<topic_configuration_select::Row>(
                     topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
-            let reader = topic_configuration_select::RowReader::new(&columns)?;
-
             let mut configs = vec![];
 
-            while let Some(row) = rows.next().await? {
-                let topic_configuration_select::Row { name, value } =
-                    reader.read_row(&row).inspect_err(|err| error!(?err))?;
-
+            while let Some(topic_configuration_select::Row { name, value }) =
+                rows.next().await.inspect_err(|err| error!(?err))?
+            {
                 configs.push(
                     DescribeConfigsResourceResult::default()
                         .name(name)
@@ -4316,15 +4298,14 @@ impl Storage for Delegate {
 
         let mut listed_groups = vec![];
 
-        let (columns, mut rows) = c
-            .query_rows(consumer_group_select::QUERY, &[self.cluster.as_str()])
+        let mut rows = c
+            .query_rows::<consumer_group_select::Row>(
+                consumer_group_select::QUERY,
+                &[self.cluster.as_str()],
+            )
             .await?;
 
-        let reader = consumer_group_select::RowReader::new(&columns)?;
-
-        while let Some(row) = rows.next().await? {
-            let consumer_group_select::Row { name, detail } = reader.read_row(&row)?;
-
+        while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {
             let stored =
                 detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 

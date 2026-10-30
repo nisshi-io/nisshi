@@ -37,8 +37,9 @@ changes.
   }
   ```
 
-  The macro declares `Row` and a `RowReader`. A query whose engines read no column, because a row
-  only means that something exists, needs only `QUERY`.
+  The macro declares `Row`, implements `QueryRow` for it, and declares the `RowReader` that reads
+  it. A query whose engines read no column, because a row only means that something exists, needs
+  only `QUERY`.
 
 - **Name a field as its column, and rename a column in the SQL.** The macro reads each field from
   the column with the field's name. When the Rust name should differ from a table's column, the
@@ -50,34 +51,35 @@ changes.
   holds, and re-export it from each query's module:
 
   ```rust
-  pub(crate) use super::row::topic::{Row, RowReader};
+  pub(crate) use super::row::topic::Row;
   ```
 
   Each `sql_row!` declares types named `Row` and `RowReader`, so each shared row needs a module of
-  its own. Re-export only `RowReader` when no engine names `Row`, because the compiler rejects an
-  unused re-export. Each engine still names the query's own module, `topic_select::RowReader`, so
-  the query's module stays the one place that says what the query returns. A row that only one
-  query returns stays in that query's module. Variants of one query, such as a PostgreSQL version
-  and a SQLite version, are constants in one module, not separate modules.
-- **Run the query by `QUERY` through the engine's helper, and read each row with the module's
-  `RowReader`.** Never write the query's file name or a column's index at a call site. Each helper
-  returns the result's column names with its rows. Build the reader once, before the first row,
-  and read every row with it:
+  its own. Each engine still names the query's own module, `topic_select::Row`, so the query's
+  module stays the one place that says what the query returns. A row that only one query returns
+  stays in that query's module. Variants of one query, such as a PostgreSQL version and a SQLite
+  version, are constants in one module, not separate modules.
+- **Read every row through the engine's helper, which takes the row type and returns rows of it.**
+  Run the query by `QUERY`, and name the row type with a turbofish, unless the code around it
+  already names the type. Never write the query's file name, a column's index or a `RowReader` at
+  a call site:
 
   ```rust
-  let (columns, mut rows) = connection.query_rows(topic_select::QUERY, params).await?;
-  let reader = topic_select::RowReader::new(&columns)?;
+  let mut rows = connection
+      .query_rows::<topic_select::Row>(topic_select::QUERY, params)
+      .await?;
 
-  while let Some(row) = rows.next().await? {
-      let topic_select::Row { name, partitions } = reader.read_row(&row)?;
+  while let Some(topic_select::Row { name, partitions }) = rows.next().await? {
+      // ...
   }
   ```
 
-  For a result of at most one row, use the engine's one-row helper, which records the same SQL
-  metrics as a many-row query. PostgreSQL has `prepare_query_rows` and
-  `prepare_query_optional_row`, which fails on a second row. libSQL and Turso have `query_rows` and
-  `query_first`. PostgreSQL gets the column names from the prepared statement, so a result without
-  rows has them too.
+  The helper builds the reader once, from the result's column names, before the first row.
+  PostgreSQL has `prepare_query_rows`, which returns every row, and `prepare_query_optional_row`,
+  for none or one row, which fails on a second row. libSQL and Turso have `query_rows`, which
+  returns each row when the caller reaches it, and `query_first`, which takes the first row of any
+  number. Each one-row helper records the same SQL metrics as a many-row query. PostgreSQL gets the
+  column names from the prepared statement, so a result without rows has them too.
 - **Write the row type qualified, as `topic_select::Row`.** The module already names the query, so
   the type needs no other name. Each engine file also imports its driver's own `Row`, and the
   qualified name shows which of the two a line means.

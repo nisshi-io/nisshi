@@ -20,7 +20,8 @@
 /// `RowReader::new` finds each column's index by its name once, before the first row, and
 /// `RowReader::read_row` reads each row by those indexes through any
 /// [`DriverRow`](driver::DriverRow). Each field's type implements [`FromColumn`](driver::FromColumn).
-/// A read error names the query and the column.
+/// A read error names the query and the column. The macro implements [`QueryRow`] for `Row`, so
+/// that an engine's query helpers read each row of a result as `Row`.
 macro_rules! sql_row {
     (
         $(#[$row_attribute:meta])*
@@ -80,7 +81,65 @@ macro_rules! sql_row {
                 })
             }
         }
+
+        impl $crate::sql::QueryRow for Row {
+            type Reader = RowReader;
+
+            fn reader(
+                columns: &$crate::sql::result_columns::ResultColumns,
+            ) -> ::nisshi_storage::Result<RowReader> {
+                RowReader::new(columns)
+            }
+
+            fn read<R>(reader: &RowReader, row: &R) -> ::nisshi_storage::Result<Self>
+            where
+                R: $crate::sql::driver::DriverRow,
+            {
+                reader.read_row(row)
+            }
+        }
     };
+}
+
+/// A row of one query's result, which [`sql_row!`] declares, read by column name. An engine's query
+/// helpers take the row type, as in `query_first::<topic_select_name::Row>`, and return each row
+/// read as it.
+pub(crate) trait QueryRow: Sized {
+    /// The reader that finds each column of a result by its name, before the first row.
+    type Reader;
+
+    /// Returns the reader for the result with `columns`.
+    fn reader(columns: &result_columns::ResultColumns) -> Result<Self::Reader>;
+
+    /// Reads `row` with `reader`.
+    fn read<R: driver::DriverRow>(reader: &Self::Reader, row: &R) -> Result<Self>;
+}
+
+/// A cursor over one query's result on libSQL or Turso, which returns each of its rows as a
+/// [`QueryRow`], in order. It reads a row only when the caller reaches it.
+pub(crate) struct QueryRowCursor<R: driver::DriverRowCursor, T: QueryRow> {
+    driver_cursor: R,
+    reader: T::Reader,
+}
+
+impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
+    /// Returns a cursor over the result with `columns`, which reads each row from
+    /// `driver_cursor`.
+    pub(crate) fn new(columns: &result_columns::ResultColumns, driver_cursor: R) -> Result<Self> {
+        T::reader(columns).map(|reader| Self {
+            driver_cursor,
+            reader,
+        })
+    }
+
+    /// Returns the next row as `T`, or `None` after the last row.
+    pub(crate) async fn next(&mut self) -> Result<Option<T>> {
+        self.driver_cursor
+            .next()
+            .await?
+            .map(|row| T::read(&self.reader, &row))
+            .transpose()
+    }
 }
 
 pub(crate) mod consumer_group_select;

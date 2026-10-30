@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `pg/topic_configuration_select_keys.sql` query and [`Row`], one row of its result. A change
-//! to the query's `select` list must keep the column names that [`Row`] declares.
+//! The PostgreSQL query that reads the configs among some keys that a topic sets. It returns no row
+//! when the topic does not exist, and one row with a null name when the topic sets none of the
+//! keys.
 //!
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the array of config keys to read.

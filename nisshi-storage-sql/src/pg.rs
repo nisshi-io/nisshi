@@ -103,9 +103,10 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        consumer_group_select, default_hash, idempotent_epoch_check, idempotent_sequence_check,
-        producer_epochs_select, result_columns::ResultColumns, topic_configuration_select,
-        topic_configuration_select_keys, topic_select, watermark_select_for_write,
+        QueryRow, consumer_group_select, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, result_columns::ResultColumns,
+        topic_configuration_select, topic_configuration_select_keys, topic_select,
+        watermark_select_for_write,
     },
 };
 
@@ -1634,8 +1635,8 @@ impl Postgres {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        let (columns, row) = self
-            .prepare_query_optional_row(
+        let epochs = self
+            .prepare_query_optional_row::<producer_epochs_select::Row>(
                 tx,
                 producer_epochs_select::QUERY,
                 &[
@@ -1648,11 +1649,7 @@ impl Postgres {
             .await
             .inspect_err(|err| error!(?err))?;
 
-        let reader = producer_epochs_select::RowReader::new(&columns)?;
-
-        if let Some(row) = row {
-            let epochs = reader.read_row(&row).inspect_err(|err| error!(?err))?;
-
+        if let Some(epochs) = epochs {
             let stored = StoredEpochs {
                 transactional: epochs.transactional != 0,
                 newest: epochs.newest_epoch,
@@ -1743,22 +1740,14 @@ impl Postgres {
         topition: &Topition,
         tx: &Transaction<'_>,
     ) -> Result<watermark_select_for_write::Row> {
-        let (columns, row) = self
-            .prepare_query_optional_row(
-                tx,
-                watermark_select_for_write::QUERY,
-                &[&self.cluster, &topition.topic(), &topition.partition()],
-            )
-            .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?;
-
-        let reader = watermark_select_for_write::RowReader::new(&columns)?;
-
-        let Some(row) = row else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        reader.read_row(&row).inspect_err(|err| error!(?err))
+        self.prepare_query_optional_row(
+            tx,
+            watermark_select_for_write::QUERY,
+            &[&self.cluster, &topition.topic(), &topition.partition()],
+        )
+        .await
+        .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
+        .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
     }
 
     /// Advances one partition's log start for DeleteRecords, answering the
@@ -1887,33 +1876,27 @@ impl Postgres {
         // This function runs one query instead of the two that `all_topic_configs` runs, because
         // the broker reads `message.timestamp.type` through here for each topic of each produce
         // request.
-        let (columns, rows) = self
-            .prepare_query_rows(
+        let rows = self
+            .prepare_query_rows::<topic_configuration_select_keys::Row>(
                 c,
                 topic_configuration_select_keys::QUERY,
                 &[&self.cluster.as_str(), &name, &keys],
             )
-            .await?;
-
-        let reader = topic_configuration_select_keys::RowReader::new(&columns)?;
+            .await
+            .inspect_err(|err| error!(?err))?;
 
         if rows.is_empty() {
             return Ok(None);
         }
 
-        let mut configs = vec![];
-
-        for row in &rows {
-            if let Some(topic_configuration_select_keys::Config { name, value }) = reader
-                .read_row(row)
-                .inspect_err(|err| error!(?err))?
-                .config()
-            {
-                configs.push(dynamic_topic_config(name, value));
-            }
-        }
-
-        Ok(Some(configs))
+        Ok(Some(
+            rows.into_iter()
+                .filter_map(topic_configuration_select_keys::Row::config)
+                .map(|topic_configuration_select_keys::Config { name, value }| {
+                    dynamic_topic_config(name, value)
+                })
+                .collect(),
+        ))
     }
 
     /// Returns every config that the topic `name` sets, or `None` when the topic does not exist.
@@ -1930,26 +1913,20 @@ impl Postgres {
             return Ok(None);
         }
 
-        let (columns, rows) = self
-            .prepare_query_rows(
+        Ok(Some(
+            self.prepare_query_rows::<topic_configuration_select::Row>(
                 c,
                 topic_configuration_select::QUERY,
                 &[&self.cluster.as_str(), &name],
             )
-            .await?;
-
-        let reader = topic_configuration_select::RowReader::new(&columns)?;
-
-        let mut configs = vec![];
-
-        for row in &rows {
-            let topic_configuration_select::Row { name, value } =
-                reader.read_row(row).inspect_err(|err| error!(?err))?;
-
-            configs.push(dynamic_topic_config(name, value));
-        }
-
-        Ok(Some(configs))
+            .await
+            .inspect_err(|err| error!(?err))?
+            .into_iter()
+            .map(|topic_configuration_select::Row { name, value }| {
+                dynamic_topic_config(name, value)
+            })
+            .collect(),
+        ))
     }
 
     /// Returns the SQL text that the SQL cache holds for `key`, and the statement that `client`
@@ -2038,45 +2015,41 @@ impl Postgres {
             .await
     }
 
-    /// Runs the query that the SQL cache holds for `query`, and returns its rows with the names
-    /// of its result's columns, which a query module's `RowReader` reads the rows by.
+    /// Runs the query that the SQL cache holds for `query`, and returns each row of its result
+    /// as `T`.
     #[instrument(skip(self, client, params))]
-    async fn prepare_query_rows<C>(
+    async fn prepare_query_rows<T: QueryRow>(
         &self,
-        client: &C,
+        client: &impl GenericClient,
         query: &'static str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<(ResultColumns, Vec<Row>)>
-    where
-        C: GenericClient,
-    {
+    ) -> Result<Vec<T>> {
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let columns = ResultColumns::postgres(query, &statement);
+        let reader = T::reader(&ResultColumns::postgres(query, &statement))?;
 
         self.record_sql_metrics(sql, client.query(&statement, params))
-            .await
-            .map(|rows| (columns, rows))
+            .await?
+            .iter()
+            .map(|row| T::read(&reader, row))
+            .collect()
     }
 
-    /// Runs the query that the SQL cache holds for `query`, and returns its row with the names of
-    /// its result's columns, or with `None` when the result has no rows. A result with more than
-    /// one row is an error.
+    /// Runs the query that the SQL cache holds for `query`, and returns its row as `T`, or `None`
+    /// when the result has no rows. A result with more than one row is an error.
     #[instrument(skip(self, client, params))]
-    async fn prepare_query_optional_row<C>(
+    async fn prepare_query_optional_row<T: QueryRow>(
         &self,
-        client: &C,
+        client: &impl GenericClient,
         query: &'static str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<(ResultColumns, Option<Row>)>
-    where
-        C: GenericClient,
-    {
+    ) -> Result<Option<T>> {
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let columns = ResultColumns::postgres(query, &statement);
+        let reader = T::reader(&ResultColumns::postgres(query, &statement))?;
 
         self.record_sql_metrics(sql, client.query_opt(&statement, params))
-            .await
-            .map(|row| (columns, row))
+            .await?
+            .map(|row| T::read(&reader, &row))
+            .transpose()
     }
 
     #[instrument(skip(self, client, params))]
@@ -4369,16 +4342,11 @@ impl Storage for Postgres {
 
         let mut listed_groups = vec![];
 
-        let (columns, rows) = self
+        for consumer_group_select::Row { name, detail } in self
             .prepare_query_rows(&c, consumer_group_select::QUERY, &[&self.cluster])
             .await
-            .inspect_err(|err| error!(?err))?;
-
-        let reader = consumer_group_select::RowReader::new(&columns)?;
-
-        for row in &rows {
-            let consumer_group_select::Row { name, detail } = reader.read_row(row)?;
-
+            .inspect_err(|err| error!(?err))?
+        {
             let stored =
                 detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 

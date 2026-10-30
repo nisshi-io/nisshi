@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_configuration_select.sql` query and [`Row`], one row of its result. A change to the
-//! query's `select` list must keep the column names that [`Row`] declares.
+//! The query that reads each config that a topic sets.
 //!
-//! The query takes two parameters: `$1` is the cluster's name, and `$2` the topic's name. It
-//! returns one row for each config that the topic sets.
+//! The query takes two parameters: `$1` is the cluster's name, and `$2` the topic's name.
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "topic_configuration_select.sql";
