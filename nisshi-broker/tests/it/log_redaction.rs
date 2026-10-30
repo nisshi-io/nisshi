@@ -40,7 +40,7 @@ use nisshi_sans_io::{
     record::{self, Record, inflated},
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{ArcDynStorage, Storage, TopicCreationConfig};
+use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, Storage, TopicCreationConfig};
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -73,6 +73,7 @@ where
         FrameRouteService::<Error>::builder(),
         storage,
         TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
     )
     .and_then(auth::services)
     .and_then(|builder| builder.build().map_err(Into::into))

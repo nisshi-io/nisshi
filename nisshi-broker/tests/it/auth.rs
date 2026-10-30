@@ -40,10 +40,11 @@ use nisshi_sans_io::{
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential,
-    Storage, TopicCreationConfig, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    AutoCreateRefusals, BrokerRegistrationRequest, CommittedOffset, GroupDetail,
+    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, ScramCredential, Storage, TopicCreationConfig, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rsasl::{
@@ -64,6 +65,7 @@ where
         FrameRouteService::<Error>::builder(),
         storage,
         TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
     )
     .and_then(auth::services)
     .and_then(|builder| builder.build().map_err(Into::into))
